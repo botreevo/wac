@@ -9,6 +9,8 @@
 // EIP-2 bounds s to the lower half of the curve order so that no signature has a twin.
 
 import { crypto.keccak256 } from "wac";
+import { Map } from "core";
+import { hashU256, eqU256 } from "../state/world.wac";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
 import { U256 } from "../u256.wac";
 import { ecrecover, secpN } from "../precompiles/ecrecover.wac";
@@ -147,9 +149,30 @@ DecodedTx refuse(string why) {
   return DecodedTx(t, u8[].filled(0, 0), why);
 }
 
+/**
+ * Senders already recovered, by the hash of the transaction's own encoding. Recovery is most of what
+ * decoding a transaction costs — milliseconds against microseconds for the rest — and a node decodes the
+ * same transaction many times: as it enters the mempool, as a block is built from it, as that block comes
+ * back to be imported. The same bytes always recover to the same sender, so the answer is kept.
+ */
+export struct SenderCache {
+  Map<U256, U256> senders;
+
+  SenderCache create() { return SenderCache(Map.create(hashU256, eqU256)); }
+
+  /** A bound on what is kept: past it, everything is forgotten and recovered again as needed. */
+  void note(this, U256 key, U256 sender) {
+    if (this.senders.len() > 100000) { this.senders = Map.create(hashU256, eqU256); }
+    this.senders.set(key, sender);
+  }
+}
+
 /** One transaction from a block body's list, typed or legacy, with its sender recovered. */
-export DecodedTx decodeTransaction(Item item, U256 chainId) {
-  if (isList(item)) { return decodeLegacy(item, chainId); }
+export DecodedTx decodeTransaction(Item item, U256 chainId) { return decodeWith(item, chainId, null); }
+
+/** `decodeTransaction`, taking the sender from `cache` when it is there and keeping it there when not. */
+export DecodedTx decodeWith(Item item, U256 chainId, SenderCache? cache) {
+  if (isList(item)) { return decodeLegacy(item, chainId, cache); }
   u8[] raw = bytesOf(item);
   if (raw.len() == 0) { return refuse("an empty typed transaction"); }
   i32 txType = raw[0] as i32;
@@ -207,7 +230,7 @@ export DecodedTx decodeTransaction(Item item, U256 chainId) {
   u8[] msg = u8[].filled(body.len() + 1, 0);
   msg[0] = txType as! u8;
   for (i32 i = 0; i < body.len(); i++) { msg[i + 1] = body[i]; }
-  U256? sender = recover(keccak256(msg), yParity, r, s);
+  U256? sender = senderOf(raw, msg, yParity, r, s, cache);
   if (sender is null) { return refuse("the signature recovers no sender"); }
   Transaction tx = Transaction(txType, nonce, gasPrice, maxFee, maxPriority, gas, to, value, data, access, maxBlobFee, blobs,
                                auths, sender!);
@@ -218,7 +241,7 @@ export DecodedTx decodeTransaction(Item item, U256 chainId) {
  * A legacy transaction: nine fields, and EIP-155's chain id folded into v. A v of 27 or 28 is a signature
  * from before EIP-155, which still verifies — it is valid on every chain.
  */
-DecodedTx decodeLegacy(Item item, U256 chainId) {
+DecodedTx decodeLegacy(Item item, U256 chainId, SenderCache? cache) {
   Fields f = Fields.of(item);
   U256 nonce = f.int();
   U256 gasPrice = f.int();
@@ -249,13 +272,24 @@ DecodedTx decodeLegacy(Item item, U256 chainId) {
     signed[8] = Item.Bytes(u8[].filled(0, 0));
     msg = encode(Item.List(signed));
   }
-  U256? sender = recover(keccak256(msg), yParity, r, s);
+  U256? sender = senderOf(encode(item), msg, yParity, r, s, cache);
   if (sender is null) { return refuse("the signature recovers no sender"); }
   AccessEntry[] none = AccessEntry[].filled(0, AccessEntry(U256.zero(), U256[].filled(0, U256.zero())));
   Authorization[] noAuths = Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero()));
   Transaction tx = Transaction(0, nonce, gasPrice, U256.zero(), U256.zero(), gas, to, value, data, none, U256.zero(),
                                U256[].filled(0, U256.zero()), noAuths, sender!);
   return DecodedTx(tx, encode(item), "");
+}
+
+/** The sender of the transaction `raw`, whose signing message is `msg`: from the cache, or recovered. */
+U256? senderOf(u8[] raw, u8[] msg, U256 yParity, U256 r, U256 s, SenderCache? cache) {
+  if (cache is null) { return recover(keccak256(msg), yParity, r, s); }
+  U256 key = U256.fromBytes(keccak256(raw), 0, 32);
+  U256? known = cache!.senders.get(key);
+  if (known is not null) { return known!; }
+  U256? sender = recover(keccak256(msg), yParity, r, s);
+  if (sender is not null) { cache!.note(key, sender!); }
+  return sender;
 }
 
 /** The sender, if (yParity, r, s) is a valid low-s signature over `hash`. */

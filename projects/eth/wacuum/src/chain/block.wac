@@ -20,7 +20,7 @@ import { OpTable } from "../evm/table.wac";
 import { Spec, MAX_RLP_BLOCK_SIZE } from "../evm/spec.wac";
 import { precompileAddresses } from "../evm/precompiles.wac";
 import { Transaction, Processed, processTransaction, blobGasPrice, GAS_PER_BLOB } from "../tx/process.wac";
-import { DecodedTx, decodeTransaction } from "../tx/decode.wac";
+import { DecodedTx, decodeTransaction, decodeWith, SenderCache } from "../tx/decode.wac";
 
 export struct Header {
   U256 parentHash;
@@ -379,11 +379,11 @@ u8[]? depositOf(u8[] data) {
  * in no state anyone should keep — run this on a clone.
  */
 export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainId, Map<U256, U256> hashes) {
-  return executeBlock(spec, w, b, parent, chainId, hashes).error;
+  return executeBlock(spec, w, b, parent, chainId, hashes, null).error;
 }
 
 /** `applyBlock`, keeping what executing the block produced: its receipts, for whoever reports them. */
-export Body executeBlock(Spec spec, World w, Block b, Header parent, U256 chainId, Map<U256, U256> hashes) {
+export Body executeBlock(Spec spec, World w, Block b, Header parent, U256 chainId, Map<U256, U256> hashes, SenderCache? senders) {
   Header h = b.header;
   string bad = checkHeader(spec, h, parent);
   if (bad != "") { return failed(bad); }
@@ -392,7 +392,7 @@ export Body executeBlock(Spec spec, World w, Block b, Header parent, U256 chainI
 
   BlockEnv env = BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee,
                           blobGasPrice(spec, h.excessBlobGas), chainId, hashes);
-  Body r = executeBody(spec, w, env, h, b.txs, b.withdrawals, false);
+  Body r = executeBody(spec, w, env, h, b.txs, b.withdrawals, false, senders);
   if (r.error != "") { return r; }
   if (spec.isPrague && !r.requestsHash.eq(h.requestsHash)) { return failed("requests hash does not match"); }
   if (!U256.ofU64(r.gasUsed as! u64).eq(h.gasUsed)) { return failed("gas used \{r.gasUsed}, header says \{h.gasUsed.toDecimal()}"); }
@@ -463,7 +463,8 @@ Body failed(string why) {
  * whole body invalid; building (`skipInvalid` true), it is left out — which is safe because an invalid
  * transaction is refused before it writes anything.
  */
-export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, Withdrawal[] withdrawals, bool skipInvalid) {
+export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, Withdrawal[] withdrawals, bool skipInvalid,
+                        SenderCache? senders) {
   systemCall(spec, w, env, U256.fromHex(BEACON_ROOTS)!, h.parentBeaconBlockRoot.toBytes());
   if (spec.isPrague) { systemCall(spec, w, env, U256.fromHex(HISTORY_STORAGE)!, h.parentHash.toBytes()); }
 
@@ -488,7 +489,7 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
   u8[] blockBloom = u8[].filled(256, 0);
   Vec<u8[]> deposits = Vec.create();
   for (i32 i = 0; i < txs.len(); i++) {
-    DecodedTx d = decodeTransaction(txs[i], env.chainId);
+    DecodedTx d = decodeWith(txs[i], env.chainId, senders);
     if (d.error != "") {
       if (skipInvalid) { continue; }
       return failed("transaction \{i}: \{d.error}");

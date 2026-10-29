@@ -27,18 +27,18 @@ in about an hour and a half.
 | | state |
 | --- | --- |
 | `U256`, the EVM word | **done**. Every arithmetic, comparison and bit operation the EVM has, checked against BigInt over every pair of nine edge values and 192 random cases |
-| the interpreter | **done through Osaka**. Every opcode, with EIP-2929 access costs, EIP-2200/3529 SSTORE metering and refunds, EIP-1153 transient storage, EIP-6780 SELFDESTRUCT, EIP-7939 CLZ |
+| the interpreter | **done through Osaka**. Every opcode, with EIP-2929 access costs, EIP-2200/3529 SSTORE metering and refunds, EIP-1153 transient storage, EIP-6780 SELFDESTRUCT, EIP-7939 CLZ. Calls do not recurse on the host's stack: frames are kept on a stack of the EVM's own, so 1024-deep calls run on any host |
 | calls and creation | **done**. The CALL family with EIP-150's 63/64 and the stipend, CREATE and CREATE2 with collision, EIP-3860 and EIP-170 limits, EIP-7702 delegation |
 | world state | **done**. One journal undoes everything a failed frame did; EIP-161 sweeps touched empty accounts. Each block's changes are kept as a change set, so one world serves every block the engine knows |
 | transactions | **done for types 0 to 4**. Validity, intrinsic gas, EIP-1559 fees, EIP-4844 blob fees, EIP-7623's calldata floor, EIP-7825's gas cap, refunds, the coinbase's share |
-| state root, logs hash | **done**. A Merkle-Patricia trie built from scratch, checked against `trieanyorder.json`, with each account's storage root cached until its storage changes |
+| state root, logs hash | **done, incrementally**. The account trie and every storage trie are kept between blocks, and a root rehashes only the paths to what changed; the from-scratch builder, checked against `trieanyorder.json`, is the oracle it is tested against |
 | precompiles | **all of them**. ecrecover, SHA-256, RIPEMD-160, identity, MODEXP (with EIP-7883's prices), bn254 add, mul and pairing, BLAKE2F, KZG point evaluation, EIP-2537's seven BLS12-381 operations, and EIP-7951's P256VERIFY |
 | forks | **Cancun, Prague, Osaka and the BPO forks**, scheduled by timestamp from a genesis's `config` and `blobSchedule` |
 | blocks | **done**. Blocks and transactions decoded from RLP with every sender recovered, headers checked against their parents (base fee, blob gas with EIP-7918's floor, gas limit), EIP-4788 and EIP-2935 system calls, withdrawals, EIP-7685 requests, EIP-7934's size limit, and every root and the bloom checked. An invalid block is undone and leaves no trace |
 | the Engine API | **done**. `engine_newPayloadV1`–`V4`, `engine_forkchoiceUpdatedV1`–`V3` with and without payload attributes, `engine_getPayloadV3`–`V5` with blobs bundles, `engine_getBlobsV1`/`V2`, `eth_sendRawTransaction` into a mempool (blob transactions in their network form), over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Forks are followed and finality prunes them. Blob proofs and Osaka's cell proofs (each blob extended to its 128 cells) are verified, about half a second a blob |
-| persistence | **done, simply**. With `--datadir`, every imported block and fork choice is appended to a log before it is acknowledged, and the log is replayed on start. Not yet: a state snapshot, so a long chain restarts slowly |
+| persistence | **done**. With `--datadir`, every imported block and fork choice is appended to a log before it is acknowledged, and every `--snapshot-every` finalized blocks (1024) the state at the finalized block is written. On start the snapshot is loaded and the log replayed, running only the blocks after it |
 | the user's JSON-RPC | **done for what wallets and libraries use**. Blocks, transactions and receipts (`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`), `eth_getLogs`, state reads at any unfinalized block, `eth_call`, `eth_estimateGas`, fees (`eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_blobBaseFee`), and the `net_` and `web3_` basics. With `--public-rpc` they are answered without a token; ethers drives them all in `tools/rpc-e2e.mjs`. Not yet: subscriptions and traces |
-| devp2p | **talks to geth**. RLPx (EIP-8's handshake, checked against its vectors; AES-CTR frames with keccak MACs), snappy, the base protocol and eth/69 with EIP-2124 fork ids. The node dials `--peer`s and accepts others on `--p2p-port`, serves headers, bodies and receipts, and swaps transactions. Blob transactions travel in their network form. Not yet: discovery (discv4/v5) and serving snap |
+| devp2p | **talks to geth**. RLPx (EIP-8's handshake, checked against its vectors; AES-CTR frames with keccak MACs), snappy, the base protocol and eth/69 with EIP-2124 fork ids, and discovery v4 (EIP-8's packets; Ping/Pong bonding, FindNode, Neighbors, ENR). The node finds peers from `--bootnode`s, dials them up to `--max-peers`, accepts others on `--p2p-port`, serves headers, bodies and receipts, and swaps transactions, blob transactions in their network form. Not yet: discv5, serving snap |
 | sync | **full sync from peers**. When the consensus client names a block this has not got, headers are fetched back to one it has, then bodies forward, each executed. `tools/devnet-e2e.mjs` runs geth and wacuum side by side: each syncs the other's blocks, transactions cross both ways, and both end on the same state root. Not yet: snap sync, so joining a large chain means executing all of it |
 
 ## Running it
@@ -109,7 +109,8 @@ devnet and checks that they sync from each other.
     src/evm/spec.wac         what differs between forks, as data
     src/state/world.wac      accounts, storage and the journal that undoes them
     src/state/root.wac       the state root and the logs hash
-    src/trie/trie.wac        a Merkle-Patricia root from a set of pairs
+    src/trie/trie.wac        a Merkle-Patricia root from a set of pairs, from scratch
+    src/trie/live.wac        the trie kept and updated in place, as the state uses it
     src/tx/process.wac       a transaction, from validity to the coinbase's fee
     src/tx/decode.wac        transactions from RLP, and their senders recovered
     src/chain/block.wac      a block: header rules, system calls, execution, every root
@@ -119,7 +120,7 @@ devnet and checks that they sync from each other.
     src/engine/eth.wac       blocks, transactions, receipts and logs as the eth_ methods spell them
     src/engine/rpc.wac       JSON-RPC over HTTP, and the JWT gate in front of it
     src/engine/jwt.wac       HS256 JWTs, as the Engine API authenticates them
-    src/p2p/                 devp2p: secp256k1 keys, RLPx, snappy, the wire messages, peers, sync
+    src/p2p/                 devp2p: secp256k1 keys, RLPx, snappy, the wire messages, peers, sync, discovery
     cmd/wacuum.wac           the node: genesis, the Engine API, its peers
     src/crypto/              a Montgomery field, short-Weierstrass curves, bn254 and its pairing, KZG blob and cell proofs
     src/precompiles/         ecrecover, RIPEMD-160, MODEXP, BLAKE2F, and BLS12-381 on wac's `bls`

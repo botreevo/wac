@@ -1,7 +1,8 @@
 // wacuum and geth on one devnet, over devp2p. Each has its own consensus client — this script, playing one
 // for each — and they must agree:
 //
-// The chain is Osaka from its genesis.
+// The chain is Osaka from its genesis, and the two find each other by discovery v4, each given only the
+// other as a bootnode.
 //
 //   1. geth makes blocks; wacuum, told of geth's head, syncs them from geth over the network.
 //   2. A transaction sent to wacuum reaches geth's pool, and one sent to geth reaches wacuum's.
@@ -9,7 +10,7 @@
 //      state root.
 //
 //     GETH=path/to/geth ETHERS=path/to/node_modules/ethers WAC=path/to/native/wac node tools/devnet-e2e.mjs
-import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -63,8 +64,14 @@ const until = async (f, ms = 60000) => {
   return false;
 };
 
+// wacuum's node key is chosen here, so that each client can be given the other as its bootnode: neither is
+// told of a peer, and they find each other by discovery v4.
+const wacKey = randomBytes(32).toString("hex");
+mkdirSync(join(dir, "wacuum"), { recursive: true });
+writeFileSync(join(dir, "wacuum", "nodekey"), wacKey);
+const wacEnode = `enode://${new ethers.SigningKey("0x" + wacKey).publicKey.slice(4)}@127.0.0.1:${ports.wacP2p}`;
 execFileSync(GETH, ["--datadir", join(dir, "geth"), "init", join(dir, "genesis.json")], { stdio: "ignore" });
-const geth = start("geth", GETH, ["--datadir", join(dir, "geth"), "--networkid", "1337", "--nodiscover", "--port", String(ports.gethP2p),
+const geth = start("geth", GETH, ["--datadir", join(dir, "geth"), "--networkid", "1337", "--bootnodes", wacEnode, "--port", String(ports.gethP2p),
   "--authrpc.port", String(ports.gethAuth), "--authrpc.jwtsecret", join(dir, "jwt.hex"), "--http", "--http.port", String(ports.gethRpc),
   "--http.api", "eth,admin,net,txpool", "--syncmode", "full"]);
 
@@ -114,8 +121,8 @@ try {
 
   const wac = start("wacuum", process.env.WAC ?? "wac", ["run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
     "--genesis", join(dir, "genesis.json"), "--jwt-secret", join(dir, "jwt.hex"), "--datadir", join(dir, "wacuum"), "--public-rpc",
-    "--port", String(ports.wac), "--peer", enode, "--p2p-port", String(ports.wacP2p)]);
-  check(await until(() => wac.log().includes("serving blocks"), 300000), "wacuum dialled geth and agreed on the chain");
+    "--port", String(ports.wac), "--bootnode", enode, "--p2p-port", String(ports.wacP2p)]);
+  check(await until(() => wac.log().includes("serving blocks"), 300000), "wacuum and geth found each other and agreed on the chain");
 
   // 1. geth's chain into wacuum.
   check((await choose(ports.wac, gethHead.hash)).payloadStatus.status === "SYNCING", "wacuum is SYNCING to geth's head");

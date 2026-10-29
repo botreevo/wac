@@ -11,8 +11,7 @@
 // whole transaction's cells cost two pairings. Committing to I needs the ceremony's first 64 monomial G1
 // points and [τ⁶⁴]G2, which are below; nothing else of the setup is.
 //
-// The scalar arithmetic is in a Montgomery field mod r; the G1 sums are a multiplication each, which is
-// the slow part, and a multi-scalar multiplication would be the thing to change if it matters.
+// The scalar arithmetic is in a Montgomery field mod r, and the G1 sums are multi-scalar multiplications.
 
 import { crypto.sha256 } from "wac";
 import { bls.G1, bls.G2, bls.Pair, bls.Fp12, bls.g1Infinity, bls.g1IsInfinity, bls.g1Add, bls.g1Mul, bls.g1Negate,
@@ -21,6 +20,7 @@ import { bls.G1, bls.G2, bls.Pair, bls.Fp12, bls.g1Infinity, bls.g1IsInfinity, b
 import { U256 } from "../u256.wac";
 import { hexToBytes } from "../hex.wac";
 import { Field } from "./field.wac";
+import { g1Msm } from "./msm.wac";
 
 export static i32 CELL_ELEMENTS = 64;
 export static i32 CELLS = 128;
@@ -228,25 +228,20 @@ export bool verifyCellProofs(u8[][] commitments, i32[] indices, u8[][] cells, u8
     u64[][] evals = rows[row];
     for (i32 j = 0; j < CELL_ELEMENTS; j++) { natural[j] = evals[reverseBits(j, 6)]; }
     u64[] hInv = f.inv(f.pow(w8192, U256.ofI32(reverseBits(row, 7))));
+    // c_i = (1/64)·Σ_j v_j·ω₆₄^(−ij), by an NTT with ω₆₄⁻¹.
+    ntt(f, natural, w64inv);
     u64[] shift = f.one();
-    u64[] wk = f.one();
     for (i32 i = 0; i < CELL_ELEMENTS; i++) {
-      // c_i = (1/64)·Σ_j v_j·ω₆₄^(−ij)
-      u64[] c = f.zero();
-      u64[] wij = f.one();
-      for (i32 j = 0; j < CELL_ELEMENTS; j++) {
-        c = f.add(c, f.mul(natural[j], wij));
-        wij = f.mul(wij, wk);
-      }
-      agg[i] = f.add(agg[i], f.mul(f.mul(c, inv64), shift));
+      agg[i] = f.add(agg[i], f.mul(f.mul(natural[i], inv64), shift));
       shift = f.mul(shift, hInv);
-      wk = f.mul(wk, w64inv);
     }
   }
 
   // The three G1 sums: commitments by their summed weights, minus the interpolation's commitment, plus
   // each proof by its weight times its coset shift to the 64th; and the proofs by their weights alone.
-  G1 lhs = g1Infinity();
+  i32 m = unique.len() + CELL_ELEMENTS + n;
+  G1[] points = G1[].filled(m, g1Infinity());
+  u32[][] scalars = u32[][].defaulted(m);
   for (i32 u = 0; u < unique.len(); u++) {
     u64[] weight = f.zero();
     for (i32 k = 0; k < n; k++) {
@@ -254,33 +249,38 @@ export bool verifyCellProofs(u8[][] commitments, i32[] indices, u8[][] cells, u8
     }
     G1? c = g1FromBytes(unique[u]);
     if (c is null) { return false; }
-    lhs = g1Add(lhs, g1Mul(c!, limbs(f.toU256(weight))));
+    points[u] = c!;
+    scalars[u] = limbs(f.toU256(weight));
   }
-  G1 interp = g1Infinity();
+  // −I(τ): the setup's points with the interpolation's coefficients negated.
   for (i32 i = 0; i < CELL_ELEMENTS; i++) {
-    G1 p = g1FromBytes(hexToBytes(G1_MONOMIAL[i])!)!;
-    interp = g1Add(interp, g1Mul(p, limbs(f.toU256(agg[i]))));
+    points[unique.len() + i] = g1FromBytes(hexToBytes(G1_MONOMIAL[i])!)!;
+    scalars[unique.len() + i] = limbs(f.toU256(f.neg(agg[i])));
   }
-  lhs = g1Add(lhs, g1Negate(interp));
-  G1 proofSum = g1Infinity();
+  G1[] proofPoints = G1[].filled(n, g1Infinity());
+  u32[][] proofScalars = u32[][].defaulted(n);
   for (i32 k = 0; k < n; k++) {
     G1? p = g1FromBytes(proofs[k]);
     if (p is null) { return false; }
     u64[] hk64 = f.pow(w8192, U256.ofI32((reverseBits(indices[k], 7) * CELL_ELEMENTS) % 8192));
-    lhs = g1Add(lhs, g1Mul(p!, limbs(f.toU256(f.mul(rp[k], hk64)))));
-    proofSum = g1Add(proofSum, g1Mul(p!, limbs(f.toU256(rp[k]))));
+    points[unique.len() + CELL_ELEMENTS + k] = p!;
+    scalars[unique.len() + CELL_ELEMENTS + k] = limbs(f.toU256(f.mul(rp[k], hk64)));
+    proofPoints[k] = p!;
+    proofScalars[k] = limbs(f.toU256(rp[k]));
   }
+  G1 lhs = g1Msm(points, scalars);
+  G1 proofSum = g1Msm(proofPoints, proofScalars);
 
   // e(lhs, G2) · e(proofSum, −[τ⁶⁴]G2) = 1
   G2 tau64 = g2FromBytes(hexToBytes(TAU64_G2)!)!;
   G1[] g1s = [lhs, proofSum];
   G2[] g2s = [g2Generator(), g2Negate(tau64)];
-  i32 m = 0;
+  i32 live = 0;
   for (i32 i = 0; i < 2; i++) {
-    if (!g1IsInfinity(g1s[i])) { m++; }
+    if (!g1IsInfinity(g1s[i])) { live++; }
   }
-  if (m == 0) { return true; }
-  Pair[] pairs = Pair[].defaulted(m);
+  if (live == 0) { return true; }
+  Pair[] pairs = Pair[].defaulted(live);
   i32 j = 0;
   for (i32 i = 0; i < 2; i++) {
     if (g1IsInfinity(g1s[i])) { continue; }

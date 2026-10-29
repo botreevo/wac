@@ -5,12 +5,12 @@
 // be read beside its counterpart there. Where the spec's order of operations is observable (which charges
 // come before which checks, what is refunded when a call cannot happen) the order here is the spec's.
 
-import { Map } from "core";
+import { Map, Vec } from "core";
 import { crypto.keccak256 } from "wac";
 import { rlp.Item, rlp.encode } from "wac";
 import { U256 } from "../u256.wac";
 import { World, Snapshot } from "../state/world.wac";
-import { Frame, Outcome, Halt, run } from "./interp.wac";
+import { Frame, Outcome, Halt, run, resume } from "./interp.wac";
 import { OpTable } from "./table.wac";
 import { isPrecompile, runPrecompile } from "./precompiles.wac";
 import { Spec } from "./spec.wac";
@@ -70,28 +70,37 @@ export struct Message {
   bool noPrecompile;
 }
 
-/** Run a message call: the value moves, then the code (or the precompile) runs, and a failure undoes both. */
-export Outcome processMessage(Evm evm, Message m) {
+// ## Calls without recursion
+//
+// A CALL or CREATE does not run its callee by calling into it: the opcode leaves the callee's message on
+// its frame and stops, and the driver below keeps the frames on a stack of its own — beginning the callee,
+// running whatever frame is on top, and when one halts, finishing it and handing its outcome back to the
+// frame below. So however deep the EVM's calls go (1024 is allowed), the host's stack does not, and no
+// host's stack limit decides whether a block can be executed.
+
+/** A message begun: either already done (a precompile, an account with no code) or a frame to run. */
+struct Begun {
+  Message m;
+  bool isCreate;
+  Snapshot snap;
+  Outcome? done;
+  Frame? frame;
+}
+
+/** The value moves and the code is found: what a call does before its code runs. */
+Begun beginCall(Evm evm, Message m) {
   World w = evm.world;
   Snapshot s = w.snapshot();
   w.markTouched(m.target);
   if (m.transfersValue && !m.value.isZero()) { w.transfer(m.caller, m.target, m.value); }
-  Outcome o = execute(evm, m, w.code(m.codeAddress));
-  if (!o.succeeded()) { w.revert(s); }
-  return o;
-}
-
-Outcome execute(Evm evm, Message m, u8[] code) {
-  if (!m.noPrecompile && isPrecompile(evm.spec, m.codeAddress)) { return runPrecompile(evm.spec, m.codeAddress, m.data, m.gas); }
-  if (code.len() == 0) { return Outcome(Halt.Stop, m.gas); }
-  return run(Frame.create(evm, m, code));
+  return started(evm, m, false, s, w.code(m.codeAddress));
 }
 
 /**
- * Run a creation whose address is already chosen and checked for collision: the new account gets nonce 1,
- * the init code runs, and what it returns becomes the code if it is allowed and paid for.
+ * A creation whose address is already chosen and checked for collision: the new account gets nonce 1 and
+ * the value, and the init code is the frame's code, its calldata empty.
  */
-export Outcome processCreate(Evm evm, Message m) {
+Begun beginCreate(Evm evm, Message m) {
   World w = evm.world;
   Snapshot s = w.snapshot();
   w.touch(m.target);
@@ -99,23 +108,72 @@ export Outcome processCreate(Evm evm, Message m) {
   w.setNonce(m.target, 1);
   w.markTouched(m.target);
   if (!m.value.isZero()) { w.transfer(m.caller, m.target, m.value); }
-  // The message carries the init code to here; once it is code, the frame's calldata is empty.
   u8[] initcode = m.data;
   m.data = u8[].filled(0, 0);
-  Outcome o = execute(evm, m, initcode);
+  return started(evm, m, true, s, initcode);
+}
+
+Begun started(Evm evm, Message m, bool isCreate, Snapshot s, u8[] code) {
+  if (!m.noPrecompile && isPrecompile(evm.spec, m.codeAddress)) {
+    return Begun(m, isCreate, s, runPrecompile(evm.spec, m.codeAddress, m.data, m.gas), null);
+  }
+  if (code.len() == 0) { return Begun(m, isCreate, s, Outcome(Halt.Stop, m.gas), null); }
+  return Begun(m, isCreate, s, null, Frame.create(evm, m, code));
+}
+
+/**
+ * What a message's outcome comes to once it is over: a failed call is undone; a creation's returned code
+ * is checked and paid for (EIP-3541's 0xEF, EIP-170's size, 200 gas a byte) and becomes the account's.
+ */
+Outcome finish(Evm evm, Begun b, Outcome o) {
+  World w = evm.world;
   if (!o.succeeded()) {
-    w.revert(s);
+    w.revert(b.snap);
     return o;
   }
+  if (!b.isCreate) { return o; }
   u8[] code = o.output();
-  // EIP-3541 refuses code starting 0xEF; EIP-170 caps the size; and the deposit is 200 gas a byte.
   i64 deposit = 200 * (code.len() as i64);
   if ((code.len() > 0 && code[0] == 0xEF) || code.len() > MAX_CODE_SIZE || deposit > o.gasLeft) {
-    w.revert(s);
+    w.revert(b.snap);
     return Outcome(Halt.Failure("code deposit refused"), 0);
   }
-  w.setCode(m.target, code);
+  w.setCode(b.m.target, code);
   return Outcome(Halt.Return(u8[].filled(0, 0)), o.gasLeft - deposit);
+}
+
+/** Run a message call: the value moves, then the code (or the precompile) runs, and a failure undoes both. */
+export Outcome processMessage(Evm evm, Message m) { return drive(evm, beginCall(evm, m)); }
+
+/** Run a creation; see `beginCreate` and `finish`. */
+export Outcome processCreate(Evm evm, Message m) { return drive(evm, beginCreate(evm, m)); }
+
+/** Run `first` and every call it makes, on a stack of frames, to its outcome. */
+Outcome drive(Evm evm, Begun first) {
+  if (first.done is not null) { return finish(evm, first, first.done!); }
+  Vec<Begun> stack = Vec.create();
+  stack.push(first);
+  while (true) {
+    Begun top = stack.get(stack.len() - 1);
+    Frame f = top.frame!;
+    Outcome? o = run(f);
+    if (o is null) {
+      // The frame stopped to make a call: begin it, and either hand back its outcome at once or run it.
+      Message child = f.spawned!;
+      f.spawned = null;
+      Begun b = f.spawnedCreate ? beginCreate(evm, child) : beginCall(evm, child);
+      if (b.done is not null) {
+        resume(f, finish(evm, b, b.done!));
+      } else {
+        stack.push(b);
+      }
+      continue;
+    }
+    stack.pop();
+    Outcome out = finish(evm, top, o!);
+    if (stack.len() == 0) { return out; }
+    resume(stack.get(stack.len() - 1).frame!, out);
+  }
 }
 
 /** The address CREATE gives: the last 20 bytes of keccak256(rlp([sender, nonce])). */

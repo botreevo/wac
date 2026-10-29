@@ -3,9 +3,8 @@
 // attributes, getPayload, newPayload, forkchoiceUpdated), and use ethers as a wallet would — send a
 // transfer, deploy a contract, call it, estimate gas, wait for receipts, read blocks, logs and fees.
 //
-//     ETHERS=path/to/node_modules/ethers WAC=path/to/native/wac node tools/rpc-e2e.mjs
+//     ETHERS=path/to/node_modules/ethers WAC=path/to/wac node tools/rpc-e2e.mjs
 //
-// Like engine-e2e.mjs, it needs a `wac` on a native host.
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";

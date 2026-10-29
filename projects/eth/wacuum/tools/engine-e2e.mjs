@@ -3,9 +3,9 @@
 // HS256 JWT and check every answer — and that a request without a token is refused. Then stop it, start it
 // again on the same data directory, and check the state it replayed against the fixture's post-state.
 //
-//     WAC=path/to/native/wac node tools/engine-e2e.mjs FIXTURE.json [TEST-NAME-SUBSTRING]
+//     WAC=path/to/wac node tools/engine-e2e.mjs FIXTURE.json [TEST-NAME-SUBSTRING]
 //
-// It needs a `wac` on a native host: on the JavaScript hosts a program is given no network.
+// Any of wac's hosts will do: Node, v8 or wasmtime.
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";

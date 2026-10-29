@@ -12,7 +12,7 @@ README's table, top to bottom, and each row is "done" when the matching `ethereu
 ## Working agreements
 
 - **wac is pinned to one commit**, in `wac.lock`, and the `wac` command should be built from it. Change both
-  together. Today it is `8b92a23dd`.
+  together. Today it is `09e49772a`.
 - **When wac gets in the way, write it down in `docs/wac-asks.md`** with a reproduction, and work around it
   here. Fixing the compiler is ordinary work in the wac repository, but it is a different repository with
   other people's work in it.

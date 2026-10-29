@@ -9,7 +9,7 @@
 //   3. wacuum makes blocks; geth, told of wacuum's head, syncs them from wacuum, and both end on the same
 //      state root.
 //
-//     GETH=path/to/geth ETHERS=path/to/node_modules/ethers WAC=path/to/native/wac node tools/devnet-e2e.mjs
+//     GETH=path/to/geth ETHERS=path/to/node_modules/ethers WAC=path/to/wac node tools/devnet-e2e.mjs
 import { readFileSync, writeFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";

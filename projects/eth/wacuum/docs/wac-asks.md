@@ -50,17 +50,12 @@ Both are exported since wac `96f6bd34d`, and `src/precompiles/bls.wac` is built 
 evaluation and EIP-2537 state test passes. The one thing `bls` lacked for the EVM, the map from Fp to G1
 (its SSWU and 11-isogeny), is written there.
 
-## On the JavaScript hosts, a program is given no network, whatever it is granted
+## Done: the JavaScript hosts give a program the network it is granted
 
-`wac run --allow-net prog.wac`, and a `wac app` built with `--allow-net`, both run the program as a spawned
-child, and on the Node host (and, by the same code, Deno) a child gets only its standard streams: the
-comment in `entryNode.ts`/`children.ts` says so ("What a child is granted, in this first cut: nothing but
-its standard input and output"). So `sys.net().listen(...)` answers "network access not granted to this
-application" even with `--allow-net`. `wac update` fails the same way under `--host nodejs`.
-
-**What it costs here:** the node, `cmd/wacuum.wac`, needs a native host. On wasmtime (`./bootstrap.sh --host
-wasmtime`) it listens and serves the Engine API as it should. A refusal that said "this host does not pass
-the network to programs" rather than "not granted" would have saved the hour it took to find.
+`wac run --allow-net` on the Node host used to start the program as a child with only its standard
+streams, so `sys.net()` answered "not granted" and the node needed a native host. `01762d3f7` fixed it,
+and since the repin to `09e49772a` the node runs on the Node host as on wasmtime: `tools/rpc-e2e.mjs` and
+`tools/devnet-e2e.mjs` (TCP and UDP, against geth) both pass with the Node-hosted `wac`.
 
 ## Done: a running Keccak-256
 

@@ -51,7 +51,7 @@ git clone https://git.voltrevo.com/wac.git ~/src/wac
 ```
 
 ```bash
-cd ~/src/wac && git checkout 8b92a23ddc4075c8079be9db315455bbb9e50cf8 && ./bootstrap.sh --host nodejs
+cd ~/src/wac && git checkout 09e49772a0dfad6aba21996f7202248ea180a92d && ./bootstrap.sh --host nodejs
 ```
 
 Then, in this repository:
@@ -90,8 +90,7 @@ wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum
   --p2p-port 30303 --peer enode://…
 ```
 
-It needs a `wac` on a native host (`./bootstrap.sh --host wasmtime` or the default v8): on the JavaScript
-hosts a program is given no network, whatever it is granted. `node tools/engine-e2e.mjs FIXTURE` drives a
+It runs on any of wac's hosts: Node, v8 or wasmtime. `node tools/engine-e2e.mjs FIXTURE` drives a
 running node through an engine fixture over HTTP, JWT and all, then restarts it on its data directory and
 checks the replayed state; `node tools/rpc-e2e.mjs` makes blocks as a consensus client would and uses
 ethers as a wallet against them; `node tools/devnet-e2e.mjs` (with `GETH` set) puts wacuum and geth on one

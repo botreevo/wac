@@ -62,16 +62,14 @@ application" even with `--allow-net`. `wac update` fails the same way under `--h
 wasmtime`) it listens and serves the Engine API as it should. A refusal that said "this host does not pass
 the network to programs" rather than "not granted" would have saved the hour it took to find.
 
-## Open: a running Keccak-256
+## Done: a running Keccak-256
 
 RLPx's frame MACs are a Keccak-256 over everything sent so far, read after every frame without ending it.
-wac's crypto package has exactly that shape for SHA3-256 (`Sha3_256`, for Tor) but not for Ethereum's
-Keccak, whose padding byte differs. `src/p2p/keccak.wac` is a copy of the permutation until it does; asked
-for on 2026-10-29.
+wac's crypto package had that shape only for SHA3-256; `crypto.Keccak256` is there since `3d6824b52`, and
+wacuum's own copy of the permutation is gone.
 
-## Open: a5a17eeba cannot emit a program that imports from the `wac` dependency
+## Done: a program importing from the `wac` dependency builds again
 
-Built fresh, on either host, the compiler at `a5a17eeba` refuses any `main(Sys)` program that imports
-anything from `"wac"`: "the exported function `__wacHost` is not in the module the emitter produced — a call
-to __wacHostOf". The compiler from `49e5268e` builds the same file against the same packages. It holds back
-the repin for `01762d3f7`, which gives the Node host a network. Reported 2026-10-29.
+`a5a17eeba` refused any `main(Sys)` program that imported a namespace member from `"wac"` ("the exported
+function `__wacHost` is not in the module the emitter produced"); `8b92a23dd` fixed it, and the repin to it
+also brought `01762d3f7`, which gives the Node host a network.

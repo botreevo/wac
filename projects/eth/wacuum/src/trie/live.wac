@@ -1,0 +1,178 @@
+// A Merkle-Patricia trie that is updated in place, for the state: the account trie and each account's
+// storage trie live as long as the world does, a block's changes are put and deleted, and a root is the
+// hash of what changed plus cached hashes for everything else.
+//
+// Every node caches how its parent refers to it — itself when its encoding is under 32 bytes, its hash
+// otherwise — and a put or delete clears that cache on the path it walks, which is exactly the set of
+// nodes whose encoding it changed. `trieRoot` in trie.wac builds the same root from scratch, and is the
+// oracle: every fixture's state root goes through this.
+//
+// Keys here are always 32 bytes (hashes), so no key ends at a branch, and a branch's value slot stays
+// empty.
+
+import { crypto.keccak256 } from "wac";
+import { rlp.Item, rlp.encode } from "wac";
+import { emptyRoot, hexPrefixOf } from "./trie.wac";
+
+static i32 LEAF = 0;
+static i32 EXT = 1;
+static i32 BRANCH = 2;
+
+struct TNode {
+  i32 kind;
+  /** A leaf's remaining key, or an extension's shared nibbles. */
+  u8[] path;
+  u8[] value;
+  /** A branch's sixteen children. */
+  TNode?[] kids;
+  /** An extension's child. */
+  TNode? next;
+  /** How a parent refers to this node, once computed; cleared when the node changes. */
+  Item? ref;
+}
+
+TNode leaf(u8[] path, u8[] value) { return TNode(LEAF, path, value, TNode?[].defaulted(0), null, null); }
+TNode ext(u8[] path, TNode next) { return TNode(EXT, path, u8[].filled(0, 0), TNode?[].defaulted(0), next, null); }
+TNode branch() { return TNode(BRANCH, u8[].filled(0, 0), u8[].filled(0, 0), TNode?[].defaulted(16), null, null); }
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+u8[] join(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
+
+/** How many nibbles `path` and `key[at..]` share from the start. */
+i32 common(u8[] path, u8[] key, i32 at) {
+  i32 n = 0;
+  while (n < path.len() && at + n < key.len() && path[n] == key[at + n]) { n++; }
+  return n;
+}
+
+TNode put(TNode? node, u8[] key, i32 at, u8[] value) {
+  if (node is null) { return leaf(slice(key, at, key.len()), value); }
+  TNode n = node!;
+  n.ref = null;
+  if (n.kind == BRANCH) {
+    i32 nib = key[at] as i32;
+    n.kids[nib] = put(n.kids[nib], key, at + 1, value);
+    return n;
+  }
+  i32 cp = common(n.path, key, at);
+  if (n.kind == LEAF && cp == n.path.len()) {
+    n.value = value;
+    return n;
+  }
+  if (n.kind == EXT && cp == n.path.len()) {
+    n.next = put(n.next, key, at + cp, value);
+    return n;
+  }
+  // They part after `cp` nibbles: a branch there, holding what this node was and the new leaf.
+  TNode b = branch();
+  i32 mine = n.path[cp] as i32;
+  if (n.kind == LEAF) {
+    b.kids[mine] = leaf(slice(n.path, cp + 1, n.path.len()), n.value);
+  } else {
+    b.kids[mine] = cp + 1 == n.path.len() ? n.next! : ext(slice(n.path, cp + 1, n.path.len()), n.next!);
+  }
+  i32 theirs = key[at + cp] as i32;
+  b.kids[theirs] = leaf(slice(key, at + cp + 1, key.len()), value);
+  return cp == 0 ? b : ext(slice(n.path, 0, cp), b);
+}
+
+/** `prefix` put in front of a node: a leaf or extension absorbs it, a branch gets an extension. */
+TNode prefixed(u8[] prefix, TNode n) {
+  if (n.kind == LEAF) { return leaf(join(prefix, n.path), n.value); }
+  if (n.kind == EXT) { return ext(join(prefix, n.path), n.next!); }
+  return ext(prefix, n);
+}
+
+/** What a removal left: the node in its place, and whether anything under it changed. */
+struct Removed {
+  TNode? node;
+  bool changed;
+}
+
+Removed remove(TNode? node, u8[] key, i32 at) {
+  if (node is null) { return Removed(null, false); }
+  TNode n = node!;
+  if (n.kind == LEAF) {
+    if (n.path.len() != key.len() - at || common(n.path, key, at) != n.path.len()) { return Removed(n, false); }
+    return Removed(null, true);
+  }
+  if (n.kind == EXT) {
+    if (common(n.path, key, at) != n.path.len()) { return Removed(n, false); }
+    Removed r = remove(n.next, key, at + n.path.len());
+    if (!r.changed) { return Removed(n, false); }
+    if (r.node is null) { return Removed(null, true); }
+    return Removed(prefixed(n.path, r.node!), true);
+  }
+  i32 nib = key[at] as i32;
+  Removed r = remove(n.kids[nib], key, at + 1);
+  if (!r.changed) { return Removed(n, false); }
+  n.ref = null;
+  n.kids[nib] = r.node;
+  // A branch left with one child is that child, its nibble moved into its path.
+  i32 count = 0;
+  i32 only = -1;
+  for (i32 i = 0; i < 16; i++) {
+    if (n.kids[i] is not null) {
+      count++;
+      only = i;
+    }
+  }
+  if (count == 0) { return Removed(null, true); }
+  if (count == 1) { return Removed(prefixed([only as@ u8], n.kids[only]!), true); }
+  return Removed(n, true);
+}
+
+Item itemOf(TNode n) {
+  if (n.kind == LEAF) { return Item.List([Item.Bytes(hexPrefixOf(n.path, true)), Item.Bytes(n.value)]); }
+  if (n.kind == EXT) { return Item.List([Item.Bytes(hexPrefixOf(n.path, false)), refOf(n.next!)]); }
+  Item[] b = Item[].filled(17, Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < 16; i++) {
+    if (n.kids[i] is not null) { b[i] = refOf(n.kids[i]!); }
+  }
+  return Item.List(b);
+}
+
+Item refOf(TNode n) {
+  if (n.ref is not null) { return n.ref!; }
+  Item it = itemOf(n);
+  u8[] enc = encode(it);
+  Item r = enc.len() < 32 ? it : Item.Bytes(keccak256(enc));
+  n.ref = r;
+  return r;
+}
+
+export struct LiveTrie {
+  TNode? root;
+
+  LiveTrie create() { return LiveTrie(null); }
+
+  /** Put `value` (not empty) at the 32-byte `key`. */
+  void set(this, u8[] key, u8[] value) { this.root = put(this.root, nibbles(key), 0, value); }
+
+  void delete(this, u8[] key) { this.root = remove(this.root, nibbles(key), 0).node; }
+
+  u8[] hash(this) {
+    if (this.root is null) { return emptyRoot(); }
+    // The root is hashed whatever its size: a root is always 32 bytes.
+    return keccak256(encode(itemOf(this.root!)));
+  }
+}
+
+u8[] nibbles(u8[] key) {
+  u8[] n = u8[].filled(key.len() * 2, 0);
+  for (i32 i = 0; i < key.len(); i++) {
+    n[2 * i] = key[i] >> 4;
+    n[2 * i + 1] = key[i] & 15;
+  }
+  return n;
+}

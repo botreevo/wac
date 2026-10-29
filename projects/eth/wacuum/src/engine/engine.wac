@@ -21,7 +21,7 @@ import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
 import { U256 } from "../u256.wac";
 import { hexToBytes, bytesToHex } from "../hex.wac";
-import { World, ChangeSet, hashU256, eqU256 } from "../state/world.wac";
+import { World, Account, ChangeSet, hashU256, eqU256 } from "../state/world.wac";
 import { u256Bytes } from "../state/root.wac";
 import { trieRoot } from "../trie/trie.wac";
 import { addressBytes, Evm, BlockEnv, TxEnv, Message, processMessage } from "../evm/evm.wac";
@@ -135,6 +135,11 @@ export struct Engine {
   Map<U256, Orphan> orphans;
   /** Transactions the mempool took that peers have not been told of yet, in their block form. */
   Vec<u8[]> announce;
+  /** The block a snapshot restored the world to, if one did, and its number. */
+  U256? restoredAt;
+  U256 restoredNumber;
+  /** The number of the block the last snapshot was of, written or restored. */
+  U256 snapshotNumber;
   /** What the blocks this engine builds say in their header's extra data. */
   u8[] extraData;
   /** The finalized block `forgetBelowFinalized` last pruned for. */
@@ -149,7 +154,7 @@ export struct Engine {
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
                       genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                      null, Map.create(hashU256, eqU256), Vec.create(), "wacuum".toBytes(), U256.zero(), Vec.create());
+                      null, Map.create(hashU256, eqU256), Vec.create(), null, U256.zero(), U256.zero(), "wacuum".toBytes(), U256.zero(), Vec.create());
     e.blocks.set(genesis.hash, Node(genesis, null));
     e.archive.set(genesis.hash, Archived(genesis, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
                                          Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
@@ -771,10 +776,18 @@ export struct Engine {
         Spec spec = this.config.specAt(blockTimestamp(raw));
         BlockDecode bd = decodeBlock(spec, raw);
         if (bd.block is null) { return Replayed(at, blocks, "block at byte \{at}: \{bd.error}"); }
-        Answer a = this.importBlock(spec, bd.block!);
-        string st = a.result!.member("status")!.text()!;
-        if (st != "VALID") { return Replayed(at, blocks, "block at byte \{at} is \{st} on replay"); }
-        blocks++;
+        Block b = bd.block!;
+        if (this.restoredAt is not null && !b.header.number.gt(this.restoredNumber)) {
+          // At or below the snapshot: the state already includes it, so it is recorded, not run.
+          this.adopt(spec, b);
+        } else {
+          Answer a = this.importBlock(spec, b);
+          string st = a.result!.member("status")!.text()!;
+          // A block on a fork the snapshot's finality ruled out has no parent state to run on, and is
+          // skipped as finality would have dropped it; anything else that does not run is a broken log.
+          if (st == "INVALID") { return Replayed(at, blocks, "block at byte \{at} is \{st} on replay"); }
+          if (st == "VALID") { blocks++; }
+        }
       } else if (kind.len() == 1 && kind[0] == RECORD_CHOICE && f.len() == 4) {
         U256 head = U256.fromBytes(bytesOf(f[1]), 0, 32);
         if (!this.choose(head, U256.fromBytes(bytesOf(f[2]), 0, 32), U256.fromBytes(bytesOf(f[3]), 0, 32))) {
@@ -1081,6 +1094,76 @@ export struct Engine {
   /** The head's header. */
   Header headHeader(this) { return this.blocks.get(this.head)!.header; }
 
+  /**
+   * A block from the log at or below the snapshot's: kept as a header and its transactions, without
+   * running it, and when it is the snapshot's own block the world is now at it.
+   */
+  void adopt(this, Spec spec, Block b) {
+    Header h = b.header;
+    if (this.blocks.has(h.hash)) { return; }
+    this.blocks.set(h.hash, Node(h, null));
+    this.archive.set(h.hash, Archived(h, b.txs, b.withdrawals, Vec<Receipt>.create().toArray(), encodeBlock(spec, b).len()));
+    if (h.hash.eq(this.restoredAt!)) { this.at = h.hash; }
+  }
+
+  /**
+   * The state after the finalized block, as bytes to keep: rlp([1, block hash, block number, accounts]) with
+   * each account [address, nonce, balance, code, [[slot, value]…]]. Null when the world cannot reach it.
+   */
+  u8[]? snapshot(this) {
+    Node? f = this.blocks.get(this.finalized);
+    if (f is null || !this.moveTo(this.finalized)) { return null; }
+    World w = this.world;
+    U256[] addrs = w.accounts.keys();
+    Item[] accts = Item[].filled(addrs.len(), Item.Bytes(u8[].filled(0, 0)));
+    for (i32 i = 0; i < addrs.len(); i++) {
+      Account a = w.accounts.get(addrs[i])!;
+      U256[] keys = a.storage.keys();
+      Item[] slots = Item[].filled(keys.len(), Item.Bytes(u8[].filled(0, 0)));
+      for (i32 k = 0; k < keys.len(); k++) {
+        slots[k] = Item.List([Item.Bytes(keys[k].toBytes()), Item.Bytes(u256Bytes(a.storage.get(keys[k])!))]);
+      }
+      accts[i] = Item.List([Item.Bytes(addressBytes(addrs[i])), Item.Bytes(u256Bytes(U256.ofU64(a.nonce))),
+                            Item.Bytes(u256Bytes(a.balance)), Item.Bytes(a.code), Item.List(slots)]);
+    }
+    u8[] out = encode(Item.List([Item.Bytes([1 as u8]), Item.Bytes(this.finalized.toBytes()),
+                                 Item.Bytes(u256Bytes(f!.header.number)), Item.List(accts)]));
+    this.moveTo(this.head);
+    this.snapshotNumber = f!.header.number;
+    return out;
+  }
+
+  /**
+   * Start from a snapshot instead of the genesis's state: the world is the snapshot's, and replaying the
+   * log then records the blocks up to its block and runs only those after. Why not, when it will not do.
+   */
+  string restore(this, u8[] bytes) {
+    Decoded d = decode(bytes);
+    if (!d.ok || !isList(d.item) || itemsOf(d.item).len() != 4) { return "the snapshot does not decode"; }
+    Item[] f = itemsOf(d.item);
+    World w = World.create();
+    Item[] accts = itemsOf(f[3]);
+    for (i32 i = 0; i < accts.len(); i++) {
+      Item[] a = itemsOf(accts[i]);
+      U256 addr = U256.fromBytes(bytesOf(a[0]), 0, 20);
+      Account acct = w.touch(addr);
+      acct.nonce = numberOf(bytesOf(a[1])).low();
+      acct.balance = numberOf(bytesOf(a[2]));
+      Item[] slots = itemsOf(a[4]);
+      for (i32 k = 0; k < slots.len(); k++) {
+        Item[] kv = itemsOf(slots[k]);
+        acct.storage.set(U256.fromBytes(bytesOf(kv[0]), 0, 32), numberOf(bytesOf(kv[1])));
+      }
+      w.setCode(addr, bytesOf(a[3]));
+    }
+    w.endTransaction();
+    this.world = w;
+    this.restoredAt = U256.fromBytes(bytesOf(f[1]), 0, 32);
+    this.restoredNumber = numberOf(bytesOf(f[2]));
+    this.snapshotNumber = this.restoredNumber;
+    return "";
+  }
+
   /** The state at the head of the chain. */
   World headState(this) {
     this.moveTo(this.head);
@@ -1133,6 +1216,9 @@ bool logMatches(Log l, U256[] addresses, JsonArray topics) {
   }
   return true;
 }
+
+/** A big-endian number of up to 32 bytes; empty is zero. */
+U256 numberOf(u8[] b) { return b.len() == 0 ? U256.zero() : U256.fromBytes(b, 0, b.len()); }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────────
 

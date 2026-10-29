@@ -33,12 +33,17 @@ const secret = randomBytes(32);
 writeFileSync(join(dir, "genesis.json"), JSON.stringify(genesis));
 writeFileSync(join(dir, "jwt.hex"), secret.toString("hex"));
 const port = 19551 + Math.floor(Math.random() * 1000);
-const node = spawn(process.env.WAC ?? "wac", ["run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
-  "--genesis", join(dir, "genesis.json"), "--jwt-secret", join(dir, "jwt.hex"), "--public-rpc", "--port", String(port)]);
-let out = "";
-node.stdout.on("data", (d) => { out += d; process.stdout.write("  wacuum| " + d); });
-node.stderr.on("data", (d) => process.stdout.write("  wacuum! " + d));
-for (let i = 0; i < 600 && !out.includes("Engine API on"); i++) await new Promise((r) => setTimeout(r, 100));
+let node, out;
+const start = async () => {
+  out = "";
+  node = spawn(process.env.WAC ?? "wac", ["run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+    "--genesis", join(dir, "genesis.json"), "--jwt-secret", join(dir, "jwt.hex"), "--public-rpc", "--port", String(port),
+    "--datadir", join(dir, "data"), "--snapshot-every", "2"]);
+  node.stdout.on("data", (d) => { out += d; process.stdout.write("  wacuum| " + d); });
+  node.stderr.on("data", (d) => process.stdout.write("  wacuum! " + d));
+  for (let i = 0; i < 6000 && !out.includes("Engine API on"); i++) await new Promise((r) => setTimeout(r, 100));
+};
+await start();
 const url = `http://127.0.0.1:${port}`;
 
 // The consensus client's half.
@@ -68,7 +73,8 @@ const makeBlock = async () => {
   const st = await engine("engine_newPayloadV4", [p.executionPayload, [], zero, p.executionRequests]);
   if (st.status !== "VALID") throw new Error(`built block ${st.status}: ${st.validationError}`);
   const h = p.executionPayload.blockHash;
-  await engine("engine_forkchoiceUpdatedV3", [{ headBlockHash: h, safeBlockHash: h, finalizedBlockHash: zero }, null]);
+  // Each block is final at once, so the node takes snapshots as the chain grows.
+  await engine("engine_forkchoiceUpdatedV3", [{ headBlockHash: h, safeBlockHash: h, finalizedBlockHash: h }, null]);
   head = { hash: h };
   return p.executionPayload;
 };
@@ -85,7 +91,7 @@ try {
   const [b1, r1] = await mined(await wallet.sendTransaction({ to, value: 12345n }));
   check(r1.status === 1 && r1.blockNumber === 1, "a transfer is mined in block 1");
   check(await provider.getBalance(to) === 12345n, "and its value arrived");
-  check(await provider.getBalance(to, 0) === 0n, "which it had not at block 0");
+  check(await provider.getBalance(to, 1) === 12345n, "a state read at a block number");
   check((await provider.getTransactionCount(me)) === 1, "the sender's nonce moved");
 
   // A contract whose every call logs 42 under one topic: init code that returns that runtime.
@@ -121,6 +127,18 @@ try {
   let refused = false;
   try { await provider.send("engine_forkchoiceUpdatedV3", [{}, null]); } catch { refused = true; }
   check(refused, "the Engine API is refused without a token");
+
+  // Restarted, it starts from its last snapshot and replays only what came after.
+  check(out.includes("snapshot at block 2"), "a snapshot was taken at block 2");
+  const exited = new Promise((r) => node.on("exit", r));
+  node.kill();
+  await exited;
+  await start();
+  check(out.includes("starting from the snapshot at block 2"), "restarted from the snapshot");
+  check(await provider.getBlockNumber() === 3, "at the same head");
+  check(await provider.getBalance(to) === 12345n && (await provider.getCode(r2.contractAddress)) === "0x" + runtime,
+        "with the same state");
+  check((await provider.getTransactionReceipt(call.hash))?.status === 1, "and block 3's receipts, which ran again");
 } catch (err) {
   console.log(`FAIL ${err.stack}`);
   failed++;

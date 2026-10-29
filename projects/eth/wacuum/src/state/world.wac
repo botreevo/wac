@@ -27,6 +27,7 @@
 import { Map, Vec } from "core";
 import { crypto.keccak256 } from "wac";
 import { U256 } from "../u256.wac";
+import { LiveTrie } from "../trie/live.wac";
 
 export i32 hashU256(U256 k) {
   u64 h = k.w0 ^ (k.w1 * 0x9e3779b97f4a7c15) ^ (k.w2 * 0xc2b2ae3d27d4eb4f) ^ (k.w3 * 0x165667b19e3779f9);
@@ -50,12 +51,16 @@ export struct Account {
   /** Nonzero slots only: writing zero removes the entry, so iterating gives exactly what the trie holds. */
   Map<U256, U256> storage;
   /**
-   * The storage trie's root, once computed, until a slot is written. Every write to `storage` goes through
-   * this file and clears it, so a block's state root rehashes only the storage that block changed.
+   * The storage trie, kept between roots, and the slots written since the last one: every write to
+   * `storage` goes through this file and notes its slot, so a root rehashes only what changed. Null until
+   * the first root, which builds it from `storage` whole.
    */
-  u8[]? storageRoot;
+  LiveTrie? storageTrie;
+  Map<U256, bool> dirtySlots;
 
-  Account empty() { return Account(0, U256.zero(), u8[].filled(0, 0), emptyCodeHash(), slotMap(), null); }
+  Account empty() { return Account(0, U256.zero(), u8[].filled(0, 0), emptyCodeHash(), slotMap(), null, Map.create(hashU256, eqU256)); }
+
+  void slotChanged(this, U256 key) { if (this.storageTrie is not null) { this.dirtySlots.set(key, true); } }
 
   /** EIP-161's "empty": no nonce, no balance, no code. Such an account is deleted when touched. */
   bool isEmpty(this) { return this.nonce == 0 && this.balance.isZero() && this.code.len() == 0; }
@@ -137,11 +142,18 @@ export struct World {
    * may want to take that transaction back out. Each change is noted in every one.
    */
   Vec<ChangeSet> recording;
+  /**
+   * The account trie, kept between roots, and the accounts changed since the last one; null until the
+   * first root builds it whole. The state root then rehashes only the paths to what changed.
+   */
+  LiveTrie? accountTrie;
+  Map<U256, bool> dirty;
 
   World create() {
     return World(Map.create(hashU256, eqU256), Vec.create(), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                  Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0, Vec.create());
+                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0, Vec.create(), null,
+                 Map.create(hashU256, eqU256));
   }
 
   // ── Reading ─────────────────────────────────────────────────────────────────
@@ -195,6 +207,7 @@ export struct World {
     this.noteAccount(addr);
     Account n = Account.empty();
     this.accounts.set(addr, n);
+    this.changed(addr);
     this.journal.push(Change.Created(addr));
     return n;
   }
@@ -214,6 +227,7 @@ export struct World {
     Account a = this.touch(addr);
     this.journal.push(Change.Balance(addr, a.balance));
     a.balance = v;
+    this.changed(addr);
     this.markTouched(addr);
   }
 
@@ -230,6 +244,7 @@ export struct World {
     Account a = this.touch(addr);
     this.journal.push(Change.Nonce(addr, a.nonce));
     a.nonce = n;
+    this.changed(addr);
   }
 
   void setCode(this, U256 addr, u8[] code) {
@@ -238,6 +253,7 @@ export struct World {
     this.journal.push(Change.Code(addr, a.code, a.codeHash));
     a.code = code;
     a.codeHash = code.len() == 0 ? emptyCodeHash() : U256.fromBytes(keccak256(code), 0, 32);
+    this.changed(addr);
   }
 
   void setStorage(this, U256 addr, U256 key, U256 v) {
@@ -254,7 +270,8 @@ export struct World {
     if (!o!.has(key)) { o!.set(key, prev); }
     this.journal.push(Change.Storage(addr, key, prev));
     putSlot(a.storage, key, v);
-    a.storageRoot = null;
+    a.slotChanged(key);
+    this.changed(addr);
   }
 
   void setTransient(this, U256 addr, U256 key, U256 v) {
@@ -322,7 +339,7 @@ export struct World {
       Map<U256, U256> st = slotMap();
       U256[] keys = a.storage.keys();
       for (i32 k = 0; k < keys.len(); k++) { st.set(keys[k], a.storage.get(keys[k])!); }
-      c.accounts.set(addrs[i], Account(a.nonce, a.balance, a.code, a.codeHash, st, a.storageRoot));
+      c.accounts.set(addrs[i], Account(a.nonce, a.balance, a.code, a.codeHash, st, null, Map.create(hashU256, eqU256)));
     }
     return c;
   }
@@ -335,10 +352,24 @@ export struct World {
     while (this.journal.len() > s.journal) {
       Change c = this.journal.pop()!;
       match (c) {
-        Created(addr): { this.accounts.remove(addr); }
-        Balance(addr, prev): { Account a = this.accounts.get(addr)!; a.balance = prev; }
-        Nonce(addr, prev): { Account a = this.accounts.get(addr)!; a.nonce = prev; }
+        // Whatever the change, its account may differ from what the trie last saw; noting more than
+        // changed costs a hash, noting less a wrong root.
+        Created(addr): {
+          this.accounts.remove(addr);
+          this.changed(addr);
+        }
+        Balance(addr, prev): {
+          Account a = this.accounts.get(addr)!;
+          a.balance = prev;
+          this.changed(addr);
+        }
+        Nonce(addr, prev): {
+          Account a = this.accounts.get(addr)!;
+          a.nonce = prev;
+          this.changed(addr);
+        }
         Code(addr, prev, prevHash): {
+          this.changed(addr);
           Account a = this.accounts.get(addr)!;
           a.code = prev;
           a.codeHash = prevHash;
@@ -346,7 +377,8 @@ export struct World {
         Storage(addr, key, prev): {
           Account a = this.accounts.get(addr)!;
           putSlot(a.storage, key, prev);
-          a.storageRoot = null;
+          a.slotChanged(key);
+          this.changed(addr);
         }
         Transient(addr, key, prev): { putSlot(this.transient.get(addr)!, key, prev); }
         WarmAddress(addr): { this.warmAddresses.remove(addr); }
@@ -383,6 +415,7 @@ export struct World {
     U256[] keys = a!.storage.keys();
     for (i32 k = 0; k < keys.len(); k++) { this.noteSlot(addr, keys[k]); }
     this.accounts.remove(addr);
+    this.changed(addr);
   }
 
   /** Forget the transaction in flight without sweeping anything: its journal and everything per-transaction. */
@@ -398,6 +431,9 @@ export struct World {
     this.logs = Vec.create();
     this.refund = 0;
   }
+
+  /** Note that an account may differ from what the account trie last saw. */
+  void changed(this, U256 addr) { if (this.accountTrie is not null) { this.dirty.set(addr, true); } }
 
   // ── Change sets ─────────────────────────────────────────────────────────────
 
@@ -461,6 +497,7 @@ export struct World {
     U256[] addrs = accounts.keys();
     for (i32 i = 0; i < addrs.len(); i++) {
       AccountState st = accounts.get(addrs[i])!;
+      this.changed(addrs[i]);
       if (!st.exists) {
         this.accounts.remove(addrs[i]);
         continue;
@@ -482,8 +519,11 @@ export struct World {
       if (a is null) { continue; }
       Map<U256, U256> m = slots.get(holders[i])!;
       U256[] keys = m.keys();
-      for (i32 k = 0; k < keys.len(); k++) { putSlot(a!.storage, keys[k], m.get(keys[k])!); }
-      a!.storageRoot = null;
+      for (i32 k = 0; k < keys.len(); k++) {
+        putSlot(a!.storage, keys[k], m.get(keys[k])!);
+        a!.slotChanged(keys[k]);
+      }
+      this.changed(holders[i]);
     }
   }
 }

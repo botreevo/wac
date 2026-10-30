@@ -101,8 +101,9 @@ seconds (2), and each is final as soon as it is made. With no `--genesis` the ch
 block 0, chain id 1337, with one account holding a million ether, address
 `0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A` and key `0x11…11` (64 ones). JSON-RPC is on
 `127.0.0.1:8551` without a token, so a wallet or a library can use it as it would any node. Stop it and
-start it again on the same `--datadir` and the chain goes on from where it was. Over a long run its memory
-grows with the blocks it serves receipts for, so a big one wants `--snapshot-every`.
+start it again on the same `--datadir` and the chain goes on from where it was. It keeps the last 10000
+blocks for the `eth_` methods (`--history N` to change it; 0 keeps them all), so its memory stays
+level however long it runs.
 
 It runs on any of wac's hosts: Node, v8 or wasmtime. `node tools/engine-e2e.mjs FIXTURE` drives a
 running node through an engine fixture over HTTP, JWT and all, then restarts it on its data directory and

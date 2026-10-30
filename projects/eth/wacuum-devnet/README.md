@@ -58,8 +58,12 @@ on one can take as many addresses in it as it likes.
 
 **The node answers 48 connections at a time, and closes one that has not been answered in ten seconds.** On
 wac's JavaScript hosts a program can have 128 host calls in flight, and one more waits for ever: 130 idle
-connections stopped the whole node, blocks and all, until the cap and the deadline went in. Caddy reads each
+connections stopped the whole node, blocks and all, until the cap and the deadline went in (wac
+`issues/system/0373d`). Caddy reads each
 request whole before passing it on (`deploy/Caddyfile`), so slow clients wait at Caddy and never reach it.
+
+**It keeps a day of blocks.** Every block the node serves is held in memory, a few kilobytes each, so blocks
+older than `--history` (a day's worth by default) are dropped, and the explorer says so when asked for one.
 
 **After a restart, older transactions have no receipt.** The node starts from its last snapshot and replays
 the log after it, and wacuum keeps receipts only for the blocks it ran. The explorer still finds a transaction
@@ -99,7 +103,7 @@ and `deploy/Caddyfile` in Caddy's configuration. The unit expects this repositor
 silent ones stop the node for good, as above. Nor would a peer get far: another wacuum (from `/genesis.json`,
 with `--peer`) connects and can fetch every block, but it syncs only to a head a consensus client names with
 `engine_forkchoiceUpdated`, and this chain has none. Driving that by hand works, and the peer's state roots
-match; a follower that does it by itself is still to be written.
+match; a follower that does it by itself is still to be written. Both are wacuum's `issues/0001d` and `0003d`.
 
 ## Flags
 
@@ -116,6 +120,7 @@ match; a follower that does it by itself is still to be written.
     --ip ADDR              the address advertised to peers (127.0.0.1)
     --bootnode ENODE       a discovery node to start from; as many as wanted
     --snapshot-every N     finalized blocks between state snapshots (1024)
+    --history N            blocks kept for the explorer and the eth_ methods (a day's: 86400 / --block-time)
 
 ## Dependencies
 
@@ -123,7 +128,7 @@ match; a follower that does it by itself is still to be written.
 
 - **wacuum**, from its `lib` branch: `master` plus a `src/lib.wac` named as the package's `exports`. wac lets a
   project reach another project only through its `exports`, and wacuum's `master` has none. Once that commit is
-  on wacuum's `master`, point the `ref` there.
+  on wacuum's `master` (its `issues/0006d`), point the `ref` there.
 - **wac**, at the commit wacuum pins, so that values crossing between the two (JSON from the engine, above all)
   are one type.
 - **web**, for components and `documentOf`.

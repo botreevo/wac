@@ -12,14 +12,16 @@ README does not say.
   being the `JsonValue` this code imports.
 - **Every page goes through `documentOf`/`htmlOf`.** Nothing writes HTML by string concatenation; that is what
   keeps every value from the chain (token names, input data, anything a stranger can put in a transaction)
-  escaped. A new attribute that `web`'s tags do not list uses a quoted tag: `<"button" data-x={…}>`.
-- **`src/assets.wac` is generated.** Edit `assets/`, then `wac task assets`.
+  escaped. A new attribute that `web`'s tags do not list uses a quoted tag: `<"input" aria-label="…"/>`.
+- **Everything is wac, the tooling too.** A tool is a wac program under `tools/` run by a task; a task's
+  command line runs in `wac sh`. The browser runs no script: a feature that would need one (a wallet button)
+  is left out, or done with a form the server answers.
 - Comments explain *why*, in full sentences, as wac's and wacuum's do.
 
 ## Things that have bitten
 
-- `wac update` gets a 401 from git.voltrevo.com; `wac task deps` (tools/fill-cache.sh) fills the cache with
-  `git`. It reads `wac.lock` one import per line, so keep the lock written that way.
+- `wac update` gets a 401 from git.voltrevo.com; `wac task deps` (tools/deps.wac) fills the cache with
+  `git`. It imports only `std`, since what it fetches is what any other import needs first.
 - A project cannot import a file inside another project, even a git submodule: wac says to import its
   directory, which means its `exports`. That is why wacuum has a `lib` branch.
 - **Never `pkill -f` a pattern that is in your own command line**: it kills the shell running it. Find the PID.

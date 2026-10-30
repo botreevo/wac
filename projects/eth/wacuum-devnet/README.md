@@ -9,7 +9,7 @@ in wac; the same process serves JSON-RPC and the site. Meant for **wacuum.voltre
 | path | what |
 | --- | --- |
 | `POST /rpc` (and `POST /`) | JSON-RPC: the `eth_`, `net_` and `web3_` methods wacuum answers, CORS open, no token. The Engine API is refused |
-| `/` | the chain at a glance, the latest blocks and transactions, the faucet, and the wallet details with an *Add to wallet* button |
+| `/` | the chain at a glance, the latest blocks and transactions, the faucet, and the details a wallet needs to add the network |
 | `/block/<number or hash>`, `/tx/<hash>`, `/address/<address>` | the explorer |
 | `/search?q=…` | a number, a hash or an address, sent to its page |
 | `POST /faucet` | `address=0x…`: 10 ETH, at most once a day for each visitor's IP and each recipient |
@@ -27,8 +27,13 @@ in wac; the same process serves JSON-RPC and the site. Meant for **wacuum.voltre
     src/faucet.wac     the drip, and its per-visitor and per-address limits
     src/chain.wac      the genesis, addresses, and signing the faucet's transfers
     src/format.wac     ether, gwei, ages, short hashes
-    assets/            the stylesheet, the wallet script and the icon; `wac task assets` makes src/assets.wac from them
+    src/style.wac      the stylesheet and the icon, as block strings
+    tools/deps.wac     the locked dependencies into wac's cache, with git
+    tools/e2e.wac      a visitor and a wallet against a running devnet, over HTTP
     deploy/            a Caddyfile and a systemd unit
+
+**Everything is wac**, the tooling included: there is no shell script, no JavaScript and no Python here. The
+only other languages are the CSS inside `src/style.wac` and the configuration in `deploy/`.
 
 **The node is wacuum's `--dev` mode.** A block from the mempool every `--block-time` seconds (2), each final as
 soon as it is made; with `--datadir` every block goes to `chain.log` before anything that depends on it is
@@ -37,9 +42,9 @@ through its own `eth_` methods, in process.
 
 **The pages are drawn on the server.** `web`'s components are the same ones a browser page mounts, but a `web`
 page runs in a worker with no network, so it could not ask the node anything. Here each request renders a tree
-of components once with `documentOf`, every string escaped on the way out. The browser runs one small script,
-`assets/wallet.js`, which offers the chain to a wallet and fills the faucet form with the wallet's address.
-The pages carry a Content Security Policy that allows nothing else.
+of components once with `documentOf`, every string escaped on the way out. The browser runs no script at
+all, and the pages' Content Security Policy says so. So there is no *Add to wallet* button: a wac page cannot
+reach a browser wallet, so the home page lists the details to add by hand.
 
 **The faucet is not wacuum's well-known dev account.** That key (0x11…11) is public, so anyone could empty it.
 The first start makes a key, keeps it in `<datadir>/faucet.key`, and writes a genesis funding its address with
@@ -67,10 +72,10 @@ server's default branch is `main` and empty, as for the other repositories there
     wac task test      # the unit tests, in a second: pages, RPC, the faucet and its limits, against a real engine
     wac task build     # dist/devnet, one executable file (it runs on the `wac` it finds on PATH)
 
-and to see it working end to end with a wallet library:
+and to see it working end to end, the way a visitor and a wallet use it:
 
     ./dist/devnet --datadir /tmp/devnet --block-time 1 &
-    npm install --no-save ethers@6 && node tools/e2e.mjs
+    wac task e2e       # faucet, contract deployed and called, a transfer, and the explorer showing them
 
 ## Deploying
 

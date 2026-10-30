@@ -1,0 +1,200 @@
+// wacuum-devnet: an Ethereum devnet, its block explorer and its faucet, in one program.
+//
+//     wac run --allow-read --allow-write --allow-net cmd/devnet.wac -- --datadir data [--port 8545]
+//
+// It is wacuum's `--dev` mode with a site in front: the engine makes a block from its mempool every
+// `--block-time` seconds (2), each final as soon as it is made, and one HTTP port (`--addr`:`--port`,
+// 127.0.0.1:8545) answers JSON-RPC at `/rpc` and serves the explorer and the faucet at every other path. A
+// reverse proxy (deploy/Caddyfile) puts it on the internet with TLS.
+//
+// The first start makes a key for the faucet and writes it, and the genesis that funds it, to `--datadir`;
+// every start after reads them back and replays the chain log there, so the chain goes on where it stopped.
+// The genesis is served at `/genesis.json`, so anybody can run a node of their own beside it: with
+// `--p2p-port` this one accepts peers and runs discovery, and its enode is printed at start.
+//
+// Flags:
+//   --datadir DIR          where the chain, the faucet's key and the genesis are kept (required)
+//   --addr ADDR --port N   where the site and JSON-RPC listen (127.0.0.1, 8545)
+//   --site-url URL         the site as the public reaches it, for the wallet details (https://wacuum.voltrevo.com)
+//   --name TEXT            what the site and wallets call the network (wacuum devnet)
+//   --chain-id N           only read when the genesis is first made (20261117)
+//   --block-time SECONDS   how often a block is made (2)
+//   --faucet-ether N       what one drip sends, in whole ether (10)
+//   --faucet-hours N       how long each visitor and each address waits between drips (24)
+//   --direct               trust no X-Forwarded-For: for running without a proxy in front
+//   --p2p-port N           accept devp2p peers, and run discovery, on this port (off)
+//   --ip ADDR              the address advertised to peers (127.0.0.1)
+//   --bootnode ENODE       a discovery node to start from; as many as wanted
+//   --snapshot-every N     finalized blocks between state snapshots (1024)
+
+import { Sys } from "std";
+import { Vec } from "core";
+import { U256, Engine, Genesis, Network, hexToBytes, bytesToHex, validKey, publicKey, listen, discover, tend } from "wacuum";
+import { ChainSpec, addressOf, checksummed, genesisJson, ether } from "../src/chain.wac";
+import { Started, Disk, engineFor, flush, restore } from "../src/node.wac";
+import { Faucet } from "../src/faucet.wac";
+import { Index, catchUp } from "../src/index.wac";
+import { Site } from "../src/explorer.wac";
+import { Served, serve } from "../src/server.wac";
+import { digits } from "../src/http.wac";
+import { hours } from "../src/faucet.wac";
+
+string usage() {
+  return "usage: devnet --datadir DIR [--addr 127.0.0.1] [--port 8545] [--site-url URL] [--name TEXT] [--chain-id N] " +
+         "[--block-time SECONDS] [--faucet-ether N] [--faucet-hours N] [--direct] [--p2p-port N] [--ip ADDR] " +
+         "[--bootnode ENODE]... [--snapshot-every N]";
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  string datadir = "";
+  string addr = "127.0.0.1";
+  i64 port = 8545;
+  string siteUrl = "https://wacuum.voltrevo.com";
+  string name = "wacuum devnet";
+  i64 chainId = 20261117;
+  i64 blockTime = 2;
+  i64 faucetEther = 10;
+  i64 faucetHours = 24;
+  bool direct = false;
+  i64 p2pPort = 0;
+  string ip = "127.0.0.1";
+  Vec<string> bootnodes = Vec.create();
+  i64 snapshotEvery = 1024;
+  for (i32 i = 0; i < args.len(); i++) {
+    string a = args[i];
+    if (a == "--direct") { direct = true; continue; }
+    if (i + 1 >= args.len()) { sys.warn(usage()); return 2; }
+    string v = args[i + 1];
+    i++;
+    i64? n = digits(v);
+    if (a == "--datadir") { datadir = v; }
+    else if (a == "--addr") { addr = v; }
+    else if (a == "--site-url") { siteUrl = v; }
+    else if (a == "--name") { name = v; }
+    else if (a == "--ip") { ip = v; }
+    else if (a == "--bootnode") { bootnodes.push(v); }
+    else if (n is null) { sys.warn("devnet: \{a} takes a number, not \"\{v}\""); return 2; }
+    else if (a == "--port") { port = n!; }
+    else if (a == "--chain-id") { chainId = n!; }
+    else if (a == "--block-time") { blockTime = n! < 1 ? 1 : n!; }
+    else if (a == "--faucet-ether") { faucetEther = n!; }
+    else if (a == "--faucet-hours") { faucetHours = n!; }
+    else if (a == "--p2p-port") { p2pPort = n!; }
+    else if (a == "--snapshot-every") { snapshotEvery = n!; }
+    else { sys.warn(usage()); return 2; }
+  }
+  if (datadir == "") { sys.warn(usage()); return 2; }
+  while (siteUrl.len() > 0 && siteUrl.slice(siteUrl.len() - 1, siteUrl.len()) == "/") { siteUrl = siteUrl.slice(0, siteUrl.len() - 1); }
+  await sys.files().mkdir(datadir, true);
+
+  // The faucet's key, made once. Its address is the account the genesis funds, so the two are made together.
+  u8[]? key = await readKey(sys, datadir + "/faucet.key");
+  if (key is null) {
+    u8[] fresh = (await sys.random().bytes(32)).ok()!;
+    while (!validKey(fresh)) { fresh = (await sys.random().bytes(32)).ok()!; }
+    if (!(await writeNew(sys, datadir + "/faucet.key", bytesToHex(fresh) + "\n"))) { return 1; }
+    key = fresh;
+  }
+  U256 faucetAddress = addressOf(key!);
+
+  // The genesis: made beside the key the first time, and read back every time after — never made again,
+  // since the chain log replays only on the genesis it was written on.
+  string genesisPath = datadir + "/genesis.json";
+  u8[]? genesisText = null;
+  match (await sys.readFile(genesisPath)) {
+    Ok(b): { genesisText = b; }
+    Err(err): {
+      // A billion ether: more than a conference can ask for, at any drip a faucet makes.
+      string balance = ether().mul(U256.ofU64(1000000000)).toHex();
+      string g = genesisJson(ChainSpec(chainId as@ u64, checksummed(faucetAddress), balance));
+      if (!(await writeNew(sys, genesisPath, g + "\n"))) { return 1; }
+      genesisText = g.toBytes();
+      sys.log("devnet: a new chain, id \{chainId}; its genesis is \{genesisPath}");
+    }
+  }
+  Started st = engineFor(genesisText!);
+  if (st.engine is null) { sys.warn("devnet: \{genesisPath}: \{st.error}"); return 1; }
+  Engine e = st.engine!;
+  Genesis gen = st.genesis!;
+  u64 chain = gen.config.chainId.low();
+  sys.log("devnet: \{gen.spec.name}, chain \{chain}, genesis \{gen.header.hash.toHex()}");
+
+  Disk? disk = await restore(sys, e, datadir, snapshotEvery as@ u64);
+  if (disk is null) { return 1; }
+
+  Index ix = Index.create();
+  catchUp(ix, e);
+  Faucet faucet = Faucet.create(key!, faucetAddress, chain, ether().mul(U256.ofU64(faucetEther as@ u64)), faucetHours * 3600000);
+  string faucetCooldown = hours(faucetHours * 3600000);
+  Site site = Site(name, siteUrl, chain, checksummed(faucetAddress), "\{faucetEther} ETH",
+                   faucetCooldown == "hour" ? "hour" : faucetCooldown, blockTime as! i32);
+  sys.log("devnet: faucet \{checksummed(faucetAddress)}, \{faucetEther} ETH a drip, one every \{faucetCooldown}");
+
+  // devp2p, for anybody running a node of their own from /genesis.json.
+  u8[] nodeKey = (await readKey(sys, datadir + "/nodekey")) ?? u8[]();
+  if (nodeKey.len() == 0) {
+    nodeKey = (await sys.random().bytes(32)).ok()!;
+    while (!validKey(nodeKey)) { nodeKey = (await sys.random().bytes(32)).ok()!; }
+    await writeNew(sys, datadir + "/nodekey", bytesToHex(nodeKey).slice(2, 66));
+  }
+  Network net = Network.create(e, nodeKey, gen.header.hash, gen.forkBlocks, gen.forkTimes);
+  Disk d = disk!;
+  if (p2pPort > 0) {
+    listen(sys, net, "0.0.0.0", p2pPort as! i32);
+    discover(sys, net, ip, p2pPort as! i32, bootnodes.toArray(), 25);
+    sys.log("devnet: enode://\{bytesToHex(publicKey(nodeKey)).slice(2, 130)}@\{ip}:\{p2pPort}");
+  }
+  tend(sys, net, () => flush(sys, e, d));
+
+  Served served = Served(site, e, ix, faucet, string.fromBytes(genesisText!), d);
+  if (direct) { sys.log("devnet: --direct: every connection's own address is its client's"); }
+  serve(sys, served, addr, port as! i32, !direct);
+  produce(sys, e, d, ix, blockTime as! i32);
+  await sys.drain();
+  return 0;
+}
+
+/** A block every `period` seconds, for as long as the node runs; the index reads each as it is made. */
+async void produce(Sys sys, Engine e, Disk disk, Index ix, i32 period) {
+  sys.log("devnet: a block every \{period} s");
+  while (true) {
+    await sys.sleepMillis(period * 1000);
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+    i32 waiting = e.mempool.len();
+    string why = e.produce(U256.ofU64(now as@ u64), U256.zero());
+    if (why != "") {
+      sys.warn("devnet: cannot make a block: \{why}");
+      continue;
+    }
+    await flush(sys, e, disk);
+    catchUp(ix, e);
+    if (waiting > 0) {
+      auto h = e.headerByHash(e.head)!;
+      sys.log("devnet: block \{h.number.toDecimal()}, \{waiting - e.mempool.len()} transactions");
+    }
+  }
+}
+
+/** A 32-byte key kept as hex in `path`, or null when there is none there (or it is not one). */
+async u8[]? readKey(Sys sys, string path) {
+  match (await sys.readFile(path)) {
+    Err(err): { return null; }
+    Ok(b): {
+      string text = string.fromBytes(b);
+      while (text.len() > 0 && (text.slice(text.len() - 1, text.len()) == "\n" || text.slice(text.len() - 1, text.len()) == "\r")) {
+        text = text.slice(0, text.len() - 1);
+      }
+      u8[]? k = hexToBytes(text.indexOf("0x") == 0 ? text : "0x" + text);
+      if (k is null || !validKey(k!)) { return null; }
+      return k;
+    }
+  }
+}
+
+async bool writeNew(Sys sys, string path, string text) {
+  match (await sys.writeFile(path, text.toBytes())) {
+    Err(err): { sys.warn("devnet: \{path}: \{err}"); return false; }
+    Ok(_): { return true; }
+  }
+}

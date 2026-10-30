@@ -1,0 +1,198 @@
+// HTTP/1.1, as much as a site behind a reverse proxy needs: a request read whole, an answer, and the
+// connection closed. Caddy in front keeps connections to browsers alive and speaks HTTP/2 and TLS to them;
+// between it and this, one request per connection is simple and costs little on loopback.
+
+import { Vec } from "core";
+
+export struct Request {
+  string method;
+  /** The path, without the query. */
+  string path;
+  /** The query, without its `?`; empty when there is none. */
+  string query;
+  /** Header names lower-cased, beside their values in the same order. */
+  string[] names;
+  string[] values;
+  i32 contentLength;
+  u8[] body;
+}
+
+export struct Response {
+  i32 status;
+  string contentType;
+  /** Headers beyond the type, the length and `Connection`, as whole lines without their CRLF. */
+  string[] headers;
+  u8[] body;
+
+  // A page may not be framed: a policy in a `<meta>` cannot say so, so the header does.
+  Response html(string text) { return Response(200, "text/html; charset=utf-8", ["Content-Security-Policy: frame-ancestors 'none'"], text.toBytes()); }
+  Response json(u8[] body) { return Response(200, "application/json", string[](), body); }
+  Response text(i32 status, string text) { return Response(status, "text/plain; charset=utf-8", string[](), text.toBytes()); }
+  /** A 303: after a form's POST, the browser fetches `to` with a GET. */
+  Response seeOther(string to) { return Response(303, "text/plain; charset=utf-8", ["Location: " + to], "see \{to}".toBytes()); }
+}
+
+/** The value of header `name` (lower case), or "" when it was not sent. */
+export string header(Request r, string name) {
+  for (i32 i = 0; i < r.names.len(); i++) {
+    if (r.names[i] == name) { return r.values[i]; }
+  }
+  return "";
+}
+
+/** Where the headers end (the index just past the blank line), or -1 when they have not all arrived. */
+export i32 headersEnd(u8[] buf, i32 len) {
+  for (i32 i = 3; i < len; i++) {
+    if (buf[i - 3] == 13 && buf[i - 2] == 10 && buf[i - 1] == 13 && buf[i] == 10) { return i + 1; }
+  }
+  return -1;
+}
+
+/** The request line and the headers, from the bytes before the blank line; null if they do not parse. */
+export Request? parseHead(u8[] buf, i32 end) {
+  u8[] head = u8[].filled(end, 0);
+  for (i32 i = 0; i < end; i++) { head[i] = buf[i]; }
+  string text = string.fromBytes(head);
+  i32 eol = text.indexOf("\r\n");
+  if (eol < 0) { return null; }
+  string line = text.slice(0, eol);
+  i32 sp1 = line.indexOf(" ");
+  if (sp1 < 0) { return null; }
+  string rest = line.slice(sp1 + 1, line.len());
+  i32 sp2 = rest.indexOf(" ");
+  string target = sp2 < 0 ? rest : rest.slice(0, sp2);
+  i32 q = target.indexOf("?");
+  Vec<string> names = Vec.create();
+  Vec<string> values = Vec.create();
+  i32 length = 0;
+  string lines = text.slice(eol + 2, text.len());
+  while (lines.len() > 0) {
+    i32 e = lines.indexOf("\r\n");
+    if (e <= 0) { break; }
+    string h = lines.slice(0, e);
+    lines = lines.slice(e + 2, lines.len());
+    i32 colon = h.indexOf(":");
+    if (colon < 0) { continue; }
+    string name = lower(h.slice(0, colon));
+    string value = trim(h.slice(colon + 1, h.len()));
+    if (name == "content-length") {
+      i64? n = digits(value);
+      if (n is null || n! > 16777216) { return null; }
+      length = n! as! i32;
+    }
+    names.push(name);
+    values.push(value);
+  }
+  return Request(line.slice(0, sp1), q < 0 ? target : target.slice(0, q), q < 0 ? "" : target.slice(q + 1, target.len()),
+                 names.toArray(), values.toArray(), length, u8[]());
+}
+
+/** The whole answer, status line to body. */
+export u8[] responseBytes(Response r) {
+  string head = "HTTP/1.1 \{r.status} \{reason(r.status)}\r\nContent-Type: \{r.contentType}\r\nContent-Length: \{r.body.len()}\r\n";
+  for (string h in r.headers) { head += h + "\r\n"; }
+  head += "Connection: close\r\n\r\n";
+  u8[] h = head.toBytes();
+  u8[] out = u8[].filled(h.len() + r.body.len(), 0);
+  for (i32 i = 0; i < h.len(); i++) { out[i] = h[i]; }
+  for (i32 i = 0; i < r.body.len(); i++) { out[h.len() + i] = r.body[i]; }
+  return out;
+}
+
+string reason(i32 status) {
+  if (status == 200) { return "OK"; }
+  if (status == 204) { return "No Content"; }
+  if (status == 303) { return "See Other"; }
+  if (status == 400) { return "Bad Request"; }
+  if (status == 404) { return "Not Found"; }
+  if (status == 405) { return "Method Not Allowed"; }
+  if (status == 413) { return "Content Too Large"; }
+  if (status == 429) { return "Too Many Requests"; }
+  return "Error";
+}
+
+/** `s` as a non-negative decimal number, or null if it is anything else (or too long to be one). */
+export i64? digits(string s) {
+  u8[] d = s.toBytes();
+  if (d.len() == 0 || d.len() > 15) { return null; }
+  i64 n = 0;
+  for (u8 c in d) {
+    if (c < 48 || c > 57) { return null; }
+    n = n * 10 + ((c - 48) as i64);
+  }
+  return n;
+}
+
+/** The value of `name` in a query or a form body (`a=1&b=two`), percent-decoded; "" when absent. */
+export string formValue(string form, string name) {
+  string rest = form;
+  while (rest.len() > 0) {
+    i32 amp = rest.indexOf("&");
+    string pair = amp < 0 ? rest : rest.slice(0, amp);
+    rest = amp < 0 ? "" : rest.slice(amp + 1, rest.len());
+    i32 eq = pair.indexOf("=");
+    string key = eq < 0 ? pair : pair.slice(0, eq);
+    if (percentDecode(key) == name) { return eq < 0 ? "" : percentDecode(pair.slice(eq + 1, pair.len())); }
+  }
+  return "";
+}
+
+/** `%XX` as the byte it names and `+` as a space, as a form's encoding has them. */
+export string percentDecode(string s) {
+  u8[] b = s.toBytes();
+  u8[] out = u8[].filled(b.len(), 0);
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '+') { out[n] = ' '; }
+    else if (b[i] == '%' && i + 2 < b.len() && hexDigit(b[i + 1]) >= 0 && hexDigit(b[i + 2]) >= 0) {
+      out[n] = (hexDigit(b[i + 1]) * 16 + hexDigit(b[i + 2])) as@ u8;
+      i += 2;
+    } else { out[n] = b[i]; }
+    n++;
+  }
+  u8[] trimmed = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { trimmed[i] = out[i]; }
+  return string.fromBytes(trimmed);
+}
+
+i32 hexDigit(u8 c) {
+  if (c >= 48 && c <= 57) { return (c as i32) - 48; }
+  if (c >= 97 && c <= 102) { return (c as i32) - 87; }
+  if (c >= 65 && c <= 70) { return (c as i32) - 55; }
+  return -1;
+}
+
+export string lower(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] >= 65 && b[i] <= 90) { b[i] = b[i] + 32; }
+  }
+  return string.fromBytes(b);
+}
+
+export string trim(string s) {
+  i32 a = 0;
+  i32 b = s.len();
+  while (a < b && (s.slice(a, a + 1) == " " || s.slice(a, a + 1) == "\t")) { a++; }
+  while (b > a && (s.slice(b - 1, b) == " " || s.slice(b - 1, b) == "\t")) { b--; }
+  return s.slice(a, b);
+}
+
+/**
+ * The address the request came from. Behind a proxy on this machine every connection is from loopback,
+ * so the client is the last address the proxy wrote in `X-Forwarded-For` — the last, because what came
+ * before it was sent by the client and proves nothing. A connection from anywhere else is the client
+ * itself, and its header, if any, is the client's own claim and ignored.
+ */
+export string clientAddress(Request r, string peer, bool peerIsLoopback) {
+  if (!peerIsLoopback) { return peer; }
+  string fwd = header(r, "x-forwarded-for");
+  if (fwd == "") { return peer; }
+  string last = fwd;
+  i32 comma = last.indexOf(",");
+  while (comma >= 0) {
+    last = last.slice(comma + 1, last.len());
+    comma = last.indexOf(",");
+  }
+  return trim(last);
+}

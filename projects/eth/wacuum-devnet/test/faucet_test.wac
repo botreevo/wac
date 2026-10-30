@@ -1,0 +1,72 @@
+// The faucet against a real engine: a drip is a transaction the next block carries, and the limits hold.
+
+import { json.JsonValue, json.JsonArray } from "wac";
+import { U256, Engine, hexToBytes } from "wacuum";
+import { ChainSpec, addressOf, checksummed, genesisJson, ether, parseAddress } from "../src/chain.wac";
+import { engineFor } from "../src/node.wac";
+import { Faucet, Drip, drip } from "../src/faucet.wac";
+import { Check } from "./check.wac";
+
+static string KEY = "0x4242424242424242424242424242424242424242424242424242424242424242";
+static string ALICE = "0x1111111111111111111111111111111111111111";
+static string BOB = "0x2222222222222222222222222222222222222222";
+
+Faucet faucetOn(Engine e) {
+  u8[] key = hexToBytes(KEY)!;
+  return Faucet.create(key, addressOf(key), 4242, ether().mul(U256.ofU64(5)), 3600000 as i64);
+}
+
+Engine chain() {
+  U256 faucet = addressOf(hexToBytes(KEY)!);
+  return engineFor(genesisJson(ChainSpec(4242, checksummed(faucet), "0xd3c21bcecceda1000000")).toBytes()).engine!;
+}
+
+U256 balance(Engine e, string addr) {
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Str(addr.toBytes()));
+  ps.push(JsonValue.Str("latest".toBytes()));
+  return U256.fromHex(e.call("eth_getBalance", JsonValue.Array(ps)).result!.text()!)!;
+}
+
+export string test_an_address_comes_from_its_key() {
+  Check t = Check.create();
+  // The dev key wacuum documents, 0x11…11, and its address.
+  u8[] key = hexToBytes("0x1111111111111111111111111111111111111111111111111111111111111111")!;
+  t.eqStr(checksummed(addressOf(key)), "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A", "0x11…11's address, checksummed");
+  t.ok(parseAddress("0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a") is not null, "a lower-case address parses");
+  t.ok(parseAddress("0x19e7e376") is null, "a short one does not");
+  t.ok(parseAddress("19e7e376e7c213b7e7e7e46cc70a5dd086daff2a00") is null, "nor one without 0x");
+  return t.report();
+}
+
+export string test_a_drip_is_in_the_next_block() {
+  Check t = Check.create();
+  Engine e = chain();
+  Faucet f = faucetOn(e);
+  t.ok(balance(e, checksummed(f.address)).gt(U256.zero()), "the genesis funds the faucet");
+  Drip d = drip(f, e, "10.0.0.1", parseAddress(ALICE)!, 1000 as i64);
+  t.eqStr(d.refused, "", "the first drip is sent");
+  t.ok(d.txHash.len() == 66, "and has a hash: " + d.txHash);
+  // A second, to someone else from someone else, in the same block: the nonce counts the first.
+  Drip d2 = drip(f, e, "10.0.0.2", parseAddress(BOB)!, 2000 as i64);
+  t.eqStr(d2.refused, "", "a second visitor's drip is sent");
+  t.eqStr(e.produce(U256.ofU64(10), U256.zero()), "", "the block is made");
+  t.eqU256(balance(e, ALICE), ether().mul(U256.ofU64(5)), "Alice has five ether");
+  t.eqU256(balance(e, BOB), ether().mul(U256.ofU64(5)), "and so does Bob");
+  t.ok(e.mempool.len() == 0, "the mempool is empty");
+  return t.report();
+}
+
+export string test_each_visitor_and_each_address_waits_the_cooldown() {
+  Check t = Check.create();
+  Engine e = chain();
+  Faucet f = faucetOn(e);
+  t.eqStr(drip(f, e, "10.0.0.1", parseAddress(ALICE)!, 0 as i64).refused, "", "the first");
+  Drip again = drip(f, e, "10.0.0.1", parseAddress(BOB)!, 60000 as i64);
+  t.ok(again.refused != "", "the same visitor a minute later, to another address, is refused");
+  t.ok(again.waitSeconds == 3540, "and told to wait 59 minutes: \{again.waitSeconds}");
+  t.ok(drip(f, e, "10.0.0.9", parseAddress(ALICE)!, 60000 as i64).refused != "", "another visitor, to the same address, is refused");
+  t.eqStr(drip(f, e, "10.0.0.1", parseAddress(BOB)!, 3600000 as i64).refused, "", "after the hour it is sent");
+  t.ok(drip(f, e, "10.0.0.3", f.address, 0 as i64).refused != "", "the faucet does not pay itself");
+  return t.report();
+}

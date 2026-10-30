@@ -1,0 +1,92 @@
+// The faucet: a transfer from the account the genesis funded, at most once per cooldown for each client
+// address and for each recipient.
+//
+// Both limits are kept in memory, so a restart forgets them. For a devnet whose ether is worth nothing that
+// is the right trade: a restart is rare, and nothing has to be written for every drip.
+
+import { Map, Vec, hashString, stringEq } from "core";
+import { json.JsonValue, json.JsonArray } from "wac";
+import { U256, Engine, Answer, bytesToHex } from "wacuum";
+import { signedTransfer, checksummed } from "./chain.wac";
+
+export struct Faucet {
+  u8[] key;
+  U256 address;
+  u64 chainId;
+  /** What one drip sends, in wei. */
+  U256 amount;
+  i64 cooldownMillis;
+  /** When each client address, and each recipient, last had a drip. */
+  Map<string, i64> byClient;
+  Map<string, i64> byRecipient;
+  i32 drips;
+
+  Faucet create(u8[] key, U256 address, u64 chainId, U256 amount, i64 cooldownMillis) {
+    return Faucet(key, address, chainId, amount, cooldownMillis, Map.create(hashString, stringEq),
+                  Map.create(hashString, stringEq), 0);
+  }
+}
+
+/** What a drip came to: the transaction's hash, or why there was none. */
+export struct Drip {
+  string txHash;
+  string refused;
+  /** When the refusal was the cooldown: how long until the next drip, in seconds. */
+  i64 waitSeconds;
+}
+
+/**
+ * Send `faucet.amount` to `to`, for the client at `client`, at `nowMillis`. The transaction goes into the
+ * engine's mempool and is in the next block.
+ */
+export Drip drip(Faucet faucet, Engine e, string client, U256 to, i64 nowMillis) {
+  string recipient = bytesToHex(to.toBytes());
+  i64 wait = remaining(faucet.byClient, client, faucet.cooldownMillis, nowMillis);
+  i64 waitTo = remaining(faucet.byRecipient, recipient, faucet.cooldownMillis, nowMillis);
+  if (waitTo > wait) { wait = waitTo; }
+  if (wait > 0) {
+    return Drip("", "The faucet sends to each address, and to each visitor, once every \{hours(faucet.cooldownMillis)}.", (wait + 999) / 1000);
+  }
+  if (to.eq(faucet.address)) { return Drip("", "That is the faucet's own address.", 0); }
+
+  // The next nonce counts what is already waiting in the mempool, so drips in one block do not collide; the
+  // fee cap is twice the next base fee, which covers any rise a devnet's blocks can make before this is in.
+  string from = checksummed(faucet.address);
+  Answer n = e.call("eth_getTransactionCount", params2(from, "pending"));
+  Answer fee = e.call("eth_gasPrice", JsonValue.Array(JsonArray.create()));
+  if (n.result is null || fee.result is null) { return Drip("", "The node could not say what the faucet's next transaction is.", 0); }
+  u64 nonce = U256.fromHex(n.result!.text()!)!.low();
+  U256 tip = U256.ofU64(1000000000);
+  U256 maxFee = U256.fromHex(fee.result!.text()!)!.mul(U256.ofU64(2)).add(tip);
+  u8[] raw = signedTransfer(faucet.key, faucet.chainId, nonce, tip, maxFee, to, faucet.amount);
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Str(bytesToHex(raw).toBytes()));
+  Answer sent = e.call("eth_sendRawTransaction", JsonValue.Array(ps));
+  if (sent.result is null) { return Drip("", "The node refused the faucet's transaction: \{sent.message}", 0); }
+  faucet.byClient.set(client, nowMillis);
+  faucet.byRecipient.set(recipient, nowMillis);
+  faucet.drips++;
+  return Drip(sent.result!.text()!, "", 0);
+}
+
+/** How many milliseconds `key` must still wait, or 0. */
+i64 remaining(Map<string, i64> last, string key, i64 cooldown, i64 now) {
+  i64? at = last.get(key);
+  if (at is null || now - at! >= cooldown) { return 0; }
+  return cooldown - (now - at!);
+}
+
+/** A duration as people say it: "24 hours", "1 hour", "30 minutes". */
+export string hours(i64 millis) {
+  i64 minutes = millis / 60000;
+  if (minutes % 60 != 0 || minutes == 0) { return minutes == 1 ? "minute" : "\{minutes} minutes"; }
+  i64 h = minutes / 60;
+  return h == 1 ? "hour" : "\{h} hours";
+}
+
+JsonValue params2(string a, string b) {
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Str(a.toBytes()));
+  ps.push(JsonValue.Str(b.toBytes()));
+  return JsonValue.Array(ps);
+}

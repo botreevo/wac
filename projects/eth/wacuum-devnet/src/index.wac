@@ -1,0 +1,107 @@
+// What the JSON-RPC cannot answer and an explorer needs: which transactions touched an address, and the
+// latest transactions on the chain. Built by reading each block once, as it is made, through the engine's
+// own `eth_` methods; a restart builds it again from the blocks the engine has.
+//
+// A devnet's blocks are mostly empty and a conference is a few days, so this stays small enough to keep in
+// memory: one entry per transaction per address it touched.
+
+import { Map, Vec, hashString, stringEq } from "core";
+import { json.JsonValue, json.JsonArray } from "wac";
+import { U256, Engine } from "wacuum";
+import { smallOf } from "./format.wac";
+
+/** A transaction as a list shows it. */
+export struct TxRef {
+  string hash;
+  u64 block;
+  string from;
+  /** The recipient, or the contract it created; "" for neither (a create that failed). */
+  string to;
+  bool created;
+  string value;
+}
+
+export struct Index {
+  /** The next block to read. */
+  u64 next;
+  Map<string, Vec<TxRef>> byAddress;
+  /** The latest transactions, oldest first, at most `KEEP`. */
+  Vec<TxRef> recent;
+  u64 transactions;
+
+  Index create() { return Index(0, Map.create(hashString, stringEq), Vec.create(), 0); }
+}
+
+static i32 KEEP = 50;
+
+/** Read every block the engine has made since last time. */
+export void catchUp(Index ix, Engine e) {
+  u64 head = smallOf(call(e, "eth_blockNumber", JsonArray.create())?.text());
+  while (ix.next <= head) {
+    u64 n = ix.next;
+    ix.next++;
+    JsonArray ps = JsonArray.create();
+    ps.push(JsonValue.Str(U256.ofU64(n).toHex().toBytes()));
+    ps.push(JsonValue.Bool(true));
+    JsonArray? txs = call(e, "eth_getBlockByNumber", ps)?.member("transactions")?.array();
+    if (txs is null || txs!.len() == 0) { continue; }
+    // Receipts say what a create made; a block from before the snapshot has none, and its creates go unnamed.
+    JsonArray rps = JsonArray.create();
+    rps.push(JsonValue.Str(U256.ofU64(n).toHex().toBytes()));
+    JsonArray? receipts = call(e, "eth_getBlockReceipts", rps)?.array();
+    for (i32 i = 0; i < txs!.len(); i++) {
+      JsonValue tx = txs!.get(i);
+      string from = lowerHex(tx.member("from")?.text() ?? "");
+      string to = lowerHex(tx.member("to")?.text() ?? "");
+      bool created = false;
+      if (to == "" && receipts is not null && i < receipts!.len()) {
+        to = lowerHex(receipts!.get(i).member("contractAddress")?.text() ?? "");
+        created = to != "";
+      }
+      TxRef r = TxRef(tx.member("hash")?.text() ?? "", n, from, to, created, tx.member("value")?.text() ?? "0x0");
+      add(ix, from, r);
+      if (to != "" && to != from) { add(ix, to, r); }
+      ix.recent.push(r);
+      ix.transactions++;
+    }
+    if (ix.recent.len() > KEEP * 2) {
+      Vec<TxRef> keep = Vec.create();
+      for (i32 i = ix.recent.len() - KEEP; i < ix.recent.len(); i++) { keep.push(ix.recent.get(i)); }
+      ix.recent = keep;
+    }
+  }
+}
+
+/** The transactions that touched `address` (0x-hex, any case), oldest first. */
+export TxRef[] touching(Index ix, string address) {
+  Vec<TxRef>? v = ix.byAddress.get(lowerHex(address));
+  return v is null ? TxRef[]() : v!.toArray();
+}
+
+/** The latest `n` transactions, newest first. */
+export TxRef[] latest(Index ix, i32 n) {
+  i32 k = ix.recent.len() < n ? ix.recent.len() : n;
+  TxRef[] out = TxRef[].filled(k, TxRef("", 0, "", "", false, ""));
+  for (i32 i = 0; i < k; i++) { out[i] = ix.recent.get(ix.recent.len() - 1 - i); }
+  return out;
+}
+
+void add(Index ix, string address, TxRef r) {
+  if (address == "") { return; }
+  Vec<TxRef>? v = ix.byAddress.get(address);
+  if (v is null) {
+    Vec<TxRef> fresh = Vec.create();
+    fresh.push(r);
+    ix.byAddress.set(address, fresh);
+  } else { v!.push(r); }
+}
+
+JsonValue? call(Engine e, string method, JsonArray ps) { return e.call(method, JsonValue.Array(ps)).result; }
+
+export string lowerHex(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] >= 65 && b[i] <= 70) { b[i] = b[i] + 32; }
+  }
+  return string.fromBytes(b);
+}

@@ -1,0 +1,180 @@
+// The one HTTP port: JSON-RPC for wallets and libraries, the explorer's pages, the faucet, and the few files
+// the pages load. Everything is answered from the engine in this process, between blocks.
+
+import { Sys, Socket } from "std";
+import { U256, Engine, answerRpc } from "wacuum";
+import { Request, Response, header, headersEnd, parseHead, responseBytes, formValue, clientAddress, trim } from "./http.wac";
+import { Site, home, block, transaction, address, faucetAnswer, notFound } from "./explorer.wac";
+import { Index, lowerHex } from "./index.wac";
+import { Faucet, Drip, drip } from "./faucet.wac";
+import { parseAddress, checksummed } from "./chain.wac";
+import { Disk, flush } from "./node.wac";
+import { STYLE, WALLET_JS, FAVICON } from "./assets.wac";
+
+/** Everything a request can reach. */
+export struct Served {
+  Site site;
+  Engine engine;
+  Index index;
+  Faucet faucet;
+  /** The genesis, as served at /genesis.json for anyone who wants to run a node of their own. */
+  string genesis;
+  /** Where the chain log goes: written after every request, before its answer, as wacuum does. */
+  Disk disk;
+}
+
+/** The answer to one request, at `nowMillis`, from `client`. */
+export Response route(Served s, Request r, string client, i64 nowMillis) {
+  u64 now = ((nowMillis / 1000) as@ u64);
+  string p = r.path;
+  // JSON-RPC: at /rpc, and at / for clients that are given the bare origin. A browser dapp on another origin
+  // asks first with OPTIONS.
+  if (r.method == "OPTIONS") { return cors(Response(204, "text/plain", string[](), u8[]())); }
+  if (r.method == "POST" && (p == "/rpc" || p == "/")) {
+    u8[] answer = answerRpc(s.engine, r.body, false);
+    return cors(Response.json(answer));
+  }
+  if (r.method == "POST" && p == "/faucet") {
+    string to = trim(formValue(string.fromBytes(r.body), "address"));
+    U256? a = parseAddress(to);
+    if (a is null) {
+      return Response(400, "text/html; charset=utf-8", string[](),
+                      notFound(s.site, "That is not an address: an address is 0x and forty hexadecimal digits.").toBytes());
+    }
+    Drip d = drip(s.faucet, s.engine, client, a!, nowMillis);
+    Response out = Response.html(faucetAnswer(s.site, d, checksummed(a!)));
+    if (d.refused != "") { out.status = d.waitSeconds > 0 ? 429 : 400; }
+    return out;
+  }
+  if (r.method != "GET" && r.method != "HEAD") { return Response.text(405, "GET, POST or OPTIONS\n"); }
+
+  if (p == "/") { return Response.html(home(s.site, s.engine, s.index, now)); }
+  if (p == "/style.css") { return cached(Response(200, "text/css; charset=utf-8", string[](), STYLE.toBytes())); }
+  if (p == "/wallet.js") { return cached(Response(200, "text/javascript; charset=utf-8", string[](), WALLET_JS.toBytes())); }
+  if (p == "/favicon.svg" || p == "/favicon.ico") { return cached(Response(200, "image/svg+xml", string[](), FAVICON.toBytes())); }
+  if (p == "/genesis.json") { return cors(Response(200, "application/json", string[](), s.genesis.toBytes())); }
+  if (p == "/healthz") { return Response.text(200, "ok\n"); }
+  if (p == "/rpc") { return Response.text(405, "JSON-RPC is POSTed here: point a wallet or a library at this URL.\n"); }
+  if (p == "/search") { return search(s, formValue(r.query, "q")); }
+  if (p.indexOf("/block/") == 0) {
+    string id = p.slice(7, p.len());
+    string? html = block(s.site, s.engine, id, now);
+    return html is null ? missing(s, "There is no block \{id} on this chain yet.") : Response.html(html!);
+  }
+  if (p.indexOf("/tx/") == 0) {
+    string hash = lowerHex(p.slice(4, p.len()));
+    string? html = hash.len() == 66 ? transaction(s.site, s.engine, hash, now) : null;
+    return html is null ? missing(s, "This chain has no transaction \{hash}.") : Response.html(html!);
+  }
+  if (p.indexOf("/address/") == 0) {
+    string a = p.slice(9, p.len());
+    if (parseAddress(a) is null) { return missing(s, "That is not an address: an address is 0x and forty hexadecimal digits."); }
+    return Response.html(address(s.site, s.engine, s.index, a, now));
+  }
+  return missing(s, "There is no page at this address.");
+}
+
+/** Where a search for `q` goes: a block by number, a block or transaction by hash, or an address. */
+Response search(Served s, string q) {
+  string t = lowerHex(trim(q));
+  if (t == "") { return Response.seeOther("/"); }
+  if (parseAddress(t) is not null) { return Response.seeOther("/address/" + t); }
+  if (t.len() == 66 && t.indexOf("0x") == 0) {
+    // A hash is a transaction's or a block's; the transaction is the likelier.
+    if (transaction(s.site, s.engine, t, 0) is not null) { return Response.seeOther("/tx/" + t); }
+    return Response.seeOther("/block/" + t);
+  }
+  return Response.seeOther("/block/" + t);
+}
+
+Response missing(Served s, string what) {
+  return Response(404, "text/html; charset=utf-8", string[](), notFound(s.site, what).toBytes());
+}
+
+Response cors(Response r) {
+  r.headers = ["Access-Control-Allow-Origin: *", "Access-Control-Allow-Methods: GET, POST, OPTIONS",
+               "Access-Control-Allow-Headers: Content-Type"];
+  return r;
+}
+
+Response cached(Response r) {
+  r.headers = ["Cache-Control: public, max-age=3600"];
+  return r;
+}
+
+/**
+ * Accept connections on `addr`:`port` for as long as the program runs. With `trustProxy`, a connection from
+ * loopback is a reverse proxy's, and the client is the one its `X-Forwarded-For` names.
+ */
+export async void serve(Sys sys, Served s, string addr, i32 port, bool trustProxy) {
+  match (await sys.net().listen(addr, port)) {
+    Err(err): { sys.warn("devnet: cannot listen on \{addr}:\{port}: \{err}"); }
+    Ok(listener): {
+      sys.log("devnet: site and JSON-RPC on http://\{listener.addr}");
+      while (true) {
+        match (await listener.accept()) {
+          Err(err): { sys.warn("devnet: accept: \{err}"); }
+          Ok(sock): { answer(sys, s, sock, trustProxy); }
+        }
+      }
+    }
+  }
+}
+
+/** One request on its own connection: read it whole, answer it, close. */
+async void answer(Sys sys, Served s, Socket sock, bool trustProxy) {
+  u8[] buf = u8[].filled(4096, 0);
+  i32 len = 0;
+  i32 end = -1;
+  Request? req = null;
+  bool done = false;
+  bool tooBig = false;
+  while (!done) {
+    match (await sock.recv()) {
+      Err(err): { done = true; }
+      Ok(r): {
+        match (r) {
+          End: { done = true; }
+          Data(bytes): {
+            if (len + bytes.len() > 16777216 + 65536) { tooBig = true; done = true; break; }
+            if (len + bytes.len() > buf.len()) {
+              i32 cap = buf.len() * 2;
+              while (cap < len + bytes.len()) { cap = cap * 2; }
+              u8[] grown = u8[].filled(cap, 0);
+              for (i32 i = 0; i < len; i++) { grown[i] = buf[i]; }
+              buf = grown;
+            }
+            for (i32 i = 0; i < bytes.len(); i++) { buf[len + i] = bytes[i]; }
+            len += bytes.len();
+            if (end < 0) {
+              end = headersEnd(buf, len);
+              if (end < 0 && len > 65536) { tooBig = true; done = true; }
+              if (end >= 0) {
+                req = parseHead(buf, end);
+                if (req is null) { done = true; }
+              }
+            }
+            if (req is not null && len - end >= req!.contentLength) { done = true; }
+          }
+        }
+      }
+    }
+  }
+  if (tooBig) {
+    await sock.send(responseBytes(Response.text(413, "too large\n")));
+  } else if (req is not null && len - end >= req!.contentLength) {
+    Request rq = req!;
+    u8[] body = u8[].filled(rq.contentLength, 0);
+    for (i32 i = 0; i < body.len(); i++) { body[i] = buf[end + i]; }
+    rq.body = body;
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64);
+    Response out = route(s, rq, clientAddress(rq, sock.peer, trustProxy && sock.fromLoopback()), now);
+    // A transaction the request put in the mempool is not in the log until a block has it; what is, goes first.
+    await flush(sys, s.engine, s.disk);
+    if (rq.method == "HEAD") { out.body = u8[](); }
+    await sock.send(responseBytes(out));
+  } else if (end >= 0) {
+    await sock.send(responseBytes(Response.text(400, "bad request\n")));
+  }
+  sock.close();
+}

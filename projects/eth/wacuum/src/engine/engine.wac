@@ -469,6 +469,40 @@ export struct Engine {
     return Answer.ok(JsonValue.Object(o));
   }
 
+  /**
+   * What a consensus client and this engine do between them each slot, done here alone: build a block on
+   * the head from the mempool, keep it, and make it the head, safe and finalized at once. It is how a devnet
+   * with no consensus client runs. The block is kept as it was built, not run a second time, and recorded
+   * as an imported one is, so a restart replays it. Answers why it could not, or "".
+   */
+  string produce(this, U256 timestamp, U256 feeRecipient) {
+    Header parent = this.blocks.get(this.head)!.header;
+    if (!timestamp.gt(parent.timestamp)) { timestamp = parent.timestamp.add(U256.one()); }
+    // Something that changes from block to block for PREVRANDAO, and a beacon root no beacon chain made.
+    U256 randao = U256.fromBytes(keccak256(parent.hash.toBytes()), 0, 32);
+    Attributes attrs = Attributes(timestamp, randao, feeRecipient,
+                                  Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())), U256.zero());
+    Spec spec = this.config.specAt(timestamp);
+    this.moveTo(this.head);
+    this.world.record();
+    Built built = buildBlock(spec, this.world, parent, attrs, this.candidates(spec), this.chainId,
+                             this.ancestorHashes(parent), this.extraData, this.senders);
+    ChangeSet cs = this.world.seal();
+    if (built.body.error != "") {
+      this.world.undo(cs);
+      return built.body.error;
+    }
+    Block b = built.block;
+    U256 hash = b.header.hash;
+    this.blocks.set(hash, Node(b.header, cs));
+    this.at = hash;
+    u8[] rlp = encodeBlock(spec, b);
+    this.archive.set(hash, Archived(b.header, b.txs, b.withdrawals, built.body.receipts, rlp.len()));
+    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(rlp)])));
+    this.choose(hash, hash, hash);
+    return "";
+  }
+
   /** The bookkeeping of a fork choice: false, changing nothing, when the head is not a block this has. */
   bool choose(this, U256 head, U256 safe, U256 finalized) {
     if (!this.blocks.has(head)) { return false; }

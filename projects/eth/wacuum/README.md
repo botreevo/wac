@@ -90,6 +90,20 @@ wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum
   --p2p-port 30303 --peer enode://…
 ```
 
+### A devnet on its own
+
+```bash
+./dist/wacuum --dev --datadir devnet
+```
+
+With `--dev` the node needs no consensus client: it makes a block from its mempool every `--dev-period`
+seconds (2), and each is final as soon as it is made. With no `--genesis` the chain is Osaka from
+block 0, chain id 1337, with one account holding a million ether, address
+`0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A` and key `0x11…11` (64 ones). JSON-RPC is on
+`127.0.0.1:8551` without a token, so a wallet or a library can use it as it would any node. Stop it and
+start it again on the same `--datadir` and the chain goes on from where it was. Over a long run its memory
+grows with the blocks it serves receipts for, so a big one wants `--snapshot-every`.
+
 It runs on any of wac's hosts: Node, v8 or wasmtime. `node tools/engine-e2e.mjs FIXTURE` drives a
 running node through an engine fixture over HTTP, JWT and all, then restarts it on its data directory and
 checks the replayed state; `node tools/rpc-e2e.mjs` makes blocks as a consensus client would and uses

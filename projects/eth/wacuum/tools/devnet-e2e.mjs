@@ -21,7 +21,7 @@ const GETH = process.env.GETH ?? "geth";
 const dir = mkdtempSync(join(tmpdir(), "wacuum-devnet-"));
 const key = "0x" + "11".repeat(32);
 const blobKey = "0x" + "33".repeat(32);
-const kit = readFileSync(new URL("../test/chainkit.wac", import.meta.url), "utf8");
+const kit = readFileSync(new URL("../src/chain/dev.wac", import.meta.url), "utf8");
 const code = (name) => kit.match(new RegExp(`static string ${name} = "(0x[0-9a-f]+)"`))[1];
 const genesis = {
   config: { chainId: 1337, homesteadBlock: 0, eip150Block: 0, eip155Block: 0, eip158Block: 0, byzantiumBlock: 0,

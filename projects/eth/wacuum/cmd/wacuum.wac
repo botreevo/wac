@@ -15,6 +15,13 @@
 // either way: it answers their requests for headers and bodies, swaps transactions
 // with them, and fetches from them any chain the consensus client names that it has not got.
 //
+// With `--dev` it is a devnet by itself: it needs no consensus client, because every `--dev-period`
+// seconds (2) it builds a block from its mempool and makes it the head and finalized at once. Without
+// `--genesis` it starts the chain in src/chain/dev.wac — Osaka from block 0, chain id 1337, and one
+// account with a million ether whose key it prints. A `--jwt-secret` is optional, and `--public-rpc` is on.
+//
+//     wac run --allow-read --allow-write --allow-net cmd/wacuum.wac -- --dev --datadir devnet
+//
 // With `--datadir`, it keeps `chain.log` there: every block it imports and every fork choice, appended
 // before the answer that reports it goes out, so a block this node has called VALID is one it still has
 // after a restart. Every `--snapshot-every` finalized blocks (1024; 0 for never) it also writes the state at
@@ -38,8 +45,9 @@ import { HttpRequest, headersEnd, parseHead, answerHttp } from "../src/engine/rp
 import { Network, dial, listen, tend } from "../src/p2p/node.wac";
 import { discover } from "../src/p2p/discovery.wac";
 import { validKey } from "../src/p2p/secp.wac";
+import { devGenesis, DEV_KEY, DEV_ADDRESS } from "../src/chain/dev.wac";
 
-string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--datadir DIR] [--public-rpc] [--peer ENODE]... [--p2p-port N] [--bootnode ENODE]... [--ip ADDR] [--max-peers N] [--snapshot-every N] [--addr 127.0.0.1] [--port 8551]"; }
+string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--datadir DIR] [--public-rpc] [--peer ENODE]... [--p2p-port N] [--bootnode ENODE]... [--ip ADDR] [--max-peers N] [--snapshot-every N] [--dev] [--dev-period SECONDS] [--addr 127.0.0.1] [--port 8551]"; }
 
 export async i32 main(Sys sys) {
   string[] args = sys.args();
@@ -55,9 +63,11 @@ export async i32 main(Sys sys) {
   string ip = "127.0.0.1";
   i32 maxPeers = 10;
   i32 port = 8551;
+  bool dev = false;
+  i32 devPeriod = 2;
   for (i32 i = 0; i < args.len(); i += 2) {
-    if (args[i] == "--public-rpc") {
-      publicRpc = true;
+    if (args[i] == "--public-rpc" || args[i] == "--dev") {
+      if (args[i] == "--dev") { dev = true; } else { publicRpc = true; }
       i--;
       continue;
     }
@@ -84,6 +94,12 @@ export async i32 main(Sys sys) {
       for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as u64); }
       snapshotEvery = n;
     }
+    else if (args[i] == "--dev-period") {
+      i32 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i32); }
+      devPeriod = n < 1 ? 1 : n;
+    }
     else if (args[i] == "--p2p-port") {
       i32 n = 0;
       u8[] d = args[i + 1].toBytes();
@@ -100,38 +116,44 @@ export async i32 main(Sys sys) {
       return 2;
     }
   }
-  if (genesisPath == "" || secretPath == "") {
+  if (!dev && (genesisPath == "" || secretPath == "")) {
     sys.warn(usage());
     return 2;
   }
+  if (dev) { publicRpc = true; }
 
-  u8[] secret = u8[].filled(0, 0);
-  match (await sys.readFile(secretPath)) {
-    Err(e): { sys.warn("wacuum: \{secretPath}: \{e}"); return 1; }
-    Ok(b): {
-      // The secret file is hex, with or without 0x, and maybe a trailing newline.
-      string text = string.fromBytes(b);
-      while (text.len() > 0 && (text.slice(text.len() - 1, text.len()) == "\n" || text.slice(text.len() - 1, text.len()) == "\r")) {
-        text = text.slice(0, text.len() - 1);
+  // A devnet's Engine API has no consensus client to answer, so without a secret it gets one nobody knows.
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  if (secretPath != "") {
+    match (await sys.readFile(secretPath)) {
+      Err(e): { sys.warn("wacuum: \{secretPath}: \{e}"); return 1; }
+      Ok(b): {
+        // The secret file is hex, with or without 0x, and maybe a trailing newline.
+        string text = string.fromBytes(b);
+        while (text.len() > 0 && (text.slice(text.len() - 1, text.len()) == "\n" || text.slice(text.len() - 1, text.len()) == "\r")) {
+          text = text.slice(0, text.len() - 1);
+        }
+        u8[]? s = hexToBytes(text);
+        if (s is null || s!.len() != 32) { sys.warn("wacuum: the JWT secret must be 32 bytes of hex"); return 1; }
+        secret = s!;
       }
-      u8[]? s = hexToBytes(text);
-      if (s is null || s!.len() != 32) { sys.warn("wacuum: the JWT secret must be 32 bytes of hex"); return 1; }
-      secret = s!;
     }
   }
 
   Genesis? g = null;
-  match (await sys.readFile(genesisPath)) {
-    Err(e): { sys.warn("wacuum: \{genesisPath}: \{e}"); return 1; }
-    Ok(b): {
-      match (parse(b)) {
-        Err(e): { sys.warn("wacuum: \{genesisPath} is not JSON"); return 1; }
-        Ok(doc): {
-          string[] why = [""];
-          g = genesisFrom(doc, why);
-          if (g is null) { sys.warn("wacuum: \{genesisPath}: \{why[0]}"); return 1; }
-        }
-      }
+  u8[] genesisText = devGenesis().toBytes();
+  if (genesisPath != "") {
+    match (await sys.readFile(genesisPath)) {
+      Err(e): { sys.warn("wacuum: \{genesisPath}: \{e}"); return 1; }
+      Ok(b): { genesisText = b; }
+    }
+  }
+  match (parse(genesisText)) {
+    Err(e): { sys.warn("wacuum: \{genesisPath} is not JSON"); return 1; }
+    Ok(doc): {
+      string[] why = [""];
+      g = genesisFrom(doc, why);
+      if (g is null) { sys.warn("wacuum: \{genesisPath}: \{why[0]}"); return 1; }
     }
   }
   Genesis gen = g!;
@@ -219,6 +241,10 @@ export async i32 main(Sys sys) {
   Disk disk = Disk(log, datadir, snapshotEvery);
   tend(sys, net, () => flush(sys, e, disk));
   serveEngine(sys, e, addr, port, secret, publicRpc, disk);
+  if (dev) {
+    if (genesisPath == "") { sys.log("wacuum: dev account \{DEV_ADDRESS}, key \{DEV_KEY}"); }
+    produce(sys, e, disk, devPeriod);
+  }
   await sys.drain();
   return 0;
 }
@@ -257,6 +283,24 @@ async void flush(Sys sys, Engine e, Disk disk) {
       await sys.files().rename(tmp, disk.dir + "/snapshot");
       sys.log("wacuum: snapshot at block \{f!.number.toDecimal()}");
     }
+  }
+}
+
+/** `--dev`'s block producer: a block every `period` seconds, for as long as the node runs. */
+async void produce(Sys sys, Engine e, Disk disk, i32 period) {
+  sys.log("wacuum: dev mode, a block every \{period} s");
+  while (true) {
+    await sys.sleepMillis(period * 1000);
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+    i32 waiting = e.mempool.len();
+    string why = e.produce(U256.ofU64(now as@ u64), U256.zero());
+    if (why != "") {
+      sys.warn("wacuum: cannot make a block: \{why}");
+      continue;
+    }
+    await flush(sys, e, disk);
+    Header h = e.headerByHash(e.head)!;
+    if (waiting > 0) { sys.log("wacuum: block \{h.number.toDecimal()} \{h.hash.toHex()}, \{waiting - e.mempool.len()} transactions"); }
   }
 }
 

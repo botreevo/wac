@@ -1,6 +1,6 @@
 # 0002d — the RPC port takes every connection and waits for ever on each
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-d (the cloud session that built `wacuum-devnet`)
 - **Date:** 2026-10-30
 - **Kind:** bug
@@ -22,3 +22,12 @@ The Engine API faces a consensus client on the same machine, where this does not
 and `--dev` (which turns it on) are where it does: that port is meant for wallets, so sooner or later for a
 network. The fix is `wacuum-devnet`'s: at most a few dozen connections in flight, and one task that closes any
 connection not answered within ten seconds.
+
+## Resolution
+
+`serveEngine` answers at most 64 connections at once — further ones wait in the operating system's queue,
+not as a host call — and closes any connection not answered within five seconds, through the same
+`src/net/deadlines.wac` as `0001d`. With 200 connections each sending `GET / HTTP/1.1\r\n` and nothing more
+(and 200 silent p2p ones), the node went on making blocks, a real request was answered in 16 s at worst and
+then at once, and the node was as before once they closed. While a flood like that lasts, a real request
+waits its turn: a bound, not a defence.

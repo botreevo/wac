@@ -20,6 +20,7 @@ import { Engine, Answer, rawOf } from "../engine/engine.wac";
 import { blockFormOf } from "../engine/blobs.wac";
 import { publicKey } from "./secp.wac";
 import { Conn } from "./peer.wac";
+import { Deadlines, Watched, enforce } from "../net/deadlines.wac";
 import { Message, HelloMsg, StatusMsg, Response, ForkId, hello, readHello, status, readStatus, forkId, disconnect,
          disconnectReason, getHeadersByHash, getBodies, readResponse, blockRange, numOf, small, HELLO, DISCONNECT, PING, PONG,
          STATUS, TRANSACTIONS, GET_BLOCK_HEADERS, BLOCK_HEADERS, GET_BLOCK_BODIES, BLOCK_BODIES,
@@ -44,9 +45,17 @@ export struct Network {
   Vec<Peer> peers;
   u64 nextId;
   U256 announcedHead;
+  /**
+   * Connections accepted and not yet gone, and how many may be at once: past it a new one is closed as it
+   * arrives. Each holds a host call while it waits, and a host gives a program only so many.
+   */
+  i32 inbound;
+  i32 maxInbound;
+  /** Where an accepted connection's deadline for its handshake is kept, and enforced. */
+  Deadlines deadlines;
 
   Network create(Engine e, u8[] nodeKey, U256 genesis, u64[] forkBlocks, u64[] forkTimes) {
-    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero());
+    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero(), 0, 10, Deadlines.create());
   }
 
   StatusMsg ourStatus(this) {
@@ -166,8 +175,12 @@ export async void dialOnce(Sys sys, Network n, string host, i32 port, u8[] remot
   }
 }
 
-/** Accept peers on `port`. */
+/**
+ * Accept peers on `port`: at most `n.maxInbound` at once, each closed if its handshake and greeting are not
+ * done within ten seconds, so that connections which say nothing cannot pile up.
+ */
 export async void listen(Sys sys, Network n, string addr, i32 port) {
+  enforce(sys, n.deadlines);
   match (await sys.net().listen(addr, port)) {
     Err(err): { sys.warn("p2p: cannot listen on \{addr}:\{port}: \{err}"); }
     Ok(listener): {
@@ -175,7 +188,14 @@ export async void listen(Sys sys, Network n, string addr, i32 port) {
       while (true) {
         match (await listener.accept()) {
           Err(err): { sys.warn("p2p: accept: \{err}"); }
-          Ok(sock): { inbound(sys, n, sock); }
+          Ok(sock): {
+            if (n.inbound >= n.maxInbound) {
+              sock.close();
+            } else {
+              n.inbound++;
+              inbound(sys, n, sock);
+            }
+          }
         }
       }
     }
@@ -183,14 +203,18 @@ export async void listen(Sys sys, Network n, string addr, i32 port) {
 }
 
 async void inbound(Sys sys, Network n, Socket sock) {
+  Watched w = n.deadlines.watch(sock, (await sys.clock().nowMillis()).orElse(0 as i64), 10000);
   Conn c = Conn.over(sock);
   u8[] rand = (await sys.random().bytes(112)).ok()!;
   string name = "\{sock.peer}:\{sock.port}";
   if (await c.respond(n.nodeKey, rand)) {
     Peer? p = await greet(sys, n, c, name);
+    w.done = true;
     if (p is not null) { await run(sys, n, p!); }
   }
+  w.done = true;
   sock.close();
+  n.inbound--;
 }
 
 /** Read a peer's messages until it goes: answer what it asks, settle what it answers. */

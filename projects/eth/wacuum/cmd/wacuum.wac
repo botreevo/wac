@@ -26,6 +26,10 @@
 //
 //     wac run --allow-read --allow-write --allow-net cmd/wacuum.wac -- --dev --datadir devnet
 //
+// Neither port waits for ever on anyone: the RPC port answers 64 connections at once and closes any not
+// answered in five seconds, and the p2p port takes `--max-peers` connections from outside and closes any
+// whose handshake is not done in ten.
+//
 // With `--datadir`, it keeps `chain.log` there: every block it imports and every fork choice, appended
 // before the answer that reports it goes out, so a block this node has called VALID is one it still has
 // after a restart. Every `--snapshot-every` finalized blocks (1024; 0 for never) it also writes the state at
@@ -49,6 +53,7 @@ import { HttpRequest, headersEnd, parseHead, answerHttp } from "../src/engine/rp
 import { Network, dial, listen, tend } from "../src/p2p/node.wac";
 import { discover } from "../src/p2p/discovery.wac";
 import { validKey } from "../src/p2p/secp.wac";
+import { Deadlines, Watched, enforce } from "../src/net/deadlines.wac";
 import { devGenesis, DEV_KEY, DEV_ADDRESS } from "../src/chain/dev.wac";
 
 string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--datadir DIR] [--public-rpc] [--peer ENODE]... [--p2p-port N] [--bootnode ENODE]... [--ip ADDR] [--max-peers N] [--snapshot-every N] [--history BLOCKS] [--dev] [--dev-period SECONDS] [--addr 127.0.0.1] [--port 8551]"; }
@@ -246,6 +251,7 @@ export async i32 main(Sys sys) {
   }
 
   Network net = Network.create(e, nodeKey, gen.header.hash, gen.forkBlocks, gen.forkTimes);
+  net.maxInbound = maxPeers;
   for (i32 i = 0; i < peers.len(); i++) { dial(sys, net, peers.get(i)); }
   if (p2pPort > 0) {
     listen(sys, net, "0.0.0.0", p2pPort);
@@ -253,7 +259,7 @@ export async i32 main(Sys sys) {
   }
   Disk disk = Disk(log, datadir, snapshotEvery);
   tend(sys, net, () => flush(sys, e, disk));
-  serveEngine(sys, e, addr, port, secret, publicRpc, disk);
+  serveEngine(sys, e, addr, port, secret, publicRpc, disk, net.deadlines);
   if (dev) {
     if (genesisPath == "") { sys.log("wacuum: dev account \{DEV_ADDRESS}, key \{DEV_KEY}"); }
     produce(sys, e, disk, devPeriod);
@@ -317,15 +323,34 @@ async void produce(Sys sys, Engine e, Disk disk, i32 period) {
   }
 }
 
-async void serveEngine(Sys sys, Engine e, string addr, i32 port, u8[] secret, bool publicRpc, Disk disk) {
+/**
+ * How many RPC connections are answered at once, and how long each may take. A connection holds a host call
+ * while it waits for its request, and a host gives a program only so many (wac `issues/system/0373d`): with
+ * no bound, a hundred-odd clients that connect and say nothing would leave the node unable to do anything.
+ */
+static i32 RPC_AT_ONCE = 64;
+static i64 RPC_DEADLINE = 5000;
+
+/** Connections being answered, counted so that no more than `RPC_AT_ONCE` are. */
+struct InFlight { i32 n; }
+
+async void serveEngine(Sys sys, Engine e, string addr, i32 port, u8[] secret, bool publicRpc, Disk disk, Deadlines deadlines) {
   match (await sys.net().listen(addr, port)) {
     Err(err): { sys.warn("wacuum: cannot listen on \{addr}:\{port}: \{err}"); }
     Ok(listener): {
       sys.log("wacuum: Engine API on \{listener.addr}");
+      enforce(sys, deadlines);
+      InFlight busy = InFlight(0);
       while (true) {
+        // While full, the next connection waits in the operating system's queue rather than here.
+        while (busy.n >= RPC_AT_ONCE) { await sys.sleepMillis(20); }
         match (await listener.accept()) {
           Err(err): { sys.warn("wacuum: accept: \{err}"); }
-          Ok(sock): { answer(sys, e, sock, secret, publicRpc, disk); }
+          Ok(sock): {
+            busy.n++;
+            Watched w = deadlines.watch(sock, (await sys.clock().nowMillis()).orElse(0 as i64), RPC_DEADLINE);
+            answer(sys, e, sock, secret, publicRpc, disk, w, busy);
+          }
         }
       }
     }
@@ -333,7 +358,7 @@ async void serveEngine(Sys sys, Engine e, string addr, i32 port, u8[] secret, bo
 }
 
 /** One HTTP request on its own connection: read it whole, answer it, close. */
-async void answer(Sys sys, Engine e, Socket sock, u8[] secret, bool publicRpc, Disk disk) {
+async void answer(Sys sys, Engine e, Socket sock, u8[] secret, bool publicRpc, Disk disk, Watched w, InFlight busy) {
   // Read until the headers are complete, then until the body is.
   u8[] buf = u8[].filled(4096, 0);
   i32 len = 0;
@@ -380,5 +405,7 @@ async void answer(Sys sys, Engine e, Socket sock, u8[] secret, bool publicRpc, D
     await flush(sys, e, disk);
     await sock.send(answer);
   }
+  w.done = true;
   sock.close();
+  busy.n--;
 }

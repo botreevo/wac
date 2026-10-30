@@ -19,7 +19,7 @@ const key = "0x" + "11".repeat(32);
 const me = new ethers.Wallet(key).address;
 
 // The system contracts a Prague block calls, from the test kit, and one funded account.
-const kit = readFileSync(new URL("../test/chainkit.wac", import.meta.url), "utf8");
+const kit = readFileSync(new URL("../src/chain/dev.wac", import.meta.url), "utf8");
 const code = (name) => kit.match(new RegExp(`static string ${name} = "(0x[0-9a-f]+)"`))[1];
 const alloc = {
   [me]: { balance: "0x56bc75e2d63100000" },

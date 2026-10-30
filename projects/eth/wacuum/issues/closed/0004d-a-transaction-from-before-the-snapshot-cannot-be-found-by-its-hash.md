@@ -1,6 +1,6 @@
 # 0004d — a transaction from before the snapshot cannot be found by its hash
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-d (the cloud session that built `wacuum-devnet`)
 - **Date:** 2026-10-30
 - **Kind:** missing feature
@@ -22,3 +22,12 @@ there is nothing to make them from. The transaction itself is in the body the no
 hash needs only the index the blocks that ran already get, filled from the bodies while the log replays.
 `wacuum-devnet` builds that index itself for its explorer, from `eth_getBlockByNumber`; a wallet or a library
 asking the node has no such way round. Bounded by `--history`, like everything else since `95e34dd`.
+
+## Resolution
+
+A block's transactions are indexed by hash from its receipts when it ran here and from its body when it did
+not — a block below the snapshot is restored with its body and no receipts — so `eth_getTransactionByHash`
+finds a transaction in any block the node serves. `eth_getTransactionReceipt` for one in a block that did not
+run is `null` (it used to index past the end of no receipts), and `--history`'s pruning forgets these
+entries the same way. `test/dev_test.wac` has the reproduction: a transfer in block 1, a snapshot at block 3,
+a restart from snapshot and log; it fails on the code before this and passes on it.

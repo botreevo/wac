@@ -12,7 +12,7 @@ in wac; the same process serves JSON-RPC and the site. Meant for **wacuum.voltre
 | `/` | the chain at a glance, the latest blocks and transactions, the faucet, and the details a wallet needs to add the network |
 | `/block/<number or hash>`, `/tx/<hash>`, `/address/<address>` | the explorer |
 | `/search?q=…` | a number, a hash or an address, sent to its page |
-| `POST /faucet` | `address=0x…`: 10 ETH, at most once a day for each visitor's IP and each recipient |
+| `POST /faucet` | `address=0x…`: 10 ETH, at most once a day for each visitor and each recipient. A visitor is an IPv4 address, or an IPv6 /64 |
 | `/genesis.json` | the chain's genesis, for anybody who wants a node of their own |
 | `/healthz` | `ok` |
 
@@ -53,7 +53,17 @@ start a new chain; `--chain-id` matters only then. The limits are kept in memory
 
 **Behind Caddy, the visitor is the last address in `X-Forwarded-For`.** Caddy replaces that header with the
 client's address, so the last entry is the one Caddy wrote. That header is trusted only on connections from
-loopback. Without a proxy, `--direct` stops trusting it at all.
+loopback. Without a proxy, `--direct` stops trusting it at all. An IPv6 visitor is their /64, since a host
+on one can take as many addresses in it as it likes.
+
+**The node answers 48 connections at a time, and closes one that has not been answered in ten seconds.** On
+wac's JavaScript hosts a program can have 128 host calls in flight, and one more waits for ever: 130 idle
+connections stopped the whole node, blocks and all, until the cap and the deadline went in. Caddy reads each
+request whole before passing it on (`deploy/Caddyfile`), so slow clients wait at Caddy and never reach it.
+
+**After a restart, older transactions have no receipt.** The node starts from its last snapshot and replays
+the log after it, and wacuum keeps receipts only for the blocks it ran. The explorer still finds a transaction
+from before the snapshot, from its block, and says that its status, fee and logs were not kept.
 
 ## Building
 
@@ -85,9 +95,11 @@ and `deploy/Caddyfile` in Caddy's configuration. The unit expects this repositor
 `wac task build` run, a `wacuum` user with `wac` in `~/.wac/bin`, and keeps the chain in
 `/var/lib/wacuum-devnet`. Back that directory up: `faucet.key` and `genesis.json` are the chain's identity.
 
-To let people sync a node of their own from it, add `--p2p-port 30303 --ip <public address>` and open that
-port (TCP and UDP); the enode is printed at start. A node joins with
-`wacuum --genesis genesis.json --peer enode://…` and the genesis from `/genesis.json`.
+**Leave `--p2p-port` off on the public node.** wacuum's devp2p takes every inbound connection, and two hundred
+silent ones stop the node for good, as above. Nor would a peer get far: another wacuum (from `/genesis.json`,
+with `--peer`) connects and can fetch every block, but it syncs only to a head a consensus client names with
+`engine_forkchoiceUpdated`, and this chain has none. Driving that by hand works, and the peer's state roots
+match; a follower that does it by itself is still to be written.
 
 ## Flags
 
@@ -100,7 +112,7 @@ port (TCP and UDP); the enode is printed at start. A node joins with
     --faucet-ether N       what one drip sends, in whole ether (10)
     --faucet-hours N       how long each visitor and each address waits between drips (24)
     --direct               trust no X-Forwarded-For: for running without a proxy in front
-    --p2p-port N           accept devp2p peers, and run discovery, on this port (off)
+    --p2p-port N           accept devp2p peers, and run discovery, on this port (off; not on a public node)
     --ip ADDR              the address advertised to peers (127.0.0.1)
     --bootnode ENODE       a discovery node to start from; as many as wanted
     --snapshot-every N     finalized blocks between state snapshots (1024)

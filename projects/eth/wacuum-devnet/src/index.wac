@@ -14,6 +14,8 @@ import { smallOf } from "./format.wac";
 export struct TxRef {
   string hash;
   u64 block;
+  /** Where it is in its block. */
+  i32 position;
   string from;
   /** The recipient, or the contract it created; "" for neither (a create that failed). */
   string to;
@@ -25,11 +27,53 @@ export struct Index {
   /** The next block to read. */
   u64 next;
   Map<string, Vec<TxRef>> byAddress;
+  /**
+   * Every transaction by its hash. wacuum finds a transaction by hash only in the blocks it ran since it
+   * started; a block from before its snapshot it has the body of and nothing more, so this is how the
+   * explorer finds those.
+   */
+  Map<string, TxRef> byHash;
   /** The latest transactions, oldest first, at most `KEEP`. */
   Vec<TxRef> recent;
   u64 transactions;
+  /**
+   * Blocks with their transactions in full, as `eth_getBlockByNumber` gives them, by number: the engine
+   * recovers every sender's signature for each such answer, about a millisecond a transaction, and a page of a
+   * busy block asked for a few times a second is all of the node's time. A devnet's blocks are final as they
+   * are made, so one never changes once it is here.
+   */
+  Map<string, JsonValue> fullBlocks;
+  Vec<string> fullOrder;
 
-  Index create() { return Index(0, Map.create(hashString, stringEq), Vec.create(), 0); }
+  Index create() {
+    return Index(0, Map.create(hashString, stringEq), Map.create(hashString, stringEq), Vec.create(), 0,
+                 Map.create(hashString, stringEq), Vec.create());
+  }
+}
+
+static i32 CACHED_BLOCKS = 256;
+
+/** Block `n` with its transactions in full; null when the engine has no such block. */
+export JsonValue? fullBlock(Index ix, Engine e, u64 n) {
+  string key = "\{n}";
+  JsonValue? hit = ix.fullBlocks.get(key);
+  if (hit is not null) { return hit; }
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Str(U256.ofU64(n).toHex().toBytes()));
+  ps.push(JsonValue.Bool(true));
+  JsonValue? b = call(e, "eth_getBlockByNumber", ps);
+  if (b is null || b!.isNull()) { return null; }
+  ix.fullBlocks.set(key, b!);
+  ix.fullOrder.push(key);
+  if (ix.fullOrder.len() > CACHED_BLOCKS * 2) {
+    Vec<string> keep = Vec.create();
+    for (i32 i = 0; i < ix.fullOrder.len(); i++) {
+      if (i < ix.fullOrder.len() - CACHED_BLOCKS) { ix.fullBlocks.remove(ix.fullOrder.get(i)); }
+      else { keep.push(ix.fullOrder.get(i)); }
+    }
+    ix.fullOrder = keep;
+  }
+  return b;
 }
 
 static i32 KEEP = 50;
@@ -40,10 +84,7 @@ export void catchUp(Index ix, Engine e) {
   while (ix.next <= head) {
     u64 n = ix.next;
     ix.next++;
-    JsonArray ps = JsonArray.create();
-    ps.push(JsonValue.Str(U256.ofU64(n).toHex().toBytes()));
-    ps.push(JsonValue.Bool(true));
-    JsonArray? txs = call(e, "eth_getBlockByNumber", ps)?.member("transactions")?.array();
+    JsonArray? txs = fullBlock(ix, e, n)?.member("transactions")?.array();
     if (txs is null || txs!.len() == 0) { continue; }
     // Receipts say what a create made; a block from before the snapshot has none, and its creates go unnamed.
     JsonArray rps = JsonArray.create();
@@ -58,7 +99,8 @@ export void catchUp(Index ix, Engine e) {
         to = lowerHex(receipts!.get(i).member("contractAddress")?.text() ?? "");
         created = to != "";
       }
-      TxRef r = TxRef(tx.member("hash")?.text() ?? "", n, from, to, created, tx.member("value")?.text() ?? "0x0");
+      TxRef r = TxRef(lowerHex(tx.member("hash")?.text() ?? ""), n, i, from, to, created, tx.member("value")?.text() ?? "0x0");
+      ix.byHash.set(r.hash, r);
       add(ix, from, r);
       if (to != "" && to != from) { add(ix, to, r); }
       ix.recent.push(r);
@@ -78,10 +120,13 @@ export TxRef[] touching(Index ix, string address) {
   return v is null ? TxRef[]() : v!.toArray();
 }
 
+/** The transaction with hash `hash` (0x-hex, any case), if a block has it. */
+export TxRef? byHash(Index ix, string hash) { return ix.byHash.get(lowerHex(hash)); }
+
 /** The latest `n` transactions, newest first. */
 export TxRef[] latest(Index ix, i32 n) {
   i32 k = ix.recent.len() < n ? ix.recent.len() : n;
-  TxRef[] out = TxRef[].filled(k, TxRef("", 0, "", "", false, ""));
+  TxRef[] out = TxRef[].filled(k, TxRef("", 0, 0, "", "", false, ""));
   for (i32 i = 0; i < k; i++) { out[i] = ix.recent.get(ix.recent.len() - 1 - i); }
   return out;
 }

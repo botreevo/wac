@@ -11,7 +11,7 @@ import { Head, Node, Ui, documentOf, html.a, html.b, html.button, html.code, htm
          html.h1, html.h2, html.header, html.input, html.label, html.main, html.nav, html.p, html.section,
          html.span, html.strong, html.table, html.tbody, html.td, html.th, html.thead, html.tr } from "web";
 import { etherText, gweiText, grouped, short, ago, gasShare, quantityOf, smallOf } from "./format.wac";
-import { Index, TxRef, latest, touching, lowerHex } from "./index.wac";
+import { Index, TxRef, latest, touching, byHash, fullBlock, lowerHex } from "./index.wac";
 import { Drip } from "./faucet.wac";
 
 /** What every page knows about the site: names, links, the chain, the faucet's terms. */
@@ -59,7 +59,7 @@ Node TxLink(Ui ui, string hash) { return <a class="mono" href={"/tx/" + hash}>{s
 /** An address, linked; `whole` shows all of it rather than its ends. */
 Node AddressLink(Ui ui, string address, bool whole) {
   if (address == "") { return <span class="muted">—</span>; }
-  return <a class="mono" href={"/address/" + address}>{whole ? address : short(address)}</a>;
+  return <a class={whole ? "mono wrap-any" : "mono"} href={"/address/" + address}>{whole ? address : short(address)}</a>;
 }
 
 /** A label and its value, as one row of a definition table. */
@@ -173,15 +173,17 @@ export string home(Site site, Engine e, Index ix, u64 now) {
 // ── A block ────────────────────────────────────────────────────────────────────
 
 /** The block numbered or hashed `id`, or null when there is no such block. */
-export string? block(Site site, Engine e, string id, u64 now) {
-  JsonValue? b = null;
+export string? block(Site site, Engine e, Index ix, string id, u64 now) {
+  // By hash, the header alone says which number to take from the cache.
+  U256? n = null;
   if (id.len() == 66 && id.indexOf("0x") == 0) {
-    b = rpc(e, "eth_getBlockByHash", [str(id), JsonValue.Bool(true)]);
+    JsonValue? h = rpc(e, "eth_getBlockByHash", [str(id), JsonValue.Bool(false)]);
+    if (h is not null && !h!.isNull()) { n = quantityOf(field(h, "number")); }
   } else {
-    U256? n = decimal(id);
-    if (n is null) { return null; }
-    b = rpc(e, "eth_getBlockByNumber", [str(n!.toHex()), JsonValue.Bool(true)]);
+    n = decimal(id);
   }
+  if (n is null || !n!.fitsU64()) { return null; }
+  JsonValue? b = fullBlock(ix, e, n!.low());
   if (b is null || b!.isNull()) { return null; }
   JsonValue blk = b!;
   u64 n = smallOf(field(blk, "number"));
@@ -234,13 +236,28 @@ export string? block(Site site, Engine e, string id, u64 now) {
 
 // ── A transaction ──────────────────────────────────────────────────────────────
 
-export string? transaction(Site site, Engine e, string hash, u64 now) {
+/** The transaction `hash`, in the mempool or in a block; null when there is no such transaction. */
+export JsonValue? findTransaction(Engine e, Index ix, string hash) {
   JsonValue? t = rpc(e, "eth_getTransactionByHash", [str(hash)]);
+  if (t is not null && !t!.isNull()) { return t; }
+  // From before the snapshot the node started at: the engine has the block, so take it from there.
+  TxRef? ref = byHash(ix, hash);
+  if (ref is null) { return null; }
+  return fullBlock(ix, e, ref!.block)?.member("transactions")?.item(ref!.position);
+}
+
+export string? transaction(Site site, Engine e, Index ix, string hash, u64 now) {
+  JsonValue? t = findTransaction(e, ix, hash);
   if (t is null || t!.isNull()) { return null; }
   JsonValue tx = t!;
-  JsonValue? r = rpc(e, "eth_getTransactionReceipt", [str(hash)]);
-  bool pending = r is null || r!.isNull();
-  string status = pending ? "Waiting in the mempool for the next block" : field(r, "status") == "0x1" ? "Succeeded" : "Failed (reverted)";
+  JsonValue? found = rpc(e, "eth_getTransactionReceipt", [str(hash)]);
+  JsonValue? r = found is null || found!.isNull() ? null : found;
+  // In a block, or still waiting for one; and in a block, with its receipt or (before a snapshot) without.
+  bool pending = field(tx, "blockNumber") == "";
+  bool receipt = r is not null;
+  string status = pending ? "Waiting in the mempool for the next block"
+                : !receipt ? "In a block from before the node's last restart, whose receipt it did not keep"
+                : field(r, "status") == "0x1" ? "Succeeded" : "Failed (reverted)";
   string to = lowerHex(field(tx, "to"));
   string created = lowerHex(field(r, "contractAddress"));
   JsonArray logs = r?.member("logs")?.array() ?? JsonArray.create();
@@ -265,12 +282,12 @@ export string? transaction(Site site, Engine e, string hash, u64 now) {
     <section class="card">
       <table class="kv"><tbody>
         <Row label="Hash" value={<Mono text={field(tx, "hash")}/>}/>
-        <Row label="Status" value={<span class={pending ? "badge wait" : field(r, "status") == "0x1" ? "badge ok" : "badge bad"}>{status}</span>}/>
+        <Row label="Status" value={<span class={pending ? "badge wait" : !receipt ? "muted" : field(r, "status") == "0x1" ? "badge ok" : "badge bad"}>{status}</span>}/>
         <Row label="Block" value={pending ? <span class="muted">—</span> : <BlockLink n={smallOf(field(tx, "blockNumber"))}/>}/>
         <Row label="From" value={<AddressLink address={lowerHex(field(tx, "from"))} whole={true}/>}/>
         <Row label={created != "" ? "Created" : "To"} value={<AddressLink address={created != "" ? created : to} whole={true}/>}/>
         <Row label="Value" value={<Text text={etherText(quantityOf(field(tx, "value")))}/>}/>
-        <Row label="Fee" value={pending ? <span class="muted">—</span> : <Text text={etherText(gasUsed.mul(price)) + " (" + grouped(gasUsed.toDecimal()) + " gas at " + gweiText(price) + ")"}/>}/>
+        <Row label="Fee" value={!receipt ? <span class="muted">—</span> : <Text text={etherText(gasUsed.mul(price)) + " (" + grouped(gasUsed.toDecimal()) + " gas at " + gweiText(price) + ")"}/>}/>
         <Row label="Gas limit" value={<Text text={grouped(quantityOf(field(tx, "gas")).toDecimal())}/>}/>
         <Row label="Type" value={<Text text={typeName(smallOf(field(tx, "type")))}/>}/>
         <Row label="Nonce" value={<Text text={"\{smallOf(field(tx, "nonce"))}"}/>}/>

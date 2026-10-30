@@ -24,6 +24,10 @@ README does not say.
   `git`. It imports only `std`, since what it fetches is what any other import needs first.
 - A project cannot import a file inside another project, even a git submodule: wac says to import its
   directory, which means its `exports`. That is why wacuum has a `lib` branch.
+- **wac's JavaScript hosts allow 128 host calls in flight; the 129th waits for ever and the program stops.**
+  Every connection reading, every sleep, every peer holds one. `src/server.wac` caps connections and reaps slow
+  ones for that reason; anything new that waits on the host (a timer per request, more peers) spends from the
+  same 128. A test that holds a few hundred idle connections finds it in seconds.
 - **Never `pkill -f` a pattern that is in your own command line**: it kills the shell running it. Find the PID.
 - `i32` to `u64` has no single cast; go through `i64` and `as@`.
 - `web`'s tag functions take a fixed list of attributes (no `aria-*`, no `data-*`): use a quoted tag for others.

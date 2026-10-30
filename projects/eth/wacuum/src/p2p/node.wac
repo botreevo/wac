@@ -33,6 +33,8 @@ export struct Peer {
   /** Requests sent and not yet answered, by id: settled by the reading task with the response's items. */
   Map<U256, Ticket<Item[]>> pending;
   u64 latest;
+  /** The hash of the peer's latest block, from its Status and then its BlockRangeUpdates. */
+  U256 latestHash;
   bool alive;
 }
 
@@ -53,9 +55,15 @@ export struct Network {
   i32 maxInbound;
   /** Where an accepted connection's deadline for its handshake is kept, and enforced. */
   Deadlines deadlines;
+  /**
+   * Whether to take the chain from peers, with no consensus client: the longest head a peer announces is
+   * fetched and becomes this node's head, safe and finalized. It trusts the peer for the fork choice, which
+   * is right for a devnet whose blocks one node makes, and for nothing else.
+   */
+  bool follow;
 
   Network create(Engine e, u8[] nodeKey, U256 genesis, u64[] forkBlocks, u64[] forkTimes) {
-    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero(), 0, 10, Deadlines.create());
+    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero(), 0, 10, Deadlines.create(), false);
   }
 
   StatusMsg ourStatus(this) {
@@ -83,6 +91,16 @@ export struct Network {
       if (this.peers.get(i).alive) { k++; }
     }
     return k;
+  }
+
+  /** The peer announcing the highest block, if any is connected. */
+  Peer? highestPeer(this) {
+    Peer? best = null;
+    for (i32 i = 0; i < this.peers.len(); i++) {
+      Peer p = this.peers.get(i);
+      if (p.alive && (best is null || p.latest > best!.latest)) { best = p; }
+    }
+    return best;
   }
 
   Peer? anyPeer(this) {
@@ -125,7 +143,7 @@ async Peer? greet(Sys sys, Network n, Conn c, string name) {
     return null;
   }
   sys.log("p2p: \{name}: \{h.client}, serving blocks \{st.earliest}-\{st.latest}");
-  Peer p = Peer(c, name, Map.create(hashU256, eqU256), st.latest, true);
+  Peer p = Peer(c, name, Map.create(hashU256, eqU256), st.latest, st.latestHash, true);
   n.peers.push(p);
   return p;
 }
@@ -253,6 +271,9 @@ async void run(Sys sys, Network n, Peer p) {
       await askForAnnounced(n, p, body);
     } else if (code == BLOCK_RANGE_UPDATE) {
       if (isList(body) && itemsOf(body).len() >= 2) { p.latest = numOf(itemsOf(body)[1]).low(); }
+      if (isList(body) && itemsOf(body).len() >= 3 && bytesOf(itemsOf(body)[2]).len() == 32) {
+        p.latestHash = U256.fromBytes(bytesOf(itemsOf(body)[2]), 0, 32);
+      }
     }
   }
   p.alive = false;
@@ -413,7 +434,8 @@ async bool syncOnce(Sys sys, Network n, Peer p, U256 target) {
       }
     }
   }
-  sys.log("p2p: syncing \{headers.len()} blocks from \{p.name}");
+  // A block at a time is what following a chain is, every slot: only a longer fetch is worth a line.
+  if (headers.len() > 1) { sys.log("p2p: syncing \{headers.len()} blocks from \{p.name}"); }
   // Oldest first, 64 bodies at a time.
   i32 i = headers.len() - 1;
   while (i >= 0) {
@@ -444,7 +466,9 @@ async bool syncOnce(Sys sys, Network n, Peer p, U256 target) {
     i -= bodies!.len();
   }
   i32 adopted = n.e.adoptOrphans();
-  sys.log("p2p: synced to \{n.e.syncTarget is null ? "the target" : "short of it"}; \{adopted} waiting payloads went in");
+  if (headers.len() > 1 || adopted > 0 || n.e.syncTarget is not null) {
+    sys.log("p2p: synced to \{n.e.syncTarget is null ? "the target" : "short of it"}; \{adopted} waiting payloads went in");
+  }
   return true;
 }
 
@@ -455,13 +479,29 @@ async bool syncOnce(Sys sys, Network n, Peer p, U256 target) {
 export async void tend(Sys sys, Network n, fn<Ticket<void>()> flush) {
   while (true) {
     await sys.sleepMillis(500);
+    Peer? from = n.anyPeer();
+    if (n.follow) {
+      // The highest head on offer: taken once its blocks are in, and fetched until they are.
+      Peer? best = n.highestPeer();
+      Header ours = n.e.headHeader();
+      if (best is not null && best!.latest > ours.number.low() && !best!.latestHash.isZero()) {
+        U256 theirs = best!.latestHash;
+        from = best;
+        if (n.e.has(theirs)) {
+          n.e.choose(theirs, theirs, theirs);
+          await flush();
+          if (best!.latest > ours.number.low() + 1) { sys.log("p2p: following \{best!.name}: head \{best!.latest} \{theirs.toHex()}"); }
+        } else if (n.e.syncTarget is null) {
+          n.e.syncTarget = theirs;
+        }
+      }
+    }
     U256? target = n.e.syncTarget;
     if (target is not null) {
       if (n.e.has(target!)) {
         n.e.adoptOrphans();
-      } else {
-        Peer? p = n.anyPeer();
-        if (p is not null) { await syncOnce(sys, n, p!, target!); }
+      } else if (from is not null) {
+        await syncOnce(sys, n, from!, target!);
       }
       await flush();
     }

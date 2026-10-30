@@ -1,6 +1,6 @@
 # 0003d — a node cannot follow a chain that has no consensus client
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-d (the cloud session that built `wacuum-devnet`)
 - **Date:** 2026-10-30
 - **Kind:** missing feature
@@ -27,3 +27,17 @@ that takes the head a peer announces (eth/69's `Status` and `BlockRangeUpdate` c
 as the target, and makes it the head once its blocks are in, would let anyone run a node beside one. It
 trusts the peer for the fork choice, which for a devnet whose blocks one node makes is the truth anyway.
 Until then `wacuum-devnet` tells its operators to leave `--p2p-port` off (which `0001d` also asks).
+
+## Resolution
+
+`--follow`: with no consensus client, the node takes the highest head a peer announces (from its `Status`,
+then its `BlockRangeUpdate`s, whose latest hash peers now keep), fetches the blocks up to it from that peer,
+and makes it the head, safe and finalized — as a `--dev` node does with its own blocks. Without `--genesis`
+it is on the dev chain; it needs no `--jwt-secret`, and turns on `--public-rpc`. A block at a time is no
+longer logged, only a longer catch-up.
+
+The reproduction, on the Node host: a `--dev` node with `--p2p-port`, and `wacuum --follow --peer enode://…`
+beside it. The follower stayed a block behind; a transfer sent to the follower's RPC was gossiped to the
+first node and mined, and both answered the same balance; block 5 had the same hash and state root on both.
+Stopped for ten seconds and started again, the follower replayed its log and fetched the ten blocks it had
+missed. The README's devnet section says how.

@@ -6,7 +6,7 @@
 //     WAC=path/to/wac node tools/engine-e2e.mjs FIXTURE.json [TEST-NAME-SUBSTRING]
 //
 // Any of wac's hosts will do: Node, v8 or wasmtime.
-import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -19,6 +19,8 @@ const t = doc[name];
 const g = t.genesisBlockHeader;
 const fork = t.network;
 const dir = mkdtempSync(join(tmpdir(), "wacuum-e2e-"));
+// Each run's data, geth's above all, is a gigabyte or so: gone when the run is, however it ends.
+process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
 const genesis = {
   config: { chainId: parseInt(t.config.chainid, 16), cancunTime: 0, ...(fork !== "Cancun" ? { pragueTime: 0 } : {}),
             ...(fork === "Osaka" ? { osakaTime: 0 } : {}) },

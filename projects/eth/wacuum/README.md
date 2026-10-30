@@ -105,6 +105,17 @@ start it again on the same `--datadir` and the chain goes on from where it was. 
 blocks for the `eth_` methods (`--history N` to change it; 0 keeps them all), so its memory stays
 level however long it runs.
 
+Another node can run beside it without a consensus client too. Give the first a `--p2p-port` (it prints
+its enode), and start the second with `--follow`, which takes the head its peers announce as its own once
+it has the blocks:
+
+```bash
+./dist/wacuum --dev --datadir devnet --p2p-port 30303
+./dist/wacuum --follow --peer enode://…@127.0.0.1:30303 --datadir follower --port 8552
+```
+
+The follower serves the same JSON-RPC, and a transaction sent to it reaches the first node's blocks.
+
 It runs on any of wac's hosts: Node, v8 or wasmtime. `node tools/engine-e2e.mjs FIXTURE` drives a
 running node through an engine fixture over HTTP, JWT and all, then restarts it on its data directory and
 checks the replayed state; `node tools/rpc-e2e.mjs` makes blocks as a consensus client would and uses

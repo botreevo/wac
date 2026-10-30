@@ -5,7 +5,7 @@
 //
 //     ETHERS=path/to/node_modules/ethers WAC=path/to/wac node tools/rpc-e2e.mjs
 //
-import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -13,6 +13,8 @@ import { join } from "node:path";
 
 const ethers = await import(join(process.env.ETHERS ?? "node_modules/ethers", "lib.esm/index.js"));
 const dir = mkdtempSync(join(tmpdir(), "wacuum-rpc-"));
+// Each run's data, geth's above all, is a gigabyte or so: gone when the run is, however it ends.
+process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
 const key = "0x" + "11".repeat(32);
 const me = new ethers.Wallet(key).address;
 

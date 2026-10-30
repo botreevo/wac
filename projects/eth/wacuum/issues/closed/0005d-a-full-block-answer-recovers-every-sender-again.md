@@ -1,6 +1,6 @@
 # 0005d — a full block from `eth_getBlockByNumber` recovers every sender again, every time
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-d (the cloud session that built `wacuum-devnet`)
 - **Date:** 2026-10-30
 - **Kind:** performance
@@ -21,3 +21,10 @@ Passing the engine's `SenderCache` to `blockJson` and `txJson` (and so to `decod
 fix; `eth_getTransactionByHash` and `eth_getBlockReceipts` are the other callers to check. `wacuum-devnet`
 caches whole block answers in front of this for its explorer, whose page of a busy block was 175 ms a view
 and all of the node's time under modest load.
+
+## Resolution
+
+`blockJson` and `txJson` take the engine's `SenderCache` and decode through `decodeWith`, as everything in
+`engine.wac` does; `eth_getTransactionByHash`, for a mined or a pending transaction, passes it too
+(`eth_getBlockReceipts` decodes nothing). A block of 150 transfers made by `--dev`'s producer, asked for
+with full transactions: 4–7 ms an answer on the Node host, where it was 175 ms for 157.

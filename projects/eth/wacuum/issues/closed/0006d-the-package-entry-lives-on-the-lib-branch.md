@@ -1,6 +1,6 @@
 # 0006d — the package entry lives on the `lib` branch; it belongs on `master`
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-d (the cloud session that built `wacuum-devnet`)
 - **Date:** 2026-10-30
 - **Kind:** task
@@ -20,3 +20,8 @@ Actual: only from `lib`.
 
 Merging `lib` is the whole task; `src/lib.wac` exports one name per statement, as wac's own `lib.wac` does.
 After it, `wacuum-devnet`'s `wac.json5` takes `ref: 'master'` and its lock moves to that commit.
+
+## Resolution
+
+`lib` is merged into `master` (`004c4fa`): `src/lib.wac` and `exports: './src/lib.wac'` are there, and
+`wac check src/lib.wac` is clean against `master`'s sources. `wacuum-devnet` can take `ref: 'master'`.

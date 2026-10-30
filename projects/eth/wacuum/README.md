@@ -22,7 +22,7 @@ every fixture of every suite passes:
 
 And so does every transition network the fixtures have — Cancun to Prague, Prague to Osaka, and Osaka
 through BPO1 to BPO4 — in block import and through the Engine API. `sh tools/all-fixtures.sh` runs it all
-in about an hour and a half.
+in about twenty minutes on the Node host (an hour and a half on wasmtime).
 
 | | state |
 | --- | --- |

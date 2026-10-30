@@ -58,7 +58,10 @@ on 2026-10-30), three commits after the library commit `wac.lock` pins:
     git clone https://git.voltrevo.com/wac.git ~/src/wac
     cd ~/src/wac && git checkout 96e5a0cfe && ./bootstrap.sh --host nodejs
 
-Node is the fastest of wac's hosts for wacuum, by two to four times. Then, here:
+Node is the fastest of wac's hosts for wacuum, by two to four times. Then clone this with `-b master`: the
+server's default branch is `main` and empty, as for the other repositories there.
+
+    git clone -b master https://git.voltrevo.com/wacuum-devnet.git && cd wacuum-devnet
 
     wac task deps      # the three locked dependencies into wac's cache, with git (`wac update` gets a 401 from git.voltrevo.com)
     wac task test      # the unit tests, in a second: pages, RPC, the faucet and its limits, against a real engine

@@ -22,6 +22,12 @@ export struct Field {
   u64[] r2;
   /** R mod p: one, in Montgomery form. */
   u64[] oneM;
+  /**
+   * Whether this is secp256k1's field, p = 2^256 − 2^32 − 977, which multiplies by its own routine: the
+   * product reduced by 2^256 = 2^32 + 977 (mod p), about a tenth of Montgomery's reduction. Its elements are
+   * held as themselves (R = 1) rather than in Montgomery form; nothing outside `mul` can tell.
+   */
+  bool special;
 
   Field create(U256 modulus) {
     u64[] p = limbsOf(modulus);
@@ -33,7 +39,12 @@ export struct Field {
     r[8] = 1;
     u64[] rr = u64[].filled(17, 0);
     rr[16] = 1;
-    return Field(modulus, p, n0, fit(modLimbs(rr, p)), fit(modLimbs(r, p)));
+    if (modulus.eq(U256.fromHex("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f")!)) {
+      u64[] one = u64[].filled(8, 0);
+      one[0] = 1;
+      return Field(modulus, p, n0, one, one, true);
+    }
+    return Field(modulus, p, n0, fit(modLimbs(rr, p)), fit(modLimbs(r, p)), false);
   }
 
   u64[] zero(this) { return u64[].filled(8, 0); }
@@ -56,6 +67,7 @@ export struct Field {
    * in git history; this is it written out, and about five times faster.
    */
   u64[] mul(this, u64[] a, u64[] b) {
+    if (this.special) { return mulSecp(a, b, this.p); }
     u64[] p = this.p;
     u64 n0 = this.n0;
     u64 a0 = a[0];
@@ -543,35 +555,67 @@ export struct Field {
 
   u64[] square(this, u64[] a) { return this.mul(a, a); }
 
+  /** a + b mod p, unrolled as `mul` is: the limbs in locals, the result written once. */
   u64[] add(this, u64[] a, u64[] b) {
-    u64[] out = u64[].filled(8, 0);
-    u64 c = 0;
-    for (i32 i = 0; i < 8; i++) {
-      u64 s = a[i] + b[i] + c;
-      out[i] = s & MASK;
-      c = s >> 32;
-    }
-    if (c != 0 || !less(out, this.p)) { subInPlace(out, this.p); }
+    u64 s = a[0] + b[0];
+    u64 r0 = s & MASK;
+    s = a[1] + b[1] + (s >> 32);
+    u64 r1 = s & MASK;
+    s = a[2] + b[2] + (s >> 32);
+    u64 r2 = s & MASK;
+    s = a[3] + b[3] + (s >> 32);
+    u64 r3 = s & MASK;
+    s = a[4] + b[4] + (s >> 32);
+    u64 r4 = s & MASK;
+    s = a[5] + b[5] + (s >> 32);
+    u64 r5 = s & MASK;
+    s = a[6] + b[6] + (s >> 32);
+    u64 r6 = s & MASK;
+    s = a[7] + b[7] + (s >> 32);
+    u64 r7 = s & MASK;
+    u64[] out = [r0, r1, r2, r3, r4, r5, r6, r7];
+    if ((s >> 32) != 0 || !less(out, this.p)) { subInPlace(out, this.p); }
     return out;
   }
 
+  /** a - b mod p, unrolled: p is added back when the subtraction borrows. */
   u64[] sub(this, u64[] a, u64[] b) {
-    u64[] out = u64[].filled(8, 0);
-    u64 borrow = 0;
-    for (i32 i = 0; i < 8; i++) {
-      u64 d = a[i] - b[i] - borrow;
-      out[i] = d & MASK;
-      borrow = (d >> 32) != 0 ? 1 : 0;
+    u64 d = a[0] - b[0];
+    u64 r0 = d & MASK;
+    d = a[1] - b[1] - ((d >> 32) & 1);
+    u64 r1 = d & MASK;
+    d = a[2] - b[2] - ((d >> 32) & 1);
+    u64 r2 = d & MASK;
+    d = a[3] - b[3] - ((d >> 32) & 1);
+    u64 r3 = d & MASK;
+    d = a[4] - b[4] - ((d >> 32) & 1);
+    u64 r4 = d & MASK;
+    d = a[5] - b[5] - ((d >> 32) & 1);
+    u64 r5 = d & MASK;
+    d = a[6] - b[6] - ((d >> 32) & 1);
+    u64 r6 = d & MASK;
+    d = a[7] - b[7] - ((d >> 32) & 1);
+    u64 r7 = d & MASK;
+    if ((d >> 32) != 0) {
+      u64[] p = this.p;
+      u64 c = r0 + p[0];
+      r0 = c & MASK;
+      c = r1 + p[1] + (c >> 32);
+      r1 = c & MASK;
+      c = r2 + p[2] + (c >> 32);
+      r2 = c & MASK;
+      c = r3 + p[3] + (c >> 32);
+      r3 = c & MASK;
+      c = r4 + p[4] + (c >> 32);
+      r4 = c & MASK;
+      c = r5 + p[5] + (c >> 32);
+      r5 = c & MASK;
+      c = r6 + p[6] + (c >> 32);
+      r6 = c & MASK;
+      c = r7 + p[7] + (c >> 32);
+      r7 = c & MASK;
     }
-    if (borrow != 0) {
-      u64 c = 0;
-      for (i32 i = 0; i < 8; i++) {
-        u64 s = out[i] + this.p[i] + c;
-        out[i] = s & MASK;
-        c = s >> 32;
-      }
-    }
-    return out;
+    return [r0, r1, r2, r3, r4, r5, r6, r7];
   }
 
   u64[] neg(this, u64[] a) { return this.sub(this.zero(), a); }
@@ -609,6 +653,240 @@ export struct Field {
     u64[] c = this.pow(a, this.modulus.add(U256.one()).shr(2));
     return this.eq(this.square(c), a) ? c : null;
   }
+}
+
+/**
+ * a·b mod secp256k1's p, for elements held as themselves: the 512-bit product, schoolbook and unrolled, and
+ * then its high half H folded down twice by H·2^256 = H·(2^32 + 977) (mod p) — a shift and eight small
+ * multiplications — and one conditional subtraction.
+ */
+u64[] mulSecp(u64[] a, u64[] b, u64[] p) {
+  u64 a0 = a[0];
+  u64 a1 = a[1];
+  u64 a2 = a[2];
+  u64 a3 = a[3];
+  u64 a4 = a[4];
+  u64 a5 = a[5];
+  u64 a6 = a[6];
+  u64 a7 = a[7];
+  u64 b0 = b[0];
+  u64 b1 = b[1];
+  u64 b2 = b[2];
+  u64 b3 = b[3];
+  u64 b4 = b[4];
+  u64 b5 = b[5];
+  u64 b6 = b[6];
+  u64 b7 = b[7];
+  u64 r0 = 0;
+  u64 r1 = 0;
+  u64 r2 = 0;
+  u64 r3 = 0;
+  u64 r4 = 0;
+  u64 r5 = 0;
+  u64 r6 = 0;
+  u64 r7 = 0;
+  u64 r8 = 0;
+  u64 r9 = 0;
+  u64 r10 = 0;
+  u64 r11 = 0;
+  u64 r12 = 0;
+  u64 r13 = 0;
+  u64 r14 = 0;
+  u64 r15 = 0;
+  u64 t = 0;
+  t = r0 + a0 * b0;
+  r0 = t & MASK;
+  t = r1 + a0 * b1 + (t >> 32);
+  r1 = t & MASK;
+  t = r2 + a0 * b2 + (t >> 32);
+  r2 = t & MASK;
+  t = r3 + a0 * b3 + (t >> 32);
+  r3 = t & MASK;
+  t = r4 + a0 * b4 + (t >> 32);
+  r4 = t & MASK;
+  t = r5 + a0 * b5 + (t >> 32);
+  r5 = t & MASK;
+  t = r6 + a0 * b6 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a0 * b7 + (t >> 32);
+  r7 = t & MASK;
+  r8 = t >> 32;
+  t = r1 + a1 * b0;
+  r1 = t & MASK;
+  t = r2 + a1 * b1 + (t >> 32);
+  r2 = t & MASK;
+  t = r3 + a1 * b2 + (t >> 32);
+  r3 = t & MASK;
+  t = r4 + a1 * b3 + (t >> 32);
+  r4 = t & MASK;
+  t = r5 + a1 * b4 + (t >> 32);
+  r5 = t & MASK;
+  t = r6 + a1 * b5 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a1 * b6 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a1 * b7 + (t >> 32);
+  r8 = t & MASK;
+  r9 = t >> 32;
+  t = r2 + a2 * b0;
+  r2 = t & MASK;
+  t = r3 + a2 * b1 + (t >> 32);
+  r3 = t & MASK;
+  t = r4 + a2 * b2 + (t >> 32);
+  r4 = t & MASK;
+  t = r5 + a2 * b3 + (t >> 32);
+  r5 = t & MASK;
+  t = r6 + a2 * b4 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a2 * b5 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a2 * b6 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a2 * b7 + (t >> 32);
+  r9 = t & MASK;
+  r10 = t >> 32;
+  t = r3 + a3 * b0;
+  r3 = t & MASK;
+  t = r4 + a3 * b1 + (t >> 32);
+  r4 = t & MASK;
+  t = r5 + a3 * b2 + (t >> 32);
+  r5 = t & MASK;
+  t = r6 + a3 * b3 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a3 * b4 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a3 * b5 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a3 * b6 + (t >> 32);
+  r9 = t & MASK;
+  t = r10 + a3 * b7 + (t >> 32);
+  r10 = t & MASK;
+  r11 = t >> 32;
+  t = r4 + a4 * b0;
+  r4 = t & MASK;
+  t = r5 + a4 * b1 + (t >> 32);
+  r5 = t & MASK;
+  t = r6 + a4 * b2 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a4 * b3 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a4 * b4 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a4 * b5 + (t >> 32);
+  r9 = t & MASK;
+  t = r10 + a4 * b6 + (t >> 32);
+  r10 = t & MASK;
+  t = r11 + a4 * b7 + (t >> 32);
+  r11 = t & MASK;
+  r12 = t >> 32;
+  t = r5 + a5 * b0;
+  r5 = t & MASK;
+  t = r6 + a5 * b1 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a5 * b2 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a5 * b3 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a5 * b4 + (t >> 32);
+  r9 = t & MASK;
+  t = r10 + a5 * b5 + (t >> 32);
+  r10 = t & MASK;
+  t = r11 + a5 * b6 + (t >> 32);
+  r11 = t & MASK;
+  t = r12 + a5 * b7 + (t >> 32);
+  r12 = t & MASK;
+  r13 = t >> 32;
+  t = r6 + a6 * b0;
+  r6 = t & MASK;
+  t = r7 + a6 * b1 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a6 * b2 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a6 * b3 + (t >> 32);
+  r9 = t & MASK;
+  t = r10 + a6 * b4 + (t >> 32);
+  r10 = t & MASK;
+  t = r11 + a6 * b5 + (t >> 32);
+  r11 = t & MASK;
+  t = r12 + a6 * b6 + (t >> 32);
+  r12 = t & MASK;
+  t = r13 + a6 * b7 + (t >> 32);
+  r13 = t & MASK;
+  r14 = t >> 32;
+  t = r7 + a7 * b0;
+  r7 = t & MASK;
+  t = r8 + a7 * b1 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a7 * b2 + (t >> 32);
+  r9 = t & MASK;
+  t = r10 + a7 * b3 + (t >> 32);
+  r10 = t & MASK;
+  t = r11 + a7 * b4 + (t >> 32);
+  r11 = t & MASK;
+  t = r12 + a7 * b5 + (t >> 32);
+  r12 = t & MASK;
+  t = r13 + a7 * b6 + (t >> 32);
+  r13 = t & MASK;
+  t = r14 + a7 * b7 + (t >> 32);
+  r14 = t & MASK;
+  r15 = t >> 32;
+  // Fold H into L: limb k gains H[k]·977 and H[k−1] (the 2^32 part), and a ninth limb takes what is left.
+  t = r0 + r8 * 977;
+  u64 s0 = t & MASK;
+  t = r1 + r9 * 977 + r8 + (t >> 32);
+  u64 s1 = t & MASK;
+  t = r2 + r10 * 977 + r9 + (t >> 32);
+  u64 s2 = t & MASK;
+  t = r3 + r11 * 977 + r10 + (t >> 32);
+  u64 s3 = t & MASK;
+  t = r4 + r12 * 977 + r11 + (t >> 32);
+  u64 s4 = t & MASK;
+  t = r5 + r13 * 977 + r12 + (t >> 32);
+  u64 s5 = t & MASK;
+  t = r6 + r14 * 977 + r13 + (t >> 32);
+  u64 s6 = t & MASK;
+  t = r7 + r15 * 977 + r14 + (t >> 32);
+  u64 s7 = t & MASK;
+  u64 s8 = r15 + (t >> 32);
+  // And the ninth limb the same way: it is small, so this leaves at most a carry out of 2^256.
+  t = s0 + s8 * 977;
+  s0 = t & MASK;
+  t = s1 + s8 + (t >> 32);
+  s1 = t & MASK;
+  t = s2 + (t >> 32);
+  s2 = t & MASK;
+  t = s3 + (t >> 32);
+  s3 = t & MASK;
+  t = s4 + (t >> 32);
+  s4 = t & MASK;
+  t = s5 + (t >> 32);
+  s5 = t & MASK;
+  t = s6 + (t >> 32);
+  s6 = t & MASK;
+  t = s7 + (t >> 32);
+  s7 = t & MASK;
+  if ((t >> 32) != 0) {
+    // 2^256 once more, as 2^32 + 977; what is left is far below 2^256, so nothing carries out of this.
+    t = s0 + 977;
+    s0 = t & MASK;
+    t = s1 + 1 + (t >> 32);
+    s1 = t & MASK;
+    t = s2 + (t >> 32);
+    s2 = t & MASK;
+    t = s3 + (t >> 32);
+    s3 = t & MASK;
+    t = s4 + (t >> 32);
+    s4 = t & MASK;
+    t = s5 + (t >> 32);
+    s5 = t & MASK;
+    t = s6 + (t >> 32);
+    s6 = t & MASK;
+    t = s7 + (t >> 32);
+    s7 = t & MASK;
+  }
+  u64[] out = [s0, s1, s2, s3, s4, s5, s6, s7];
+  if (!less(out, p)) { subInPlace(out, p); }
+  return out;
 }
 
 u64[] limbsOf(U256 x) {

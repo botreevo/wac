@@ -1,0 +1,78 @@
+// secp256k1's GLV multiplication against the plain one it replaces, and its scalar split against its
+// definition.
+
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../src/u256.wac";
+import { Jac } from "../src/crypto/curve.wac";
+import { Secp, Split, split, wnaf, secpN } from "../src/crypto/secp256k1.wac";
+import { Check } from "./check.wac";
+
+U256 lambda() { return U256.fromHex("0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72")!; }
+
+/** Scalars that are hard for a split or a NAF, then pseudo-random ones. */
+U256[] scalars() {
+  U256 n = secpN();
+  U256[] edge = [U256.zero(), U256.one(), U256.ofU64(2), U256.ofU64(15), U256.ofU64(16), U256.ofU64(31), U256.ofU64(32),
+                 n.sub(U256.one()), n.sub(U256.ofU64(2)), n.shr(1), n.shr(1).add(U256.one()), lambda(), n.sub(lambda()),
+                 U256.one().shl(128), U256.one().shl(128).sub(U256.one()), U256.one().shl(255).mod(n)];
+  U256[] out = U256[].filled(edge.len() + 40, U256.zero());
+  for (i32 i = 0; i < edge.len(); i++) { out[i] = edge[i]; }
+  u8[] seed = "wacuum".toBytes();
+  for (i32 i = 0; i < 40; i++) {
+    seed = keccak256(seed);
+    out[edge.len() + i] = U256.fromBytes(seed, 0, 32).mod(n);
+  }
+  return out;
+}
+
+bool same(Secp k, Jac a, Jac b) {
+  if (k.c.isInfinity(a) || k.c.isInfinity(b)) { return k.c.isInfinity(a) && k.c.isInfinity(b); }
+  U256[] x = k.c.toAffine(a);
+  U256[] y = k.c.toAffine(b);
+  return x[0].eq(y[0]) && x[1].eq(y[1]);
+}
+
+export string test_the_split_recombines_into_halves() {
+  Check t = Check.create();
+  U256 n = secpN();
+  U256[] ks = scalars();
+  for (i32 i = 0; i < ks.len(); i++) {
+    Split s = split(ks[i]);
+    U256 k1 = s.neg1 ? n.sub(s.k1).mod(n) : s.k1;
+    U256 k2 = s.neg2 ? n.sub(s.k2).mod(n) : s.k2;
+    t.eqU256(k1.addmod(k2.mulmod(lambda(), n), n), ks[i], "k1 + k2·λ for scalar \{i}");
+    t.ok(256 - s.k1.leadingZeros() <= 129 && 256 - s.k2.leadingZeros() <= 129, "halves of at most 129 bits for scalar \{i}");
+  }
+  return t.report();
+}
+
+export string test_wnaf_digits_spell_the_scalar() {
+  Check t = Check.create();
+  U256[] ks = scalars();
+  for (i32 i = 0; i < ks.len(); i++) {
+    i32[] d = wnaf(ks[i]);
+    U256 v = U256.zero();
+    for (i32 j = d.len() - 1; j >= 0; j--) {
+      v = v.shl(1);
+      v = d[j] >= 0 ? v.add(U256.ofU64(d[j] as! u64)) : v.sub(U256.ofU64((0 - d[j]) as! u64));
+      t.ok(d[j] == 0 || ((d[j] & 1) != 0 && d[j] > -16 && d[j] < 16), "digit \{j} of scalar \{i} is 0 or odd and small");
+    }
+    t.eqU256(v, ks[i], "the digits of scalar \{i}");
+  }
+  return t.report();
+}
+
+export string test_glv_agrees_with_shamirs_trick() {
+  Check t = Check.create();
+  U256[] ks = scalars();
+  Secp k = Secp.create();
+  Jac g = k.generator();
+  // Q: some point other than G, 7·G.
+  Jac q = k.c.mul(g, U256.ofU64(7));
+  for (i32 i = 0; i + 1 < ks.len(); i++) {
+    U256 a = ks[i];
+    U256 b = ks[ks.len() - 1 - i];
+    t.ok(same(k, k.mulG2(a, q, b), k.c.mul2(g, a, q, b)), "a·G + b·Q for pair \{i}");
+  }
+  return t.report();
+}

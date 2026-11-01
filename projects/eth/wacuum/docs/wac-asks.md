@@ -2,6 +2,19 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
+## A `switch` over integers is a chain of comparisons
+
+wacc emits a `switch` as one comparison per case, in order, re-evaluating the subject for each
+(`packages/wacc/src/emit.wac`, "a chain of comparisons rather than a jump table"). The EVM interpreter's
+`step` switches over the opcode, about 80 cases, so an opcode's place in the switch is what it pays to be
+dispatched. A V8 profile of the arithmetic benchmark put 40% of the time in `step`, and checking three hot
+opcodes ahead of the switch made the whole interpreter 22% faster on the Node host; wasmtime barely
+noticed (Cranelift handles the chain well).
+
+The ask: `br_table` when every case is an integer constant and the range is dense, and the subject in a
+local otherwise. wac's maintainer agrees and has left it to the owner to schedule. Until then `step` lists
+its cases commonest first, which is the comment there.
+
 ## An operator method is not found from another file
 
 `spec/3-expressions/22-operators.md` says `a + b` on a struct calls the left operand's `[operators.add]`

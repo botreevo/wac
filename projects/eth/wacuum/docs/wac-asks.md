@@ -2,6 +2,18 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
+## The static evaluator: no `switch`, and one step budget for a whole file
+
+Two things met while moving bn254's and secp256k1's constants to compile time:
+
+- A `switch` anywhere on a static's path is "something the compiler cannot evaluate statically yet".
+  `U256.word` was a switch; it is ifs now, which compile no worse.
+- `Ev.create()` sets an 8,000,000-step budget and the checker makes one `Ev` per file (`ensureStaticView`,
+  `check.wac`), so every static in a file draws on the same budget: a static that evaluates alone fails when
+  placed after two others. The comment by `step()` reads as if the budget were per evaluation ("no table
+  anyone writes reaches it"). bn254 fits by computing its constants from one exponentiation rather than
+  three.
+
 ## An operator method is not found from another file
 
 `spec/3-expressions/22-operators.md` says `a + b` on a struct calls the left operand's `[operators.add]`

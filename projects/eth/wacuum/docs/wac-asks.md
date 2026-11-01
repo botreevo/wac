@@ -2,19 +2,6 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
-## A `switch` over integers is a chain of comparisons
-
-wacc emits a `switch` as one comparison per case, in order, re-evaluating the subject for each
-(`packages/wacc/src/emit.wac`, "a chain of comparisons rather than a jump table"). The EVM interpreter's
-`step` switches over the opcode, about 80 cases, so an opcode's place in the switch is what it pays to be
-dispatched. A V8 profile of the arithmetic benchmark put 40% of the time in `step`, and checking three hot
-opcodes ahead of the switch made the whole interpreter 22% faster on the Node host; wasmtime barely
-noticed (Cranelift handles the chain well).
-
-The ask: `br_table` when every case is an integer constant and the range is dense, and the subject in a
-local otherwise. wac's maintainer agrees and has left it to the owner to schedule. Until then `step` lists
-its cases commonest first, which is the comment there.
-
 ## An operator method is not found from another file
 
 `spec/3-expressions/22-operators.md` says `a + b` on a struct calls the left operand's `[operators.add]`
@@ -55,6 +42,13 @@ accessor exception, `§wac-deep-const-accessor-w3kf8nq`, which makes the result 
 
 Written the way the language means it: `const W n = this;`, or `(const W) n` to rebind, and `const W` as
 the return type. `U256` still takes a plain `this` everywhere, which is simpler and costs nothing.
+
+## Done: a dense integer `switch` is one `br_table`
+
+wacc emitted a `switch` as a comparison per case, in order, so the EVM interpreter's opcode switch made an
+opcode's place in it what dispatching it cost: checking three hot opcodes ahead of it was 22% on the Node
+host. Since `d267592b8` a switch whose cases are dense integer constants is one `br_table`, and its subject
+is read once (it was read once per case compared, which was also a bug for a subject with effects).
 
 ## Done: `bls` and `bignum` are reachable from outside the repository
 

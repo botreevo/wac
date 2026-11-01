@@ -54,8 +54,8 @@ evaluation and EIP-2537 state test passes. The one thing `bls` lacked for the EV
 
 `wac run --allow-net` on the Node host used to start the program as a child with only its standard
 streams, so `sys.net()` answered "not granted" and the node needed a native host. `01762d3f7` fixed it,
-and since the repin to `09e49772a` the node runs on the Node host as on wasmtime: `tools/rpc-e2e.mjs` and
-`tools/devnet-e2e.mjs` (TCP and UDP, against geth) both pass with the Node-hosted `wac`.
+and since the repin to `09e49772a` the node runs on the Node host as on wasmtime: the RPC and devnet end-to-end tests
+(TCP and UDP, against geth) both pass with the Node-hosted `wac`.
 
 ## Done: a running Keccak-256
 

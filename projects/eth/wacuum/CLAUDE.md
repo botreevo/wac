@@ -49,8 +49,9 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
 ## Against other clients
 
 The fixtures say whether wacuum computes what Ethereum computes; other clients say whether it talks the way
-they do. `tools/rpc-e2e.mjs` drives the node with ethers, and `tools/devnet-e2e.mjs` runs it beside geth on
-an Osaka devnet, each syncing the other. geth builds from source here with
+they do. `tools/e2e/rpc.wac` drives the node as a wallet would, and `tools/e2e/devnet.wac` runs it beside
+geth on an Osaka devnet, each syncing the other; geth is the independent party, since the tests sign with
+wacuum's own secp256k1. They are wac, like everything here, and start the node with the `wac` on PATH. geth builds from source here with
 `go install github.com/ethereum/go-ethereum/cmd/geth@latest` (the Go module proxy is reachable when
 GitHub's release downloads are not), and so does anything else written in Go.
 

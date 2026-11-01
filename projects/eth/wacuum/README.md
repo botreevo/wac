@@ -37,10 +37,10 @@ in about twenty minutes on the Node host (an hour and a half on wasmtime).
 | blocks | **done**. Blocks and transactions decoded from RLP with every sender recovered, headers checked against their parents (base fee, blob gas with EIP-7918's floor, gas limit), EIP-4788 and EIP-2935 system calls, withdrawals, EIP-7685 requests, EIP-7934's size limit, and every root and the bloom checked. An invalid block is undone and leaves no trace |
 | the Engine API | **done**. `engine_newPayloadV1`–`V4`, `engine_forkchoiceUpdatedV1`–`V3` with and without payload attributes, `engine_getPayloadV3`–`V5` with blobs bundles, `engine_getBlobsV1`/`V2`, `eth_sendRawTransaction` into a mempool (blob transactions in their network form), over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Forks are followed and finality prunes them. Blob proofs and Osaka's cell proofs (each blob extended to its 128 cells) are verified, about half a second a blob |
 | persistence | **done**. With `--datadir`, every imported block and fork choice is appended to a log before it is acknowledged, and every `--snapshot-every` finalized blocks (1024) the state at the finalized block is written. On start the snapshot is loaded and the log replayed, running only the blocks after it |
-| the user's JSON-RPC | **done for what wallets and libraries use**. Blocks, transactions and receipts (`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`), `eth_getLogs`, state reads at any unfinalized block, `eth_call`, `eth_estimateGas`, fees (`eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_blobBaseFee`), and the `net_` and `web3_` basics. With `--public-rpc` they are answered without a token; ethers drives them all in `tools/rpc-e2e.mjs`. Not yet: subscriptions and traces |
+| the user's JSON-RPC | **done for what wallets and libraries use**. Blocks, transactions and receipts (`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`), `eth_getLogs`, state reads at any unfinalized block, `eth_call`, `eth_estimateGas`, fees (`eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_blobBaseFee`), and the `net_` and `web3_` basics. With `--public-rpc` they are answered without a token; `tools/e2e/rpc.wac` drives them all as a wallet would. Not yet: subscriptions and traces |
 | performance | **measured, not tuned**, and the host matters: wac's Node host runs wacuum two to four times as fast as its wasmtime host. `wac run tools/bench.wac` on Node: the interpreter at about 78 Mgas/s on arithmetic (33 on wasmtime), KECCAK256 at 32 (10); 1300 fresh SSTOREs in 4 ms and their storage root in 13 (51); a block of 1428 transfers, every sender's signature recovered, built in 1.6 s (5.5). Every Cancun state test runs in 49 s on Node and 142 s on wasmtime |
 | devp2p | **talks to geth**. RLPx (EIP-8's handshake, checked against its vectors; AES-CTR frames with keccak MACs), snappy, the base protocol and eth/69 with EIP-2124 fork ids, and discovery v4 (EIP-8's packets; Ping/Pong bonding, FindNode, Neighbors, ENR). The node finds peers from `--bootnode`s, dials them up to `--max-peers`, accepts others on `--p2p-port`, serves headers, bodies and receipts, and swaps transactions, blob transactions in their network form. Not yet: discv5, serving snap |
-| sync | **full sync from peers**. When the consensus client names a block this has not got, headers are fetched back to one it has, then bodies forward, each executed. `tools/devnet-e2e.mjs` runs geth and wacuum side by side: each syncs the other's blocks, transactions cross both ways, and both end on the same state root. Not yet: snap sync, so joining a large chain means executing all of it |
+| sync | **full sync from peers**. When the consensus client names a block this has not got, headers are fetched back to one it has, then bodies forward, each executed. `tools/e2e/devnet.wac` runs geth and wacuum side by side: each syncs the other's blocks, transactions cross both ways, and both end on the same state root. Not yet: snap sync, so joining a large chain means executing all of it |
 
 ## Running it
 
@@ -116,11 +116,19 @@ it has the blocks:
 
 The follower serves the same JSON-RPC, and a transaction sent to it reaches the first node's blocks.
 
-It runs on any of wac's hosts: Node, v8 or wasmtime. `node tools/engine-e2e.mjs FIXTURE` drives a
-running node through an engine fixture over HTTP, JWT and all, then restarts it on its data directory and
-checks the replayed state; `node tools/rpc-e2e.mjs` makes blocks as a consensus client would and uses
-ethers as a wallet against them; `node tools/devnet-e2e.mjs` (with `GETH` set) puts wacuum and geth on one
-devnet and checks that they sync from each other.
+It runs on any of wac's hosts: Node, v8 or wasmtime. Three end-to-end tests run it as a separate
+program and speak to it over sockets, so they need `--allow-run` as well as the node's own grants:
+
+```bash
+wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/engine.wac -- FIXTURE.json [NAME]
+wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/rpc.wac
+wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/devnet.wac -- path/to/geth
+```
+
+`engine.wac` drives the node through an engine fixture over HTTP, JWT and all, then restarts it on its data
+directory and checks the replayed state against the fixture's; `rpc.wac` makes blocks as a consensus client
+would and uses the node as a wallet would, then restarts it from a snapshot; `devnet.wac` puts wacuum and
+geth on one devnet and checks that they sync from each other, transactions and blobs crossing both ways.
 
 ## Layout
 
@@ -156,6 +164,7 @@ devnet and checks that they sync from each other.
     tools/enginetest.wac     the engine-test runner, through the Engine API's own methods
     tools/buildtest.wac      the block-building runner: each payload rebuilt from the mempool
     tools/dial.wac           dial a devp2p node and fetch its chain, saying what happens
+    tools/e2e/               the node run as a program and spoken to: an engine fixture, a wallet, geth
     tools/fixture.wac        what both runners read from a fixture
     tools/                   vector generators, the fixture fetcher, the cache filler
     docs/wac-asks.md         what wacuum has found wrong with, or wants from, wac

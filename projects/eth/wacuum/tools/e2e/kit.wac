@@ -1,0 +1,359 @@
+// What the end-to-end tests share: programs started in the background and stopped, JSON-RPC over HTTP with
+// and without an Engine API token, signed transactions, and the line a check prints.
+//
+// The tests run wacuum as its users do, as a separate program spoken to over sockets, so they need the
+// right to run host programs: `wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/…`.
+// Transactions are signed with wacuum's own secp256k1 and RLP; what is independent of wacuum is geth, in
+// `devnet.wac`, which takes wacuum's blocks and transactions and must agree on every hash and state root.
+
+import { Sys, Launch, ChildEnv, Socket } from "std";
+import { Vec } from "core";
+import { json.parse, json.JsonValue } from "wac";
+import { crypto.hmacSha256, crypto.keccak256, crypto.sha256 } from "wac";
+import { rlp.Item, rlp.encode } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../../src/hex.wac";
+import { u256Bytes } from "../../src/state/root.wac";
+import { publicKey, sign } from "../../src/p2p/secp.wac";
+
+// ── Checks ──
+
+/** Each check prints a line, `ok` or `FAIL`, and the failures are counted for the exit status. */
+export struct Check {
+  Sys sys;
+  i32 failed;
+
+  Check on(Sys sys) { return Check(sys, 0); }
+
+  bool that(this, bool ok, string what) {
+    this.sys.log("\{ok ? "ok  " : "FAIL"} \{what}");
+    if (!ok) { this.failed++; }
+    return ok;
+  }
+
+  /** The last line, and the program's exit status. */
+  i32 done(this) {
+    this.sys.log(this.failed > 0 ? "\{this.failed} failed" : "all ok");
+    return this.failed > 0 ? 1 : 0;
+  }
+}
+
+// ── Host programs ──
+
+/** Run `sh -c script` to its end; its standard output, or "" when it could not run. */
+export async string shell(Sys sys, string script) {
+  match (await sys.procs().exec("sh", ["-c", script], u8[].filled(0, 0), ChildEnv.inherited(), Launch.plain())) {
+    Ok(x): { return string.fromBytes(x.stdout); }
+    Err(e): { return ""; }
+  }
+}
+
+/** `s` as one word to a shell: in single quotes, each single quote in it closed, escaped and reopened. */
+export string quote(string s) {
+  u8[] b = s.toBytes();
+  string out = "'";
+  i32 from = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == 39) {
+      out += s.slice(from, i) + "'\\''";
+      from = i + 1;
+    }
+  }
+  return out + s.slice(from, b.len()) + "'";
+}
+
+/** A program running in the background, its output going to `log`. */
+export struct Proc {
+  string pid;
+  string log;
+
+  /** Start `argv` in the background. */
+  async Proc start(Sys sys, string[] argv, string log) {
+    string cmd = "exec";
+    for (i32 i = 0; i < argv.len(); i++) { cmd += " " + quote(argv[i]); }
+    string pid = await shell(sys, "\{cmd} > \{quote(log)} 2>&1 & echo $!");
+    return Proc(trim(pid), log);
+  }
+
+  /** What it has written so far. */
+  async string output(this, Sys sys) {
+    match (await sys.readFile(this.log)) {
+      Ok(b): { return string.fromBytes(b); }
+      Err(e): { return ""; }
+    }
+  }
+
+  /** Whether `text` has appeared in its output, waiting up to `millis` for it. */
+  async bool says(this, Sys sys, string text, i32 millis) {
+    for (i32 t = 0; t < millis; t += 200) {
+      if ((await this.output(sys)).indexOf(text) >= 0) { return true; }
+      await sys.sleepMillis(200);
+    }
+    return false;
+  }
+
+  /** Stop it, and wait until it has gone: what it was writing to disk is then whole. */
+  async void stop(this, Sys sys) {
+    await shell(sys, "kill \{this.pid} 2>/dev/null; while kill -0 \{this.pid} 2>/dev/null; do sleep 0.1; done");
+  }
+}
+
+export string trim(string s) {
+  i32 end = s.len();
+  while (end > 0 && (s.slice(end - 1, end) == "\n" || s.slice(end - 1, end) == " " || s.slice(end - 1, end) == "\r")) { end--; }
+  return s.slice(0, end);
+}
+
+/** A fresh directory for a run's files; the caller removes it with `removeDir`. */
+export async string tempDir(Sys sys, string prefix) { return trim(await shell(sys, "mktemp -d -t \{prefix}-XXXXXX")); }
+
+export async void removeDir(Sys sys, string dir) { await shell(sys, "rm -rf \{quote(dir)}"); }
+
+/** A port to listen on: chosen at random in [from, from + span), so that runs side by side rarely meet. */
+export async i32 somePort(Sys sys, i32 from, i32 span) {
+  u8[] r = (await sys.random().bytes(2)).ok()!;
+  return from + ((r[0] as i32) * 256 + (r[1] as i32)) % span;
+}
+
+// ── JSON-RPC ──
+
+/** An answer: the HTTP status, and the JSON body when there was one. */
+export struct Reply {
+  i32 status;
+  JsonValue? body;
+
+  /** The result, or null for an error or no answer. */
+  JsonValue? result(this) {
+    if (this.body is null) { return null; }
+    JsonValue? r = this.body!.member("result");
+    return r;
+  }
+
+  string error(this) {
+    if (this.body is null) { return "no answer (HTTP \{this.status})"; }
+    JsonValue? e = this.body!.member("error");
+    if (e is null) { return ""; }
+    return e!.member("message")?.text() ?? "an error";
+  }
+}
+
+/** A node's JSON-RPC endpoint on 127.0.0.1, with the Engine API's secret when it has one. */
+export struct Rpc {
+  Sys sys;
+  i32 port;
+  u8[]? secret;
+
+  Rpc at(Sys sys, i32 port) { return Rpc(sys, port, null); }
+  Rpc authed(Sys sys, i32 port, u8[] secret) { return Rpc(sys, port, secret); }
+
+  /** `method` with `params`, already JSON. */
+  async Reply call(this, string method, string params) {
+    string token = "";
+    if (this.secret is not null) { token = jwt(this.secret!, (await this.sys.clock().nowMillis()).orElse(0 as i64) / 1000); }
+    return await this.raw("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\{method}\",\"params\":\{params}}", token);
+  }
+
+  /** `call`'s result, or null; a failure is printed, since a test that gets none usually goes on to fail on it. */
+  async JsonValue? get(this, string method, string params) {
+    Reply r = await this.call(method, params);
+    if (r.error() != "") { this.sys.warn("  \{method}: \{r.error()}"); }
+    return r.result();
+  }
+
+  /** A text result, or "". */
+  async string text(this, string method, string params) {
+    JsonValue? v = await this.get(method, params);
+    return v is null ? "" : (v!.text() ?? "");
+  }
+
+  /** POST `body`, with `token` as a bearer token when it is not "". */
+  async Reply raw(this, string body, string token) {
+    match (await this.sys.net().connect("127.0.0.1", this.port)) {
+      Err(err): { return Reply(0, null); }
+      Ok(sock): {
+        string auth = token == "" ? "" : "Authorization: Bearer \{token}\r\n";
+        u8[] b = body.toBytes();
+        string head = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\{auth}Content-Length: \{b.len()}\r\nConnection: close\r\n\r\n";
+        await sock.send(head.toBytes());
+        await sock.send(b);
+        u8[] got = await readAll(sock);
+        sock.close();
+        return parseResponse(got);
+      }
+    }
+  }
+}
+
+/** Everything until the other end closes. */
+async u8[] readAll(Socket sock) {
+  Vec<u8[]> parts = Vec.create();
+  i32 n = 0;
+  bool done = false;
+  while (!done) {
+    match (await sock.recv()) {
+      Err(err): { done = true; }
+      Ok(r): {
+        match (r) {
+          End: { done = true; }
+          Data(bytes): {
+            parts.push(bytes);
+            n += bytes.len();
+          }
+        }
+      }
+    }
+  }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    u8[] p = parts.get(i);
+    for (i32 k = 0; k < p.len(); k++) { out[at + k] = p[k]; }
+    at += p.len();
+  }
+  return out;
+}
+
+/** An HTTP response: its status, and its body as JSON, whole or chunked. */
+Reply parseResponse(u8[] r) {
+  i32 end = -1;
+  for (i32 i = 0; i + 3 < r.len() && end < 0; i++) {
+    if (r[i] == 13 && r[i + 1] == 10 && r[i + 2] == 13 && r[i + 3] == 10) { end = i + 4; }
+  }
+  if (end < 0) { return Reply(0, null); }
+  string head = string.fromBytes(slice(r, 0, end));
+  i32 status = 0;
+  if (head.len() >= 12) {
+    u8[] d = head.slice(9, 12).toBytes();
+    for (i32 i = 0; i < 3; i++) { status = status * 10 + ((d[i] - 48) as i32); }
+  }
+  u8[] body = slice(r, end, r.len());
+  if (head.indexOf("chunked") >= 0) { body = unchunk(body); }
+  match (parse(body)) {
+    Ok(doc): { return Reply(status, doc); }
+    Err(e): { return Reply(status, null); }
+  }
+}
+
+u8[] unchunk(u8[] b) {
+  Vec<u8> out = Vec.create();
+  i32 at = 0;
+  while (at < b.len()) {
+    i32 size = 0;
+    while (at < b.len() && b[at] != 13) {
+      i32 c = b[at] as i32;
+      i32 v = c >= 97 ? c - 87 : c >= 65 ? c - 55 : c - 48;
+      if (c != 59) { size = size * 16 + v; }
+      at++;
+    }
+    at += 2;
+    if (size == 0) { break; }
+    for (i32 i = 0; i < size && at + i < b.len(); i++) { out.push(b[at + i]); }
+    at += size + 2;
+  }
+  return out.toArray();
+}
+
+export u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = b[from + i]; }
+  return out;
+}
+
+/** An HS256 JWT issued at `iat`, as the Engine API wants: the token a consensus client sends. */
+export string jwt(u8[] secret, i64 iat) {
+  string signing = base64url("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".toBytes()) + "." + base64url("{\"iat\":\{iat}}".toBytes());
+  return signing + "." + base64url(hmacSha256(secret, signing.toBytes()));
+}
+
+export string base64url(u8[] b) {
+  u8[] abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toBytes();
+  Vec<u8> out = Vec.create();
+  for (i32 i = 0; i < b.len(); i += 3) {
+    i32 n = ((b[i] as i32) << 16) | (i + 1 < b.len() ? (b[i + 1] as i32) << 8 : 0) | (i + 2 < b.len() ? (b[i + 2] as i32) : 0);
+    out.push(abc[(n >> 18) & 63]);
+    out.push(abc[(n >> 12) & 63]);
+    if (i + 1 < b.len()) { out.push(abc[(n >> 6) & 63]); }
+    if (i + 2 < b.len()) { out.push(abc[n & 63]); }
+  }
+  return string.fromBytes(out.toArray());
+}
+
+// ── Accounts and transactions ──
+
+/** The address a private key signs for, as 0x-hex. */
+export string addressOf(u8[] key) { return bytesToHex(slice(keccak256(publicKey(key)), 12, 32)); }
+
+/** Where `sender`'s CREATE with `nonce` puts its contract: keccak(rlp([sender, nonce]))[12:]. */
+export string createAddress(string sender, u64 nonce) {
+  return bytesToHex(slice(keccak256(encode(Item.List([Item.Bytes(hexToBytes(sender)!), int(U256.ofU64(nonce))]))), 12, 32));
+}
+
+export Item int(U256 v) { return Item.Bytes(u256Bytes(v)); }
+
+/** The fees every test transaction offers: 10 gwei at most, 1 gwei to the block's maker. */
+export static u64 MAX_FEE = 10000000000;
+export static u64 TIP = 1000000000;
+
+/** An EIP-1559 transaction, signed, as 0x-hex: to `to` ("" creates), with `value` wei and `data`. */
+export string type2(u8[] key, u64 chainId, u64 nonce, string to, U256 value, u8[] data, u64 gas) {
+  Item[] fields = [int(U256.ofU64(chainId)), int(U256.ofU64(nonce)), int(U256.ofU64(TIP)), int(U256.ofU64(MAX_FEE)),
+                   int(U256.ofU64(gas)), Item.Bytes(to == "" ? u8[].filled(0, 0) : hexToBytes(to)!), int(value), Item.Bytes(data),
+                   Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0))))];
+  return bytesToHex(signed(2, fields, key));
+}
+
+/**
+ * An EIP-4844 transaction of the zero blob, in the network form Osaka takes: the signed transaction, then
+ * version 1, the blob, its commitment and its 128 cell proofs. The zero blob's commitment and every proof
+ * of it are the point at infinity, so none has to be computed.
+ */
+export string zeroBlobTx(u8[] key, u64 chainId, u64 nonce, string to) {
+  u8[] point = u8[].filled(48, 0);
+  point[0] = 0xc0;
+  u8[] vhash = sha256(point);
+  vhash[0] = 1;
+  Item[] fields = [int(U256.ofU64(chainId)), int(U256.ofU64(nonce)), int(U256.ofU64(TIP)), int(U256.ofU64(MAX_FEE)),
+                   int(U256.ofU64(21000)), Item.Bytes(hexToBytes(to)!), int(U256.one()), Item.Bytes(u8[].filled(0, 0)),
+                   Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))), int(U256.ofU64(TIP)),
+                   Item.List([Item.Bytes(vhash)])];
+  Item[] proofs = Item[].filled(128, Item.Bytes(point));
+  Item body = Item.List(signedFields(3, fields, key));
+  return bytesToHex(typed(3, encode(Item.List([body, Item.Bytes([1 as u8]), Item.List([Item.Bytes(u8[].filled(131072, 0))]),
+                                                Item.List([Item.Bytes(point)]), Item.List(proofs)]))));
+}
+
+/** A typed transaction's fields with its signature after them: yParity, r, s. */
+Item[] signedFields(u8 txType, Item[] fields, u8[] key) {
+  u8[] sig = sign(keccak256(typed(txType, encode(Item.List(fields)))), key);
+  Item[] all = Item[].filled(fields.len() + 3, Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < fields.len(); i++) { all[i] = fields[i]; }
+  all[fields.len()] = int(U256.ofU64(sig[64] as u64));
+  all[fields.len() + 1] = int(U256.fromBytes(sig, 0, 32));
+  all[fields.len() + 2] = int(U256.fromBytes(sig, 32, 32));
+  return all;
+}
+
+u8[] signed(u8 txType, Item[] fields, u8[] key) { return typed(txType, encode(Item.List(signedFields(txType, fields, key)))); }
+
+u8[] typed(u8 txType, u8[] body) {
+  u8[] out = u8[].filled(body.len() + 1, txType);
+  for (i32 i = 0; i < body.len(); i++) { out[i + 1] = body[i]; }
+  return out;
+}
+
+// ── JSON ──
+
+/** A field of a JSON object as text, or "" when it is not there. */
+export string field(JsonValue? v, string name) {
+  if (v is null) { return ""; }
+  return v!.member(name)?.text() ?? "";
+}
+
+/** A hex quantity as a number; 0 for anything else. */
+export u64 quantity(string hex) {
+  U256? v = U256.fromHex(hex);
+  return v is null ? 0 : v!.low();
+}
+
+/** Hex as a number, so that two spellings of one quantity compare equal: "0x0" and "0x00", say. */
+export U256 number(string hex) { return U256.fromHex(hex == "" ? "0x0" : hex) ?? U256.zero(); }

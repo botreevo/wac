@@ -1,0 +1,151 @@
+// The user's JSON-RPC, used as a wallet would: start wacuum with --public-rpc on a fresh chain, make blocks
+// the way a consensus client would (forkchoiceUpdated with attributes, getPayload, newPayload,
+// forkchoiceUpdated), and send a transfer, deploy a contract, call it, estimate gas, read receipts, blocks,
+// logs and fees. Then stop it, start it again from its snapshot, and check it is where it was.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/rpc.wac
+//
+// It runs the node with the `wac` on PATH, from cmd/wacuum.wac.
+
+import { Sys } from "std";
+import { json.JsonValue, json.stringify } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { systemContracts } from "../../src/chain/dev.wac";
+import { Check, Proc, Rpc, Reply, tempDir, removeDir, somePort, addressOf, createAddress, type2, field, quantity } from "./kit.wac";
+
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+static string TO = "0x2222222222222222222222222222222222222222";
+
+/** The node, and what the consensus client's half of the test remembers between blocks. */
+struct Node {
+  Sys sys;
+  string dir;
+  i32 port;
+  Proc proc;
+  Rpc engine;
+  Rpc user;
+  string head;
+  u64 time;
+}
+
+async Proc startNode(Sys sys, string dir, i32 port) {
+  Proc p = await Proc.start(sys, ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                                  "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
+                                  "--port", "\{port}", "--datadir", dir + "/data", "--snapshot-every", "2"],
+                            dir + "/wacuum.log");
+  await p.says(sys, "Engine API on", 600000);
+  return p;
+}
+
+/** Be the consensus client for one block: build it from the mempool, import it, make it head and final. */
+async JsonValue? makeBlock(Node n) {
+  string fc = "{\"headBlockHash\":\"\{n.head}\",\"safeBlockHash\":\"\{n.head}\",\"finalizedBlockHash\":\"\{ZERO}\"}";
+  string attrs = "{\"timestamp\":\"\{U256.ofU64(n.time).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                 "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fe\",\"withdrawals\":[],\"parentBeaconBlockRoot\":\"\{ZERO}\"}";
+  n.time += 12;
+  string id = field(await n.engine.get("engine_forkchoiceUpdatedV3", "[\{fc},\{attrs}]"), "payloadId");
+  Reply got = await n.engine.call("engine_getPayloadV4", "[\"\{id}\"]");
+  JsonValue? p = got.result();
+  if (p is null) { return null; }
+  JsonValue payload = p!.member("executionPayload")!;
+  string requests = string.fromBytes(stringifyOf(p!.member("executionRequests")!));
+  string st = field(await n.engine.get("engine_newPayloadV4", "[\{string.fromBytes(stringifyOf(payload))},[],\"\{ZERO}\",\{requests}]"), "status");
+  if (st != "VALID") { return null; }
+  string h = field(payload, "blockHash");
+  // Each block is final at once, so the node takes snapshots as the chain grows.
+  await n.engine.get("engine_forkchoiceUpdatedV3", "[{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{h}\"},null]");
+  n.head = h;
+  return payload;
+}
+
+u8[] stringifyOf(JsonValue v) { return stringify(v); }
+
+export async i32 main(Sys sys) {
+  Check t = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-rpc");
+  u8[] key = u8[].filled(32, 0x11);
+  string me = addressOf(key);
+  string genesis = "{\"config\":{\"chainId\":1337,\"cancunTime\":0,\"pragueTime\":0},\"gasLimit\":\"0x1c9c380\"," +
+                   "\"baseFeePerGas\":\"0x3b9aca00\",\"timestamp\":\"0x0\",\"alloc\":{\"\{me}\":{\"balance\":\"0x56bc75e2d63100000\"}," +
+                   systemContracts() + "}}";
+  await sys.writeFile(dir + "/genesis.json", genesis.toBytes());
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+  i32 port = await somePort(sys, 19551, 1000);
+
+  Proc proc = await startNode(sys, dir, port);
+  Rpc user = Rpc.at(sys, port);
+  Node n = Node(sys, dir, port, proc, Rpc.authed(sys, port, secret), user, field(await user.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash"), 12);
+
+  t.that(await user.text("eth_chainId", "[]") == "0x539", "eth_chainId");
+
+  // A transfer.
+  string sent = await user.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, 0, TO, U256.ofU64(12345), u8[].filled(0, 0), 21000)}\"]");
+  await makeBlock(n);
+  JsonValue? r1 = await user.get("eth_getTransactionReceipt", "[\"\{sent}\"]");
+  t.that(field(r1, "status") == "0x1" && field(r1, "blockNumber") == "0x1", "a transfer is mined in block 1");
+  t.that(quantity(await user.text("eth_getBalance", "[\"\{TO}\",\"latest\"]")) == 12345, "and its value arrived");
+  t.that(quantity(await user.text("eth_getBalance", "[\"\{TO}\",\"0x1\"]")) == 12345, "a state read at a block number");
+  t.that(quantity(await user.text("eth_getTransactionCount", "[\"\{me}\",\"latest\"]")) == 1, "the sender's nonce moved");
+
+  // A contract whose every call logs 42 under one topic: init code that returns that runtime.
+  string topic = bytesToHex(keccak256("Answered(uint256)".toBytes()));
+  string runtime = "602a600052" + "7f" + topic.slice(2, 66) + "60206000a100";
+  string len = bytesToHex([(runtime.len() / 2) as! u8]).slice(2, 4);
+  string init = "60" + len + "600c60003960" + len + "6000f3" + runtime;
+  string deploy = await user.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, 1, "", U256.zero(), hexBytes(init), 200000)}\"]");
+  await makeBlock(n);
+  JsonValue? r2 = await user.get("eth_getTransactionReceipt", "[\"\{deploy}\"]");
+  string contract = field(r2, "contractAddress");
+  t.that(field(r2, "status") == "0x1" && contract == createAddress(me, 1), "a contract is deployed at keccak(rlp([sender, nonce]))");
+  t.that(await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + runtime, "with its runtime code");
+  u64 est = quantity(await user.text("eth_estimateGas", "[{\"from\":\"\{me}\",\"to\":\"\{contract}\",\"data\":\"0x\"}]"));
+  t.that(est > 21000 && est < 30000, "eth_estimateGas: \{est}");
+  string called = await user.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, 2, contract, U256.zero(), u8[].filled(0, 0), est)}\"]");
+  JsonValue? b3 = await makeBlock(n);
+  JsonValue? r3 = await user.get("eth_getTransactionReceipt", "[\"\{called}\"]");
+  t.that(field(r3, "status") == "0x1" && quantity(field(r3, "gasUsed")) <= est, "the call succeeds within the estimate");
+  JsonValue? log0 = r3?.member("logs")?.item(0);
+  t.that(log0 is not null && (log0!.member("topics")?.item(0)?.text() ?? "") == topic && quantity(field(log0, "data")) == 42, "its log is in the receipt");
+  JsonValue? logs = await user.get("eth_getLogs", "[{\"address\":\"\{contract}\",\"topics\":[\"\{topic}\"],\"fromBlock\":\"0x0\"}]");
+  t.that((logs?.array()?.len() ?? -1) == 1 && field(logs!.item(0), "transactionHash") == called, "eth_getLogs finds it");
+  string other = bytesToHex(keccak256("other".toBytes()));
+  t.that(((await user.get("eth_getLogs", "[{\"topics\":[\"\{other}\"],\"fromBlock\":\"0x0\"}]"))?.array()?.len() ?? -1) == 0, "and not under another topic");
+  JsonValue? block = await user.get("eth_getBlockByNumber", "[\"0x3\",true]");
+  t.that(field(block, "hash") == field(b3, "blockHash") && field(block?.member("transactions")?.item(0), "hash") == called,
+         "eth_getBlockByNumber, full");
+  JsonValue? tx = await user.get("eth_getTransactionByHash", "[\"\{called}\"]");
+  t.that(field(tx, "blockNumber") == "0x3" && field(tx, "from") == me && field(tx, "r") != "0x0", "eth_getTransactionByHash");
+  t.that(quantity(await user.text("eth_gasPrice", "[]")) > 0 && quantity(await user.text("eth_maxPriorityFeePerGas", "[]")) == 1000000000,
+         "eth_gasPrice and eth_maxPriorityFeePerGas");
+  JsonValue? hist = await user.get("eth_feeHistory", "[\"0x2\",\"latest\",[50]]");
+  t.that((hist?.member("baseFeePerGas")?.array()?.len() ?? -1) == 3 && (hist?.member("reward")?.array()?.len() ?? -1) == 2, "eth_feeHistory");
+  t.that(await user.text("eth_call", "[{\"to\":\"\{contract}\"},\"latest\"]") == "0x", "eth_call");
+  t.that(await user.text("eth_blockNumber", "[]") == "0x3", "eth_blockNumber");
+  t.that((await user.call("engine_forkchoiceUpdatedV3", "[{},null]")).error() != "", "the Engine API is refused without a token");
+
+  // Restarted, it starts from its last snapshot and replays only what came after.
+  t.that((await proc.output(sys)).indexOf("snapshot at block 2") >= 0, "a snapshot was taken at block 2");
+  await proc.stop(sys);
+  proc = await startNode(sys, dir, port);
+  t.that((await proc.output(sys)).indexOf("starting from the snapshot at block 2") >= 0, "restarted from the snapshot");
+  t.that(await user.text("eth_blockNumber", "[]") == "0x3", "at the same head");
+  t.that(quantity(await user.text("eth_getBalance", "[\"\{TO}\",\"latest\"]")) == 12345 &&
+         await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + runtime, "with the same state");
+  t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{called}\"]"), "status") == "0x1", "and block 3's receipts, which ran again");
+
+  await proc.stop(sys);
+  await removeDir(sys, dir);
+  return t.done();
+}
+
+u8[] hexBytes(string h) {
+  u8[] out = u8[].filled(h.len() / 2, 0);
+  u8[] d = h.toBytes();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ((nibble(d[2 * i]) << 4) | nibble(d[2 * i + 1])) as! u8; }
+  return out;
+}
+
+i32 nibble(u8 c) { return c >= 97 ? (c as i32) - 87 : (c as i32) - 48; }

@@ -105,6 +105,11 @@ start it again on the same `--datadir` and the chain goes on from where it was. 
 blocks for the `eth_` methods (`--history N` to change it; 0 keeps them all), so its memory stays
 level however long it runs.
 
+The well-known key suits a devnet on one machine. For one other people can reach, `--dev-key random`
+funds a key of its own instead (kept in the data directory as `devkey`, and printed), or `--dev-key HEX`
+one you choose; a `--follow` node on the same chain is given the same `--dev-key`. Otherwise anyone who can
+reach the RPC can spend the dev account, and fill every block.
+
 Another node can run beside it without a consensus client too. Give the first a `--p2p-port` (it prints
 its enode), and start the second with `--follow`, which takes the head its peers announce as its own once
 it has the blocks:

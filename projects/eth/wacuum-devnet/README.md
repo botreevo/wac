@@ -126,9 +126,8 @@ match; a follower that does it by itself is still to be written. Both are wacuum
 
 `wac.json5` imports three packages by git, each pinned in `wac.lock`:
 
-- **wacuum**, from its `lib` branch: `master` plus a `src/lib.wac` named as the package's `exports`. wac lets a
-  project reach another project only through its `exports`, and wacuum's `master` has none. Once that commit is
-  on wacuum's `master` (its `issues/0006d`), point the `ref` there.
+- **wacuum**, from `master`, through the `src/lib.wac` its manifest names as `exports`: wac lets a project reach
+  another project only that way.
 - **wac**, at the commit wacuum pins, so that values crossing between the two (JSON from the engine, above all)
   are one type.
 - **web**, for components and `documentOf`.

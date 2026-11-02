@@ -47,3 +47,23 @@ building the curve (and its pairing constants) for every call, which at 150 gas 
 1 ms a recovery is the same cost a transfer's sender recovery has (`tools/bench.wac`'s transfers run at 20
 Mgas/s), and P256VERIFY at about 7 ms a verification is the slowest per call — both are worth a look at how
 their curve and its precomputation are built per call.
+
+## Measured again at `ca9b924` (2026-11-02)
+
+The same contract, inputs and machine, with `wac` built from `d267592b8`:
+
+| precompile | at `4f48eaa` | at `ca9b924` |
+|---|---|---|
+| bn254 add (0x06) | 248 s | **2.9 s** |
+| bn254 mul (0x07) | 21 s | **4.6 s** |
+| bn254 pairing, 2 pairs (0x08) | 25 s | **3.5 s** |
+| P256VERIFY (0x100) | 53 s | **3.0 s** |
+| ecrecover (0x01) | 15 s | **3.0 s** |
+| KZG point evaluation (0x0a) | 1.9 s | 1.5 s |
+| blake2f, 1M rounds (0x09) | 2.0 s | 0.8 s |
+| modexp, 256-bit, full exponent (0x05) | 1.9 s | 1.1 s |
+
+So nothing takes minutes now, and the five that did are within 1.5x to 2.3x of a 2-second block. The ones
+still over it, slowest first: bn254 mul, the pairing, P256VERIFY, ecrecover and bn254 add — at 3 to 10 Mgas/s
+against `tools/bench.wac`'s 131 for the interpreter on the same build. A devnet making blocks every 2 s falls
+behind under a flood of them by about that factor, rather than stopping.

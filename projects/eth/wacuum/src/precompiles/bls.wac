@@ -7,14 +7,15 @@
 // input the EIP calls an error, which the caller turns into a failure that consumes all the gas.
 
 import { bls.G1, bls.G2, bls.Fp2, bls.Fp12, bls.Pair, bls.g1Infinity, bls.g1IsInfinity, bls.g1Generator, bls.g1Negate,
-         bls.g1Add, bls.g1Mul, bls.g1IsOnCurve, bls.g1InSubgroup, bls.g1AffineX, bls.g1AffineY, bls.g1FromBytes,
+         bls.g1Add, bls.g1Mul, bls.g1IsOnCurve, bls.g1InSubgroup, bls.g1FromBytes,
          bls.g2Infinity, bls.g2IsInfinity, bls.g2Generator, bls.g2Negate, bls.g2Add, bls.g2Mul, bls.g2IsOnCurve,
-         bls.g2InSubgroup, bls.g2AffineX, bls.g2AffineY, bls.g2FromBytes, bls.mapToCurveG2, bls.clearCofactorG2,
-         bls.fpZero, bls.fpOne, bls.fpIsZero, bls.fpAdd, bls.fpMul, bls.fpSquare, bls.fpNeg, bls.fpInvert,
-         bls.fpSqrt, bls.fpSgn0, bls.fpFromBytes, bls.fpToBytes, bls.millerLoopMulti, bls.finalExponentiate,
+         bls.g2InSubgroup, bls.g2FromBytes, bls.mapToCurveG2, bls.clearCofactorG2,
+         bls.fpZero, bls.fpOne, bls.fpIsZero, bls.fpAdd, bls.fpMul, bls.fpSquare, bls.fpNeg,
+         bls.fpSqrt, bls.fpSgn0, bls.fpFromBytes, bls.fpToBytes, bls.fp2Norm, bls.fp2Square, bls.fp2Mul, bls.millerLoopMulti, bls.finalExponentiate,
          bls.fp12IsOne } from "wac";
 import { crypto.sha256 } from "wac";
 import { g1Msm, g2Msm } from "../crypto/msm.wac";
+import { fpInverse } from "../crypto/blsinv.wac";
 import { hexToBytes } from "../hex.wac";
 
 // ── EIP-2537's encodings ─────────────────────────────────────────────────────────────────────────
@@ -70,19 +71,41 @@ void putFp(u8[] out, i32 at, u32[] v) {
   for (i32 i = 0; i < 48; i++) { out[at + 16 + i] = b[i]; }
 }
 
+/**
+ * A point's affine x and y, from one inversion of z — `bls`'s g1AffineX and g1AffineY each invert z, so
+ * asking for both cost two — and by blsinv.wac's inversion, three times quicker than `bls`'s. An inversion is
+ * most of what a G1ADD costs.
+ */
+export u32[][] g1Affine(G1 p) {
+  u32[] zi = fpInverse(p.z)!;
+  u32[] zi2 = fpSquare(zi);
+  return [fpMul(p.x, zi2), fpMul(p.y, fpMul(zi2, zi))];
+}
+
+/** The same in G2, over Fp2. */
+export Fp2[] g2Affine(G2 p) {
+  // (a + bu)⁻¹ = (a − bu) / (a² + b²): one inversion in Fp, the faster one.
+  u32[] n = fpInverse(fp2Norm(p.z))!;
+  Fp2 zi = Fp2(fpMul(p.z.c0, n), fpMul(fpNeg(p.z.c1), n));
+  Fp2 zi2 = fp2Square(zi);
+  return [fp2Mul(p.x, zi2), fp2Mul(p.y, fp2Mul(zi2, zi))];
+}
+
 u8[] g1Bytes(G1 p) {
   u8[] out = u8[].filled(128, 0);
   if (g1IsInfinity(p)) { return out; }
-  putFp(out, 0, g1AffineX(p)!);
-  putFp(out, 64, g1AffineY(p)!);
+  u32[][] xy = g1Affine(p);
+  putFp(out, 0, xy[0]);
+  putFp(out, 64, xy[1]);
   return out;
 }
 
 u8[] g2Bytes(G2 p) {
   u8[] out = u8[].filled(256, 0);
   if (g2IsInfinity(p)) { return out; }
-  Fp2 x = g2AffineX(p)!;
-  Fp2 y = g2AffineY(p)!;
+  Fp2[] xy = g2Affine(p);
+  Fp2 x = xy[0];
+  Fp2 y = xy[1];
   putFp(out, 0, x.c0);
   putFp(out, 64, x.c1);
   putFp(out, 128, y.c0);
@@ -167,7 +190,9 @@ bool pairingIsOne(G1[] g1s, G2[] g2s) {
   i32 j = 0;
   for (i32 i = 0; i < g1s.len(); i++) {
     if (g1IsInfinity(g1s[i]) || g2IsInfinity(g2s[i])) { continue; }
-    pairs[j] = Pair(g1AffineX(g1s[i])!, g1AffineY(g1s[i])!, g2AffineX(g2s[i])!, g2AffineY(g2s[i])!);
+    u32[][] a = g1Affine(g1s[i]);
+    Fp2[] b = g2Affine(g2s[i]);
+    pairs[j] = Pair(a[0], a[1], b[0], b[1]);
     j++;
   }
   Fp12? f = finalExponentiate(millerLoopMulti(pairs));
@@ -251,7 +276,7 @@ u32[] fpSmall(i32 n) {
   return fpFromBytes(v)!;
 }
 
-u32[] inv0(u32[] a) { return fpInvert(a) ?? fpZero(); }
+u32[] inv0(u32[] a) { return fpInverse(a) ?? fpZero(); }
 
 static string SWU_A = "144698a3b8e9433d693a02c96d4982b0ea985383ee66a8d8e8981aefd881ac98936f8da0e0f97f5cf428082d584c1d";
 static string SWU_B = "12e2908d11688030018b12e8753eee3b2016c1f0f24f4070a0b9c14fcef35ef55a23215a316ceaa5d1cc48e98e172be0";
@@ -347,8 +372,8 @@ G1 mapToCurveG1(u32[] u) {
   if (fpSgn0(yy) != fpSgn0(u)) { yy = fpNeg(yy); }
 
   // The 11-isogeny back to E. A vanishing denominator is RFC 9380's exceptional case, the identity.
-  u32[]? xd = fpInvert(poly(X_DEN, x));
-  u32[]? yd = fpInvert(poly(Y_DEN, x));
+  u32[]? xd = fpInverse(poly(X_DEN, x));
+  u32[]? yd = fpInverse(poly(Y_DEN, x));
   if (xd is null || yd is null) { return g1Infinity(); }
   return G1(fpMul(poly(X_NUM, x), xd!), fpMul(fpMul(yy, poly(Y_NUM, x)), yd!), fpOne());
 }

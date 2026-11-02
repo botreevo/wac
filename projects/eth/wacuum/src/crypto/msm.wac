@@ -6,9 +6,18 @@
 // window's digit names, and the buckets are folded with a running sum, so bucket j counts j times; the
 // windows are then combined by c doublings each. For n points that is about (256/c)·(n + 2ᶜ) additions,
 // against n·256 doublings and n·128 additions one point at a time.
+//
+// Below 512 points the bucket method loses, here, to the simpler thing: every scalar in width-5 NAF over one
+// shared run of 256 doublings, with each point's odd multiples — about 51 additions a point. Measured on the
+// Node host, one G2 point took 5.3 ms by buckets and 2.4 by this; 128 points, 127 ms and 79; at 512 they meet.
 
-import { bls.G1, bls.G2, bls.g1Infinity, bls.g1IsInfinity, bls.g1Add, bls.g1Double, bls.g2Infinity, bls.g2IsInfinity,
-         bls.g2Add, bls.g2Double } from "wac";
+import { bls.G1, bls.G2, bls.g1Infinity, bls.g1IsInfinity, bls.g1Add, bls.g1Double, bls.g1Negate, bls.g2Infinity,
+         bls.g2IsInfinity, bls.g2Add, bls.g2Double, bls.g2Negate } from "wac";
+import { U256 } from "../u256.wac";
+import { wnaf } from "./curve.wac";
+
+/** Where the bucket method starts to beat one shared run of doublings. */
+static i32 BUCKETS_FROM = 512;
 
 /** A window width for `n` points: about log₂ n, at least 1. */
 i32 windowFor(i32 n) {
@@ -37,6 +46,7 @@ i32 bitsOf(u32[][] scalars) {
 }
 
 export G1 g1Msm(G1[] points, u32[][] scalars) {
+  if (points.len() < BUCKETS_FROM) { return g1MsmSmall(points, scalars); }
   i32 c = windowFor(points.len());
   i32 bits = bitsOf(scalars);
   G1 acc = g1Infinity();
@@ -59,6 +69,7 @@ export G1 g1Msm(G1[] points, u32[][] scalars) {
 }
 
 export G2 g2Msm(G2[] points, u32[][] scalars) {
+  if (points.len() < BUCKETS_FROM) { return g2MsmSmall(points, scalars); }
   i32 c = windowFor(points.len());
   i32 bits = bitsOf(scalars);
   G2 acc = g2Infinity();
@@ -76,6 +87,66 @@ export G2 g2Msm(G2[] points, u32[][] scalars) {
       sum = g2Add(sum, running);
     }
     acc = g2Add(acc, sum);
+  }
+  return acc;
+}
+
+/** A scalar as `bls` takes one — eight 32-bit limbs, least significant first — as a U256. */
+U256 scalarU256(u32[] s) {
+  return U256(((s[1] as u64) << 32) | (s[0] as u64), ((s[3] as u64) << 32) | (s[2] as u64), ((s[5] as u64) << 32) | (s[4] as u64),
+              ((s[7] as u64) << 32) | (s[6] as u64));
+}
+
+/** Σ k_i P_i over G1 for a few points: width-5 NAF digits for each over one run of doublings. */
+G1 g1MsmSmall(G1[] points, u32[][] scalars) {
+  i32 n = points.len();
+  i32[][] digits = i32[][].filled(n, i32[].filled(0, 0));
+  G1[][] tables = G1[][].filled(n, G1[].filled(0, g1Infinity()));
+  i32 len = 0;
+  for (i32 i = 0; i < n; i++) {
+    digits[i] = wnaf(scalarU256(scalars[i]));
+    if (digits[i].len() > len) { len = digits[i].len(); }
+    G1[] t = G1[].filled(8, points[i]);
+    G1 twice = g1Double(points[i]);
+    for (i32 k = 1; k < 8; k++) { t[k] = g1Add(t[k - 1], twice); }
+    tables[i] = t;
+  }
+  G1 acc = g1Infinity();
+  for (i32 b = len - 1; b >= 0; b--) {
+    acc = g1Double(acc);
+    for (i32 i = 0; i < n; i++) {
+      if (b >= digits[i].len() || digits[i][b] == 0) { continue; }
+      i32 d = digits[i][b];
+      G1 m = tables[i][(d < 0 ? -d : d) >> 1];
+      acc = g1Add(acc, d < 0 ? g1Negate(m) : m);
+    }
+  }
+  return acc;
+}
+
+/** The same over G2. */
+G2 g2MsmSmall(G2[] points, u32[][] scalars) {
+  i32 n = points.len();
+  i32[][] digits = i32[][].filled(n, i32[].filled(0, 0));
+  G2[][] tables = G2[][].filled(n, G2[].filled(0, g2Infinity()));
+  i32 len = 0;
+  for (i32 i = 0; i < n; i++) {
+    digits[i] = wnaf(scalarU256(scalars[i]));
+    if (digits[i].len() > len) { len = digits[i].len(); }
+    G2[] t = G2[].filled(8, points[i]);
+    G2 twice = g2Double(points[i]);
+    for (i32 k = 1; k < 8; k++) { t[k] = g2Add(t[k - 1], twice); }
+    tables[i] = t;
+  }
+  G2 acc = g2Infinity();
+  for (i32 b = len - 1; b >= 0; b--) {
+    acc = g2Double(acc);
+    for (i32 i = 0; i < n; i++) {
+      if (b >= digits[i].len() || digits[i][b] == 0) { continue; }
+      i32 d = digits[i][b];
+      G2 m = tables[i][(d < 0 ? -d : d) >> 1];
+      acc = g2Add(acc, d < 0 ? g2Negate(m) : m);
+    }
   }
   return acc;
 }

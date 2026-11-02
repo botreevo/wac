@@ -2,7 +2,8 @@
 // (X/Z^2, Y/Z^3), and Z = 0 is the point at infinity. secp256k1 (b = 7) and bn254's G1 (b = 3) are both
 // this shape, so ecrecover and the bn254 precompiles share it.
 //
-// The formulas are the Explicit-Formulas Database's for a = 0: dbl-2009-l and add-2007-bl.
+// The formulas are the Explicit-Formulas Database's: dbl-2009-l for a = 0, dbl-2001-b for a = −3 (P-256,
+// y^2 = x^3 − 3x + b), and add-2007-bl, which does not depend on a.
 
 import { U256 } from "../u256.wac";
 import { Field } from "./field.wac";
@@ -17,8 +18,13 @@ export struct Curve {
   Field f;
   /** b, in Montgomery form. */
   u64[] b;
+  /** Whether a is −3 rather than 0. */
+  bool aMinus3;
 
-  Curve create(Field f, U256 b) { return Curve(f, f.fromU256(b)); }
+  Curve create(Field f, U256 b) { return Curve(f, f.fromU256(b), false); }
+
+  /** y^2 = x^3 − 3x + b. */
+  Curve createAMinus3(Field f, U256 b) { return Curve(f, f.fromU256(b), true); }
 
   Jac infinity(this) { return Jac(this.f.one(), this.f.one(), this.f.zero()); }
   bool isInfinity(this, Jac p) { return this.f.isZero(p.z); }
@@ -31,12 +37,28 @@ export struct Curve {
     Field f = this.f;
     u64[] xm = f.fromU256(x);
     u64[] ym = f.fromU256(y);
-    return f.eq(f.square(ym), f.add(f.mul(f.square(xm), xm), this.b));
+    u64[] rhs = f.add(f.mul(f.square(xm), xm), this.b);
+    if (this.aMinus3) { rhs = f.sub(rhs, f.add(f.double(xm), xm)); }
+    return f.eq(f.square(ym), rhs);
   }
 
   Jac double(this, Jac p) {
     Field f = this.f;
     if (f.isZero(p.z) || f.isZero(p.y)) { return this.infinity(); }
+    if (this.aMinus3) {
+      // dbl-2001-b: 3M + 5S.
+      u64[] delta = f.square(p.z);
+      u64[] gamma = f.square(p.y);
+      u64[] beta = f.mul(p.x, gamma);
+      u64[] t = f.mul(f.sub(p.x, delta), f.add(p.x, delta));
+      u64[] alpha = f.add(f.double(t), t);
+      u64[] beta4 = f.double(f.double(beta));
+      u64[] x3 = f.sub(f.square(alpha), f.double(beta4));
+      u64[] z3 = f.sub(f.sub(f.square(f.add(p.y, p.z)), gamma), delta);
+      u64[] g2 = f.square(gamma);
+      u64[] y3 = f.sub(f.mul(alpha, f.sub(beta4, x3)), f.double(f.double(f.double(g2))));
+      return Jac(x3, y3, z3);
+    }
     u64[] a = f.square(p.x);
     u64[] bb = f.square(p.y);
     u64[] c = f.square(bb);
@@ -104,6 +126,14 @@ export struct Curve {
     return r;
   }
 
+  /** P, 3P, 5P, … 15P: the table a width-5 NAF digit indexes, by (|d| − 1) / 2. */
+  Jac[] oddMultiples(this, Jac p) {
+    Jac[] t = Jac[].filled(8, p);
+    Jac twice = this.double(p);
+    for (i32 i = 1; i < 8; i++) { t[i] = this.add(t[i - 1], twice); }
+    return t;
+  }
+
   /** The affine coordinates as plain integers; the point must not be at infinity. */
   U256[] toAffine(this, Jac p) {
     Field f = this.f;
@@ -113,4 +143,26 @@ export struct Curve {
     U256 y = f.toU256(f.mul(p.y, f.mul(zi2, zi)));
     return [x, y];
   }
+}
+
+/** k's width-5 NAF, least significant digit first: each digit 0 or odd in (−16, 16). */
+export i32[] wnaf(U256 k) {
+  i32[] out = i32[].filled(k.isZero() ? 0 : 258 - k.leadingZeros(), 0);
+  U256 v = k;
+  i32 i = 0;
+  while (!v.isZero()) {
+    if (v.bit(0)) {
+      i32 d = (v.low() & 31) as! i32;
+      if (d >= 16) {
+        d -= 32;
+        v = v.add(U256.ofU64((0 - d) as! u64));
+      } else {
+        v = v.sub(U256.ofU64(d as! u64));
+      }
+      out[i] = d;
+    }
+    v = v.shr(1);
+    i++;
+  }
+  return out;
 }

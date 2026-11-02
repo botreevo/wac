@@ -152,11 +152,20 @@ export struct Bn {
   Fq2 sub2(this, Fq2 x, Fq2 y) { return Fq2(this.f.sub(x.a, y.a), this.f.sub(x.b, y.b)); }
   Fq2 neg2(this, Fq2 x) { return Fq2(this.f.neg(x.a), this.f.neg(x.b)); }
   Fq2 conj2(this, Fq2 x) { return Fq2(x.a, this.f.neg(x.b)); }
+  /** Karatsuba: (a + bi)(c + di) from ac, bd and (a + b)(c + d), three multiplications in Fp, not four. */
   Fq2 mul2(this, Fq2 x, Fq2 y) {
     Field f = this.f;
-    return Fq2(f.sub(f.mul(x.a, y.a), f.mul(x.b, y.b)), f.add(f.mul(x.a, y.b), f.mul(x.b, y.a)));
+    u64[] ac = f.mul(x.a, y.a);
+    u64[] bd = f.mul(x.b, y.b);
+    u64[] cross = f.mul(f.add(x.a, x.b), f.add(y.a, y.b));
+    return Fq2(f.sub(ac, bd), f.sub(f.sub(cross, ac), bd));
   }
-  Fq2 square2(this, Fq2 x) { return this.mul2(x, x); }
+  /** (a + bi)² = (a + b)(a − b) + 2ab i: two multiplications. */
+  Fq2 square2(this, Fq2 x) {
+    Field f = this.f;
+    u64[] ab = f.mul(x.a, x.b);
+    return Fq2(f.mul(f.add(x.a, x.b), f.sub(x.a, x.b)), f.add(ab, ab));
+  }
   Fq2 scale2(this, Fq2 x, u64[] k) { return Fq2(this.f.mul(x.a, k), this.f.mul(x.b, k)); }
   bool isZero2(this, Fq2 x) { return this.f.isZero(x.a) && this.f.isZero(x.b); }
   bool eq2(this, Fq2 x, Fq2 y) { return this.f.eq(x.a, y.a) && this.f.eq(x.b, y.b); }
@@ -351,6 +360,51 @@ export struct Bn {
     return this.mul2(this.sub2(q.y, t.y), this.inv2(this.sub2(q.x, t.x)));
   }
 
+  /**
+   * The slopes for every pair's step at once — the tangent at each t when `doubling`, else the line through
+   * each t and q — with one inversion in Fp for all of them, by Montgomery's trick over the denominators'
+   * norms: a/d = a·d̄/N(d), and n norms invert as one product. A denominator of zero, a vertical line, does not
+   * arise in the loop for points of order r; `slope` is left to say so for that pair, as it always did.
+   */
+  Fq2[] slopes(this, G2[] ts, G2[] qs, bool doubling) {
+    Field f = this.f;
+    i32 n = ts.len();
+    Fq2[] num = Fq2[].filled(n, ts[0].x);
+    Fq2[] den = Fq2[].filled(n, ts[0].x);
+    u64[][] norms = u64[][].filled(n, f.zero());
+    for (i32 j = 0; j < n; j++) {
+      G2 t = ts[j];
+      if (doubling) {
+        Fq2 x2 = this.square2(t.x);
+        num[j] = this.add2(this.add2(x2, x2), x2);
+        den[j] = this.add2(t.y, t.y);
+      } else {
+        num[j] = this.sub2(qs[j].y, t.y);
+        den[j] = this.sub2(qs[j].x, t.x);
+      }
+      norms[j] = f.add(f.square(den[j].a), f.square(den[j].b));
+      if (f.isZero(norms[j])) { return this.slopesOneByOne(ts, qs, doubling); }
+    }
+    // prefix[j] = N_0 … N_j; one inversion of the whole; then back down, peeling one norm off at a time.
+    u64[][] prefix = u64[][].filled(n, norms[0]);
+    for (i32 j = 1; j < n; j++) { prefix[j] = f.mul(prefix[j - 1], norms[j]); }
+    u64[] inv = f.inv(prefix[n - 1]);
+    Fq2[] out = Fq2[].filled(n, ts[0].x);
+    for (i32 j = n - 1; j >= 0; j--) {
+      u64[] nInv = j == 0 ? inv : f.mul(inv, prefix[j - 1]);
+      if (j > 0) { inv = f.mul(inv, norms[j]); }
+      Fq2 dInv = this.scale2(this.conj2(den[j]), nInv);
+      out[j] = this.mul2(num[j], dInv);
+    }
+    return out;
+  }
+
+  Fq2[] slopesOneByOne(this, G2[] ts, G2[] qs, bool doubling) {
+    Fq2[] out = Fq2[].filled(ts.len(), ts[0].x);
+    for (i32 j = 0; j < ts.len(); j++) { out[j] = this.slope(ts[j], doubling ? ts[j] : qs[j])!; }
+    return out;
+  }
+
   /** The line of slope λ through t, evaluated at P = (xp, yp): yp − λ xp w + (λ t.x − t.y) w^3, in Fp12. */
   u64[][] lineAt(this, Fq2 lambda, G2 t, u64[] xp, u64[] yp) {
     u64[][] l = u64[][].filled(12, this.f.zero());
@@ -382,15 +436,17 @@ export struct Bn {
     }
     for (i32 i = 63; i >= 0; i--) {
       fv = this.sqr12(fv);
+      Fq2[] ls = this.slopes(ts, ts, true);
       for (i32 j = 0; j < n; j++) {
-        Fq2 lambda = this.slope(ts[j], ts[j])!;
-        fv = this.mul12(fv, this.lineAt(lambda, ts[j], xps[j], yps[j]));
-        ts[j] = this.along(lambda, ts[j], ts[j]);
-        if (ATE[i] != 0) {
-          G2 q = ATE[i] == 1 ? qs[j] : nqs[j];
-          Fq2 l2 = this.slope(ts[j], q)!;
-          fv = this.mul12(fv, this.lineAt(l2, ts[j], xps[j], yps[j]));
-          ts[j] = this.along(l2, ts[j], q);
+        fv = this.mul12(fv, this.lineAt(ls[j], ts[j], xps[j], yps[j]));
+        ts[j] = this.along(ls[j], ts[j], ts[j]);
+      }
+      if (ATE[i] != 0) {
+        G2[] qq = ATE[i] == 1 ? qs : nqs;
+        Fq2[] l2 = this.slopes(ts, qq, false);
+        for (i32 j = 0; j < n; j++) {
+          fv = this.mul12(fv, this.lineAt(l2[j], ts[j], xps[j], yps[j]));
+          ts[j] = this.along(l2[j], ts[j], qq[j]);
         }
       }
     }

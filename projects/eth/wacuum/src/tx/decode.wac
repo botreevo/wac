@@ -23,6 +23,8 @@ export struct DecodedTx {
   u8[] raw;
   /** Why it could not be decoded or its sender recovered, or "". */
   string error;
+  /** keccak256 of `raw`: the transaction's hash, worked out once — it is the sender cache's key too. */
+  U256 hash;
 }
 
 /** Reads fields off an RLP list, remembering the first thing wrong with them. */
@@ -147,7 +149,7 @@ DecodedTx refuse(string why) {
                               U256.zero(), U256[].filled(0, U256.zero()),
                               Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero())),
                               U256.zero());
-  return DecodedTx(t, u8[].filled(0, 0), why);
+  return DecodedTx(t, u8[].filled(0, 0), why, U256.zero());
 }
 
 /**
@@ -223,19 +225,25 @@ export DecodedTx decodeWith(Item item, U256 chainId, SenderCache? cache) {
   if (!txChain.eq(chainId)) { return refuse("chain id \{txChain.toDecimal()}, want \{chainId.toDecimal()}"); }
   if (yParity.gt(U256.one())) { return refuse("y parity above 1"); }
 
-  // The signing hash: the type byte, then the RLP of every field but the signature.
-  Item[] fields = itemsOf(d.item);
-  Item[] signed = Item[].filled(unsigned, fields[0]);
-  for (i32 i = 0; i < unsigned; i++) { signed[i] = fields[i]; }
-  u8[] body = encode(Item.List(signed));
-  u8[] msg = u8[].filled(body.len() + 1, 0);
-  msg[0] = txType as! u8;
-  for (i32 i = 0; i < body.len(); i++) { msg[i + 1] = body[i]; }
-  U256? sender = senderOf(raw, msg, yParity, r, s, cache);
-  if (sender is null) { return refuse("the signature recovers no sender"); }
+  // A sender the cache knows needs no signing message: it is built, and the signature recovered, only on a miss.
+  U256 hash = U256.fromBytes(keccak256(raw), 0, 32);
+  U256? sender = cache is null ? null : cache!.senders.get(hash);
+  if (sender is null) {
+    // The signing hash: the type byte, then the RLP of every field but the signature.
+    Item[] fields = itemsOf(d.item);
+    Item[] signed = Item[].filled(unsigned, fields[0]);
+    for (i32 i = 0; i < unsigned; i++) { signed[i] = fields[i]; }
+    u8[] body = encode(Item.List(signed));
+    u8[] msg = u8[].filled(body.len() + 1, 0);
+    msg[0] = txType as! u8;
+    for (i32 i = 0; i < body.len(); i++) { msg[i + 1] = body[i]; }
+    sender = recover(keccak256(msg), yParity, r, s);
+    if (sender is null) { return refuse("the signature recovers no sender"); }
+    if (cache is not null) { cache!.note(hash, sender!); }
+  }
   Transaction tx = Transaction(txType, nonce, gasPrice, maxFee, maxPriority, gas, to, value, data, access, maxBlobFee, blobs,
                                auths, sender!);
-  return DecodedTx(tx, raw, "");
+  return DecodedTx(tx, raw, "", hash);
 }
 
 /**
@@ -273,19 +281,20 @@ DecodedTx decodeLegacy(Item item, U256 chainId, SenderCache? cache) {
     signed[8] = Item.Bytes(u8[].filled(0, 0));
     msg = encode(Item.List(signed));
   }
-  U256? sender = senderOf(encode(item), msg, yParity, r, s, cache);
+  u8[] raw = encode(item);
+  U256 hash = U256.fromBytes(keccak256(raw), 0, 32);
+  U256? sender = senderOf(hash, msg, yParity, r, s, cache);
   if (sender is null) { return refuse("the signature recovers no sender"); }
   AccessEntry[] none = AccessEntry[].filled(0, AccessEntry(U256.zero(), U256[].filled(0, U256.zero())));
   Authorization[] noAuths = Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero()));
   Transaction tx = Transaction(0, nonce, gasPrice, U256.zero(), U256.zero(), gas, to, value, data, none, U256.zero(),
                                U256[].filled(0, U256.zero()), noAuths, sender!);
-  return DecodedTx(tx, encode(item), "");
+  return DecodedTx(tx, raw, "", hash);
 }
 
-/** The sender of the transaction `raw`, whose signing message is `msg`: from the cache, or recovered. */
-U256? senderOf(u8[] raw, u8[] msg, U256 yParity, U256 r, U256 s, SenderCache? cache) {
+/** The sender of the transaction whose hash is `key` and signing message `msg`: from the cache, or recovered. */
+U256? senderOf(U256 key, u8[] msg, U256 yParity, U256 r, U256 s, SenderCache? cache) {
   if (cache is null) { return recover(keccak256(msg), yParity, r, s); }
-  U256 key = U256.fromBytes(keccak256(raw), 0, 32);
   U256? known = cache!.senders.get(key);
   if (known is not null) { return known!; }
   U256? sender = recover(keccak256(msg), yParity, r, s);

@@ -20,11 +20,126 @@ export struct Curve {
   u64[] b;
   /** Whether a is −3 rather than 0. */
   bool aMinus3;
+  /** Scratch for `doubleTo` and `addTo`, made once: fourteen field elements, the last always zero. */
+  u64[][] t;
 
-  Curve create(Field f, U256 b) { return Curve(f, f.fromU256(b), false); }
+  Curve create(Field f, U256 b) { return Curve(f, f.fromU256(b), false, scratch()); }
 
   /** y^2 = x^3 − 3x + b. */
-  Curve createAMinus3(Field f, U256 b) { return Curve(f, f.fromU256(b), true); }
+  Curve createAMinus3(Field f, U256 b) { return Curve(f, f.fromU256(b), true, scratch()); }
+
+  /** A point at infinity of its own, to be changed in place: `infinity` shares the field's one. */
+  Jac freshInfinity(this) { return Jac(copyOf(this.f.one()), copyOf(this.f.one()), this.f.zero()); }
+
+  /**
+   * r = 2r, in place: `double`'s formulas with every intermediate in the curve's scratch, so a run of
+   * doublings allocates nothing. The hot loops of the scalar multiplications are made of this and `addTo`.
+   */
+  void doubleTo(this, Jac r) {
+    Field f = this.f;
+    u64[][] t = this.t;
+    if (f.isZero(r.z) || f.isZero(r.y)) {
+      setInfinity(f, r);
+      return;
+    }
+    if (this.aMinus3) {
+      // dbl-2001-b.
+      f.sqrTo(t[0], r.z);                 // delta
+      f.sqrTo(t[1], r.y);                 // gamma
+      f.mulTo(t[2], r.x, t[1]);           // beta
+      f.subTo(t[3], r.x, t[0]);
+      f.addTo(t[4], r.x, t[0]);
+      f.mulTo(t[3], t[3], t[4]);
+      f.addTo(t[4], t[3], t[3]);
+      f.addTo(t[4], t[4], t[3]);          // alpha = 3(x − delta)(x + delta)
+      f.addTo(t[5], t[2], t[2]);
+      f.addTo(t[5], t[5], t[5]);          // 4 beta
+      f.addTo(t[6], r.y, r.z);
+      f.sqrTo(t[6], t[6]);
+      f.subTo(t[6], t[6], t[1]);
+      f.subTo(r.z, t[6], t[0]);           // z3 = (y + z)^2 − gamma − delta
+      f.addTo(t[7], t[5], t[5]);
+      f.sqrTo(t[8], t[4]);
+      f.subTo(r.x, t[8], t[7]);           // x3 = alpha^2 − 8 beta
+      f.subTo(t[8], t[5], r.x);
+      f.mulTo(t[8], t[4], t[8]);
+      f.sqrTo(t[9], t[1]);
+      f.addTo(t[9], t[9], t[9]);
+      f.addTo(t[9], t[9], t[9]);
+      f.addTo(t[9], t[9], t[9]);
+      f.subTo(r.y, t[8], t[9]);           // y3 = alpha(4 beta − x3) − 8 gamma^2
+      return;
+    }
+    // dbl-2009-l.
+    f.sqrTo(t[0], r.x);                   // A
+    f.sqrTo(t[1], r.y);                   // B
+    f.sqrTo(t[2], t[1]);                  // C
+    f.addTo(t[3], r.x, t[1]);
+    f.sqrTo(t[3], t[3]);
+    f.subTo(t[3], t[3], t[0]);
+    f.subTo(t[3], t[3], t[2]);
+    f.addTo(t[3], t[3], t[3]);            // D
+    f.addTo(t[4], t[0], t[0]);
+    f.addTo(t[4], t[4], t[0]);            // E = 3A
+    f.sqrTo(t[5], t[4]);                  // F
+    f.mulTo(r.z, r.y, r.z);
+    f.addTo(r.z, r.z, r.z);               // z3 = 2yz
+    f.addTo(t[6], t[3], t[3]);
+    f.subTo(r.x, t[5], t[6]);             // x3 = F − 2D
+    f.subTo(t[6], t[3], r.x);
+    f.mulTo(t[6], t[4], t[6]);
+    f.addTo(t[7], t[2], t[2]);
+    f.addTo(t[7], t[7], t[7]);
+    f.addTo(t[7], t[7], t[7]);
+    f.subTo(r.y, t[6], t[7]);             // y3 = E(D − x3) − 8C
+  }
+
+  /** r = r + q, or r − q when `negQ`, in place, by add-2007-bl as `add`; q is only read. */
+  void addTo(this, Jac r, Jac q, bool negQ) {
+    Field f = this.f;
+    u64[][] t = this.t;
+    if (f.isZero(q.z)) { return; }
+    if (f.isZero(r.z)) {
+      copyInto(r.x, q.x);
+      if (negQ) { f.subTo(r.y, t[13], q.y); } else { copyInto(r.y, q.y); }
+      copyInto(r.z, q.z);
+      return;
+    }
+    f.sqrTo(t[0], r.z);                   // Z1Z1
+    f.sqrTo(t[1], q.z);                   // Z2Z2
+    f.mulTo(t[2], r.x, t[1]);             // U1
+    f.mulTo(t[3], q.x, t[0]);             // U2
+    f.mulTo(t[4], r.y, q.z);
+    f.mulTo(t[4], t[4], t[1]);            // S1
+    f.mulTo(t[5], q.y, r.z);
+    f.mulTo(t[5], t[5], t[0]);            // S2
+    if (negQ) { f.subTo(t[5], t[13], t[5]); }
+    f.subTo(t[6], t[3], t[2]);            // H
+    f.subTo(t[7], t[5], t[4]);
+    f.addTo(t[7], t[7], t[7]);            // r
+    if (f.isZero(t[6])) {
+      if (f.isZero(t[7])) { this.doubleTo(r); } else { setInfinity(f, r); }
+      return;
+    }
+    f.addTo(t[8], t[6], t[6]);
+    f.sqrTo(t[8], t[8]);                  // I
+    f.mulTo(t[9], t[6], t[8]);            // J
+    f.mulTo(t[10], t[2], t[8]);           // V
+    f.addTo(t[2], r.z, q.z);
+    f.sqrTo(t[2], t[2]);
+    f.subTo(t[2], t[2], t[0]);
+    f.subTo(t[2], t[2], t[1]);
+    f.mulTo(r.z, t[2], t[6]);             // z3 = ((Z1 + Z2)^2 − Z1Z1 − Z2Z2) H
+    f.sqrTo(t[11], t[7]);
+    f.subTo(t[11], t[11], t[9]);
+    f.subTo(t[11], t[11], t[10]);
+    f.subTo(r.x, t[11], t[10]);           // x3 = r^2 − J − 2V
+    f.subTo(t[12], t[10], r.x);
+    f.mulTo(t[12], t[7], t[12]);
+    f.mulTo(t[4], t[4], t[9]);
+    f.addTo(t[4], t[4], t[4]);
+    f.subTo(r.y, t[12], t[4]);            // y3 = r(V − x3) − 2 S1 J
+  }
 
   Jac infinity(this) { return Jac(this.f.one(), this.f.one(), this.f.zero()); }
   bool isInfinity(this, Jac p) { return this.f.isZero(p.z); }
@@ -145,24 +260,70 @@ export struct Curve {
   }
 }
 
-/** k's width-5 NAF, least significant digit first: each digit 0 or odd in (−16, 16). */
+/**
+ * k's width-5 NAF, least significant digit first: each digit 0 or odd in (−16, 16). On k's words in locals,
+ * with a fifth for the carry an upward correction can make: a U256 a bit was a twentieth of a recovery.
+ */
 export i32[] wnaf(U256 k) {
   i32[] out = i32[].filled(k.isZero() ? 0 : 258 - k.leadingZeros(), 0);
-  U256 v = k;
+  u64 w0 = k.word(0);
+  u64 w1 = k.word(1);
+  u64 w2 = k.word(2);
+  u64 w3 = k.word(3);
+  u64 w4 = 0;
   i32 i = 0;
-  while (!v.isZero()) {
-    if (v.bit(0)) {
-      i32 d = (v.low() & 31) as! i32;
+  while ((w0 | w1 | w2 | w3 | w4) != 0) {
+    if ((w0 & 1) == 1) {
+      i32 d = (w0 & 31) as! i32;
       if (d >= 16) {
+        // Digit d − 32: the value goes up by 32 − d, carrying as far as it must.
         d -= 32;
-        v = v.add(U256.ofU64((0 - d) as! u64));
+        u64 before = w0;
+        w0 = w0 + ((0 - d) as! u64);
+        if (w0 < before) {
+          w1 = w1 + 1;
+          if (w1 == 0) {
+            w2 = w2 + 1;
+            if (w2 == 0) {
+              w3 = w3 + 1;
+              if (w3 == 0) { w4 = w4 + 1; }
+            }
+          }
+        }
       } else {
-        v = v.sub(U256.ofU64(d as! u64));
+        // Digit d: the low five bits are d, so taking it away borrows nothing.
+        w0 = w0 - (d as! u64);
       }
       out[i] = d;
     }
-    v = v.shr(1);
+    w0 = (w0 >> 1) | (w1 << 63);
+    w1 = (w1 >> 1) | (w2 << 63);
+    w2 = (w2 >> 1) | (w3 << 63);
+    w3 = (w3 >> 1) | (w4 << 63);
+    w4 = w4 >> 1;
     i++;
   }
   return out;
+}
+
+u64[][] scratch() {
+  u64[][] t = u64[][].filled(14, u64[].filled(0, 0));
+  for (i32 i = 0; i < 14; i++) { t[i] = u64[].filled(8, 0); }
+  return t;
+}
+
+u64[] copyOf(u64[] a) {
+  u64[] out = u64[].filled(a.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  return out;
+}
+
+void copyInto(u64[] out, u64[] a) {
+  for (i32 i = 0; i < 8; i++) { out[i] = a[i]; }
+}
+
+void setInfinity(Field f, Jac r) {
+  copyInto(r.x, f.one());
+  copyInto(r.y, f.one());
+  for (i32 i = 0; i < 8; i++) { r.z[i] = 0; }
 }

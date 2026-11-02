@@ -70,7 +70,11 @@ export struct Field {
    * in git history; this is it written out, and about five times faster.
    */
   u64[] mul(this, u64[] a, u64[] b) {
-    if (this.special) { return mulSecp(a, b, this.p); }
+    if (this.special) {
+      u64[] out = u64[].filled(8, 0);
+      mulSecpTo(out, a, b, this.p);
+      return out;
+    }
     u64[] p = this.p;
     u64 n0 = this.n0;
     u64 a0 = a[0];
@@ -556,10 +560,19 @@ export struct Field {
     return out;
   }
 
-  u64[] square(this, u64[] a) { return this.special ? sqrSecp(a, this.p) : this.mul(a, a); }
+  u64[] square(this, u64[] a) {
+    if (!this.special) { return this.mul(a, a); }
+    u64[] out = u64[].filled(8, 0);
+    sqrSecpTo(out, a, this.p);
+    return out;
+  }
 
-  /** a + b mod p, unrolled as `mul` is: the limbs in locals, the result written once. */
-  u64[] add(this, u64[] a, u64[] b) {
+  /**
+   * a + b mod p into `out`, unrolled as `mul` is: the limbs in locals, the result written once, so `out` may be
+   * `a` or `b`. The ...To forms are what the curve's hot loops use: a fresh array costs about 12 ns on the Node
+   * host, and a recovery made some four thousand of them.
+   */
+  void addTo(this, u64[] out, u64[] a, u64[] b) {
     u64 s = a[0] + b[0];
     u64 r0 = s & MASK;
     s = a[1] + b[1] + (s >> 32);
@@ -576,13 +589,19 @@ export struct Field {
     u64 r6 = s & MASK;
     s = a[7] + b[7] + (s >> 32);
     u64 r7 = s & MASK;
-    u64[] out = [r0, r1, r2, r3, r4, r5, r6, r7];
+    out[0] = r0;
+    out[1] = r1;
+    out[2] = r2;
+    out[3] = r3;
+    out[4] = r4;
+    out[5] = r5;
+    out[6] = r6;
+    out[7] = r7;
     if ((s >> 32) != 0 || !less(out, this.p)) { subInPlace(out, this.p); }
-    return out;
   }
 
-  /** a - b mod p, unrolled: p is added back when the subtraction borrows. */
-  u64[] sub(this, u64[] a, u64[] b) {
+  /** a − b mod p into `out`, unrolled: p is added back when the subtraction borrows. `out` may be `a` or `b`. */
+  void subTo(this, u64[] out, u64[] a, u64[] b) {
     u64 d = a[0] - b[0];
     u64 r0 = d & MASK;
     d = a[1] - b[1] - ((d >> 32) & 1);
@@ -618,7 +637,45 @@ export struct Field {
       c = r7 + p[7] + (c >> 32);
       r7 = c & MASK;
     }
-    return [r0, r1, r2, r3, r4, r5, r6, r7];
+    out[0] = r0;
+    out[1] = r1;
+    out[2] = r2;
+    out[3] = r3;
+    out[4] = r4;
+    out[5] = r5;
+    out[6] = r6;
+    out[7] = r7;
+  }
+
+  u64[] add(this, u64[] a, u64[] b) {
+    u64[] out = u64[].filled(8, 0);
+    this.addTo(out, a, b);
+    return out;
+  }
+
+  u64[] sub(this, u64[] a, u64[] b) {
+    u64[] out = u64[].filled(8, 0);
+    this.subTo(out, a, b);
+    return out;
+  }
+
+  /** a·b into `out`, which may be `a` or `b`: in place for secp256k1's field, a copy of `mul`'s answer otherwise. */
+  void mulTo(this, u64[] out, u64[] a, u64[] b) {
+    if (this.special) {
+      mulSecpTo(out, a, b, this.p);
+      return;
+    }
+    u64[] r = this.mul(a, b);
+    for (i32 i = 0; i < 8; i++) { out[i] = r[i]; }
+  }
+
+  /** a² into `out`, which may be `a`. */
+  void sqrTo(this, u64[] out, u64[] a) {
+    if (this.special) {
+      sqrSecpTo(out, a, this.p);
+      return;
+    }
+    this.mulTo(out, a, a);
   }
 
   u64[] neg(this, u64[] a) { return this.sub(this.zero(), a); }
@@ -656,6 +713,7 @@ export struct Field {
    */
   u64[] inv(this, u64[] a) {
     if (this.isZero(a)) { return this.zero(); }
+    if (this.special) { return this.secpChain(a, false); }
     u64[] p = this.p;
     u64[] u = fit(a);
     u64[] v = fit(p);
@@ -673,10 +731,10 @@ export struct Field {
       }
       if (!less(u, v)) {
         subInPlace(u, v);
-        x1 = this.sub(x1, x2);
+        this.subTo(x1, x1, x2);
       } else {
         subInPlace(v, u);
-        x2 = this.sub(x2, x1);
+        this.subTo(x2, x2, x1);
       }
     }
     u64[] plain = isOne(u) ? x1 : x2;
@@ -686,8 +744,47 @@ export struct Field {
   /** a^(p-2), by Fermat: the inverse the long way, which `inv` is checked against. */
   u64[] invByFermat(this, u64[] a) { return this.pow(a, this.modulus.sub(U256.ofU64(2))); }
 
+  /**
+   * secp256k1's a^((p+1)/4), its square root, or a^(p−2), its inverse, by libsecp256k1's addition chain:
+   * x_n below is a^(2^n − 1), and the runs of ones in the two exponents are built from them. 253 or 255
+   * squarings and 13 or 15 multiplications, where square-and-multiply does about 250 more multiplications.
+   * Both chains' exponents were checked against (p+1)/4 and p−2 when this was written.
+   */
+  u64[] secpChain(this, u64[] a, bool root) {
+    u64[] x2 = this.mul(this.square(a), a);
+    u64[] x3 = this.mul(this.squares(x2, 1), a);
+    u64[] x6 = this.mul(this.squares(x3, 3), x3);
+    u64[] x9 = this.mul(this.squares(x6, 3), x3);
+    u64[] x11 = this.mul(this.squares(x9, 2), x2);
+    u64[] x22 = this.mul(this.squares(x11, 11), x11);
+    u64[] x44 = this.mul(this.squares(x22, 22), x22);
+    u64[] x88 = this.mul(this.squares(x44, 44), x44);
+    u64[] x176 = this.mul(this.squares(x88, 88), x88);
+    u64[] x220 = this.mul(this.squares(x176, 44), x44);
+    u64[] x223 = this.mul(this.squares(x220, 3), x3);
+    u64[] t = this.mul(this.squares(x223, 23), x22);
+    if (root) {
+      t = this.mul(this.squares(t, 6), x2);
+      return this.squares(t, 2);
+    }
+    t = this.mul(this.squares(t, 5), a);
+    t = this.mul(this.squares(t, 3), x2);
+    return this.mul(this.squares(t, 2), a);
+  }
+
+  /** a^(2^n): n squarings, in place on one copy. */
+  u64[] squares(this, u64[] a, i32 n) {
+    u64[] out = this.square(a);
+    for (i32 i = 1; i < n; i++) { this.sqrTo(out, out); }
+    return out;
+  }
+
   /** A square root when p is 3 mod 4, or null when `a` is not a square. */
   u64[]? sqrt(this, u64[] a) {
+    if (this.special) {
+      u64[] r = this.secpChain(a, true);
+      return this.eq(this.square(r), a) ? r : null;
+    }
     u64[] c = this.pow(a, this.modulus.add(U256.one()).shr(2));
     return this.eq(this.square(c), a) ? c : null;
   }
@@ -699,7 +796,7 @@ export struct Field {
  * multiplications — and one conditional subtraction. The fold is written out here and in `sqrSecp`: as a
  * function of sixteen limbs it was not inlined, and cost a sixth of a recovery.
  */
-u64[] mulSecp(u64[] a, u64[] b, u64[] p) {
+void mulSecpTo(u64[] out, u64[] a, u64[] b, u64[] p) {
   u64 a0 = a[0];
   u64 a1 = a[1];
   u64 a2 = a[2];
@@ -923,9 +1020,15 @@ u64[] mulSecp(u64[] a, u64[] b, u64[] p) {
     t = s7 + (t >> 32);
     s7 = t & MASK;
   }
-  u64[] out = [s0, s1, s2, s3, s4, s5, s6, s7];
+  out[0] = s0;
+  out[1] = s1;
+  out[2] = s2;
+  out[3] = s3;
+  out[4] = s4;
+  out[5] = s5;
+  out[6] = s6;
+  out[7] = s7;
   if (!less(out, p)) { subInPlace(out, p); }
-  return out;
 }
 
 /**
@@ -933,7 +1036,7 @@ u64[] mulSecp(u64[] a, u64[] b, u64[] p) {
  * then the 8 squares a_i² added on the diagonal — 36 limb multiplications where a product of two takes 64.
  * Half the multiplications in a point doubling are squarings.
  */
-u64[] sqrSecp(u64[] a, u64[] p) {
+void sqrSecpTo(u64[] out, u64[] a, u64[] p) {
   u64 a0 = a[0];
   u64 a1 = a[1];
   u64 a2 = a[2];
@@ -1133,9 +1236,15 @@ u64[] sqrSecp(u64[] a, u64[] p) {
     t = s7 + (t >> 32);
     s7 = t & MASK;
   }
-  u64[] out = [s0, s1, s2, s3, s4, s5, s6, s7];
+  out[0] = s0;
+  out[1] = s1;
+  out[2] = s2;
+  out[3] = s3;
+  out[4] = s4;
+  out[5] = s5;
+  out[6] = s6;
+  out[7] = s7;
   if (!less(out, p)) { subInPlace(out, p); }
-  return out;
 }
 
 u64[] limbsOf(U256 x) {

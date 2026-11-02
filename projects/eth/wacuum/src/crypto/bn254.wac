@@ -46,9 +46,12 @@ export struct Fq2 {
 // conjugates. wac's static evaluator allows eight million steps for all of a file's statics together, so
 // doing it once rather than three times (twice in Fp12, the long way) is what lets it fit.
 
-/** b2, frobX, frobY as [a, b] each, then γ^0 … γ^11: what `Bn.create` copies. */
+/**
+ * b2, frobX, frobY as [a, b] each, then γ^0 … γ^11, then t^0 … t^11 for the p-power Frobenius on Fp12, each
+ * as the pair (A, B) with t^k = A + B w^6 — an Fp2 element a + b i is a − 9b + b w^6 here, since i = w^6 − 9:
+ * what `Bn.create` copies.
+ */
 static u64[][] CONSTANTS = constants();
-static u64[] HARD = hardExponent();
 
 u64[][] constants() {
   Bn bn = bare();
@@ -59,7 +62,7 @@ u64[][] constants() {
   Fq2 t2 = bn.square2(t);
   Fq2 t3 = bn.mul2(t2, t);
   u64[] gamma = f.add(f.square(t.a), f.square(t.b));
-  u64[][] out = u64[][].filled(6 + 12, f.one());
+  u64[][] out = u64[][].filled(6 + 12 + 24, f.one());
   out[0] = b2.a;
   out[1] = b2.b;
   out[2] = t2.a;
@@ -67,13 +70,19 @@ u64[][] constants() {
   out[4] = t3.a;
   out[5] = t3.b;
   for (i32 i = 1; i < 12; i++) { out[6 + i] = f.mul(out[5 + i], gamma); }
+  Fq2 tk = Fq2(f.one(), f.zero());
+  for (i32 k = 0; k < 12; k++) {
+    out[18 + 2 * k] = f.sub(tk.a, f.mul(tk.b, bn.c9));
+    out[19 + 2 * k] = tk.b;
+    tk = bn.mul2(tk, t);
+  }
   return out;
 }
 
 Bn bare() {
   Field f = Field.create(bnP());
   Fq2 zero = Fq2(f.zero(), f.zero());
-  return Bn(f, Curve.create(f, U256.ofU64(3)), zero, zero, zero, u64[][].defaulted(0), u64[].filled(0, 0),
+  return Bn(f, Curve.create(f, U256.ofU64(3)), zero, zero, zero, u64[][].defaulted(0), u64[][].defaulted(0), u64[].filled(0, 0),
             f.fromU256(U256.ofU64(82)), f.fromU256(U256.ofU64(18)), f.fromU256(U256.ofU64(9)));
 }
 
@@ -93,6 +102,8 @@ export struct Bn {
   Fq2 frobY;
   /** w^(p^2) = γ w with γ in Fp: Frobenius squared multiplies coefficient i by γ^i. */
   u64[][] frob2Powers;
+  /** t^0 … t^11 as `CONSTANTS` holds them, (A, B) pairs: w^(kp) = w^k t^k. */
+  u64[][] frob1Coeffs;
   /** (p^4 - p^2 + 1) / r as limbs: the hard part of the final exponent. */
   u64[] hard;
   u64[] c82;
@@ -110,7 +121,9 @@ export struct Bn {
     u64[][] frob2 = u64[][].filled(12, bn.f.zero());
     for (i32 i = 0; i < 12; i++) { frob2[i] = copyOf(CONSTANTS[6 + i]); }
     bn.frob2Powers = frob2;
-    bn.hard = copyOf(HARD);
+    u64[][] frob1 = u64[][].filled(24, bn.f.zero());
+    for (i32 i = 0; i < 24; i++) { frob1[i] = copyOf(CONSTANTS[18 + i]); }
+    bn.frob1Coeffs = frob1;
     return bn;
   }
 
@@ -119,13 +132,17 @@ export struct Bn {
     Field f = Field.create(bnP());
     Curve g1 = Curve.create(f, U256.ofU64(3));
     Bn bn = Bn(f, g1, Fq2(f.zero(), f.zero()), Fq2(f.zero(), f.zero()), Fq2(f.zero(), f.zero()), u64[][].defaulted(0),
-               u64[].filled(0, 0), f.fromU256(U256.ofU64(82)), f.fromU256(U256.ofU64(18)), f.fromU256(U256.ofU64(9)));
+               u64[][].defaulted(0), u64[].filled(0, 0), f.fromU256(U256.ofU64(82)), f.fromU256(U256.ofU64(18)), f.fromU256(U256.ofU64(9)));
     Fq2 xi = Fq2(f.fromU256(U256.ofU64(9)), f.one());
     bn.b2 = bn.mul2(Fq2(f.fromU256(U256.ofU64(3)), f.zero()), bn.inv2(xi));
     U256 pm1 = bnP().sub(U256.one());
     bn.frobX = bn.pow2(xi, pm1.div(U256.ofU64(3)));
     bn.frobY = bn.pow2(xi, pm1.shr(1));
     bn.frob2Powers = bn.frobeniusPowers();
+    u64[][] k = constants();
+    u64[][] frob1 = u64[][].filled(24, f.zero());
+    for (i32 i = 0; i < 24; i++) { frob1[i] = k[18 + i]; }
+    bn.frob1Coeffs = frob1;
     bn.hard = hardExponent();
     return bn;
   }
@@ -388,16 +405,106 @@ export struct Bn {
   }
 
   /**
-   * Whether the product of Miller loops `fv` is one after the final exponentiation: whether
-   * f^((p^6 − 1)(p^2 + 1)h) = 1, h the hard part, which is whether y = (f^(p^2) · f)^h is fixed by the p^6
-   * Frobenius — so no inverse in Fp12 is needed. (This computed (frob2(a) · a)^h with a = frob6(f) as well,
-   * and compared; but Frobenius maps are ring homomorphisms and commute, so that is frob6(y), and one
-   * exponentiation by h does where it did two.)
+   * f^p: coefficient k of f, in Fp and so fixed, times w^(kp) = w^k t^k with t^k = A + B w^6; the w^(k+6)
+   * terms that reach w^12 come back down by w^12 = 18 w^6 − 82.
    */
-  bool finalIsOne(this, u64[][] fv) {
-    u64[][] y = this.pow12Big(this.mul12(this.frob2(fv), fv), this.hard);
-    return this.eq12(this.frob6(y), y);
+  u64[][] frob1(this, u64[][] x) {
+    Field f = this.f;
+    u64[][] out = u64[][].filled(12, f.zero());
+    for (i32 k = 0; k < 12; k++) {
+      if (f.isZero(x[k])) { continue; }
+      out[k] = f.add(out[k], f.mul(x[k], this.frob1Coeffs[2 * k]));
+      u64[] v = f.mul(x[k], this.frob1Coeffs[2 * k + 1]);
+      if (k < 6) {
+        out[k + 6] = f.add(out[k + 6], v);
+      } else {
+        out[k] = f.add(out[k], f.mul(v, this.c18));
+        out[k - 6] = f.sub(out[k - 6], f.mul(v, this.c82));
+      }
+    }
+    return out;
   }
+
+  /**
+   * x⁻¹, by norms down the tower: x̄ = x^(p^6) and N = x·x̄ lies in Fp6; N's norm M = N·N^(p²)·N^(p⁴) lies in
+   * Fp2, which is m0 + m6 w^6 here; so x⁻¹ = x̄ · N^(p²) · N^(p⁴) · M⁻¹, and the only inversion is one in Fp.
+   */
+  u64[][] inv12(this, u64[][] x) {
+    Field f = this.f;
+    u64[][] xc = this.frob6(x);
+    u64[][] n = this.mul12(x, xc);
+    u64[][] n2 = this.frob2(n);
+    u64[][] n4 = this.frob2(n2);
+    u64[][] n24 = this.mul12(n2, n4);
+    u64[][] m = this.mul12(n, n24);
+    // m0 + m6 w^6 is α + β i with i = w^6 − 9: α = m0 + 9 m6, β = m6. Its inverse is (α − β i) / (α² + β²).
+    u64[] alpha = f.add(m[0], f.mul(m[6], this.c9));
+    u64[] beta = m[6];
+    u64[] d = f.inv(f.add(f.square(alpha), f.square(beta)));
+    u64[] ia = f.mul(alpha, d);
+    u64[] ib = f.neg(f.mul(beta, d));
+    u64[][] mInv = u64[][].filled(12, f.zero());
+    mInv[0] = f.sub(ia, f.mul(ib, this.c9));
+    mInv[6] = ib;
+    return this.mul12(xc, this.mul12(n24, mInv));
+  }
+
+  /** x^u, u = 4965661367192848881 the BN parameter: 6u + 2 is what the Miller loop runs over. */
+  u64[][] expU(this, u64[][] x) {
+    u64 u = 4965661367192848881;
+    u64[][] r = x;
+    for (i32 i = 61; i >= 0; i--) {
+      r = this.mul12(r, r);
+      if (((u >> i) & 1) == 1) { r = this.mul12(r, x); }
+    }
+    return r;
+  }
+
+  /**
+   * The final exponentiation, f^((p^12 − 1)/r). The easy part, (p^6 − 1)(p^2 + 1), by one inversion and two
+   * Frobenius maps; the hard part, (p^4 − p^2 + 1)/r, by Devegili, Scott and Dahab's chain for BN curves —
+   * three exponentiations by u and Frobenius maps, as go-ethereum's bn256 has it — where it was square and
+   * multiply over a 762-bit exponent. After the easy part the value is unitary, so its inverse is its
+   * conjugate, which the chain uses.
+   */
+  u64[][] finalExp(this, u64[][] f) {
+    u64[][] t1 = this.mul12(this.frob6(f), this.inv12(f));
+    t1 = this.mul12(this.frob2(t1), t1);
+    u64[][] fp = this.frob1(t1);
+    u64[][] fp2 = this.frob2(t1);
+    u64[][] fp3 = this.frob1(fp2);
+    u64[][] fu = this.expU(t1);
+    u64[][] fu2 = this.expU(fu);
+    u64[][] fu3 = this.expU(fu2);
+    u64[][] y3 = this.frob6(this.frob1(fu));
+    u64[][] fu2p = this.frob1(fu2);
+    u64[][] fu3p = this.frob1(fu3);
+    u64[][] y2 = this.frob2(fu2);
+    u64[][] y0 = this.mul12(this.mul12(fp, fp2), fp3);
+    u64[][] y1 = this.frob6(t1);
+    u64[][] y5 = this.frob6(fu2);
+    u64[][] y4 = this.frob6(this.mul12(fu, fu2p));
+    u64[][] y6 = this.frob6(this.mul12(fu3, fu3p));
+    u64[][] t0 = this.mul12(this.mul12(this.mul12(y6, y6), y4), y5);
+    u64[][] t = this.mul12(this.mul12(y3, y5), t0);
+    t0 = this.mul12(t0, y2);
+    t = this.mul12(this.mul12(t, t), t0);
+    t = this.mul12(t, t);
+    t0 = this.mul12(t, y1);
+    t = this.mul12(t, y0);
+    t0 = this.mul12(t0, t0);
+    return this.mul12(t0, t);
+  }
+
+  /** Whether the product of Miller loops `fv` is one after the final exponentiation. */
+  bool finalIsOne(this, u64[][] fv) { return this.eq12(this.finalExp(fv), this.one12()); }
+
+  /**
+   * The hard part the long way, square and multiply by h: what `finalExp`'s chain is checked against. Only
+   * `compute` sets h.
+   */
+  u64[][] hardPartByExponent(this, u64[][] g) { return this.pow12Big(g, this.hard); }
+
 }
 
 /** A G2 point in Jacobian coordinates over Fp2: (X/Z^2, Y/Z^3); Z = 0 is infinity. */

@@ -8,7 +8,7 @@ in wac; the same process serves JSON-RPC and the site. Meant for **wacuum.voltre
 
 | path | what |
 | --- | --- |
-| `POST /rpc` (and `POST /`) | JSON-RPC: the `eth_`, `net_` and `web3_` methods wacuum answers, CORS open, no token. The Engine API is refused |
+| `POST /rpc` (and `POST /`) | JSON-RPC: the `eth_`, `net_` and `web3_` methods wacuum answers, CORS open, no token. The Engine API is refused, and `eth_call` runs with at most `--rpc-gas-cap` gas |
 | `/` | the chain at a glance, the latest blocks and transactions, the faucet, and the details a wallet needs to add the network |
 | `/block/<number or hash>`, `/tx/<hash>`, `/address/<address>` | the explorer |
 | `/search?q=…` | a number, a hash or an address, sent to its page |
@@ -64,6 +64,12 @@ request whole before passing it on (`deploy/Caddyfile`), so slow clients wait at
 
 **It keeps a day of blocks.** Every block the node serves is held in memory, a few kilobytes each, so blocks
 older than `--history` (a day's worth by default) are dropped, and the explorer says so when asked for one.
+
+**One request may run at most 10M gas** (`--rpc-gas-cap`). The engine does one thing at a time, so an
+`eth_call` costs everyone the time it runs; with a block's gas of the slowest precompile that was 4.6 s, and is
+1.3 s behind the cap. `eth_estimateGas` is tried once at the cap and refused if it fails there; a call that
+succeeds with any gas it is given still costs about 5 s, because wacuum's search starts at a whole transaction's
+limit whatever the caller asks (its `issues/0008d`).
 
 **After a restart, older transactions have no receipt.** The node starts from its last snapshot and replays
 the log after it, and wacuum keeps receipts only for the blocks it ran. The explorer still finds a transaction
@@ -123,6 +129,7 @@ match; a follower that does it by itself is still to be written. Both are wacuum
     --bootnode ENODE       a discovery node to start from; as many as wanted
     --snapshot-every N     finalized blocks between state snapshots (1024)
     --history N            blocks kept for the explorer and the eth_ methods (a day's: 86400 / --block-time)
+    --rpc-gas-cap N        the most gas one eth_call or eth_estimateGas may use (10,000,000)
 
 ## Dependencies
 

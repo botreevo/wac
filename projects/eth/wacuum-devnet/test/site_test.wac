@@ -16,11 +16,16 @@ static string KEY = "0x424242424242424242424242424242424242424242424242424242424
 Served served() {
   u8[] key = hexToBytes(KEY)!;
   U256 faucet = addressOf(key);
-  string genesis = genesisJson(ChainSpec(4242, checksummed(faucet), "0xd3c21bcecceda1000000"));
+  // Two contracts for the gas cap's tests: one that answers the gas it has left (GAS, MSTORE, RETURN 32 bytes),
+  // and one that loops until its gas runs out.
+  string plain = genesisJson(ChainSpec(4242, checksummed(faucet), "0xd3c21bcecceda1000000"));
+  i32 at = plain.indexOf("\"alloc\": {") + 10;
+  string genesis = plain.slice(0, at) + "\"" + GAS_LEFT + "\": {\"code\": \"0x5a60005260206000f3\"}, \"" + FOREVER +
+                   "\": {\"code\": \"0x5b600056\"}, " + plain.slice(at, plain.len());
   Engine e = engineFor(genesis.toBytes()).engine!;
   Site site = Site("test devnet", "https://devnet.invalid", 4242, checksummed(faucet), "5 ETH", "hour", 2);
   return Served(site, e, Index.create(), Faucet.create(key, faucet, 4242, ether().mul(U256.ofU64(5)), 3600000 as i64),
-                genesis, Images.decode(), Disk(null, "", 0));
+                genesis, Images.decode(), 1000000 as i64, Disk(null, "", 0));
 }
 
 Request request(string text) {
@@ -140,5 +145,46 @@ export string test_blocks_beyond_the_history_are_said_to_be_so_and_forgotten() {
   t.ok(old.indexOf("older than the 5 blocks this node keeps") > 0, "an old block says why it is not there");
   t.ok(route(s, get("/block/1009"), "1.1.1.1", 0 as i64).status == 200, "a recent one is there");
   t.ok(touching(s.index, to).len() == 0, "and the index forgot the drip, which was in block 1");
+  return t.report();
+}
+
+/** Where the test genesis puts its contract that answers the gas it has left, and the one that never stops. */
+static string GAS_LEFT = "0x00000000000000000000000000000000000a5a5a";
+static string FOREVER = "0x00000000000000000000000000000000000f0f0f";
+
+/** The gas an `eth_call` of `GAS_LEFT` reports, from the JSON-RPC answer to `body`. */
+U256 gasLeft(Served s, string call) {
+  string body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[" + call + ",\"latest\"]}";
+  string answer = text(route(s, post("/rpc", body), "1.1.1.1", 0 as i64));
+  i32 at = answer.indexOf("\"result\":\"");
+  if (at < 0) { return U256.max(); }
+  string rest = answer.slice(at + 10, answer.len());
+  string hex = rest.slice(0, rest.indexOf("\""));
+  return U256.fromHex(hex) ?? U256.max();
+}
+
+export string test_a_call_runs_with_no_more_than_the_cap() {
+  Check t = Check.create();
+  Served s = served();    // a cap of 1,000,000
+  U256 cap = U256.ofU64(1000000);
+  t.ok(gasLeft(s, "{\"to\":\"" + GAS_LEFT + "\",\"gas\":\"0x2aea540\"}").le(cap), "asking for a block's gas gets the cap");
+  t.ok(gasLeft(s, "{\"to\":\"" + GAS_LEFT + "\"}").le(cap), "asking for none gets the cap");
+  U256 small = gasLeft(s, "{\"to\":\"" + GAS_LEFT + "\",\"gas\":\"0x10000\"}");
+  t.ok(small.le(U256.ofU64(65536)) && small.gt(U256.ofU64(60000)), "asking for less gets that: \{small.toDecimal()}");
+  string batch = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}," +
+                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_call\",\"params\":[{\"to\":\"" + GAS_LEFT + "\",\"gas\":\"0x2aea540\"},\"latest\"]}]";
+  string answer = text(route(s, post("/rpc", batch), "1.1.1.1", 0 as i64));
+  t.ok(answer.indexOf("\"id\":1,\"result\":\"0x1092\"") > 0 && answer.indexOf("\"id\":2,\"result\":\"0x") > 0, "a batch is answered whole: " + answer);
+  return t.report();
+}
+
+export string test_an_estimate_beyond_the_cap_is_refused_before_it_is_searched() {
+  Check t = Check.create();
+  Served s = served();
+  string body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"eth_estimateGas\",\"params\":[{\"to\":\"" + FOREVER + "\"}]}";
+  string answer = text(route(s, post("/rpc", body), "1.1.1.1", 0 as i64));
+  t.ok(answer.indexOf("\"id\":7") > 0 && answer.indexOf("limit of 1000000 gas") > 0, "a call that never ends is refused: " + answer);
+  string fine = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"eth_estimateGas\",\"params\":[{\"to\":\"0x00000000000000000000000000000000000dead1\",\"value\":\"0x0\"}]}";
+  t.ok(text(route(s, post("/rpc", fine), "1.1.1.1", 0 as i64)).indexOf("\"result\":\"0x5208\"") > 0, "a plain transfer is estimated at 21,000");
   return t.report();
 }

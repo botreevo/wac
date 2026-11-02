@@ -17,7 +17,7 @@
 import { U256, wordsOf } from "../u256.wac";
 import { mulFull, divmod, sigLimbs } from "../limbs.wac";
 import { Field } from "./field.wac";
-import { Curve, Jac } from "./curve.wac";
+import { Curve, Jac, wnaf } from "./curve.wac";
 
 // Constants as their words, parsed once by the compiler (see U256.ofWords).
 static u64[] BN_P = wordsOf(U256.fromHex("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47")!);
@@ -181,13 +181,70 @@ export struct Bn {
     return G2(x3, y3);
   }
 
-  G2? g2Mul(this, G2 p, U256 k) {
-    G2? r = null;
-    for (i32 i = 255; i >= 0; i--) {
-      r = this.g2Add(r, r);
-      if (k.bit(i)) { r = this.g2Add(r, p); }
+  /**
+   * Whether r·Q is the point at infinity: the subgroup check every pairing input's Q must pass. In Jacobian
+   * coordinates over Fp2, the same a = 0 formulas G1 uses, with r in width-5 NAF: affine, as `g2Mul` is, it
+   * paid an Fp2 inversion on each of some 380 steps, and was a third of a pairing.
+   */
+  bool g2InSubgroup(this, G2 q) {
+    G2J[] odd = G2J[].filled(8, G2J(q.x, q.y, this.one2()));
+    G2J twice = this.dblJ(odd[0]);
+    for (i32 i = 1; i < 8; i++) { odd[i] = this.addJ(odd[i - 1], twice); }
+    i32[] d = wnaf(bnR());
+    G2J acc = G2J(this.one2(), this.one2(), this.zero2());
+    for (i32 i = d.len() - 1; i >= 0; i--) {
+      acc = this.dblJ(acc);
+      if (d[i] != 0) {
+        G2J m = odd[(d[i] < 0 ? -d[i] : d[i]) >> 1];
+        acc = this.addJ(acc, d[i] < 0 ? G2J(m.x, this.neg2(m.y), m.z) : m);
+      }
     }
-    return r;
+    return this.isZero2(acc.z);
+  }
+
+  Fq2 one2(this) { return Fq2(this.f.one(), this.f.zero()); }
+  Fq2 zero2(this) { return Fq2(this.f.zero(), this.f.zero()); }
+
+  /** dbl-2009-l over Fp2. */
+  G2J dblJ(this, G2J p) {
+    if (this.isZero2(p.z) || this.isZero2(p.y)) { return G2J(this.one2(), this.one2(), this.zero2()); }
+    Fq2 a = this.square2(p.x);
+    Fq2 b = this.square2(p.y);
+    Fq2 c = this.square2(b);
+    Fq2 d = this.sub2(this.sub2(this.square2(this.add2(p.x, b)), a), c);
+    d = this.add2(d, d);
+    Fq2 e = this.add2(this.add2(a, a), a);
+    Fq2 x3 = this.sub2(this.square2(e), this.add2(d, d));
+    Fq2 c8 = this.add2(c, c);
+    c8 = this.add2(c8, c8);
+    c8 = this.add2(c8, c8);
+    Fq2 y3 = this.sub2(this.mul2(e, this.sub2(d, x3)), c8);
+    Fq2 yz = this.mul2(p.y, p.z);
+    return G2J(x3, y3, this.add2(yz, yz));
+  }
+
+  /** add-2007-bl over Fp2. */
+  G2J addJ(this, G2J p, G2J q) {
+    if (this.isZero2(p.z)) { return q; }
+    if (this.isZero2(q.z)) { return p; }
+    Fq2 z1z1 = this.square2(p.z);
+    Fq2 z2z2 = this.square2(q.z);
+    Fq2 u1 = this.mul2(p.x, z2z2);
+    Fq2 u2 = this.mul2(q.x, z1z1);
+    Fq2 s1 = this.mul2(this.mul2(p.y, q.z), z2z2);
+    Fq2 s2 = this.mul2(this.mul2(q.y, p.z), z1z1);
+    Fq2 h = this.sub2(u2, u1);
+    Fq2 r = this.sub2(s2, s1);
+    r = this.add2(r, r);
+    if (this.isZero2(h)) { return this.isZero2(r) ? this.dblJ(p) : G2J(this.one2(), this.one2(), this.zero2()); }
+    Fq2 i = this.square2(this.add2(h, h));
+    Fq2 j = this.mul2(h, i);
+    Fq2 v = this.mul2(u1, i);
+    Fq2 x3 = this.sub2(this.sub2(this.square2(r), j), this.add2(v, v));
+    Fq2 s1j = this.mul2(s1, j);
+    Fq2 y3 = this.sub2(this.mul2(r, this.sub2(v, x3)), this.add2(s1j, s1j));
+    Fq2 z3 = this.mul2(this.sub2(this.sub2(this.square2(this.add2(p.z, q.z)), z1z1), z2z2), h);
+    return G2J(x3, y3, z3);
   }
 
   /** The Frobenius endomorphism on the twist: (x, y) -> (conj(x) ξ^((p-1)/3), conj(y) ξ^((p-1)/2)). */
@@ -330,13 +387,24 @@ export struct Bn {
     return this.mul12(fv, this.line(t, nq2, xp, yp));
   }
 
-  /** Whether the product of Miller loops `fv` is one after the final exponentiation. */
+  /**
+   * Whether the product of Miller loops `fv` is one after the final exponentiation: whether
+   * f^((p^6 − 1)(p^2 + 1)h) = 1, h the hard part, which is whether y = (f^(p^2) · f)^h is fixed by the p^6
+   * Frobenius — so no inverse in Fp12 is needed. (This computed (frob2(a) · a)^h with a = frob6(f) as well,
+   * and compared; but Frobenius maps are ring homomorphisms and commute, so that is frob6(y), and one
+   * exponentiation by h does where it did two.)
+   */
   bool finalIsOne(this, u64[][] fv) {
-    u64[][] a = this.frob6(fv);
-    u64[][] x = this.pow12Big(this.mul12(this.frob2(a), a), this.hard);
     u64[][] y = this.pow12Big(this.mul12(this.frob2(fv), fv), this.hard);
-    return this.eq12(x, y);
+    return this.eq12(this.frob6(y), y);
   }
+}
+
+/** A G2 point in Jacobian coordinates over Fp2: (X/Z^2, Y/Z^3); Z = 0 is infinity. */
+export struct G2J {
+  Fq2 x;
+  Fq2 y;
+  Fq2 z;
 }
 
 export struct G2 {
@@ -435,7 +503,7 @@ export u8[]? ecPairing(u8[] input) {
       Fq2 y = Fq2(f.fromU256(ya), f.fromU256(yb));
       if (!bn.onTwist(x, y)) { return null; }
       G2 pt = G2(x, y);
-      if (bn.g2Mul(pt, bnR()) is not null) { return null; }
+      if (!bn.g2InSubgroup(pt)) { return null; }
       q = pt;
     }
     if (q is null || bn.g1.isInfinity(g1!)) { continue; }

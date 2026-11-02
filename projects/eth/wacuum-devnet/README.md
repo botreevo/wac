@@ -71,11 +71,13 @@ from before the snapshot, from its block, and says that its status, fee and logs
 
 ## Building
 
-You need the `wac` command. This was developed and tested with one built from wac `96e5a0cfe` (wac's `master`
-on 2026-10-30), three commits after the library commit `wac.lock` pins:
+You need the `wac` command, built from the commit `wac.lock` pins for `wac` (the one wacuum pins):
 
     git clone https://git.voltrevo.com/wac.git ~/src/wac
-    cd ~/src/wac && git checkout 96e5a0cfe && ./bootstrap.sh --host nodejs
+    cd ~/src/wac && git checkout d267592b8 && ./bootstrap.sh --host nodejs
+
+One built from `96e5a0cfe`, which this was first deployed with, builds and runs it too, as fast: the
+end-to-end test passes on either.
 
 Node is the fastest of wac's hosts for wacuum, by two to four times. Then clone this with `-b master`: the
 server's default branch is `main` and empty, as for the other repositories there.

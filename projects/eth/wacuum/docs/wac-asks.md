@@ -2,7 +2,7 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
-## The static evaluator: no `switch`, and one step budget for a whole file
+## The static evaluator: no `switch`, and one step budget for a whole file (wac `issues/lang/0422w`)
 
 Two things met while moving bn254's and secp256k1's constants to compile time:
 

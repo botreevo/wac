@@ -11,9 +11,10 @@
 // dynamic gas. Any failure is an exceptional halt, which in the EVM consumes all the frame's gas and
 // discards its output — `Failure` carries the reason only for whoever is debugging.
 
+import { Map } from "core";
 import { keccak256 } from "../crypto/keccak.wac";
 import { U256 } from "../u256.wac";
-import { World, Log, Account } from "../state/world.wac";
+import { World, Log, Account, hashU256, eqU256 } from "../state/world.wac";
 import { Memory } from "./memory.wac";
 import { OpTable } from "./table.wac";
 import { Evm, Message, createAddress, create2Address, allButOne64th,
@@ -50,7 +51,9 @@ export struct Frame {
   Message msg;
   OpTable table;
   u8[] code;
-  bool[] jumpdests;
+  /** Where jumps may land: worked out at the frame's first jump, from the world's cache when the code has a hash. */
+  bool[]? jumpdests;
+  U256? codeHash;
   /** The last call's output, for RETURNDATASIZE and RETURNDATACOPY. */
   u8[] returndata;
   /**
@@ -75,8 +78,8 @@ export struct Frame {
   U256 outLen;
   U256 created;
 
-  Frame create(Evm evm, Message msg, u8[] code) {
-    return Frame(evm, msg, evm.table, code, jumpdestsOf(code), u8[].filled(0, 0), u64[].filled(256, 0), 0,
+  Frame create(Evm evm, Message msg, u8[] code, U256? codeHash) {
+    return Frame(evm, msg, evm.table, code, null, codeHash, u8[].filled(0, 0), u64[].filled(256, 0), 0,
                  Memory.create(), 0, msg.gas, null, false, U256.zero(), U256.zero(), U256.zero());
   }
 
@@ -522,7 +525,21 @@ Halt? step(Frame f, i32 op) {
 }
 
 bool validJump(Frame f, U256 dest) {
-  return dest.fitsU64() && dest.low() < (f.code.len() as@ u32) as u64 && f.jumpdests[dest.low() as! i32];
+  if (!dest.fitsU64() || dest.low() >= (f.code.len() as@ u32) as u64) { return false; }
+  if (f.jumpdests is null) { f.jumpdests = analysed(f); }
+  return f.jumpdests![dest.low() as! i32];
+}
+
+/** The frame's jump destinations: the world's for its code hash, worked out and kept when not there yet. */
+bool[] analysed(Frame f) {
+  if (f.codeHash is null) { return jumpdestsOf(f.code); }
+  Map<U256, bool[]> cache = f.evm.world.jumpdests;
+  bool[]? known = cache.get(f.codeHash!);
+  if (known is not null) { return known!; }
+  bool[] fresh = jumpdestsOf(f.code);
+  if (cache.len() > 10000) { f.evm.world.jumpdests = Map.create(hashU256, eqU256); }
+  f.evm.world.jumpdests.set(f.codeHash!, fresh);
+  return fresh;
 }
 
 /** CALLDATACOPY, CODECOPY and RETURNDATACOPY: `dest`, `src`, `len` from the stack, 3 gas a word. */

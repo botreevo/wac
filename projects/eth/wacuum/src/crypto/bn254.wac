@@ -33,6 +33,20 @@ static i32[] ATE = [0, 0, 0, 1, 0, 1, 0, -1, 0, 0, 1, -1, 0, 0, 1, 0, 0, 1, 1, 0
 
 // ── Fp2 ─────────────────────────────────────────────────────────────────────────
 
+/** 9x, as 8x + x: three doublings and an addition rather than a multiplication. */
+u64[] nine(Field f, u64[] x) {
+  u64[] x2 = f.add(x, x);
+  u64[] x4 = f.add(x2, x2);
+  return f.add(f.add(x4, x4), x);
+}
+
+/** An element of Fp6 = Fp2[v]/(v^3 − ξ): c0 + c1 v + c2 v². */
+export struct Fp6 {
+  Fq2 c0;
+  Fq2 c1;
+  Fq2 c2;
+}
+
 export struct Fq2 {
   u64[] a;
   u64[] b;
@@ -269,6 +283,13 @@ export struct Bn {
     return r;
   }
 
+  /**
+   * x·y in Fp12, as polynomials in w reduced by w^12 = 18 w^6 − 82, skipping zero coefficients: a Miller
+   * loop's lines have five of twelve, so most products here are a fifth of the work. (The tower's Karatsuba,
+   * as `sqr12` uses, does 54 multiplications to this one's 144 when both are dense, but adds so much more —
+   * and an addition costs half a multiplication on the Node host, most of it the new array — that it is no
+   * quicker dense and much slower sparse.)
+   */
   u64[][] mul12(this, u64[][] x, u64[][] y) {
     Field f = this.f;
     u64[][] t = u64[][].filled(23, f.zero());
@@ -279,7 +300,6 @@ export struct Bn {
         t[i + j] = f.add(t[i + j], f.mul(x[i], y[j]));
       }
     }
-    // w^12 = 18 w^6 - 82, from the top down so each reduction lands below what is left to reduce.
     for (i32 k = 22; k >= 12; k--) {
       if (f.isZero(t[k])) { continue; }
       t[k - 6] = f.add(t[k - 6], f.mul(t[k], this.c18));
@@ -289,6 +309,66 @@ export struct Bn {
     for (i32 i = 0; i < 12; i++) { out[i] = t[i]; }
     return out;
   }
+
+
+  /**
+   * x², as the tower Fp2 → Fp6 → Fp12 the same field also is: coefficients k and k + 6 make the Fp2
+   * coefficient (c_k + 9 c_(k+6)) + c_(k+6) i of w^k, since w^6 is ξ = 9 + i; even and odd powers of w make
+   * two elements of Fp6 = Fp2[v]/(v^3 − ξ), v = w^2; and the complex squaring there is two multiplications in
+   * Fp6, 36 in Fp, where the polynomial square takes 78.
+   */
+  u64[][] sqr12(this, u64[][] x) {
+    Fq2[] a = this.toTower(x);
+    Fp6 a0 = Fp6(a[0], a[2], a[4]);
+    Fp6 a1 = Fp6(a[1], a[3], a[5]);
+    Fp6 t = this.mul6(a0, a1);
+    Fp6 c0 = this.sub6(this.sub6(this.mul6(this.add6(a0, a1), this.add6(a0, this.mulByV6(a1))), t), this.mulByV6(t));
+    return this.fromTower(c0, this.add6(t, t));
+  }
+
+  /** The six Fp2 coefficients of x over w: (c_k + 9 c_(k+6)) + c_(k+6) i. */
+  Fq2[] toTower(this, u64[][] x) {
+    Field f = this.f;
+    Fq2[] out = Fq2[].filled(6, Fq2(x[0], x[6]));
+    for (i32 k = 0; k < 6; k++) { out[k] = Fq2(f.add(x[k], nine(f, x[k + 6])), x[k + 6]); }
+    return out;
+  }
+
+  /** Back: coefficient k is a − 9b and coefficient k + 6 is b, for c0 + c1 w's Fp2 coefficient a + bi of w^k. */
+  u64[][] fromTower(this, Fp6 c0, Fp6 c1) {
+    Field f = this.f;
+    Fq2[] a = [c0.c0, c1.c0, c0.c1, c1.c1, c0.c2, c1.c2];
+    u64[][] out = u64[][].filled(12, f.zero());
+    for (i32 k = 0; k < 6; k++) {
+      out[k] = f.sub(a[k].a, nine(f, a[k].b));
+      out[k + 6] = a[k].b;
+    }
+    return out;
+  }
+
+  /** x·ξ, ξ = 9 + i: (9a − b) + (a + 9b) i. */
+  Fq2 mulXi(this, Fq2 x) {
+    Field f = this.f;
+    return Fq2(f.sub(nine(f, x.a), x.b), f.add(x.a, nine(f, x.b)));
+  }
+
+  Fp6 add6(this, Fp6 x, Fp6 y) { return Fp6(this.add2(x.c0, y.c0), this.add2(x.c1, y.c1), this.add2(x.c2, y.c2)); }
+  Fp6 sub6(this, Fp6 x, Fp6 y) { return Fp6(this.sub2(x.c0, y.c0), this.sub2(x.c1, y.c1), this.sub2(x.c2, y.c2)); }
+
+  /** x·v: v·(c0 + c1 v + c2 v²) = ξ c2 + c0 v + c1 v², since v^3 = ξ. */
+  Fp6 mulByV6(this, Fp6 x) { return Fp6(this.mulXi(x.c2), x.c0, x.c1); }
+
+  /** Karatsuba in Fp6 = Fp2[v]/(v^3 − ξ): six multiplications in Fp2. */
+  Fp6 mul6(this, Fp6 x, Fp6 y) {
+    Fq2 t0 = this.mul2(x.c0, y.c0);
+    Fq2 t1 = this.mul2(x.c1, y.c1);
+    Fq2 t2 = this.mul2(x.c2, y.c2);
+    Fq2 c0 = this.add2(t0, this.mulXi(this.sub2(this.sub2(this.mul2(this.add2(x.c1, x.c2), this.add2(y.c1, y.c2)), t1), t2)));
+    Fq2 c1 = this.add2(this.sub2(this.sub2(this.mul2(this.add2(x.c0, x.c1), this.add2(y.c0, y.c1)), t0), t1), this.mulXi(t2));
+    Fq2 c2 = this.add2(this.sub2(this.sub2(this.mul2(this.add2(x.c0, x.c2), this.add2(y.c0, y.c2)), t0), t2), t1);
+    return Fp6(c0, c1, c2);
+  }
+
 
   bool eq12(this, u64[][] x, u64[][] y) {
     for (i32 i = 0; i < 12; i++) {
@@ -472,29 +552,6 @@ export struct Bn {
       return l;
     }
     return this.lineAt(lambda!, t, xp, yp);
-  }
-
-  /** x²: the cross products once and doubled, and the squares, 78 products where `mul12` takes 144. */
-  u64[][] sqr12(this, u64[][] x) {
-    Field f = this.f;
-    u64[][] t = u64[][].filled(23, f.zero());
-    for (i32 i = 0; i < 12; i++) {
-      if (f.isZero(x[i])) { continue; }
-      for (i32 j = i + 1; j < 12; j++) {
-        if (f.isZero(x[j])) { continue; }
-        t[i + j] = f.add(t[i + j], f.mul(x[i], x[j]));
-      }
-    }
-    for (i32 k = 0; k < 23; k++) { t[k] = f.add(t[k], t[k]); }
-    for (i32 i = 0; i < 12; i++) { t[2 * i] = f.add(t[2 * i], f.square(x[i])); }
-    for (i32 k = 22; k >= 12; k--) {
-      if (f.isZero(t[k])) { continue; }
-      t[k - 6] = f.add(t[k - 6], f.mul(t[k], this.c18));
-      t[k - 12] = f.sub(t[k - 12], f.mul(t[k], this.c82));
-    }
-    u64[][] out = u64[][].filled(12, f.zero());
-    for (i32 i = 0; i < 12; i++) { out[i] = t[i]; }
-    return out;
   }
 
   /**

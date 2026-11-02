@@ -3,7 +3,10 @@
 //   - an arithmetic loop (the interpreter itself),
 //   - a KECCAK256 loop,
 //   - an SSTORE loop writing fresh slots (state writes, and the state root after),
-//   - a block of plain transfers built from the mempool (signatures recovered, receipts, roots).
+//   - a block of plain transfers built from the mempool (signatures recovered, receipts, roots),
+//   - a block of token transfers: per call two hashed storage keys, two balances read and written (one a
+//     fresh slot), a three-topic log; built once recovering every sender and once with them known, so
+//     what the EVM and the state cost is told apart from what signatures cost.
 //
 // Each burns about 30M gas, a block's worth. The two loops run until their gas runs out, which is a failure
 // and undoes them; the SSTORE one stops on its own, so its state root is of 1300 slots.
@@ -26,6 +29,7 @@ import { publicKey, sign } from "../src/p2p/secp.wac";
 import { SenderCache } from "../src/tx/decode.wac";
 import { u256Bytes } from "../src/state/root.wac";
 import { addressBytes } from "../src/evm/evm.wac";
+import { hexToBytes } from "../src/hex.wac";
 
 static i64 GAS = 30000000;
 
@@ -51,10 +55,13 @@ async void report(Sys sys, string name, i64 gas, i64 nanos) {
 }
 
 /** A signed EIP-1559 transfer of 1 wei from `key` with `nonce`, chain 1, in its block form. */
-Item transfer(u8[] key, u64 nonce) {
+Item transfer(u8[] key, u64 nonce) { return call(key, nonce, U256.ofU64(0x2222), U256.one(), u8[].filled(0, 0), 21000); }
+
+/** A signed EIP-1559 call from `key` with `nonce`, chain 1, in its block form. */
+Item call(u8[] key, u64 nonce, U256 to, U256 value, u8[] data, u64 gas) {
   Item[] fields = [Item.Bytes(u256Bytes(U256.one())), Item.Bytes(u256Bytes(U256.ofU64(nonce))), Item.Bytes(u256Bytes(U256.one())),
-                   Item.Bytes(u256Bytes(U256.ofU64(10000000000))), Item.Bytes(u256Bytes(U256.ofU64(21000))),
-                   Item.Bytes(addressBytes(U256.ofU64(0x2222))), Item.Bytes(u256Bytes(U256.one())), Item.Bytes(u8[].filled(0, 0)),
+                   Item.Bytes(u256Bytes(U256.ofU64(10000000000))), Item.Bytes(u256Bytes(U256.ofU64(gas))),
+                   Item.Bytes(addressBytes(to)), Item.Bytes(u256Bytes(value)), Item.Bytes(data),
                    Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0))))];
   u8[] body = encode(Item.List(fields));
   u8[] unsigned = u8[].filled(body.len() + 1, 2);
@@ -128,5 +135,37 @@ export async i32 main(Sys sys) {
                        U256.one(), Map.create(hashU256, eqU256), u8[].filled(0, 0), SenderCache.create());
   i64 used = b.body.gasUsed;
   await report(sys, "\{b.block.txs.len()} transfers", used, (await sys.monotonicNanos()) - t0);
+
+  // Token transfers, to a new recipient each: the contract keeps balances at keccak(address ‖ 0), checks the
+  // sender's covers the amount, and logs ERC-20's Transfer(from, to, amount).
+  u8[] token = hexToBytes("0x" + TOKEN)!;
+  U256 at = U256.ofU64(0xc0de);
+  i32 m = 560;
+  Item[] calls = Item[].filled(m, Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < m; i++) {
+    u8[] data = u8[].filled(64, 0);
+    U256.ofU64(0x100000 + ((i as@ u32) as u64)).writeBytes(data, 0);
+    U256.ofU64(7).writeBytes(data, 32);
+    calls[i] = call(key, (i as@ u32) as u64, at, U256.zero(), data, 100000);
+  }
+  SenderCache senders = SenderCache.create();
+  for (i32 pass = 0; pass < 2; pass++) {
+    World wt = World.create();
+    wt.addBalance(sender, U256.ofU64(1000000000000000000));
+    wt.setCode(at, token);
+    u8[] slot = u8[].filled(64, 0);
+    sender.writeBytes(slot, 0);
+    wt.setStorage(at, U256.fromBytes(keccak256(slot), 0, 32), U256.ofU64(1000000000));
+    wt.endTransaction();
+    stateRoot(wt);
+    t0 = await sys.monotonicNanos();
+    Built tb = buildBlock(cancun, wt, parent, Attributes(U256.ofU64(12), U256.zero(), U256.ofU64(0xfe), none, U256.zero()), calls,
+                          U256.one(), Map.create(hashU256, eqU256), u8[].filled(0, 0), senders);
+    await report(sys, "\{tb.block.txs.len()} token transfers, senders \{pass == 0 ? "recovered" : "known"}", tb.body.gasUsed,
+                 (await sys.monotonicNanos()) - t0);
+  }
   return 0;
 }
+
+/** The token: transfer(to, amount) from calldata's two words, balances at keccak(address ‖ 0), a Transfer log. */
+static string TOKEN = "33600052600060205260406000208054602035808210605e578181900383556000356000526040600020805482019055600052600035337fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef60206000a3005b600080fd";

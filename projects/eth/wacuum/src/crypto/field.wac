@@ -8,8 +8,11 @@
 //
 // Elements are treated as values: no method writes into an argument.
 
-import { U256 } from "../u256.wac";
+import { U256, wordsOf } from "../u256.wac";
 import { modLimbs } from "../limbs.wac";
+
+// Constants as their words, parsed once by the compiler (see U256.ofWords).
+static u64[] SECP_P = wordsOf(U256.fromHex("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f")!);
 
 static u64 MASK = 0xFFFFFFFF;
 
@@ -39,7 +42,7 @@ export struct Field {
     r[8] = 1;
     u64[] rr = u64[].filled(17, 0);
     rr[16] = 1;
-    if (modulus.eq(U256.fromHex("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f")!)) {
+    if (modulus.eq(U256.ofWords(SECP_P))) {
       u64[] one = u64[].filled(8, 0);
       one[0] = 1;
       return Field(modulus, p, n0, one, one, true);
@@ -553,7 +556,7 @@ export struct Field {
     return out;
   }
 
-  u64[] square(this, u64[] a) { return this.mul(a, a); }
+  u64[] square(this, u64[] a) { return this.special ? sqrSecp(a, this.p) : this.mul(a, a); }
 
   /** a + b mod p, unrolled as `mul` is: the limbs in locals, the result written once. */
   u64[] add(this, u64[] a, u64[] b) {
@@ -693,7 +696,8 @@ export struct Field {
 /**
  * a·b mod secp256k1's p, for elements held as themselves: the 512-bit product, schoolbook and unrolled, and
  * then its high half H folded down twice by H·2^256 = H·(2^32 + 977) (mod p) — a shift and eight small
- * multiplications — and one conditional subtraction.
+ * multiplications — and one conditional subtraction. The fold is written out here and in `sqrSecp`: as a
+ * function of sixteen limbs it was not inlined, and cost a sixth of a recovery.
  */
 u64[] mulSecp(u64[] a, u64[] b, u64[] p) {
   u64 a0 = a[0];
@@ -865,6 +869,216 @@ u64[] mulSecp(u64[] a, u64[] b, u64[] p) {
   t = r14 + a7 * b7 + (t >> 32);
   r14 = t & MASK;
   r15 = t >> 32;
+  // Fold H into L: limb k gains H[k]·977 and H[k−1] (the 2^32 part), and a ninth limb takes what is left.
+  t = r0 + r8 * 977;
+  u64 s0 = t & MASK;
+  t = r1 + r9 * 977 + r8 + (t >> 32);
+  u64 s1 = t & MASK;
+  t = r2 + r10 * 977 + r9 + (t >> 32);
+  u64 s2 = t & MASK;
+  t = r3 + r11 * 977 + r10 + (t >> 32);
+  u64 s3 = t & MASK;
+  t = r4 + r12 * 977 + r11 + (t >> 32);
+  u64 s4 = t & MASK;
+  t = r5 + r13 * 977 + r12 + (t >> 32);
+  u64 s5 = t & MASK;
+  t = r6 + r14 * 977 + r13 + (t >> 32);
+  u64 s6 = t & MASK;
+  t = r7 + r15 * 977 + r14 + (t >> 32);
+  u64 s7 = t & MASK;
+  u64 s8 = r15 + (t >> 32);
+  // And the ninth limb the same way: it is small, so this leaves at most a carry out of 2^256.
+  t = s0 + s8 * 977;
+  s0 = t & MASK;
+  t = s1 + s8 + (t >> 32);
+  s1 = t & MASK;
+  t = s2 + (t >> 32);
+  s2 = t & MASK;
+  t = s3 + (t >> 32);
+  s3 = t & MASK;
+  t = s4 + (t >> 32);
+  s4 = t & MASK;
+  t = s5 + (t >> 32);
+  s5 = t & MASK;
+  t = s6 + (t >> 32);
+  s6 = t & MASK;
+  t = s7 + (t >> 32);
+  s7 = t & MASK;
+  if ((t >> 32) != 0) {
+    // 2^256 once more, as 2^32 + 977; what is left is far below 2^256, so nothing carries out of this.
+    t = s0 + 977;
+    s0 = t & MASK;
+    t = s1 + 1 + (t >> 32);
+    s1 = t & MASK;
+    t = s2 + (t >> 32);
+    s2 = t & MASK;
+    t = s3 + (t >> 32);
+    s3 = t & MASK;
+    t = s4 + (t >> 32);
+    s4 = t & MASK;
+    t = s5 + (t >> 32);
+    s5 = t & MASK;
+    t = s6 + (t >> 32);
+    s6 = t & MASK;
+    t = s7 + (t >> 32);
+    s7 = t & MASK;
+  }
+  u64[] out = [s0, s1, s2, s3, s4, s5, s6, s7];
+  if (!less(out, p)) { subInPlace(out, p); }
+  return out;
+}
+
+/**
+ * a² mod secp256k1's p: the 28 cross products a_i·a_j (i < j) once, schoolbook, then doubled by a shift,
+ * then the 8 squares a_i² added on the diagonal — 36 limb multiplications where a product of two takes 64.
+ * Half the multiplications in a point doubling are squarings.
+ */
+u64[] sqrSecp(u64[] a, u64[] p) {
+  u64 a0 = a[0];
+  u64 a1 = a[1];
+  u64 a2 = a[2];
+  u64 a3 = a[3];
+  u64 a4 = a[4];
+  u64 a5 = a[5];
+  u64 a6 = a[6];
+  u64 a7 = a[7];
+  u64 r0 = 0;
+  u64 r1 = 0;
+  u64 r2 = 0;
+  u64 r3 = 0;
+  u64 r4 = 0;
+  u64 r5 = 0;
+  u64 r6 = 0;
+  u64 r7 = 0;
+  u64 r8 = 0;
+  u64 r9 = 0;
+  u64 r10 = 0;
+  u64 r11 = 0;
+  u64 r12 = 0;
+  u64 r13 = 0;
+  u64 r14 = 0;
+  u64 r15 = 0;
+  u64 t = 0;
+  t = r1 + a0 * a1;
+  r1 = t & MASK;
+  t = r2 + a0 * a2 + (t >> 32);
+  r2 = t & MASK;
+  t = r3 + a0 * a3 + (t >> 32);
+  r3 = t & MASK;
+  t = r4 + a0 * a4 + (t >> 32);
+  r4 = t & MASK;
+  t = r5 + a0 * a5 + (t >> 32);
+  r5 = t & MASK;
+  t = r6 + a0 * a6 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a0 * a7 + (t >> 32);
+  r7 = t & MASK;
+  r8 = t >> 32;
+  t = r3 + a1 * a2;
+  r3 = t & MASK;
+  t = r4 + a1 * a3 + (t >> 32);
+  r4 = t & MASK;
+  t = r5 + a1 * a4 + (t >> 32);
+  r5 = t & MASK;
+  t = r6 + a1 * a5 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a1 * a6 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a1 * a7 + (t >> 32);
+  r8 = t & MASK;
+  r9 = t >> 32;
+  t = r5 + a2 * a3;
+  r5 = t & MASK;
+  t = r6 + a2 * a4 + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + a2 * a5 + (t >> 32);
+  r7 = t & MASK;
+  t = r8 + a2 * a6 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a2 * a7 + (t >> 32);
+  r9 = t & MASK;
+  r10 = t >> 32;
+  t = r7 + a3 * a4;
+  r7 = t & MASK;
+  t = r8 + a3 * a5 + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + a3 * a6 + (t >> 32);
+  r9 = t & MASK;
+  t = r10 + a3 * a7 + (t >> 32);
+  r10 = t & MASK;
+  r11 = t >> 32;
+  t = r9 + a4 * a5;
+  r9 = t & MASK;
+  t = r10 + a4 * a6 + (t >> 32);
+  r10 = t & MASK;
+  t = r11 + a4 * a7 + (t >> 32);
+  r11 = t & MASK;
+  r12 = t >> 32;
+  t = r11 + a5 * a6;
+  r11 = t & MASK;
+  t = r12 + a5 * a7 + (t >> 32);
+  r12 = t & MASK;
+  r13 = t >> 32;
+  t = r13 + a6 * a7;
+  r13 = t & MASK;
+  r14 = t >> 32;
+  // Doubled: each limb shifted left one, taking the bit the limb below shifts out.
+  r15 = ((r15 << 1) & MASK) | (r14 >> 31);
+  r14 = ((r14 << 1) & MASK) | (r13 >> 31);
+  r13 = ((r13 << 1) & MASK) | (r12 >> 31);
+  r12 = ((r12 << 1) & MASK) | (r11 >> 31);
+  r11 = ((r11 << 1) & MASK) | (r10 >> 31);
+  r10 = ((r10 << 1) & MASK) | (r9 >> 31);
+  r9 = ((r9 << 1) & MASK) | (r8 >> 31);
+  r8 = ((r8 << 1) & MASK) | (r7 >> 31);
+  r7 = ((r7 << 1) & MASK) | (r6 >> 31);
+  r6 = ((r6 << 1) & MASK) | (r5 >> 31);
+  r5 = ((r5 << 1) & MASK) | (r4 >> 31);
+  r4 = ((r4 << 1) & MASK) | (r3 >> 31);
+  r3 = ((r3 << 1) & MASK) | (r2 >> 31);
+  r2 = ((r2 << 1) & MASK) | (r1 >> 31);
+  r1 = ((r1 << 1) & MASK) | (r0 >> 31);
+  r0 = (r0 << 1) & MASK;
+  // And the squares, on the diagonal: a_i² lands on limbs 2i and 2i+1.
+  t = r0 + a0 * a0;
+  r0 = t & MASK;
+  t = r1 + (t >> 32);
+  r1 = t & MASK;
+  u64 q1 = a1 * a1;
+  t = r2 + (q1 & MASK) + (t >> 32);
+  r2 = t & MASK;
+  t = r3 + (q1 >> 32) + (t >> 32);
+  r3 = t & MASK;
+  u64 q2 = a2 * a2;
+  t = r4 + (q2 & MASK) + (t >> 32);
+  r4 = t & MASK;
+  t = r5 + (q2 >> 32) + (t >> 32);
+  r5 = t & MASK;
+  u64 q3 = a3 * a3;
+  t = r6 + (q3 & MASK) + (t >> 32);
+  r6 = t & MASK;
+  t = r7 + (q3 >> 32) + (t >> 32);
+  r7 = t & MASK;
+  u64 q4 = a4 * a4;
+  t = r8 + (q4 & MASK) + (t >> 32);
+  r8 = t & MASK;
+  t = r9 + (q4 >> 32) + (t >> 32);
+  r9 = t & MASK;
+  u64 q5 = a5 * a5;
+  t = r10 + (q5 & MASK) + (t >> 32);
+  r10 = t & MASK;
+  t = r11 + (q5 >> 32) + (t >> 32);
+  r11 = t & MASK;
+  u64 q6 = a6 * a6;
+  t = r12 + (q6 & MASK) + (t >> 32);
+  r12 = t & MASK;
+  t = r13 + (q6 >> 32) + (t >> 32);
+  r13 = t & MASK;
+  u64 q7 = a7 * a7;
+  t = r14 + (q7 & MASK) + (t >> 32);
+  r14 = t & MASK;
+  t = r15 + (q7 >> 32) + (t >> 32);
+  r15 = t & MASK;
   // Fold H into L: limb k gains H[k]·977 and H[k−1] (the 2^32 part), and a ninth limb takes what is left.
   t = r0 + r8 * 977;
   u64 s0 = t & MASK;

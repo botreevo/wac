@@ -271,7 +271,7 @@ requirement, and an implementation must not treat a guess about one as settled.
 ## Beside the chapters
 
 - **[_status/STATUS.md](_status/STATUS.md)** says which examples the compiler in this tree meets, and
-  [_status/MET](_status/MET) is the ratchet: `packages/wacc/test/wac/specexamples_test.wac` fails when an
+  [_status/MET](_status/MET) is the ratchet: `packages/wacc/test/wac/specexamples_test.wac` and its two siblings fail when an
   example in it stops being met. `packages/wacc/tools/specstatus.wac` writes both.
 - **[tour.wac](tour.wac)** is the language in one annotated file that compiles, and whose `selfTest()`
   returns `true`.

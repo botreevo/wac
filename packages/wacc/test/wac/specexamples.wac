@@ -11,10 +11,11 @@
 // **A fence this cannot read is reported, never skipped.** An unreadable fence counted as met would
 // let a typo in an expectation pass as a language that agrees with the spec.
 
-import { Exec, ChildEnv, Env, Files, Launch, Procs } from "std";
+import { Exec, ChildEnv, Env, Files, Launch, Output, Procs, Sys } from "std";
 import { Vec, flatten } from "core";
 import { itoa, utoa64 } from "../../../fmt/src/itoa.wac";
 import { startsWith, endsWith, trimmed, splitKeepingEmpty, splitLines } from "../../../wactest/src/strings.wac";
+import { T } from "../../../wactest/src/assert.wac";
 import { diagnoseBuildIn, pruneForBuild, diagnoseGraphIn, wireHasErrors, blockedFilesIn, emitFilesSelfDescribingIn,
          importSpecsFor } from "../../src/api.wac";
 import { renderDiagnostics } from "../../src/render.wac";
@@ -866,8 +867,19 @@ export struct ExJudged {
 }
 
 export ExJudged judgeAll(Env env, Files fs, Procs procs, string dir) {
-  string[] docs = exampleDocs(fs, dir);
-  string scratch = flatten(env.cwd().wait()).unwrap() + "/.cache/specexamples";
+  return judgeAllIn(env, fs, procs, dir, "specexamples");
+}
+
+/**
+ * `judgeAll` with a scratch directory of its own under `.cache/` — what lets several walks run at once.
+ *
+ * Each walk numbers its modules from one, so two walks sharing `.cache/specexamples` would build `ex100.wasm`
+ * over each other and remove the directory under the other's feet.
+ */
+export ExJudged judgeAllIn(Env env, Files fs, Procs procs, string dir, string scratchName) {
+  // A part may name one document rather than a directory: `spec/README.md` has examples of its own.
+  string[] docs = endsWith(dir, ".md") ? [dir] : exampleDocs(fs, dir);
+  string scratch = flatten(env.cwd().wait()).unwrap() + "/.cache/" + scratchName;
   fs.mkdir(scratch, true).wait();
   Vec<string> keys = Vec.create();
   Vec<ExVerdict> all = Vec.create();
@@ -887,4 +899,83 @@ export ExJudged judgeAll(Env env, Files fs, Procs procs, string dir) {
   }
   fs.remove(scratch, true).wait();
   return ExJudged(keys.toArray(), all.toArray(), docs);
+}
+
+/**
+ * **The specification's chapters, in three parts**, each held by a test file of its own: the examples were
+ * one test, about 130s on one worker, and the suite's wall is decided by its longest single runs. Every
+ * top-level directory of `spec/` that holds an example is in exactly one part — `specexamples_test.wac`
+ * checks that, so a new chapter cannot go unjudged by belonging to none.
+ *
+ * Sized by how many examples `MET` holds in each, which is the cost: `2-types` is 219 of 512. A part is a
+ * directory, or one document by its name (`inPart`).
+ */
+export bool inPart(string path, string part) {
+  if (endsWith(part, ".md")) { return path == part || startsWith(path, part + "#"); }
+  return startsWith(path, part + "/");
+}
+export string[] specPart(i32 k) {
+  if (k == 0) { return ["spec/2-types"]; }
+  if (k == 1) { return ["spec/1-programs", "spec/4-static", "spec/appendices", "spec/README.md"]; }
+  return ["spec/3-expressions", "spec/5-inference", "spec/6-concurrency", "spec/7-library", "spec/8-tooling"];
+}
+export i32 specPartCount() { return 3; }
+
+/**
+ * Every example `MET` lists under part `k` is still met: the body of the specexamples tests.
+ *
+ * `MET` is read whole and narrowed to the part, so a key whose document is in another part is that part's
+ * business, and one in no part is the coverage test's.
+ */
+export string heldStillMet(Sys sys, i32 k) {
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  u8[]? f = flatten(fs.readFile("spec/_status/MET").wait()).ok();
+  t.isTrue((f is not null), "spec/_status/MET cannot be read — run packages/wacc/tools/specstatus.wac");
+  if ((f is null)) { return t.report(); }
+  string[] parts = specPart(k);
+  string[] lines = splitLines(string.fromBytes(f!));
+  Vec<string> heldV = Vec.create();
+  for (i32 i = 0; i < lines.len(); i++) {
+    for (i32 p = 0; p < parts.len(); p++) {
+      if (inPart(lines[i], parts[p])) { heldV.push(lines[i]); }
+    }
+  }
+  string[] held = heldV.toArray();
+
+  i32 regressed = 0;
+  string detail = "";
+  i32 judged = 0;
+  i32 met = 0;
+  for (i32 p = 0; p < parts.len(); p++) {
+    ExJudged j = judgeAllIn(env, fs, procs, parts[p], "specexamples-" + itoa(k) + "-" + itoa(p));
+    judged = judged + j.verdicts.len();
+    for (i32 i = 0; i < j.verdicts.len(); i++) { if (j.verdicts[i].state == "met") { met = met + 1; } }
+    for (i32 h = 0; h < held.len(); h++) {
+      if (!inPart(held[h], parts[p])) { continue; }
+      bool found = false;
+      for (i32 i = 0; i < j.keys.len(); i++) {
+        if (j.keys[i] != held[h]) { continue; }
+        found = true;
+        if (j.verdicts[i].state != "met") {
+          regressed = regressed + 1;
+          if (regressed <= 10) { detail = detail + "\n  " + held[h] + " — " + j.verdicts[i].why; }
+        }
+      }
+      if (!found) {
+        regressed = regressed + 1;
+        if (regressed <= 10) { detail = detail + "\n  " + held[h] + " — no longer an example; rerun specstatus"; }
+      }
+    }
+  }
+  // A walk that found nothing would hold every listed example to nothing.
+  t.isTrue(judged >= held.len() && judged > 0,
+           "only " + itoa(judged) + " examples read for " + itoa(held.len()) + " held — did the walk resolve?");
+  out.line("    spec examples, part " + itoa(k) + ": " + itoa(met) + " of " + itoa(judged) + " met; "
+           + itoa(held.len()) + " held");
+  t.eqI32(regressed, 0, itoa(regressed) + " example(s) once met are not met now:" + detail);
+  return t.report();
 }

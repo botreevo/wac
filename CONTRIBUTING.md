@@ -22,7 +22,7 @@ you could edit.
 
 [The language spec](spec/) is written as examples, and each example carries tagged requirements —
 `[§wac-int32-dfkqg8u]` and the like — directly below it. Each tag names one testable behaviour, and the
-example above it is the test: `packages/wacc/test/wac/specexamples_test.wac` runs every example.
+example above it is the test: `packages/wacc/test/wac/specexamples_test.wac` and its two siblings run every example, a part of the chapters each.
 
 - **The spec is the source of truth.** It describes what the code should do, not what the code
   happens to do. Where they disagree, one of them is wrong and saying which is the work.

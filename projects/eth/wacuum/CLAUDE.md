@@ -36,6 +36,7 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
 
 ## Building and testing here
 
+    wac task deps        # the wac wac.lock pins, into the package cache with git — once, and after the pin moves
     wac task test        # the unit tests, in about a second
     wac task vectors     # regenerate the U256 cases (needs node)
     wac task fixtures    # execution-spec-tests v5.4.0 into fixtures/

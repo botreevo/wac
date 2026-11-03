@@ -643,6 +643,30 @@ for attempt in 1 2 3; do
     echo "== merge needs hands: resolve, then run this again =="
     exit 1
   fi
+  # **A merge that brought only documentation is pushed without another suite.** Against the tree the suite
+  # just passed, `tools/docsOnly.wac` asks whether anything changed that a test could execute — a `.md` with
+  # an executed ```wac fence, or any other file, is a no. When it answers yes, the code under test is the
+  # tree that passed, byte for byte, so a second suite would test the same thing again — and lose the race
+  # again, since a docs-only push takes no lock and needs seconds. That rerun is most of what
+  # `issues/system/0213a` and `0154` measured. A push lost even then merges once more and asks again; the
+  # first answer of no goes round the loop and runs the suite, as before.
+  for docsRound in 1 2 3 4 5; do
+    said=$("$WAC" run --allow-read --allow-run tools/docsOnly.wac -- "$tested" HEAD 2>&1); docsOnly=$?
+    printf '%s\n' "$said" | sed 's/^/   /'
+    [ "$docsOnly" -eq 0 ] || break
+    echo "== what landed is documentation only, so the tested code is unchanged: pushing the merge =="
+    if git push --quiet origin HEAD:master 2>/dev/null; then
+      echo "== pushed $(git rev-parse --short HEAD), the merge of $(git rev-parse --short "$tested") with documentation =="
+      rm -f "$log" "$log".*
+      starveClear
+      exit 0
+    fi
+    echo "== rejected again ($docsRound): merging what landed =="
+    if ! git pull --no-rebase --no-edit --quiet origin master; then
+      echo "== merge needs hands: resolve, then run this again =="
+      exit 1
+    fi
+  done
   # **Reseed when the merge aged the seed, and ask the test that owns that question.**
   #
   # `native/v8/seed/wacc.wasm` and `native/v8/target/release/wac` are gitignored and one per agent, so

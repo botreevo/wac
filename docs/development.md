@@ -195,6 +195,12 @@ that is what "still being beaten to the push after three tries" means. The suite
 another agent's push takes none, so the race is lost in the gap between the last test and the push.
 Nothing is wrong when this happens: pull, and run it again.
 
+**What it was beaten by decides whether the suite runs again.** After a rejected push the gate merges, and
+asks `tools/docsOnly.wac` whether anything between the tree it tested and the merge is something a test
+could execute. When the answer is no — the usual case, since a documentation push needs no suite and so
+lands in seconds — the code is the tree that passed, and the gate pushes the merge without a second
+suite. Anything else runs the suite again, as before.
+
 Work on the primary branch and push only complete changes. A rejected push means somebody got there
 first: pull, merge, check the result still holds together, and push again. Never force-push — the
 bare repos reject non-fast-forwards, so an attempt fails loudly rather than quietly discarding

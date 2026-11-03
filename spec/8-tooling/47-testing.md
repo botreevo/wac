@@ -56,6 +56,11 @@ what it dropped. Naming a path explicitly still runs it.
 
 `--filter <text>` runs only the tests whose names contain it.
 
+`--only f,…` runs the tests of only those files, of the ones a directory walk found — the rest are compiled into the
+run and not called, so every such run of one directory is the same build; a name the walk did not find is refused.
+`--compile-only` builds the run and remembers it, and calls nothing. Both are for a runner that splits a directory
+across processes, as the repository's suite does.
+
 ## What a run prints
 
 `[§wac-cli-verbose-5vq3mk8]` A run prints a line per test as it finishes — `ok   <name> (<n> ms)`, or `FAIL <name> — <message>`

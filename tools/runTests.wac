@@ -445,6 +445,16 @@ struct Chunk {
    * and it would quietly halve the ordering below.
    */
   string key;
+  /**
+   * For a chunk of a split directory, its share of the files; `targets` is then the directory itself.
+   *
+   * **The directory, not the files, so that every chunk of it is one build.** Named by its files, each
+   * chunk was an aggregate of its own, and `packages/wacc/test/wac`'s eight compiled the compiler eight
+   * times — 150s of the suite's work outside any test. Named as the directory, with `wac test --only`
+   * choosing which files run, they are the same aggregate, which `warmed` builds once before the queue
+   * and the build cache serves to the rest.
+   */
+  string[] only;
 }
 
 /**
@@ -482,13 +492,13 @@ Chunk[] chunksOf(Env env, Files fs, string[] dirs, string[] skip) {
                      : (kept[d].len() + chunkSize() - 1) / chunkSize());
   }
 
-  Chunk[] out = Chunk[].filled(total, Chunk(string[].filled(0, ""), "", ""));
+  Chunk[] out = Chunk[].filled(total, Chunk(string[].filled(0, ""), "", "", string[].filled(0, "")));
   i32 n = 0;
   for (i32 d = 0; d < dirs.len(); d++) {
     string[] mine = kept[d];
     if (mine.len() == 0) { continue; }
     if (mine.len() <= chunkSize()) {
-      out[n] = Chunk([dirs[d]], dirs[d], dirs[d]);
+      out[n] = Chunk([dirs[d]], dirs[d], dirs[d], string[].filled(0, ""));
       n = n + 1;
       continue;
     }
@@ -502,9 +512,9 @@ Chunk[] chunksOf(Env env, Files fs, string[] dirs, string[] skip) {
       // different work, and the footer — which dedupes the slowest runs by label — showed one of
       // them and silently dropped the other. That is the exact information somebody reading either
       // is after.
-      out[n] = Chunk(targets, dirs[d] + " — " + itoa(targets.len()) + " of its files ("
+      out[n] = Chunk([dirs[d]], dirs[d] + " — " + itoa(targets.len()) + " of its files ("
                               + itoa(k + 1) + " of " + itoa(parts) + ")",
-                     dirs[d] + "#" + itoa(k));
+                     dirs[d] + "#" + itoa(k), targets);
       n = n + 1;
     }
   }
@@ -695,11 +705,53 @@ string logDir(Env env) { return flatten(env.cwd().wait()).unwrap() + "/.cache/su
  * on screen either way — and the lane still exits non-zero. `!r.ran()` below is now about the shell
  * itself, which is a different and much rarer failure.
  */
-string chunkLine(string wac, string[] targets, string[] ignore, string log) {
+string chunkLine(string wac, string[] targets, string[] ignore, string[] only, string log) {
   string line = "exec " + quoted(wac);
   string[] args = runArgs(targets, ignore);
-  for (i32 i = 0; i < args.len(); i++) { line = line + " " + quoted(args[i]); }
+  for (i32 i = 0; i < args.len(); i++) {
+    line = line + " " + quoted(args[i]);
+    // Straight after `test`, with the command's other flags rather than among the targets.
+    if (i == 0 && only.len() > 0) { line = line + " --only " + quoted(joined(only, ",")); }
+  }
   return line + " > " + quoted(log) + " 2>&1";
+}
+
+/**
+ * Build, once each, the directories the queue runs in several chunks — before any chunk starts.
+ *
+ * Every chunk of such a directory is the same aggregate (`Chunk.only` says why), so one build serves them all
+ * from the cache — but only if it is there first: started together, the chunks would all miss and all compile,
+ * which is the cost this exists to remove. So `wac test --compile-only` runs for each of those directories, at
+ * `workers` at once, and the queue waits for them. A build that fails is not reported here: the chunks that
+ * follow compile it again and say why in their own blocks, which is where a reader looks.
+ */
+void warmed(Output out, Clock clock, Procs procs, string wac, Chunk[] queue, string[] ignore, i32 workers) {
+  Names dirs = Names.create();
+  for (i32 i = 0; i < queue.len(); i++) {
+    if (queue[i].only.len() == 0 || queue[i].targets.len() != 1) { continue; }
+    if (!has(dirs.all(), queue[i].targets[0])) { dirs.push(queue[i].targets[0]); }
+  }
+  string[] ds = dirs.all();
+  if (ds.len() == 0) { return; }
+  i64 began = nowMs(clock);
+  i32 at = 0;
+  while (at < ds.len()) {
+    i32 n = ds.len() - at < workers ? ds.len() - at : workers;
+    Ticket<Result<Exec, SpawnFault>>[] batch = Ticket<Result<Exec, SpawnFault>>[].defaulted(n);
+    for (i32 k = 0; k < n; k++) {
+      string line = "exec " + quoted(wac);
+      string[] args = runArgs([ds[at + k]], ignore);
+      for (i32 i = 0; i < args.len(); i++) {
+        line = line + " " + quoted(args[i]);
+        if (i == 0) { line = line + " --compile-only"; }
+      }
+      batch[k] = procs.exec("/bin/sh", ["-c", line + " > /dev/null 2>&1"], u8[](), ChildEnv.inherited(), Launch.plain());
+    }
+    for (i32 k = 0; k < n; k++) { batch[k].wait(); }
+    at = at + n;
+  }
+  out.line("   built " + itoa(ds.len()) + " split directories once each, for all their chunks, in "
+           + itoa(((nowMs(clock) - began) / (1000 as i64)) as~ i32) + "s");
 }
 
 /** The whole lines after `from`, and how far they consumed. */
@@ -1280,10 +1332,11 @@ i32 lanes(Output err, Output out, Clock clock, Env env, Files fs, Procs procs, O
   }
 
   string[] ignore = f.skip;
+  warmed(out, clock, procs, wac, queue, ignore, workers);
   for (i32 s = 0; s < workers && next < queue.len(); s++) {
     fs.writeFile(slotLog[s], u8[]()).wait();
     out.line("── " + slotTag[s] + " " + queue[next].label);
-    live[s] = procs.exec("/bin/sh", ["-c", chunkLine(wac, queue[next].targets, ignore, slotLog[s])],
+    live[s] = procs.exec("/bin/sh", ["-c", chunkLine(wac, queue[next].targets, ignore, queue[next].only, slotLog[s])],
                          u8[](), ChildEnv.inherited(), Launch.plain());
     slotItem[s] = next;
     slotStart[s] = nowMs(clock);
@@ -1366,7 +1419,7 @@ i32 lanes(Output err, Output out, Clock clock, Env env, Files fs, Procs procs, O
       fs.writeFile(slotLog[slot], u8[]()).wait();
       out.line("── " + slotTag[slot] + " " + queue[next].label);
       live[slot] = procs.exec("/bin/sh",
-                              ["-c", chunkLine(wac, queue[next].targets, ignore, slotLog[slot])],
+                              ["-c", chunkLine(wac, queue[next].targets, ignore, queue[next].only, slotLog[slot])],
                               u8[](), ChildEnv.inherited(), Launch.plain());
       slotItem[slot] = next;
       slotStart[slot] = nowMs(clock);

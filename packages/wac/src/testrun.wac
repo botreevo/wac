@@ -22,6 +22,7 @@ import { parse } from "../../json/src/json.wac";
 import { JsonObject, JsonValue } from "../../json/src/value.wac";
 import { cellAt, cells } from "../../wacc/src/manifest.wac";
 import { DeclaredTest, declaredTests, hostEntries, hostImports, testEntry } from "../../wacc/src/program.wac";
+import { normalisePath } from "../../wacc/src/path.wac";
 
 /**
  * The walked paths as the aggregate can import them: relative to the project, or nothing.
@@ -243,6 +244,30 @@ bool isBlank(string c) { return c == " " || c == "\n" || c == "\t" || c == "\r";
  * other — a caller that gets a different answer for naming one file than for naming its directory has
  * to hold both rules in its head.
  */
+/**
+ * `--only a_test.wac,b_test.wac`: the walked files whose tests this run calls, the rest compiled and not run.
+ *
+ * **Why a run would compile what it does not run.** The suite splits a large directory into chunks run at
+ * once, and a chunk named by its files is an aggregate of its own — so `packages/wacc/test/wac`'s eight chunks
+ * compiled the compiler eight times, about 19s each, a third of what that directory cost. Named as the
+ * directory with `--only`, every chunk is the same aggregate, which the build cache holds after the first.
+ * Each name is spelled as the walk spells it, `dir/` trimmed as `--ignore` trims it.
+ */
+export string[] onlyList(string spec) {
+  Vec<string> out = Vec.create();
+  if (trimmedText(spec) == "") { return out.toArray(); }
+  i32 at = 0;
+  while (at <= spec.len()) {
+    i32 comma = spec.slice(at, spec.len()).indexOf(",");
+    i32 end = comma < 0 ? spec.len() : at + comma;
+    string one = trimmedText(spec.slice(at, end));
+    if (one != "") { out.push(normalisePath(one)); }
+    if (comma < 0) { break; }
+    at = end + 1;
+  }
+  return out.toArray();
+}
+
 export string[] withoutIgnored(string[] files, string spec) {
   if (trimmedText(spec) == "") { return files; }
   // A `Vec`, not an array trimmed by `exactly` afterwards: this is the test runner's code and the
@@ -939,7 +964,8 @@ void writeProfile(Output err, Files fs, string dir, string entry, Tally t, strin
   }
 }
 
-export i32 runTests(Output err, Output out, Clock clock, Files fs, Modules mods, string entry, u8[] whole, string manifest, Authority given, string filter, string[] files, i32 ignored, string target, string covTable, bool loud, string profileDir) {
+export i32 runTests(Output err, Output out, Clock clock, Files fs, Modules mods, string entry, u8[] whole, string manifest, Authority given, string filter, string[] files, i32 ignored, string target, string covTable, bool loud, string profileDir,
+                      string[] only) {
   // **The tests get what the caller granted, and no more.** `wac test --allow-read` means the tests
   // may read; it does not mean they may write because *this command* can. `load` narrows the world it
   // hands over, and it took a test writing a file to disk to find that it had not been asked to —
@@ -1030,7 +1056,23 @@ export i32 runTests(Output err, Output out, Clock clock, Files fs, Modules mods,
   // whether the run was worth waiting for. Wall time, named as such: the CPU split the native
   // command used to print is `getrusage` and not something a wac program is offered.
   i64 runBegan = flatten(clock.monotonicNanos().wait()).unwrap();
+  // **A name `--only` gives that the walk did not find is refused, not skipped**: skipping it would run
+  // nothing for it and pass, which is the one answer a list of files must never give.
+  for (i32 k = 0; k < only.len(); k++) {
+    bool walkedIt = false;
+    for (i32 f = 0; f < files.len(); f++) { if (files[f] == only[k]) { walkedIt = true; } }
+    if (!walkedIt) {
+      m.unload();
+      err.line("wac: --only names \{only[k]}, which this walk of \{target} did not find");
+      return 1;
+    }
+  }
   for (i32 f = 0; f < files.len(); f++) {
+    if (only.len() > 0) {
+      bool chosen = false;
+      for (i32 k = 0; k < only.len(); k++) { if (files[f] == only[k]) { chosen = true; } }
+      if (!chosen) { continue; }
+    }
     i32[] mine = i32[].filled(names.len(), 0);
     i32 count = 0;
     for (i32 i = 0; i < names.len(); i++) {

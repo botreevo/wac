@@ -127,6 +127,11 @@ because a silent skip reads as coverage.
 
 ## Before pushing
 
+**`bash tools/gatedeps.sh` says what the suite needs from the machine** — the webrtc oracles' Python modules,
+coturn, sshd and its `/run/sshd`, `ss`, the Chromium `npm:playwright@1` asks for — and `tools/push.sh` asks it
+first. A missing one fails its tests only after their timeouts, so without it a fresh machine spends a whole
+suite finding out, in failures that name something else.
+
 **The suite refuses to start on a busy machine, or twice in twenty minutes.** Three agents share
 five cores, 11.9 GB and 4 GB of swap; a suite peaks over 3 GB, so two at once is tight and three get
 killed at about 70% having reported no failure at all. `wac task test` checks first and says what to

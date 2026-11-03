@@ -204,6 +204,14 @@ if ! git pull --no-rebase --no-edit --quiet origin master; then
   exit 1
 fi
 
+# **What the suite needs from the machine, asked first** (`tools/gatedeps.sh`): a missing oracle fails its
+# tests only after waiting out their timeouts, so a machine short of one package spent the whole suite to
+# say so, in forty failures that each named something else. `WAC_GATE_DEPS_ANYWAY=1` goes past it.
+if [ "${WAC_GATE_DEPS_ANYWAY:-}" != "1" ] && ! bash tools/gatedeps.sh; then
+  echo "== not running the suite: install what is listed above, or set WAC_GATE_DEPS_ANYWAY=1 ==" >&2
+  exit 1
+fi
+
 # **The git imports `wac.lock` pins, in the cache, before anything compiles a page.** `web` is a
 # repository of its own since 2026-10-29, pinned on GitHub and fetched from git.voltrevo.com through `git`'s
 # setting (`tools/use-mirror.sh`), which `wac update`'s fetcher does not follow — so `git` does. After the pull, because the pull is what moves the lock.

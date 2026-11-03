@@ -477,9 +477,29 @@ export struct Decls {
 
   /** The indices of `decls` that are `type` declarations, in order — found once, by `typeDeclAt`. */
   i32[]? typeDecls;
+  /** Their names, position for position with `typeDecls`, and those positions by name — filled with it. */
+  string[] typeNames;
+  KeyIndex typeIx;
 
   /** `impName` by name (`keyindex.wac`), filled where the imports are. */
   KeyIndex impIndex;
+
+  /**
+   * `keys` and `names` by value, and each declaration's first constant — filled by `indexDecls` and
+   * `indexConsts` once those tables are final, and read only while `indexed` says so.
+   *
+   * **Why they exist.** `declAt`, `structParentIn` and `constAt` each walked every declaration (or every
+   * constant) per question, and were asked per name, per hop and per pair of union members, so emitting
+   * a one-line program that imports `std` spent about 1.3s here — 36 million turns of
+   * `structParentIn`'s loop alone (`issues/lang/0398b` is the same shape, met in other tables). A bucket
+   * lists its rows in increasing order, so a walk of one visits the rows the full walk matched, earliest
+   * first, and answers the same.
+   */
+  KeyIndex keyIx;
+  KeyIndex nameIx;
+  i32[] constOfDecl;
+  bool indexed;
+  bool constsIndexed;
 
   u8[] srcOf(const this, i32 fi) {
     return fi >= 0 && fi < this.srcs.len() ? this.srcs[fi] : this.blobSrc;
@@ -498,6 +518,7 @@ export struct Decls {
    * exported name is only an answer when it is the only one.
    */
   i32 declAt(const this, string name, i32 fi) {
+    if (this.indexed) { return declAtIndexed(this, name, fi); }
     for (i32 d = 0; d < this.decls.len(); d++) {
       if (this.keys[d] == "") { continue; }
       if (this.nameOf(d) == name && this.declFiles[d] == fi) { return d; }
@@ -528,6 +549,7 @@ export struct Decls {
   i32 constAt(const this, string name, i32 fi) {
     i32 d = this.declAt(name, fi);
     if (d < 0) { return 0 - 1; }
+    if (this.constsIndexed) { return d < this.constOfDecl.len() ? this.constOfDecl[d] : 0 - 1; }
     for (i32 i = 0; i < this.constCount; i++) {
       if (this.constDecls[i] == d) { return i; }
     }
@@ -2293,6 +2315,7 @@ export void keyDecls(Decls cx) {
     }
     cx.keys[d] = twice ? cx.names[d] + "@" + decimalText(cx.declFiles[d]) : cx.names[d];
   }
+  indexDecls(cx);
 }
 
 /** A declaration's written name, or "" for one that declares no name. */
@@ -2353,7 +2376,8 @@ export Decls declsOfProgram(u8[] src, Lexed lexed, Decl[] decls) {
                Expr?[].filled(nc < 1 ? 1 : nc, null), i32[].filled(nc < 1 ? 1 : nc, 0), 0,
                string[].filled(nd, ""), string[].filled(nd, ""), bool[].filled(nd, false),
                i32[].filled(nc < 1 ? 1 : nc, 0),
-               i32[].filled(1, 0), string[].filled(1, ""), i32[].filled(1, 0), string[].filled(1, ""), 0, null, KeyIndex.create());
+               i32[].filled(1, 0), string[].filled(1, ""), i32[].filled(1, 0), string[].filled(1, ""), 0, null, string[](), KeyIndex.create(), KeyIndex.create(),
+               KeyIndex.create(), KeyIndex.create(), i32[](), false, false);
   for (i32 d = 0; d < decls.len(); d++) { cx.declFiles[d] = 0 - 1; }
   // **Before the tables, because the tables are keyed on what it decides.** A struct's fields are
   // filed under the struct's identity, not under the spelling one file gave it.
@@ -2380,6 +2404,7 @@ export Decls declsOfProgram(u8[] src, Lexed lexed, Decl[] decls) {
       default: { }
     }
   }
+  indexConsts(cx);
   return cx;
 }
 
@@ -2469,7 +2494,8 @@ export Decls declsOfFiles(string[] paths, string[] sources, Lexed?[] lexes, Prog
                    Expr?[].filled(nc < 1 ? 1 : nc, null), i32[].filled(nc < 1 ? 1 : nc, 0), 0,
                    string[].filled(nd2, ""), string[].filled(nd2, ""), bool[].filled(nd2, false),
                    i32[].filled(nc < 1 ? 1 : nc, 0),
-                   i32[].filled(1, 0), string[].filled(1, ""), i32[].filled(1, 0), string[].filled(1, ""), 0, null, KeyIndex.create());
+                   i32[].filled(1, 0), string[].filled(1, ""), i32[].filled(1, 0), string[].filled(1, ""), 0, null, string[](), KeyIndex.create(), KeyIndex.create(),
+               KeyIndex.create(), KeyIndex.create(), i32[](), false, false);
   keyDecls(cx);
 
   // **The import edges, from the files' own `import` lines.** Without them a name a file spells
@@ -2540,6 +2566,7 @@ export Decls declsOfFiles(string[] paths, string[] sources, Lexed?[] lexes, Prog
       default: { }
     }
   }
+  indexConsts(cx);
   return cx;
 }
 
@@ -2971,6 +2998,12 @@ bool isAncestorIn(Decls cx, string anc, string t) {
 
 /** The parent of the struct whose key is `key`, as a key, or "". */
 string structParentIn(Decls cx, string key) {
+  if (cx.indexed) {
+    for (i32 d = keyFirst(cx.keyIx, key); d >= 0; d = cx.keyIx.next[d]) {
+      if (cx.keys[d] == key) { return structParentOf(cx, d); }
+    }
+    return "";
+  }
   for (i32 d = 0; d < cx.decls.len(); d++) {
     if (cx.keys[d] != key) { continue; }
     match (cx.decls[d].kind) {
@@ -2985,6 +3018,72 @@ string structParentIn(Decls cx, string key) {
     }
   }
   return "";
+}
+
+/** `structParentIn`'s answer for declaration `d`, whose key matched. */
+string structParentOf(Decls cx, i32 d) {
+  match (cx.decls[d].kind) {
+    StructDecl(nameTok, parentTok, fields, methods, exported, isConst, typeParams): {
+      if (parentTok < 0) { return ""; }
+      i32 pf = d < cx.declFiles.len() ? cx.declFiles[d] : 0 - 1;
+      string pn = tokText(cx.srcOf(pf), cx.lexOf(pf), parentTok);
+      string pk = cx.keyAt(pn, pf);
+      return pk == "" ? pn : pk;
+    }
+    default: { return ""; }
+  }
+}
+
+/**
+ * `Decls.declAt` through `nameIx` and `impIndex`: the same three questions in the same order, each asked
+ * of the rows that can match rather than of every row.
+ */
+i32 declAtIndexed(const Decls cx, string name, i32 fi) {
+  for (i32 d = keyFirst(cx.nameIx, name); d >= 0; d = cx.nameIx.next[d]) {
+    if (cx.keys[d] == "" || cx.names[d] != name) { continue; }
+    if (cx.declFiles[d] == fi) { return d; }
+  }
+  for (i32 e = keyFirst(cx.impIndex, name); e >= 0; e = cx.impIndex.next[e]) {
+    if (cx.impFrom[e] != fi || cx.impName[e] != name) { continue; }
+    string want = cx.impDecl[e];
+    for (i32 d = keyFirst(cx.nameIx, want); d >= 0; d = cx.nameIx.next[d]) {
+      if (cx.keys[d] == "" || cx.names[d] != want) { continue; }
+      if (cx.declFiles[d] == cx.impTo[e]) { return d; }
+    }
+  }
+  i32 found = 0 - 1;
+  for (i32 d = keyFirst(cx.nameIx, name); d >= 0; d = cx.nameIx.next[d]) {
+    if (cx.keys[d] == "" || cx.names[d] != name || !cx.exported[d]) { continue; }
+    if (found >= 0) { return 0 - 1; }
+    found = d;
+  }
+  return found;
+}
+
+/**
+ * Index `keys` and `names`, once both are final — at the end of `keyDecls`, and where `emit.wac` fills
+ * them from `Env` instead. Anything that changes either afterwards must call this again.
+ */
+export void indexDecls(Decls cx) {
+  cx.keyIx = KeyIndex.create();
+  cx.nameIx = KeyIndex.create();
+  for (i32 d = 0; d < cx.decls.len(); d++) {
+    if (cx.keys[d] != "") { keyAdd(cx.keyIx, cx.keys[d], d); }
+    if (cx.names[d] != "") { keyAdd(cx.nameIx, cx.names[d], d); }
+  }
+  cx.indexed = true;
+}
+
+/** Each declaration's first constant, once `constDecls` is final — what `constAt`'s walk found first. */
+export void indexConsts(Decls cx) {
+  i32 nd = cx.decls.len() < 1 ? 1 : cx.decls.len();
+  i32[] first = i32[].filled(nd, 0 - 1);
+  for (i32 i = 0; i < cx.constCount; i++) {
+    i32 d = cx.constDecls[i];
+    if (d >= 0 && d < nd && first[d] < 0) { first[d] = i; }
+  }
+  cx.constOfDecl = first;
+  cx.constsIndexed = true;
 }
 
 /**
@@ -3226,6 +3325,27 @@ bool isNullTy(u8[] src, Lexed lx, Ty t) {
 }
 
 /** The indices of the `type` declarations among `decls`, in order. */
+/** `typeDecls`, their names, and `typeIx` over the names — what `typeDeclAt` reads. */
+void indexTypeDecls(Decls cx) {
+  i32[] tds = typeDeclIndices(cx.decls);
+  string[] names = string[].filled(tds.len() < 1 ? 1 : tds.len(), "");
+  KeyIndex ix = KeyIndex.create();
+  for (i32 k = 0; k < tds.len(); k++) {
+    i32 d = tds[k];
+    match (cx.decls[d].kind) {
+      TypeDecl(nameTok, typeParams, alias, body, exported): {
+        i32 dfi = d < cx.declFiles.len() ? cx.declFiles[d] : 0 - 1;
+        names[k] = tokText(cx.srcOf(dfi), cx.lexOf(dfi), nameTok);
+        keyAdd(ix, names[k], k);
+      }
+      default: { }
+    }
+  }
+  cx.typeNames = names;
+  cx.typeIx = ix;
+  cx.typeDecls = tds;
+}
+
 i32[] typeDeclIndices(Decl[] decls) {
   i32 n = 0;
   for (i32 d = 0; d < decls.len(); d++) {
@@ -3250,14 +3370,18 @@ export i32 typeDeclAt(Decls cx, string name, i32 fi) {
   // **Only the `type` declarations**, found once: this is asked of every type name the emitter
   // resolves, and walking every declaration of the module for the few that are `type` was the largest
   // single cost of building box's shell once the others had gone (`issues/lang/0398b`).
-  if (cx.typeDecls is null) { cx.typeDecls = typeDeclIndices(cx.decls); }
+  //
+  // **And by name**: each of those was asked for its text, a fresh string per type per question, to compare
+  // with `name` — about a third of the work of emitting a program that imports `std`. The names are read
+  // once, beside the list, and a question walks only the ones spelled like it, in the list's order.
+  if (cx.typeDecls is null) { indexTypeDecls(cx); }
   i32[] tds = cx.typeDecls!;
-  for (i32 k = 0; k < tds.len(); k++) {
+  for (i32 k = keyFirst(cx.typeIx, name); k >= 0; k = cx.typeIx.next[k]) {
+    if (cx.typeNames[k] != name) { continue; }
     i32 d = tds[k];
     match (cx.decls[d].kind) {
       TypeDecl(nameTok, typeParams, alias, body, exported): {
         i32 dfi = d < cx.declFiles.len() ? cx.declFiles[d] : 0 - 1;
-        if (tokText(cx.srcOf(dfi), cx.lexOf(dfi), nameTok) != name) { continue; }
         if (dfi == fi || exported || fi < 0 || dfi < 0) { return d; }
       }
       default: { }

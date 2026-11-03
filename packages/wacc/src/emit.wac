@@ -19,7 +19,7 @@
 import { canonicalSymbolMembers } from "./symkeys.wac";
 import { coreEntry } from "./carried.wac";
 import { KeyIndex, keyAdd, keyFirst } from "./keyindex.wac";
-import {
+import { indexDecls, indexConsts,
   Decls, Ev, StaticBind, Value, bindStaticLocals, demandConst, evFinished, isIntName, outcomeName, declExportedOf, declNameOf,
   decimalText, evalExpr, evLimit, evUnsupported, numValue, staticForCap, staticForName,
   staticForType, staticForValues, textFunctionFor, truthy, wrapTo, vF32, vF64, vNum, evTyName, typeDeclAt, unfoldTypeName, intOf,
@@ -1697,14 +1697,19 @@ string pairInner(string t) { return t.slice(pairMark().len(), t.len()); }
  * scanners below rely on; a tuple is the one that starts with one (spec ch14).
  */
 i32 sigTupleReturnEnd(string t) {
-  if (t.len() < 5 || t[3] != "(") { return -1; }
+  // **Bytes, not characters**, as in the two below: `t[i]` makes a one-character string per position, and
+  // these three scan every signature the emitter asks about — a fifth of the time of emitting a program
+  // that imports `std`. Every character they look for is ASCII, and a byte of a longer character is none
+  // of them, so the verdicts are the same; `slice` takes the same byte offsets.
+  u8[] b = t.toBytes();
+  if (b.len() < 5 || (b[3] as i32) != 40) { return -1; }
   i32 depth = 0;
-  for (i32 i = 3; i < t.len(); i++) {
-    string c = t[i];
-    if (c == "(" || c == "[" || c == "<") { depth = depth + 1; }
-    if (c == ")" || c == "]" || c == ">") {
+  for (i32 i = 3; i < b.len(); i++) {
+    i32 c = b[i] as i32;
+    if (c == 40 || c == 91 || c == 60) { depth = depth + 1; }        // ( [ <
+    if (c == 41 || c == 93 || c == 62) {                             // ) ] >
       depth = depth - 1;
-      if (depth == 0) { return i + 1 < t.len() && t[i + 1] == "(" ? i + 1 : -1; }
+      if (depth == 0) { return i + 1 < b.len() && (b[i + 1] as i32) == 40 ? i + 1 : -1; }
     }
   }
   return -1;
@@ -1714,16 +1719,17 @@ string sigReturn(string t) {
   i32 tupleEnd = sigTupleReturnEnd(t);
   if (tupleEnd > 0) { return t.slice(3, tupleEnd); }
   i32 depth = 0;
-  for (i32 i = 3; i < t.len(); i++) {
-    string c = t[i];
+  u8[] b = t.toBytes();   // bytes, as `sigTupleReturnEnd` says
+  for (i32 i = 3; i < b.len(); i++) {
+    i32 c = b[i] as i32;
     // **`<` nests too.** An instantiation is spelled `Result<i32,string>`, so a signature that
     // mentions one has a comma *inside* a parameter — and a scanner that counts only brackets and
     // parentheses reads `fn[bool(Result<i32,string>)]` as taking two. The function then declares one
     // parameter and its type says two, which wasm reports as a `struct.get` on a number, in a
     // method several functions away. This is what made two type parameters fail and one work.
-    if (c == "[" || c == "<") { depth = depth + 1; }
-    if (c == "]" || c == ">") { depth = depth - 1; }
-    if (c == "(" && depth == 0) { return t.slice(3, i); }
+    if (c == 91 || c == 60) { depth = depth + 1; }
+    if (c == 93 || c == 62) { depth = depth - 1; }
+    if (c == 40 && depth == 0) { return t.slice(3, i); }
   }
   return "";
 }
@@ -1735,28 +1741,29 @@ i32 sigParamCount(string t) {
   i32 n = 0;
   bool any = false;
   i32 tupleEnd = sigTupleReturnEnd(t);
-  for (i32 i = tupleEnd > 0 ? tupleEnd : 3; i < t.len(); i++) {
-    string c = t[i];
+  u8[] b = t.toBytes();
+  for (i32 i = tupleEnd > 0 ? tupleEnd : 3; i < b.len(); i++) {
+    i32 c = b[i] as i32;
     // **`<` nests too.** An instantiation is spelled `Result<i32,string>`, so a signature that
     // mentions one has a comma *inside* a parameter — and a scanner that counts only brackets and
     // parentheses reads `fn[bool(Result<i32,string>)]` as taking two. The function then declares one
     // parameter and its type says two, which wasm reports as a `struct.get` on a number, in a
     // method several functions away. This is what made two type parameters fail and one work.
-    if (c == "[" || c == "<") { depth = depth + 1; }
-    if (c == "]" || c == ">") { depth = depth - 1; }
-    if (c == "(" && depth == 0 && start < 0) {
+    if (c == 91 || c == 60) { depth = depth + 1; }                   // [ <
+    if (c == 93 || c == 62) { depth = depth - 1; }                   // ] >
+    if (c == 40 && depth == 0 && start < 0) {                        // (
       start = i;
       depth = depth + 1;
       continue;
     }
     if (start < 0) { continue; }
-    if (c == "(") { depth = depth + 1; }
-    if (c == ")") {
+    if (c == 40) { depth = depth + 1; }
+    if (c == 41) {
       depth = depth - 1;
       if (depth == 0) { return any ? n + 1 : 0; }
     }
-    if (c == "," && depth == 1) { n = n + 1; }
-    if (c != " ") { any = true; }
+    if (c == 44 && depth == 1) { n = n + 1; }                        // ,
+    if (c != 32) { any = true; }                                     // not a space
   }
   return 0;
 }
@@ -1766,29 +1773,30 @@ string sigParamAt(string t, i32 want) {
   i32 from = -1;
   i32 n = 0;
   i32 tupleEnd = sigTupleReturnEnd(t);
-  for (i32 i = tupleEnd > 0 ? tupleEnd : 3; i < t.len(); i++) {
-    string c = t[i];
+  u8[] b = t.toBytes();
+  for (i32 i = tupleEnd > 0 ? tupleEnd : 3; i < b.len(); i++) {
+    i32 c = b[i] as i32;
     // **`<` nests too.** An instantiation is spelled `Result<i32,string>`, so a signature that
     // mentions one has a comma *inside* a parameter — and a scanner that counts only brackets and
     // parentheses reads `fn[bool(Result<i32,string>)]` as taking two. The function then declares one
     // parameter and its type says two, which wasm reports as a `struct.get` on a number, in a
     // method several functions away. This is what made two type parameters fail and one work.
-    if (c == "[" || c == "<") { depth = depth + 1; }
-    if (c == "]" || c == ">") { depth = depth - 1; }
-    if (c == "(" && depth == 0 && from < 0) {
+    if (c == 91 || c == 60) { depth = depth + 1; }
+    if (c == 93 || c == 62) { depth = depth - 1; }
+    if (c == 40 && depth == 0 && from < 0) {
       from = i + 1;
       depth = depth + 1;
       continue;
     }
     if (from < 0) { continue; }
-    if (c == "(") { depth = depth + 1; }
-    if (c == ")") {
+    if (c == 40) { depth = depth + 1; }
+    if (c == 41) {
       depth = depth - 1;
       if (depth == 0) {
         return n == want ? t.slice(from, i) : "";
       }
     }
-    if (c == "," && depth == 1) {
+    if (c == 44 && depth == 1) {
       if (n == want) { return t.slice(from, i); }
       n = n + 1;
       from = i + 1;
@@ -19910,7 +19918,8 @@ Ev staticEvalOf(Env env, u8[] src, Lexed lexed) {
                        string[].filled(nd, ""), string[].filled(nd, ""), bool[].filled(nd, false),
                        i32[].filled(env.constCount < 1 ? 1 : env.constCount, 0),
                        i32[].filled(ni, 0), string[].filled(ni, ""), i32[].filled(ni, 0), string[].filled(ni, ""),
-                       env.importCount, null, KeyIndex.create());
+                       env.importCount, null, string[](), KeyIndex.create(), KeyIndex.create(), KeyIndex.create(), KeyIndex.create(), i32[](),
+                       false, false);
   // Bound to a local first: an assignment through an unwrap does not parse on wac-L5.
   Decls scx = env.staticCx!;
   for (i32 e = 0; e < env.importCount; e++) {
@@ -19933,11 +19942,16 @@ Ev staticEvalOf(Env env, u8[] src, Lexed lexed) {
   }
   env.ambiguous = wasAmbiguous;
   env.ambiguousName = wasAmbiguousName;
+  indexDecls(scx);
+  // The last declaration whose key is the constant's, as the walk over every declaration left it.
   for (i32 i = 0; i < env.constCount; i++) {
-    for (i32 d = 0; d < decls.len(); d++) {
-      if (scx.keys[d] != "" && scx.keys[d] == env.constNames[i]) { scx.constDecls[i] = d; }
+    string want = env.constNames[i];
+    if (want == "") { continue; }
+    for (i32 d = keyFirst(scx.keyIx, want); d >= 0; d = scx.keyIx.next[d]) {
+      if (scx.keys[d] == want) { scx.constDecls[i] = d; }
     }
   }
+  indexConsts(scx);
   env.staticEv = Ev.create();
   return env.staticEv!;
 }

@@ -13,6 +13,9 @@ s.text([0x77, 0x61, 0x63] as i32[], 8, 6, 0xDCE8E7FF);   // "wac"
 // s.pixels is R G B A, row-major — the layout a canvas handle's `pixels` takes
 ```
 
+From outside the repository it is `raster` in the root entry — `import { raster.Surface, raster.glyphRow } from
+"wac"` — with the surface, the font's lookups and the hit tests (`src/lib.wac`).
+
 `design/system/0004` is why this exists: the window manager and the terminal are built on a DOM, and
 the stack `design/system/0001` is aiming at has no DOM in it. This is step 2 of that document — *a
 surface, rectangles, blits, a bitmap font, a glyph cache*.

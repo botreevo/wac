@@ -1220,15 +1220,28 @@ Stmt flatStmt(Ctx c, Stmt s, i32 brkTo, i32 contTo) {
 }
 
 /**
+ * What copying the awaited expression declared ahead of it, taken off the copy's list: the locals a lambda
+ * in it captures through (`__wacAwK = name`, in `subExpr`'s `Ident`). They are declared in the suspending
+ * state, before the operand runs. Dropped, `await run((i32 d) => { string s = name; })` read a capture
+ * nothing declared, and the emitter refused it.
+ */
+Stmt[] takePre(Ctx c, i32 mark) {
+  Stmt[] out = Stmt[].filled(c.copy.preN - mark, sRet(c, null));
+  for (i32 i = mark; i < c.copy.preN; i++) { out[i - mark] = c.copy.pre[i]; }
+  c.copy.preN = mark;
+  return out;
+}
+
+/**
  * A suspension: park on what is awaited and stop stepping, with `rest` where the machine carries on
  * once a continuation or a `wait` resumes it.
  *
  * `ty` is what the awaited ticket answers when `rest` reads the value, and null when nothing does —
  * a bare `await;`, an `await e;` whose value is thrown away, an `await` on a `TicketBase?`. A typed
  * suspension keeps its ticket in slot `k` for `rest` to read with `value()`; an untyped one hands it
- * straight to `park`, which takes any ticket at all.
+ * straight to `park`, which takes any ticket at all. `before` runs first: `takePre`'s declarations.
  */
-i32 lowerSuspend(Bld b, Expr awaited, Ty? ty, i32 rest) {
+i32 lowerSuspend(Bld b, Stmt[] before, Expr awaited, Ty? ty, i32 rest) {
   Ctx c = b.c;
   i32 k = b.slot[0];
   b.slot[0] = b.slot[0] + 1;
@@ -1239,8 +1252,9 @@ i32 lowerSuspend(Bld b, Expr awaited, Ty? ty, i32 rest) {
   // slot, the operand straight in. `__wacOrReady` answers a settled ticket for `null`, which is what a
   // bare `await;` and an `await` on a null `TicketBase?` wait on.
   i32 susp = lowAlloc(b);
-  Stmt[] sus = Stmt[].filled(typed ? 3 : 2, sRet(c, null));
+  Stmt[] sus = Stmt[].filled(before.len() + (typed ? 3 : 2), sRet(c, null));
   i32 at = 0;
+  for (i32 i = 0; i < before.len(); i++) { sus[at] = before[i]; at = at + 1; }
   Expr parked = awaited;
   if (typed) {
     sus[at] = sSet(c, tUp(c, k), awaited); at = at + 1;
@@ -1269,19 +1283,24 @@ i32 lowerOne(Bld b, Stmt s, i32 next) {
       Stmt bind = sCellSet(c, nameTok, eSlotValue(c, k));
       c.copy.decl(bind, nameTok, subTy(c, type));
       lowPut(b, rest, lowJoin(c, Stmt[].filled(1, bind), gotoS(c, next)));
-      return lowerSuspend(b, subExpr(c, innerAwait(c, init!)), type, rest);
+      i32 pm = c.copy.preN;
+      Expr aw = subExpr(c, innerAwait(c, init!));
+      return lowerSuspend(b, takePre(c, pm), aw, type, rest);
     }
     // `return await e;` — suspend, then the answer *is* the machine's.
     Return(value): {
       i32 rest = lowAlloc(b);
       i32 k = b.slot[0];
       lowPut(b, rest, Stmt[].filled(1, sFinish(c, eSlotValue(c, k))));
-      return lowerSuspend(b, subExpr(c, innerAwait(c, (value is null) ? eNull(c) : value!)),
-                          cloneTy(b.ret), rest);
+      i32 pm = c.copy.preN;
+      Expr aw = subExpr(c, innerAwait(c, (value is null) ? eNull(c) : value!));
+      return lowerSuspend(b, takePre(c, pm), aw, cloneTy(b.ret), rest);
     }
     // `await e;` and `await;` — suspend, and carry straight on: nothing reads what it answered.
     ExprStmt(expr): {
-      return lowerSuspend(b, subExpr(c, innerAwait(c, expr)), null, next);
+      i32 pm = c.copy.preN;
+      Expr aw = subExpr(c, innerAwait(c, expr));
+      return lowerSuspend(b, takePre(c, pm), aw, null, next);
     }
     // **A `match` whose arms suspend** — a head state that matches and jumps to each arm's states,
     // copying the arm's bindings (the leading locals `splitMatch` wrote) on the way.

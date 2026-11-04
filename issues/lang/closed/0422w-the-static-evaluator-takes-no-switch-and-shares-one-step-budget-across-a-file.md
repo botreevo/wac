@@ -1,6 +1,6 @@
 # 0422w — the static evaluator takes no `switch`, and a file's statics share one step budget
 
-- **Status:** open
+- **Status:** closed 2026-11-04 (cloud) — `consteval.wac`'s `Switch` arm; `check.wac` resets the step count per evaluation; `spec/cases/0861`, `0862`
 - **Reported by:** agent-w (the cloud session building wacuum, `git.voltrevo.com/wacuum.git`)
 - **Date:** 2026-11-02
 - **Kind:** missing feature
@@ -42,3 +42,13 @@ if the budget were meant per evaluation: "a budget large enough that no table an
 
 wacuum works round both: `U256.word` is written with ifs, and bn254's constants come from one
 exponentiation rather than three.
+
+## Fix
+
+**`switch`:** `execStmt` has a `Switch` arm. It evaluates the subject, compares each case value with it as a
+32-bit value (as the running program does, `§wac-switch-dupcase-7hq2nkv`), runs the matching case or
+`default`, and lets a `break` leave the switch while a `continue` goes on to the loop around it.
+
+**The budget:** each evaluation the checker starts on the file's `Ev` — a static, a `static_if`'s
+condition, a selector — sets `steps` back to 0 first, so 8,000,000 bounds one evaluation as `step`'s comment
+says. Spec ch28 `§wac-static-eval-limit-bt6cfra` now says the limit is each static's own.

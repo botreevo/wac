@@ -167,7 +167,8 @@ export i32 readsX() { return X; }
 ```
 
 `[§wac-static-eval-limit-bt6cfra]` A static evaluation the compiler stops before it finishes is an error, reported as
-a resource limit — the answer is unknown — and never as nontermination unless nontermination was proven.
+a resource limit — the answer is unknown — and never as nontermination unless nontermination was proven. The limit is
+each static's own: how much work the statics before it took does not count against it.
 
 ```wac
 // expect: refused

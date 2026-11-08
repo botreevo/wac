@@ -1,0 +1,218 @@
+// Indexing a pack that arrived without one, in time proportional to its size.
+//
+// wac's `indexPack` (`packages/git/src/pack.wac`) finds a `ref-delta`'s base by resolving and hashing every
+// other object in the pack until one has the right name, for each such delta — so a pack of n objects whose
+// deltas name their bases, which is what every thin pack is and therefore every push, costs n² hashes of
+// whole objects. A 4 MB push of 400 objects did not finish in five minutes.
+//
+// This does what `git index-pack` does instead: every object is inflated once; the whole ones are hashed
+// first; then each resolved object releases the deltas waiting on it — by offset for an `ofs-delta`, by name
+// for a `ref-delta`, both looked up in a map — so every object is resolved and hashed exactly once. Whatever
+// is still waiting at the end names a base the pack does not hold: a thin pack's, answered as `Thin` with the
+// names, which is the same contract as wac's, so `completePack` and this compose as they do there.
+
+import { Buf, Vec, Map, hashBytes, bytesEq, hashI64, i64Eq } from "core";
+import { Indexed } from "../vendor/wac/packages/git/src/pack.wac";
+import { applyDelta } from "../vendor/wac/packages/git/src/pack.wac";
+import { PackIndex } from "../vendor/wac/packages/git/src/idx.wac";
+import { Kind, framed } from "../vendor/wac/packages/git/src/object.wac";
+import { Inflation, inflateAtResult } from "../vendor/wac/packages/gzip/src/inflate.wac";
+import { crc32 } from "../vendor/wac/packages/gzip/src/crc32.wac";
+import { sha1 } from "../vendor/wac/packages/crypto/src/sha1.wac";
+
+Kind kindFor(i32 n) {
+  if (n == 1) { return Kind.Commit; }
+  if (n == 2) { return Kind.Tree; }
+  if (n == 4) { return Kind.Tag; }
+  return Kind.Blob;
+}
+
+export Indexed indexPackFast(u8[] pack) {
+  if (pack.len() < 32) { return Indexed.Unindexable("shorter than a header and a checksum"); }
+  if (pack[0] != 'P' || pack[1] != 'A' || pack[2] != 'C' || pack[3] != 'K') {
+    return Indexed.Unindexable("not a pack: the magic is missing");
+  }
+  i32 count = (pack[8] as i32 << 24) | (pack[9] as i32 << 16) | (pack[10] as i32 << 8) | pack[11] as i32;
+  if (count < 0 || count > 10000000) { return Indexed.Unindexable("implausible object count"); }
+
+  i64[] offsets = i64[].filled(count, 0);
+  i32[] kinds = i32[].filled(count, 0);
+  i32[] baseIndex = i32[].filled(count, -1);
+  Vec<u8[]> data = Vec.create();
+  Vec<u8[]> baseNames = Vec.create();
+  Map<i64, i32> byOffset = Map.withCapacity(count * 2 + 8, hashI64, i64Eq);
+
+  // Pass one: where every object is, what kind of entry, and its inflated bytes.
+  i32 at = 12;
+  i32 stop = pack.len() - 20;
+  for (i32 i = 0; i < count; i++) {
+    if (at >= stop) { return Indexed.Unindexable("the pack ended before its object count"); }
+    i64 here = at as i64;
+    i32 b = pack[at] as i32;
+    i32 kind = (b >> 4) & 7;
+    i32 size = b & 0x0f;
+    i32 shift = 4;
+    at = at + 1;
+    while ((b & 0x80) != 0) {
+      if (at >= stop || shift > 28) { return Indexed.Unindexable("a size runs off the end"); }
+      b = pack[at] as i32;
+      size = size | ((b & 0x7f) << shift);
+      shift = shift + 7;
+      at = at + 1;
+    }
+    if (kind == 0 || kind == 5) { return Indexed.Unindexable("object type \{kind} is not defined"); }
+    u8[] baseName = u8[]();
+    if (kind == 6) {
+      if (at >= stop) { return Indexed.Unindexable("a delta offset runs off the end"); }
+      i32 c = pack[at] as i32;
+      at = at + 1;
+      i64 ofs = (c & 0x7f) as i64;
+      while ((c & 0x80) != 0) {
+        if (at >= stop) { return Indexed.Unindexable("a delta offset runs off the end"); }
+        c = pack[at] as i32;
+        at = at + 1;
+        ofs = ((ofs + 1) << 7) | ((c & 0x7f) as i64);
+      }
+      i32? base = byOffset.get(here - ofs);
+      // An offset delta's base comes before it, so it has been seen — or the pack is damaged.
+      if (base is null) { return Indexed.Unindexable("a delta's base offset is not an object"); }
+      baseIndex[i] = base!;
+    } else if (kind == 7) {
+      if (at + 20 > stop) { return Indexed.Unindexable("a base name runs off the end"); }
+      baseName = u8[].filled(20, 0);
+      baseName.copyFrom(pack, at, 0, 20);
+      at = at + 20;
+    }
+    match (inflateAtResult(pack, at + 2)) {
+      Err(why): { return Indexed.Unindexable("an object does not inflate: \{why}"); }
+      Ok(got): {
+        if (got.bytes.len() != size) {
+          return Indexed.Unindexable("an object's header says \{size} bytes and \{got.bytes.len()} inflated");
+        }
+        at = got.end + 4;
+        data.push(got.bytes);
+      }
+    }
+    offsets[i] = here;
+    kinds[i] = kind;
+    baseNames.push(baseName);
+    byOffset.set(here, i);
+  }
+  if (at != stop) { return Indexed.Unindexable("bytes left over before the checksum"); }
+
+  // Who waits on whom: an offset delta on an index, a reference delta on a name.
+  Vec<Vec<i32>> waitingOn = Vec.create();
+  for (i32 i = 0; i < count; i++) { waitingOn.push(Vec.create()); }
+  Map<u8[], Vec<i32>> waitingFor = Map.create(hashBytes, bytesEq);
+  for (i32 i = 0; i < count; i++) {
+    if (kinds[i] == 6) { waitingOn.get(baseIndex[i]).push(i); }
+    else if (kinds[i] == 7) {
+      Vec<i32>? list = waitingFor.get(baseNames.get(i));
+      if (list is null) {
+        Vec<i32> fresh = Vec.create();
+        fresh.push(i);
+        waitingFor.set(baseNames.get(i), fresh);
+      } else {
+        list!.push(i);
+      }
+    }
+  }
+
+  // Pass two: resolve outward from the whole objects, hashing each object once.
+  i32[] resolvedKind = i32[].filled(count, 0);
+  u8[] names = u8[].filled(count * 20, 0);
+  Vec<i32> ready = Vec.create();
+  for (i32 i = 0; i < count; i++) {
+    if (kinds[i] >= 1 && kinds[i] <= 4) { resolvedKind[i] = kinds[i]; ready.push(i); }
+  }
+  i32 done = 0;
+  i32 next = 0;
+  while (next < ready.len()) {
+    i32 i = ready.get(next);
+    next = next + 1;
+    u8[] body = data.get(i);
+    u8[] name = sha1(framed(kindFor(resolvedKind[i]), body));
+    names.copyFrom(name, 0, i * 20, 20);
+    done = done + 1;
+    Vec<i32> children = waitingOn.get(i);
+    Vec<i32>? byName = waitingFor.get(name);
+    if (byName is not null) {
+      for (i32 k = 0; k < byName!.len(); k++) { children.push(byName!.get(k)); }
+      waitingFor.remove(name);
+    }
+    for (i32 k = 0; k < children.len(); k++) {
+      i32 c = children.get(k);
+      if (resolvedKind[c] != 0) { continue; }
+      u8[]? made = applyDelta(body, data.get(c));
+      if (made is null) { return Indexed.Unindexable("a delta does not apply to its base"); }
+      data.set(c, made!);
+      resolvedKind[c] = resolvedKind[i];
+      ready.push(c);
+    }
+    // Every delta waiting on this object was known before resolving began and has now been applied, so its
+    // bytes are needed no longer.
+    waitingOn.set(i, Vec.create());
+    data.set(i, u8[]());
+  }
+
+  if (done < count) {
+    // What is left waits on names this pack does not hold — a thin pack — or on a cycle, which is damage.
+    Vec<u8[]> need = Vec.create();
+    u8[][] keys = waitingFor.keys();
+    for (i32 k = 0; k < keys.len(); k++) { need.push(keys[k]); }
+    if (need.len() == 0) { return Indexed.Unindexable("a delta chain could not be resolved"); }
+    return Indexed.Thin(need);
+  }
+
+  // Each object's CRC-32 over its bytes as they sit in the pack, header included.
+  u32[] crcInPackOrder = u32[].filled(count, 0);
+  for (i32 i = 0; i < count; i++) {
+    i32 from = offsets[i] as~ i32;
+    i32 to = i + 1 < count ? offsets[i + 1] as~ i32 : stop;
+    u8[] seg = u8[].filled(to - from, 0);
+    seg.copyFrom(pack, from, 0, to - from);
+    crcInPackOrder[i] = crc32(seg);
+  }
+
+  // Names ascending, with each offset and CRC carried along.
+  i32[] order = i32[].filled(count, 0);
+  for (i32 i = 0; i < count; i++) { order[i] = i; }
+  i32[] scratch = i32[].filled(count, 0);
+  mergeSort(order, scratch, 0, count, names);
+  u8[] sortedNames = u8[].filled(count * 20, 0);
+  i64[] sortedOffsets = i64[].filled(count, 0);
+  u32[] crcs = u32[].filled(count, 0);
+  for (i32 i = 0; i < count; i++) {
+    i32 from = order[i];
+    sortedNames.copyFrom(names, from * 20, i * 20, 20);
+    sortedOffsets[i] = offsets[from];
+    crcs[i] = crcInPackOrder[from];
+  }
+  return Indexed.Built(PackIndex(count, sortedNames, sortedOffsets, crcs));
+}
+
+bool nameBefore(u8[] names, i32 a, i32 b) {
+  for (i32 q = 0; q < 20; q++) {
+    u8 x = names[a * 20 + q];
+    u8 y = names[b * 20 + q];
+    if (x != y) { return x < y; }
+  }
+  return false;
+}
+
+void mergeSort(i32[] a, i32[] tmp, i32 lo, i32 hi, u8[] names) {
+  if (hi - lo < 2) { return; }
+  i32 mid = lo + (hi - lo) / 2;
+  mergeSort(a, tmp, lo, mid, names);
+  mergeSort(a, tmp, mid, hi, names);
+  i32 i = lo;
+  i32 j = mid;
+  i32 k = lo;
+  while (i < mid && j < hi) {
+    if (nameBefore(names, a[j], a[i])) { tmp[k] = a[j]; j++; } else { tmp[k] = a[i]; i++; }
+    k++;
+  }
+  while (i < mid) { tmp[k] = a[i]; i++; k++; }
+  while (j < hi) { tmp[k] = a[j]; j++; k++; }
+  for (i32 x = lo; x < hi; x++) { a[x] = tmp[x]; }
+}

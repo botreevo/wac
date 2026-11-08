@@ -1,0 +1,624 @@
+// `gitserve <root> [--addr A] [--port N] [--push-token-file F | --anonymous-push] [--create-on-push]
+//          [--max-body-mb N]`
+//
+// A git server: every bare repository under `<root>`, over git's smart HTTP protocol, for `git clone`,
+// `git fetch`, `git ls-remote` and `git push` as they are, with nothing configured on the client.
+//
+//     GET  /                                       the repositories, one per line
+//     GET  /<repo>/info/refs?service=git-upload-pack     the advertisement (protocol v2 when asked for it)
+//     POST /<repo>/git-upload-pack                 ls-refs and fetch
+//     GET  /<repo>/info/refs?service=git-receive-pack    the push advertisement
+//     POST /<repo>/git-receive-pack                the updates and their pack
+//
+// `<repo>` may be named with or without `.git`, and may have `/` in it. The protocol is in `src/serve.wac`;
+// this is HTTP around it — the request read whole (with a `chunked` body, which is how git sends a push larger
+// than its `http.postBuffer`, and gzip, which is how it sends a large negotiation), one answer, the connection
+// closed.
+//
+// **Pushing is off until it is allowed.** `--push-token-file` names a file whose first line is the password:
+// git asks for credentials when the push advertisement answers 401, and any user name is accepted with it.
+// `--anonymous-push` lets anyone push, for a server only you can reach. Reading is always open.
+//
+// `--create-on-push` makes a bare repository the first time somebody allowed to push names one that is not
+// there, so a new project needs no step on the server.
+
+import { Sys, Socket, Files, Stat } from "std";
+import { Buf, Vec, Map, hashString, stringEq } from "core";
+import { decode as base64 } from "../vendor/wac/packages/codec/src/base64.wac";
+import { gunzipBytesResult } from "../vendor/wac/packages/gzip/src/inflate.wac";
+import { writeText, flushPkt } from "../vendor/wac/packages/git/src/pktline.wac";
+import { Repo, RepoAt, openRepo } from "../vendor/wac/packages/git/src/repo.wac";
+import { Pushed, advertiseV0, advertiseV2, errPkt, initBare, receivePack, uploadPackV0, uploadPackV2 } from "../src/serve.wac";
+
+struct Config {
+  string root;
+  string token;
+  bool anonymousPush;
+  bool createOnPush;
+  i32 maxBody;
+}
+
+/** What requests share: one write at a time per repository, and the repositories already open. */
+struct Locks {
+  /** A push compares each ref's old value and then writes it, so two to one repository take turns. */
+  Map<string, bool> held;
+  Map<string, Cached> repos;
+}
+
+struct Request {
+  string method;
+  string path;
+  string query;
+  string[] names;
+  string[] values;
+  u8[] body;
+}
+
+struct Response {
+  i32 status;
+  string contentType;
+  string[] headers;
+  u8[] body;
+}
+
+Response text(i32 status, string t) { return Response(status, "text/plain; charset=utf-8", string[](), t.toBytes()); }
+
+export async i32 main(Sys sys) {
+  string[] argv = sys.args();
+  if (argv.len() < 1) {
+    sys.warn("usage: gitserve <root> [--addr A] [--port N] [--push-token-file F | --anonymous-push] [--create-on-push] [--max-body-mb N]");
+    return 2;
+  }
+  Config c = Config(argv[0], "", false, false, 512 * 1048576);
+  string addr = "127.0.0.1";
+  i32 port = 8080;
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv[i];
+    bool hasNext = i + 1 < argv.len();
+    if (a == "--addr" && hasNext) { addr = argv[i + 1]; i++; }
+    else if (a == "--port" && hasNext) { port = number(argv[i + 1]); i++; }
+    else if (a == "--max-body-mb" && hasNext) { c.maxBody = number(argv[i + 1]) * 1048576; i++; }
+    else if (a == "--anonymous-push") { c.anonymousPush = true; }
+    else if (a == "--create-on-push") { c.createOnPush = true; }
+    else if (a == "--push-token-file" && hasNext) {
+      u8[]? f = (await sys.files().readFile(argv[i + 1])).ok();
+      if (f is null) { sys.warn("gitserve: cannot read \{argv[i + 1]}"); return 2; }
+      c.token = firstLine(string.fromBytes(f!));
+      if (c.token == "") { sys.warn("gitserve: \{argv[i + 1]} is empty"); return 2; }
+      i++;
+    } else {
+      sys.warn("gitserve: unknown argument \{a}");
+      return 2;
+    }
+  }
+  if (port <= 0 || port > 65535) { sys.warn("gitserve: bad port"); return 2; }
+  await serve(sys, c, Locks(Map.create(hashString, stringEq), Map.create(hashString, stringEq)), addr, port);
+  return 1;
+}
+
+i32 number(string s) {
+  i32 n = 0;
+  for (u8 ch in s.toBytes()) {
+    if (ch < 48 || ch > 57 || n > 100000000) { return -1; }
+    n = n * 10 + ((ch - 48) as i32);
+  }
+  return s.len() == 0 ? -1 : n;
+}
+
+string firstLine(string s) {
+  i32 nl = s.indexOf("\n");
+  string l = nl < 0 ? s : s.slice(0, nl);
+  if (l.len() > 0 && l.slice(l.len() - 1, l.len()) == "\r") { l = l.slice(0, l.len() - 1); }
+  return l;
+}
+
+// ── Connections ─────────────────────────────────────────────────────────────
+//
+// A wac program on a JavaScript host has a bounded number of host calls in flight, and every connection
+// waiting for its request holds one; so a few at a time, and none for ever. A clone of a large repository
+// takes a while to assemble, which is why the deadline is minutes rather than seconds.
+
+static i32 MAX_CONNECTIONS = 32;
+static i64 DEADLINE_MILLIS = 600000;
+
+struct Open {
+  Socket sock;
+  i64 since;
+  bool closed;
+}
+
+struct Conns {
+  Vec<Open> open;
+  i32 active;
+}
+
+async void serve(Sys sys, Config c, Locks locks, string addr, i32 port) {
+  match (await sys.net().listen(addr, port)) {
+    Err(err): { sys.warn("gitserve: cannot listen on \{addr}:\{port}: \{err}"); }
+    Ok(listener): {
+      sys.log("gitserve: \{c.root} on http://\{listener.addr}");
+      Conns conns = Conns(Vec.create(), 0);
+      reap(sys, conns);
+      while (true) {
+        while (conns.active >= MAX_CONNECTIONS) { await sys.sleepMillis(25); }
+        match (await listener.accept()) {
+          Err(err): { sys.warn("gitserve: accept: \{err}"); }
+          Ok(sock): {
+            Open o = Open(sock, (await sys.clock().nowMillis()).orElse(0 as i64), false);
+            conns.open.push(o);
+            conns.active++;
+            answer(sys, c, locks, conns, o);
+          }
+        }
+      }
+    }
+  }
+}
+
+async void reap(Sys sys, Conns conns) {
+  while (true) {
+    await sys.sleepMillis(1000);
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64);
+    Vec<Open> keep = Vec.create();
+    for (i32 i = 0; i < conns.open.len(); i++) {
+      Open o = conns.open.get(i);
+      if (!o.closed && now - o.since > DEADLINE_MILLIS) { close(o); }
+      if (!o.closed) { keep.push(o); }
+    }
+    conns.open = keep;
+  }
+}
+
+void close(Open o) {
+  if (o.closed) { return; }
+  o.closed = true;
+  o.sock.close();
+}
+
+/** What reading a request came to. */
+enum Arrived {
+  Whole(Request r),
+  TooLarge,
+  Malformed(string why),
+  Gone
+}
+
+async void answer(Sys sys, Config c, Locks locks, Conns conns, Open o) {
+  match (await readRequest(o.sock, c.maxBody)) {
+    Whole(r): {
+      Response out = await route(sys, c, locks, r);
+      if (r.method == "HEAD") { out.body = u8[](); }
+      await o.sock.send(responseBytes(out));
+      sys.log("gitserve: \{r.method} \{r.path}\{r.query == "" ? "" : "?" + r.query} \{out.status} \{out.body.len()}");
+    }
+    TooLarge: { await o.sock.send(responseBytes(text(413, "too large\n"))); }
+    Malformed(why): { await o.sock.send(responseBytes(text(400, "bad request: \{why}\n"))); }
+    Gone: { }
+  }
+  close(o);
+  conns.active--;
+}
+
+/**
+ * One request, read whole.
+ *
+ * **Nothing is copied until the request is complete.** The buffer only grows, its length is counted as data
+ * arrives, and a chunked body's end is recognised from the last five bytes alone — so a 50 MB push costs one
+ * pass over its bytes rather than one per packet, which is what the first version of this did, and which
+ * turned a 4 MB push into minutes.
+ */
+async Arrived readRequest(Socket sock, i32 maxBody) {
+  Buf buf = Buf.create();
+  i32 total = 0;
+  i32 end = -1;
+  Request? req = null;
+  i32 length = -1;
+  bool chunked = false;
+  while (true) {
+    match (await sock.recv()) {
+      Err(err): { return Arrived.Gone; }
+      Ok(got): {
+        match (got) {
+          End: { return Arrived.Gone; }
+          Data(bytes): {
+            i32 before = total;
+            buf.pushAll(bytes);
+            total = total + bytes.len();
+            if (end < 0) {
+              end = headersEndFrom(buf, before, total);
+              if (end < 0) {
+                if (total > 65536) { return Arrived.TooLarge; }
+                continue;
+              }
+              Request? parsed = parseHead(buf.bytes(), end);
+              if (parsed is null) { return Arrived.Malformed("the request line or a header"); }
+              req = parsed;
+              chunked = lower(header(parsed!, "transfer-encoding")).indexOf("chunked") >= 0;
+              string cl = header(parsed!, "content-length");
+              if (!chunked) {
+                length = cl == "" ? 0 : number(cl);
+                if (length < 0) { return Arrived.Malformed("content-length"); }
+                if (length > maxBody) { return Arrived.TooLarge; }
+              }
+            }
+            i32 have = total - end;
+            if (have > maxBody + 65536) { return Arrived.TooLarge; }
+            if (!chunked && have >= length) {
+              Request r = req!;
+              r.body = slice(buf.bytes(), end, end + length);
+              return finish(r);
+            }
+            if (chunked && have >= 5 && endsChunked(buf, total)) {
+              u8[]? body = dechunk(buf.bytes(), end);
+              if (body is not null) {
+                Request r = req!;
+                r.body = body!;
+                return finish(r);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/** Where the headers end — just past the blank line — looking only at what arrived since `from`; or -1. */
+i32 headersEndFrom(Buf b, i32 from, i32 total) {
+  i32 start = from - 3 < 3 ? 3 : from;
+  for (i32 i = start; i < total; i++) {
+    if (b.get(i - 3) == 13 && b.get(i - 2) == 10 && b.get(i - 1) == 13 && b.get(i) == 10) { return i + 1; }
+  }
+  return -1;
+}
+
+/** Undo `Content-Encoding: gzip`, which git uses for an upload-pack request of more than a kilobyte. */
+Arrived finish(Request r) {
+  string ce = lower(header(r, "content-encoding"));
+  if (ce == "gzip" || ce == "x-gzip") {
+    match (gunzipBytesResult(r.body)) {
+      Ok(plain): { r.body = plain; }
+      Err(why): { return Arrived.Malformed("the gzip body: \{why}"); }
+    }
+  } else if (ce != "" && ce != "identity") {
+    return Arrived.Malformed("content-encoding \{ce}");
+  }
+  return Arrived.Whole(r);
+}
+
+/** Whether a chunked body could be complete: it ends with the zero-length chunk and a blank line. */
+bool endsChunked(Buf b, i32 n) {
+  return b.get(n - 5) == '0' && b.get(n - 4) == 13 && b.get(n - 3) == 10 && b.get(n - 2) == 13 && b.get(n - 1) == 10;
+}
+
+/** The body a chunked encoding carries, or null if it is not all there (or not chunked at all). */
+u8[]? dechunk(u8[] b, i32 from) {
+  Buf out = Buf.create();
+  i32 at = from;
+  while (true) {
+    i32 size = 0;
+    i32 digits = 0;
+    while (at < b.len() && hexVal(b[at]) >= 0) {
+      size = size * 16 + hexVal(b[at]);
+      at++;
+      digits++;
+      if (digits > 7) { return null; }
+    }
+    if (digits == 0) { return null; }
+    // A chunk extension, if any, runs to the line's end.
+    while (at < b.len() && b[at] != 13) { at++; }
+    if (at + 1 >= b.len() || b[at + 1] != 10) { return null; }
+    at = at + 2;
+    if (size == 0) {
+      // Trailers would sit here; git sends none, so the blank line must follow.
+      if (at + 1 < b.len() && b[at] == 13 && b[at + 1] == 10) { return out.take(); }
+      return null;
+    }
+    if (at + size + 2 > b.len()) { return null; }
+    out.pushBytes(b, at, size);
+    at = at + size;
+    if (b[at] != 13 || b[at + 1] != 10) { return null; }
+    at = at + 2;
+  }
+}
+
+i32 hexVal(u8 c) {
+  if (c >= 48 && c <= 57) { return (c as i32) - 48; }
+  if (c >= 97 && c <= 102) { return (c as i32) - 87; }
+  if (c >= 65 && c <= 70) { return (c as i32) - 55; }
+  return -1;
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+Request? parseHead(u8[] buf, i32 end) {
+  string t = string.fromBytes(slice(buf, 0, end));
+  i32 eol = t.indexOf("\r\n");
+  if (eol < 0) { return null; }
+  string line = t.slice(0, eol);
+  i32 sp1 = line.indexOf(" ");
+  if (sp1 < 0) { return null; }
+  string rest = line.slice(sp1 + 1, line.len());
+  i32 sp2 = rest.indexOf(" ");
+  string target = sp2 < 0 ? rest : rest.slice(0, sp2);
+  i32 q = target.indexOf("?");
+  Vec<string> names = Vec.create();
+  Vec<string> values = Vec.create();
+  string lines = t.slice(eol + 2, t.len());
+  while (lines.len() > 0) {
+    i32 e = lines.indexOf("\r\n");
+    if (e <= 0) { break; }
+    string h = lines.slice(0, e);
+    lines = lines.slice(e + 2, lines.len());
+    i32 colon = h.indexOf(":");
+    if (colon < 0) { continue; }
+    names.push(lower(h.slice(0, colon)));
+    values.push(trim(h.slice(colon + 1, h.len())));
+  }
+  return Request(line.slice(0, sp1), q < 0 ? target : target.slice(0, q), q < 0 ? "" : target.slice(q + 1, target.len()),
+                 names.toArray(), values.toArray(), u8[]());
+}
+
+string header(Request r, string name) {
+  for (i32 i = 0; i < r.names.len(); i++) { if (r.names[i] == name) { return r.values[i]; } }
+  return "";
+}
+
+string lower(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] >= 65 && b[i] <= 90) { b[i] = b[i] + 32; } }
+  return string.fromBytes(b);
+}
+
+string trim(string s) {
+  i32 a = 0;
+  i32 b = s.len();
+  while (a < b && (s.slice(a, a + 1) == " " || s.slice(a, a + 1) == "\t")) { a++; }
+  while (b > a && (s.slice(b - 1, b) == " " || s.slice(b - 1, b) == "\t")) { b--; }
+  return s.slice(a, b);
+}
+
+u8[] responseBytes(Response r) {
+  string head = "HTTP/1.1 \{r.status} \{reason(r.status)}\r\nContent-Type: \{r.contentType}\r\nContent-Length: \{r.body.len()}\r\n";
+  for (string h in r.headers) {
+    if (h.indexOf("\r") < 0 && h.indexOf("\n") < 0) { head += h + "\r\n"; }
+  }
+  head += "Connection: close\r\n\r\n";
+  Buf out = Buf.create();
+  out.pushAll(head.toBytes());
+  out.pushAll(r.body);
+  return out.take();
+}
+
+string reason(i32 status) {
+  if (status == 200) { return "OK"; }
+  if (status == 400) { return "Bad Request"; }
+  if (status == 401) { return "Unauthorized"; }
+  if (status == 403) { return "Forbidden"; }
+  if (status == 404) { return "Not Found"; }
+  if (status == 405) { return "Method Not Allowed"; }
+  if (status == 413) { return "Content Too Large"; }
+  if (status == 415) { return "Unsupported Media Type"; }
+  return "Error";
+}
+
+// ── Routes ──────────────────────────────────────────────────────────────────
+
+/** `name` is a repository path a request may name: segments of letters, digits, `.`, `_` and `-`, none hidden. */
+bool repoNameOk(string name) {
+  if (name.len() == 0 || name.len() > 200) { return false; }
+  string rest = name;
+  while (rest.len() > 0) {
+    i32 slash = rest.indexOf("/");
+    string part = slash < 0 ? rest : rest.slice(0, slash);
+    rest = slash < 0 ? "" : rest.slice(slash + 1, rest.len());
+    if (part.len() == 0 || part.slice(0, 1) == ".") { return false; }
+    for (u8 ch in part.toBytes()) {
+      bool ok = (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)
+                || ch == '.' || ch == '_' || ch == '-';
+      if (!ok) { return false; }
+    }
+  }
+  return true;
+}
+
+bool endsWith(string s, string suffix) {
+  return s.len() >= suffix.len() && s.slice(s.len() - suffix.len(), s.len()) == suffix;
+}
+
+/** Where `name` is on disk, trying it with and without `.git`; null when neither is a repository. */
+async string? locate(Files fs, string root, string name) {
+  string[] tries = endsWith(name, ".git") ? [name, name.slice(0, name.len() - 4)] : [name + ".git", name];
+  for (string t in tries) {
+    Stat? s = (await fs.stat("\{root}/\{t}/HEAD")).ok();
+    if (s is not null && s!.exists && s!.isFile) { return "\{root}/\{t}"; }
+  }
+  return null;
+}
+
+async Response route(Sys sys, Config c, Locks locks, Request r) {
+  Files fs = sys.files();
+  string p = r.path;
+  if (p == "/" && (r.method == "GET" || r.method == "HEAD")) { return await listing(fs, c.root); }
+
+  string repo = "";
+  string what = "";
+  string[] suffixes = ["/info/refs", "/git-upload-pack", "/git-receive-pack"];
+  for (string s in suffixes) {
+    if (endsWith(p, s) && p.len() > s.len() + 1) {
+      repo = p.slice(1, p.len() - s.len());
+      what = s;
+    }
+  }
+  if (what == "") { return text(404, "not found\n"); }
+  if (!repoNameOk(repo)) { return text(404, "no such repository\n"); }
+
+  string service = what == "/info/refs" ? queryValue(r.query, "service") : what.slice(1, what.len());
+  if (service != "git-upload-pack" && service != "git-receive-pack") {
+    return text(403, "this server speaks git's smart HTTP protocol only\n");
+  }
+  bool push = service == "git-receive-pack";
+  if (what == "/info/refs" && r.method != "GET" && r.method != "HEAD") { return text(405, "GET\n"); }
+  if (what != "/info/refs" && r.method != "POST") { return text(405, "POST\n"); }
+  if (what != "/info/refs" && lower(header(r, "content-type")) != "application/x-\{service}-request") {
+    return text(415, "expected application/x-\{service}-request\n");
+  }
+
+  if (push) {
+    if (!c.anonymousPush && c.token == "") { return text(403, "pushing is not enabled on this server\n"); }
+    if (!c.anonymousPush && !authorized(r, c.token)) {
+      return Response(401, "text/plain; charset=utf-8", ["WWW-Authenticate: Basic realm=\"git\""], "credentials required to push\n".toBytes());
+    }
+  }
+
+  string? dir = await locate(fs, c.root, repo);
+  if (dir is null && push && c.createOnPush) {
+    string made = endsWith(repo, ".git") ? "\{c.root}/\{repo}" : "\{c.root}/\{repo}.git";
+    string? why = await initBare(fs, made, "main");
+    if (why is not null) { return text(500, "cannot create the repository: \{why!}\n"); }
+    sys.log("gitserve: created \{made}");
+    dir = made;
+  }
+  if (dir is null) { return text(404, "no such repository\n"); }
+
+  // Writes wait for each other; reads go straight through, and see refs before or after a push.
+  if (push && what != "/info/refs") {
+    while (locks.held.has(dir!)) { await sys.sleepMillis(10); }
+    locks.held.set(dir!, true);
+  }
+  Response out = await serveRepo(fs, locks, dir!, r, what, service);
+  if (push && what != "/info/refs") { locks.held.remove(dir!); }
+  return out;
+}
+
+/**
+ * An open repository, kept between requests: opening one reads every pack and its index into memory, which
+ * for a repository of 50 MB is most of what a request would otherwise cost.
+ *
+ * It is reopened when the names in `objects/pack` change — a push stored one, or `git gc` rewrote them.
+ * Loose objects and refs are read from disk on every request, so nothing else can go stale.
+ */
+struct Cached {
+  Repo repo;
+  string packs;
+}
+
+async string packNames(Files fs, string dir) {
+  string[]? names = (await fs.readDir("\{dir}/objects/pack")).ok();
+  if (names is null) { return ""; }
+  string[] list = names!;
+  for (i32 i = 1; i < list.len(); i++) {
+    string cur = list[i];
+    i32 j = i - 1;
+    while (j >= 0 && list[j] > cur) { list[j + 1] = list[j]; j--; }
+    list[j + 1] = cur;
+  }
+  string out = "";
+  for (string n in list) { out = out + n + "\n"; }
+  return out;
+}
+
+async Response serveRepo(Files fs, Locks locks, string dir, Request r, string what, string service) {
+  string packs = await packNames(fs, dir);
+  Cached? hit = locks.repos.get(dir);
+  if (hit is not null && hit!.packs == packs) { return await serveOpen(fs, locks, dir, hit!.repo, r, what, service); }
+  match ((await openRepo(fs, dir, dir))) {
+    NoRepo(why): { return text(500, "cannot open the repository: \{why}\n"); }
+    Opened(repo): {
+      locks.repos.set(dir, Cached(repo, packs));
+      return await serveOpen(fs, locks, dir, repo, r, what, service);
+    }
+  }
+}
+
+async Response serveOpen(Files fs, Locks locks, string dir, Repo repo, Request r, string what, string service) {
+  bool v2 = header(r, "git-protocol").indexOf("version=2") >= 0 && service == "git-upload-pack";
+  string[] nocache = ["Cache-Control: no-cache, max-age=0, must-revalidate", "Expires: Fri, 01 Jan 1980 00:00:00 GMT", "Pragma: no-cache"];
+  if (what == "/info/refs") {
+    Buf body = Buf.create();
+    if (v2) {
+      // http-backend leaves the `# service=` preamble off a v2 advertisement, and so does this.
+      body.pushAll(advertiseV2());
+    } else {
+      body.pushAll(writeText("# service=\{service}\n"));
+      body.pushAll(flushPkt());
+      body.pushAll(await advertiseV0(repo, service));
+    }
+    return Response(200, "application/x-\{service}-advertisement", nocache, body.take());
+  }
+  if (service == "git-upload-pack") {
+    u8[] answer = v2 ? await uploadPackV2(repo, r.body) : await uploadPackV0(repo, r.body);
+    return Response(200, "application/x-git-upload-pack-result", nocache, answer);
+  }
+  Pushed done = await receivePack(repo, r.body);
+  // A stored pack is already in `repo.packs`, so the open repository stays current: record its new listing.
+  locks.repos.set(dir, Cached(repo, await packNames(fs, dir)));
+  return Response(200, "application/x-git-receive-pack-result", nocache, done.report);
+}
+
+/** Basic credentials whose password is `token`; any user name. Compared without stopping at the first difference. */
+bool authorized(Request r, string token) {
+  string h = header(r, "authorization");
+  if (h.len() < 6 || lower(h.slice(0, 6)) != "basic ") { return false; }
+  u8[]? raw = base64(trim(h.slice(6, h.len())).toBytes());
+  if (raw is null) { return false; }
+  string pair = string.fromBytes(raw!);
+  i32 colon = pair.indexOf(":");
+  if (colon < 0) { return false; }
+  u8[] given = pair.slice(colon + 1, pair.len()).toBytes();
+  u8[] want = token.toBytes();
+  i32 diff = given.len() ^ want.len();
+  for (i32 i = 0; i < want.len(); i++) {
+    u8 g = i < given.len() ? given[i] : 0;
+    diff = diff | ((g ^ want[i]) as i32);
+  }
+  return diff == 0;
+}
+
+string queryValue(string q, string name) {
+  string rest = q;
+  while (rest.len() > 0) {
+    i32 amp = rest.indexOf("&");
+    string pair = amp < 0 ? rest : rest.slice(0, amp);
+    rest = amp < 0 ? "" : rest.slice(amp + 1, rest.len());
+    i32 eq = pair.indexOf("=");
+    if ((eq < 0 ? pair : pair.slice(0, eq)) == name) { return eq < 0 ? "" : pair.slice(eq + 1, pair.len()); }
+  }
+  return "";
+}
+
+/** The repositories under `root`, one per line — as deep as two levels, for `owner/project.git`. */
+async Response listing(Files fs, string root) {
+  Vec<string> found = Vec.create();
+  await collect(fs, root, "", found, 2);
+  Buf out = Buf.create();
+  for (i32 i = 0; i < found.len(); i++) { out.pushAll("\{found.get(i)}\n".toBytes()); }
+  return Response(200, "text/plain; charset=utf-8", string[](), out.take());
+}
+
+async void collect(Files fs, string root, string rel, Vec<string> found, i32 depth) {
+  string[]? names = (await fs.readDir(rel == "" ? root : "\{root}/\{rel}")).ok();
+  if (names is null) { return; }
+  // Sorted, so the listing does not depend on the filesystem's order.
+  string[] list = names!;
+  for (i32 i = 1; i < list.len(); i++) {
+    string cur = list[i];
+    i32 j = i - 1;
+    while (j >= 0 && list[j] > cur) { list[j + 1] = list[j]; j--; }
+    list[j + 1] = cur;
+  }
+  for (string n in list) {
+    if (n.slice(0, 1) == ".") { continue; }
+    string path = rel == "" ? n : "\{rel}/\{n}";
+    Stat? head = (await fs.stat("\{root}/\{path}/HEAD")).ok();
+    if (head is not null && head!.exists && head!.isFile) { found.push(path); continue; }
+    if (depth > 1) {
+      Stat? s = (await fs.stat("\{root}/\{path}")).ok();
+      if (s is not null && s!.isDir) { await collect(fs, root, path, found, depth - 1); }
+    }
+  }
+}

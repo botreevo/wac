@@ -1,0 +1,90 @@
+// `indexPackFast` against git's own index of the same pack: byte for byte.
+//
+// git writes an index for every pack it makes, so the oracle is free. A pack with offset deltas, reference
+// deltas, and a thin one whose bases are elsewhere are each made by `git pack-objects`, and the index this
+// writes must be the file `git index-pack` writes — names, offsets and CRC-32s alike.
+
+import { T } from "../vendor/wac/packages/wactest/src/assert.wac";
+import { Sys, ChildEnv, Launch, Procs } from "std";
+import { Vec, flatten } from "core";
+import { Indexed } from "../vendor/wac/packages/git/src/pack.wac";
+import { writeIdx } from "../vendor/wac/packages/git/src/idx.wac";
+import { indexPackFast } from "../src/indexpack.wac";
+
+u8[] run(Procs p, string[] args, u8[] stdin) {
+  return flatten(p.exec("git", args, stdin, ChildEnv.inherited(), Launch.plain()).wait()).unwrap().stdout;
+}
+
+/** A pack of `revs` from this repository's own history, and git's index of it. */
+async bool sameAsGit(T t, Sys sys, string dir, string revs, string flags, string what) {
+  Procs p = sys.procs();
+  string[] args = ["-C", dir, "pack-objects", "--revs", "--stdout", "-q"];
+  if (flags != "") { args = ["-C", dir, "pack-objects", "--revs", "--stdout", "-q", flags]; }
+  u8[] pack = run(p, args, revs.toBytes());
+  t.isTrue(pack.len() > 32, "\{what}: git made a pack");
+  match (indexPackFast(pack)) {
+    Unindexable(why): { t.fail("\{what}: \{why}"); return false; }
+    Thin(bases): { t.fail("\{what}: thin, wanting \{bases.len()}"); return false; }
+    Built(idx): {
+      u8[] sum = u8[].filled(20, 0);
+      sum.copyFrom(pack, pack.len() - 20, 0, 20);
+      u8[] ours = writeIdx(idx, sum);
+      string tmp = "\{dir}/.git/check-\{what}";
+      await sys.files().writeFile("\{tmp}.pack", pack);
+      run(p, ["-C", dir, "index-pack", "-o", "\{tmp}.idx", "\{tmp}.pack"], u8[]());
+      u8[] theirs = (await sys.files().readFile("\{tmp}.idx")).ok()!;
+      await sys.files().remove("\{tmp}.pack", false);
+      await sys.files().remove("\{tmp}.idx", false);
+      t.eqI32(idx.count, (theirs.len() - 8 - 1024 - 40) / 28, "\{what}: as many objects as git counted");
+      bool same = ours.len() == theirs.len();
+      for (i32 i = 0; same && i < ours.len(); i++) { if (ours[i] != theirs[i]) { same = false; } }
+      t.isTrue(same, "\{what}: the index is git's, byte for byte (\{ours.len()} and \{theirs.len()} bytes)");
+      return same;
+    }
+  }
+}
+
+/**
+ * A repository with twenty commits of a growing file and a few others — enough history that git deltifies.
+ * Made fresh under `dist/`, which is ignored.
+ */
+async string fixture(Sys sys) {
+  Procs p = sys.procs();
+  string dir = flatten(sys.env().cwd().wait()).unwrap() + "/dist/indexpack-fixture";
+  await sys.files().remove(dir, true);
+  await sys.files().mkdir(dir, true);
+  run(p, ["-C", dir, "init", "-q"], u8[]());
+  string text = "";
+  for (i32 n = 0; n < 20; n++) {
+    for (i32 k = 0; k < 40; k++) { text = text + "line \{k} of revision \{n}, which deltas against the last\n"; }
+    await sys.files().writeFile("\{dir}/grow.txt", text.toBytes());
+    await sys.files().writeFile("\{dir}/n\{n % 4}.txt", "revision \{n}\n".toBytes());
+    run(p, ["-C", dir, "add", "-A"], u8[]());
+    run(p, ["-C", dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-qm", "r\{n}"], u8[]());
+  }
+  return dir;
+}
+
+export async string test_the_index_is_the_one_git_writes(Sys sys) {
+  T t = T.create();
+  string dir = await fixture(sys);
+  // Offset deltas, which is what git writes when it is told the reader understands them.
+  await sameAsGit(t, sys, dir, "HEAD\n", "--delta-base-offset", "ofs");
+  // Reference deltas, every one of them — `pack-objects`' default, and the case wac's own `indexPack`
+  // resolves in quadratic time.
+  await sameAsGit(t, sys, dir, "HEAD\n", "", "ref");
+  return t.report();
+}
+
+export async string test_a_thin_pack_names_the_bases_it_lacks(Sys sys) {
+  T t = T.create();
+  Procs p = sys.procs();
+  string dir = await fixture(sys);
+  u8[] pack = run(p, ["-C", dir, "pack-objects", "--revs", "--stdout", "-q", "--thin"], "HEAD\n^HEAD~1\n".toBytes());
+  match (indexPackFast(pack)) {
+    Unindexable(why): { t.fail(why); }
+    Built(idx): { t.fail("a pack of one commit's change against its parent was not thin"); }
+    Thin(bases): { t.isTrue(bases.len() > 0, "a thin pack names its missing bases"); }
+  }
+  return t.report();
+}

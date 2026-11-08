@@ -35,3 +35,4 @@ SELECT count(*) FROM pragma_collation_list;
 SELECT * FROM pragma_table_info('nosuch');
 SELECT arg, schema FROM pragma_table_info('t') LIMIT 1;
 SELECT * FROM pragma_nosuch('t');
+SELECT min(0.0, 0), max(0.0, 0), min(0, 0.0), max(0, 0.0), min(1, 1.0, 1), typeof(min(2.0, 2));

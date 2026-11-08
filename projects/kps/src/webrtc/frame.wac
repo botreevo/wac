@@ -1,0 +1,179 @@
+// The WebRTC mapping's two codecs — SPEC §6.2 (stream frames) and §8 (control messages), wire version 1.
+//
+// **Every data-channel message on an application channel is exactly one frame**: a type byte and a
+// type-specific payload. That is what turns a reliable, ordered, *message*-oriented data channel into a byte
+// stream with QUIC's lifecycle — EOF after FIN, an error after RESET, a request to stop after STOP_SENDING —
+// plus per-stream credit. The reserved control channel (id 0) carries the connection-level messages.
+//
+// **Malformed input is a protocol violation, never something weaker.** An unknown type, a payload of the wrong
+// length, an empty or oversized DATA, or a credit above MAX_OFFSET closes the connection with `protocol-error`.
+// Reading a short CONNECTION_CLOSE as a clean close, or skipping an unknown frame, is how two implementations
+// end up disagreeing about a stream's final offset with neither noticing.
+
+/** Stream frame types (§6.2). */
+export static i32 FRAME_DATA = 0x00;
+export static i32 FRAME_FIN = 0x01;
+export static i32 FRAME_RESET = 0x02;
+export static i32 FRAME_STOP_SENDING = 0x03;
+export static i32 FRAME_MAX_STREAM_DATA = 0x04;
+
+/**
+ * The largest frame, type byte included. An SCTP user message is reassembled whole before KPS can look at its
+ * type or check its credit, so credit cannot protect a receiver from one enormous message — this cap does.
+ */
+export static i32 MAX_FRAME = 16384;
+/** The most payload one DATA frame carries: a write larger than this is split, an empty one sends nothing. */
+export static i32 MAX_PAYLOAD = 16383;
+
+/** The ceiling for every offset, limit and count: 2^62 − 1, QUIC's integer range (§6.5). */
+export static i64 MAX_OFFSET = 4611686018427387903;
+
+/** Control message types (§8). */
+export static i32 CTRL_CONNECTION_CLOSE = 0x00;
+export static i32 CTRL_HELLO = 0x01;
+export static i32 CTRL_MAX_DATA = 0x02;
+export static i32 CTRL_MAX_STREAMS = 0x03;
+
+/** The wire version HELLO carries. Bumped only by an incompatible revision; there is no downgrade. */
+export static i32 WIRE_VERSION = 1;
+
+/** One parsed stream frame, or why the bytes are not one. */
+export enum Frame {
+  Data(u8[] payload),
+  Fin,
+  ResetFrame(i64 code),
+  StopSending(i64 code),
+  MaxStreamData(i64 value),
+  Violation(string why),
+}
+
+/** One parsed control message, or why the bytes are not one. */
+export enum Control {
+  Close(i64 code),
+  Hello(i32 version, i64 maxStreamData, i64 maxData, i64 maxStreams),
+  MaxData(i64 value),
+  MaxStreams(i64 value),
+  Bad(string why),
+}
+
+export u8[] encodeData(const u8[] payload, i32 from, i32 n) {
+  u8[] out = u8[].filled(1 + n, 0);
+  out[0] = FRAME_DATA as@ u8;
+  out.copyFrom(payload, from, 1, n);
+  return out;
+}
+
+export u8[] encodeFin() { return [FRAME_FIN as@ u8] as u8[]; }
+
+/** RESET or STOP_SENDING: the type, then the code as a big-endian u32. */
+export u8[] encodeCode(i32 type, i64 code) {
+  u8[] out = u8[].filled(5, 0);
+  out[0] = type as@ u8;
+  putU32(out, 1, code);
+  return out;
+}
+
+export u8[] encodeMaxStreamData(i64 value) { return withU64(FRAME_MAX_STREAM_DATA, value); }
+
+/** Parse one message from an application channel as a stream frame. */
+export Frame parseFrame(const u8[] m) {
+  if (m.len() == 0) { return Frame.Violation("empty data-channel message"); }
+  if (m.len() > MAX_FRAME) { return Frame.Violation("frame of \{m.len()} bytes exceeds \{MAX_FRAME}"); }
+  i32 type = m[0] as i32;
+  i32 n = m.len() - 1;
+  if (type == FRAME_DATA) {
+    if (n == 0) { return Frame.Violation("empty DATA frame"); }
+    u8[] payload = u8[].filled(n, 0);
+    payload.copyFrom(m, 1, 0, n);
+    return Frame.Data(payload);
+  }
+  if (type == FRAME_FIN) {
+    return n == 0 ? Frame.Fin : Frame.Violation("FIN with a payload");
+  }
+  if (type == FRAME_RESET) {
+    return n == 4 ? Frame.ResetFrame(getU32(m, 1)) : Frame.Violation("RESET payload must be 4 bytes");
+  }
+  if (type == FRAME_STOP_SENDING) {
+    return n == 4 ? Frame.StopSending(getU32(m, 1)) : Frame.Violation("STOP_SENDING payload must be 4 bytes");
+  }
+  if (type == FRAME_MAX_STREAM_DATA) {
+    if (n != 8) { return Frame.Violation("MAX_STREAM_DATA payload must be 8 bytes"); }
+    i64 v = getU62(m, 1);
+    return v < (0 as i64) ? Frame.Violation("MAX_STREAM_DATA above MAX_OFFSET") : Frame.MaxStreamData(v);
+  }
+  return Frame.Violation("unknown frame type \{type}");
+}
+
+export u8[] encodeConnClose(i64 code) {
+  u8[] out = u8[].filled(5, 0);
+  out[0] = CTRL_CONNECTION_CLOSE as@ u8;
+  putU32(out, 1, code);
+  return out;
+}
+
+export u8[] encodeHello(i32 version, i64 maxStreamData, i64 maxData, i64 maxStreams) {
+  u8[] out = u8[].filled(26, 0);
+  out[0] = CTRL_HELLO as@ u8;
+  out[1] = version as@ u8;
+  putU64(out, 2, maxStreamData);
+  putU64(out, 10, maxData);
+  putU64(out, 18, maxStreams);
+  return out;
+}
+
+export u8[] encodeMaxData(i64 value) { return withU64(CTRL_MAX_DATA, value); }
+export u8[] encodeMaxStreams(i64 value) { return withU64(CTRL_MAX_STREAMS, value); }
+
+/** Parse one control-channel message. Sizes are exact; a credit above MAX_OFFSET is refused. */
+export Control parseControl(const u8[] m) {
+  if (m.len() == 0) { return Control.Bad("empty control message"); }
+  i32 type = m[0] as i32;
+  if (type == CTRL_CONNECTION_CLOSE) {
+    return m.len() == 5 ? Control.Close(getU32(m, 1)) : Control.Bad("CONNECTION_CLOSE must be 5 bytes");
+  }
+  if (type == CTRL_HELLO) {
+    if (m.len() != 26) { return Control.Bad("HELLO must be 26 bytes"); }
+    i64 a = getU62(m, 2);
+    i64 b = getU62(m, 10);
+    i64 c = getU62(m, 18);
+    if (a < (0 as i64) || b < (0 as i64) || c < (0 as i64)) { return Control.Bad("HELLO credit above MAX_OFFSET"); }
+    return Control.Hello(m[1] as i32, a, b, c);
+  }
+  if (type == CTRL_MAX_DATA || type == CTRL_MAX_STREAMS) {
+    if (m.len() != 9) { return Control.Bad(type == CTRL_MAX_DATA ? "MAX_DATA must be 9 bytes" : "MAX_STREAMS must be 9 bytes"); }
+    i64 v = getU62(m, 1);
+    if (v < (0 as i64)) { return Control.Bad("credit above MAX_OFFSET"); }
+    return type == CTRL_MAX_DATA ? Control.MaxData(v) : Control.MaxStreams(v);
+  }
+  return Control.Bad("unknown control message type \{type}");
+}
+
+u8[] withU64(i32 type, i64 value) {
+  u8[] out = u8[].filled(9, 0);
+  out[0] = type as@ u8;
+  putU64(out, 1, value);
+  return out;
+}
+
+void putU32(u8[] b, i32 at, i64 v) {
+  for (i32 i = 0; i < 4; i++) { b[at + i] = ((v >> (((3 - i) * 8) as@ u32)) & (0xFF as i64)) as@ u8; }
+}
+
+void putU64(u8[] b, i32 at, i64 v) {
+  for (i32 i = 0; i < 8; i++) { b[at + i] = ((v >> (((7 - i) * 8) as@ u32)) & (0xFF as i64)) as@ u8; }
+}
+
+/** A big-endian u32, which always fits an i64 without its sign. */
+i64 getU32(const u8[] b, i32 at) {
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < 4; i++) { v = (v << 8) | (b[at + i] as i64); }
+  return v;
+}
+
+/** A big-endian u64 if it is at most MAX_OFFSET, else -1: the top two bits must be clear. */
+i64 getU62(const u8[] b, i32 at) {
+  if ((b[at] as i32 & 0xC0) != 0) { return -1 as i64; }
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < 8; i++) { v = (v << 8) | (b[at + i] as i64); }
+  return v;
+}

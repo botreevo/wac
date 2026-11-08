@@ -1,0 +1,256 @@
+// End-to-end flow control for the WebRTC mapping — SPEC §6.5.
+//
+// **Why it exists.** SCTP has one association-wide receive window that every stack drains eagerly whatever the
+// application is doing, and browsers expose no receive-side pressure at all — so data channels give a slow
+// reader no way to slow a fast writer. KPS adds QUIC-style credit above them: per-stream bytes, per-connection
+// bytes, and a count of streams the peer may open, each granted by the receiver as its application consumes.
+//
+// **All values are absolute and cumulative**, so an update is idempotent and a stale one harmless: a limit that
+// would go down is ignored. Offsets are i64 under MAX_OFFSET (2^62 − 1), so nothing here can wrap.
+//
+// The sender distinguishes *sent* bytes (handed to the transport) from *reserved* ones (admitted to the send
+// path but not yet handed over — they can still be discarded by STOP_SENDING or a reset). A reservation is
+// taken **before** a DATA frame exists: a frame blocked for credit at the head of a send queue would trap the
+// FIN, RESET or credit update queued behind it, and both ends would wait for ever.
+//
+// wac runs one thing at a time and nothing here suspends inside a check-then-count, so §6.5's "atomically"
+// holds by construction.
+
+import { Ticket, Vec } from "core";
+import { MAX_OFFSET } from "./frame.wac";
+
+/** The recommended initial windows — a receiver's policy, not protocol constants. */
+export static i64 DEFAULT_MAX_STREAM_DATA = 1048576;
+export static i64 DEFAULT_MAX_DATA = 8388608;
+export static i64 DEFAULT_MAX_STREAMS = 100;
+
+/** What this end grants its peer, announced in HELLO. */
+export struct Limits {
+  i64 maxStreamData;
+  i64 maxData;
+  i64 maxStreams;
+
+  Limits defaults() { return Limits(DEFAULT_MAX_STREAM_DATA, DEFAULT_MAX_DATA, DEFAULT_MAX_STREAMS); }
+}
+
+i64 saturate(i64 v) { return v > MAX_OFFSET || v < (0 as i64) ? MAX_OFFSET : v; }
+
+/**
+ * A set of coroutines waiting for something to change. `wait` hands out a ticket; `wake` settles every ticket
+ * handed out so far, and each waiter re-checks whatever it was waiting for. Resumption is queued, never
+ * immediate, so waking from inside a state change cannot re-enter it.
+ */
+export struct Wakeable {
+  Vec<Ticket<bool>> waiting;
+
+  Wakeable create() { return Wakeable(Vec<Ticket<bool>>.create()); }
+
+  Ticket<bool> wait(this) {
+    Ticket<bool> t;
+    this.waiting.push(t);
+    return t;
+  }
+
+  void wake(this) {
+    if (this.waiting.len() == 0) { return; }
+    Vec<Ticket<bool>> now = this.waiting;
+    this.waiting = Vec<Ticket<bool>>.create();
+    for (i32 i = 0; i < now.len(); i++) { now.get(i).resolve(true); }
+  }
+}
+
+/** One connection's credit, both directions, plus the stream-count credit. */
+export struct ConnFlow {
+  Limits local;
+  // ── sending: what the peer granted, zero until its HELLO ──
+  i64 peerMaxStreamDataInitial;
+  i64 peerMaxData;
+  i64 peerMaxStreams;
+  i64 connSent;
+  i64 connReserved;
+  i64 streamsOpened;
+  i64 streamsReserved;
+  // ── receiving ──
+  /** The enforcement limit: advances when an update is committed for sending, not when the peer has it. */
+  i64 localMaxData;
+  i64 connReceived;
+  i64 connConsumed;
+  i64 connAdvertisedAt;
+  i64 peerOpened;
+  i64 peerRetired;
+  i64 advertisedMaxStreams;
+  /** Every credit-blocked writer and opener waits here; any grant, release or failure wakes them all. */
+  Wakeable credit;
+  bool failed;
+  /** Where MAX_DATA and MAX_STREAMS updates go: the control channel. */
+  fn<void(i64)> sendMaxData;
+  fn<void(i64)> sendMaxStreams;
+
+  ConnFlow create(Limits local, fn<void(i64)> sendMaxData, fn<void(i64)> sendMaxStreams) {
+    return ConnFlow(local, 0 as i64, 0 as i64, 0 as i64, 0 as i64, 0 as i64, 0 as i64, 0 as i64,
+                    local.maxData, 0 as i64, 0 as i64, 0 as i64, 0 as i64, 0 as i64, local.maxStreams,
+                    Wakeable.create(), false, sendMaxData, sendMaxStreams);
+  }
+
+  /** The peer's HELLO seeds every send-side limit. */
+  void onPeerHello(this, i64 maxStreamData, i64 maxData, i64 maxStreams) {
+    this.peerMaxStreamDataInitial = maxStreamData;
+    this.peerMaxData = maxData;
+    this.peerMaxStreams = maxStreams;
+    this.credit.wake();
+  }
+
+  void onPeerMaxData(this, i64 v) {
+    if (v > this.peerMaxData) { this.peerMaxData = v; this.credit.wake(); }
+  }
+
+  void onPeerMaxStreams(this, i64 v) {
+    if (v > this.peerMaxStreams) { this.peerMaxStreams = v; this.credit.wake(); }
+  }
+
+  /** Fail every pending and future wait: the connection is going. */
+  void fail(this) {
+    this.failed = true;
+    this.credit.wake();
+  }
+
+  /**
+   * Up to `n` bytes of credit for `sf`, granted now: 0 when there is none, in which case the caller waits on
+   * `credit` and asks again. A grant smaller than `n` is a frame split at the window's edge, as a QUIC sender
+   * splits — all-or-nothing would deadlock a write larger than the whole window.
+   */
+  i64 reserve(this, StreamFlow sf, i64 n) {
+    i64 streamAvail = sf.peerMaxStreamData(this) - sf.sendSent - sf.sendReserved;
+    i64 connAvail = this.peerMaxData - this.connSent - this.connReserved;
+    i64 grant = streamAvail < connAvail ? streamAvail : connAvail;
+    if (grant > n) { grant = n; }
+    if (grant < (1 as i64)) { return 0 as i64; }
+    sf.sendReserved += grant;
+    this.connReserved += grant;
+    return grant;
+  }
+
+  /** Reserved bytes handed to the transport. */
+  void commit(this, StreamFlow sf, i64 n) {
+    sf.sendReserved -= n;
+    sf.sendSent += n;
+    this.connReserved -= n;
+    this.connSent += n;
+  }
+
+  /** Reserved bytes discarded unsent: the credit returns. */
+  void release(this, StreamFlow sf, i64 n) {
+    sf.sendReserved -= n;
+    this.connReserved -= n;
+    this.credit.wake();
+  }
+
+  /** A slot to open one stream, if the peer's limit allows one now. */
+  bool reserveStream(this) {
+    if (this.streamsOpened + this.streamsReserved >= this.peerMaxStreams) { return false; }
+    this.streamsReserved += 1 as i64;
+    return true;
+  }
+
+  /** The channel was created: the cumulative count only ever grows. */
+  void commitStream(this) {
+    this.streamsReserved -= 1 as i64;
+    this.streamsOpened += 1 as i64;
+  }
+
+  void releaseStream(this) {
+    this.streamsReserved -= 1 as i64;
+    this.credit.wake();
+  }
+
+  /** `n` inbound DATA bytes on some stream, against the connection window. False is a violation. */
+  bool received(this, i64 n) {
+    if (this.connReceived + n > this.localMaxData) { return false; }
+    this.connReceived += n;
+    return true;
+  }
+
+  /** `n` bytes consumed (read or discarded); past half a window, MAX_DATA goes out. */
+  void consumed(this, i64 n) {
+    this.connConsumed += n;
+    i64 window = this.local.maxData;
+    if (this.connConsumed - this.connAdvertisedAt >= window / (2 as i64)) {
+      this.connAdvertisedAt = this.connConsumed;
+      this.localMaxData = saturate(this.connConsumed + window);
+      this.sendMaxData(this.localMaxData);
+    }
+  }
+
+  /**
+   * The peer opened a stream. It takes a slot from the moment it is observed — before HELLO, before anybody
+   * accepts it — or an application that stops accepting would hold an unbounded queue. False is a violation.
+   */
+  bool peerStreamOpened(this) {
+    if (this.peerOpened >= this.advertisedMaxStreams) { return false; }
+    this.peerOpened += 1 as i64;
+    return true;
+  }
+
+  /** A peer-opened stream retired: its slot comes back as MAX_STREAMS. */
+  void peerStreamRetired(this) {
+    this.peerRetired += 1 as i64;
+    this.advertisedMaxStreams = saturate(this.local.maxStreams + this.peerRetired);
+    this.sendMaxStreams(this.advertisedMaxStreams);
+  }
+}
+
+/** One stream's credit. */
+export struct StreamFlow {
+  i64 sendSent;
+  i64 sendReserved;
+  /** The largest MAX_STREAM_DATA the peer has sent on this stream. */
+  i64 peerMaxExplicit;
+  i64 localMaxStreamData;
+  i64 received;
+  i64 consumedBytes;
+  i64 advertisedAt;
+  /** Set by cancelRead: no more stream credit is granted, though discards still free connection credit. */
+  bool cancelled;
+  /** Where this stream's MAX_STREAM_DATA goes: its own channel. */
+  fn<void(i64)> sendMaxStreamData;
+
+  StreamFlow create(i64 localMaxStreamData, fn<void(i64)> sendMaxStreamData) {
+    return StreamFlow(0 as i64, 0 as i64, 0 as i64, localMaxStreamData, 0 as i64, 0 as i64, 0 as i64, false,
+                      sendMaxStreamData);
+  }
+
+  /**
+   * The peer's window for this stream: never below its HELLO initial. Read through the connection rather than
+   * copied in, so a stream staged before the peer's HELLO sees the window the moment it arrives.
+   */
+  i64 peerMaxStreamData(const this, const ConnFlow conn) {
+    return this.peerMaxExplicit > conn.peerMaxStreamDataInitial ? this.peerMaxExplicit : conn.peerMaxStreamDataInitial;
+  }
+
+  /** MAX_STREAM_DATA from the peer; a decrease is ignored. Answers whether anything changed. */
+  bool onPeerMaxStreamData(this, i64 v) {
+    if (v <= this.peerMaxExplicit) { return false; }
+    this.peerMaxExplicit = v;
+    return true;
+  }
+
+  /** `n` inbound bytes, checked against both windows before either is counted. Empty is fine; else why not. */
+  string onReceived(this, ConnFlow conn, i64 n) {
+    if (this.received + n > this.localMaxStreamData) { return "peer exceeded MAX_STREAM_DATA"; }
+    if (!conn.received(n)) { return "peer exceeded MAX_DATA"; }
+    this.received += n;
+    return "";
+  }
+
+  /** `n` bytes read by the application or discarded: credit flows back at both levels. */
+  void onConsumed(this, ConnFlow conn, i64 n) {
+    this.consumedBytes += n;
+    i64 window = conn.local.maxStreamData;
+    if (!this.cancelled && this.consumedBytes - this.advertisedAt >= window / (2 as i64)) {
+      this.advertisedAt = this.consumedBytes;
+      this.localMaxStreamData = saturate(this.consumedBytes + window);
+      this.sendMaxStreamData(this.localMaxStreamData);
+    }
+    conn.consumed(n);
+  }
+}

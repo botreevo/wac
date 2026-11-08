@@ -1,0 +1,170 @@
+// Two WebRTC-mapping engines back to back, over a wire made of queues.
+//
+// Every message one side sends becomes a delivery waiting on the wire, and nothing crosses until the test pumps
+// it — so a test decides the order things arrive in (a stream before a HELLO, say), and can put bytes on the wire
+// that no conforming engine would send. The channels are reliable and ordered per channel, as SCTP's are; across
+// channels the order is the order of sending unless a test holds one back.
+
+import { Vec, Ticket } from "core";
+import { Channel, Driver, WebrtcConn, WebrtcStream } from "../src/webrtc/conn.wac";
+import { Limits } from "../src/webrtc/flow.wac";
+import { Endpoint } from "../src/api.wac";
+
+export struct Delivery {
+  string what;
+  fn<void()> run;
+}
+
+export struct Wire {
+  Vec<Delivery> q;
+  /** When set, deliveries to side B's control channel are held back until released. */
+  bool holdControlToB;
+  Vec<Delivery> held;
+
+  void put(this, string what, fn<void()> run) { this.q.push(Delivery(what, run)); }
+
+  /** Deliver everything queued, including whatever the deliveries themselves cause, until the wire is quiet. */
+  i32 flush(this) {
+    i32 n = 0;
+    while (this.q.len() > 0) {
+      Delivery d = this.q.remove(0);
+      d.run();
+      n++;
+    }
+    return n;
+  }
+
+  /** Hold back a's control messages to b — including any already on the wire, such as a's HELLO. */
+  void holdControl(this) {
+    this.holdControlToB = true;
+    Vec<Delivery> keep = Vec<Delivery>.create();
+    for (i32 i = 0; i < this.q.len(); i++) {
+      Delivery d = this.q.get(i);
+      if (d.what == "a→b control") { this.held.push(d); } else { keep.push(d); }
+    }
+    this.q = keep;
+  }
+
+  void releaseHeld(this) {
+    for (i32 i = 0; i < this.held.len(); i++) { this.q.push(this.held.get(i)); }
+    this.held = Vec<Delivery>.create();
+  }
+}
+
+/**
+ * One end of one application channel: what its stream is, once known, and whether it is open and closed.
+ *
+ * `closing` is set the moment either end closes, so neither may send after it; `closed` only when the close is
+ * delivered, behind whatever was already on the wire — an SCTP stream reset follows the data sent before it,
+ * so a FIN written just before a close still arrives.
+ */
+export struct End {
+  WebrtcStream? stream;
+  bool open;
+  bool closing;
+  bool closed;
+  i64 sent;
+}
+
+export struct Pair {
+  Wire wire;
+  WebrtcConn a;
+  WebrtcConn b;
+  /** Every channel each side has sent on, for tests that want to forge a message on one. */
+  Vec<End> aEnds;
+  Vec<End> bEnds;
+  bool aControlOpen;
+  bool bControlOpen;
+  /** Raw control bytes each side sent, for assertions about what went on the wire. */
+  Vec<u8[]> aControlSent;
+  Vec<u8[]> bControlSent;
+}
+
+/** Wire up a pair. Both control channels open at once, as a negotiated channel does when SCTP comes up. */
+export Pair pair(Limits la, Limits lb) {
+  Wire wire = Wire(Vec<Delivery>.create(), false, Vec<Delivery>.create());
+  Vec<End> aEnds = Vec<End>.create();
+  Vec<End> bEnds = Vec<End>.create();
+  Vec<u8[]> aSent = Vec<u8[]>.create();
+  Vec<u8[]> bSent = Vec<u8[]>.create();
+  // The connections are made below; the channels reach them through these one-element boxes.
+  WebrtcConn?[] ca = WebrtcConn?[].defaulted(1);
+  WebrtcConn?[] cb = WebrtcConn?[].defaulted(1);
+
+  Channel aControl = Channel(() => true, (u8[] m) => {
+    aSent.push(m);
+    Delivery d = Delivery("a→b control", () => { cb[0]!.controlMessage(m); });
+    if (wire.holdControlToB) { wire.held.push(d); } else { wire.q.push(d); }
+  }, () => 0 as i64, () => { });
+  Channel bControl = Channel(() => true, (u8[] m) => {
+    bSent.push(m);
+    wire.put("b→a control", () => { ca[0]!.controlMessage(m); });
+  }, () => 0 as i64, () => { });
+  Channel aDatagram = Channel(() => true, (u8[] m) => { wire.put("a→b datagram", () => { cb[0]!.datagram(m); }); },
+                              () => 0 as i64, () => { });
+  Channel bDatagram = Channel(() => true, (u8[] m) => { wire.put("b→a datagram", () => { ca[0]!.datagram(m); }); },
+                              () => 0 as i64, () => { });
+
+  Driver ha = Driver(aControl, aDatagram, (WebrtcStream s) => openOn(wire, s, cb, aEnds, bEnds), () => { },
+                 Endpoint("192.0.2.2", 2000));
+  Driver hb = Driver(bControl, bDatagram, (WebrtcStream s) => openOn(wire, s, ca, bEnds, aEnds), () => { },
+                 Endpoint("192.0.2.1", 1000));
+  WebrtcConn a = WebrtcConn.make(ha, la, 0 as i64);
+  WebrtcConn b = WebrtcConn.make(hb, lb, 0 as i64);
+  ca[0] = a;
+  cb[0] = b;
+  return Pair(wire, a, b, aEnds, bEnds, true, true, aSent, bSent);
+}
+
+/**
+ * `s`, on the opening side, gets a channel; the far side hears of it as an incoming channel when the open
+ * crosses the wire, and both ends hear it open. Messages each way are deliveries; a close reaches both ends.
+ */
+Channel? openOn(Wire wire, WebrtcStream s, WebrtcConn?[] far, Vec<End> nearEnds, Vec<End> farEnds) {
+  End near = End(s, false, false, false, 0 as i64);
+  End other = End(null, false, false, false, 0 as i64);
+  nearEnds.push(near);
+  farEnds.push(other);
+  Channel farCh = Channel(() => other.open && !other.closing, (u8[] m) => {
+    other.sent += m.len() as i64;
+    wire.put("far→near data", () => { if (!near.closed) { near.stream!.message(m); } });
+  }, () => 0 as i64, () => { closeBoth(wire, near, other); });
+  Channel nearCh = Channel(() => near.open && !near.closing, (u8[] m) => {
+    near.sent += m.len() as i64;
+    wire.put("near→far data", () => { if (!other.closed && other.stream is not null) { other.stream!.message(m); } });
+  }, () => 0 as i64, () => { closeBoth(wire, near, other); });
+  wire.put("channel open", () => {
+    other.stream = far[0]!.incomingChannel(farCh);
+    near.open = true;
+    other.open = true;
+    near.stream!.opened();
+    if (other.stream is not null) { other.stream!.opened(); }
+  });
+  return nearCh;
+}
+
+void closeBoth(Wire wire, End near, End other) {
+  if (near.closing) { return; }
+  near.closing = true;
+  other.closing = true;
+  wire.put("channel close", () => {
+    near.closed = true;
+    other.closed = true;
+    near.stream!.channelGone();
+    if (other.stream is not null) { other.stream!.channelGone(); }
+  });
+}
+
+/**
+ * Let everything happen: deliver what is on the wire, then let waiting coroutines run, until neither has
+ * anything left to do. Twenty quiet turns in a row is "nothing left" — a coroutine woken by a delivery runs on
+ * the turn after it, and may put more on the wire.
+ */
+export async void settle(Wire wire) {
+  i32 quiet = 0;
+  while (quiet < 20) {
+    i32 n = wire.flush();
+    await;
+    if (n == 0) { quiet++; } else { quiet = 0; }
+  }
+}

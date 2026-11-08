@@ -5772,11 +5772,7 @@ string unionTargetE(u8[] src, Lexed lexed, Env env, string u, Expr e) {
     }
   }
   for (i32 i = 0; i < ms.len(); i++) { if (ms[i] == t) { return t; } }
-  match (e.kind) {
-    IntLit(tok): { return numericMember(ms); }
-    FloatLit(tok): { return numericMember(ms); }
-    default: { }
-  }
+  if (isSignedNumericLiteralE(e)) { return numericMember(ms); }
   for (i32 i = 0; i < ms.len(); i++) { if (isOrDescends(env, t, ms[i])) { return ms[i]; } }
   // A mutable value where the union has only `const` access to its type enters that way.
   for (i32 i = 0; i < ms.len(); i++) {
@@ -5785,6 +5781,20 @@ string unionTargetE(u8[] src, Lexed lexed, Env env, string u, Expr e) {
     if (cb == t || isOrDescends(env, t, cb)) { return ms[i]; }
   }
   return "";
+}
+
+/**
+ * Whether `e` is a numeric literal, negated or not — `-0.5` is a unary minus over `0.5`, and a literal
+ * that way. Asked as anything else it entered no alternative of `union<T, f64>` (wac-tensor's
+ * `t.mul(-0.5)`).
+ */
+bool isSignedNumericLiteralE(Expr e) {
+  match (e.kind) {
+    IntLit(tok): { return true; }
+    FloatLit(tok): { return true; }
+    Unary(op, operand): { return isSignedNumericLiteralE(operand); }
+    default: { return false; }
+  }
 }
 
 /** Whether `e` is a reference the function holds only `const` access to: a local or parameter declared so. */
@@ -7988,7 +7998,28 @@ string computedTypeE(Env env, u8[] src, Lexed lexed, Ty t) {
  * every reference here can be null, while a number's is kept — it is a box — and two layers keep both.
  */
 string emitterSpelling(Env env, string t) {
-  if (t.len() > 2 && t.slice(t.len() - 2, t.len()) == "[]") {
+  // **A bracketed funcref with a suffix** — `(fn(T) -> T)[]`, `(fn() -> i32)?` — is the suffix applied to the
+  // funcref, which is how the evaluator tells it from a funcref answering `T[]` (`fnSuffixed`).
+  if (t.len() > 4 && t.slice(0, 4) == "(fn(") {
+    i32 pd = 0;
+    i32 pclose = -1;
+    u8[] pb = t.toBytes();
+    for (i32 i = 0; i < pb.len() && pclose < 0; i++) {
+      if (pb[i] == 40) { pd = pd + 1; }
+      if (pb[i] == 41) {
+        pd = pd - 1;
+        if (pd == 0) { pclose = i; }
+      }
+    }
+    if (pclose > 0 && pclose < t.len() - 1) {
+      string fnPart = emitterSpelling(env, t.slice(1, pclose));
+      string sfx = t.slice(pclose + 1, t.len());
+      if (sfx == "[]") { return fnPart + "[]"; }
+      if (sfx == "?") { return fnPart; }
+      if (sfx == "??") { return fnPart + "??"; }
+    }
+  }
+  if (t.len() > 2 && t.slice(t.len() - 2, t.len()) == "[]" && !(t.len() > 3 && t.slice(0, 3) == "fn(")) {
     return emitterSpelling(env, t.slice(0, t.len() - 2)) + "[]";
   }
   if (isTupleName(t)) {
@@ -11227,7 +11258,7 @@ void emitExprAt(B fb, u8[] src, Lexed lexed, Env env, Expr e, string want) {
     string et = typeOfE(src, lexed, env, e);
     if (!isUnionName(et)) {
       string m = unionTargetE(src, lexed, env, want, e);
-      if (m == "") { env.declineFor("a value that enters no alternative of " + want); return; }
+      if (m == "") { env.declineFor("a value that enters no alternative of " + want + ", at line " + numText(e.line) + ":" + numText(e.col)); return; }
       emitExprAt(fb, src, lexed, env, e, isConstAlt(m) ? m.slice(6, m.len()) : m);
       if (unionBoxes(m)) { fb.byte(251); fb.u32leb(0); fb.u32leb(env.boxType(m)); }   // struct.new
       return;
@@ -13652,6 +13683,13 @@ bool emitStackToText(B fb, Env env, string t) {
 /** The type a binary operator's operands share, taken from whichever side is not a literal. */
 string operandType(u8[] src, Lexed lexed, Env env, Expr left, Expr right) {
   string lt = typeOfE(src, lexed, env, left);
+  // **A literal expression takes the other operand's type**, as a lone literal does: `0.0 - 2.0 + r` with an
+  // `f32` `r` adds `f32`s. Typed first, `0.0 - 2.0` answered its family's `f64` and the add was emitted at
+  // `f64` over an `f32` local — a module that would not load (`typeOfE`'s `Binary` arm already reads it so).
+  if (isLiteral(lexed, left) && !isLiteral(lexed, right)) {
+    string rt0 = typeOfE(src, lexed, env, right);
+    if (rt0 != "") { return rt0; }
+  }
   if (lt != "") { return lt; }
   return typeOfE(src, lexed, env, right);
   // **Two literals leave this empty, and the caller reads empty as `i32`.** `1.0 == 1.0` is
@@ -14784,6 +14822,17 @@ bool holdsLambda(Expr e) {
       return false;
     }
     Unwrap(operand): { return holdsLambda(operand); }
+    // **Inside a literal too**: `many([(T t) => t.v])` hands its lambda to the parameter through the array,
+    // and answered no here the call's arguments were walked with no wanted type (wac-tensor).
+    ArrLit(elements): {
+      for (i32 i = 0; i < elements.len(); i++) { if (holdsLambda(elements[i])) { return true; } }
+      return false;
+    }
+    TupleLit(elements): {
+      for (i32 i = 0; i < elements.len(); i++) { if (holdsLambda(elements[i])) { return true; } }
+      return false;
+    }
+    Ternary(cond, then, els): { return holdsLambda(then) || holdsLambda(els); }
     default: { return false; }
   }
 }
@@ -14963,7 +15012,14 @@ void findLambdasExpr(Env env, u8[] src, Lexed lexed, Expr e, string want) {
             Ident(rtok): {
               string rn = tokenTextOf(src, lexed, rtok);
               recv = env.walkTypeOf(rn);
-              if (recv == "" && (env.isStructName(rn) || env.isEnumName(rn))) { recv = rn; }
+              // **By the name's key in this file, not its spelling** (`issues/lang/0425w`): `Host.of` in `std` is
+              // `std`'s `Host`, and a program declaring a `Host` of its own made the bare name find that one, so
+              // the lambdas `std` hands `Host.of` had no target.
+              if (recv == "") {
+                string rk = nameKeyOf(env, src, lexed, rtok);
+                if (env.isStructName(rk) || env.isEnumName(rk)) { recv = rk; }
+                else if (env.isStructName(rn) || env.isEnumName(rn)) { recv = rn; }
+              }
             }
             // **A receiver that is not a bare name**, which `this.sched!.on(id, h, d)` is: a field,
             // unwrapped from its nullable. `walkCalleeSig` walks exactly that chain — name, field,
@@ -17490,19 +17546,9 @@ string unsupportedExpr(u8[] src, Lexed lexed, Env env, Expr e) {
               env.lambdaInst[j] == env.lambdaInst[i]) { dup = dup + 1; }
         }
       }
-      // **Where the first of them is.** The count alone sent whoever met this to bisect a test file by
-      // hand, and the lambdas it counted were in another file entirely — the channels of a test harness
-      // two imports away. The position the emitter keys a lambda by is the one worth printing.
-      string first = "";
-      for (i32 i = 0; i < env.lambdaCount && first == ""; i++) {
-        if (env.lambdaSigs[i] != "") { continue; }
-        i32 fi = env.lambdaFile[i];
-        string where = fi >= 0 && fi < env.filePaths.len() ? env.filePaths[fi] : "?";
-        first = "; the first at " + where + ":" + numText(env.lambdaLine[i]) + ":" + numText(env.lambdaCol[i]);
-      }
       return "a lambda (this module has " + numText(env.lambdaCount) + ", "
            + numText(untyped) + " in a position the walk does not type yet, "
-           + numText(dup) + " sharing a position key" + first + ")";
+           + numText(dup) + " sharing a position key; this one at line " + numText(e.line) + ":" + numText(e.col) + ")";
     }
     IntLit(tok): { return ""; }
     FloatLit(tok): { return ""; }
@@ -19753,6 +19799,10 @@ void emitAt(B fb, u8[] src, Lexed lexed, Env env, Expr e, string want) {
   string got = typeOfE(src, lexed, env, e);
   emitExprAt(fb, src, lexed, env, e, want);
   if (want == "" || got == "" || got == want) { return; }
+  // **A float literal expression was emitted at the float type wanted**, which `emitExprAt` steers: `r ==
+  // 0.0 - 2.0` with an `f32` `r` is an `f32.sub` already, and demoting it as the `f64` its family answers
+  // was a module that would not load.
+  if (isFloat(got) && isFloat(want) && isLiteral(lexed, e)) { return; }
   if (valType(got) == valType(want) && !isFloat(got)) { return; }
   emitConversion(fb, env, got, want, 0);
 }

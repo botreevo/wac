@@ -81,6 +81,36 @@ every adapter has; there is no `f64`, no `bfloat16`, and no 8- or 64-bit integer
 two to a `u32` and unpacked with core WGSL's `unpack2x16float` — no extension, every adapter, the arithmetic in `f32`
 either way. An `I32` type for integer arithmetic is the natural next one; it is not here yet.
 
+## A tiny GPT
+
+`example/gpt/` is a character-level transformer language model — GPT-2's architecture at toy size: token and
+position embeddings, pre-norm blocks of causal multi-head attention and a GELU feed-forward network, a final layer norm,
+a linear head — and what training and sampling one takes. `MultiHeadAttention` and `TransformerBlock` are library
+layers, their gradients checked against finite differences like everything else, and a test holds that no position's
+output changes when only later positions do.
+
+```sh
+wac task gpt:train      # names, on the CPU: 2000 steps in about ten minutes
+wac task gpt:build      # the page that trains on WebGPU, with its texts beside it — serve dist/gpt
+wac task gpt:check      # in headless Chromium: 20 steps on the GPU and the CPU agree at every step
+```
+
+On the 32,033 names of makemore's list, shuffled and with the last tenth held out, a model of 104,603 numbers (context
+16, width 64, two layers of four heads) reaches a validation loss of **2.13** in 2000 steps of batch 32 on the CPU —
+where a uniform guess scores 3.30 and a model of which letter follows which about 2.45 — and invents names like
+*kaliah, micariah, nixanna, ezley, araela, jayelenn, samira*.
+
+The page trains the same model, or a larger one on tiny Shakespeare (context 64, width 128, four layers), on the GPU,
+and shows the loss, the speed and fresh samples as it goes; without WebGPU it trains on the CPU and says so. Its check
+trains the names model twenty Adam steps on WebGPU and on the CPU from one seed: the losses agree to about seven
+significant figures (2.781002 and 2.7810018 after the twentieth), so the whole model, forwards and backwards, computes
+the same on both.
+
+**Speed, honestly.** The CPU backend does about 0.28 s a step at this size; the profile is matrix products at roughly
+1.2 GFLOP/s, which is scalar wasm over GC arrays. WebGPU speed could not be measured here: the only GPU in this
+environment is SwiftShader, a software rasteriser, which managed ten steps a minute. A real GPU is the point of the
+page, and is where a number for it should come from.
+
 ## The backends
 
 Everything above is written once (`src/tensor.wac`) against sixteen kernels (`src/backend.wac`): elementwise unary
@@ -113,7 +143,7 @@ The host side is on wac-web's `gpu` branch (`tools/build.wac`, `wac.gpu` in `pro
 ## Checking it
 
 ```sh
-wac task test             # 32 tests, about a second: every op, every gradient, every optimizer's first step, halves
+wac task test             # 35 tests, about a second: every op, every gradient, every optimizer's first step, halves
 wac task gpucheck:build   # the GPU check as a page
 wac task gpucheck         # ...run in headless Chromium: PASS 128
 wac task shaders          # every WGSL program, in both types, compiled in Chromium: 100 of them
@@ -135,9 +165,10 @@ wac task shaders          # every WGSL program, in both types, compiled in Chrom
 
 ## Not here yet
 
-- Recurrent layers and attention, as layers. Both are expressible today — `matmul`, `softmax` and `concat` are all
-  there and differentiable — but there is no `Lstm` or `MultiHeadAttention`.
-- Saving and loading weights. `Variable`s are plain tensors; a format is the missing piece.
+- Recurrent layers. An LSTM is expressible today — `matmul`, `sigmoid`, `tanh` and `concat` are all there and
+  differentiable — but there is no `Lstm` layer.
+- Saving and loading weights. `Variable`s are plain tensors; a format is the missing piece — a trained GPT is gone
+  when its page closes.
 - Speed on the CPU. It is a reference. On the GPU the matrix product is tiled and the rest is one pass per kernel,
   with no fusion of elementwise chains.
 - GPU scatter-add is a gather over every index per output element — WGSL has no float atomics — so an embedding's

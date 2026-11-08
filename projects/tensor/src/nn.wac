@@ -9,6 +9,7 @@
 // is put into, so dropout and batch normalisation cannot be left in the wrong one by an earlier call.
 
 import { Vec } from "core";
+import { DType } from "./backend.wac";
 import { Device, Padding, Tensor, Variable } from "./tensor.wac";
 
 export enum Activation {
@@ -203,6 +204,92 @@ export struct BatchNorm : Layer {
 
   override Variable[] params(this) { return [this.gamma, this.beta]; }
   override Variable[] state(this) { return [this.gamma, this.beta, this.movingMean, this.movingVariance]; }
+}
+
+/**
+ * Self-attention over `[batch, time, width]`, split into `heads` heads of `width / heads` each — the layer a transformer
+ * is made of. Queries, keys and values come from one `[width, 3·width]` projection, and the heads are joined and
+ * projected back by another. When `causal`, a position attends only to itself and those before it, which is what lets
+ * a language model be trained on every position of a sequence at once without seeing what it is predicting.
+ */
+export struct MultiHeadAttention : Layer {
+  Variable qkv;
+  Variable qkvBias;
+  Variable out;
+  Variable outBias;
+  i32 heads;
+  bool causal;
+
+  MultiHeadAttention create(Device d, i32 width, i32 heads, bool causal) {
+    if (width % heads != 0) { trap; }
+    return MultiHeadAttention(weight(d, glorotUniform(d, [width, 3 * width], width, 3 * width), "qkv"),
+                              weight(d, d.zeros([3 * width]), "qkv_bias"),
+                              weight(d, glorotUniform(d, [width, width], width, width), "out"),
+                              weight(d, d.zeros([width]), "out_bias"), heads, causal);
+  }
+
+  override Tensor apply(this, Tensor x, bool training) {
+    i32 b = x.shape[0];
+    i32 t = x.shape[1];
+    i32 w = x.shape[2];
+    i32 hd = w / this.heads;
+    Tensor[] parts = x.matmul(this.qkv).add(this.qkvBias).split([w, w, w], 2);
+    // [b, t, w] → [b, heads, t, hd]: each head a batch of its own for the matrix products.
+    Tensor q = parts[0].reshape([b, t, this.heads, hd]).transpose([0, 2, 1, 3]);
+    Tensor k = parts[1].reshape([b, t, this.heads, hd]).transpose([0, 2, 1, 3]);
+    Tensor v = parts[2].reshape([b, t, this.heads, hd]).transpose([0, 2, 1, 3]);
+    Tensor scores = q.matmulT(k, false, true).mul(1.0 / (hd as f64).sqrt());
+    if (this.causal) {
+      // A score for a later position is replaced by one so negative its weight is exactly 0 after the softmax — and
+      // still finite in half precision, where -1e9 would be -inf and an all-masked row NaN.
+      scores = causalMask(x.device, t, x.dtype()).where(scores, 0.0 - 30000.0);
+    }
+    Tensor mixed = scores.softmax(-1).matmul(v);
+    return mixed.transpose([0, 2, 1, 3]).reshape([b, t, w]).matmul(this.out).add(this.outBias);
+  }
+
+  override Variable[] params(this) { return [this.qkv, this.qkvBias, this.out, this.outBias]; }
+}
+
+/** `[t, t]`, 1 on and below the diagonal: which positions each position may attend to. */
+export Tensor causalMask(Device d, i32 t, DType dtype) {
+  f32[] m = f32[].filled(t * t, 0.0);
+  for (i32 i = 0; i < t; i++) {
+    for (i32 j = 0; j <= i; j++) { m[i * t + j] = 1.0; }
+  }
+  return d.tensorOf(m, [t, t], dtype);
+}
+
+/**
+ * One pre-norm transformer block, as GPT-2 has it: attention and a feed-forward network four times as wide, each
+ * applied to a layer-normalised copy of the input and added back to it.
+ */
+export struct TransformerBlock : Layer {
+  LayerNorm norm1;
+  MultiHeadAttention attention;
+  LayerNorm norm2;
+  Dense up;
+  Dense down;
+  Dropout dropout;
+
+  TransformerBlock create(Device d, i32 width, i32 heads, f64 dropout) {
+    return TransformerBlock(LayerNorm.create(d, width), MultiHeadAttention.create(d, width, heads, true),
+                            LayerNorm.create(d, width), Dense.create(d, width, 4 * width, Activation.Gelu),
+                            Dense.create(d, 4 * width, width, Activation.Linear), Dropout.create(dropout));
+  }
+
+  override Tensor apply(this, Tensor x, bool training) {
+    Tensor h = x.add(this.dropout.apply(this.attention.apply(this.norm1.apply(x, training), training), training));
+    Tensor ff = this.down.apply(this.up.apply(this.norm2.apply(h, training), training), training);
+    return h.add(this.dropout.apply(ff, training));
+  }
+
+  override Variable[] params(this) {
+    Vec<Variable> all = Vec.create();
+    Layer[] parts = [this.norm1, this.attention, this.norm2, this.up, this.down];
+    for (Layer l in parts) { for (Variable v in l.params()) { all.push(v); } }
+    return all.toArray();
+  }
 }
 
 /** Layers applied in order. */

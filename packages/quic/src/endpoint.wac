@@ -1,0 +1,1880 @@
+// A QUIC version 1 connection, either end, without a socket: RFC 9000, RFC 9001 and RFC 9002, as far as an endpoint
+// with one path needs them.
+//
+// **Datagrams in, datagrams out, events up.** `receive` takes a UDP payload; `take` answers the payloads to send;
+// `tick` is the clock — loss detection, the probe timeout, the delayed ACK, the idle timeout; `events` says what
+// happened. What a caller supplies is a socket and a clock, as for `packages/webrtc`'s `Session`.
+//
+// ## What is here
+//
+// - **The handshake**, through `tlsq.wac` — TLS 1.3 at three encryption levels, the keys QUIC derives from TLS's
+//   secrets, Initial keys discarded when RFC 9001 §4.9 says, the server's HANDSHAKE_DONE.
+// - **Packet protection** for every space, with real packet-number decoding (RFC 9000 §A.3) and the 1-RTT key
+//   update a peer may start (RFC 9001 §6) answered.
+// - **Acknowledgements** with every range, delayed in the application space to two packets or `max_ack_delay`.
+// - **Loss recovery** (RFC 9002 §6): packet and time thresholds, RTT estimation, the probe timeout; lost frames are
+//   resent, not packets. **Congestion control**: NewReno (§7), with the anti-amplification limit a server owes an
+//   unvalidated client (RFC 9000 §8.1).
+// - **Bidirectional streams** with stream and connection flow control both ways, FIN, RESET_STREAM and
+//   STOP_SENDING, and the stream count — peer streams are retired and credited back with MAX_STREAMS only once both
+//   halves are finished and every byte has been read, so unread data and open streams stay bounded.
+// - **DATAGRAM frames** (RFC 9221), both ways.
+// - **Close**: CONNECTION_CLOSE either kind, the closing and draining periods, and the idle timeout.
+//
+// ## What is not
+//
+// Unidirectional streams (none are allowed: `initial_max_streams_uni` is zero), 0-RTT, Retry, version negotiation,
+// connection migration and the extra connection ids that serve it (the peer's NEW_CONNECTION_ID is accepted and
+// not used; `disable_active_migration` is sent), path MTU discovery (every datagram fits 1200 bytes), ECN.
+
+import { Vec, Map, Buf, hashI64, i64Eq } from "core";
+import { InitialKeys, initialKeys, headerMask, nonce, unprotect, retryIntegrityOk, retryToken } from "./initial.wac";
+import { packetKeys } from "./keys.wac";
+import { LongHeader, parseLong, decodePacketNumber, TYPE_INITIAL, TYPE_HANDSHAKE, TYPE_RETRY } from "./packet.wac";
+import { Varint, decode, encode, encodedLength } from "./varint.wac";
+import { QuicTls, TlsOut, LEVEL_INITIAL, LEVEL_HANDSHAKE, LEVEL_APPLICATION } from "./tlsq.wac";
+import { RangeSet, Range } from "./ranges.wac";
+import { expandLabel } from "../../tls/src/keyschedule.wac";
+import { gcmEncrypt, gcmTag } from "../../crypto/src/aesgcm.wac";
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────── constants ───
+
+export static i32 MAX_DATAGRAM_SIZE = 1200;
+static i32 CID_LEN = 8;
+static i64 INITIAL_RTT = 333;
+static i64 GRANULARITY = 1;
+static i64 MAX_ACK_DELAY = 25;
+static i64 INITIAL_WINDOW = 12000;
+static i64 MINIMUM_WINDOW = 2400;
+
+/** Transport error codes, RFC 9000 §20.1. */
+export static i64 NO_ERROR = 0;
+export static i64 INTERNAL_ERROR = 1;
+export static i64 FLOW_CONTROL_ERROR = 3;
+export static i64 STREAM_LIMIT_ERROR = 4;
+export static i64 STREAM_STATE_ERROR = 5;
+export static i64 FINAL_SIZE_ERROR = 6;
+export static i64 FRAME_ENCODING_ERROR = 7;
+export static i64 TRANSPORT_PARAMETER_ERROR = 8;
+export static i64 PROTOCOL_VIOLATION = 10;
+export static i64 APPLICATION_ERROR = 12;
+export static i64 CRYPTO_ERROR = 256;
+
+/** How a connection is configured: our limits and the application protocol. */
+export struct QuicConfig {
+  i64 maxData = 4194304 as i64;
+  i64 maxStreamData = 1048576 as i64;
+  i64 maxStreamsBidi = 100 as i64;
+  i64 idleTimeoutMs = 30000 as i64;
+  i64 maxDatagramFrame = 65535 as i64;
+  u8[] alpn = "h3".toBytes();
+}
+
+/** What happened, for the layer above. */
+export enum QuicEvent {
+  /** The handshake is complete: streams may be opened and datagrams sent. */
+  Connected,
+  /** The peer opened stream `id`. */
+  StreamOpened(i64 id),
+  /** Stream `id` has bytes to read, or its end (FIN or reset) has been reached. */
+  Readable(i64 id),
+  /** Stream `id`'s send queue drained, or its window opened. */
+  Writable(i64 id),
+  /** The peer reset its half of stream `id` with `code`. */
+  StreamReset(i64 id, i64 code),
+  /** The peer asked us to stop sending on stream `id`, with `code`. */
+  StopSending(i64 id, i64 code),
+  /** The peer raised the number of streams this end may open. */
+  StreamsAvailable,
+  /** A DATAGRAM frame's payload. */
+  Datagram(u8[] data),
+  /**
+   * The connection is over. `app` says whether `code` is an application's (CONNECTION_CLOSE 0x1d) or QUIC's;
+   * `remote` whether the peer closed it. An idle timeout is `app` false, `code` 0, reason "idle timeout".
+   */
+  Closed(bool app, i64 code, string reason, bool remote),
+}
+
+/** One frame of a sent packet, as what to do if the packet is lost. */
+enum Item {
+  Crypto(i64 off, i32 len),
+  Stream(i64 id, i64 off, i32 len, bool fin),
+  Reset(i64 id),
+  Stop(i64 id),
+  MaxData,
+  MaxStreamData(i64 id),
+  MaxStreams,
+  Done,
+}
+
+struct Sent {
+  i64 pn;
+  i64 time;
+  i32 size;
+  bool eliciting;
+  Item[] items;
+}
+
+/** One packet-number space and the CRYPTO stream that goes with its level. */
+struct Space {
+  i32 level;
+  InitialKeys? tx = null;
+  InitialKeys? rx = null;
+  bool discarded = false;
+  i64 nextPn = 0 as i64;
+  RangeSet received = RangeSet.create();
+  i64 largestRecvTime = 0 as i64;
+  /** Whether a packet arrived since we last sent an ACK, and whether one of them asked for it. */
+  bool ackAny = false;
+  i32 eliciting = 0;
+  i64 firstElicitingAt = 0 as i64;
+  Vec<Sent> sent = Vec<Sent>.create();
+  i64 largestAcked = -1 as i64;
+  i64 lossTime = 0 as i64;
+  i64 lastElicitingSent = 0 as i64;
+  // The CRYPTO stream: what TLS gave us to send at this level, how far it has gone, what to send again.
+  Buf cryptoOut = Buf.create();
+  i64 cryptoNext = 0 as i64;
+  RangeSet cryptoRetx = RangeSet.create();
+  // What has arrived, reassembled by offset.
+  Map<i64, u8[]> cryptoEarly = Map<i64, u8[]>.create(hashI64, i64Eq);
+  i64 cryptoIn = 0 as i64;
+}
+
+/** One bidirectional stream, both halves. */
+struct QStream {
+  i64 id;
+  // ── sending ──
+  /** Written and not yet acknowledged past `base`: chunks in order, the first starting at `base`. */
+  Vec<u8[]> chunks = Vec<u8[]>.create();
+  i64 base = 0 as i64;
+  i64 sendEnd = 0 as i64;
+  i64 sendNext = 0 as i64;
+  RangeSet acked = RangeSet.create();
+  RangeSet retx = RangeSet.create();
+  i64 peerMax = 0 as i64;
+  bool finWanted = false;
+  bool finSent = false;
+  bool finAcked = false;
+  bool resetWanted = false;
+  i64 resetCode = 0 as i64;
+  bool resetSent = false;
+  bool resetAcked = false;
+  bool peerStopped = false;
+  // ── receiving ──
+  Map<i64, u8[]> early = Map<i64, u8[]>.create(hashI64, i64Eq);
+  i64 recvContig = 0 as i64;
+  Vec<u8[]> ready = Vec<u8[]>.create();
+  i64 readyBytes = 0 as i64;
+  i64 consumed = 0 as i64;
+  i64 recvMax = 0 as i64;
+  i64 recvHighest = 0 as i64;
+  i64 finalSize = -1 as i64;
+  bool peerReset = false;
+  i64 peerResetCode = 0 as i64;
+  bool finRead = false;
+  bool stopWanted = false;
+  i64 stopCode = 0 as i64;
+  bool stopSent = false;
+  bool msdDue = false;
+  bool retired = false;
+}
+
+/** A frame being built, and the record of what it carries. */
+struct Packet {
+  Buf frames = Buf.create();
+  Vec<Item> items = Vec<Item>.create();
+  bool eliciting = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────── the connection ───
+
+export struct QuicConn {
+  bool isServer;
+  QuicConfig cfg;
+  QuicTls tls;
+  u8[] scid;
+  u8[] dcid;
+  /** The client's first destination id: the Initial keys, and what a server echoes in its parameters. */
+  u8[] originalDcid;
+  bool dcidFromServer = false;
+  /** A client told to start again by a Retry: the token it must carry, and the id the Retry came from. */
+  bool retried = false;
+  u8[] token = u8[]();
+  u8[] retryScid = u8[]();
+  Space[] spaces;
+
+  // 1-RTT keys, and the key phase (RFC 9001 §6).
+  u8[] txSecret = u8[]();
+  u8[] rxSecret = u8[]();
+  i32 keyPhase = 0;
+  InitialKeys? nextRx = null;
+  u8[] nextRxSecret = u8[]();
+
+  bool connected = false;
+  bool confirmed = false;
+  bool doneWanted = false;
+  /** Whether the peer's address is validated: until then a server sends at most three times what it received. */
+  bool validated = false;
+  i64 bytesIn = 0 as i64;
+  i64 bytesOut = 0 as i64;
+
+  // The peer's transport parameters.
+  bool peerParamsRead = false;
+  i64 peerMaxData = 0 as i64;
+  i64 peerStreamBidiLocal = 0 as i64;
+  i64 peerStreamBidiRemote = 0 as i64;
+  i64 peerMaxStreams = 0 as i64;
+  i64 peerIdle = 0 as i64;
+  i64 peerMaxAckDelay = MAX_ACK_DELAY;
+  i32 peerAckExponent = 3;
+  i64 peerMaxDatagram = 0 as i64;
+
+  // Flow control, connection-wide.
+  i64 sentData = 0 as i64;
+  i64 recvData = 0 as i64;
+  i64 recvMaxData = 0 as i64;
+  i64 consumedData = 0 as i64;
+  bool maxDataDue = false;
+  bool dataBlocked = false;
+
+  // Streams.
+  Map<i64, QStream> streams = Map<i64, QStream>.create(hashI64, i64Eq);
+  i64 nextLocal = 0 as i64;
+  i64 peerOpened = 0 as i64;
+  i64 peerRetired = 0 as i64;
+  i64 localMaxStreams = 0 as i64;
+  bool maxStreamsDue = false;
+  /** The stream the round-robin sends from next. */
+  i32 rr = 0;
+
+  /**
+   * How streams that were retired ended for their reader — -1 for a FIN, else the reset code — so an application
+   * that reads the last bytes and the end in one call still learns which it was. The most recent 1024.
+   */
+  Map<i64, i64> gone = Map<i64, i64>.create(hashI64, i64Eq);
+  Vec<i64> goneOrder = Vec<i64>.create();
+
+  Vec<u8[]> datagramsOut = Vec<u8[]>.create();
+  Vec<u8[]> pathResponses = Vec<u8[]>.create();
+
+  // Recovery.
+  i64 latestRtt = 0 as i64;
+  i64 smoothedRtt = INITIAL_RTT;
+  i64 rttVar = INITIAL_RTT / (2 as i64);
+  i64 minRtt = 0 as i64;
+  bool rttSampled = false;
+  i32 ptoCount = 0;
+  i32 probes = 0;
+  i32 probeSpace = 0;
+  i64 cwnd = INITIAL_WINDOW;
+  i64 ssthresh = 9223372036854775807;
+  i64 inFlight = 0 as i64;
+  i64 recoveryStart = 0 as i64;
+
+  // Close.
+  /** 0 open, 1 closing (we sent CONNECTION_CLOSE), 2 draining (the peer did), 3 closed. */
+  i32 closeState = 0;
+  bool closeApp = false;
+  i64 closeCode = 0 as i64;
+  string closeReason = "";
+  i64 closeUntil = 0 as i64;
+  i64 lastCloseSent = 0 as i64;
+  bool closeSendWanted = false;
+  i64 lastActivity = 0 as i64;
+
+  Vec<u8[]> out = Vec<u8[]>.create();
+  Vec<QuicEvent> happened = Vec<QuicEvent>.create();
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────── making one ───
+
+  /**
+   * A client. `seed` is 16 random bytes for the two connection ids; `tls` was made with
+   * `QuicTls.client(...)` and our parameters (`clientParams`). Its first flight is queued at once.
+   */
+  QuicConn client(QuicConfig cfg, QuicTls tls, u8[] scid, u8[] dcid, i64 now) {
+    QuicConn c = QuicConn { isServer: false, cfg: cfg, tls: tls, scid: scid, dcid: dcid, originalDcid: dcid,
+                            spaces: [Space { level: 0 }, Space { level: 1 }, Space { level: 2 }] };
+    c.init(now);
+    c.spaces[0].tx = initialKeys(dcid, false);
+    c.spaces[0].rx = initialKeys(dcid, true);
+    tls.start();
+    c.fromTls();
+    return c;
+  }
+
+  /**
+   * A server, for a client whose first Initial was addressed to `originalDcid` from `clientScid`. The datagram
+   * itself is then given to `receive`.
+   */
+  QuicConn server(QuicConfig cfg, QuicTls tls, u8[] scid, u8[] originalDcid, u8[] clientScid, i64 now) {
+    QuicConn c = QuicConn { isServer: true, cfg: cfg, tls: tls, scid: scid, dcid: clientScid,
+                            originalDcid: originalDcid, dcidFromServer: true,
+                            spaces: [Space { level: 0 }, Space { level: 1 }, Space { level: 2 }] };
+    c.init(now);
+    c.spaces[0].tx = initialKeys(originalDcid, true);
+    c.spaces[0].rx = initialKeys(originalDcid, false);
+    return c;
+  }
+
+  void init(this, i64 now) {
+    this.recvMaxData = this.cfg.maxData;
+    this.localMaxStreams = this.cfg.maxStreamsBidi;
+    this.nextLocal = this.isServer ? 1 as i64 : 0 as i64;
+    this.lastActivity = now;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────────────────────── the wire ───
+
+  /** One UDP payload from the peer. */
+  void receive(this, u8[] d, i64 now) {
+    if (this.closeState == 3) { return; }
+    if (this.closeState == 1) {
+      // Closing: whatever arrives is answered with the close again, at most once per smoothed RTT.
+      if (now - this.lastCloseSent >= this.smoothedRtt) { this.closeSendWanted = true; }
+      return;
+    }
+    if (this.closeState == 2) { return; }
+    this.bytesIn += d.len() as i64;
+    i32 at = 0;
+    while (at < d.len() && this.closeState == 0) {
+      if ((d[at] as i32 & 0x80) != 0) {
+        LongHeader h = parseLong(d, at, true);
+        if (!h.ok || h.version != 1) { return; }
+        if (h.packetType == TYPE_RETRY()) {
+          this.onRetry(d, at, h);
+          return;
+        }
+        i32 end = h.numberAt + (h.length as~ i32);
+        if (h.packetType == TYPE_INITIAL() || h.packetType == TYPE_HANDSHAKE()) {
+          i32 si = h.packetType == TYPE_INITIAL() ? 0 : 1;
+          if (!this.matchesUs(h.dcid)) { at = end; continue; }
+          this.openLong(d, at, h, si, now);
+        }
+        at = end;
+      } else {
+        this.openShort(d, at, now);
+        return;
+      }
+    }
+  }
+
+  /**
+   * A Retry (RFC 9000 §17.2.5): the server wants proof of our address before it spends anything on us. Taken once,
+   * only before any Initial from the server, and only with an integrity tag over the id we first sent to — so a
+   * stranger cannot restart someone else's handshake. Then: the Retry's id is the destination, the Initial keys are
+   * derived from it, the token goes in every Initial after, and the ClientHello goes again from its first byte.
+   */
+  void onRetry(this, u8[] d, i32 at, LongHeader h) {
+    if (this.isServer || this.retried || this.dcidFromServer || !same(h.dcid, this.scid)) { return; }
+    u8[] packet = u8[].filled(d.len() - at, 0);
+    packet.copyFrom(d, at, 0, packet.len());
+    if (!retryIntegrityOk(packet, this.originalDcid)) { return; }
+    u8[] tok = retryToken(packet);
+    if (tok.len() == 0) { return; }
+    this.retried = true;
+    this.token = tok;
+    this.retryScid = h.scid;
+    this.dcid = h.scid;
+    Space s = this.spaces[0];
+    s.tx = initialKeys(this.dcid, false);
+    s.rx = initialKeys(this.dcid, true);
+    for (i32 i = 0; i < s.sent.len(); i++) { this.inFlight -= s.sent.get(i).size as i64; }
+    if (this.inFlight < 0 as i64) { this.inFlight = 0 as i64; }
+    s.sent = Vec<Sent>.create();
+    s.cryptoRetx.add(0 as i64, s.cryptoNext);
+    s.lossTime = 0 as i64;
+    this.ptoCount = 0;
+  }
+
+  bool matchesUs(const this, u8[] dcid) {
+    if (same(dcid, this.scid)) { return true; }
+    // A client's first flights are addressed to the id it invented; a server answers them until it is told its own.
+    return this.isServer && same(dcid, this.originalDcid);
+  }
+
+  void openLong(this, u8[] d, i32 at, LongHeader h, i32 si, i64 now) {
+    Space s = this.spaces[si];
+    if (s.rx is null || s.discarded) { return; }
+    InitialKeys k = s.rx!;
+    i32 end = h.numberAt + (h.length as~ i32);
+    if (h.numberAt + 4 + 16 > end) { return; }
+    u8[] mask = headerMask(k.hp, d, h.numberAt + 4);
+    if (mask.len() == 0) { return; }
+    i32 first = (d[at] as i32) ^ (mask[0] as i32 & 0x0F);
+    i32 pnLen = (first & 3) + 1;
+    u8[] header = u8[].filled(h.numberAt + pnLen - at, 0);
+    header.copyFrom(d, at, 0, header.len());
+    header[0] = first as@ u8;
+    i64 truncated = 0 as i64;
+    for (i32 i = 0; i < pnLen; i++) {
+      i32 b = (d[h.numberAt + i] as i32) ^ (mask[1 + i] as i32);
+      header[h.numberAt - at + i] = b as@ u8;
+      truncated = (truncated << (8 as i64)) | (b as i64);
+    }
+    i64 pn = decodePacketNumber(s.received.max(), truncated, pnLen * 8);
+    u8[] ct = u8[].filled(end - (h.numberAt + pnLen), 0);
+    ct.copyFrom(d, h.numberAt + pnLen, 0, ct.len());
+    u8[] payload = unprotect(k, header, ct, pn);
+    if (payload.len() == 0) { return; }
+    // RFC 9000 §17.2: the reserved bits must be zero once protection is off.
+    if ((first & 0x0C) != 0) { this.closeTransport(PROTOCOL_VIOLATION, "reserved bits set"); return; }
+    if (s.received.contains(pn)) { return; }
+    // The client learns the server's id from the server's first Initial, and keeps it.
+    if (!this.isServer && !this.dcidFromServer && si == 0) {
+      this.dcid = h.scid;
+      this.dcidFromServer = true;
+    }
+    // RFC 9001 §4.9.1: a server stops using Initial keys once it receives a Handshake packet — which also proves
+    // the client holds the address it sends from.
+    if (this.isServer && si == 1) {
+      this.validated = true;
+      this.discard(0);
+    }
+    this.packet(si, pn, payload, now);
+  }
+
+  void openShort(this, u8[] d, i32 at, i64 now) {
+    Space s = this.spaces[2];
+    if (s.rx is null) { return; }
+    i32 numberAt = at + 1 + CID_LEN;
+    if (numberAt + 4 + 16 > d.len()) { return; }
+    u8[] dcid = u8[].filled(CID_LEN, 0);
+    dcid.copyFrom(d, at + 1, 0, CID_LEN);
+    if (!same(dcid, this.scid)) { return; }
+    InitialKeys k = s.rx!;
+    u8[] mask = headerMask(k.hp, d, numberAt + 4);
+    if (mask.len() == 0) { return; }
+    i32 first = (d[at] as i32) ^ (mask[0] as i32 & 0x1F);
+    i32 pnLen = (first & 3) + 1;
+    u8[] header = u8[].filled(numberAt + pnLen - at, 0);
+    header.copyFrom(d, at, 0, header.len());
+    header[0] = first as@ u8;
+    i64 truncated = 0 as i64;
+    for (i32 i = 0; i < pnLen; i++) {
+      i32 b = (d[numberAt + i] as i32) ^ (mask[1 + i] as i32);
+      header[numberAt - at + i] = b as@ u8;
+      truncated = (truncated << (8 as i64)) | (b as i64);
+    }
+    i64 pn = decodePacketNumber(s.received.max(), truncated, pnLen * 8);
+    u8[] ct = u8[].filled(d.len() - (numberAt + pnLen), 0);
+    ct.copyFrom(d, numberAt + pnLen, 0, ct.len());
+    i32 phase = (first >> 2) & 1;
+    u8[] payload = u8[]();
+    if (phase == this.keyPhase) {
+      payload = unprotect(k, header, ct, pn);
+    } else {
+      // **The peer updated its keys** (RFC 9001 §6.3): the next generation opens it, and then both directions move.
+      if (this.nextRx is null) {
+        this.nextRxSecret = expandLabel(this.rxSecret, "quic ku".toBytes(), u8[](), 32);
+        this.nextRx = withHp(packetKeys(this.nextRxSecret), k.hp);
+      }
+      payload = unprotect(this.nextRx!, header, ct, pn);
+      if (payload.len() > 0) {
+        this.rxSecret = this.nextRxSecret;
+        s.rx = this.nextRx;
+        this.nextRx = null;
+        this.txSecret = expandLabel(this.txSecret, "quic ku".toBytes(), u8[](), 32);
+        s.tx = withHp(packetKeys(this.txSecret), s.tx!.hp);
+        this.keyPhase = phase;
+      }
+    }
+    if (payload.len() == 0) { return; }
+    if ((first & 0x18) != 0) { this.closeTransport(PROTOCOL_VIOLATION, "reserved bits set"); return; }
+    if (s.received.contains(pn)) { return; }
+    this.packet(2, pn, payload, now);
+  }
+
+  /** An authenticated packet's frames. */
+  void packet(this, i32 si, i64 pn, u8[] p, i64 now) {
+    Space s = this.spaces[si];
+    this.lastActivity = now;
+    bool eliciting = false;
+    i32 at = 0;
+    while (at < p.len() && this.closeState == 0) {
+      Varint t = decode(p, at);
+      if (t.size == 0) { this.closeTransport(FRAME_ENCODING_ERROR, "a frame type cut short"); return; }
+      i64 kind = t.value;
+      if (kind != 0 as i64 && kind != 2 as i64 && kind != 3 as i64 && kind != 0x1c as i64 && kind != 0x1d as i64) {
+        eliciting = true;
+      }
+      if (si < 2 && !(kind == 0 as i64 || kind == 1 as i64 || kind == 2 as i64 || kind == 3 as i64 ||
+                      kind == 6 as i64 || kind == 0x1c as i64)) {
+        this.closeTransport(PROTOCOL_VIOLATION, "frame \{kind} in a handshake packet");
+        return;
+      }
+      i32 next = this.frame(si, kind, p, at + t.size, now);
+      if (next < 0) {
+        if (this.closeState == 0) { this.closeTransport(FRAME_ENCODING_ERROR, "frame \{kind} does not parse"); }
+        return;
+      }
+      at = next;
+    }
+    if (this.closeState != 0 && this.closeState != 2) { return; }
+    s.received.add(pn, pn + (1 as i64));
+    s.received.keepLargest(64);
+    if (pn == s.received.max()) { s.largestRecvTime = now; }
+    s.ackAny = true;
+    if (eliciting) {
+      if (s.eliciting == 0) { s.firstElicitingAt = now; }
+      s.eliciting += 1;
+    }
+  }
+
+  /** One frame at `at` (just past its type); answers where the next begins, or -1 when it does not parse. */
+  i32 frame(this, i32 si, i64 kind, u8[] p, i32 at, i64 now) {
+    Rd r = Rd(p, at, false);
+    i32 k = kind as~ i32;
+    if (k == 0x00) {
+      while (r.at < p.len() && p[r.at] == 0) { r.at += 1; }
+      return r.at;
+    }
+    if (k == 0x01) { return at; }
+    if (k == 0x02 || k == 0x03) { return this.ackFrame(si, r, k == 0x03, now); }
+    if (k == 0x06) {
+      i64 off = r.v();
+      i64 len = r.v();
+      u8[] data = r.take(len);
+      if (r.bad) { return -1; }
+      this.crypto(si, off, data);
+      return r.at;
+    }
+    if (k == 0x1c || k == 0x1d) {
+      i64 code = r.v();
+      if (k == 0x1c) { r.v(); }
+      u8[] reason = r.take(r.v());
+      if (r.bad) { return -1; }
+      this.peerClosed(k == 0x1d, code, string.fromBytes(reason), now);
+      return r.at;
+    }
+    if (k >= 0x08 && k <= 0x0f) {
+      i64 id = r.v();
+      i64 off = (k & 0x04) != 0 ? r.v() : 0 as i64;
+      u8[] data = u8[]();
+      if ((k & 0x02) != 0) { data = r.take(r.v()); } else { data = r.take((p.len() - r.at) as i64); }
+      if (r.bad) { return -1; }
+      this.streamFrame(id, off, data, (k & 0x01) != 0);
+      return r.at;
+    }
+    if (k == 0x04) {
+      i64 id = r.v();
+      i64 code = r.v();
+      i64 size = r.v();
+      if (r.bad) { return -1; }
+      this.resetFrame(id, code, size);
+      return r.at;
+    }
+    if (k == 0x05) {
+      i64 id = r.v();
+      i64 code = r.v();
+      if (r.bad) { return -1; }
+      this.stopFrame(id, code);
+      return r.at;
+    }
+    if (k == 0x07) {
+      r.take(r.v());
+      if (r.bad) { return -1; }
+      if (this.isServer) { this.closeTransport(PROTOCOL_VIOLATION, "NEW_TOKEN from a client"); }
+      return r.at;
+    }
+    if (k == 0x10) {
+      i64 m = r.v();
+      if (r.bad) { return -1; }
+      if (m > this.peerMaxData) { this.peerMaxData = m; this.wakeWriters(); }
+      return r.at;
+    }
+    if (k == 0x11) {
+      i64 id = r.v();
+      i64 m = r.v();
+      if (r.bad) { return -1; }
+      QStream? st = this.streamFor(id, false);
+      if (st is not null && m > st!.peerMax) {
+        st!.peerMax = m;
+        this.happened.push(QuicEvent.Writable(id));
+      }
+      return r.at;
+    }
+    if (k == 0x12 || k == 0x13) {
+      i64 m = r.v();
+      if (r.bad) { return -1; }
+      if (k == 0x12 && m > this.peerMaxStreams) {
+        this.peerMaxStreams = m;
+        this.happened.push(QuicEvent.StreamsAvailable);
+      }
+      return r.at;
+    }
+    if (k == 0x14) { r.v(); return r.bad ? -1 : r.at; }
+    if (k == 0x15) { r.v(); r.v(); return r.bad ? -1 : r.at; }
+    if (k == 0x16 || k == 0x17) { r.v(); return r.bad ? -1 : r.at; }
+    if (k == 0x18) {
+      r.v();
+      r.v();
+      i32 n = r.u8();
+      r.take(n as i64);
+      r.take(16 as i64);
+      if (r.bad || n < 1 || n > 20) { return -1; }
+      return r.at;
+    }
+    if (k == 0x19) { r.v(); return r.bad ? -1 : r.at; }
+    if (k == 0x1a) {
+      u8[] data = r.take(8 as i64);
+      if (r.bad) { return -1; }
+      this.pathResponses.push(data);
+      return r.at;
+    }
+    if (k == 0x1b) { r.take(8 as i64); return r.bad ? -1 : r.at; }
+    if (k == 0x1e) {
+      if (this.isServer) { this.closeTransport(PROTOCOL_VIOLATION, "HANDSHAKE_DONE from a client"); return r.at; }
+      this.confirm();
+      return r.at;
+    }
+    if (k == 0x30 || k == 0x31) {
+      u8[] data = k == 0x31 ? r.take(r.v()) : r.take((p.len() - r.at) as i64);
+      if (r.bad) { return -1; }
+      if (this.cfg.maxDatagramFrame == 0 as i64) { this.closeTransport(PROTOCOL_VIOLATION, "DATAGRAM not negotiated"); return r.at; }
+      this.happened.push(QuicEvent.Datagram(data));
+      return r.at;
+    }
+    this.closeTransport(FRAME_ENCODING_ERROR, "unknown frame type \{kind}");
+    return -1;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────── crypto and TLS ───
+
+  void crypto(this, i32 si, i64 off, u8[] data) {
+    Space s = this.spaces[si];
+    i64 end = off + (data.len() as i64);
+    if (end <= s.cryptoIn) { return; }
+    if (end - s.cryptoIn > 65536 as i64) { this.closeTransport(0x0d as i64, "CRYPTO data too far ahead"); return; }
+    s.cryptoEarly.set(off, data);
+    // Deliver the contiguous prefix, whatever order it arrived in.
+    bool moved = true;
+    while (moved) {
+      moved = false;
+      i64[] keys = s.cryptoEarly.keys();
+      for (i64 o in keys) {
+        u8[] piece = s.cryptoEarly.get(o)!;
+        i64 pend = o + (piece.len() as i64);
+        if (o <= s.cryptoIn) {
+          s.cryptoEarly.remove(o);
+          if (pend > s.cryptoIn) {
+            i32 skip = (s.cryptoIn - o) as~ i32;
+            u8[] fresh = u8[].filled(piece.len() - skip, 0);
+            fresh.copyFrom(piece, skip, 0, fresh.len());
+            s.cryptoIn = pend;
+            this.tls.receive(si, fresh);
+          }
+          moved = true;
+        }
+      }
+    }
+    this.fromTls();
+  }
+
+  /** Whatever TLS produced: bytes to send at each level, and keys as they become known. */
+  void fromTls(this) {
+    TlsOut[] o = this.tls.take();
+    for (TlsOut x in o) { this.spaces[x.level].cryptoOut.pushAll(x.data); }
+    if (this.tls.failed()) {
+      this.closeTransport(CRYPTO_ERROR + (this.tls.alert as i64), this.tls.why);
+      return;
+    }
+    Space hs = this.spaces[1];
+    if (this.tls.handshakeKeys() && hs.tx is null && !hs.discarded) {
+      hs.tx = packetKeys(this.isServer ? this.tls.serverHs : this.tls.clientHs);
+      hs.rx = packetKeys(this.isServer ? this.tls.clientHs : this.tls.serverHs);
+    }
+    Space app = this.spaces[2];
+    if (this.tls.applicationKeys() && app.tx is null) {
+      this.txSecret = this.isServer ? this.tls.serverApp : this.tls.clientApp;
+      this.rxSecret = this.isServer ? this.tls.clientApp : this.tls.serverApp;
+      app.tx = packetKeys(this.txSecret);
+      // A server may send 1-RTT before the client's Finished, and must not read any until it has it.
+      if (!this.isServer) { app.rx = packetKeys(this.rxSecret); }
+    }
+    if (this.tls.peerParams.len() > 0 && !this.peerParamsRead) {
+      this.peerParamsRead = true;
+      this.readPeerParams(this.tls.peerParams);
+      if (this.closeState != 0) { return; }
+    }
+    if (this.tls.complete() && !this.connected) {
+      this.connected = true;
+      if (this.isServer) {
+        app.rx = packetKeys(this.rxSecret);
+        this.validated = true;
+        this.doneWanted = true;
+        this.confirm();
+      }
+      this.happened.push(QuicEvent.Connected);
+    }
+  }
+
+  /** The handshake is confirmed: the Handshake keys go (RFC 9001 §4.9.2). */
+  void confirm(this) {
+    if (this.confirmed) { return; }
+    this.confirmed = true;
+    this.discard(0);
+    this.discard(1);
+  }
+
+  void discard(this, i32 si) {
+    Space s = this.spaces[si];
+    if (s.discarded) { return; }
+    s.discarded = true;
+    s.tx = null;
+    s.rx = null;
+    for (i32 i = 0; i < s.sent.len(); i++) { this.inFlight -= s.sent.get(i).size as i64; }
+    if (this.inFlight < 0 as i64) { this.inFlight = 0 as i64; }
+    s.sent = Vec<Sent>.create();
+    s.lossTime = 0 as i64;
+    s.ackAny = false;
+    s.eliciting = 0;
+    this.ptoCount = 0;
+  }
+
+  void readPeerParams(this, u8[] b) {
+    Rd r = Rd(b, 0, false);
+    bool sawScid = false;
+    bool sawOdcid = false;
+    bool sawRetry = false;
+    while (r.at < b.len() && !r.bad) {
+      i64 id = r.v();
+      u8[] v = r.take(r.v());
+      if (r.bad) { break; }
+      Rd x = Rd(v, 0, false);
+      if (id == 0x00 as i64) { sawOdcid = true; if (!same(v, this.originalDcid)) { r.bad = true; } }
+      if (id == 0x01 as i64) { this.peerIdle = x.v(); }
+      if (id == 0x04 as i64) { this.peerMaxData = x.v(); }
+      if (id == 0x05 as i64) { this.peerStreamBidiLocal = x.v(); }
+      if (id == 0x06 as i64) { this.peerStreamBidiRemote = x.v(); }
+      if (id == 0x08 as i64) { this.peerMaxStreams = x.v(); }
+      if (id == 0x0a as i64) { this.peerAckExponent = x.v() as~ i32; }
+      if (id == 0x0b as i64) { this.peerMaxAckDelay = x.v(); }
+      if (id == 0x0f as i64) { sawScid = true; if (!same(v, this.dcid)) { r.bad = true; } }
+      if (id == 0x10 as i64) { sawRetry = true; if (this.isServer || !same(v, this.retryScid)) { r.bad = true; } }
+      if (id == 0x20 as i64) { this.peerMaxDatagram = x.v(); }
+      if (x.bad) { r.bad = true; }
+    }
+    // RFC 9000 §7.3: the ids each end used are authenticated here, and a client checks the server echoed the id
+    // the client first sent to.
+    if (r.bad || !sawScid || (!this.isServer && !sawOdcid) || (this.isServer && sawOdcid) || sawRetry != this.retried) {
+      this.closeTransport(TRANSPORT_PARAMETER_ERROR, "the peer's transport parameters are wrong");
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────────── ACKs ───
+
+  i32 ackFrame(this, i32 si, Rd r, bool ecn, i64 now) {
+    i64 largest = r.v();
+    i64 delay = r.v();
+    i64 count = r.v();
+    i64 first = r.v();
+    if (r.bad || first > largest || count > 256 as i64) { return -1; }
+    Vec<Range> acked = Vec<Range>.create();
+    i64 hi = largest;
+    i64 lo = largest - first;
+    acked.push(Range(lo, hi + (1 as i64)));
+    for (i64 i = 0 as i64; i < count; i++) {
+      i64 gap = r.v();
+      i64 len = r.v();
+      if (r.bad) { return -1; }
+      hi = lo - gap - (2 as i64);
+      lo = hi - len;
+      if (lo < 0 as i64) { return -1; }
+      acked.push(Range(lo, hi + (1 as i64)));
+    }
+    if (ecn) { r.v(); r.v(); r.v(); }
+    if (r.bad) { return -1; }
+    Space s = this.spaces[si];
+    if (largest >= s.nextPn) { this.closeTransport(PROTOCOL_VIOLATION, "an ACK of a packet never sent"); return r.at; }
+    this.onAck(si, acked, largest, delay, now);
+    return r.at;
+  }
+
+  void onAck(this, i32 si, Vec<Range> ranges, i64 largest, i64 delay, i64 now) {
+    Space s = this.spaces[si];
+    if (largest > s.largestAcked) { s.largestAcked = largest; }
+    Vec<Sent> keep = Vec<Sent>.create();
+    bool newlyEliciting = false;
+    Sent? largestNew = null;
+    for (i32 i = 0; i < s.sent.len(); i++) {
+      Sent p = s.sent.get(i);
+      bool hit = false;
+      for (i32 j = 0; j < ranges.len(); j++) {
+        Range rg = ranges.get(j);
+        if (p.pn >= rg.lo && p.pn < rg.hi) { hit = true; }
+      }
+      if (!hit) { keep.push(p); continue; }
+      if (p.eliciting) { newlyEliciting = true; }
+      if (p.pn == largest) { largestNew = p; }
+      this.inFlight -= p.size as i64;
+      if (p.time > this.recoveryStart) {
+        if (this.cwnd < this.ssthresh) { this.cwnd += p.size as i64; }
+        else { this.cwnd += ((MAX_DATAGRAM_SIZE as i64) * (p.size as i64)) / this.cwnd; }
+      }
+      this.acknowledged(si, p);
+    }
+    if (this.inFlight < 0 as i64) { this.inFlight = 0 as i64; }
+    s.sent = keep;
+    if (largestNew is not null && newlyEliciting) {
+      i64 ackDelay = si == 2 ? ((delay << (this.peerAckExponent as i64)) / (1000 as i64)) : 0 as i64;
+      if (ackDelay > this.peerMaxAckDelay) { ackDelay = this.peerMaxAckDelay; }
+      this.rtt(now - largestNew!.time, ackDelay);
+    }
+    // RFC 9002 §6.2.1: the backoff resets on an acknowledgement — but a client still in the handshake keeps it,
+    // since it cannot yet know the server validated its address.
+    if (newlyEliciting && (this.isServer || this.connected)) { this.ptoCount = 0; }
+    this.detectLoss(si, now);
+  }
+
+  void rtt(this, i64 latest, i64 ackDelay) {
+    this.latestRtt = latest;
+    if (!this.rttSampled) {
+      this.rttSampled = true;
+      this.minRtt = latest;
+      this.smoothedRtt = latest;
+      this.rttVar = latest / (2 as i64);
+      return;
+    }
+    if (latest < this.minRtt) { this.minRtt = latest; }
+    i64 adjusted = latest;
+    if (latest >= this.minRtt + ackDelay) { adjusted = latest - ackDelay; }
+    i64 diff = this.smoothedRtt - adjusted;
+    if (diff < 0 as i64) { diff = -diff; }
+    this.rttVar = (this.rttVar * (3 as i64) + diff) / (4 as i64);
+    this.smoothedRtt = (this.smoothedRtt * (7 as i64) + adjusted) / (8 as i64);
+  }
+
+  /** What an acknowledged packet carried, settled. */
+  void acknowledged(this, i32 si, Sent p) {
+    for (Item it in p.items) {
+      match (it) {
+        Stream(id, off, len, fin): {
+          QStream? st = this.streams.get(id);
+          if (st is null) { continue; }
+          st!.acked.add(off, off + (len as i64));
+          if (fin) { st!.finAcked = true; }
+          this.trimSent(st!);
+          this.happened.push(QuicEvent.Writable(id));
+          this.maybeRetire(st!);
+        }
+        Reset(id): {
+          QStream? st = this.streams.get(id);
+          if (st is not null) { st!.resetAcked = true; this.maybeRetire(st!); }
+        }
+        default: { }
+      }
+    }
+  }
+
+  /** Free a stream's acknowledged prefix. */
+  void trimSent(this, QStream st) {
+    i64 upTo = st.acked.runFrom(st.base);
+    while (st.chunks.len() > 0) {
+      u8[] c = st.chunks.get(0);
+      if (st.base + (c.len() as i64) > upTo) { break; }
+      st.chunks.remove(0);
+      st.base += c.len() as i64;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────── loss recovery ───
+
+  i64 lossDelay(const this) {
+    i64 m = this.latestRtt > this.smoothedRtt ? this.latestRtt : this.smoothedRtt;
+    i64 d = (m * (9 as i64)) / (8 as i64);
+    return d < GRANULARITY ? GRANULARITY : d;
+  }
+
+  void detectLoss(this, i32 si, i64 now) {
+    Space s = this.spaces[si];
+    s.lossTime = 0 as i64;
+    if (s.largestAcked < 0 as i64) { return; }
+    i64 delay = this.lossDelay();
+    Vec<Sent> keep = Vec<Sent>.create();
+    bool congestion = false;
+    i64 latestLost = 0 as i64;
+    for (i32 i = 0; i < s.sent.len(); i++) {
+      Sent p = s.sent.get(i);
+      if (p.pn > s.largestAcked) { keep.push(p); continue; }
+      if (p.pn <= s.largestAcked - (3 as i64) || p.time <= now - delay) {
+        this.inFlight -= p.size as i64;
+        this.lost(si, p);
+        if (p.time > this.recoveryStart) { congestion = true; }
+        if (p.time > latestLost) { latestLost = p.time; }
+        continue;
+      }
+      i64 when = p.time + delay;
+      if (s.lossTime == 0 as i64 || when < s.lossTime) { s.lossTime = when; }
+      keep.push(p);
+    }
+    if (this.inFlight < 0 as i64) { this.inFlight = 0 as i64; }
+    s.sent = keep;
+    if (congestion) {
+      this.recoveryStart = now;
+      this.cwnd = this.cwnd / (2 as i64);
+      if (this.cwnd < MINIMUM_WINDOW) { this.cwnd = MINIMUM_WINDOW; }
+      this.ssthresh = this.cwnd;
+    }
+  }
+
+  /** A packet declared lost: whatever it carried that still matters goes back in the queue. */
+  void lost(this, i32 si, Sent p) {
+    for (Item it in p.items) { this.requeue(si, it); }
+  }
+
+  void requeue(this, i32 si, Item it) {
+    match (it) {
+      Crypto(off, len): { this.spaces[si].cryptoRetx.add(off, off + (len as i64)); }
+      Stream(id, off, len, fin): {
+        QStream? st = this.streams.get(id);
+        if (st is null || st!.resetWanted) { return; }
+        st!.retx.add(off, off + (len as i64));
+        if (fin && !st!.finAcked) { st!.finSent = false; }
+      }
+      Reset(id): {
+        QStream? st = this.streams.get(id);
+        if (st is not null && !st!.resetAcked) { st!.resetSent = false; }
+      }
+      Stop(id): {
+        QStream? st = this.streams.get(id);
+        if (st is not null && st!.finalSize < 0 as i64 && !st!.peerReset) { st!.stopSent = false; }
+      }
+      MaxData: { this.maxDataDue = true; }
+      MaxStreamData(id): {
+        QStream? st = this.streams.get(id);
+        if (st is not null && st!.finalSize < 0 as i64) { st!.msdDue = true; }
+      }
+      MaxStreams: { this.maxStreamsDue = true; }
+      Done: { if (!this.isServer || this.doneWanted == false) { this.doneWanted = true; } }
+    }
+  }
+
+  /** The probe timeout's duration, before backoff, for space `si`. */
+  i64 ptoBase(const this, i32 si) {
+    i64 v = 4 as i64 * this.rttVar;
+    if (v < GRANULARITY) { v = GRANULARITY; }
+    i64 d = this.smoothedRtt + v;
+    if (si == 2) { d += this.peerMaxAckDelay; }
+    return d;
+  }
+
+  /** When the next loss or probe timer fires, and in which space; 0 when none is armed. */
+  i64 timer(const this) {
+    i64 best = 0 as i64;
+    for (i32 si = 0; si < 3; si++) {
+      const Space s = this.spaces[si];
+      if (s.lossTime > 0 as i64 && (best == 0 as i64 || s.lossTime < best)) { best = s.lossTime; }
+    }
+    if (best > 0 as i64) { return best; }
+    for (i32 si = 0; si < 3; si++) {
+      i64 at = this.ptoAt(si);
+      if (at > 0 as i64 && (best == 0 as i64 || at < best)) { best = at; }
+    }
+    return best;
+  }
+
+  i64 ptoAt(const this, i32 si) {
+    const Space s = this.spaces[si];
+    if (s.discarded || s.tx is null) { return 0 as i64; }
+    if (si == 2 && !this.connected) { return 0 as i64; }
+    bool anyEliciting = false;
+    for (i32 i = 0; i < s.sent.len(); i++) { if (s.sent.get(i).eliciting) { anyEliciting = true; } }
+    // A client must keep probing in the handshake even with nothing in flight (RFC 9002 §6.2.2.1): the server
+    // may be unable to send until it hears more, and only the client can break that.
+    bool clientStall = !this.isServer && !this.connected && si < 2 && (si == 1 || this.spaces[1].tx is null) &&
+                       s.nextPn > 0 as i64;
+    if (!anyEliciting && !clientStall) { return 0 as i64; }
+    i64 from = s.lastElicitingSent;
+    i64 d = this.ptoBase(si);
+    for (i32 i = 0; i < this.ptoCount && i < 16; i++) { d = d * (2 as i64); }
+    return from + d;
+  }
+
+  void onTimer(this, i64 now) {
+    for (i32 si = 0; si < 3; si++) {
+      Space s = this.spaces[si];
+      if (s.lossTime > 0 as i64 && s.lossTime <= now) {
+        this.detectLoss(si, now);
+        return;
+      }
+    }
+    for (i32 si = 0; si < 3; si++) {
+      i64 at = this.ptoAt(si);
+      if (at > 0 as i64 && at <= now) {
+        // **A probe**: up to two packets that ignore the congestion window, carrying the oldest data still
+        // unacknowledged in this space — or a PING when there is none.
+        this.ptoCount += 1;
+        this.probes = 2;
+        this.probeSpace = si;
+        Space s = this.spaces[si];
+        for (i32 i = 0; i < s.sent.len() && i < 2; i++) {
+          for (Item it in s.sent.get(i).items) { this.requeue(si, it); }
+        }
+        s.lastElicitingSent = now;
+        return;
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────── streams ───
+
+  bool localStream(const this, i64 id) { return ((id & (1 as i64)) == 1 as i64) == this.isServer; }
+
+  /**
+   * The stream `id` names, opening the peer's streams up to it if this is the first we hear of them; null when the
+   * frame cannot be about a live stream (it is retired, or it is ours and we never opened it — the latter a
+   * violation, closed here).
+   */
+  QStream? streamFor(this, i64 id, bool peerSends) {
+    if ((id & (2 as i64)) != 0 as i64) {
+      this.closeTransport(STREAM_STATE_ERROR, "a unidirectional stream, which this endpoint allows none of");
+      return null;
+    }
+    QStream? st = this.streams.get(id);
+    if (st is not null) { return st; }
+    if (this.localStream(id)) {
+      if (id >= this.nextLocal) { this.closeTransport(STREAM_STATE_ERROR, "a frame for a stream of ours never opened"); }
+      return null;
+    }
+    i64 n = id / (4 as i64);
+    if (n < this.peerOpened) { return null; }           // retired already
+    if (n >= this.localMaxStreams) { this.closeTransport(STREAM_LIMIT_ERROR, "the peer opened past MAX_STREAMS"); return null; }
+    while (this.peerOpened <= n) {
+      i64 sid = this.peerOpened * (4 as i64) + (this.isServer ? 0 as i64 : 1 as i64);
+      QStream fresh = QStream { id: sid, peerMax: this.peerStreamBidiLocal, recvMax: this.cfg.maxStreamData };
+      this.streams.set(sid, fresh);
+      this.peerOpened += 1 as i64;
+      this.happened.push(QuicEvent.StreamOpened(sid));
+    }
+    return this.streams.get(id);
+  }
+
+  void streamFrame(this, i64 id, i64 off, u8[] data, bool fin) {
+    QStream? sto = this.streamFor(id, true);
+    if (sto is null) { return; }
+    QStream st = sto!;
+    i64 end = off + (data.len() as i64);
+    if (end > st.recvMax) { this.closeTransport(FLOW_CONTROL_ERROR, "STREAM past MAX_STREAM_DATA"); return; }
+    if (st.finalSize >= 0 as i64 && (end > st.finalSize || (fin && end != st.finalSize))) {
+      this.closeTransport(FINAL_SIZE_ERROR, "STREAM data past or changing the final size");
+      return;
+    }
+    if (fin) {
+      if (end < st.recvHighest) { this.closeTransport(FINAL_SIZE_ERROR, "a FIN below data already received"); return; }
+      st.finalSize = end;
+    }
+    if (end > st.recvHighest) {
+      i64 grow = end - st.recvHighest;
+      if (this.recvData + grow > this.recvMaxData) { this.closeTransport(FLOW_CONTROL_ERROR, "STREAM past MAX_DATA"); return; }
+      this.recvData += grow;
+      st.recvHighest = end;
+    }
+    if (st.peerReset || st.stopWanted) {
+      // Nobody will read it: it counts against the window and is consumed at once.
+      this.consume(st, 0 as i64);
+      return;
+    }
+    if (end > st.recvContig) {
+      if (off <= st.recvContig) {
+        this.deliver(st, off, data);
+        this.drainEarly(st);
+      } else {
+        st.early.set(off, data);
+      }
+    }
+    if (st.readyBytes > 0 as i64 || (st.finalSize >= 0 as i64 && st.recvContig == st.finalSize)) {
+      this.happened.push(QuicEvent.Readable(id));
+    }
+  }
+
+  void deliver(this, QStream st, i64 off, u8[] data) {
+    i64 end = off + (data.len() as i64);
+    if (end <= st.recvContig) { return; }
+    i32 skip = (st.recvContig - off) as~ i32;
+    u8[] fresh = data;
+    if (skip > 0) {
+      fresh = u8[].filled(data.len() - skip, 0);
+      fresh.copyFrom(data, skip, 0, fresh.len());
+    }
+    st.ready.push(fresh);
+    st.readyBytes += fresh.len() as i64;
+    st.recvContig = end;
+  }
+
+  void drainEarly(this, QStream st) {
+    bool moved = true;
+    while (moved) {
+      moved = false;
+      i64[] keys = st.early.keys();
+      for (i64 o in keys) {
+        if (o <= st.recvContig) {
+          u8[] piece = st.early.get(o)!;
+          st.early.remove(o);
+          this.deliver(st, o, piece);
+          moved = true;
+        }
+      }
+    }
+  }
+
+  void resetFrame(this, i64 id, i64 code, i64 size) {
+    QStream? sto = this.streamFor(id, true);
+    if (sto is null) { return; }
+    QStream st = sto!;
+    if (st.finalSize >= 0 as i64 && size != st.finalSize) { this.closeTransport(FINAL_SIZE_ERROR, "RESET_STREAM changed the final size"); return; }
+    if (size < st.recvHighest) { this.closeTransport(FINAL_SIZE_ERROR, "RESET_STREAM below data received"); return; }
+    if (size > st.recvMax) { this.closeTransport(FLOW_CONTROL_ERROR, "RESET_STREAM past MAX_STREAM_DATA"); return; }
+    if (size > st.recvHighest) {
+      this.recvData += size - st.recvHighest;
+      st.recvHighest = size;
+    }
+    st.finalSize = size;
+    if (st.peerReset) { return; }
+    st.peerReset = true;
+    st.peerResetCode = code;
+    // What was buffered and unread is discarded, and its credit returns.
+    st.ready = Vec<u8[]>.create();
+    st.early = Map<i64, u8[]>.create(hashI64, i64Eq);
+    st.readyBytes = 0 as i64;
+    this.consume(st, 0 as i64);
+    this.happened.push(QuicEvent.StreamReset(id, code));
+    this.happened.push(QuicEvent.Readable(id));
+    this.maybeRetire(st);
+  }
+
+  void stopFrame(this, i64 id, i64 code) {
+    QStream? sto = this.streamFor(id, false);
+    if (sto is null) { return; }
+    QStream st = sto!;
+    if (st.peerStopped) { return; }
+    st.peerStopped = true;
+    this.happened.push(QuicEvent.StopSending(id, code));
+    // RFC 9000 §3.5: answered with a RESET_STREAM, unless the stream already ended.
+    if (!st.finAcked && !st.resetWanted) {
+      st.resetWanted = true;
+      st.resetCode = code;
+    }
+  }
+
+  /**
+   * Credit for what was read, or discarded: the stream's and the connection's windows move once half of them has
+   * been consumed, which is when the MAX frames go out.
+   */
+  void consume(this, QStream st, i64 n) {
+    i64 target = st.peerReset || st.stopWanted ? st.recvHighest : st.consumed + n;
+    i64 delta = target - st.consumed;
+    if (delta <= 0 as i64) { return; }
+    st.consumed = target;
+    this.consumedData += delta;
+    if (st.finalSize < 0 as i64 && st.recvMax - st.consumed < this.cfg.maxStreamData / (2 as i64)) {
+      st.recvMax = st.consumed + this.cfg.maxStreamData;
+      st.msdDue = true;
+    }
+    if (this.recvMaxData - this.consumedData < this.cfg.maxData / (2 as i64)) {
+      this.recvMaxData = this.consumedData + this.cfg.maxData;
+      this.maxDataDue = true;
+    }
+  }
+
+  /**
+   * A stream is done when both halves are: ours FIN'd and acknowledged or reset and acknowledged, theirs read to
+   * the end or reset. A peer's stream's slot comes back then as MAX_STREAMS.
+   */
+  void maybeRetire(this, QStream st) {
+    if (st.retired) { return; }
+    bool sendDone = st.finAcked || st.resetAcked;
+    bool recvDone = st.finRead || st.peerReset;
+    if (!sendDone || !recvDone) { return; }
+    st.retired = true;
+    this.streams.remove(st.id);
+    this.gone.set(st.id, st.peerReset ? st.peerResetCode : -1 as i64);
+    this.goneOrder.push(st.id);
+    if (this.goneOrder.len() > 1024) { this.gone.remove(this.goneOrder.remove(0)); }
+    if (!this.localStream(st.id)) {
+      this.peerRetired += 1 as i64;
+      this.localMaxStreams = this.cfg.maxStreamsBidi + this.peerRetired;
+      this.maxStreamsDue = true;
+    }
+  }
+
+  void wakeWriters(this) {
+    i64[] ids = this.streams.keys();
+    for (i64 id in ids) { this.happened.push(QuicEvent.Writable(id)); }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────────────── the application ───
+
+  /** Open a stream; its id, or -1 while the peer's MAX_STREAMS says no or the handshake is not done. */
+  i64 openStream(this) {
+    if (!this.connected || this.closeState != 0) { return -1 as i64; }
+    i64 n = this.nextLocal / (4 as i64);
+    if (n >= this.peerMaxStreams) { return -1 as i64; }
+    i64 id = this.nextLocal;
+    this.nextLocal += 4 as i64;
+    this.streams.set(id, QStream { id: id, peerMax: this.peerStreamBidiRemote, recvMax: this.cfg.maxStreamData });
+    return id;
+  }
+
+  /** Queue bytes on stream `id`. False if the stream cannot be written (gone, finished, reset, or the connection). */
+  bool write(this, i64 id, u8[] bytes) {
+    QStream? st = this.streams.get(id);
+    if (st is null || st!.finWanted || st!.resetWanted || this.closeState != 0) { return false; }
+    if (bytes.len() == 0) { return true; }
+    st!.chunks.push(bytes);
+    st!.sendEnd += bytes.len() as i64;
+    return true;
+  }
+
+  /** Bytes written on `id` and not yet acknowledged. */
+  i64 queued(const this, i64 id) {
+    const QStream? st = this.streams.get(id);
+    if (st is null) { return 0 as i64; }
+    return st!.sendEnd - st!.acked.runFrom(st!.base);
+  }
+
+  void finish(this, i64 id) {
+    QStream? st = this.streams.get(id);
+    if (st is null || st!.resetWanted) { return; }
+    st!.finWanted = true;
+  }
+
+  void resetStream(this, i64 id, i64 code) {
+    QStream? st = this.streams.get(id);
+    if (st is null || st!.resetWanted || st!.finAcked) { return; }
+    st!.resetWanted = true;
+    st!.resetCode = code;
+    st!.retx = RangeSet.create();
+  }
+
+  void stopSending(this, i64 id, i64 code) {
+    QStream? st = this.streams.get(id);
+    if (st is null || st!.stopWanted || st!.finalSize >= 0 as i64 || st!.peerReset) {
+      if (st is not null && !st!.stopWanted) {
+        st!.stopWanted = true;
+        st!.ready = Vec<u8[]>.create();
+        st!.readyBytes = 0 as i64;
+        st!.finRead = true;
+        this.consume(st!, 0 as i64);
+        this.maybeRetire(st!);
+      }
+      return;
+    }
+    st!.stopWanted = true;
+    st!.stopCode = code;
+    st!.ready = Vec<u8[]>.create();
+    st!.early = Map<i64, u8[]>.create(hashI64, i64Eq);
+    st!.readyBytes = 0 as i64;
+    st!.finRead = true;
+    this.consume(st!, 0 as i64);
+  }
+
+  /** Everything readable on `id` now, taken (empty if nothing). */
+  u8[] read(this, i64 id) {
+    QStream? st = this.streams.get(id);
+    if (st is null || st!.readyBytes == 0 as i64) {
+      if (st is not null) { this.markEnd(st!); }
+      return u8[]();
+    }
+    Buf b = Buf.create();
+    for (i32 i = 0; i < st!.ready.len(); i++) { b.pushAll(st!.ready.get(i)); }
+    st!.ready = Vec<u8[]>.create();
+    i64 n = st!.readyBytes;
+    st!.readyBytes = 0 as i64;
+    this.consume(st!, n);
+    this.markEnd(st!);
+    return b.take();
+  }
+
+  void markEnd(this, QStream st) {
+    if (st.readyBytes == 0 as i64 && st.finalSize >= 0 as i64 && st.recvContig == st.finalSize && !st.finRead) {
+      st.finRead = true;
+      this.maybeRetire(st);
+    }
+  }
+
+  /**
+   * Where stream `id`'s receiving half stands: 0 open, 1 at its end (FIN, everything read), 2 reset by the peer
+   * (`resetCodeOf`), 3 unknown. A stream retired since stays 1 or 2.
+   */
+  i32 recvState(const this, i64 id) {
+    const QStream? st = this.streams.get(id);
+    if (st is null) {
+      if (!this.gone.has(id)) { return 3; }
+      return this.gone.getOr(id, -1 as i64) < 0 as i64 ? 1 : 2;
+    }
+    if (st!.peerReset) { return 2; }
+    if (st!.readyBytes == 0 as i64 && st!.finalSize >= 0 as i64 && st!.recvContig == st!.finalSize) { return 1; }
+    return 0;
+  }
+
+  i64 resetCodeOf(const this, i64 id) {
+    const QStream? st = this.streams.get(id);
+    if (st is null) { return this.gone.getOr(id, 0 as i64); }
+    return st!.peerResetCode;
+  }
+
+  bool hasStream(const this, i64 id) { return this.streams.has(id); }
+
+  /** The largest DATAGRAM payload that fits in one packet, or 0 when the peer accepts none. */
+  i32 maxDatagram(const this) {
+    if (this.peerMaxDatagram == 0 as i64) { return 0; }
+    i32 room = MAX_DATAGRAM_SIZE - (1 + CID_LEN + 4 + 16) - 1 - 2 - 32;
+    if (this.peerMaxDatagram - (3 as i64) < room as i64) { return (this.peerMaxDatagram as~ i32) - 3; }
+    return room;
+  }
+
+  /** Queue a datagram. False when it is too large or the connection cannot send it. */
+  bool sendDatagram(this, u8[] data) {
+    if (!this.connected || this.closeState != 0 || data.len() > this.maxDatagram()) { return false; }
+    // Datagrams are unreliable: a queue that cannot drain loses the oldest rather than growing.
+    if (this.datagramsOut.len() >= 64) { this.datagramsOut.remove(0); }
+    this.datagramsOut.push(data);
+    return true;
+  }
+
+  /** Close with an application error `code` (CONNECTION_CLOSE 0x1d). */
+  void close(this, i64 code, string reason, i64 now) {
+    if (this.closeState != 0) { return; }
+    this.startClose(true, code, reason, now);
+  }
+
+  void closeTransport(this, i64 code, string reason) {
+    if (this.closeState != 0) { return; }
+    this.startClose(false, code, reason, this.lastActivity);
+  }
+
+  void startClose(this, bool app, i64 code, string reason, i64 now) {
+    this.closeState = 1;
+    this.closeApp = app;
+    this.closeCode = code;
+    this.closeReason = reason;
+    this.closeSendWanted = true;
+    this.closeUntil = now + (3 as i64) * this.ptoBase(2);
+    this.happened.push(QuicEvent.Closed(app, code, reason, false));
+  }
+
+  void peerClosed(this, bool app, i64 code, string reason, i64 now) {
+    if (this.closeState != 0) { return; }
+    this.closeState = 2;
+    this.closeUntil = now + (3 as i64) * this.ptoBase(2);
+    this.happened.push(QuicEvent.Closed(app, code, reason, true));
+  }
+
+  /** Whether everything is over: the closing or draining period has passed (or the idle timeout fired). */
+  bool isClosed(const this) { return this.closeState == 3; }
+
+  /** What happened since the last call, taken. */
+  QuicEvent[] events(this) {
+    QuicEvent[] a = this.happened.toArray();
+    this.happened = Vec<QuicEvent>.create();
+    return a;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────────────────── the clock ───
+
+  void tick(this, i64 now) {
+    if (this.closeState == 3) { return; }
+    if (this.closeState != 0) {
+      if (now >= this.closeUntil) { this.closeState = 3; }
+      return;
+    }
+    i64 idle = this.cfg.idleTimeoutMs;
+    if (this.peerIdle > 0 as i64 && this.peerIdle < idle) { idle = this.peerIdle; }
+    i64 floor = (3 as i64) * this.ptoBase(2);
+    if (idle < floor) { idle = floor; }
+    if (now - this.lastActivity >= idle) {
+      this.closeState = 3;
+      this.happened.push(QuicEvent.Closed(false, 0 as i64, "idle timeout", false));
+      return;
+    }
+    i64 t = this.timer();
+    if (t > 0 as i64 && t <= now) { this.onTimer(now); }
+  }
+
+  /** The datagrams to send now, taken. */
+  u8[][] take(this, i64 now) {
+    this.flush(now);
+    u8[][] a = this.out.toArray();
+    this.out = Vec<u8[]>.create();
+    return a;
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────────────────── sending ───
+
+  void flush(this, i64 now) {
+    if (this.closeState == 3 || this.closeState == 2) { return; }
+    if (this.closeState == 1) {
+      if (!this.closeSendWanted) { return; }
+      this.closeSendWanted = false;
+      this.lastCloseSent = now;
+      this.sendClose(now);
+      return;
+    }
+    for (i32 n = 0; n < 64; n++) {
+      if (!this.datagram(now)) { return; }
+    }
+  }
+
+  /** One datagram, coalescing a packet from each space that has something; false when there was nothing. */
+  bool datagram(this, i64 now) {
+    Vec<u8[]> packets = Vec<u8[]>.create();
+    i32 used = 0;
+    bool hasInitial = false;
+    Vec<Packet> built = Vec<Packet>.create();
+    Vec<i32> spaceOf = Vec<i32>.create();
+    for (i32 si = 0; si < 3; si++) {
+      Space s = this.spaces[si];
+      if (s.tx is null || s.discarded) { continue; }
+      i32 overhead = si == 2 ? 1 + this.dcid.len() + 4 + 16
+                             : 1 + 4 + 1 + this.dcid.len() + 1 + this.scid.len() + 2 + this.token.len() + 2 + 4 + 16;
+      i32 room = MAX_DATAGRAM_SIZE - used - overhead;
+      if (room < 40) { break; }
+      Packet p = this.build(si, room, now);
+      if (p.frames.len == 0) { continue; }
+      if (si == 0) { hasInitial = true; }
+      built.push(p);
+      spaceOf.push(si);
+      used += overhead + p.frames.len;
+    }
+    if (built.len() == 0) { return false; }
+    // A datagram carrying an Initial is padded to 1200 (RFC 9000 §14.1): the last packet in it takes the padding.
+    i32 total = 0;
+    for (i32 i = 0; i < built.len(); i++) {
+      i32 si = spaceOf.get(i);
+      Packet p = built.get(i);
+      Space s = this.spaces[si];
+      i64 pn = s.nextPn;
+      s.nextPn += 1 as i64;
+      i32 padTo = 0;
+      if (i == built.len() - 1 && hasInitial) { padTo = MAX_DATAGRAM_SIZE - total; }
+      u8[] frames = p.frames.take();
+      u8[] sealed = si == 2 ? sealShortPhase(this.dcid, frames, pn, s.tx!, this.keyPhase, padTo)
+                            : sealLongToken(si == 0 ? TYPE_INITIAL() : TYPE_HANDSHAKE(), this.dcid, this.scid,
+                                            si == 0 ? this.token : u8[](), frames, pn, s.tx!, padTo);
+      if (sealed.len() == 0) { continue; }
+      total += sealed.len();
+      packets.push(sealed);
+      Sent rec = Sent(pn, now, sealed.len(), p.eliciting, p.items.toArray());
+      if (p.eliciting) {
+        s.sent.push(rec);
+        s.lastElicitingSent = now;
+        this.inFlight += sealed.len() as i64;
+      }
+      // A client sending its first Handshake packet is done with Initial keys (RFC 9001 §4.9.1).
+      if (!this.isServer && si == 1) { this.discard(0); }
+    }
+    Buf d = Buf.create();
+    for (i32 i = 0; i < packets.len(); i++) { d.pushAll(packets.get(i)); }
+    if (d.len == 0) { return false; }
+    this.bytesOut += d.len as i64;
+    this.out.push(d.take());
+    if (this.probes > 0) { this.probes -= 1; }
+    return true;
+  }
+
+  /** How many more bytes may go out now: the congestion window, and a server's amplification limit. */
+  i64 allowance(const this) {
+    i64 a = this.cwnd - this.inFlight;
+    if (this.probes > 0 && a < MAX_DATAGRAM_SIZE as i64) { a = MAX_DATAGRAM_SIZE as i64; }
+    if (this.isServer && !this.validated) {
+      i64 amp = (3 as i64) * this.bytesIn - this.bytesOut;
+      if (amp < a) { a = amp; }
+    }
+    return a;
+  }
+
+  /** The frames for one packet in space `si`, at most `room` bytes. */
+  Packet build(this, i32 si, i32 room, i64 now) {
+    Packet p = Packet { };
+    Space s = this.spaces[si];
+    if (this.isServer && !this.validated && this.allowance() < MAX_DATAGRAM_SIZE as i64) { return p; }
+    // The ACK: at once in the handshake spaces, after two packets or the delay in the application space — and in
+    // any packet that is going anyway.
+    bool ackDue = s.ackAny && (si < 2 || s.eliciting >= 2 || (s.eliciting > 0 && now - s.firstElicitingAt >= MAX_ACK_DELAY));
+    bool sendable = this.allowance() > 0 as i64;
+    if (ackDue || (s.ackAny && sendable && this.hasWork(si))) { this.writeAck(s, p, now); }
+    if (!sendable) { return p; }
+    i32 limit = room;
+
+    // CRYPTO: what was lost first, then what is new.
+    while (!s.cryptoRetx.isEmpty() && p.frames.len + 32 < limit) {
+      Range r = s.cryptoRetx.get(0);
+      i32 n = (r.hi - r.lo) as~ i32;
+      i32 fit = limit - p.frames.len - 16;
+      if (n > fit) { n = fit; }
+      this.writeCrypto(s, p, r.lo, n);
+      s.cryptoRetx.dropBelow(r.lo + (n as i64));
+    }
+    while (s.cryptoNext < s.cryptoOut.len as i64 && p.frames.len + 32 < limit) {
+      i32 n = (s.cryptoOut.len as i64 - s.cryptoNext) as~ i32;
+      i32 fit = limit - p.frames.len - 16;
+      if (n > fit) { n = fit; }
+      this.writeCrypto(s, p, s.cryptoNext, n);
+      s.cryptoNext += n as i64;
+    }
+
+    if (si == 2) {
+      if (this.doneWanted && this.isServer) {
+        this.doneWanted = false;
+        p.frames.push(0x1e as u8);
+        p.items.push(Item.Done);
+        p.eliciting = true;
+      }
+      for (i32 i = 0; i < this.pathResponses.len(); i++) {
+        p.frames.push(0x1b as u8);
+        p.frames.pushAll(this.pathResponses.get(i));
+        p.eliciting = true;
+      }
+      this.pathResponses = Vec<u8[]>.create();
+      if (this.maxDataDue) {
+        this.maxDataDue = false;
+        vi(p.frames, 0x10 as i64);
+        vi(p.frames, this.recvMaxData);
+        p.items.push(Item.MaxData);
+        p.eliciting = true;
+      }
+      if (this.maxStreamsDue) {
+        this.maxStreamsDue = false;
+        vi(p.frames, 0x12 as i64);
+        vi(p.frames, this.localMaxStreams);
+        p.items.push(Item.MaxStreams);
+        p.eliciting = true;
+      }
+      i64[] ids = this.streams.keys();
+      for (i64 id in ids) {
+        if (p.frames.len + 40 > limit) { break; }
+        QStream st = this.streams.get(id)!;
+        if (st.msdDue) {
+          st.msdDue = false;
+          vi(p.frames, 0x11 as i64); vi(p.frames, id); vi(p.frames, st.recvMax);
+          p.items.push(Item.MaxStreamData(id));
+          p.eliciting = true;
+        }
+        if (st.resetWanted && !st.resetSent) {
+          st.resetSent = true;
+          vi(p.frames, 0x04 as i64); vi(p.frames, id); vi(p.frames, st.resetCode); vi(p.frames, st.sendNext);
+          p.items.push(Item.Reset(id));
+          p.eliciting = true;
+        }
+        if (st.stopWanted && !st.stopSent && st.finalSize < 0 as i64 && !st.peerReset) {
+          st.stopSent = true;
+          vi(p.frames, 0x05 as i64); vi(p.frames, id); vi(p.frames, st.stopCode);
+          p.items.push(Item.Stop(id));
+          p.eliciting = true;
+        }
+      }
+      while (this.datagramsOut.len() > 0) {
+        u8[] dg = this.datagramsOut.get(0);
+        if (p.frames.len + dg.len() + 4 > limit) { break; }
+        this.datagramsOut.remove(0);
+        vi(p.frames, 0x31 as i64);
+        vi(p.frames, dg.len() as i64);
+        p.frames.pushAll(dg);
+        p.eliciting = true;
+      }
+      this.streamData(p, limit);
+    }
+    if (this.probes > 0 && si == this.probeSpace && !p.eliciting) {
+      p.frames.push(0x01 as u8);
+      p.eliciting = true;
+    }
+    return p;
+  }
+
+  bool hasWork(const this, i32 si) {
+    const Space s = this.spaces[si];
+    if (!s.cryptoRetx.isEmpty() || s.cryptoNext < s.cryptoOut.len as i64) { return true; }
+    return si == 2 && (this.datagramsOut.len() > 0 || this.maxDataDue || this.maxStreamsDue);
+  }
+
+  void writeAck(this, Space s, Packet p, i64 now) {
+    i32 n = s.received.count();
+    if (n == 0) { return; }
+    Range top = s.received.get(n - 1);
+    i64 largest = top.hi - (1 as i64);
+    i64 delayUs = (now - s.largestRecvTime) * (1000 as i64);
+    if (delayUs < 0 as i64) { delayUs = 0 as i64; }
+    vi(p.frames, 0x02 as i64);
+    vi(p.frames, largest);
+    vi(p.frames, delayUs >> (3 as i64));
+    i32 ranges = n - 1;
+    if (ranges > 32) { ranges = 32; }
+    vi(p.frames, ranges as i64);
+    vi(p.frames, largest - top.lo);
+    i64 prevLo = top.lo;
+    for (i32 i = 0; i < ranges; i++) {
+      Range r = s.received.get(n - 2 - i);
+      vi(p.frames, prevLo - r.hi - (1 as i64));
+      vi(p.frames, r.hi - (1 as i64) - r.lo);
+      prevLo = r.lo;
+    }
+    s.ackAny = false;
+    s.eliciting = 0;
+  }
+
+  void writeCrypto(this, Space s, Packet p, i64 off, i32 n) {
+    if (n <= 0) { return; }
+    vi(p.frames, 0x06 as i64);
+    vi(p.frames, off);
+    vi(p.frames, n as i64);
+    p.frames.pushBytes(s.cryptoOut.data, off as~ i32, n);
+    p.items.push(Item.Crypto(off, n));
+    p.eliciting = true;
+  }
+
+  /** STREAM frames, round-robin across the streams with something to send, within both windows. */
+  void streamData(this, Packet p, i32 limit) {
+    i64[] ids = this.streams.keys();
+    if (ids.len() == 0) { return; }
+    i32 start = this.rr % ids.len();
+    for (i32 k = 0; k < ids.len(); k++) {
+      if (p.frames.len + 24 > limit) { break; }
+      i64 id = ids[(start + k) % ids.len()];
+      QStream st = this.streams.get(id)!;
+      if (st.resetWanted) { continue; }
+      // Lost data first: it is already counted against both windows.
+      while (!st.retx.isEmpty() && p.frames.len + 24 < limit) {
+        Range r = st.retx.get(0);
+        i64 lo = r.lo > st.base ? r.lo : st.base;
+        lo = st.acked.runFrom(lo);
+        if (lo >= r.hi) { st.retx.dropBelow(r.hi); continue; }
+        i64 hi = r.hi;
+        i32 fit = limit - p.frames.len - 24;
+        if (hi - lo > fit as i64) { hi = lo + (fit as i64); }
+        bool fin = st.finWanted && hi == st.sendEnd && st.finSent == false;
+        this.writeStream(st, p, lo, hi, fin);
+        st.retx.dropBelow(hi);
+      }
+      // Then new data.
+      i64 window = st.peerMax;
+      i64 connRoom = this.peerMaxData - this.sentData;
+      i64 hi = st.sendEnd;
+      if (hi > window) { hi = window; }
+      if (hi - st.sendNext > connRoom) { hi = st.sendNext + connRoom; }
+      i32 fit = limit - p.frames.len - 24;
+      if (hi - st.sendNext > fit as i64) { hi = st.sendNext + (fit as i64); }
+      bool finNow = st.finWanted && !st.finSent && hi == st.sendEnd;
+      if (hi > st.sendNext || finNow) {
+        i64 lo = st.sendNext;
+        this.sentData += hi - lo;
+        st.sendNext = hi;
+        this.writeStream(st, p, lo, hi, finNow);
+        this.rr = (start + k + 1) % ids.len();
+      }
+    }
+  }
+
+  void writeStream(this, QStream st, Packet p, i64 lo, i64 hi, bool fin) {
+    i32 n = (hi - lo) as~ i32;
+    vi(p.frames, 0x0e as i64 | (fin ? 1 as i64 : 0 as i64));
+    vi(p.frames, st.id);
+    vi(p.frames, lo);
+    vi(p.frames, n as i64);
+    // The bytes, out of the chunks that hold them.
+    i64 at = st.base;
+    i32 need = n;
+    i64 pos = lo;
+    for (i32 i = 0; i < st.chunks.len() && need > 0; i++) {
+      u8[] c = st.chunks.get(i);
+      i64 cend = at + (c.len() as i64);
+      if (pos < cend) {
+        i32 from = (pos - at) as~ i32;
+        i32 take = c.len() - from;
+        if (take > need) { take = need; }
+        p.frames.pushBytes(c, from, take);
+        need -= take;
+        pos += take as i64;
+      }
+      at = cend;
+    }
+    if (fin) { st.finSent = true; }
+    p.items.push(Item.Stream(st.id, lo, n, fin));
+    p.eliciting = true;
+  }
+
+  /** The CONNECTION_CLOSE, in the highest space there are keys for (and in the Initial too, before the handshake). */
+  void sendClose(this, i64 now) {
+    for (i32 si = 2; si >= 0; si--) {
+      Space s = this.spaces[si];
+      if (s.tx is null || s.discarded) { continue; }
+      Buf f = Buf.create();
+      // An application's close cannot be sent before the handshake is done: it becomes APPLICATION_ERROR.
+      bool app = this.closeApp && si == 2;
+      vi(f, app ? 0x1d as i64 : 0x1c as i64);
+      vi(f, this.closeApp && !app ? APPLICATION_ERROR : this.closeCode);
+      if (!app) { vi(f, 0 as i64); }
+      u8[] reason = app || !this.closeApp ? this.closeReason.toBytes() : u8[]();
+      if (reason.len() > 100) { reason = u8[](); }
+      vi(f, reason.len() as i64);
+      f.pushAll(reason);
+      i64 pn = s.nextPn;
+      s.nextPn += 1 as i64;
+      u8[] frames = f.take();
+      u8[] sealed = si == 2 ? sealShortPhase(this.dcid, frames, pn, s.tx!, this.keyPhase, 0)
+                            : sealLongToken(si == 0 ? TYPE_INITIAL() : TYPE_HANDSHAKE(), this.dcid, this.scid,
+                                            si == 0 ? this.token : u8[](), frames, pn, s.tx!, si == 0 ? MAX_DATAGRAM_SIZE : 0);
+      if (sealed.len() > 0) { this.out.push(sealed); }
+      if (si == 2 || this.connected) { return; }
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────── helpers ───
+
+/** A frame reader: varints and byte runs, bounds-checked, `bad` once anything ran out. */
+struct Rd {
+  u8[] b;
+  i32 at;
+  bool bad;
+
+  i64 v(this) {
+    if (this.bad) { return 0 as i64; }
+    Varint x = decode(this.b, this.at);
+    if (x.size == 0) { this.bad = true; return 0 as i64; }
+    this.at += x.size;
+    return x.value;
+  }
+  i32 u8(this) {
+    if (this.bad || this.at >= this.b.len()) { this.bad = true; return 0; }
+    i32 v = this.b[this.at] as i32;
+    this.at += 1;
+    return v;
+  }
+  u8[] take(this, i64 n) {
+    if (this.bad || n < 0 as i64 || (this.at as i64) + n > (this.b.len() as i64)) { this.bad = true; return u8[](); }
+    i32 m = n as~ i32;
+    u8[] out = u8[].filled(m, 0);
+    out.copyFrom(this.b, this.at, 0, m);
+    this.at += m;
+    return out;
+  }
+}
+
+void vi(Buf b, i64 v) {
+  u8[] t = u8[].filled(8, 0);
+  i32 n = encode(t, 0, v);
+  b.pushBytes(t, 0, n);
+}
+
+bool same(const u8[] a, const u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+/** Keys of a new generation keep the header-protection key: RFC 9001 §6 updates only the packet keys. */
+InitialKeys withHp(InitialKeys k, u8[] hp) { return InitialKeys(k.key, k.iv, hp); }
+
+/**
+ * A short-header packet with the key phase bit set as `phase`, padded to `padTo` bytes. Four-byte packet numbers,
+ * as `sealLong` uses, so the header's size never depends on its contents.
+ */
+u8[] sealShortPhase(const u8[] dcid, u8[] frames, i64 pn, InitialKeys keys, i32 phase, i32 padTo) {
+  i32 headerLen = 1 + dcid.len() + 4;
+  i32 payloadLen = frames.len();
+  i32 least = padTo - headerLen - 16;
+  if (payloadLen < least) { payloadLen = least; }
+  // The sample needs four bytes of payload past a four-byte packet number less... at least four bytes of plaintext.
+  if (payloadLen < 4) { payloadLen = 4; }
+  u8[] payload = u8[].filled(payloadLen, 0);
+  payload.copyFrom(frames, 0, 0, frames.len());
+  u8[] header = u8[].filled(headerLen, 0);
+  header[0] = (0x40 | (phase << 2) | 3) as@ u8;
+  header.copyFrom(dcid, 0, 1, dcid.len());
+  i32 numberAt = 1 + dcid.len();
+  for (i32 i = 0; i < 4; i++) {
+    header[numberAt + i] = (((pn >> ((8 * (3 - i)) as i64)) & (0xFF as i64)) as~ i32) as@ u8;
+  }
+  u8[] iv = nonce(keys.iv, pn);
+  u8[] ct = gcmEncrypt(keys.key, iv, payload);
+  u8[] tag = gcmTag(keys.key, iv, header, ct);
+  u8[] out = u8[].filled(headerLen + ct.len() + 16, 0);
+  out.copyFrom(header, 0, 0, headerLen);
+  out.copyFrom(ct, 0, headerLen, ct.len());
+  out.copyFrom(tag, 0, headerLen + ct.len(), 16);
+  u8[] mask = headerMask(keys.hp, out, numberAt + 4);
+  if (mask.len() == 0) { return u8[](); }
+  out[0] = out[0] ^ (mask[0] & 0x1F);
+  for (i32 i = 0; i < 4; i++) { out[numberAt + i] = out[numberAt + i] ^ mask[1 + i]; }
+  return out;
+}
+
+/**
+ * Transport parameters for this end: the limits in `cfg`, our source id, and — a server's — the client's original
+ * destination id. `max_udp_payload_size` says what we accept, not what we send.
+ */
+export u8[] transportParams(QuicConfig cfg, u8[] scid, u8[] originalDcid, bool isServer) {
+  Buf b = Buf.create();
+  if (isServer) { param(b, 0x00, originalDcid); }
+  paramV(b, 0x01, cfg.idleTimeoutMs);
+  paramV(b, 0x03, 65527 as i64);
+  paramV(b, 0x04, cfg.maxData);
+  paramV(b, 0x05, cfg.maxStreamData);
+  paramV(b, 0x06, cfg.maxStreamData);
+  paramV(b, 0x07, 0 as i64);
+  paramV(b, 0x08, cfg.maxStreamsBidi);
+  paramV(b, 0x09, 0 as i64);
+  param(b, 0x0c, u8[]());
+  param(b, 0x0f, scid);
+  if (cfg.maxDatagramFrame > 0 as i64) { paramV(b, 0x20, cfg.maxDatagramFrame); }
+  return b.take();
+}
+
+void param(Buf b, i32 id, u8[] v) {
+  vi(b, id as i64);
+  vi(b, v.len() as i64);
+  b.pushAll(v);
+}
+
+void paramV(Buf b, i32 id, i64 v) {
+  vi(b, id as i64);
+  vi(b, encodedLength(v) as i64);
+  vi(b, v);
+}
+
+/**
+ * A long-header packet — Initial or Handshake — with an Initial's token, padded to `padTo`. Four-byte packet
+ * numbers and a two-byte length, as `initial.wac`'s `sealLong`, which has no token.
+ */
+u8[] sealLongToken(i32 packetType, const u8[] dcid, const u8[] scid, u8[] token, u8[] frames, i64 pn,
+                   InitialKeys keys, i32 padTo) {
+  bool initial = packetType == TYPE_INITIAL();
+  i32 tokenLen = initial ? encodedLength(token.len() as i64) + token.len() : 0;
+  i32 headerLen = 1 + 4 + 1 + dcid.len() + 1 + scid.len() + tokenLen + 2 + 4;
+  i32 payloadLen = frames.len();
+  i32 least = padTo - headerLen - 16;
+  if (payloadLen < least) { payloadLen = least; }
+  if (payloadLen < 4) { payloadLen = 4; }
+  u8[] payload = u8[].filled(payloadLen, 0);
+  payload.copyFrom(frames, 0, 0, frames.len());
+  Buf h = Buf.create();
+  h.push((0xC0 | (packetType << 4) | 3) as@ u8);
+  h.push(0 as u8); h.push(0 as u8); h.push(0 as u8); h.push(1 as u8);
+  h.push(dcid.len() as@ u8);
+  h.pushAll(dcid);
+  h.push(scid.len() as@ u8);
+  h.pushAll(scid);
+  if (initial) {
+    vi(h, token.len() as i64);
+    h.pushAll(token);
+  }
+  i64 length = (4 + payloadLen + 16) as i64;
+  h.push((0x40 | ((length >> (8 as i64)) as~ i32)) as@ u8);
+  h.push(((length & (0xFF as i64)) as~ i32) as@ u8);
+  i32 numberAt = h.len;
+  for (i32 i = 0; i < 4; i++) { h.push((((pn >> ((8 * (3 - i)) as i64)) & (0xFF as i64)) as~ i32) as@ u8); }
+  u8[] header = h.take();
+  u8[] iv = nonce(keys.iv, pn);
+  u8[] ct = gcmEncrypt(keys.key, iv, payload);
+  u8[] tag = gcmTag(keys.key, iv, header, ct);
+  u8[] out = u8[].filled(header.len() + ct.len() + 16, 0);
+  out.copyFrom(header, 0, 0, header.len());
+  out.copyFrom(ct, 0, header.len(), ct.len());
+  out.copyFrom(tag, 0, header.len() + ct.len(), 16);
+  u8[] mask = headerMask(keys.hp, out, numberAt + 4);
+  if (mask.len() == 0) { return u8[](); }
+  out[0] = out[0] ^ (mask[0] & 0x0F);
+  for (i32 i = 0; i < 4; i++) { out[numberAt + i] = out[numberAt + i] ^ mask[1 + i]; }
+  return out;
+}

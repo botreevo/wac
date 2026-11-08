@@ -179,6 +179,12 @@ enum Cap {
     Validated,
     /// `OP_CAPABILITY`: a capability by name, of which this host provides none yet.
     Capability,
+    /// A file `Files.openRandom` opened: a read or a write at an offset, its size, cutting it, `fsync`.
+    ReadAt,
+    WriteAt,
+    FileSize,
+    TruncateFile,
+    SyncFile,
     Unsupported,
 }
 
@@ -232,7 +238,46 @@ fn cap_of_op(op: i32) -> Cap {
         66 => Cap::Unload,
         67 => Cap::Validated,
         68 => Cap::Capability,
+        69 => Cap::ReadAt,
+        70 => Cap::WriteAt,
+        71 => Cap::FileSize,
+        72 => Cap::TruncateFile,
+        73 => Cap::SyncFile,
         _ => Cap::Unsupported,
+    }
+}
+
+/// Up to `n` bytes of `f` from `offset`, fewer only where it ends — `Files.openRandom`'s `readAt`.
+fn read_at(f: &std::fs::File, n: usize, offset: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    let mut got = 0;
+    while got < n {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[got..], offset + got as u64);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[got..], offset + got as u64);
+        match r {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
+}
+
+/// All of `b` written to `f` from `offset`.
+fn write_at(f: &std::fs::File, b: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::write_all_at(f, b, offset);
+    #[cfg(windows)]
+    {
+        let mut put = 0;
+        while put < b.len() {
+            put += std::os::windows::fs::FileExt::seek_write(f, &b[put..], offset + put as u64)?;
+        }
+        Ok(())
     }
 }
 
@@ -3081,15 +3126,19 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
         Cap::OpenFile => {
             let path = resolve_path(&r.text);
             let how = r.a as i32;
+            // 3 and 4 are `Files.openRandom`: to read anywhere, or to read and write anywhere.
             let granted = HOST.with(|h| {
-                h.borrow().as_ref().is_some_and(|s| if how == 0 { s.grants.read } else { s.grants.write })
+                h.borrow().as_ref().is_some_and(|s| if how == 0 || how == 3 { s.grants.read } else { s.grants.write })
             });
             let answer = if !granted {
                 Answer::Socket(-1, "Not granted to this application".into(), String::new(), 0, FAULT_NOT_GRANTED)
             } else {
                 let mut o = std::fs::OpenOptions::new();
-                if how == 0 {
+                if how == 0 || how == 3 {
                     o.read(true);
+                } else if how == 4 {
+                    // Created if absent, and never emptied: a database's file.
+                    o.read(true).write(true).create(true);
                 } else {
                     o.write(true).create(true);
                     if how == 2 { o.append(true); } else { o.truncate(true); }
@@ -3100,6 +3149,55 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 }
             };
             return Reply::Now(answer);
+        }
+        // **A file `openRandom` opened**: positioned reads and writes (`pread`, `pwrite`), so two requests in
+        // flight on one handle cannot move each other's cursor; on a thread each, as the whole-file
+        // operations are, with a handle of its own (`try_clone`) so the table's lock is not held there.
+        Cap::ReadAt | Cap::WriteAt | Cap::FileSize | Cap::TruncateFile | Cap::SyncFile => {
+            let handle = r.a as i32;
+            let file = HOST.with(|h| {
+                h.borrow().as_ref().and_then(|st| match st.sockets.lock().unwrap().get(&handle) {
+                    Some(Sock::File(f)) => f.try_clone().ok(),
+                    _ => None,
+                })
+            });
+            let Some(f) = file else {
+                return Reply::Now(Answer::Change(FAULT_OTHER, "not an open file".into()));
+            };
+            let Some(t) = table() else { return no_table() };
+            let id = t.submit();
+            let worker = t.clone();
+            let offset = r.b as u64;
+            let data = r.bytes.clone();
+            std::thread::spawn(move || {
+                let a = match cap {
+                    Cap::ReadAt => {
+                        let n = data.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize).unwrap_or(0);
+                        match read_at(&f, n, offset) {
+                            Ok(got) => Answer::File(true, got, String::new(), FAULT_NONE),
+                            Err(e) => Answer::File(false, Vec::new(), message_of(&e), FAULT_OTHER),
+                        }
+                    }
+                    Cap::WriteAt => match write_at(&f, &data, offset) {
+                        Ok(()) => Answer::Change(FAULT_NONE, String::new()),
+                        Err(e) => Answer::Change(FAULT_OTHER, message_of(&e)),
+                    },
+                    Cap::FileSize => match f.metadata() {
+                        Ok(m) => Answer::I64(m.len() as i64),
+                        Err(e) => Answer::Change(FAULT_OTHER, message_of(&e)),
+                    },
+                    Cap::TruncateFile => match f.set_len(offset) {
+                        Ok(()) => Answer::Change(FAULT_NONE, String::new()),
+                        Err(e) => Answer::Change(FAULT_OTHER, message_of(&e)),
+                    },
+                    _ => match f.sync_all() {
+                        Ok(()) => Answer::Change(FAULT_NONE, String::new()),
+                        Err(e) => Answer::Change(FAULT_OTHER, message_of(&e)),
+                    },
+                };
+                let _ = worker.complete(id, a);
+            });
+            return Reply::Later(id);
         }
         // The end of a file `openFile` opened. `std::fs::File` does not buffer — each `send` was a write
         // to the system — so dropping it is the whole of closing, and a later read finds every byte.

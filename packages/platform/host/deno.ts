@@ -20,7 +20,7 @@ import {
   want,
 } from "./children.ts";
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
-import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
+import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, readI64le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_RUN, GRANT_WRITE, OP } from "./ops.ts";
 import { randomBytes } from "./entropy.ts";
 import { envRecord, joinPath, unpackExec } from "./child.ts";
@@ -513,6 +513,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // Files opened as streams, in the same handle space: `recv` reads one, `send` writes one and
   // `closeSocket` closes it, so a program holds as many as it likes and waits on them like sockets.
   const files = new Map<number, Deno.FsFile>();
+  const openFile = (p: Uint8Array): Deno.FsFile => {
+    const f = files.get(readI32le(p));
+    if (f === undefined) throw new Error("not an open file");
+    return f;
+  };
   // Children share the handle space with sockets, so `recv`, `send` and `waitAny` need no
   // idea which they are holding — which is the whole reason a child is a handle.
   const children = new Map<number, Child>();
@@ -693,10 +698,15 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      */
     [OP.OPEN_FILE]: async (p) => {
       const how = readI32le(p);
-      if (how === 0 ? !opts.fs?.read : !opts.fs?.write) deny(how === 0 ? "filesystem read" : "filesystem write");
+      const toRead = how === 0 || how === 3;
+      if (toRead ? !opts.fs?.read : !opts.fs?.write) deny(toRead ? "filesystem read" : "filesystem write");
       const path = P(unstr(p.subarray(4)));
+      // 3 and 4 are `Files.openRandom`: to read anywhere, or to read and write anywhere — created if absent, never
+      // emptied. Its handle is used through `READ_AT` and its neighbours rather than `recv` and `send`.
+      const how3or4 = how === 3 || how === 4;
       const file = await onPath(path, () =>
-        Deno.open(path, how === 0 ? { read: true } : { write: true, create: true, truncate: how === 1, append: how === 2 })
+        Deno.open(path, how3or4 ? { read: true, write: how === 4, create: how === 4 }
+          : how === 0 ? { read: true } : { write: true, create: true, truncate: how === 1, append: how === 2 })
       );
       const h = nextHandle++;
       files.set(h, file);
@@ -709,6 +719,37 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       files.delete(h);
       if (file === undefined) throw new Error("not an open file");
       file.close();
+      return EMPTY;
+    },
+    /** A file `openRandom` opened: the handle, the offset as an i64, then the length to read or the bytes. */
+    [OP.READ_AT]: async (p) => {
+      const file = openFile(p);
+      const n = readI32le(p, 12);
+      await file.seek(Number(readI64le(p, 4)), Deno.SeekMode.Start);
+      const b = new Uint8Array(n);
+      let got = 0;
+      while (got < n) {
+        const r = await file.read(b.subarray(got));
+        if (r === null || r === 0) break;
+        got += r;
+      }
+      return b.slice(0, got);
+    },
+    [OP.WRITE_AT]: async (p) => {
+      const file = openFile(p);
+      await file.seek(Number(readI64le(p, 4)), Deno.SeekMode.Start);
+      const b = p.subarray(12);
+      let put = 0;
+      while (put < b.length) put += await file.write(b.subarray(put));
+      return EMPTY;
+    },
+    [OP.FILE_SIZE]: async (p) => i64le(BigInt((await openFile(p).stat()).size)),
+    [OP.TRUNCATE_FILE]: async (p) => {
+      await openFile(p).truncate(Number(readI64le(p, 4)));
+      return EMPTY;
+    },
+    [OP.SYNC_FILE]: async (p) => {
+      await openFile(p).sync();
       return EMPTY;
     },
     /** The end of this program's output or its diagnostic output; it goes on running. */

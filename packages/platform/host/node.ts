@@ -11,7 +11,7 @@
 // world is what an application is written against either way.
 
 import { type Handlers } from "./respond.ts";
-import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
+import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, readI64le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_RUN, GRANT_WRITE, OP } from "./ops.ts";
 import { randomBytes } from "./entropy.ts";
 import { envRecord, joinPath, unpackExec } from "./child.ts";
@@ -72,6 +72,17 @@ function netFault(e: unknown): number {
   }
 }
 
+/** A file `openRandom` opened: `Files.openRandom` in `std/platform.wac`. */
+export type RandomIo = {
+  /** Up to `n` bytes from `offset`, fewer only at the end. */
+  readAt(offset: number, n: number): Promise<Uint8Array>;
+  writeAt(offset: number, b: Uint8Array): Promise<void>;
+  size(): Promise<number>;
+  truncate(n: number): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+};
+
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
 export type NodeIo = {
   readStdin(): Promise<Uint8Array>;
@@ -81,6 +92,8 @@ export type NodeIo = {
   openFile(path: string): Promise<{ read(): Promise<Uint8Array>; close(): Promise<void> }>;
   /** A file opened for writing: truncated, or with `append` added to. Created if absent either way. */
   createFile(path: string, append?: boolean): Promise<{ write(b: Uint8Array): Promise<void>; close(): Promise<void> }>;
+  /** A file to read, and with `write` to change, at any offset — created if absent then, and never emptied. */
+  openRandom(path: string, write: boolean): Promise<RandomIo>;
   /**
    * The network, in the same shape Deno's is.
    *
@@ -312,6 +325,13 @@ export function nodeWorld(
   // Files opened as streams, in the same handle space — see the note in `deno.ts`.
   const reading = new Map<number, { read(): Promise<Uint8Array>; close(): Promise<void> }>();
   const writing = new Map<number, { write(b: Uint8Array): Promise<void>; close(): Promise<void> }>();
+  /** Files `openRandom` opened, by handle. */
+  const randoms = new Map<number, RandomIo>();
+  const random = (p: Uint8Array): RandomIo => {
+    const f = randoms.get(readI32le(p));
+    if (f === undefined) throw new Error("not a file open to read and write anywhere");
+    return f;
+  };
   let nextHandle = FIRST_FREE_HANDLE;
 
   /**
@@ -612,8 +632,16 @@ export function nodeWorld(
     /** A file as a stream of its own — see the note in `deno.ts`. */
     [OP.OPEN_FILE]: async (p) => {
       const how = readI32le(p);
-      if (how === 0 ? !opts.fs?.read : !opts.fs?.write) deny(how === 0 ? "filesystem read" : "filesystem write");
+      const toRead = how === 0 || how === 3;
+      if (toRead ? !opts.fs?.read : !opts.fs?.write) deny(toRead ? "filesystem read" : "filesystem write");
       const path = P(unstr(p.subarray(4)));
+      // 3 and 4: a file to read (and write) anywhere — `Files.openRandom`.
+      if (how === 3 || how === 4) {
+        const f = await io.openRandom(path, how === 4);
+        const h = nextHandle++;
+        randoms.set(h, f);
+        return withPeer(h, "");
+      }
       if (how === 0) {
         const r = await io.openFile(path);
         const h = nextHandle++;
@@ -624,6 +652,25 @@ export function nodeWorld(
       const h = nextHandle++;
       writing.set(h, w);
       return withPeer(h, "");
+    },
+
+    /** A file `openRandom` opened: the handle, the offset as an i64, then the length or the bytes. */
+    [OP.READ_AT]: async (p) => {
+      const at = Number(readI64le(p, 4));
+      return await random(p).readAt(at, readI32le(p, 12));
+    },
+    [OP.WRITE_AT]: async (p) => {
+      await random(p).writeAt(Number(readI64le(p, 4)), p.slice(12));
+      return EMPTY;
+    },
+    [OP.FILE_SIZE]: async (p) => i64le(BigInt(await random(p).size())),
+    [OP.TRUNCATE_FILE]: async (p) => {
+      await random(p).truncate(Number(readI64le(p, 4)));
+      return EMPTY;
+    },
+    [OP.SYNC_FILE]: async (p) => {
+      await random(p).sync();
+      return EMPTY;
     },
 
     /** The end of this program's output or its diagnostic output — see the note in `deno.ts`. */
@@ -638,9 +685,10 @@ export function nodeWorld(
     /** The end of a file opened with `OPEN_FILE` — see the note in `deno.ts`. */
     [OP.CLOSE_FILE]: async (p) => {
       const h = readI32le(p);
-      const file = reading.get(h) ?? writing.get(h);
+      const file = reading.get(h) ?? writing.get(h) ?? randoms.get(h);
       reading.delete(h);
       writing.delete(h);
+      randoms.delete(h);
       if (file === undefined) throw new Error("not an open file");
       await file.close();
       return EMPTY;

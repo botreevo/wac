@@ -242,6 +242,34 @@ export async function runLauncherNode(
       const h = await fs.open(path, append ? "a" : "w");
       return { write: async (b: Uint8Array) => { await h.write(b); }, close: () => h.close() };
     },
+    openRandom: async (path: string, write: boolean) => {
+      // "r+" needs the file to exist; making it first, without emptying it, is what "created if absent" asks.
+      if (write) await (await fs.open(path, "a")).close();
+      const h = await fs.open(path, write ? "r+" : "r");
+      return {
+        readAt: async (offset: number, n: number): Promise<Uint8Array> => {
+          const b = new Uint8Array(n);
+          let got = 0;
+          while (got < n) {
+            const { bytesRead } = await h.read(b, got, n - got, offset + got);
+            if (bytesRead === 0) break;
+            got += bytesRead;
+          }
+          return b.subarray(0, got);
+        },
+        writeAt: async (offset: number, b: Uint8Array): Promise<void> => {
+          let put = 0;
+          while (put < b.length) {
+            const { bytesWritten } = await h.write(b, put, b.length - put, offset + put);
+            put += bytesWritten;
+          }
+        },
+        size: async (): Promise<number> => (await h.stat()).size,
+        truncate: (n: number) => h.truncate(n),
+        sync: () => h.sync(),
+        close: () => h.close(),
+      };
+    },
     openFile: async (path: string) => {
       const h = await fs.open(path, "r");
       return {

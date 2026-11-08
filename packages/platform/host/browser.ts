@@ -721,6 +721,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.OPEN_FILE]: async (p) => {
       const how = readI32le(p);
       const path = unstr(p.subarray(4));
+      // `Files.openRandom` (3 and 4): a page's files are blobs read whole and writables committed on close, with
+      // nothing to read or write in place.
+      if (how === 3 || how === 4) throw new Faulted(FAULT_UNSUPPORTED, `${path}: a page's files open as streams only`);
       if (how === 0) {
         const blob = await readOrPhrase(() => fileOf(path));
         const h = nextHandle++;

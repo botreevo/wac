@@ -31,6 +31,9 @@ export struct Exec {
   Value[] params;
   FnEnv env;
   Vec<CteDef> ctes;
+  // While a trigger runs: NEW and OLD, as a scope outside every select of its statements.
+  Scope? triggerScope;
+  Ctx? triggerCtx;
   // The last pattern LIKE saw, as bytes: the pattern is almost always the same for every row.
   string lastPattern = "";
   u8[] lastPatternBytes;
@@ -57,6 +60,10 @@ string? needleOf(const u8[] b) {
   mid.copyFrom(b, 1, 0, b.len() - 2);
   return string.fromBytes(mid);
 }
+
+// The context a statement's outermost select runs in: none, or a trigger's NEW and OLD, which the
+// select's scope has outside it.
+export Ctx topCtx(Exec x) { return x.triggerCtx ?? Ctx(Row?[](), null, null, null); }
 
 // Names visible to an expression: this select's sources, then the enclosing selects'.
 export struct Scope {
@@ -197,6 +204,10 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
         return Result.Ok(Node.NAgg(p.aggs.len() - 1));
       }
       if (star) { return Result.Err(err("wrong number of arguments to function \{name}()")); }
+      if (name == "raise") {
+        if (x.triggerScope is null) { return Result.Err(err("RAISE() may only be used within a trigger-program")); }
+        return Result.Ok(Node.NCall(name, -1, try bindAll(args, s, x), bool[].filled(args.len(), false)));
+      }
       if (!knownFunction(name, args.len())) {
         return Result.Err(err(knownFunction(name, -99) ? "wrong number of arguments to function \{name}()" : "no such function: \{name}"));
       }
@@ -263,10 +274,17 @@ export i32 nodeAff(const Node n) {
   return match (n) { NCol(d, s, c, aff, coll): aff, NCast(e, aff): aff, NCollate(e, coll): nodeAff(e), default: AFF_NONE };
 }
 
-Result<Value, SqlError> colValue(Ctx c, i32 depth, i32 src, i32 col) {
+Result<Value, SqlError> colValue(Ctx c, i32 depth, i32 src, i32 col, Exec x) {
   Ctx cur = c;
+  bool usedTrigger = false;
   for (i32 d = 0; d < depth; d++) {
-    if (cur.outer is null) { return Result.Ok(Value.Null); }
+    if (cur.outer is null) {
+      // Past the outermost select is the trigger's NEW and OLD, when a trigger is running.
+      if (x.triggerCtx is null || usedTrigger) { return Result.Ok(Value.Null); }
+      cur = x.triggerCtx!;
+      usedTrigger = true;
+      continue;
+    }
     cur = cur.outer!;
   }
   if (src >= cur.rows.len()) { return Result.Ok(Value.Null); }
@@ -280,7 +298,7 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
   match (n) {
     NLit(v): { return Result.Ok(v as Value); }
     NParam(i): { return Result.Ok(i >= 1 && i <= x.params.len() ? x.params[i - 1] : Value.Null); }
-    NCol(depth, src, col, aff, coll): { return colValue(c, depth, src, col); }
+    NCol(depth, src, col, aff, coll): { return colValue(c, depth, src, col, x); }
     NCollate(e, coll): { return eval(e, c, x); }
     NUnary(op, e): {
       Value v = try eval(e, c, x);
@@ -388,6 +406,11 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       }
       Value[] vals = Value[].filled(args.len(), Value.Null);
       for (i32 i = 0; i < args.len(); i++) { vals[i] = try eval(args[i], c, x); }
+      if (fid < 0 && name == "raise") {
+        // Carried out as an error the trigger's runner understands; its code says which kind.
+        string kind = textOf(vals[0]);
+        return Result.Err(SqlError("raise-" + lower(kind), vals.len() > 1 ? textOf(vals[1]) : ""));
+      }
       return callScalar(name, fid, vals, isJson, x.env);
     }
     NLike(value, pattern, glob): {
@@ -541,7 +564,8 @@ string defaultName(const ResultCol rc) {
   }
 }
 
-export Result<SelectPlan, SqlError> planSelect(const Select s, Scope? outer, Exec x) {
+export Result<SelectPlan, SqlError> planSelect(const Select s, Scope? outer0, Exec x) {
+  Scope? outer = outer0 ?? x.triggerScope;
   if (s.with.len() == 0) { return planSelectBody(s, outer, x); }
   i32 depth = pushCtes(s.with, s.recursive, x);
   Result<SelectPlan, SqlError> r = planSelectBody(s, outer, x);
@@ -563,13 +587,13 @@ export void popCtes(Exec x, i32 depth) {
   while (x.ctes.len() > depth) { x.ctes.pop(); }
 }
 
-struct Named {
+export struct Named {
   Table table;
   bool derived;   // computed rows (a CTE, a view, sqlite_schema) rather than a stored table
 }
 
 // What a name in FROM means: a CTE in scope, then a table, then a view, then the schema table.
-Result<Named, SqlError> resolveTable(string name, Exec x) {
+export Result<Named, SqlError> resolveTable(string name, Exec x) {
   string n = lower(name);
   for (i32 i = x.ctes.len() - 1; i >= 0; i--) {
     CteDef c = x.ctes.get(i);
@@ -601,7 +625,7 @@ Result<Named, SqlError> resolveTable(string name, Exec x) {
     x.ctes = saved;
     SelectPlan sp = try pr;
     x.ctes = Vec.create();
-    Result<Vec<Value[]>, SqlError> rr = runPlan(sp, Ctx(Row?[](), null, null, null), x);
+    Result<Vec<Value[]>, SqlError> rr = runPlan(sp, topCtx(x), x);
     x.ctes = saved;
     Vec<Value[]> rows = try rr;
     string[] names = try namesFor(v!.cols, sp.names, name);
@@ -635,6 +659,7 @@ Table schemaTable(Database db) {
       root = page;
       page++;
     } else if (e.kind == "view") { sql = Value.Text(db.view(e.name)!.sql); }
+    else if (e.kind == "trigger") { sql = Value.Text(db.trigger(e.name)!.def.sql); }
     rows.push([Value.Text(e.kind), Value.Text(e.name), Value.Text(e.table), Value.Int(root), sql]);
   }
   return tableOfRows("sqlite_schema", ["type", "name", "tbl_name", "rootpage", "sql"], rows);
@@ -677,7 +702,7 @@ bool selectNames(const Select s, string n) {
 Result<Table, SqlError> materializeCte(CteDef c, Exec x) {
   if (!c.recursive || !selectNames(c.sel, c.name)) {
     SelectPlan sp = try planSelect(c.sel, null, x);
-    Vec<Value[]> rows = try runPlan(sp, Ctx(Row?[](), null, null, null), x);
+    Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
     return Result.Ok(tableOfRows(c.name, try namesFor(c.cols, sp.names, c.name), rows));
   }
   // Recursive: the members before the first that names the CTE give the starting rows; each round runs
@@ -788,7 +813,7 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
       const Source f = s.from[i];
       if (f.sub is not null) {
         SelectPlan sp = try planSelect(f.sub!, outer, x);
-        Vec<Value[]> rows = try runPlan(sp, Ctx(Row?[](), null, null, null), x);
+        Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
         string nm = f.alias ?? "subquery_\{i}";
         srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true));
       } else {
@@ -1728,6 +1753,6 @@ Value[] rekey(const SelectPlan p, const Value[] row) {
 
 export Result<Rows, SqlError> query(const Select s, Exec x) {
   SelectPlan p = try planSelect(s, null, x);
-  Vec<Value[]> rows = try runPlan(p, Ctx(Row?[](), null, null, null), x);
+  Vec<Value[]> rows = try runPlan(p, topCtx(x), x);
   return Result.Ok(Rows(p.names, rows));
 }

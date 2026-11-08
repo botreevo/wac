@@ -4,7 +4,7 @@ import { Result, Vec, Map, hashString, stringEq, NumberLiteral, numberLiteralToF
 import { SqlError } from "./error.wac";
 import { Value } from "./value.wac";
 import { Token, tokenize, upper, lower, T_IDENT, T_STRING, T_INTEGER, T_FLOAT, T_BLOB, T_PARAM, T_OP, T_EOF } from "./lexer.wac";
-import { Cte, ForeignKeyDef, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
+import { Cte, CreateTrigger, ForeignKeyDef, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
          CreateIndex, Assign, Upsert, Insert, Update, Delete, Stmt, JOIN_FIRST, JOIN_INNER, JOIN_LEFT,
          JOIN_CROSS, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 
@@ -434,6 +434,22 @@ export struct Parser {
         return Result.Ok(Expr.Cast(e, ty));
       }
       if (u == "CASE") { this.pos++; return this.caseRest(); }
+      // RAISE(IGNORE) and RAISE(ABORT|FAIL|ROLLBACK, message), in a trigger.
+      if (u == "RAISE" && this.peekAt(1).kind == T_OP && this.peekAt(1).text == "(") {
+        this.pos += 2;
+        string kind = upper(this.advance().text);
+        if (kind != "IGNORE" && kind != "ABORT" && kind != "FAIL" && kind != "ROLLBACK") {
+          return Result.Err(this.fail("expected IGNORE, ABORT, FAIL or ROLLBACK"));
+        }
+        Vec<Expr> args;
+        args.push(Expr.Lit(Value.Text(kind)));
+        if (kind != "IGNORE") {
+          try this.expectOp(",");
+          args.push(try this.expr());
+        }
+        try this.expectOp(")");
+        return Result.Ok(Expr.Call("raise", args.toArray(), false, false));
+      }
       if (u == "EXISTS" || (u == "NOT" && this.isKwAt(1, "EXISTS"))) {
         bool neg = u == "NOT";
         this.pos += neg ? 2 : 1;
@@ -736,7 +752,7 @@ export struct Parser {
     if (this.eatKw("CREATE")) { return this.create(); }
     if (this.eatKw("DROP")) {
       string kind = upper(this.advance().text);
-      if (kind != "TABLE" && kind != "INDEX" && kind != "VIEW") { return Result.Err(SqlError.unsupported("DROP \{kind}")); }
+      if (kind != "TABLE" && kind != "INDEX" && kind != "VIEW" && kind != "TRIGGER") { return Result.Err(SqlError.unsupported("DROP \{kind}")); }
       bool ifExists = false;
       if (this.eatKw("IF")) { try this.expectKw("EXISTS"); ifExists = true; }
       return Result.Ok(Stmt.DropStmt(kind, try this.qualifiedName(), ifExists));
@@ -750,8 +766,16 @@ export struct Parser {
     if (this.eatKw("COMMIT") || this.eatKw("END")) { this.eatKw("TRANSACTION"); return Result.Ok(Stmt.CommitStmt); }
     if (this.eatKw("ROLLBACK")) {
       this.eatKw("TRANSACTION");
-      if (this.isKw("TO")) { return Result.Err(SqlError.unsupported("savepoints")); }
+      if (this.eatKw("TO")) {
+        this.eatKw("SAVEPOINT");
+        return Result.Ok(Stmt.RollbackToStmt(try this.name()));
+      }
       return Result.Ok(Stmt.RollbackStmt);
+    }
+    if (this.eatKw("SAVEPOINT")) { return Result.Ok(Stmt.SavepointStmt(try this.name())); }
+    if (this.eatKw("RELEASE")) {
+      this.eatKw("SAVEPOINT");
+      return Result.Ok(Stmt.ReleaseStmt(try this.name()));
     }
     if (this.eatKw("PRAGMA")) {
       string n = lower(try this.qualifiedName());
@@ -893,10 +917,56 @@ export struct Parser {
       string sql = "CREATE VIEW " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
       return Result.Ok(Stmt.CreateViewStmt(n, ine, cols, sel, sql));
     }
-    if (this.isKw("TRIGGER") || this.isKw("VIRTUAL")) {
+    if (this.eatKw("TRIGGER")) { return Result.Ok(Stmt.CreateTriggerStmt(try this.createTrigger())); }
+    if (this.isKw("VIRTUAL")) {
       return Result.Err(SqlError.unsupported("CREATE \{upper(this.peek().text)}"));
     }
     return Result.Err(this.fail("expected TABLE or INDEX"));
+  }
+
+  Result<CreateTrigger, SqlError> createTrigger(this) {
+    bool ine = this.ifNotExists();
+    i32 nameStart = this.peek().start;
+    string n = try this.qualifiedName();
+    string timing = "BEFORE";
+    if (this.eatKw("BEFORE")) { timing = "BEFORE"; }
+    else if (this.eatKw("AFTER")) { timing = "AFTER"; }
+    else if (this.eatKw("INSTEAD")) { try this.expectKw("OF"); timing = "INSTEAD OF"; }
+    string event = "";
+    string[] ofCols = string[]();
+    if (this.eatKw("DELETE")) { event = "DELETE"; }
+    else if (this.eatKw("INSERT")) { event = "INSERT"; }
+    else if (this.eatKw("UPDATE")) {
+      event = "UPDATE";
+      if (this.eatKw("OF")) {
+        Vec<string> cs;
+        while (true) {
+          cs.push(try this.name());
+          if (!this.eatOp(",")) { break; }
+        }
+        ofCols = cs.toArray();
+      }
+    } else {
+      return Result.Err(this.fail("expected DELETE, INSERT or UPDATE"));
+    }
+    try this.expectKw("ON");
+    string t = try this.qualifiedName();
+    if (this.eatKw("FOR")) {
+      try this.expectKw("EACH");
+      try this.expectKw("ROW");
+    }
+    Expr? when = null;
+    if (this.eatKw("WHEN")) { when = try this.expr(); }
+    try this.expectKw("BEGIN");
+    Vec<Stmt> body;
+    while (!this.isKw("END")) {
+      if (this.peek().kind == T_EOF) { return Result.Err(this.fail("expected END")); }
+      body.push(try this.statement());
+      try this.expectOp(";");
+    }
+    this.pos++;
+    string sql = "CREATE TRIGGER " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
+    return Result.Ok(CreateTrigger(n, ine, timing, event, ofCols, t, when, body.toArray(), sql));
   }
 
   bool ifNotExists(this) {

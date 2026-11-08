@@ -11,7 +11,7 @@ import { Chunked } from "./chunked.wac";
 import { parseOne } from "./parser.wac";
 import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef, TableConstraint, ForeignKeyDef } from "./ast.wac";
 import { lower, upper } from "./lexer.wac";
-import { Column, Row, Index, Entry, Table, View, SchemaEntry, ForeignKey, affinityOf, AFF_REAL } from "./schema.wac";
+import { Column, Row, Index, Entry, Table, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_REAL } from "./schema.wac";
 
 // What version of SQLite the file claims was the last to write it. Readers only print it.
 static i64 SQLITE_VERSION_NUMBER = 3045000;
@@ -21,6 +21,7 @@ export struct Database {
   Map<string, Table> tables;      // keyed by lower-case name
   Map<string, Index> indexes;
   Map<string, View> views;
+  Map<string, Trigger> triggers;
   i32 pageSize;
   i64 changeCounter;
   i64 schemaCookie;
@@ -34,7 +35,7 @@ export struct Database {
 
   Database empty() {
     return Database { order: Vec.create(), tables: Map.create(hashString, stringEq), indexes: Map.create(hashString, stringEq),
-                      views: Map.create(hashString, stringEq), pageSize: 4096, changeCounter: 0, schemaCookie: 0, userVersion: 0, applicationId: 0,
+                      views: Map.create(hashString, stringEq), triggers: Map.create(hashString, stringEq), pageSize: 4096, changeCounter: 0, schemaCookie: 0, userVersion: 0, applicationId: 0,
                       ixCache: Map.create(hashString, stringEq) };
   }
 
@@ -43,6 +44,21 @@ export struct Database {
   Index? index(this, string name) { return this.indexes.get(lower(name)); }
 
   View? view(this, string name) { return this.views.get(lower(name)); }
+
+  Trigger? trigger(this, string name) { return this.triggers.get(lower(name)); }
+
+  // The triggers on a table or view for one timing and event, newest first: the order SQLite fires them.
+  Trigger[] triggersOn(this, string table, string timing, string event) {
+    Vec<Trigger> out;
+    string t = lower(table);
+    for (i32 i = this.order.len() - 1; i >= 0; i--) {
+      SchemaEntry e = this.order.get(i);
+      if (e.kind != "trigger" || lower(e.table) != t) { continue; }
+      Trigger tr = this.triggers.get(lower(e.name))!;
+      if (tr.def.timing == timing && tr.def.event == event) { out.push(tr); }
+    }
+    return out.toArray();
+  }
 
   // The indexes on a table, in schema order — the order SQLite checks uniqueness in.
   Index[] indexesOf(this, string table) {
@@ -357,6 +373,12 @@ export Result<Database, SqlError> openBytes(u8[] data) {
       } else if (db.index(name) is null) {
         return Result.Err(SqlError.corrupt("\{name} matches no constraint of its table"));
       }
+    } else if (kind == "trigger") {
+      if (sql is null) { return Result.Err(SqlError.corrupt("trigger \{name} has no sql")); }
+      match ((try parseOne(sql!)).stmt) {
+        CreateTriggerStmt(t): { db.triggers.set(lower(name), Trigger(t)); }
+        default: { return Result.Err(SqlError.corrupt("schema entry for \{name} is not CREATE TRIGGER")); }
+      }
     } else if (kind == "view") {
       if (sql is null) { return Result.Err(SqlError.corrupt("view \{name} has no sql")); }
       match ((try parseOne(sql!)).stmt) {
@@ -428,6 +450,10 @@ export u8[] toBytes(Database db) {
       buildTable(ps, roots[i], ids, recs);
       schemaRecs.push(encodeRecord([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
                                     Value.Int(roots[i]), Value.Text(t.sql)]));
+    } else if (e.kind == "trigger") {
+      Trigger tr = db.trigger(e.name)!;
+      schemaRecs.push(encodeRecord([Value.Text("trigger"), Value.Text(tr.def.name), Value.Text(tr.def.table),
+                                    Value.Int(0), Value.Text(tr.def.sql)]));
     } else if (e.kind == "view") {
       View v = db.view(e.name)!;
       schemaRecs.push(encodeRecord([Value.Text("view"), Value.Text(v.name), Value.Text(v.name),

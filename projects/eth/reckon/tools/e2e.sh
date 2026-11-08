@@ -15,11 +15,15 @@ keys=$work/keys; stmts=$work/stmts; mirror=$work/mirror; evil=$work/mirror-evil
 mkdir -p "$keys" "$stmts" "$mirror" "$evil"
 pass=0; fail=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-expect() {  # expect ok|refused DESCRIPTION -- command…
-  want=$1; what=$2; shift 3
+expect() {  # expect ok|refused DESCRIPTION [BECAUSE] -- command…   (BECAUSE: a phrase the output must contain)
+  want=$1; what=$2; because=""; shift 2
+  if [ "$1" != "--" ]; then because=$1; shift; fi
+  shift
   if out=$("$@" 2>&1); then got=ok; else got=refused; fi
   printf '%s\n' "$out" | sed 's/^/   | /'
-  if [ "$got" = "$want" ]; then pass=$((pass+1)); echo "   PASS ($what: $got)"; else fail=$((fail+1)); echo "   FAIL ($what: wanted $want, got $got)"; fi
+  if [ "$got" != "$want" ]; then fail=$((fail+1)); echo "   FAIL ($what: wanted $want, got $got)"
+  elif [ -n "$because" ] && ! printf '%s' "$out" | grep -qF -- "$because"; then fail=$((fail+1)); echo "   FAIL ($what: $got, but not because \"$because\")"
+  else pass=$((pass+1)); echo "   PASS ($what: $got${because:+, because \"$because\"})"; fi
 }
 
 step "a devnet: wacuum --dev, its state proved by its own eth_getProof"
@@ -76,7 +80,7 @@ P="--policy $work/trust.json5"
 pub=$addr_publisher
 
 step "1. the command-line app: resolved, decided, fetched, hash-checked, run holding nothing"
-expect ok "run hello" -- $W run "hello@$pub" $P --mirror "$mirror" -- world
+expect ok "run hello" "hello from a verified module, world" -- $W run "hello@$pub" $P --mirror "$mirror" -- world
 step "2. the web app: the same, and the checked bytes written out to open from file://"
 expect ok "run notes" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
 cmp "$work/notes-verified/index.html" examples/notes/dist/index.html && echo "   the page written is the page built"
@@ -84,39 +88,39 @@ cmp "$work/notes-verified/index.html" examples/notes/dist/index.html && echo "  
 step "3. a mirror serving other bytes is ignored when another has the right ones, and refused when it is the only one"
 mkdir -p "$evil/blobs"; cp -r "$mirror/statements" "$evil/"
 h=${hello#kb1:}; cp examples/notes/dist/index.html "$evil/blobs/$h"
-expect ok "evil mirror first, honest second" -- $W run "hello@$pub" $P --mirror "$evil" --mirror "$mirror"
-expect refused "evil mirror only" -- $W run "hello@$pub" $P --mirror "$evil"
+expect ok "evil mirror first, honest second" "hello from a verified module" -- $W run "hello@$pub" $P --mirror "$evil" --mirror "$mirror"
+expect refused "evil mirror only" "do not hash to" -- $W run "hello@$pub" $P --mirror "$evil"
 step "   ...and the same mirror over HTTP"
 ( cd "$mirror" && exec python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 ) & http_pid=$!
-sleep 1
+until curl -s -m1 -o /dev/null http://127.0.0.1:8765/; do sleep 0.2; done
 expect ok "honest mirror over http" -- $W run "hello@$pub" $P --mirror http://127.0.0.1:8765
 
 step "4. a forged statement: rebuilder2's signature over a different output"
 python3 - "$stmts/hello.rebuilder2.json" "$work/forged.json" <<'PY'
 import sys, json; s = json.load(open(sys.argv[1])); s["output"] = "kb1:" + "ee" * 32; open(sys.argv[2], "w").write(json.dumps(s, separators=(",", ":")))
 PY
-expect refused "verify a forged statement" -- $W verify "$work/forged.json"
+expect refused "verify a forged statement" "as it claims" -- $W verify "$work/forged.json"
 
 step "5. a stranger's statements count for nothing"
 $W build --dir examples/hello --path hello.wasm --toolchain "$toolchain" --key "$keys/thief" --out "$work/thief.json" -- wac build hello.wac -o hello >/dev/null 2>&1
 $W publish "$work/mirror-thief" --blob examples/hello/hello.wasm --statement "$work/thief.json" --statement "$stmts/hello.rebuilder1.json" --statement "$stmts/source.review.json" >/dev/null
-expect refused "one rebuilder and a stranger" -- $W run "$hello" $P --mirror "$work/mirror-thief"
+expect refused "one rebuilder and a stranger" "built by rebuilder1 (need 2)" -- $W run "$hello" $P --mirror "$work/mirror-thief"
 
 step "6. a rebuilder revokes: the quorum is gone"
 id=$($W verify "$stmts/hello.rebuilder2.json" | sed 's/.*id 0x//')
 $wallet revoke "$keys/rebuilder2" "$registry" "$id"
-expect refused "run hello after rebuilder2 revoked" -- $W run "hello@$pub" $P --mirror "$mirror"
+expect refused "run hello after rebuilder2 revoked" "rebuilder2 revoked statement" -- $W run "hello@$pub" $P --mirror "$mirror"
 expect ok "notes is not affected" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
 
 step "7. a node that hides that revocation is caught by the proof"
 node "$here/tools/liar.mjs" 8546 8545 & liar_pid=$!
-sleep 0.5
+until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:8546/ >/dev/null; do sleep 0.2; done
 sed 's/127.0.0.1:8545/127.0.0.1:8546/' "$work/trust.json5" > "$work/trust-liar.json5"
-expect refused "run hello by hash through the lying node" -- $W run "$hello" --policy "$work/trust-liar.json5" --mirror "$mirror"
+expect refused "run hello by hash through the lying node" "the proof ends where" -- $W run "$hello" --policy "$work/trust-liar.json5" --mirror "$mirror"
 
 step "8. a deny list you follow names the web app"
 $wallet deny "$keys/denylist" "$registry" "$notes" on
-expect refused "run notes on the deny list" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
+expect refused "run notes on the deny list" "is on a deny list you follow" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
 $wallet deny "$keys/denylist" "$registry" "$notes" off
 expect ok "taken off the list again" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
 
@@ -124,25 +128,25 @@ step "9. the publisher's key is stolen and the name pointed at other code"
 cp examples/hello/hello.wasm "$work/evil.wasm"; printf 'evil' >> "$work/evil.wasm"
 evilid=$($W blob "$work/evil.wasm"); $W publish "$mirror" --blob "$work/evil.wasm" >/dev/null
 $wallet propose "$keys/publisher" "$registry" notes "$evilid"
-expect ok "during the delay the old page is still what notes means" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
+expect ok "during the delay the old page is still what notes means" "not followed yet" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
 echo "   waiting out the 20 s delay"; sleep 22
-expect refused "after the delay: the name moved, but no rebuilder vouches for it" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
+expect refused "after the delay: the name moved, but no rebuilder vouches for it" "no statement from a signer you trust" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
 
 step "10. a name its publisher can move without notice is not followed"
 $wallet claim "$keys/publisher" "$registry" quick "$hello" 0
-expect refused "resolve quick (delay 0 < min_delay 10)" -- $W resolve "quick@$pub" $P
+expect refused "resolve quick (delay 0 < min_delay 10)" "the policy wants at least 10s" -- $W resolve "quick@$pub" $P
 
 step "11. no current answer from the chain: refused, because on_stale is refuse"
 sed 's/127.0.0.1:8545/127.0.0.1:8599/' "$work/trust.json5" > "$work/trust-down.json5"
-expect refused "run by hash with the chain unreachable" -- $W run "$notes" --policy "$work/trust-down.json5" --mirror "$mirror" --out "$work/notes-verified"
+expect refused "run by hash with the chain unreachable" "ECONNREFUSED" -- $W run "$notes" --policy "$work/trust-down.json5" --mirror "$mirror" --out "$work/notes-verified"
 
 step "12. the registry's address running other code is refused"
 sed "s/$codehash/0x$(printf 'ab%.0s' $(seq 32))/" "$work/trust.json5" > "$work/trust-code.json5"
-expect refused "a code hash that is not the registry's" -- $W check "$notes" --policy "$work/trust-code.json5" --mirror "$mirror"
+expect refused "a code hash that is not the registry's" "runs other code" -- $W check "$notes" --policy "$work/trust-code.json5" --mirror "$mirror"
 
 step "13. a dependency: wac-web's tree, as notes' lock pins it, reviewed"
 web=$(sed -n 's/.*"web": {[^}]*"tree": "\(kt1:[0-9a-f]*\)".*/\1/p' examples/notes/wac.lock)
-expect refused "unreviewed dependency" -- $W check "$web" $P --purpose dependency --mirror "$mirror"
+expect refused "unreviewed dependency" "reviewed by nobody" -- $W check "$web" $P --purpose dependency --mirror "$mirror"
 $W review "$web" "the page library" --key "$keys/reviewer" --out "$stmts/web.review.json" >/dev/null
 $W publish "$mirror" --statement "$stmts/web.review.json" >/dev/null
 expect ok "reviewed dependency" -- $W check "$web" $P --purpose dependency --mirror "$mirror"

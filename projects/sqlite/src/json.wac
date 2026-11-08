@@ -267,7 +267,7 @@ export Value sqlOf(const Json j) {
   }
 }
 
-Value numValue(string raw) {
+export Value numValue(string raw) {
   bool integral = raw.indexOf(".") < 0 && raw.indexOf("e") < 0 && raw.indexOf("E") < 0;
   if (integral) {
     bool neg = raw.slice(0, 1) == "-";
@@ -461,4 +461,161 @@ export string jsonType(const Json j) {
     JNum(raw): raw.indexOf(".") < 0 && raw.indexOf("e") < 0 && raw.indexOf("E") < 0 ? "integer" : "real",
     JStr: "text", JArr: "array", JObj: "object",
   };
+}
+
+// ── reading a value out of JSON text without building a tree ───────────────
+
+i32 skipWs(const u8[] b, i32 i) {
+  while (i < b.len() && (b[i] == ' ' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r')) { i++; }
+  return i;
+}
+
+// Past a string starting at its opening quote, or -1 when it is malformed.
+i32 skipString(const u8[] b, i32 i) {
+  i++;
+  while (i < b.len()) {
+    u8 c = b[i];
+    if (c == '"') { return i + 1; }
+    if (c < 0x20) { return -1; }
+    if (c == '\\') {
+      if (i + 1 >= b.len()) { return -1; }
+      u8 e = b[i + 1];
+      if (e == 'u') {
+        for (i32 k = 2; k <= 5; k++) { if (i + k >= b.len() || !isHexByte(b[i + k])) { return -1; } }
+        i += 6;
+        continue;
+      }
+      if (e != '"' && e != '\\' && e != '/' && e != 'b' && e != 'f' && e != 'n' && e != 'r' && e != 't') { return -1; }
+      i += 2;
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+bool isDigitByte(u8 c) { return c >= '0' && c <= '9'; }
+
+i32 skipNumber(const u8[] b, i32 i) {
+  if (i < b.len() && b[i] == '-') { i++; }
+  i32 d = i;
+  while (i < b.len() && isDigitByte(b[i])) { i++; }
+  if (i == d || (b[d] == '0' && i - d > 1)) { return -1; }
+  if (i < b.len() && b[i] == '.') {
+    i++;
+    i32 f = i;
+    while (i < b.len() && isDigitByte(b[i])) { i++; }
+    if (i == f) { return -1; }
+  }
+  if (i < b.len() && (b[i] == 'e' || b[i] == 'E')) {
+    i++;
+    if (i < b.len() && (b[i] == '+' || b[i] == '-')) { i++; }
+    i32 f = i;
+    while (i < b.len() && isDigitByte(b[i])) { i++; }
+    if (i == f) { return -1; }
+  }
+  return i;
+}
+
+bool word(const u8[] b, i32 i, string w) {
+  u8[] x = w.toBytes();
+  if (i + x.len() > b.len()) { return false; }
+  for (i32 k = 0; k < x.len(); k++) { if (b[i + k] != x[k]) { return false; } }
+  return true;
+}
+
+// Past one value starting at `i`, checking it is well formed, or -1.
+i32 skipValue(const u8[] b, i32 i, i32 depth) {
+  if (depth > 1000 || i >= b.len()) { return -1; }
+  u8 c = b[i];
+  if (c == '"') { return skipString(b, i); }
+  if (c == '{' || c == '[') {
+    bool obj = c == '{';
+    i = skipWs(b, i + 1);
+    if (i < b.len() && b[i] == (obj ? '}' : ']')) { return i + 1; }
+    while (true) {
+      if (obj) {
+        if (i >= b.len() || b[i] != '"') { return -1; }
+        i = skipString(b, i);
+        if (i < 0) { return -1; }
+        i = skipWs(b, i);
+        if (i >= b.len() || b[i] != ':') { return -1; }
+        i = skipWs(b, i + 1);
+      }
+      i = skipValue(b, i, depth + 1);
+      if (i < 0) { return -1; }
+      i = skipWs(b, i);
+      if (i >= b.len()) { return -1; }
+      if (b[i] == ',') { i = skipWs(b, i + 1); continue; }
+      if (b[i] == (obj ? '}' : ']')) { return i + 1; }
+      return -1;
+    }
+  }
+  if (c == 't') { return word(b, i, "true") ? i + 4 : -1; }
+  if (c == 'f') { return word(b, i, "false") ? i + 5 : -1; }
+  if (c == 'n') { return word(b, i, "null") ? i + 4 : -1; }
+  return skipNumber(b, i);
+}
+
+bool rawKeyIs(const u8[] b, i32 start, i32 end, const u8[] key) {
+  if (end - start != key.len()) { return false; }
+  for (i32 k = 0; k < key.len(); k++) { if (b[start + k] != key[k]) { return false; } }
+  return true;
+}
+
+// json_extract with one path, reading the text in place. Null when this cannot answer (malformed text,
+// escaped keys, counting from the end), and the caller then takes the general road, which also
+// produces the right error.
+export Value? extractFast(string text, const Step[] path) {
+  u8[] b = text.toBytes();
+  i32 start = skipWs(b, 0);
+  i32 end = skipValue(b, start, 0);
+  if (end < 0 || skipWs(b, end) != b.len()) { return null; }
+  i32 i = start;
+  for (i32 k = 0; k < path.len(); k++) {
+    const Step s = path[k];
+    if (s.key is not null) {
+      if (b[i] != '{') { return Value.Null; }
+      u8[] key = s.key!.toBytes();
+      i = skipWs(b, i + 1);
+      bool found = false;
+      while (b[i] != '}') {
+        i32 ks = i;
+        i32 ke = skipString(b, i);
+        for (i32 q = ks + 1; q < ke - 1; q++) { if (b[q] == '\\') { return null; } }
+        i = skipWs(b, skipWs(b, ke) + 1);
+        if (rawKeyIs(b, ks + 1, ke - 1, key)) { found = true; break; }
+        i = skipWs(b, skipValue(b, i, 0));
+        if (b[i] == ',') { i = skipWs(b, i + 1); }
+      }
+      if (!found) { return Value.Null; }
+    } else {
+      if (s.fromEnd) { return null; }
+      if (b[i] != '[') { return Value.Null; }
+      i = skipWs(b, i + 1);
+      i32 n = 0;
+      bool found = false;
+      while (b[i] != ']') {
+        if (n == s.index) { found = true; break; }
+        i = skipWs(b, skipValue(b, i, 0));
+        if (b[i] == ',') { i = skipWs(b, i + 1); }
+        n++;
+      }
+      if (!found) { return Value.Null; }
+    }
+  }
+  u8 c = b[i];
+  i32 e = skipValue(b, i, 0);
+  if (c == '"') {
+    string raw = string.fromBytes(sliceOf(b, i + 1, e - 1));
+    return Value.Text(unescape(raw));
+  }
+  if (c == 't') { return Value.Int(1); }
+  if (c == 'f') { return Value.Int(0); }
+  if (c == 'n') { return Value.Null; }
+  if (c == '{' || c == '[') {
+    Json? j = parseJson(string.fromBytes(sliceOf(b, i, e)));
+    return j is null ? null : Value.Text(jsonText(j!));
+  }
+  return numValue(string.fromBytes(sliceOf(b, i, e)));
 }

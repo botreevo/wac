@@ -7,6 +7,7 @@ import { encodeRecord } from "./record.wac";
 import { put16, put32 } from "./bytes.wac";
 import { openImage, Image, readTable, RawRow, decode, MAGIC } from "./reader.wac";
 import { Pages, buildTable, buildIndex } from "./writer.wac";
+import { Chunked } from "./chunked.wac";
 import { parseOne } from "./parser.wac";
 import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef } from "./ast.wac";
 import { lower, upper } from "./lexer.wac";
@@ -24,9 +25,16 @@ export struct Database {
   i64 schemaCookie;
   i64 userVersion;
   i64 applicationId;
+  // indexesOf's answers, valid while `order` is the same list at the same length: every schema change
+  // either appends to it or replaces it.
+  Vec<SchemaEntry>? cacheOrder;
+  i32 cacheLen = 0;
+  Map<string, Index[]> ixCache;
 
   Database empty() {
-    return Database(Vec.create(), Map.create(hashString, stringEq), Map.create(hashString, stringEq), 4096, 0, 0, 0, 0);
+    return Database { order: Vec.create(), tables: Map.create(hashString, stringEq), indexes: Map.create(hashString, stringEq),
+                      pageSize: 4096, changeCounter: 0, schemaCookie: 0, userVersion: 0, applicationId: 0,
+                      ixCache: Map.create(hashString, stringEq) };
   }
 
   Table? table(this, string name) { return this.tables.get(lower(name)); }
@@ -35,6 +43,19 @@ export struct Database {
 
   // The indexes on a table, in schema order — the order SQLite checks uniqueness in.
   Index[] indexesOf(this, string table) {
+    if (this.cacheOrder is null || this.cacheOrder! is not this.order || this.cacheLen != this.order.len()) {
+      this.ixCache.clear();
+      this.cacheOrder = this.order;
+      this.cacheLen = this.order.len();
+    }
+    Index[]? hit = this.ixCache.get(table);
+    if (hit is not null) { return hit!; }
+    Index[] found = this.findIndexes(table);
+    this.ixCache.set(table, found);
+    return found;
+  }
+
+  Index[] findIndexes(this, string table) {
     Vec<Index> out;
     string t = lower(table);
     for (i32 i = 0; i < this.order.len(); i++) {
@@ -121,7 +142,7 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
 }
 
 Index autoIndex(string table, i32 n, i32[] cols) {
-  return Index("sqlite_autoindex_\{table}_\{n}", table, null, cols, bool[].filled(cols.len(), false), true, Vec.create());
+  return Index("sqlite_autoindex_\{table}_\{n}", table, null, cols, bool[].filled(cols.len(), false), true, Chunked<Value[]>.create());
 }
 
 export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
@@ -133,7 +154,7 @@ export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
     desc[i] = c.cols[i].desc;
   }
   if (c.where is not null) { return Result.Err(SqlError.unsupported("partial indexes")); }
-  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, c.unique, Vec.create()));
+  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, c.unique, Chunked<Value[]>.create()));
 }
 
 // A row as the file has it, widened to the table's columns: a row written before ALTER TABLE ADD COLUMN
@@ -164,7 +185,7 @@ export void rebuildIndex(Index ix, Table t) {
   for (i32 i = 0; i < t.rows.len(); i++) { all.push(ix.entryFor(t.rows.get(i))); }
   Value[][] arr = all.toArray();
   sortEntries(ix, arr);
-  ix.entries = Vec.fromArray(arr);
+  ix.entries = Chunked.fromArray(arr);
 }
 
 // A merge sort, stable, over index entries.

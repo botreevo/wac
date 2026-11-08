@@ -6,7 +6,7 @@ import { Value, compareValues } from "./value.wac";
 import { textOf, toNumeric, toInt, toReal, isNull, typeName, exactInt } from "./ops.wac";
 import { formatReal, hexOf } from "./format.wac";
 import { lower, upper } from "./lexer.wac";
-import { Json, parseJson, jsonText, jsonOf, sqlOf, parsePath, lookup, setPath, removePath, Step, jsonType, escape } from "./json.wac";
+import { Json, parseJson, jsonText, jsonOf, sqlOf, parsePath, lookup, setPath, removePath, Step, jsonType, escape, extractFast } from "./json.wac";
 
 // Codepoints of UTF-8 text, for the functions that count characters rather than bytes.
 export i32[] codepoints(string s) {
@@ -185,6 +185,22 @@ export struct FnEnv {
   i64 lastInsertRowid;
   u8[] randomBytes;     // a pool random() and randomblob() draw from
   i32 randomAt;
+  // The last JSON path parsed: a query applies the same one to every row.
+  string lastPath = "";
+  Step[] lastSteps;
+
+  Result<Step[], SqlError> path(this, const Value v) {
+    match (v) {
+      Text(s): {
+        if (s == this.lastPath && s != "") { return Result.Ok(this.lastSteps); }
+        Step[] p = try pathArg(v);
+        this.lastPath = s;
+        this.lastSteps = p;
+        return Result.Ok(p);
+      }
+      default: { return pathArg(v); }
+    }
+  }
 }
 
 i64 nextRandom(FnEnv env) {
@@ -223,39 +239,52 @@ export string timestampOf(i64 millis, bool date, bool time) {
   return date ? dateOf(days) : t;
 }
 
-export Result<Value, SqlError> callScalar(string name, const Value[] a, const bool[] isJson, FnEnv env) {
-  if (name == "coalesce" || name == "ifnull") {
+// Every name callScalar answers, by the number it dispatches on: comparing integers per row is cheaper
+// than comparing strings.
+static string[] FUNCTION_IDS = ["coalesce", "ifnull", "nullif", "iif", "max", "min", "typeof", "random", "randomblob", "changes", "total_changes", "last_insert_rowid", "sqlite_version", "current_timestamp", "current_date", "current_time", "json_object", "json_array", "char", "printf", "format", "json_valid", "length", "octet_length", "lower", "upper", "abs", "sign", "hex", "quote", "unicode", "zeroblob", "round", "substr", "substring", "instr", "replace", "trim", "ltrim", "rtrim", "like", "glob", "unhex", "json", "json_extract", "->", "->>", "json_set", "json_insert", "json_replace", "json_remove", "json_type", "json_array_length"];
+
+export static i32 FID_COALESCE = 0;
+export static i32 FID_IFNULL = 1;
+export static i32 FID_IIF = 3;
+
+export i32 functionId(string name) {
+  for (i32 i = 0; i < FUNCTION_IDS.len(); i++) { if (FUNCTION_IDS[i] == name) { return i; } }
+  return -1;
+}
+
+export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a, const bool[] isJson, FnEnv env) {
+  if (fid == 0 || fid == 1) {
     for (i32 i = 0; i < a.len(); i++) { if (!isNull(a[i])) { return Result.Ok(a[i] as Value); } }
     return Result.Ok(Value.Null);
   }
-  if (name == "nullif") { return Result.Ok(compareValues(a[0], a[1]) == 0 && !isNull(a[0]) ? Value.Null : a[0] as Value); }
-  if (name == "iif") { return Result.Ok(toReal(a[0]) != 0.0 && !isNull(a[0]) ? a[1] as Value : a[2] as Value); }
-  if (name == "max" || name == "min") {
+  if (fid == 2) { return Result.Ok(compareValues(a[0], a[1]) == 0 && !isNull(a[0]) ? Value.Null : a[0] as Value); }
+  if (fid == 3) { return Result.Ok(toReal(a[0]) != 0.0 && !isNull(a[0]) ? a[1] as Value : a[2] as Value); }
+  if (fid == 4 || fid == 5) {
     Value best = a[0] as Value;
     for (i32 i = 0; i < a.len(); i++) {
       if (isNull(a[i])) { return Result.Ok(Value.Null); }
       i32 c = compareValues(a[i], best);
-      if ((name == "max" && c > 0) || (name == "min" && c < 0)) { best = a[i] as Value; }
+      if ((fid == 4 && c > 0) || (fid == 5 && c < 0)) { best = a[i] as Value; }
     }
     return Result.Ok(best);
   }
-  if (name == "typeof") { return Result.Ok(Value.Text(typeName(a[0]))); }
-  if (name == "random") { return Result.Ok(Value.Int(nextRandom(env))); }
-  if (name == "randomblob") {
+  if (fid == 6) { return Result.Ok(Value.Text(typeName(a[0]))); }
+  if (fid == 7) { return Result.Ok(Value.Int(nextRandom(env))); }
+  if (fid == 8) {
     i64 n = toInt(a[0]);
     if (n < 1) { n = 1; }
     u8[] out = u8[].filled(n as! i32, 0);
     for (i32 i = 0; i < out.len(); i++) { out[i] = nextRandom(env) as@ u8; }
     return Result.Ok(Value.Blob(out));
   }
-  if (name == "changes") { return Result.Ok(Value.Int(env.changes)); }
-  if (name == "total_changes") { return Result.Ok(Value.Int(env.totalChanges)); }
-  if (name == "last_insert_rowid") { return Result.Ok(Value.Int(env.lastInsertRowid)); }
-  if (name == "sqlite_version") { return Result.Ok(Value.Text("3.45.0")); }
-  if (name == "current_timestamp") { return Result.Ok(Value.Text(timestampOf(env.nowMillis, true, true))); }
-  if (name == "current_date") { return Result.Ok(Value.Text(timestampOf(env.nowMillis, true, false))); }
-  if (name == "current_time") { return Result.Ok(Value.Text(timestampOf(env.nowMillis, false, true))); }
-  if (name == "json_object") {
+  if (fid == 9) { return Result.Ok(Value.Int(env.changes)); }
+  if (fid == 10) { return Result.Ok(Value.Int(env.totalChanges)); }
+  if (fid == 11) { return Result.Ok(Value.Int(env.lastInsertRowid)); }
+  if (fid == 12) { return Result.Ok(Value.Text("3.45.0")); }
+  if (fid == 13) { return Result.Ok(Value.Text(timestampOf(env.nowMillis, true, true))); }
+  if (fid == 14) { return Result.Ok(Value.Text(timestampOf(env.nowMillis, true, false))); }
+  if (fid == 15) { return Result.Ok(Value.Text(timestampOf(env.nowMillis, false, true))); }
+  if (fid == 16) {
     if (a.len() % 2 != 0) { return Result.Err(SqlError("error", "json_object() requires an even number of arguments")); }
     Vec<string> keys;
     Vec<Json> vals;
@@ -268,23 +297,23 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
     }
     return Result.Ok(Value.Text(jsonText(Json.JObj(keys, vals))));
   }
-  if (name == "json_array") {
+  if (fid == 17) {
     Vec<Json> items;
     for (i32 i = 0; i < a.len(); i++) { items.push(try asMember(a[i], isJson[i])); }
     return Result.Ok(Value.Text(jsonText(Json.JArr(items))));
   }
-  if (name == "char") {
+  if (fid == 18) {
     Buf out = Buf.create();
     for (i32 i = 0; i < a.len(); i++) { out.pushCodepoint(toInt(a[i]) as~ i32); }
     return Result.Ok(Value.Text(out.toStr()));
   }
-  if (name == "printf" || name == "format") { return Result.Err(SqlError.unsupported("printf")); }
+  if (fid == 19 || fid == 20) { return Result.Err(SqlError.unsupported("printf")); }
   // Everything below is NULL for a NULL first argument.
   if (isNull(a[0])) {
-    if (name == "json_valid") { return Result.Ok(Value.Null); }
+    if (fid == 21) { return Result.Ok(Value.Null); }
     return Result.Ok(Value.Null);
   }
-  if (name == "length") {
+  if (fid == 22) {
     return match (a[0]) {
       Blob(b): Result.Ok(Value.Int(b.len() as i64)),
       Int: Result.Ok(Value.Int(codepoints(textOf(a[0])).len() as i64)),
@@ -292,12 +321,12 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
       default: Result.Ok(Value.Int(codepoints(textOf(a[0])).len() as i64)),
     };
   }
-  if (name == "octet_length") {
+  if (fid == 23) {
     return match (a[0]) { Blob(b): Result.Ok(Value.Int(b.len() as i64)), default: Result.Ok(Value.Int(textOf(a[0]).len() as i64)) };
   }
-  if (name == "lower") { return Result.Ok(Value.Text(lower(textOf(a[0])))); }
-  if (name == "upper") { return Result.Ok(Value.Text(upper(textOf(a[0])))); }
-  if (name == "abs") {
+  if (fid == 24) { return Result.Ok(Value.Text(lower(textOf(a[0])))); }
+  if (fid == 25) { return Result.Ok(Value.Text(upper(textOf(a[0])))); }
+  if (fid == 26) {
     match (toNumeric(a[0])) {
       Int(i): {
         if (i == -9223372036854775807 - 1) { return Result.Err(SqlError("error", "integer overflow")); }
@@ -307,26 +336,26 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
       default: { return Result.Ok(Value.Null); }
     }
   }
-  if (name == "sign") {
+  if (fid == 27) {
     f64 r = toReal(a[0]);
     return Result.Ok(Value.Int(r > 0.0 ? 1 : (r < 0.0 ? -1 : 0)));
   }
-  if (name == "hex") {
+  if (fid == 28) {
     return match (a[0]) { Blob(b): Result.Ok(Value.Text(hexOf(b))), default: Result.Ok(Value.Text(hexOf(textOf(a[0]).toBytes()))) };
   }
-  if (name == "quote") {
+  if (fid == 29) {
     return match (a[0]) {
       Text(s): Result.Ok(Value.Text("'" + replaceText(s, "'", "''") + "'")),
       Blob(b): Result.Ok(Value.Text("X'" + hexOf(b) + "'")),
       default: Result.Ok(Value.Text(textOf(a[0]))),
     };
   }
-  if (name == "unicode") {
+  if (fid == 30) {
     i32[] cps = codepoints(textOf(a[0]));
     return Result.Ok(cps.len() == 0 ? Value.Null : Value.Int(cps[0] as i64));
   }
-  if (name == "zeroblob") { return Result.Ok(Value.Blob(u8[].filled(toInt(a[0]) as! i32, 0))); }
-  if (name == "round") {
+  if (fid == 31) { return Result.Ok(Value.Blob(u8[].filled(toInt(a[0]) as! i32, 0))); }
+  if (fid == 32) {
     i64 digits = a.len() > 1 ? toInt(a[1]) : 0;
     f64 r = toReal(a[0]);
     if (digits < 0) { digits = 0; }
@@ -336,7 +365,7 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
     f64 rounded = x < 0.0 ? -((-x + 0.5).floor()) : (x + 0.5).floor();
     return Result.Ok(Value.Real(rounded / m));
   }
-  if (name == "substr" || name == "substring") {
+  if (fid == 33 || fid == 34) {
     if (isNull(a[1]) || (a.len() > 2 && isNull(a[2]))) { return Result.Ok(Value.Null); }
     bool blob = match (a[0]) { Blob: true, default: false };
     i64 start = toInt(a[1]);
@@ -362,27 +391,27 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
     }
     return Result.Ok(Value.Text(fromCodepoints(cps, s0 as! i32, e0 as! i32)));
   }
-  if (name == "instr") {
+  if (fid == 35) {
     if (isNull(a[1])) { return Result.Ok(Value.Null); }
     string h = textOf(a[0]);
     i32 at = h.indexOf(textOf(a[1]));
     if (at < 0) { return Result.Ok(Value.Int(0)); }
     return Result.Ok(Value.Int((codepoints(h.slice(0, at)).len() + 1) as i64));
   }
-  if (name == "replace") {
+  if (fid == 36) {
     if (isNull(a[1]) || isNull(a[2])) { return Result.Ok(Value.Null); }
     return Result.Ok(Value.Text(replaceText(textOf(a[0]), textOf(a[1]), textOf(a[2]))));
   }
-  if (name == "trim" || name == "ltrim" || name == "rtrim") {
+  if (fid == 37 || fid == 38 || fid == 39) {
     i32[] s = codepoints(textOf(a[0]));
     i32[] set = a.len() > 1 ? codepoints(textOf(a[1])) : [32];
     i32 lo = 0;
     i32 hi = s.len();
-    if (name != "rtrim") { while (lo < hi && inSet(set, s[lo])) { lo++; } }
-    if (name != "ltrim") { while (hi > lo && inSet(set, s[hi - 1])) { hi--; } }
+    if (fid != 39) { while (lo < hi && inSet(set, s[lo])) { lo++; } }
+    if (fid != 38) { while (hi > lo && inSet(set, s[hi - 1])) { hi--; } }
     return Result.Ok(Value.Text(fromCodepoints(s, lo, hi)));
   }
-  if (name == "like" || name == "glob") {
+  if (fid == 40 || fid == 41) {
     // like(pattern, value[, escape]) — the function form puts the pattern first.
     if (isNull(a[1])) { return Result.Ok(Value.Null); }
     i32 esc = -1;
@@ -393,10 +422,10 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
     }
     i32[] p = codepoints(textOf(a[0]));
     i32[] s = codepoints(textOf(a[1]));
-    bool m = name == "like" ? likeMatch(p, 0, s, 0, esc) : globMatch(p, 0, s, 0);
+    bool m = fid == 40 ? likeMatch(p, 0, s, 0, esc) : globMatch(p, 0, s, 0);
     return Result.Ok(Value.Int(m ? 1 : 0));
   }
-  if (name == "unhex") {
+  if (fid == 42) {
     u8[] h = textOf(a[0]).toBytes();
     if (h.len() % 2 != 0) { return Result.Ok(Value.Null); }
     u8[] out = u8[].filled(h.len() / 2, 0);
@@ -409,13 +438,23 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
     return Result.Ok(Value.Blob(out));
   }
   // JSON.
-  if (name == "json") { return Result.Ok(Value.Text(jsonText(try parseArg(a[0])))); }
-  if (name == "json_valid") {
+  if (fid == 43) { return Result.Ok(Value.Text(jsonText(try parseArg(a[0])))); }
+  if (fid == 21) {
     match (a[0]) { Text(s): { return Result.Ok(Value.Int(parseJson(s) is null ? 0 : 1)); } default: { return Result.Ok(Value.Int(isNumber(a[0]) ? 1 : 0)); } }
   }
-  if (name == "json_extract" || name == "->" || name == "->>") {
+  if (fid == 44 && a.len() == 2) {
+    match (a[0]) {
+      Text(text): {
+        Step[] p = try env.path(a[1]);
+        Value? fast = extractFast(text, p);
+        if (fast is not null) { return Result.Ok(fast!); }
+      }
+      default: {}
+    }
+  }
+  if (fid == 44 || fid == 45 || fid == 46) {
     Json root = try parseArg(a[0]);
-    if (name != "json_extract") {
+    if (fid != 44) {
       Value p = a[1] as Value;
       // `->` and `->>` take a bare key or index as well as a path.
       match (a[1]) {
@@ -425,7 +464,7 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
       }
       Json? hit = lookup(root, try pathArg(p));
       if (hit is null) { return Result.Ok(Value.Null); }
-      return Result.Ok(name == "->" ? Value.Text(jsonText(hit!)) : sqlOf(hit!));
+      return Result.Ok(fid == 45 ? Value.Text(jsonText(hit!)) : sqlOf(hit!));
     }
     if (a.len() == 2) {
       Json? hit = lookup(root, try pathArg(a[1]));
@@ -438,17 +477,17 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
     }
     return Result.Ok(Value.Text(jsonText(Json.JArr(items))));
   }
-  if (name == "json_set" || name == "json_insert" || name == "json_replace") {
+  if (fid == 47 || fid == 48 || fid == 49) {
     if (a.len() % 2 != 1) { return Result.Err(SqlError("error", "\{name}() needs an odd number of arguments")); }
     Json root = try parseArg(a[0]);
-    bool create = name != "json_replace";
-    bool replace = name != "json_insert";
+    bool create = fid != 49;
+    bool replace = fid != 48;
     for (i32 i = 1; i < a.len(); i += 2) {
       root = setPath(root, try pathArg(a[i]), try asMember(a[i + 1], isJson[i + 1]), create, replace);
     }
     return Result.Ok(Value.Text(jsonText(root)));
   }
-  if (name == "json_remove") {
+  if (fid == 50) {
     Json root = try parseArg(a[0]);
     for (i32 i = 1; i < a.len(); i++) {
       Step[] p = try pathArg(a[i]);
@@ -457,12 +496,12 @@ export Result<Value, SqlError> callScalar(string name, const Value[] a, const bo
     }
     return Result.Ok(Value.Text(jsonText(root)));
   }
-  if (name == "json_type" || name == "json_array_length") {
+  if (fid == 51 || fid == 52) {
     Json root = try parseArg(a[0]);
     Json? at = root;
     if (a.len() > 1) { at = lookup(root, try pathArg(a[1])); }
     if (at is null) { return Result.Ok(Value.Null); }
-    if (name == "json_type") { return Result.Ok(Value.Text(jsonType(at!))); }
+    if (fid == 51) { return Result.Ok(Value.Text(jsonType(at!))); }
     match (at!) { JArr(items): { return Result.Ok(Value.Int(items.len() as i64)); } default: { return Result.Ok(Value.Int(0)); } }
   }
   return Result.Err(SqlError("error", "no such function: \{name}"));
@@ -499,4 +538,60 @@ export string replaceText(string s, string from, string to) {
   }
   out.pushStr(s.slice(at, s.len()));
   return out.toStr();
+}
+
+i32 utf8Len(u8 c) {
+  if (c >= 0xF0) { return 4; }
+  if (c >= 0xE0) { return 3; }
+  if (c >= 0xC0) { return 2; }
+  return 1;
+}
+
+u8 foldByte(u8 c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+// LIKE over UTF-8 bytes: `_` takes one whole character, `%` any run, ASCII letters fold. The usual
+// wildcard walk: on a mismatch, back up to just after the last `%` and let it take one more character.
+// `esc` is -1, or the escape character when it is a single byte.
+export bool likeBytes(const u8[] p, const u8[] s, i32 esc) {
+  i32 pi = 0;
+  i32 si = 0;
+  i32 starP = -1;
+  i32 starS = 0;
+  while (si < s.len()) {
+    if (pi < p.len()) {
+      u8 c = p[pi];
+      if (c == '%') {
+        while (pi < p.len() && p[pi] == '%') { pi++; }
+        if (pi == p.len()) { return true; }
+        starP = pi;
+        starS = si;
+        continue;
+      }
+      if (c == '_') {
+        pi++;
+        si += utf8Len(s[si]);
+        continue;
+      }
+      i32 lit = pi;
+      if (esc >= 0 && (c as i32) == esc && pi + 1 < p.len()) { lit = pi + 1; }
+      // One character of the pattern against one of the text, byte for byte.
+      i32 n = utf8Len(p[lit]);
+      bool ok = si + n <= s.len() && lit + n <= p.len();
+      if (ok) {
+        if (n == 1) { ok = foldByte(p[lit]) == foldByte(s[si]); }
+        else { for (i32 k = 0; k < n; k++) { if (p[lit + k] != s[si + k]) { ok = false; break; } } }
+      }
+      if (ok) {
+        pi = lit + n;
+        si += n;
+        continue;
+      }
+    }
+    if (starP < 0) { return false; }
+    starS += utf8Len(s[starS]);
+    si = starS;
+    pi = starP;
+  }
+  while (pi < p.len() && p[pi] == '%') { pi++; }
+  return pi == p.len();
 }

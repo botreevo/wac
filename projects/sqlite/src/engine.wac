@@ -1,9 +1,9 @@
 // A connection: statements run against a database in memory, with transactions, and the image to save
 // when a transaction commits.
 
-import { Result, Vec, Map, hashString, stringEq } from "core";
+import { Result, Vec, Map, hashString, stringEq, hashI64, i64Eq } from "core";
 import { SqlError } from "./error.wac";
-import { Value, compareValues } from "./value.wac";
+import { Value, compareValues, sameValue } from "./value.wac";
 import { Expr, Stmt, Select, Source, ResultCol, Insert, Update, Delete, Upsert, Assign, CreateTable,
          CreateIndex, ColumnDef, JOIN_FIRST, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 import { parseOne, Parsed, isBlank } from "./parser.wac";
@@ -14,11 +14,13 @@ import { Exec, Scope, Ctx, bindExpr, eval, planSelect, runPlan, query } from "./
 import { applyAffinity, isNull, textOf } from "./ops.wac";
 import { FnEnv } from "./functions.wac";
 import { lower } from "./lexer.wac";
+import { Chunked } from "./chunked.wac";
 
 // What undoes one change, newest last.
 enum Undo {
   UInserted(Table t, Row r),
   UDeleted(Table t, Row r),
+  UReplaced(Table t, Row old, Row now),
   USchema(Vec<SchemaEntry> order, Map<string, Table> tables, Map<string, Index> indexes),
   UAddColumn(Table t, Column[] cols, string sql),
   UUserVersion(i64 v),
@@ -42,7 +44,7 @@ export struct Connection {
 
   Connection over(Database db) {
     return Connection(db, false, Vec.create(), false, false, false, false, 0, 0, 0,
-                      FnEnv(0, 0, 0, 0, u8[].filled(64, 7), 0), Map.create(hashString, stringEq));
+                      FnEnv { nowMillis: 0, changes: 0, totalChanges: 0, lastInsertRowid: 0, randomBytes: u8[].filled(64, 7), randomAt: 0 }, Map.create(hashString, stringEq));
   }
 
   Connection memory() { return Connection.over(Database.empty()); }
@@ -127,7 +129,7 @@ export struct Connection {
       default: {}
     }
     Vec<Undo> undo;
-    Exec x = Exec(this.db, params, this.env);
+    Exec x = Exec { db: this.db, params: params, env: this.env };
     this.env.changes = this.changes;
     Statement s = Statement(this, x, undo, 0, false, false, false);
     match (s.run(st)) {
@@ -166,6 +168,7 @@ void undoAll(Database db, Vec<Undo> undo) {
     match (undo.get(i)) {
       UInserted(t, r): { removeRow(db, t, r); }
       UDeleted(t, r): { addRow(db, t, r); }
+      UReplaced(t, old, now): { replaceRow(db, t, now, old); }
       USchema(order, tables, indexes): {
         db.order = order;
         db.tables = tables;
@@ -198,6 +201,44 @@ void removeRow(Database db, Table t, Row r) {
   if (at < t.rows.len() && t.rows.get(at).rowid == r.rowid) { t.rows.remove(at); }
   Index[] ixs = db.indexesOf(t.name);
   for (i32 i = 0; i < ixs.len(); i++) { ixs[i].drop(r); }
+}
+
+// Swaps a row for another with the same rowid, touching only the indexes whose key changed.
+void replaceRow(Database db, Table t, Row old, Row now) {
+  i32 at = t.find(old.rowid);
+  t.rows.set(at, now);
+  Index[] ixs = db.indexesOf(t.name);
+  for (i32 i = 0; i < ixs.len(); i++) {
+    Index ix = ixs[i];
+    bool same = true;
+    for (i32 k = 0; k < ix.cols.len(); k++) {
+      if (!sameValue(old.vals[ix.cols[k]], now.vals[ix.cols[k]])) { same = false; break; }
+    }
+    if (!same) { ix.drop(old); ix.add(now); }
+  }
+}
+
+// Removes many rows in one pass over the table and each index, rather than one shift per row.
+void removeRows(Database db, Table t, Map<i64, bool> gone) {
+  Vec<Row> keep = Vec.withCapacity(t.rows.len());
+  for (i32 i = 0; i < t.rows.len(); i++) {
+    Row r = t.rows.get(i);
+    if (!gone.has(r.rowid)) { keep.push(r); }
+  }
+  t.rows = keep;
+  Index[] ixs = db.indexesOf(t.name);
+  for (i32 i = 0; i < ixs.len(); i++) {
+    Index ix = ixs[i];
+    Vec<Value[]> ek = Vec.withCapacity(ix.entries.len());
+    for (i32 k = 0; k < ix.entries.len(); k++) {
+      Value[] e = ix.entries.get(k);
+      match (e[e.len() - 1]) {
+        Int(id): { if (!gone.has(id)) { ek.push(e); } }
+        default: { ek.push(e); }
+      }
+    }
+    ix.entries = Chunked.fromArray(ek.toArray());
+  }
 }
 
 Map<string, V> copyMap<V>(Map<string, V> m) {
@@ -517,6 +558,22 @@ struct Statement {
     }
     Row r = Row(rowid, vals);
     if (!(try this.prepareRow(t, r, orAction))) { return Result.Ok(null); }
+    if (rowid == old.rowid) {
+      // The common case: the row keeps its rowid, so it is swapped in place, and only the indexes whose
+      // key changed are touched. Its own entries do not count as conflicts.
+      while (true) {
+        Conflict? cf = this.firstConflict(t, r, old.rowid);
+        if (cf is null) { break; }
+        if (orAction == OR_IGNORE) { return Result.Ok(null); }
+        if (orAction == OR_REPLACE) { this.deleteRow(t, cf!.row); continue; }
+        if (orAction == OR_ROLLBACK) { this.rollbackTx = true; }
+        return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, cf!.cols)));
+      }
+      replaceRow(this.conn.db, t, old, r);
+      this.undo.push(Undo.UReplaced(t, old, r));
+      this.count++;
+      return Result.Ok(r);
+    }
     // The old row is out of the way while the new one is checked, so a row may keep its own key.
     this.deleteRow(t, old);
     while (true) {
@@ -578,10 +635,21 @@ struct Statement {
     RetPlan? ret = try this.returning(t, d.returning);
     Vec<Value[]> out;
     this.counted = true;
-    for (i32 i = 0; i < rows.len(); i++) {
-      if (ret is not null) { out.push(try this.evalReturning(ret!, rows[i])); }
-      this.deleteRow(t, rows[i]);
-      this.count++;
+    if (rows.len() > 32) {
+      Map<i64, bool> gone = Map.create(hashI64, i64Eq);
+      for (i32 i = 0; i < rows.len(); i++) {
+        if (ret is not null) { out.push(try this.evalReturning(ret!, rows[i])); }
+        gone.set(rows[i].rowid, true);
+        this.undo.push(Undo.UDeleted(t, rows[i]));
+      }
+      removeRows(this.conn.db, t, gone);
+      this.count += rows.len() as i64;
+    } else {
+      for (i32 i = 0; i < rows.len(); i++) {
+        if (ret is not null) { out.push(try this.evalReturning(ret!, rows[i])); }
+        this.deleteRow(t, rows[i]);
+        this.count++;
+      }
     }
     if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
     return Result.Ok(noRows());

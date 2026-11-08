@@ -8,10 +8,10 @@ import { encodeRecord } from "./record.wac";
 import { Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
 import { Table, Row, Index, Column, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database } from "./database.wac";
-import { Node, BoundSource, AggSpec, SelectPlan, Rows } from "./plan.wac";
+import { Node, BoundSource, AggSpec, SelectPlan, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT } from "./plan.wac";
 import { AFF_NONE, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
-import { callScalar, knownFunction, returnsJson, FnEnv, likeMatch, globMatch, codepoints } from "./functions.wac";
+import { callScalar, functionId, FID_COALESCE, FID_IFNULL, FID_IIF, knownFunction, returnsJson, FnEnv, likeMatch, likeBytes, globMatch, codepoints } from "./functions.wac";
 import { lower } from "./lexer.wac";
 
 // What a statement runs with: the database, its parameters, and the function environment.
@@ -19,6 +19,17 @@ export struct Exec {
   Database db;
   Value[] params;
   FnEnv env;
+  // The last pattern LIKE saw, as bytes: the pattern is almost always the same for every row.
+  string lastPattern = "";
+  u8[] lastPatternBytes;
+
+  u8[] patternBytes(this, string p) {
+    if (p != this.lastPattern || this.lastPatternBytes.len() != p.len()) {
+      this.lastPattern = p;
+      this.lastPatternBytes = p.toBytes();
+    }
+    return this.lastPatternBytes;
+  }
 }
 
 // Names visible to an expression: this select's sources, then the enclosing selects'.
@@ -126,7 +137,7 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
       if (op == "||") { return Result.Ok(Node.NConcat(a, b)); }
       if (op == "LIKE") { return Result.Ok(Node.NLike(a, b, false)); }
       if (op == "GLOB") { return Result.Ok(Node.NLike(a, b, true)); }
-      if (op == "->" || op == "->>") { return Result.Ok(Node.NCall(op, [a, b], [false, false])); }
+      if (op == "->" || op == "->>") { return Result.Ok(Node.NCall(op, functionId(op), [a, b], [false, false])); }
       return Result.Err(err("unknown operator \{op}"));
     }
     IsNull(a, neg): { return Result.Ok(Node.NIsNull(try bindExpr(a, s, x), neg)); }
@@ -150,7 +161,11 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
         Scope inner = Scope(s.srcs, s.outer, s.plan, false);
         Node[] bound = try bindAll(args, inner, x);
         SelectPlan p = s.plan!;
-        p.aggs.push(AggSpec(name, bound, distinct, star));
+        i32 kind = AGG_COUNT;
+        if (name == "sum" || name == "total" || name == "avg") { kind = AGG_SUM; }
+        else if (name == "min" || name == "max") { kind = AGG_MINMAX; }
+        else if (name == "group_concat" || name == "string_agg") { kind = AGG_CONCAT; }
+        p.aggs.push(AggSpec(name, kind, bound, distinct, star));
         return Result.Ok(Node.NAgg(p.aggs.len() - 1));
       }
       if (star) { return Result.Err(err("wrong number of arguments to function \{name}()")); }
@@ -159,7 +174,7 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
       }
       bool[] js = bool[].filled(args.len(), false);
       for (i32 i = 0; i < args.len(); i++) { js[i] = exprIsJson(args[i]); }
-      return Result.Ok(Node.NCall(name, try bindAll(args, s, x), js));
+      return Result.Ok(Node.NCall(name, functionId(name), try bindAll(args, s, x), js));
     }
     Case(base, whens, thens, otherwise): {
       Node? b = null;
@@ -294,30 +309,31 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       }
       return Result.Ok(sawNull ? Value.Null : boolValue(neg));
     }
-    NCall(name, args, isJson): {
+    NCall(name, fid, args, isJson): {
       // Short-circuiting functions evaluate only what they need.
-      if (name == "coalesce" || name == "ifnull") {
+      if (fid == FID_COALESCE || fid == FID_IFNULL) {
         for (i32 i = 0; i < args.len(); i++) {
           Value v = try eval(args[i], c, x);
           if (!isNull(v)) { return Result.Ok(v); }
         }
         return Result.Ok(Value.Null);
       }
-      if (name == "iif") {
+      if (fid == FID_IIF) {
         i32 t = truth(try eval(args[0], c, x));
         return eval(t == 1 ? args[1] : args[2], c, x);
       }
       Value[] vals = Value[].filled(args.len(), Value.Null);
       for (i32 i = 0; i < args.len(); i++) { vals[i] = try eval(args[i], c, x); }
-      return callScalar(name, vals, isJson, x.env);
+      return callScalar(name, fid, vals, isJson, x.env);
     }
     NLike(value, pattern, glob): {
       Value v = try eval(value, c, x);
       Value p = try eval(pattern, c, x);
       if (isNull(v) || isNull(p)) { return Result.Ok(Value.Null); }
+      if (!glob) { return Result.Ok(boolValue(likeBytes(x.patternBytes(textOf(p)), textOf(v).toBytes(), -1))); }
       i32[] pc = codepoints(textOf(p));
       i32[] vc = codepoints(textOf(v));
-      return Result.Ok(boolValue(glob ? globMatch(pc, 0, vc, 0) : likeMatch(pc, 0, vc, 0, -1)));
+      return Result.Ok(boolValue(globMatch(pc, 0, vc, 0)));
     }
     NAgg(slot): {
       if (c.aggs is null) { return Result.Err(err("misuse of aggregate")); }
@@ -391,7 +407,7 @@ export i32 refs(const Node n, i32 depth) {
       return m;
     }
     NInRows(e, sub, neg): { return refs(e, depth) | planRefs(sub, depth + 1); }
-    NCall(name, args, js): {
+    NCall(name, fid, args, js): {
       i32 m = 0;
       for (i32 i = 0; i < args.len(); i++) { m = m | refs(args[i], depth); }
       return m;
@@ -963,7 +979,7 @@ Result<void, SqlError> emit(SelectPlan p, Ctx c, Exec x, Sink sink) {
     } else {
       g = sink.groups.get(gi!);
     }
-    bool repFromBest = p.aggs.len() == 1 && (p.aggs.get(0).name == "min" || p.aggs.get(0).name == "max");
+    bool repFromBest = p.aggs.len() == 1 && p.aggs.get(0).kind == AGG_MINMAX;
     bool improved = false;
     for (i32 i = 0; i < p.aggs.len(); i++) {
       if (try step(p.aggs.get(i), g.states[i], c, x)) { improved = true; }
@@ -1003,7 +1019,7 @@ Result<bool, SqlError> step(const AggSpec a, AggState s, Ctx c, Exec x) {
   }
   s.count++;
   string n = a.name;
-  if (n == "sum" || n == "total" || n == "avg") {
+  if (a.kind == AGG_SUM) {
     Value num = toNumeric(v);
     match (num) {
       Int(i): {
@@ -1017,13 +1033,13 @@ Result<bool, SqlError> step(const AggSpec a, AggState s, Ctx c, Exec x) {
     }
     return Result.Ok(false);
   }
-  if (n == "min" || n == "max") {
+  if (a.kind == AGG_MINMAX) {
     if (s.best is null) { s.best = v; return Result.Ok(true); }
     i32 cmp = compareValues(v, s.best!);
     if ((n == "max" && cmp > 0) || (n == "min" && cmp < 0)) { s.best = v; return Result.Ok(true); }
     return Result.Ok(false);
   }
-  if (n == "group_concat" || n == "string_agg") {
+  if (a.kind == AGG_CONCAT) {
     string sep = ",";
     if (args.len() > 1) { sep = isNull(args[1]) ? "" : textOf(args[1]); }
     else if (n == "string_agg") { return Result.Err(err("string_agg() needs two arguments")); }

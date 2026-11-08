@@ -1,0 +1,89 @@
+// A KPS echo server: every stream's bytes back on the same stream, then its FIN; every datagram back.
+//
+//   echo <dir> [port] [host] [trace]
+//
+// Prints the address to dial — `kps <ip>:<port>:<certhash>` — once it is listening, then a line per connection
+// and per stream, so a test driving it from outside can follow along. The identity lives in `<dir>`, made on the
+// first run, so a restart keeps the address.
+
+import { Sys } from "std";
+import { listen, ListenOptions, Listener } from "../src/listener.wac";
+import { Connection, Stream, ReadResult } from "../src/api.wac";
+import { Code, Reason } from "../src/errors.wac";
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 1) {
+    sys.warn("usage: echo <dir> [port] [host]");
+    return 2;
+  }
+  ListenOptions o = ListenOptions { dir: args[0] };
+  if (args.len() > 1) { o.port = digits(args[1]); }
+  if (args.len() > 2) { o.host = args[2]; }
+  o.trace = args.len() > 3 && args[3] == "trace";
+  auto made = await listen(sys, o);
+  if (made.isErr()) {
+    sys.warn(made.err()!);
+    return 1;
+  }
+  Listener l = made.unwrap();
+  sys.log("kps " + l.address(o.host == "0.0.0.0" ? "127.0.0.1" : o.host));
+  while (true) {
+    match (await l.accept()) {
+      Ok(c): {
+        sys.log("connection from \{c.remote().ip}:\{c.remote().port}");
+        streams(sys, c);
+        datagrams(c);
+      }
+      Err(why): { sys.log("listener: \{why.describe()}"); return 0; }
+    }
+  }
+  return 0;
+}
+
+async void streams(Sys sys, Connection c) {
+  while (true) {
+    match (await c.acceptStream()) {
+      Ok(s): { echoStream(sys, s); }
+      Err(why): { sys.log("connection ended: \{why.describe()}"); return; }
+    }
+  }
+}
+
+async void echoStream(Sys sys, Stream s) {
+  i64 total = 0 as i64;
+  while (true) {
+    match (await s.read()) {
+      Data(b): {
+        total += b.len() as i64;
+        if ((await s.write(b)).isErr()) { return; }
+      }
+      End: {
+        s.closeWrite();
+        sys.log("stream echoed \{total} bytes");
+        return;
+      }
+      Failed(why): {
+        sys.log("stream failed: \{why.describe()}");
+        s.resetWrite(why);
+        return;
+      }
+    }
+  }
+}
+
+async void datagrams(Connection c) {
+  while (true) {
+    match (await c.receiveDatagram()) {
+      Ok(d): { c.sendDatagram(d); }
+      Err(_): { return; }
+    }
+  }
+}
+
+i32 digits(string s) {
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + (b[i] - '0') as i32; }
+  return n;
+}

@@ -1,0 +1,67 @@
+// The listener, judged by the clients that matter: Chromium running `@kpstreams/webrtc-client` unmodified.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-net test/listener_test.wac
+//
+// `cmd/echo.wac` is built and started, and `interop/js/browser-dial.mjs` opens a page that dials it: a stream echoed
+// to EOF, 3 MiB past the 1 MiB stream window, twenty concurrent streams, 150 in a row past the 100-stream limit (so
+// retired slots, and SCTP ids Chromium reuses, come back), datagrams both ways and an oversized one refused, and a
+// reset carried with its code. The same scenarios run first against the reference listener, `@kpstreams/server`, so
+// a scenario that is wrong about KPS fails there rather than being blamed on wac.
+
+import { Check } from "./check.wac";
+import { splitLines, word } from "./oracle.wac";
+import { Buf, flatten } from "core";
+import { ChildEnv, Exec, Launch, Procs, Sys } from "std";
+
+Exec sh(Procs procs, string script) {
+  return flatten(procs.exec("/bin/sh", ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+/** Start a server with `cmd`, which prints `kps <address>`; answer the address, or "" if none appeared. */
+string started(Procs procs, string cmd, string log) {
+  sh(procs, "(\{cmd} > \{log} 2>&1 &)");
+  for (i32 i = 0; i < 100; i++) {
+    Exec e = sh(procs, "grep -o 'kps [^ ]*' \{log} | head -1 | cut -d' ' -f2; sleep 0.1");
+    string a = string.fromBytes(e.stdout);
+    while (a.len() > 0 && a.slice(a.len() - 1, a.len()) == "\n") { a = a.slice(0, a.len() - 1); }
+    if (a.len() > 0) { return a; }
+  }
+  return "";
+}
+
+/** Run the browser scenarios against `addr` and fold each line into `c`, prefixed with `who`. */
+i32 dialled(Check c, Procs procs, string who, string addr) {
+  Exec e = sh(procs, "cd interop/js && timeout 240 node browser-dial.mjs '\{addr}' 2>&1");
+  string[] lines = splitLines(string.fromBytes(e.stdout));
+  i32 passes = 0;
+  bool done = false;
+  for (string line in lines) {
+    if (line.indexOf("PASS ") == 0) { passes++; }
+    if (line.indexOf("FAIL ") == 0) { c.fail("\{who}: \{line.slice(5, line.len())}"); }
+    if (line.indexOf("DONE ") == 0) { done = true; }
+  }
+  c.ok(done, "\{who}: the browser run finished: \{string.fromBytes(e.stdout)}");
+  return passes;
+}
+
+export string test_chromium_dials_the_listener_as_it_dials_the_reference_one(Sys sys) {
+  Check c = Check.create();
+  Procs procs = sys.procs();
+  sh(procs, "mkdir -p .tmp/listener && rm -rf .tmp/listener/*");
+
+  string jsAddr = started(procs, "timeout 300 node interop/js/js-echo-server.mjs .tmp/listener 41998", ".tmp/listener/js.log");
+  c.ok(jsAddr.len() > 0, "the reference listener started");
+  i32 jsPasses = jsAddr.len() > 0 ? dialled(c, procs, "@kpstreams/server", jsAddr) : 0;
+  sh(procs, "pkill -f 'js-echo-server.mjs .tmp/listener' || true");
+
+  Exec built = sh(procs, "wac build cmd/echo.wac -o .tmp/listener/echo --allow-net --allow-read --allow-write --quiet 2>&1");
+  c.eqI32(built.status, 0, "the echo server builds: \{string.fromBytes(built.stdout)}");
+  string wacAddr = started(procs, "timeout 300 wac .tmp/listener/echo.wasm .tmp/listener/id 0 127.0.0.1", ".tmp/listener/wac.log");
+  c.ok(wacAddr.len() > 0, "the wac listener started");
+  i32 wacPasses = wacAddr.len() > 0 ? dialled(c, procs, "wac-kps", wacAddr) : 0;
+  sh(procs, "pkill -f 'listener/echo.wasm' || true");
+
+  c.ok(jsPasses >= 8, "the reference listener passes every scenario: \{jsPasses}");
+  c.eqI32(wacPasses, jsPasses, "and the wac listener passes as many");
+  return c.report();
+}

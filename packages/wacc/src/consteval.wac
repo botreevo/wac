@@ -2895,16 +2895,18 @@ export bool isValueTypeName(string t) {
  * spelled `t`. `pushNull` adds a layer rather than ensuring one, since `?` does not flatten.
  */
 export Value typerefMethod(Ev ev, string t, string m) {
-  bool nullable = t.len() > 0 && t.slice(t.len() - 1, t.len()) == "?";
+  // A funcref's spelling ends in its return type's, so `fn() -> i32?` is no nullable layer (`fnSuffixed`).
+  bool isFn = t.len() > 3 && t.slice(0, 3) == "fn(";
+  bool nullable = !isFn && t.len() > 0 && t.slice(t.len() - 1, t.len()) == "?";
   if (m == "isNullable") { return boolValue(nullable); }
   if (m == "isRef") { return boolValue(nullable || !isValueTypeName(t)); }
   // `isArray()` and `element()` — what `for (x in e)` walks, asked of `e`'s type: an array's
   // element, or what a generator yields (spec ch30). How an `async` function's loop over either is
   // written without knowing which it is.
-  bool arr = !nullable && t.len() > 2 && t.slice(t.len() - 2, t.len()) == "[]";
+  bool arr = !isFn && !nullable && t.len() > 2 && t.slice(t.len() - 2, t.len()) == "[]";
   if (m == "isArray") { return boolValue(arr); }
   if (m == "element") {
-    if (arr) { return typeValue(ev, t.slice(0, t.len() - 2)); }
+    if (arr) { return typeValue(ev, fnUnbracketed(t.slice(0, t.len() - 2))); }
     string gb = genericBase(t);
     string[] ga = genericArgs(t);
     if ((gb == "Generator" || gb == "AsyncGenerator") && ga.len() == 2) { return typeValue(ev, ga[0]); }
@@ -2920,10 +2922,10 @@ export Value typerefMethod(Ev ev, string t, string m) {
     string sb = genericBase(t);
     return boolValue(!nullable && (sb == "Generator" || sb == "AsyncGenerator"));
   }
-  if (m == "pushNull") { return typeValue(ev, t + "?"); }
+  if (m == "pushNull") { return typeValue(ev, fnSuffixed(t, "?")); }
   if (m == "popNull") {
     if (!nullable) { ev.raise("`popNull` on " + t + ", which has no nullable layer"); return noneValue(); }
-    return typeValue(ev, t.slice(0, t.len() - 1));
+    return typeValue(ev, fnUnbracketed(t.slice(0, t.len() - 1)));
   }
   if (m == "tupleMembers") {
     // Of a tuple only. A name with nothing bound to it reaches here as itself — `Ts` while a generic's
@@ -3147,11 +3149,11 @@ export string evTyName(Ev ev, Decls cx, i32 fi, Ty t) {
     }
     Arr(elem): {
       string e = evTyName(ev, cx, fi, elem);
-      return evFinished(ev.status) ? e + "[]" : "";
+      return evFinished(ev.status) ? fnSuffixed(e, "[]") : "";
     }
     Nullable(inner): {
       string n = evTyName(ev, cx, fi, inner);
-      return evFinished(ev.status) ? n + "?" : "";
+      return evFinished(ev.status) ? fnSuffixed(n, "?") : "";
     }
     TupleOf(members): {
       string[] ms = string[].filled(members.len(), "");
@@ -3188,6 +3190,31 @@ export string evTyName(Ev ev, Decls cx, i32 fi, Ty t) {
     }
     TypeofExpr(e): { return evTypeOfExpr(ev, cx, fi, e); }
   }
+}
+
+/**
+ * `t` with `[]` or `?` after it, **bracketed when `t` is a funcref**, as the checker's `suffixed` writes it:
+ * `fn(T) -> T[]` is a funcref answering an array, and an array of funcrefs is `(fn(T) -> T)[]`. Unbracketed,
+ * `type B = fn<T[](T)>` and `type B = fn<T(T)>[]` were one spelling, and the emitter read the first as the
+ * second (wac-tensor).
+ */
+string fnSuffixed(string t, string sfx) {
+  return t.len() > 3 && t.slice(0, 3) == "fn(" ? "(" + t + ")" + sfx : t + sfx;
+}
+
+/** `(fn(…) -> R)` with the brackets `fnSuffixed` put round it taken off; anything else as it is. */
+string fnUnbracketed(string t) {
+  if (t.len() < 5 || t.slice(0, 4) != "(fn(" || t.slice(t.len() - 1, t.len()) != ")") { return t; }
+  i32 depth = 0;
+  u8[] b = t.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == 40) { depth = depth + 1; }
+    if (b[i] == 41) {
+      depth = depth - 1;
+      if (depth == 0 && i != b.len() - 1) { return t; }
+    }
+  }
+  return t.slice(1, t.len() - 1);
 }
 
 /**

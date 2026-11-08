@@ -1,0 +1,464 @@
+// JSON for SQLite's JSON functions: a tree that keeps numbers and strings as written, so text passes
+// through json_set unchanged except for the part it sets, as SQLite's does.
+
+import { Buf, Vec } from "core";
+import { Value } from "./value.wac";
+import { formatReal } from "./format.wac";
+import { decimalI64, parseF64, hexDigit } from "./parser.wac";
+
+export enum Json {
+  JNull,
+  JTrue,
+  JFalse,
+  JNum(string raw),
+  JStr(string raw),                       // the text between the quotes, escapes as written
+  JArr(Vec<Json> items),
+  JObj(Vec<string> keys, Vec<Json> vals), // keys raw, as JStr
+}
+
+struct JsonParser {
+  u8[] b;
+  i32 i;
+  bool ok;
+
+  void ws(this) {
+    while (this.i < this.b.len() && (this.b[this.i] == ' ' || this.b[this.i] == '\t' || this.b[this.i] == '\n' || this.b[this.i] == '\r')) {
+      this.i++;
+    }
+  }
+
+  bool lit(this, string word) {
+    u8[] w = word.toBytes();
+    if (this.i + w.len() > this.b.len()) { return false; }
+    for (i32 k = 0; k < w.len(); k++) { if (this.b[this.i + k] != w[k]) { return false; } }
+    this.i += w.len();
+    return true;
+  }
+
+  string? str(this) {
+    // at the opening quote
+    this.i++;
+    i32 s = this.i;
+    while (this.i < this.b.len()) {
+      u8 c = this.b[this.i];
+      if (c == '"') {
+        string raw = string.fromBytes(sliceOf(this.b, s, this.i));
+        this.i++;
+        return raw;
+      }
+      if (c < 0x20) { return null; }
+      if (c == '\\') {
+        this.i++;
+        if (this.i >= this.b.len()) { return null; }
+        u8 e = this.b[this.i];
+        if (e == 'u') {
+          for (i32 k = 1; k <= 4; k++) {
+            if (this.i + k >= this.b.len() || !isHexByte(this.b[this.i + k])) { return null; }
+          }
+          this.i += 4;
+        } else if (e != '"' && e != '\\' && e != '/' && e != 'b' && e != 'f' && e != 'n' && e != 'r' && e != 't') {
+          return null;
+        }
+      }
+      this.i++;
+    }
+    return null;
+  }
+
+  Json? value(this, i32 depth) {
+    if (depth > 1000) { return null; }
+    this.ws();
+    if (this.i >= this.b.len()) { return null; }
+    u8 c = this.b[this.i];
+    if (c == '{') {
+      this.i++;
+      Vec<string> keys;
+      Vec<Json> vals;
+      this.ws();
+      if (this.i < this.b.len() && this.b[this.i] == '}') { this.i++; return Json.JObj(keys, vals); }
+      while (true) {
+        this.ws();
+        if (this.i >= this.b.len() || this.b[this.i] != '"') { return null; }
+        string? k = this.str();
+        if (k is null) { return null; }
+        this.ws();
+        if (this.i >= this.b.len() || this.b[this.i] != ':') { return null; }
+        this.i++;
+        Json? v = this.value(depth + 1);
+        if (v is null) { return null; }
+        keys.push(k!);
+        vals.push(v!);
+        this.ws();
+        if (this.i < this.b.len() && this.b[this.i] == ',') { this.i++; continue; }
+        if (this.i < this.b.len() && this.b[this.i] == '}') { this.i++; return Json.JObj(keys, vals); }
+        return null;
+      }
+    }
+    if (c == '[') {
+      this.i++;
+      Vec<Json> items;
+      this.ws();
+      if (this.i < this.b.len() && this.b[this.i] == ']') { this.i++; return Json.JArr(items); }
+      while (true) {
+        Json? v = this.value(depth + 1);
+        if (v is null) { return null; }
+        items.push(v!);
+        this.ws();
+        if (this.i < this.b.len() && this.b[this.i] == ',') { this.i++; continue; }
+        if (this.i < this.b.len() && this.b[this.i] == ']') { this.i++; return Json.JArr(items); }
+        return null;
+      }
+    }
+    if (c == '"') {
+      string? s = this.str();
+      return s is null ? null : Json.JStr(s!);
+    }
+    if (this.lit("null")) { return Json.JNull; }
+    if (this.lit("true")) { return Json.JTrue; }
+    if (this.lit("false")) { return Json.JFalse; }
+    i32 s = this.i;
+    if (this.i < this.b.len() && this.b[this.i] == '-') { this.i++; }
+    i32 d = this.i;
+    while (this.i < this.b.len() && this.b[this.i] >= '0' && this.b[this.i] <= '9') { this.i++; }
+    if (this.i == d) { return null; }
+    if (this.b[d] == '0' && this.i - d > 1) { return null; }
+    if (this.i < this.b.len() && this.b[this.i] == '.') {
+      this.i++;
+      i32 f = this.i;
+      while (this.i < this.b.len() && this.b[this.i] >= '0' && this.b[this.i] <= '9') { this.i++; }
+      if (this.i == f) { return null; }
+    }
+    if (this.i < this.b.len() && (this.b[this.i] == 'e' || this.b[this.i] == 'E')) {
+      this.i++;
+      if (this.i < this.b.len() && (this.b[this.i] == '+' || this.b[this.i] == '-')) { this.i++; }
+      i32 f = this.i;
+      while (this.i < this.b.len() && this.b[this.i] >= '0' && this.b[this.i] <= '9') { this.i++; }
+      if (this.i == f) { return null; }
+    }
+    return Json.JNum(string.fromBytes(sliceOf(this.b, s, this.i)));
+  }
+}
+
+bool isHexByte(u8 c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+u8[] sliceOf(const u8[] b, i32 s, i32 e) {
+  u8[] out = u8[].filled(e - s, 0);
+  out.copyFrom(b, s, 0, e - s);
+  return out;
+}
+
+export Json? parseJson(string text) {
+  JsonParser p = JsonParser(text.toBytes(), 0, true);
+  Json? v = p.value(0);
+  if (v is null) { return null; }
+  p.ws();
+  if (p.i != p.b.len()) { return null; }
+  return v;
+}
+
+export void writeJson(Buf out, const Json j) {
+  match (j) {
+    JNull: { out.pushStr("null"); }
+    JTrue: { out.pushStr("true"); }
+    JFalse: { out.pushStr("false"); }
+    JNum(raw): { out.pushStr(raw); }
+    JStr(raw): { out.pushStr("\""); out.pushStr(raw); out.pushStr("\""); }
+    JArr(items): {
+      out.pushStr("[");
+      for (i32 i = 0; i < items.len(); i++) {
+        if (i > 0) { out.pushStr(","); }
+        writeJson(out, items.get(i));
+      }
+      out.pushStr("]");
+    }
+    JObj(keys, vals): {
+      out.pushStr("{");
+      for (i32 i = 0; i < keys.len(); i++) {
+        if (i > 0) { out.pushStr(","); }
+        out.pushStr("\"");
+        out.pushStr(keys.get(i));
+        out.pushStr("\":");
+        writeJson(out, vals.get(i));
+      }
+      out.pushStr("}");
+    }
+  }
+}
+
+export string jsonText(const Json j) {
+  Buf out = Buf.create();
+  writeJson(out, j);
+  return out.toStr();
+}
+
+// A JSON string's raw text decoded to the text it means.
+export string unescape(string raw) {
+  if (raw.indexOf("\\") < 0) { return raw; }
+  u8[] b = raw.toBytes();
+  Buf out = Buf.create();
+  i32 i = 0;
+  while (i < b.len()) {
+    if (b[i] != '\\') { out.push(b[i]); i++; continue; }
+    u8 e = b[i + 1];
+    i += 2;
+    if (e == 'n') { out.push('\n'); }
+    else if (e == 't') { out.push('\t'); }
+    else if (e == 'r') { out.push('\r'); }
+    else if (e == 'b') { out.push(8); }
+    else if (e == 'f') { out.push(12); }
+    else if (e == 'u') {
+      i32 cp = hex4(b, i);
+      i += 4;
+      if (cp >= 0xD800 && cp < 0xDC00 && i + 6 <= b.len() && b[i] == '\\' && b[i + 1] == 'u') {
+        i32 lo = hex4(b, i + 2);
+        if (lo >= 0xDC00 && lo < 0xE000) {
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          i += 6;
+        }
+      }
+      if (cp >= 0xD800 && cp < 0xE000) { cp = 0xFFFD; }
+      out.pushCodepoint(cp);
+    }
+    else { out.push(e); }
+  }
+  return out.toStr();
+}
+
+i32 hex4(const u8[] b, i32 at) {
+  i32 v = 0;
+  for (i32 k = 0; k < 4; k++) { v = (v << 4) | hexDigit(b[at + k] as i32); }
+  return v;
+}
+
+static string HEXL = "0123456789abcdef";
+
+// Text as a JSON string's raw contents.
+export string escape(string s) {
+  u8[] b = s.toBytes();
+  Buf out = Buf.create();
+  for (i32 i = 0; i < b.len(); i++) {
+    u8 c = b[i];
+    if (c == '"') { out.pushStr("\\\""); }
+    else if (c == '\\') { out.pushStr("\\\\"); }
+    else if (c == '\n') { out.pushStr("\\n"); }
+    else if (c == '\r') { out.pushStr("\\r"); }
+    else if (c == '\t') { out.pushStr("\\t"); }
+    else if (c == 8) { out.pushStr("\\b"); }
+    else if (c == 12) { out.pushStr("\\f"); }
+    else if (c < 0x20) {
+      out.pushStr("\\u00");
+      out.pushStr(HEXL.slice((c >> 4) as i32, ((c >> 4) as i32) + 1));
+      out.pushStr(HEXL.slice((c & 15) as i32, ((c & 15) as i32) + 1));
+    }
+    else { out.push(c); }
+  }
+  return out.toStr();
+}
+
+// A JSON value as the SQL value json_extract answers: scalars as themselves, containers as JSON text.
+export Value sqlOf(const Json j) {
+  match (j) {
+    JNull: { return Value.Null; }
+    JTrue: { return Value.Int(1); }
+    JFalse: { return Value.Int(0); }
+    JNum(raw): { return numValue(raw); }
+    JStr(raw): { return Value.Text(unescape(raw)); }
+    default: { return Value.Text(jsonText(j)); }
+  }
+}
+
+Value numValue(string raw) {
+  bool integral = raw.indexOf(".") < 0 && raw.indexOf("e") < 0 && raw.indexOf("E") < 0;
+  if (integral) {
+    bool neg = raw.slice(0, 1) == "-";
+    i64? v = decimalI64(neg ? raw.slice(1, raw.len()) : raw);
+    if (v is not null) { return Value.Int(neg ? 0 - v! : v!); }
+  }
+  return Value.Real(parseF64(raw));
+}
+
+// An SQL value as JSON: text becomes a string unless the caller knows it is JSON already.
+export Json jsonOf(const Value v) {
+  match (v) {
+    Null: { return Json.JNull; }
+    Int(i): { return Json.JNum("\{i}"); }
+    Real(r): { return Json.JNum(r != r || r == 1.0 / 0.0 || r == -1.0 / 0.0 ? "null" : realJson(r)); }
+    Text(s): { return Json.JStr(escape(s)); }
+    Blob: { return Json.JNull; }
+  }
+}
+
+string realJson(f64 r) {
+  string s = formatReal(r);
+  return s;
+}
+
+// One step of a path: a member name, or an array position counted from the start or (fromEnd) the end.
+export struct Step {
+  string? key;
+  i32 index;
+  bool fromEnd;
+}
+
+// "$", ".key", ".\"key\"", "[N]", "[#-N]", "[#]". Null for a malformed path.
+export Step[]? parsePath(string path) {
+  u8[] b = path.toBytes();
+  if (b.len() == 0 || b[0] != '$') { return null; }
+  Vec<Step> out;
+  i32 i = 1;
+  while (i < b.len()) {
+    if (b[i] == '.') {
+      i++;
+      if (i < b.len() && b[i] == '"') {
+        i32 s = i + 1;
+        i32 e = s;
+        while (e < b.len() && b[e] != '"') { e++; }
+        if (e >= b.len()) { return null; }
+        out.push(Step(string.fromBytes(sliceOf(b, s, e)), 0, false));
+        i = e + 1;
+      } else {
+        i32 s = i;
+        while (i < b.len() && b[i] != '.' && b[i] != '[') { i++; }
+        if (i == s) { return null; }
+        out.push(Step(string.fromBytes(sliceOf(b, s, i)), 0, false));
+      }
+    } else if (b[i] == '[') {
+      i++;
+      bool fromEnd = false;
+      if (i < b.len() && b[i] == '#') {
+        fromEnd = true;
+        i++;
+        if (i < b.len() && b[i] == '-') { i++; }
+        else if (i < b.len() && b[i] == ']') { out.push(Step(null, 0, true)); i++; continue; }
+        else { return null; }
+      }
+      i32 n = 0;
+      i32 s = i;
+      while (i < b.len() && b[i] >= '0' && b[i] <= '9') { n = n * 10 + (b[i] - '0') as i32; i++; }
+      if (i == s || i >= b.len() || b[i] != ']') { return null; }
+      i++;
+      out.push(Step(null, n, fromEnd));
+    } else {
+      return null;
+    }
+  }
+  return out.toArray();
+}
+
+i32 memberAt(const Vec<string> keys, string key) {
+  for (i32 i = 0; i < keys.len(); i++) { if (unescape(keys.get(i)) == key) { return i; } }
+  return -1;
+}
+
+// The value at a path, or null when there is none.
+export Json? lookup(Json root, const Step[] path) {
+  Json cur = root;
+  for (i32 k = 0; k < path.len(); k++) {
+    const Step s = path[k];
+    Json next = cur;
+    match (cur) {
+      JObj(keys, vals): {
+        if (s.key is null) { return null; }
+        i32 at = memberAt(keys, s.key!);
+        if (at < 0) { return null; }
+        next = vals.get(at);
+      }
+      JArr(items): {
+        if (s.key is not null) { return null; }
+        i32 at = s.fromEnd ? items.len() - s.index : s.index;
+        if (at < 0 || at >= items.len()) { return null; }
+        next = items.get(at);
+      }
+      default: { return null; }
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+// Sets the value at a path, creating the last member or appending at the end of an array when
+// `create`, replacing only when `replace`. Answers the new root.
+export Json setPath(Json root, const Step[] path, Json v, bool create, bool replace) {
+  if (path.len() == 0) { return replace ? v : root; }
+  Json cur = root;
+  for (i32 k = 0; k < path.len(); k++) {
+    const Step s = path[k];
+    bool last = k == path.len() - 1;
+    Json next = cur;
+    match (cur) {
+      JObj(keys, vals): {
+        if (s.key is null) { return root; }
+        i32 at = memberAt(keys, s.key!);
+        if (at < 0) {
+          if (!create) { return root; }
+          // Missing members along the way are made as objects, as SQLite does.
+          Json fresh = last ? v : Json.JObj(Vec.create(), Vec.create());
+          keys.push(escape(s.key!));
+          vals.push(fresh);
+          if (last) { return root; }
+          next = fresh;
+        } else {
+          if (last) {
+            if (replace) { vals.set(at, v); }
+            return root;
+          }
+          next = vals.get(at);
+        }
+      }
+      JArr(items): {
+        if (s.key is not null) { return root; }
+        i32 at = s.fromEnd ? items.len() - s.index : s.index;
+        if (at == items.len() && last) {
+          if (create) { items.push(v); }
+          return root;
+        }
+        if (at < 0 || at >= items.len()) { return root; }
+        if (last) {
+          if (replace) { items.set(at, v); }
+          return root;
+        }
+        next = items.get(at);
+      }
+      default: { return root; }
+    }
+    cur = next;
+  }
+  return root;
+}
+
+// Removes the value at a path.
+export void removePath(Json root, const Step[] path) {
+  if (path.len() == 0) { return; }
+  Json cur = root;
+  for (i32 k = 0; k < path.len(); k++) {
+    const Step s = path[k];
+    bool last = k == path.len() - 1;
+    Json next = cur;
+    match (cur) {
+      JObj(keys, vals): {
+        if (s.key is null) { return; }
+        i32 at = memberAt(keys, s.key!);
+        if (at < 0) { return; }
+        if (last) { keys.remove(at); vals.remove(at); return; }
+        next = vals.get(at);
+      }
+      JArr(items): {
+        if (s.key is not null) { return; }
+        i32 at = s.fromEnd ? items.len() - s.index : s.index;
+        if (at < 0 || at >= items.len()) { return; }
+        if (last) { items.remove(at); return; }
+        next = items.get(at);
+      }
+      default: { return; }
+    }
+    cur = next;
+  }
+}
+
+export string jsonType(const Json j) {
+  return match (j) {
+    JNull: "null", JTrue: "true", JFalse: "false",
+    JNum(raw): raw.indexOf(".") < 0 && raw.indexOf("e") < 0 && raw.indexOf("E") < 0 ? "integer" : "real",
+    JStr: "text", JArr: "array", JObj: "object",
+  };
+}

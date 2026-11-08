@@ -1,0 +1,105 @@
+// The corpus in test/corpus: each .sql run here, statement by statement, against what the real SQLite
+// answered for the same file (the .out beside it, written by tools/corpus.py).
+
+import { Buf, Vec, flatten } from "core";
+import { Sys } from "std";
+import { Connection } from "../src/engine.wac";
+import { Rows } from "../src/plan.wac";
+import { Value } from "../src/value.wac";
+import { sqlLiteral } from "../src/format.wac";
+
+// Statements end at a line that ends with `;`; a line starting `--` between them is a comment.
+string[] statements(string text) {
+  Vec<string> out;
+  string buf = "";
+  i32 at = 0;
+  while (at < text.len()) {
+    i32 nl = text.slice(at, text.len()).indexOf("\n");
+    string line = nl < 0 ? text.slice(at, text.len()) : text.slice(at, at + nl);
+    at = nl < 0 ? text.len() : at + nl + 1;
+    if (buf == "" && line.indexOf("--") == 0) { continue; }
+    buf = buf == "" ? line : buf + "\n" + line;
+    if (line.len() > 0 && line.slice(line.len() - 1, line.len()) == ";") {
+      out.push(buf);
+      buf = "";
+    }
+  }
+  if (buf != "") { out.push(buf); }
+  return out.toArray();
+}
+
+string firstLine(string s) {
+  i32 nl = s.indexOf("\n");
+  return nl < 0 ? s : s.slice(0, nl);
+}
+
+export string run(string sql) {
+  Connection c = Connection.memory();
+  Buf out = Buf.create();
+  string[] sts = statements(sql);
+  for (i32 i = 0; i < sts.len(); i++) {
+    out.pushStr("> " + firstLine(sts[i]) + "\n");
+    match (c.exec(sts[i])) {
+      Ok(rows): {
+        for (i32 r = 0; r < rows.rows.len(); r++) {
+          Value[] vals = rows.rows.get(r);
+          for (i32 k = 0; k < vals.len(); k++) {
+            if (k > 0) { out.pushStr("|"); }
+            out.pushStr(sqlLiteral(vals[k]));
+          }
+          out.pushStr("\n");
+        }
+      }
+      Err(e): { out.pushStr("error\n"); }
+    }
+  }
+  return out.toStr();
+}
+
+string[] lines(string s) {
+  Vec<string> out;
+  i32 at = 0;
+  while (at < s.len()) {
+    i32 nl = s.slice(at, s.len()).indexOf("\n");
+    if (nl < 0) { out.push(s.slice(at, s.len())); break; }
+    out.push(s.slice(at, at + nl));
+    at += nl + 1;
+  }
+  return out.toArray();
+}
+
+// Every line that differs, with the statement it belongs to.
+string diff(string name, string got, string want) {
+  string[] g = lines(got);
+  string[] w = lines(want);
+  Buf out = Buf.create();
+  string stmt = "";
+  i32 n = g.len() > w.len() ? g.len() : w.len();
+  i32 shown = 0;
+  for (i32 i = 0; i < n && shown < 12; i++) {
+    string a = i < g.len() ? g[i] : "<missing>";
+    string b = i < w.len() ? w[i] : "<missing>";
+    if (b.indexOf("> ") == 0) { stmt = b; }
+    if (a != b) {
+      out.pushStr("\{name}:\{i + 1} under [\{stmt}]: got [\{a}] want [\{b}]\n");
+      shown++;
+      // A missing or extra row shifts everything after it; one report per statement is enough.
+      if (a.indexOf("> ") == 0 || b.indexOf("> ") == 0) { break; }
+    }
+  }
+  return out.toStr();
+}
+
+string check(Sys sys, string name) {
+  string sql = string.fromBytes(flatten(sys.files().readFile("test/corpus/" + name + ".sql").wait()).unwrap());
+  string want = string.fromBytes(flatten(sys.files().readFile("test/corpus/" + name + ".out").wait()).unwrap());
+  return diff(name, run(sql), want);
+}
+
+export string test_basics(Sys sys) { return check(sys, "basics"); }
+
+export string test_schema(Sys sys) { return check(sys, "schema"); }
+
+export string test_queries(Sys sys) { return check(sys, "queries"); }
+
+export string test_transactions(Sys sys) { return check(sys, "transactions"); }

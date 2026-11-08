@@ -1,0 +1,837 @@
+// A connection: statements run against a database in memory, with transactions, and the image to save
+// when a transaction commits.
+
+import { Result, Vec, Map, hashString, stringEq } from "core";
+import { SqlError } from "./error.wac";
+import { Value, compareValues } from "./value.wac";
+import { Expr, Stmt, Select, Source, ResultCol, Insert, Update, Delete, Upsert, Assign, CreateTable,
+         CreateIndex, ColumnDef, JOIN_FIRST, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
+import { parseOne, Parsed, isBlank } from "./parser.wac";
+import { Table, Row, Index, Column, SchemaEntry, affinityOf, AFF_INTEGER } from "./schema.wac";
+import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
+import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
+import { Exec, Scope, Ctx, bindExpr, eval, planSelect, runPlan, query } from "./query.wac";
+import { applyAffinity, isNull, textOf } from "./ops.wac";
+import { FnEnv } from "./functions.wac";
+import { lower } from "./lexer.wac";
+
+// What undoes one change, newest last.
+enum Undo {
+  UInserted(Table t, Row r),
+  UDeleted(Table t, Row r),
+  USchema(Vec<SchemaEntry> order, Map<string, Table> tables, Map<string, Index> indexes),
+  UAddColumn(Table t, Column[] cols, string sql),
+  UUserVersion(i64 v),
+}
+
+export struct Connection {
+  Database db;
+  bool inTx;
+  Vec<Undo> txUndo;
+  bool txChanged;
+  bool txSchema;
+  // Set when a commit (or an autocommitted statement) changed the database; whoever stores the image
+  // clears it with `image()`.
+  bool dirty;
+  bool schemaDirty;
+  i64 changes;
+  i64 totalChanges;
+  i64 lastInsertRowid;
+  FnEnv env;
+  Map<string, Parsed> cache;
+
+  Connection over(Database db) {
+    return Connection(db, false, Vec.create(), false, false, false, false, 0, 0, 0,
+                      FnEnv(0, 0, 0, 0, u8[].filled(64, 7), 0), Map.create(hashString, stringEq));
+  }
+
+  Connection memory() { return Connection.over(Database.empty()); }
+
+  Result<Connection, SqlError> openImage(u8[] bytes) {
+    if (bytes.len() == 0) { return Result.Ok(Connection.memory()); }
+    return Result.Ok(Connection.over(try openBytes(bytes)));
+  }
+
+  // The time `CURRENT_TIMESTAMP` and friends answer, and fresh bytes for random(): the engine has no
+  // clock or entropy of its own, so whoever runs it provides them.
+  void setClock(this, i64 nowMillis) { this.env.nowMillis = nowMillis; }
+
+  void setRandom(this, u8[] bytes) {
+    if (bytes.len() > 0) { this.env.randomBytes = bytes; this.env.randomAt = 0; }
+  }
+
+  // The database as a file, with its change counter advanced, for storing after a commit.
+  u8[] image(this) {
+    if (this.dirty) {
+      this.db.changeCounter++;
+      if (this.schemaDirty) { this.db.schemaCookie++; }
+    }
+    this.dirty = false;
+    this.schemaDirty = false;
+    return toBytes(this.db);
+  }
+
+  Result<Parsed, SqlError> parse(this, string sql) {
+    Parsed? hit = this.cache.get(sql);
+    if (hit is not null) { return Result.Ok(hit!); }
+    Parsed p = try parseOne(sql);
+    if (this.cache.len() > 500) { this.cache.clear(); }
+    this.cache.set(sql, p);
+    return Result.Ok(p);
+  }
+
+  // Runs one statement with its parameters, in order: `?` is params[0], `?2` is params[1].
+  Result<Rows, SqlError> execute(this, string sql, Value[] params) {
+    Parsed p = try this.parse(sql);
+    if (p.rest is not null && !isBlank(p.rest!)) {
+      return Result.Err(SqlError.misuse("execute takes one statement; use exec for several"));
+    }
+    return this.run(p.stmt, params);
+  }
+
+  // Runs every statement in the text, with no parameters, and answers the last one's rows.
+  Result<Rows, SqlError> exec(this, string sql) {
+    string? rest = sql;
+    Rows last = Rows(string[](), Vec.create());
+    while (rest is not null && !isBlank(rest!)) {
+      Parsed p = try parseOne(rest!);
+      last = try this.run(p.stmt, Value[]());
+      rest = p.rest;
+    }
+    return Result.Ok(last);
+  }
+
+  Result<Rows, SqlError> run(this, Stmt st, Value[] params) {
+    match (st) {
+      BeginStmt: {
+        if (this.inTx) { return Result.Err(SqlError("error", "cannot start a transaction within a transaction")); }
+        this.inTx = true;
+        this.txUndo.clear();
+        this.txChanged = false;
+        this.txSchema = false;
+        return Result.Ok(noRows());
+      }
+      CommitStmt: {
+        if (!this.inTx) { return Result.Err(SqlError("error", "cannot commit - no transaction is active")); }
+        this.inTx = false;
+        this.txUndo.clear();
+        if (this.txChanged) { this.dirty = true; }
+        if (this.txSchema) { this.schemaDirty = true; }
+        return Result.Ok(noRows());
+      }
+      RollbackStmt: {
+        if (!this.inTx) { return Result.Err(SqlError("error", "cannot rollback - no transaction is active")); }
+        this.rollback();
+        return Result.Ok(noRows());
+      }
+      default: {}
+    }
+    Vec<Undo> undo;
+    Exec x = Exec(this.db, params, this.env);
+    this.env.changes = this.changes;
+    Statement s = Statement(this, x, undo, 0, false, false, false);
+    match (s.run(st)) {
+      Ok(rows): {
+        if (s.counted) { this.changes = s.count; this.totalChanges += s.count; }
+        bool changed = undo.len() > 0;
+        if (this.inTx) {
+          for (i32 i = 0; i < undo.len(); i++) { this.txUndo.push(undo.get(i)); }
+          if (changed) { this.txChanged = true; }
+          if (s.schema) { this.txSchema = true; }
+        } else {
+          if (changed) { this.dirty = true; }
+          if (s.schema) { this.schemaDirty = true; }
+        }
+        return Result.Ok(rows);
+      }
+      Err(e): {
+        undoAll(this.db, undo);
+        if (s.rollbackTx && this.inTx) { this.rollback(); }
+        return Result.Err(e);
+      }
+    }
+  }
+
+  void rollback(this) {
+    undoAll(this.db, this.txUndo);
+    this.txUndo.clear();
+    this.inTx = false;
+  }
+}
+
+Rows noRows() { return Rows(string[](), Vec.create()); }
+
+void undoAll(Database db, Vec<Undo> undo) {
+  for (i32 i = undo.len() - 1; i >= 0; i--) {
+    match (undo.get(i)) {
+      UInserted(t, r): { removeRow(db, t, r); }
+      UDeleted(t, r): { addRow(db, t, r); }
+      USchema(order, tables, indexes): {
+        db.order = order;
+        db.tables = tables;
+        db.indexes = indexes;
+      }
+      UAddColumn(t, cols, sql): {
+        for (i32 k = 0; k < t.rows.len(); k++) {
+          Row r = t.rows.get(k);
+          Value[] v = Value[].filled(cols.len(), Value.Null);
+          v.copyFrom(r.vals, 0, 0, cols.len());
+          r.vals = v;
+        }
+        t.cols = cols;
+        t.sql = sql;
+      }
+      UUserVersion(v): { db.userVersion = v; }
+    }
+  }
+  undo.clear();
+}
+
+void addRow(Database db, Table t, Row r) {
+  t.rows.insert(t.find(r.rowid), r);
+  Index[] ixs = db.indexesOf(t.name);
+  for (i32 i = 0; i < ixs.len(); i++) { ixs[i].add(r); }
+}
+
+void removeRow(Database db, Table t, Row r) {
+  i32 at = t.find(r.rowid);
+  if (at < t.rows.len() && t.rows.get(at).rowid == r.rowid) { t.rows.remove(at); }
+  Index[] ixs = db.indexesOf(t.name);
+  for (i32 i = 0; i < ixs.len(); i++) { ixs[i].drop(r); }
+}
+
+Map<string, V> copyMap<V>(Map<string, V> m) {
+  Map<string, V> out = Map.create(hashString, stringEq);
+  string[] keys = m.keys();
+  for (string k in keys) { out.set(k, m.get(k)!); }
+  return out;
+}
+
+SqlError constraint(string m) { return SqlError("constraint", m); }
+
+SqlError err(string m) { return SqlError("error", m); }
+
+// One statement's run: what it changed, so a failure can be undone.
+struct Statement {
+  Connection conn;
+  Exec x;
+  Vec<Undo> undo;
+  i64 count;
+  bool counted;
+  bool schema;
+  bool rollbackTx = false;
+
+  Database db(this) { return this.conn.db; }
+
+  void insertRow(this, Table t, Row r) {
+    addRow(this.conn.db, t, r);
+    this.undo.push(Undo.UInserted(t, r));
+  }
+
+  void deleteRow(this, Table t, Row r) {
+    removeRow(this.conn.db, t, r);
+    this.undo.push(Undo.UDeleted(t, r));
+  }
+
+  void saveSchema(this) {
+    Database d = this.conn.db;
+    Vec<SchemaEntry> order = Vec.create();
+    for (i32 i = 0; i < d.order.len(); i++) { order.push(d.order.get(i)); }
+    this.undo.push(Undo.USchema(order, copyMap(d.tables), copyMap(d.indexes)));
+    this.schema = true;
+  }
+
+  Result<Rows, SqlError> run(this, Stmt st) {
+    match (st) {
+      SelectStmt(s): { return query(s, this.x); }
+      InsertStmt(i): { return this.insert(i); }
+      UpdateStmt(u): { return this.update(u); }
+      DeleteStmt(d): { return this.delete(d); }
+      CreateTableStmt(c): { try this.createTable(c); return Result.Ok(noRows()); }
+      CreateIndexStmt(c): { try this.createIndex(c); return Result.Ok(noRows()); }
+      DropStmt(kind, name, ifExists): { try this.drop(kind, name, ifExists); return Result.Ok(noRows()); }
+      AddColumnStmt(table, col, text): { try this.addColumn(table, col, text); return Result.Ok(noRows()); }
+      RenameTableStmt(table, to): { return Result.Err(SqlError.unsupported("ALTER TABLE RENAME")); }
+      PragmaStmt(name, value): { return this.pragma(name, value); }
+      default: { return Result.Err(err("unexpected statement")); }
+    }
+  }
+
+  Result<Table, SqlError> table(this, string name) {
+    Table? t = this.conn.db.table(name);
+    if (t is null) { return Result.Err(err("no such table: \{name}")); }
+    if (lower(name) == "sqlite_schema" || lower(name) == "sqlite_master") {
+      return Result.Err(err("table \{name} may not be modified"));
+    }
+    return Result.Ok(t!);
+  }
+
+  // ── changes to rows ──────────────────────────────────────────────────────
+
+  Result<Value, SqlError> defaultFor(this, const Column c) {
+    if (c.dflt is null) { return Result.Ok(Value.Null); }
+    Scope none = Scope(BoundSource[](), null, null, false);
+    Node n = try bindExpr(c.dflt!, none, this.x);
+    return eval(n, Ctx(Row?[](), null, null, null), this.x);
+  }
+
+  // The rowid a new row gets when it names none: one past the largest, as SQLite does until that
+  // overflows; AUTOINCREMENT also stays past any rowid ever used, as sqlite_sequence remembers.
+  Result<i64, SqlError> newRowid(this, Table t) {
+    i64 max = t.maxRowid();
+    if (t.autoincrement) {
+      i64 seq = this.sequence(t.name);
+      if (seq > max) { max = seq; }
+    }
+    if (max == 9223372036854775807) { return Result.Err(SqlError("full", "database or disk is full")); }
+    return Result.Ok(max + 1);
+  }
+
+  i64 sequence(this, string name) {
+    Table? s = this.conn.db.table("sqlite_sequence");
+    if (s is null) { return 0; }
+    for (i32 i = 0; i < s!.rows.len(); i++) {
+      Row r = s!.rows.get(i);
+      match (r.vals[0]) {
+        Text(n): {
+          if (lower(n) == lower(name)) { match (r.vals[1]) { Int(v): { return v; } default: { return 0; } } }
+        }
+        default: {}
+      }
+    }
+    return 0;
+  }
+
+  void bumpSequence(this, Table t, i64 rowid) {
+    Table? s = this.conn.db.table("sqlite_sequence");
+    if (s is null || !t.autoincrement) { return; }
+    for (i32 i = 0; i < s!.rows.len(); i++) {
+      Row r = s!.rows.get(i);
+      match (r.vals[0]) {
+        Text(n): {
+          if (lower(n) == lower(t.name)) {
+            match (r.vals[1]) {
+              Int(v): { if (v >= rowid) { return; } }
+              default: {}
+            }
+            this.deleteRow(s!, r);
+            this.insertRow(s!, Row(r.rowid, [Value.Text(t.name), Value.Int(rowid)]));
+            return;
+          }
+        }
+        default: {}
+      }
+    }
+    this.insertRow(s!, Row(s!.maxRowid() + 1, [Value.Text(t.name), Value.Int(rowid)]));
+  }
+
+  // Coerces a row's values to its columns' affinities and checks NOT NULL. Answers false when the row
+  // is to be skipped (OR IGNORE).
+  Result<bool, SqlError> prepareRow(this, Table t, Row r, i32 orAction) {
+    for (i32 i = 0; i < t.cols.len(); i++) {
+      if (i == t.rowidAlias) { r.vals[i] = Value.Int(r.rowid); continue; }
+      r.vals[i] = applyAffinity(r.vals[i], t.cols[i].affinity);
+      if (t.cols[i].notNull && isNull(r.vals[i])) {
+        if (orAction == OR_IGNORE) { return Result.Ok(false); }
+        if (orAction == OR_REPLACE && t.cols[i].dflt is not null) {
+          r.vals[i] = applyAffinity(try this.defaultFor(t.cols[i]), t.cols[i].affinity);
+          if (!isNull(r.vals[i])) { continue; }
+        }
+        if (orAction == OR_ROLLBACK) { this.rollbackTx = true; }
+        return Result.Err(constraint("NOT NULL constraint failed: \{t.name}.\{t.cols[i].name}"));
+      }
+    }
+    return Result.Ok(true);
+  }
+
+  string describeKey(this, Table t, i32[] cols) {
+    string s = "";
+    for (i32 i = 0; i < cols.len(); i++) {
+      if (i > 0) { s += ", "; }
+      s += t.name + "." + (cols[i] < 0 ? "rowid" : t.cols[cols[i]].name);
+    }
+    return s;
+  }
+
+  // The first constraint a row breaks, other than against itself: the rowid, then each unique index in
+  // schema order. Null when there is none.
+  Conflict? firstConflict(this, Table t, Row r, i64 self) {
+    if (r.rowid != self) {
+      Row? other = t.get(r.rowid);
+      if (other is not null) {
+        i32[] key = t.rowidAlias >= 0 ? [t.rowidAlias] : [-1];
+        return Conflict(other!, key, null);
+      }
+    }
+    Index[] ixs = this.conn.db.indexesOf(t.name);
+    for (i32 i = 0; i < ixs.len(); i++) {
+      i64? hit = ixs[i].conflict(r, self);
+      if (hit is not null) { return Conflict(t.get(hit!)!, ixs[i].cols, ixs[i]); }
+    }
+    return null;
+  }
+
+  Result<Rows, SqlError> insert(this, Insert ins) {
+    Table t = try this.table(ins.table);
+    i32[] target;
+    if (ins.cols is not null) {
+      string[] names = ins.cols!;
+      target = i32[].filled(names.len(), 0);
+      for (i32 i = 0; i < names.len(); i++) {
+        target[i] = t.colIndex(names[i]);
+        if (target[i] < 0) {
+          string n = lower(names[i]);
+          if (t.rowidAlias < 0 && (n == "rowid" || n == "oid" || n == "_rowid_")) { target[i] = -1; continue; }
+          return Result.Err(err("table \{t.name} has no column named \{names[i]}"));
+        }
+      }
+    } else {
+      target = i32[].filled(t.cols.len(), 0);
+      for (i32 i = 0; i < target.len(); i++) { target[i] = i; }
+    }
+    Vec<Value[]> source;
+    if (ins.defaultValues) {
+      source.push(Value[]());
+      target = i32[]();
+    } else {
+      SelectPlan sp = try planSelect(ins.source!, null, this.x);
+      if (sp.names.len() != target.len()) {
+        if (ins.cols is null) {
+          return Result.Err(err("table \{t.name} has \{target.len()} columns but \{sp.names.len()} values were supplied"));
+        }
+        return Result.Err(err("\{sp.names.len()} values for \{target.len()} columns"));
+      }
+      source = try runPlan(sp, Ctx(Row?[](), null, null, null), this.x);
+    }
+    RetPlan? ret = try this.returning(t, ins.returning);
+    Vec<Value[]> out;
+    this.counted = true;
+    for (i32 k = 0; k < source.len(); k++) {
+      Value[] given = source.get(k);
+      Value[] vals = Value[].filled(t.cols.len(), Value.Null);
+      bool[] set = bool[].filled(t.cols.len(), false);
+      Value? rowidGiven = null;
+      for (i32 i = 0; i < target.len(); i++) {
+        if (target[i] < 0) { rowidGiven = given[i]; continue; }
+        vals[target[i]] = given[i];
+        set[target[i]] = true;
+      }
+      for (i32 i = 0; i < vals.len(); i++) {
+        if (!set[i] && i != t.rowidAlias) { vals[i] = try this.defaultFor(t.cols[i]); }
+      }
+      if (t.rowidAlias >= 0 && set[t.rowidAlias]) { rowidGiven = vals[t.rowidAlias]; }
+      i64 rowid = 0;
+      bool haveRowid = false;
+      if (rowidGiven is not null && !isNull(rowidGiven!)) {
+        match (applyAffinity(rowidGiven!, AFF_INTEGER)) {
+          Int(i): { rowid = i; haveRowid = true; }
+          default: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
+        }
+      }
+      if (!haveRowid) { rowid = try this.newRowid(t); }
+      Row r = Row(rowid, vals);
+      if (!(try this.prepareRow(t, r, ins.orAction))) { continue; }
+      bool skip = false;
+      while (true) {
+        Conflict? c = this.firstConflict(t, r, -9223372036854775807 - 1);
+        if (c is null) { break; }
+        Upsert? u = matchUpsert(ins.upserts, t, c!);
+        if (u is not null) {
+          skip = true;
+          if (!u!.doNothing) {
+            Row? changed = try this.upsertUpdate(t, c!.row, r, u!);
+            if (changed is not null && ret is not null) { out.push(try this.evalReturning(ret!, changed!)); }
+          }
+          break;
+        }
+        i32 action = ins.orAction;
+        if (action == OR_IGNORE) { skip = true; break; }
+        if (action == OR_REPLACE) {
+          this.deleteRow(t, c!.row);
+          continue;
+        }
+        if (action == OR_ROLLBACK) { this.rollbackTx = true; }
+        return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, c!.cols)));
+      }
+      if (skip) { continue; }
+      this.insertRow(t, r);
+      this.bumpSequence(t, rowid);
+      this.count++;
+      this.conn.lastInsertRowid = rowid;
+      this.conn.env.lastInsertRowid = rowid;
+      if (ret is not null) { out.push(try this.evalReturning(ret!, r)); }
+    }
+    if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
+    return Result.Ok(noRows());
+  }
+
+  // ON CONFLICT … DO UPDATE: the existing row changed by the SET list, which may read the row that
+  // was being inserted as `excluded`. Answers the row as it now is, or null when WHERE declined it.
+  Result<Row?, SqlError> upsertUpdate(this, Table t, Row existing, Row proposed, Upsert u) {
+    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create());
+    BoundSource[] srcs = [BoundSource(lower(t.name), t, JOIN_FIRST, null, false),
+                          BoundSource("excluded", ex, JOIN_FIRST, null, false)];
+    Scope sc = Scope(srcs, null, null, false);
+    Ctx c = Ctx([existing as Row?, proposed as Row?], null, null, null);
+    if (u.where is not null) {
+      Node w = try bindExpr(u.where!, sc, this.x);
+      match (eval(w, c, this.x)) {
+        Ok(v): { if (truthOf(v) != 1) { return Result.Ok(null); } }
+        Err(e): { return Result.Err(e); }
+      }
+    }
+    return this.applySets(t, existing, u.sets, sc, c, OR_ABORT);
+  }
+
+  // Computes and stores an updated row. Null when OR IGNORE skipped it.
+  Result<Row?, SqlError> applySets(this, Table t, Row old, Assign[] sets, Scope sc, Ctx c, i32 orAction) {
+    Value[] vals = Value[].filled(old.vals.len(), Value.Null);
+    vals.copyFrom(old.vals, 0, 0, old.vals.len());
+    i64 rowid = old.rowid;
+    for (i32 i = 0; i < sets.len(); i++) {
+      Assign a = sets[i];
+      if (a.cols.len() != 1) { return Result.Err(SqlError.unsupported("assigning a row value")); }
+      i32 col = t.colIndex(a.cols[0]);
+      Node n = try bindExpr(a.value, sc, this.x);
+      Value v = try eval(n, c, this.x);
+      if (col < 0) {
+        string nm = lower(a.cols[0]);
+        if (t.rowidAlias < 0 && (nm == "rowid" || nm == "oid" || nm == "_rowid_")) {
+          match (applyAffinity(v, AFF_INTEGER)) {
+            Int(r): { rowid = r; }
+            default: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
+          }
+          continue;
+        }
+        return Result.Err(err("no such column: \{a.cols[0]}"));
+      }
+      if (col == t.rowidAlias) {
+        match (applyAffinity(v, AFF_INTEGER)) {
+          Int(r): { rowid = r; }
+          Null: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
+          default: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
+        }
+        continue;
+      }
+      vals[col] = v;
+    }
+    Row r = Row(rowid, vals);
+    if (!(try this.prepareRow(t, r, orAction))) { return Result.Ok(null); }
+    // The old row is out of the way while the new one is checked, so a row may keep its own key.
+    this.deleteRow(t, old);
+    while (true) {
+      Conflict? cf = this.firstConflict(t, r, -9223372036854775807 - 1);
+      if (cf is null) { break; }
+      if (orAction == OR_IGNORE) {
+        this.insertRow(t, old);
+        return Result.Ok(null);
+      }
+      if (orAction == OR_REPLACE) { this.deleteRow(t, cf!.row); continue; }
+      if (orAction == OR_ROLLBACK) { this.rollbackTx = true; }
+      return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, cf!.cols)));
+    }
+    this.insertRow(t, r);
+    this.count++;
+    return Result.Ok(r);
+  }
+
+  // The rows a WHERE picks, by rowid, found with the same planner a SELECT uses.
+  Result<Row[], SqlError> matching(this, Table t, Expr? where) {
+    Select s = Select { cols: [ResultCol(Expr.Col(null, "rowid"), null, null, "rowid")],
+                        from: [Source { table: t.name, join: JOIN_FIRST }], where: where };
+    SelectPlan p = try planSelect(s, null, this.x);
+    Vec<Value[]> ids = try runPlan(p, Ctx(Row?[](), null, null, null), this.x);
+    Vec<Row> out;
+    for (i32 i = 0; i < ids.len(); i++) {
+      match (ids.get(i)[0]) {
+        Int(id): { Row? r = t.get(id); if (r is not null) { out.push(r!); } }
+        default: {}
+      }
+    }
+    return Result.Ok(out.toArray());
+  }
+
+  Result<Rows, SqlError> update(this, Update u) {
+    Table t = try this.table(u.table);
+    Row[] rows = try this.matching(t, u.where);
+    BoundSource[] srcs = [BoundSource(lower(t.name), t, JOIN_FIRST, null, false)];
+    Scope sc = Scope(srcs, null, null, false);
+    RetPlan? ret = try this.returning(t, u.returning);
+    Vec<Value[]> out;
+    this.counted = true;
+    for (i32 i = 0; i < rows.len(); i++) {
+      // A row an earlier REPLACE removed is no longer there to update.
+      Row? cur = t.get(rows[i].rowid);
+      Row want = rows[i];
+      if (cur is null || cur! is not want) { continue; }
+      Ctx c = Ctx([rows[i] as Row?], null, null, null);
+      Row? changed = try this.applySets(t, rows[i], u.sets, sc, c, u.orAction);
+      if (changed is not null && ret is not null) { out.push(try this.evalReturning(ret!, changed!)); }
+    }
+    if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
+    return Result.Ok(noRows());
+  }
+
+  Result<Rows, SqlError> delete(this, Delete d) {
+    Table t = try this.table(d.table);
+    Row[] rows = try this.matching(t, d.where);
+    RetPlan? ret = try this.returning(t, d.returning);
+    Vec<Value[]> out;
+    this.counted = true;
+    for (i32 i = 0; i < rows.len(); i++) {
+      if (ret is not null) { out.push(try this.evalReturning(ret!, rows[i])); }
+      this.deleteRow(t, rows[i]);
+      this.count++;
+    }
+    if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
+    return Result.Ok(noRows());
+  }
+
+  Result<RetPlan?, SqlError> returning(this, Table t, ResultCol[]? cols) {
+    if (cols is null) { return Result.Ok(null); }
+    BoundSource[] srcs = [BoundSource(lower(t.name), t, JOIN_FIRST, null, false)];
+    Scope sc = Scope(srcs, null, null, false);
+    Vec<Node> nodes;
+    Vec<string> names;
+    ResultCol[] rcs = cols!;
+    for (i32 i = 0; i < rcs.len(); i++) {
+      if (rcs[i].star is not null) {
+        for (i32 c = 0; c < t.cols.len(); c++) {
+          nodes.push(Node.NCol(0, 0, c, t.cols[c].affinity));
+          names.push(t.cols[c].name);
+        }
+        continue;
+      }
+      nodes.push(try bindExpr(rcs[i].expr!, sc, this.x));
+      names.push(rcs[i].alias ?? rcs[i].text);
+    }
+    return Result.Ok(RetPlan(nodes.toArray(), names.toArray()));
+  }
+
+  Result<Value[], SqlError> evalReturning(this, RetPlan p, Row r) {
+    Ctx c = Ctx([r as Row?], null, null, null);
+    Value[] out = Value[].filled(p.nodes.len(), Value.Null);
+    for (i32 i = 0; i < out.len(); i++) { out[i] = try eval(p.nodes[i], c, this.x); }
+    return Result.Ok(out);
+  }
+
+  // ── schema ───────────────────────────────────────────────────────────────
+
+  bool nameTaken(this, string name) {
+    return this.conn.db.table(name) is not null || this.conn.db.index(name) is not null;
+  }
+
+  Result<void, SqlError> createTable(this, CreateTable c) {
+    if (this.nameTaken(c.name)) {
+      if (c.ifNotExists && this.conn.db.table(c.name) is not null) { return Result.Ok(); }
+      return Result.Err(err("\{this.conn.db.table(c.name) is not null ? "table" : "index"} \{c.name} already exists"));
+    }
+    if (lower(c.name).indexOf("sqlite_") == 0) { return Result.Err(err("object name reserved for internal use: \{c.name}")); }
+    Vec<Index> autos;
+    Table t = try tableFrom(c, autos);
+    this.saveSchema();
+    Database d = this.conn.db;
+    d.tables.set(lower(t.name), t);
+    d.order.push(SchemaEntry("table", t.name, t.name));
+    for (i32 i = 0; i < autos.len(); i++) {
+      d.indexes.set(lower(autos.get(i).name), autos.get(i));
+      d.order.push(SchemaEntry("index", autos.get(i).name, t.name));
+    }
+    if (t.autoincrement && d.table("sqlite_sequence") is null) {
+      Table seq = Table("sqlite_sequence", "CREATE TABLE sqlite_sequence(name,seq)",
+                        [Column("name", "", 0, false, null), Column("seq", "", 0, false, null)], -1, false, Vec.create());
+      d.tables.set("sqlite_sequence", seq);
+      d.order.push(SchemaEntry("table", "sqlite_sequence", "sqlite_sequence"));
+    }
+    return Result.Ok();
+  }
+
+  Result<void, SqlError> createIndex(this, CreateIndex c) {
+    if (this.nameTaken(c.name)) {
+      if (c.ifNotExists && this.conn.db.index(c.name) is not null) { return Result.Ok(); }
+      return Result.Err(err("index \{c.name} already exists"));
+    }
+    if (lower(c.name).indexOf("sqlite_") == 0) { return Result.Err(err("object name reserved for internal use: \{c.name}")); }
+    Table t = try this.table(c.table);
+    Index ix = try indexFrom(c, t);
+    rebuildIndex(ix, t);
+    if (ix.unique) {
+      for (i32 i = 0; i < t.rows.len(); i++) {
+        if (ix.conflict(t.rows.get(i), t.rows.get(i).rowid) is not null) {
+          return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, ix.cols)));
+        }
+      }
+    }
+    this.saveSchema();
+    this.conn.db.indexes.set(lower(ix.name), ix);
+    this.conn.db.order.push(SchemaEntry("index", ix.name, t.name));
+    return Result.Ok();
+  }
+
+  Result<void, SqlError> drop(this, string kind, string name, bool ifExists) {
+    Database d = this.conn.db;
+    if (kind == "TABLE") {
+      Table? t = d.table(name);
+      if (t is null) {
+        if (ifExists) { return Result.Ok(); }
+        return Result.Err(err("no such table: \{name}"));
+      }
+      if (lower(name) == "sqlite_sequence") { return Result.Err(err("table sqlite_sequence may not be dropped")); }
+      this.saveSchema();
+      string tn = lower(t!.name);
+      Vec<SchemaEntry> keep;
+      for (i32 i = 0; i < d.order.len(); i++) {
+        SchemaEntry e = d.order.get(i);
+        if (lower(e.table) == tn) {
+          if (e.kind == "index") { d.indexes.remove(lower(e.name)); }
+          continue;
+        }
+        keep.push(e);
+      }
+      d.order = keep;
+      d.tables.remove(tn);
+      return Result.Ok();
+    }
+    Index? ix = d.index(name);
+    if (ix is null) {
+      if (ifExists) { return Result.Ok(); }
+      return Result.Err(err("no such index: \{name}"));
+    }
+    if (ix!.sql is null) {
+      return Result.Err(err("index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"));
+    }
+    this.saveSchema();
+    Vec<SchemaEntry> keep;
+    for (i32 i = 0; i < d.order.len(); i++) {
+      if (lower(d.order.get(i).name) != lower(name)) { keep.push(d.order.get(i)); }
+    }
+    d.order = keep;
+    d.indexes.remove(lower(name));
+    return Result.Ok();
+  }
+
+  Result<void, SqlError> addColumn(this, string table, ColumnDef c, string text) {
+    Table t = try this.table(table);
+    if (t.colIndex(c.name) >= 0) { return Result.Err(err("duplicate column name: \{c.name}")); }
+    if (c.primaryKey) { return Result.Err(err("Cannot add a PRIMARY KEY column")); }
+    if (c.unique) { return Result.Err(err("Cannot add a UNIQUE column")); }
+    Value dv = Value.Null;
+    if (c.dflt is not null) {
+      Value? v = constValue(c.dflt!);
+      if (v is null) {
+        // CURRENT_TIMESTAMP and the like are not constant, and neither is anything else that is not a
+        // literal: SQLite refuses them here, since existing rows would need a value.
+        return Result.Err(err("Cannot add a column with non-constant default"));
+      }
+      dv = v!;
+    }
+    if (c.notNull && isNull(dv)) { return Result.Err(err("Cannot add a NOT NULL column with default value NULL")); }
+    i32 close = t.sql.len() - 1;
+    while (close > 0 && t.sql.slice(close, close + 1) != ")") { close--; }
+    this.undo.push(Undo.UAddColumn(t, t.cols, t.sql));
+    this.schema = true;
+    string sql = t.sql.slice(0, close) + ", " + text + t.sql.slice(close, t.sql.len());
+    Column[] cols = Column[].defaulted(t.cols.len() + 1);
+    cols.copyFrom(t.cols, 0, 0, t.cols.len());
+    cols[t.cols.len()] = Column(c.name, c.typeName, affinityOf(c.typeName), c.notNull, c.dflt);
+    Value stored = applyAffinity(dv, cols[t.cols.len()].affinity);
+    for (i32 i = 0; i < t.rows.len(); i++) {
+      Row r = t.rows.get(i);
+      Value[] v = Value[].filled(cols.len(), stored);
+      v.copyFrom(r.vals, 0, 0, r.vals.len());
+      r.vals = v;
+    }
+    t.cols = cols;
+    t.sql = sql;
+    return Result.Ok();
+  }
+
+  Result<Rows, SqlError> pragma(this, string name, Expr? value) {
+    Database d = this.conn.db;
+    if (name == "user_version") {
+      if (value is null) { return Result.Ok(one("user_version", Value.Int(d.userVersion))); }
+      Value v = try this.constant(value!);
+      this.undo.push(Undo.UUserVersion(d.userVersion));
+      d.userVersion = match (applyAffinity(v, AFF_INTEGER)) { Int(i): i, default: 0 as i64 };
+      return Result.Ok(noRows());
+    }
+    if (name == "page_size") {
+      if (value is null) { return Result.Ok(one("page_size", Value.Int(d.pageSize as i64))); }
+      Value v = try this.constant(value!);
+      match (v) {
+        Int(n): {
+          if (n >= 512 && n <= 65536 && (n & (n - 1)) == 0) { d.pageSize = n as! i32; }
+        }
+        default: {}
+      }
+      return Result.Ok(noRows());
+    }
+    if (name == "journal_mode") { return Result.Ok(one("journal_mode", Value.Text("delete"))); }
+    if (name == "integrity_check" || name == "quick_check") { return Result.Ok(one(name, Value.Text("ok"))); }
+    if (name == "foreign_keys" || name == "busy_timeout" || name == "synchronous" || name == "cache_size" ||
+        name == "temp_store" || name == "mmap_size" || name == "recursive_triggers" || name == "wal_autocheckpoint") {
+      if (value is null) { return Result.Ok(one(name, Value.Int(0))); }
+      return Result.Ok(noRows());
+    }
+    if (name == "table_info") {
+      if (value is null) { return Result.Ok(noRows()); }
+      string tn = textOf(try this.constant(value!));
+      Table? t = d.table(tn);
+      Vec<Value[]> rows;
+      if (t is not null) {
+        for (i32 i = 0; i < t!.cols.len(); i++) {
+          Column c = t!.cols[i];
+          rows.push([Value.Int(i as i64), Value.Text(c.name), Value.Text(c.typeName), Value.Int(c.notNull ? 1 : 0),
+                     Value.Null, Value.Int(i == t!.rowidAlias ? 1 : 0)]);
+        }
+      }
+      return Result.Ok(Rows(["cid", "name", "type", "notnull", "dflt_value", "pk"], rows));
+    }
+    return Result.Ok(noRows());
+  }
+
+  Result<Value, SqlError> constant(this, Expr e) {
+    Scope none = Scope(BoundSource[](), null, null, false);
+    return eval(try bindExpr(e, none, this.x), Ctx(Row?[](), null, null, null), this.x);
+  }
+}
+
+i32 truthOf(Value v) {
+  return match (v) { Null: -1, Int(i): i != 0 ? 1 : 0, Real(r): r != 0.0 ? 1 : 0, default: 0 };
+}
+
+Rows one(string name, Value v) {
+  Vec<Value[]> rows;
+  rows.push([v]);
+  return Rows([name], rows);
+}
+
+struct Conflict {
+  Row row;
+  i32[] cols;     // the constraint's columns; [-1] for a bare rowid
+  Index? ix;
+}
+
+struct RetPlan {
+  Node[] nodes;
+  string[] names;
+}
+
+// The upsert clause that handles a conflict: one whose target names the constraint's columns, or a
+// clause with no target.
+Upsert? matchUpsert(Upsert[] ups, Table t, Conflict c) {
+  for (i32 i = 0; i < ups.len(); i++) {
+    Upsert u = ups[i];
+    if (u.target.len() == 0) { return u; }
+    if (u.target.len() != c.cols.len()) { continue; }
+    bool all = true;
+    for (string n in u.target) {
+      i32 col = t.colIndex(n);
+      bool found = false;
+      for (i32 k in c.cols) { if (k == col) { found = true; } }
+      if (!found) { all = false; }
+    }
+    if (all) { return u; }
+  }
+  return null;
+}

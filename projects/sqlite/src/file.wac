@@ -17,9 +17,12 @@
 // The calls block until the file operations finish (`Ticket.wait`), which keeps the interface the same
 // as the in-memory Connection's.
 //
-// One writer at a time. SQLite's locks are not taken, so another program writing the same file at the
-// same time would lose one side's changes, and one reading it while a commit is being written could see
-// half of it.
+// **Other processes.** Before each statement outside a transaction, the header's change counter is read
+// again; when another connection has committed since, the database is read afresh from the file, so a
+// server sees what an admin tool beside it wrote. SQLite's locks are still not taken: two programs
+// writing at the same moment would lose one side's changes, and one reading while a commit is being
+// written could see half of it (a commit in progress is noticed by its journal, and waited out by
+// reading the old view).
 //
 // A database in WAL mode may have a log beside it holding committed transactions the file does not yet
 // have. Opening reads the log (which SQLite keeps short) and lays its pages over the file's. Before the
@@ -129,6 +132,29 @@ export struct SqliteFile {
     }
     SqliteFile self = this;
     db.persist = (Database d) => self.commit(d);
+    db.refresh = () => self.reload(db);
+  }
+
+  // The database as the file now holds it, when another connection has committed to it since `db` was
+  // read: its header's change counter, which every commit advances, is no longer `db`'s. While another
+  // writer's journal is beside the file a commit is under way (or was cut short, which the next open
+  // recovers), so the file is left alone and `db` read as it was.
+  Result<Database?, SqlError> reload(this, Database db) {
+    if (this.disk.walPending) { return Result.Ok(null); }
+    i64 size = try fileSize(this.disk.file, this.path);
+    if (size < 100) { return Result.Ok(null); }
+    u8[] head = try readAt(this.disk.file, 0, 100, this.path);
+    if (be32(head, 24) == db.changeCounter) { return Result.Ok(null); }
+    match (flatten(this.fs.stat(this.path + "-journal").wait())) {
+      Ok(st): { if (st.exists) { return Result.Ok(null); } }
+      Err(e): {}
+    }
+    Header h = try readHeader(head, size);
+    Pager pg = Pager.overFile(h.pageSize, h.pageCount, this.reader(h.pageSize));
+    Database fresh = try openPager(pg, h);
+    this.conn.db = fresh;
+    this.attach(fresh, h.pageCount);
+    return Result.Ok(fresh);
   }
 
   // Runs one statement; a commit it makes is written to the file.

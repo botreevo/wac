@@ -134,8 +134,11 @@ So:
   back to its b-trees in the file at a commit after it changed).
 - **Some commits write a whole new image**: `VACUUM`, and every commit to an auto-vacuum database, whose
   pointer map is not kept up page by page. Those build the image in memory and rename it over the file.
-- **One writer.** SQLite's locks are not taken: another program writing the file at the same time would
-  lose one side's changes, and one reading it during a commit could see half of it.
+- **Other processes' commits are seen, but no locks are taken.** Each statement outside a transaction
+  first rereads the header's change counter and, if another connection has committed, reads the database
+  afresh (so a server sees what an admin tool beside it wrote). SQLite's locks are not taken: two programs
+  writing at the same moment would lose one side's changes, and one reading during a commit could see
+  half of it.
 - **WAL mode is kept, and a `-wal` beside the file is read**: its committed pages are laid over the
   file's on opening, and checkpointed into it (then the log and `-shm` removed) before the first write.
   That assumes no other connection is using the database meanwhile.

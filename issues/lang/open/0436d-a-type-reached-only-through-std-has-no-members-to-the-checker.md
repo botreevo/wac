@@ -1,6 +1,6 @@
 # 0436d — a type reached only through `std` has no members to the checker, and everything after it goes quiet
 
-- **Status:** closed 2026-11-08 (cloud) — `api.wac`'s reach over imported signatures follows `std`; `spec/cases/0871`
+- **Status:** open
 - **Reported by:** cloud session, met writing a test; the shape of wac-kps's "the checker accepts things that only fail at build"
 - **Date:** 2026-11-08
 - **Kind:** bug
@@ -28,7 +28,15 @@ to the file that declares it) skipped `std` — "whose bodies are fixed when the
 signatures hand on from `core` was never declared here. `wait()` then had no member to find, the call answered
 unknown, and every rule after it went quiet.
 
-## Fix
+## Tried
 
-`std` is followed like any other file. The repository's entries — `lib.wac`, the `wac` command, the site — check clean
-with it and no slower.
+Following `std` in the reach (dropping `|| paths[i] == "std"` from the skip in `checkFilesAutoIn`'s loop) makes the
+CLI refuse the reproduction, and the repository's entries still check clean — but two suite tests disagreed:
+
+- `test_cases_wacc_against_the_corpus` still accepted the case (`spec/cases/0871` then), so the corpus runner's check
+  reaches `std` some other way;
+- `test_rung_3_the_repositorys_own_code_checked_no_false_alarm` reported six false alarms in
+  `packages/quic/test/wac/complete_test.wac` — *Result takes type arguments*, *expected Datagrams?, found T?* — so a
+  type reached through `std` was declared where what it names (`core`'s `Result`) is not.
+
+Reverted 2026-11-08. A fix has to declare a reached type together with what its signature names, or not at all.

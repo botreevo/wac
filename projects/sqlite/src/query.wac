@@ -153,7 +153,9 @@ Result<Node, SqlError> bindColumn(string? table, string name, Scope s0) {
         coll = b.table.cols[foundCol].coll;
         if (b.table.rowidAlias == foundCol) { aff = AFF_INTEGER; }
       }
-      return Result.Ok(Node.NCol(depth, foundSrc, foundCol, aff, coll));
+      Node col = Node.NCol(depth, foundSrc, foundCol, aff, coll);
+      if (table is null && foundCol >= 0) { col = usingMerged(s!.srcs, depth, foundSrc, n, col); }
+      return Result.Ok(col);
     }
     if (table is not null) {
       bool known = false;
@@ -165,6 +167,21 @@ Result<Node, SqlError> bindColumn(string? table, string name, Scope s0) {
   }
   if (table is not null) { return Result.Err(err("no such column: \{table!}.\{name}")); }
   return Result.Err(err("no such column: \{name}"));
+}
+
+// A USING or NATURAL column named bare: the left side's, except that a RIGHT or FULL join on it can
+// give rows the left side has none for, so there it is the first of the sides that has a value.
+Node usingMerged(const BoundSource[] srcs, i32 depth, i32 left, string n, Node base) {
+  Node out = base;
+  for (i32 k = left + 1; k < srcs.len(); k++) {
+    const BoundSource b = srcs[k];
+    if (!isHidden(b, n) || (b.join != JOIN_RIGHT && b.join != JOIN_FULL)) { continue; }
+    i32 rc = b.table.colIndex(n);
+    if (rc < 0) { continue; }
+    Node right = Node.NCol(depth, k, rc, b.isSub ? AFF_NONE : b.table.cols[rc].affinity, b.table.cols[rc].coll);
+    out = Node.NCall("coalesce", functionId("coalesce"), [out, right], [false, false]);
+  }
+  return out;
 }
 
 Result<Node[], SqlError> bindAll(const Expr[] es, Scope s, Exec x) {
@@ -1179,7 +1196,9 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
             if (rc.star! == "" && isHidden(p.srcs[k], t.cols[c].name)) { continue; }
             // json_each's json and root columns are hidden: named, they answer, but `*` leaves them out.
             if (p.srcs[k].call is not null && c >= p.srcs[k].call!.visible) { continue; }
-            results.push(Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity, t.cols[c].coll));
+            Node col = Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity, t.cols[c].coll);
+            if (rc.star! == "") { col = usingMerged(p.srcs, 0, k, lower(t.cols[c].name), col); }
+            results.push(col);
             names.push(t.cols[c].name);
           }
         }
@@ -2134,9 +2153,10 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
   }
   // Window functions are computed over all the rows (or groups) at once, then each row is finished.
   if (p.wins.len() > 0) {
-    Value[][] wv = try computeWindows(p, sink.pend, x);
-    // The rows come out as SQLite's do: sorted by the first window's partition and order.
-    i32[] seq = try windowRowOrder(p.wins.get(0), sink.pend, x);
+    i32[] seq = i32[].filled(sink.pend.len(), 0);
+    for (i32 i = 0; i < seq.len(); i++) { seq[i] = i; }
+    // The rows come out in the order the windows leave them, as SQLite's do.
+    Value[][] wv = try computeWindows(p, sink.pend, x, seq);
     for (i32 q = 0; q < seq.len(); q++) {
       i32 i = seq[q];
       Ctx pc = sink.pend.get(i);
@@ -2185,50 +2205,16 @@ Result<i64, SqlError> frameOffset(Node? n, Exec x) {
 }
 
 // Each row's value of every window function in the plan.
-// Rows by a window's partition, then its order; a stable sort, so ties keep their order.
-Result<i32[], SqlError> windowRowOrder(const WinSpec ws, Vec<Ctx> rows, Exec x) {
-  i32 n = rows.len();
-  Value[][] part = Value[][].defaulted(n);
-  Value[][] ord = Value[][].defaulted(n);
-  for (i32 i = 0; i < n; i++) {
-    Ctx c = rows.get(i);
-    part[i] = Value[].filled(ws.partition.len(), Value.Null);
-    for (i32 k = 0; k < ws.partition.len(); k++) { part[i][k] = try eval(ws.partition[k], c, x); }
-    ord[i] = Value[].filled(ws.order.len(), Value.Null);
-    for (i32 k = 0; k < ws.order.len(); k++) { ord[i][k] = try eval(ws.order[k], c, x); }
-  }
-  i32[] idx = i32[].filled(n, 0);
-  for (i32 i = 0; i < n; i++) { idx[i] = i; }
-  if (ws.partition.len() == 0 && ws.order.len() == 0) { return Result.Ok(idx); }
-  i32[] tmp = i32[].filled(n, 0);
-  i32 width = 1;
-  while (width < n) {
-    for (i32 lo = 0; lo < n; lo += 2 * width) {
-      i32 mid = lo + width < n ? lo + width : n;
-      i32 hi = lo + 2 * width < n ? lo + 2 * width : n;
-      i32 a = lo;
-      i32 b = mid;
-      i32 k = lo;
-      while (a < mid && b < hi) {
-        i32 c = compareParts(part[idx[b]], part[idx[a]]);
-        if (c == 0) { c = compareWinOrder(ws, ord[idx[b]], ord[idx[a]]); }
-        if (c < 0) { tmp[k] = idx[b]; b++; } else { tmp[k] = idx[a]; a++; }
-        k++;
-      }
-      while (a < mid) { tmp[k] = idx[a]; a++; k++; }
-      while (b < hi) { tmp[k] = idx[b]; b++; k++; }
-    }
-    idx.copyFrom(tmp, 0, 0, n);
-    width *= 2;
-  }
-  return Result.Ok(idx);
-}
-
-Result<Value[][], SqlError> computeWindows(SelectPlan p, Vec<Ctx> rows, Exec x) {
+// Every window function's value for every row. As SQLite does, the windows are taken from the last
+// written to the first, each sorting (stably) the rows as the one before left them, by its partition
+// and order: so a window with neither, or a function that reads rows in partition order (lag, ntile,
+// first_value over ()), sees them in the order of the windows after it. `order` comes in as the rows'
+// own order and goes out as the order the first window leaves, which is the order of the output.
+Result<Value[][], SqlError> computeWindows(SelectPlan p, Vec<Ctx> rows, Exec x, i32[] order) {
   i32 n = rows.len();
   Value[][] out = Value[][].defaulted(n);
   for (i32 i = 0; i < n; i++) { out[i] = Value[].filled(p.wins.len(), Value.Null); }
-  for (i32 w = 0; w < p.wins.len(); w++) {
+  for (i32 w = p.wins.len() - 1; w >= 0; w--) {
     WinSpec ws = p.wins.get(w);
     Value[][] part = Value[][].defaulted(n);
     Value[][] ord = Value[][].defaulted(n);
@@ -2244,9 +2230,9 @@ Result<Value[][], SqlError> computeWindows(SelectPlan p, Vec<Ctx> rows, Exec x) 
       for (i32 k = 0; k < ws.agg.args.len(); k++) { args[i][k] = try eval(ws.agg.args[k], c, x); }
       if (ws.agg.filter is not null) { pass[i] = truth(try eval(ws.agg.filter!, c, x)) == 1; }
     }
-    // Rows in partition order, then window order; stable, so ties keep the rows' own order.
+    // Rows in partition order, then window order; stable, so ties keep the order they came in.
     i32[] idx = i32[].filled(n, 0);
-    for (i32 i = 0; i < n; i++) { idx[i] = i; }
+    idx.copyFrom(order, 0, 0, n);
     for (i32 i = 1; i < n; i++) {
       i32 cur = idx[i];
       i32 j = i - 1;
@@ -2365,6 +2351,8 @@ Result<Value[][], SqlError> computeWindows(SelectPlan p, Vec<Ctx> rows, Exec x) 
       }
       ps = pe;
     }
+    // The next window takes the rows in the order this one left them.
+    order.copyFrom(idx, 0, 0, n);
   }
   return Result.Ok(out);
 }

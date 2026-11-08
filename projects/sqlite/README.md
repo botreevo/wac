@@ -73,11 +73,12 @@ Reading through indexes is where this wins; producing and loading a whole file i
 since SQLite's image is its pages already and this one is built from rows (an unchanged row's record is
 kept, so a commit after a small change costs less than the first). Numbers move a few percent run to run.
 
-**And against SQLite's answers.** Beyond the hand-written corpus, two fuzzers write random SQL and
+**And against SQLite's answers.** Beyond the hand-written corpus, three fuzzers write random SQL and
 record what SQLite 3.53 answers: `tools/fuzz.py` (expressions over mixed types — affinity, casts,
 arithmetic, every scalar function) and `tools/fuzz2.py` (schemas, conflicts, upserts, joins, grouping,
-ordering, subqueries, changes). Seeds 1–60 of each agree statement for statement; seed 1 of each is in
-`test/corpus`. `sh tools/fuzzdiff.sh <seed>` shows any disagreement. Reals become text through a port
+ordering, subqueries, changes) and `tools/fuzz3.py` (window functions and frames, CTEs, RIGHT/FULL/NATURAL
+joins, row values, compound selects, JSON and `json_each`). Seeds 1–60 of each (1–90 of the first two) agree statement for statement; seed 1
+of each is in `test/corpus`. `sh tools/fuzzdiff.sh <seed>` shows any disagreement. Reals become text through a port
 of SQLite's own decimal conversion (`src/fp.wac`), so `CAST(1.0/3 AS TEXT)` is `0.33333333333333332`
 here too.
 

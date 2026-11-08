@@ -17,11 +17,27 @@ import { Answer, FAULT_UNSUPPORTED, HOST_CANNOT_WAIT, Host, OP_CAPABILITY, OP_MO
          answered } from "std";
 import { Elements } from "./element.wac";
 import { Page } from "./page.wac";
+import { ORIGIN_CAPABILITY, ORIGIN_COUNT, ORIGIN_VERSION, ORIGIN_FETCH, ORIGIN_OPEN, ORIGIN_SEND, ORIGIN_NEXT, ORIGIN_CLOSE,
+         MESSAGE_TEXT, MESSAGE_CLOSED, Reply, requestParts, RequestParts } from "./origin.wac";
 import { Change, Happened, PAGE_BATCH, PAGE_CAPABILITY, batchOf, PAGE_COUNT, PAGE_EVENT, PAGE_ONE_AT_A_TIME, PAGE_FILE, PAGE_FRAME, PAGE_GAIN, PAGE_GO, PAGE_LOCATION, PAGE_VISIBLE, PAGE_ZONE, PAGE_SURFACE, PAGE_FULLSCREEN, PAGE_PLAY, PAGE_SOUND, PAGE_STOP, PAGE_TYPE_TEXT,
          PAGE_VALUE, PAGE_VERSION, PageLine, eventAnswer, highOf, lowOf, quadAt, getF64 } from "./line.wac";
 
 /** Where this document's `wac.page` numbers start, as a host would choose them. */
 static i32 BASE = 4096;
+/** And `wac.origin`'s, when the test serves one (`TestDoc.serving`). */
+static i32 ORIGIN_BASE = 4096 + 120;
+
+/** A WebSocket the program opened on the served origin: what it sent, and what is waiting to be read. */
+export struct TestSocket {
+  string path;
+  /** Every message the program sent on it, in order. */
+  Vec<string> sent;
+  Vec<string> queue;
+  Vec<i32> asks;
+  bool closed;
+  i32 code;
+  string reason;
+}
 
 /** One node of the document: an element or, with an empty `tag`, a text node. */
 export struct TestNode {
@@ -94,17 +110,33 @@ export struct TestDoc {
   Vec<i32> seenAsks;
   /** How many minutes the reader's local time is ahead of UTC, at any moment: 0, UTC, until a test says otherwise. */
   i32 zone;
+  /**
+   * The origin this document was served from, when a test serves one (`serving`): each request the program makes of
+   * it answered by `server`, at once — method, path, the fields one a line, the body — and each socket it opens kept in
+   * `sockets`, its handle its index. `onSend` hears each message the program sends on one, to answer it if it likes.
+   */
+  fn<Reply(string, string, string, u8[])>? server;
+  Vec<TestSocket> sockets;
+  fn<void(i32, string)>? onSend;
+  /**
+   * The origin's answers given while the program was asking, to give once it has finished: the server answers as a
+   * browser's would, in a turn of its own, so each answer runs the program on and renders — which an answer given
+   * inside the request asking would not.
+   */
+  Vec<i32> laterIds;
+  Vec<Answer> laterAnswers;
 
   TestDoc create() {
     Vec<TestNode?> nodes = Vec.create();
     TestDoc d = TestDoc(nodes, 0, 0, null, null, 0, null, null, "", Vec.create(), "", 0.0, Vec.create(), Vec.create(),
-                        Vec.create(), Vec.create(), Vec.create(), Vec.create(), Vec.create(), Vec.create(), "", false, Vec.create(), "1", Vec.create(), 0);
+                        Vec.create(), Vec.create(), Vec.create(), Vec.create(), Vec.create(), Vec.create(), "", false, Vec.create(), "1", Vec.create(), 0, null, Vec.create(), null, Vec.create(), Vec.create());
     d.put(0, "div", 0 - 1);
     Host h = Host.of(
       (i32 op, i32 id, i64 a, i64 b, string text, u8[] bytes) => {
         d.asking++;
         d.request(op, id, a, b, text, bytes);
         d.asking--;
+        if (d.asking == 0) { d.giveLater(); }
       },
       // Nothing is ever waiting to be collected — every answer is given as it is — so a wait that would block cannot.
       (i32[] ids, i32 millis) => millis == 0 ? 0 - 1 : HOST_CANNOT_WAIT(),
@@ -242,10 +274,106 @@ export struct TestDoc {
     this.go(this.visited.remove(this.visited.len() - 1));
   }
 
+  // ── The origin ─────────────────────────────────────────────────────────────
+
+  /** An answer of the origin's, given as soon as the program is not in the middle of asking. */
+  void later(this, i32 id, Answer a) {
+    if (this.asking == 0) { this.answer(id, a); return; }
+    this.laterIds.push(id);
+    this.laterAnswers.push(a);
+  }
+
+  void giveLater(this) {
+    while (this.asking == 0 && this.laterIds.len() > 0) {
+      i32 id = this.laterIds.remove(0);
+      this.answer(id, this.laterAnswers.remove(0));
+    }
+  }
+
+  /** Serves the program's `wac.origin`: `server` answers each request — method, path, fields one a line, body. */
+  void serving(this, fn<Reply(string, string, string, u8[])> server) { this.server = server; }
+
+  /** A message from the server on socket `id`: the oldest `next` waiting hears it, or it waits for one. */
+  void socketSay(this, i32 id, string text) {
+    TestSocket s = this.sockets.get(id);
+    if (s.closed) { return; }
+    s.queue.push(text);
+    this.pumpSocket(s);
+  }
+
+  /** The server closes socket `id`: once what it said is read, every `next` answers this. */
+  void socketClose(this, i32 id, i32 code, string reason) {
+    TestSocket s = this.sockets.get(id);
+    if (s.closed) { return; }
+    s.closed = true;
+    s.code = code;
+    s.reason = reason;
+    this.pumpSocket(s);
+  }
+
+  void pumpSocket(this, TestSocket s) {
+    while (s.asks.len() > 0 && s.queue.len() > 0) {
+      i32 ask = s.asks.remove(0);
+      this.later(ask, Answer(0, "", s.queue.remove(0).toBytes(), 0 as i64, 0 as i64, MESSAGE_TEXT));
+    }
+    if (s.closed && s.queue.len() == 0) {
+      while (s.asks.len() > 0) { this.later(s.asks.remove(0), Answer(0, s.reason, u8[](), s.code as i64, 0 as i64, MESSAGE_CLOSED)); }
+    }
+  }
+
+  void origin(this, i32 k, i32 id, i64 a, i64 b, string text, u8[] bytes) {
+    if (k == ORIGIN_FETCH) {
+      i32 sp = text.indexOf(" ");
+      string method = sp < 0 ? text : text.slice(0, sp);
+      string path = sp < 0 ? "" : text.slice(sp + 1, text.len());
+      RequestParts parts = requestParts(bytes);
+      this.said = this.said + "fetch " + text + "\n";
+      Reply r = this.server!(method, path, parts.headers, parts.body);
+      this.later(id, Answer(0, r.headers, r.body, r.status as i64, 0 as i64, 0));
+      return;
+    }
+    if (k == ORIGIN_OPEN) {
+      this.said = this.said + "socket " + text + "\n";
+      this.sockets.push(TestSocket(text, Vec.create(), Vec.create(), Vec.create(), false, 0, ""));
+      this.later(id, Answer(0, "", u8[](), (this.sockets.len() - 1) as i64, 0 as i64, 0));
+      return;
+    }
+    i32 n = a as~ i32;
+    if (n < 0 || n >= this.sockets.len()) {
+      this.later(id, Answer(5, "no such socket", u8[](), 0 as i64, 0 as i64, 0));
+      return;
+    }
+    TestSocket s = this.sockets.get(n);
+    if (k == ORIGIN_SEND) {
+      if (s.closed) { this.later(id, Answer(5, "the socket is closed", u8[](), 0 as i64, 0 as i64, 0)); return; }
+      string msg = string.fromBytes(bytes);
+      s.sent.push(msg);
+      this.later(id, Answer(0, "", u8[](), 0 as i64, 0 as i64, 0));
+      if (this.onSend is not null) { this.onSend!(n, msg); }
+      return;
+    }
+    if (k == ORIGIN_NEXT) {
+      s.asks.push(id);
+      this.pumpSocket(s);
+      return;
+    }
+    if (k == ORIGIN_CLOSE) {
+      this.said = this.said + "close socket \{n}\n";
+      this.later(id, Answer(0, "", u8[](), 0 as i64, 0 as i64, 0));
+      this.socketClose(n, b as~ i32, text);
+      return;
+    }
+    this.later(id, Answer(FAULT_UNSUPPORTED(), "wac.origin has no request \{k}", u8[](), 0 as i64, 0 as i64, 0));
+  }
+
   // ── The requests ───────────────────────────────────────────────────────────
 
   void request(this, i32 op, i32 id, i64 a, i64 b, string text, u8[] bytes) {
     if (op == OP_CAPABILITY()) {
+      if (text == ORIGIN_CAPABILITY() && this.server is not null) {
+        this.answerWith(id, ORIGIN_VERSION(), "http://test.example".toBytes(), ORIGIN_BASE as i64, ORIGIN_COUNT as i64, 0);
+        return;
+      }
       if (text != PAGE_CAPABILITY()) {
         this.answer(id, Answer(FAULT_UNSUPPORTED(), "no capability " + text + " in a test document", u8[](), 0 as i64, 0 as i64, 0));
         return;
@@ -262,6 +390,10 @@ export struct TestDoc {
       this.said = this.said + "sleep \{a}\n";
       this.sleepAsks.push(id);
       this.sleepDue.push(this.now + (a as~ f64));
+      return;
+    }
+    if (this.server is not null && op >= ORIGIN_BASE && op < ORIGIN_BASE + ORIGIN_COUNT) {
+      this.origin(op - ORIGIN_BASE, id, a, b, text, bytes);
       return;
     }
     i32 k = op - BASE;

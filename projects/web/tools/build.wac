@@ -375,6 +375,85 @@ export string programSide() {
               : answer(id, 2, path + ": the site answered " + r.status, NONE, 0n, 0n, 0),
             (e) => answer(id, 5, path + ": " + String(e?.message ?? e), NONE, 0n, 0n, 0));
         };
+        // **`wac.origin`** (`src/origin.wac`): requests of any method to the page's own origin, and WebSockets to it —
+        // `fetch` and `WebSocket`, which a worker has as the document does, so nothing goes by the document. A path,
+        // never a URL: whatever it says, it is resolved against the origin and refused if it lands anywhere else.
+        const ORIGIN = BASE + 120;
+        const origin = site === null || !/^https?:/.test(site) ? null : new URL(site).origin;
+        const onOrigin = (path) => {
+          if (!path.startsWith("/")) return null;
+          const u = new URL(path, origin);
+          return u.origin === origin ? u : null;
+        };
+        const originFetch = (id, text, bytes) => {
+          const sp = text.indexOf(" "), method = text.slice(0, sp), path = text.slice(sp + 1);
+          const u = onOrigin(path);
+          if (u === null) return answer(id, 9, path + " is not a path on the page's origin", NONE, 0n, 0n, 0);
+          const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          const n = bytes.length >= 4 ? v.getUint32(0, true) : 0;
+          const headers = new Headers();
+          for (const line of dec.decode(bytes.subarray(4, 4 + n)).split("\\n")) {
+            const c = line.indexOf(":");
+            // A field the browser will not let a page set is the browser's to drop; it is not an error here.
+            if (c > 0) { try { headers.append(line.slice(0, c).trim(), line.slice(c + 1).trim()); } catch {} }
+          }
+          const init = { method, headers };
+          if (method !== "GET" && method !== "HEAD") init.body = bytes.slice(4 + n);
+          fetch(u, init).then((r) => r.arrayBuffer().then((buf) => {
+            let h = "";
+            r.headers.forEach((value, name) => { h += name + ": " + value + "\\n"; });
+            answer(id, 0, h, new Uint8Array(buf), BigInt(r.status), 0n, 0);
+          }), (e) => answer(id, 5, method + " " + path + ": " + String(e?.message ?? e), NONE, 0n, 0n, 0));
+        };
+        // Each socket queues what arrives until the program asks, and answers each `next` in order; once it has
+        // closed and its queue is empty, every `next` answers how it closed.
+        const sockets = new Map();
+        let lastSocket = 0;
+        const pump = (s) => {
+          while (s.asks.length && s.queue.length) {
+            const d = s.queue.shift(), ask = s.asks.shift();
+            if (typeof d === "string") answer(ask, 0, "", enc.encode(d), 0n, 0n, 0);
+            else answer(ask, 0, "", new Uint8Array(d), 0n, 0n, 1);
+          }
+          if (s.closed !== null) while (s.asks.length) answer(s.asks.shift(), 0, s.closed.reason, NONE, BigInt(s.closed.code), 0n, 2);
+        };
+        const socketOpen = (id, path) => {
+          const u = onOrigin(path);
+          if (u === null) return answer(id, 9, path + " is not a path on the page's origin", NONE, 0n, 0n, 0);
+          u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+          let ws;
+          try { ws = new WebSocket(u); } catch (e) { return answer(id, 5, path + ": " + String(e?.message ?? e), NONE, 0n, 0n, 0); }
+          ws.binaryType = "arraybuffer";
+          const key = ++lastSocket, s = { ws, queue: [], asks: [], closed: null, opened: false };
+          sockets.set(key, s);
+          ws.onopen = () => { s.opened = true; answer(id, 0, "", NONE, BigInt(key), 0n, 0); };
+          ws.onmessage = (ev) => { s.queue.push(ev.data); pump(s); };
+          ws.onclose = (ev) => {
+            if (!s.opened) { sockets.delete(key); return answer(id, 5, path + ": the socket closed before it opened (" + ev.code + ")", NONE, 0n, 0n, 0); }
+            s.closed = { code: ev.code, reason: ev.reason };
+            pump(s);
+          };
+        };
+        const originOp = (k, id, a, b, text, bytes) => {
+          if (k === 0) return originFetch(id, text, bytes);
+          if (k === 1) return socketOpen(id, text);
+          const s = sockets.get(lo(a));
+          if (k === 2) {
+            if (!s || s.ws.readyState !== 1) return answer(id, 5, "the socket is closed", NONE, 0n, 0n, 0);
+            s.ws.send(b === 1n ? bytes : dec.decode(bytes));
+            return answer(id, 0, "", NONE, 0n, 0n, 0);
+          }
+          if (k === 3) {
+            if (!s) return answer(id, 0, "no such socket", NONE, 1006n, 0n, 2);
+            s.asks.push(id);
+            return pump(s);
+          }
+          if (k === 4) {
+            if (s) { try { s.ws.close(Number(b) || 1000, text); } catch { s.ws.close(); } }
+            return answer(id, 0, "", NONE, 0n, 0n, 0);
+          }
+          return answer(id, 9, "wac.origin has no request " + k, NONE, 0n, 0n, 0);
+        };
         // **`wac.gpu`**: WebGPU's compute half — buffers, WGSL programs, runs and reads — for a program that asks for it
         // (wac-tensor's `src/gpu/line.wac` is the client, and says what each operation's fields hold). Opened the first
         // time it is looked up, which answers once the device is ready, so no operation ever arrives before it.
@@ -499,6 +578,16 @@ export string programSide() {
             return answer(id, 0, "1.1.0", enc.encode(site.split("#")[0]), BigInt(SITE), 1n, 0);
           }
           if (op === SITE) return siteGet(id, text);
+          if (op === 68 && text === "wac.origin") {
+            if (origin === null) return answer(id, 9, "a page not served over http has no origin", NONE, 0n, 0n, 0);
+            // This host speaks 1.0.0, which `^1`, `^1.0`, `^1.0.0` and `1.0.0` allow.
+            const v = dec.decode(bytes);
+            const [major, minor, patch] = (v.startsWith("^") ? v.slice(1) : v).split(".");
+            const allowed = v.startsWith("^") ? major === "1" && (minor ?? "0") === "0" && (patch ?? "0") === "0" : v === "1.0.0";
+            if (!allowed) return answer(id, 9, "wac.origin here is 1.0.0, which " + v + " does not allow", NONE, 0n, 0n, 0);
+            return answer(id, 0, "1.0.0", enc.encode(origin), BigInt(ORIGIN), 5n, 0);
+          }
+          if (op >= ORIGIN && op < ORIGIN + 5 && origin !== null) return originOp(op - ORIGIN, id, a, b, text, bytes);
           if (op === 68 && text === "wac.page") {
             // `^1`, `^1.2`, or an exact `1.2.3`: this host speaks 1.0.0, which only `^1`, `^1.0`, `^1.0.0` and `1.0.0` allow.
             const v = dec.decode(bytes);

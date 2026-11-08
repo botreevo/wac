@@ -185,6 +185,22 @@ after everything else is in place — or, from the site's own build, with `index
 `webbuild` exports beside `buildPage`. A page opened from a file has no site, and `Site.of` says so. The page's policy
 allows its own origin to be read for this (`connect-src 'self'`), and nothing else.
 
+## The server it came from — `wac.origin`
+
+`Origin.of(sys)` is the origin the page was served from — `origin.address`, `https://app.example` — to talk to:
+`await origin.request(method, path, headers, body)` answers a `Reply` (`status`, `header(name)`, `body`, `text()`), whatever
+its status, and `await origin.open(path)` an `OriginSocket`, a WebSocket to the same origin: `send(text)`, `await next()`
+— `Message.Text`, `Binary` or `Closed(code, reason)`, in the order the server sent them whether or not the program was
+waiting — and `close()`. A path, never a URL: the host resolves it against the origin and refuses it if it lands anywhere
+else, so a page reaches what its policy (`connect-src 'self'`) already allows and nothing more. It is for an app whose
+API is beside its page, as most are; `wac.site`, a GET of a file under the page's folder, is narrower and stays its own.
+A page opened from a file has no origin. The browser's host answers in the program's own worker (`fetch`, `WebSocket`),
+so nothing goes by the document.
+
+`TestDoc.serving(server)` serves it in a test: `server` answers each request — method, path, fields one a line, body —
+each socket opened is in `doc.sockets` with what the program sent on it, `doc.onSend` hears each message as it is sent,
+and `socketSay` and `socketClose` are the server's side. Answers come in a turn of their own, as a browser's do.
+
 ## A GPU — `wac.gpu`
 
 The browser's host also answers `wac.gpu` with `navigator.gpu`: WebGPU's compute half in five verbs — make a buffer,

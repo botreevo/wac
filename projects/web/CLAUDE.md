@@ -66,4 +66,7 @@ of the desktop (step 2 of the handover in `https://git.voltrevo.com/notes.git`,
   as read-only files over the `index.json` its build writes (`tools/index.wac`). The browser's host answers it.
 - **Done:** `Desktop.edit` (a file shown in the desktop's editor) and `Desktop.newFile` (a free name on the desktop,
   which the program may write): what the desktop's own viewer and editor need, now programs on its site.
+- **Done:** `wac.origin` (`src/origin.wac`): requests of any method to the page's own origin, and WebSockets to it,
+  answered in the program's worker; `TestDoc.serving` answers it in tests. For an app whose API is beside its page
+  (autonag's client, in autonag-wac).
 - **Next:** a program's description of itself, which needs a section wac's builder does not write yet.

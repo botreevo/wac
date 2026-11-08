@@ -72,6 +72,9 @@ key, or, where there is none (an iPhone's browser), the window — and `fullscre
 | `visible()`, `onVisible(f)` | whether the reader can see the page — false with its tab in the background, the screen off or the page being left — and each change of it: where a clock stops and what is unsaved is saved |
 | `zoneAt(ms)` | how many minutes the reader's local time is ahead of UTC at a moment, milliseconds since the epoch — what saying which day it is where they are takes, which the clock alone cannot |
 | `location()`, `onLocation(f)`, `go(where, push)` | where the reader is — the address's `#` part — each change of it, and a new place: added to the browser's history, so Back returns from it, or in place of this one |
+| `back()` | the browser's Back: to the place before this one, the history left as it was — what an app's own back button wants |
+| `zoneName()` | the reader's time zone by name, `Europe/Paris` — as the browser's own `Intl` names it, which may be an older alias (`Asia/Calcutta`) |
+| `await stored(key)`, `store(key, value)`, `unstore(key)` | the page's small store: the browser's `localStorage` for its origin, so what a page written in JavaScript stored there is read here too |
 | `sound(samples, rate)` → `Sound`; `.play(volume)`, `.loop(volume)`, `.playAt(volume, loop, at, offset)` → `Voice`; `.stop()`, `.fade(volume, ms)` | sound the program made — samples from -1 to 1, one channel — sent once and played as often as it likes, now or at a moment by `now()`'s clock — voices started for one moment start together, to the sample — and faded smoothly; heard once the person has clicked or pressed a key on the page |
 | `sys` | what the build granted — see below |
 

@@ -74,7 +74,7 @@ Reading through indexes is where this wins; producing and loading a whole file i
 since SQLite's image is its pages already and this one is built from rows (an unchanged row's record is
 kept, so a commit after a small change costs less than the first). Numbers move a few percent run to run.
 
-**And against SQLite's answers.** Beyond the hand-written corpus, six fuzzers write random SQL and
+**And against SQLite's answers.** Beyond the hand-written corpus, seven fuzzers write random SQL and
 record what SQLite 3.53 answers:
 
 - `tools/fuzz.py`: expressions over mixed types — affinity, casts, arithmetic, every scalar function;
@@ -86,10 +86,12 @@ record what SQLite 3.53 answers:
 - `tools/fuzz5.py`: date and time functions with their modifiers, `strftime`, `printf` formats, string
   functions over non-ASCII text, numbers as text;
 - `tools/fuzz6.py`: views over joins and aggregates, correlated subqueries everywhere, IN and EXISTS with
-  NULLs, DISTINCT, collations and NULLS FIRST/LAST in ordering, LIMIT/OFFSET, compound selects.
+  NULLs, DISTINCT, collations and NULLS FIRST/LAST in ordering, LIMIT/OFFSET, compound selects;
+- `tools/fuzz7.py`: ALTER TABLE renames and drops against the views, triggers, indexes and foreign keys
+  that name what changes, comparing the whole of `sqlite_schema` (whose text SQLite rewrites) each time.
 
 At least the first 40 seeds of each agree statement for statement (90 of the first two, 80 of the
-fifth); seed 1 of each is in `test/corpus`, and `sh tools/fuzzdiffN.sh <seed>` shows where a seed
+fifth, 100 of the seventh); seed 1 of each is in `test/corpus`, and `sh tools/fuzzdiffN.sh <seed>` shows where a seed
 disagrees. Where SQLite's answer is its planner's choice rather than the SQL's meaning (which row a
 group shows, the order of rows a query does not order), the fuzzers ask only questions with one
 answer. Reals become text through a port of SQLite's own decimal conversion (`src/fp.wac`), so

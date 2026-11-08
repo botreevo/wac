@@ -1,0 +1,170 @@
+// Layers and optimizers, held to what they promise: exact first steps, and models that actually learn.
+
+import { Check } from "./check.wac";
+import { Device, Padding, Tensor, Variable } from "../src/tensor.wac";
+import {
+  Activation, BatchNorm, Conv2d, Dense, Dropout, Flatten, LayerNorm, Layer, MaxPool, Sequential, accuracy, huber,
+  meanSquaredError, sigmoidCrossEntropy, softmaxCrossEntropy, sparseSoftmaxCrossEntropy,
+} from "../src/nn.wac";
+import { Adagrad, Adam, Momentum, Optimizer, RmsProp, Sgd, clipByGlobalNorm } from "../src/optim.wac";
+
+Variable var1(Device d, f32[] v) { return d.variable(d.vector(v), "w"); }
+
+export string test_first_steps_are_exact() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  // Loss sum(w²) has gradient 2w: from w = [1, -2] that is [2, -4].
+  Variable w = var1(d, [1.0, -2.0]);
+  Sgd sgd = Sgd.create(0.1);
+  Tensor loss = sgd.minimize(() => w.square().sum([], false), [w]);
+  t.values(loss, i32[](), [5.0], 0.0, "the loss before the step");
+  t.values(w, [2], [0.8, -1.6], 0.000001, "sgd");
+
+  // Adam's first step is the rate times the gradient's sign, whatever its size.
+  Variable a = var1(d, [1.0, -2.0]);
+  Adam adam = Adam.create(0.1);
+  adam.minimize(() => a.square().sum([], false), [a]);
+  t.values(a, [2], [0.9, -1.9], 0.00001, "adam");
+
+  Variable m = var1(d, [1.0]);
+  Momentum mom = Momentum.create(0.1, 0.9, false);
+  mom.minimize(() => m.square().sum([], false), [m]);
+  mom.minimize(() => m.square().sum([], false), [m]);
+  // Step one: v = -0.2, w = 0.8. Step two: g = 1.6, v = -0.18 - 0.16 = -0.34, w = 0.46.
+  t.values(m, [1], [0.46], 0.00001, "momentum");
+
+  Variable r = var1(d, [1.0]);
+  RmsProp rms = RmsProp.create(0.01);
+  rms.minimize(() => r.square().sum([], false), [r]);
+  // ms = 0.1·4 = 0.4; step = 0.01·2/√0.4.
+  t.values(r, [1], [0.96837723], 0.00001, "rmsprop");
+
+  Variable g = var1(d, [1.0]);
+  Adagrad ada = Adagrad.create(0.1);
+  ada.minimize(() => g.square().sum([], false), [g]);
+  t.values(g, [1], [0.9], 0.00001, "adagrad");
+  return t.report();
+}
+
+export string test_clipping_keeps_the_direction() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  Tensor[] clipped = clipByGlobalNorm([d.vector([3.0]), d.vector([4.0])], 1.0);
+  t.values(clipped[0], [1], [0.6], 0.000001, "first");
+  t.values(clipped[1], [1], [0.8], 0.000001, "second");
+  Tensor[] small = clipByGlobalNorm([d.vector([0.3, 0.4])], 1.0);
+  t.values(small[0], [2], [0.3, 0.4], 0.000001, "under the bound, unchanged");
+  return t.report();
+}
+
+export string test_losses() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  Tensor p = d.vector([1.0, 2.0, 5.0]);
+  Tensor y = d.vector([1.0, 0.0, 2.0]);
+  t.values(meanSquaredError(p, y), i32[](), [4.3333335], 0.000001, "mse");
+  t.values(huber(p, y, 1.0), i32[](), [1.3333334], 0.000001, "huber");
+  Tensor logits = d.tensor([2.0, 1.0, 0.1, 0.5, 2.5, 0.3], [2, 3]);
+  Tensor classes = d.vector([0.0, 1.0]);
+  t.values(sparseSoftmaxCrossEntropy(logits, classes), i32[](), [0.31853977], 0.00001, "sparse cross-entropy");
+  t.values(softmaxCrossEntropy(logits, classes.oneHot(3)), i32[](), [0.31853977], 0.00001, "cross-entropy");
+  t.values(accuracy(logits, d.vector([0.0, 2.0])), i32[](), [0.5], 0.0, "accuracy");
+  t.values(sigmoidCrossEntropy(d.vector([0.0, 100.0, -100.0]), d.vector([1.0, 1.0, 0.0])), i32[](), [0.23104906], 0.00001,
+           "sigmoid cross-entropy stays finite at the extremes");
+  return t.report();
+}
+
+export string test_a_dense_network_learns_xor() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  d.seed(7 as i64);
+  Tensor x = d.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], [4, 2]);
+  Tensor y = d.tensor([0.0, 1.0, 1.0, 0.0], [4, 1]);
+  Sequential model = Sequential.of([Dense.create(d, 2, 8, Activation.Tanh), Dense.create(d, 8, 1, Activation.Linear)]);
+  Adam opt = Adam.create(0.05);
+  f32 first = 0.0;
+  f32 last = 0.0;
+  for (i32 step = 0; step < 300; step++) {
+    Tensor loss = opt.minimize(() => sigmoidCrossEntropy(model.apply(x, true), y), model.params());
+    if (step == 0) { first = loss.item(); }
+    last = loss.item();
+    loss.dispose();
+  }
+  t.ok(last < first / 10.0, "the loss fell from \{first} to \{last}");
+  f32[] out = model.apply(x, false).sigmoid().valuesNow();
+  t.ok(out[0] < 0.2 && out[1] > 0.8 && out[2] > 0.8 && out[3] < 0.2, "xor: \{out[0]} \{out[1]} \{out[2]} \{out[3]}");
+  return t.report();
+}
+
+export string test_a_convolutional_network_tells_rows_from_columns() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  d.seed(8 as i64);
+  // 6x6 images with one bright row (class 0) or one bright column (class 1), at every position.
+  f32[] pixels = f32[].filled(12 * 36, 0.0);
+  f32[] labels = f32[].filled(12, 0.0);
+  for (i32 k = 0; k < 6; k++) {
+    for (i32 j = 0; j < 6; j++) {
+      pixels[k * 36 + k * 6 + j] = 1.0;
+      pixels[(6 + k) * 36 + j * 6 + k] = 1.0;
+    }
+    labels[6 + k] = 1.0;
+  }
+  Tensor x = d.tensor(pixels, [12, 6, 6, 1]);
+  Tensor y = d.vector(labels);
+  Sequential model = Sequential.of([
+    Conv2d.create(d, 1, 4, 3, 1, Padding.Same, Activation.Relu),
+    MaxPool.create(2, 2),
+    Flatten.create(),
+    Dense.create(d, 36, 2, Activation.Linear),
+  ]);
+  Adam opt = Adam.create(0.02);
+  for (i32 step = 0; step < 60; step++) {
+    opt.minimize(() => sparseSoftmaxCrossEntropy(model.apply(x, true), y), model.params()).dispose();
+  }
+  t.values(accuracy(model.apply(x, false), y), i32[](), [1.0], 0.0, "every image classified");
+  return t.report();
+}
+
+export string test_normalisation_and_dropout() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  d.seed(9 as i64);
+  Tensor x = d.normal([64, 3], 5.0, 2.0);
+  Tensor ln = LayerNorm.create(d, 3).apply(x, true);
+  t.values(ln.mean([-1], false).abs().max([], false), i32[](), [0.0], 0.0001, "layer norm centres each row");
+  BatchNorm bn = BatchNorm.create(d, 3);
+  Tensor b = bn.apply(x, true);
+  t.values(b.mean([0], false), [3], [0.0, 0.0, 0.0], 0.0001, "batch norm centres each channel");
+  t.values(b.variance([0], false), [3], [1.0, 1.0, 1.0], 0.01, "and scales it");
+  f32[] mm = bn.movingMean.valuesNow();
+  t.ok(mm[0] > 0.0 && mm[0] < 0.2, "the moving mean moved a little towards 5: \{mm[0]}");
+  Dropout drop = Dropout.create(0.5);
+  Tensor ones = d.ones([1000]);
+  t.values(drop.apply(ones, false), [1000], f32[].filled(1000, 1.0), 0.0, "dropout does nothing at inference");
+  f32[] dropped = drop.apply(ones, true).valuesNow();
+  i32 zeros = 0;
+  for (f32 v in dropped) {
+    if (v == 0.0) { zeros++; } else { t.ok(v == 2.0, "a kept element is scaled to keep the mean"); }
+  }
+  t.ok(zeros > 400 && zeros < 600, "about half dropped: \{zeros}");
+  return t.report();
+}
+
+export string test_training_frees_what_it_makes() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  Tensor x = d.normal([8, 4], 0.0, 1.0);
+  Tensor y = d.normal([8, 1], 0.0, 1.0);
+  Dense layer = Dense.create(d, 4, 1, Activation.Linear);
+  Sgd opt = Sgd.create(0.01);
+  // Every tensor made during the step is made in this scope; afterwards only the returned loss may be live.
+  d.enter();
+  Tensor loss = opt.minimize(() => meanSquaredError(layer.apply(x, true), y), layer.params());
+  i32 live = 0;
+  i32 made = d.scopes.last()!.len();
+  for (i32 i = 0; i < made; i++) { if (!d.scopes.last()!.get(i).storage.freed) { live++; } }
+  d.leave(Tensor[]());
+  t.ok(live == 1, "\{live} of \{made} tensors left live by a training step, want only the loss");
+  return t.report();
+}

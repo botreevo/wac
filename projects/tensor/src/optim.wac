@@ -1,0 +1,161 @@
+// Optimizers: how a gradient becomes a change to a variable.
+//
+// `optimizer.minimize(() => loss, params)` is a whole training step — the gradients, the update, and every tensor
+// both made given back — and answers the loss before the update. `apply(params, grads)` is the update alone, for a
+// caller who wants to look at or clip the gradients first (`clipByGlobalNorm`).
+//
+// An optimizer's per-variable state — Adam's moments, momentum's velocity — is kept by the variable's identity, so one
+// optimizer can train any set of variables, and a variable it has not seen before starts from zeros.
+
+import { Map, hashI32, i32Eq } from "core";
+import { Device, Gradients, Tensor, Variable } from "./tensor.wac";
+
+export struct Optimizer {
+  /** Moments and velocities, by variable id and slot. */
+  Map<i32, Variable> slots;
+  i32 steps = 0;
+
+  /** The update for one variable. */
+  virtual void update(this, Variable v, Tensor g) { trap; }
+
+  /** A tensor of zeros shaped like `v`, kept for it under `slot` from one step to the next. */
+  Variable slot(this, Variable v, i32 slot) {
+    i32 key = v.id * 4 + slot;
+    Variable? had = this.slots.get(key);
+    if (had is not null) { return had!; }
+    Tensor zeros = v.device.zeros(v.shape);
+    Variable made = v.device.variable(zeros, v.name + "/slot");
+    zeros.dispose();
+    this.slots.set(key, made);
+    return made;
+  }
+
+  void apply(this, Variable[] params, Tensor[] grads) {
+    this.steps++;
+    for (i32 i = 0; i < params.len(); i++) {
+      if (params[i].trainable) { this.update(params[i], grads[i]); }
+    }
+  }
+
+  /** One training step: `loss`'s gradients with respect to `params`, applied. Answers the loss, before the update. */
+  Tensor minimize(this, fn<Tensor()> loss, Variable[] params) {
+    Device d = params[0].device;
+    return d.tidy(() => {
+      Gradients g = d.gradients(loss, tensorsOf(params));
+      this.apply(params, g.grads);
+      return g.value;
+    });
+  }
+}
+
+export Tensor[] tensorsOf(Variable[] vs) {
+  Tensor[] out = Tensor[].filled(vs.len(), vs[0]);
+  for (i32 i = 0; i < vs.len(); i++) { out[i] = vs[i]; }
+  return out;
+}
+
+/** Plain gradient descent: `v -= rate · g`. */
+export struct Sgd : Optimizer {
+  f64 rate;
+
+  Sgd create(f64 rate) { return Sgd { slots: Map.create(hashI32, i32Eq), rate: rate }; }
+  override void update(this, Variable v, Tensor g) { v.assign(v.sub(g.mul(this.rate))); }
+}
+
+/** Gradient descent with a velocity, optionally Nesterov's look-ahead form. */
+export struct Momentum : Optimizer {
+  f64 rate;
+  f64 momentum;
+  bool nesterov;
+
+  Momentum create(f64 rate, f64 momentum, bool nesterov) {
+    return Momentum { slots: Map.create(hashI32, i32Eq), rate: rate, momentum: momentum, nesterov: nesterov };
+  }
+
+  override void update(this, Variable v, Tensor g) {
+    Variable vel = this.slot(v, 0);
+    vel.assign(vel.mul(this.momentum).sub(g.mul(this.rate)));
+    if (this.nesterov) { v.assign(v.add(vel.mul(this.momentum)).sub(g.mul(this.rate))); }
+    else { v.assign(v.add(vel)); }
+  }
+}
+
+/** Each element's step scaled by a running mean of its squared gradient. */
+export struct RmsProp : Optimizer {
+  f64 rate;
+  f64 decay;
+  f64 epsilon;
+
+  RmsProp create(f64 rate) { return RmsProp { slots: Map.create(hashI32, i32Eq), rate: rate, decay: 0.9, epsilon: 0.0000001 }; }
+
+  override void update(this, Variable v, Tensor g) {
+    Variable ms = this.slot(v, 0);
+    ms.assign(ms.mul(this.decay).add(g.square().mul(1.0 - this.decay)));
+    v.assign(v.sub(g.mul(this.rate).div(ms.sqrt().add(this.epsilon))));
+  }
+}
+
+/** Each element's step scaled by the root of the sum of its squared gradients so far. */
+export struct Adagrad : Optimizer {
+  f64 rate;
+  f64 epsilon;
+
+  Adagrad create(f64 rate) { return Adagrad { slots: Map.create(hashI32, i32Eq), rate: rate, epsilon: 0.0000001 }; }
+
+  override void update(this, Variable v, Tensor g) {
+    Variable acc = this.slot(v, 0);
+    acc.assign(acc.add(g.square()));
+    v.assign(v.sub(g.mul(this.rate).div(acc.sqrt().add(this.epsilon))));
+  }
+}
+
+/**
+ * Adam, with bias-corrected moments; and AdamW when `weightDecay` is not zero — the decay applied to the variable
+ * directly rather than through the gradient, as Loshchilov and Hutter have it.
+ */
+export struct Adam : Optimizer {
+  f64 rate;
+  f64 beta1;
+  f64 beta2;
+  f64 epsilon;
+  f64 weightDecay;
+
+  Adam create(f64 rate) { return Adam.withDecay(rate, 0.0); }
+
+  Adam withDecay(f64 rate, f64 weightDecay) {
+    return Adam { slots: Map.create(hashI32, i32Eq), rate: rate, beta1: 0.9, beta2: 0.999, epsilon: 0.0000001,
+                  weightDecay: weightDecay };
+  }
+
+  override void update(this, Variable v, Tensor g) {
+    Variable m = this.slot(v, 0);
+    Variable s = this.slot(v, 1);
+    m.assign(m.mul(this.beta1).add(g.mul(1.0 - this.beta1)));
+    s.assign(s.mul(this.beta2).add(g.square().mul(1.0 - this.beta2)));
+    f64 t = this.steps as f64;
+    f64 c1 = 1.0 - powi(this.beta1, this.steps);
+    f64 c2 = 1.0 - powi(this.beta2, this.steps);
+    Tensor stepped = m.div(c1).div(s.div(c2).sqrt().add(this.epsilon)).mul(this.rate);
+    if (this.weightDecay != 0.0) { stepped = stepped.add(v.mul(this.rate * this.weightDecay)); }
+    v.assign(v.sub(stepped));
+  }
+}
+
+f64 powi(f64 x, i32 n) {
+  f64 r = 1.0;
+  for (i32 i = 0; i < n; i++) { r *= x; }
+  return r;
+}
+
+/**
+ * The gradients scaled down together, when the norm of all of them as one vector is above `maxNorm`, so that it is
+ * `maxNorm` — the direction kept, the step bounded.
+ */
+export Tensor[] clipByGlobalNorm(Tensor[] grads, f64 maxNorm) {
+  Tensor total = grads[0].square().sum([], false);
+  for (i32 i = 1; i < grads.len(); i++) { total = total.add(grads[i].square().sum([], false)); }
+  Tensor scale = total.sqrt().maximum(maxNorm).reciprocal().mul(maxNorm);
+  Tensor[] out = Tensor[].filled(grads.len(), grads[0]);
+  for (i32 i = 0; i < grads.len(); i++) { out[i] = grads[i].mul(scale); }
+  return out;
+}

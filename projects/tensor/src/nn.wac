@@ -1,0 +1,266 @@
+// Layers, losses and metrics: models as values that own their weights.
+//
+// **A layer is told its input size when it is made.** Keras builds a layer the first time it sees an input, which
+// means a model has no weights until it has run and a typo in a shape surfaces far from where it was made. Here
+// `Dense.create(device, 784, 128, Activation.Relu)` has its weights the moment it exists, and `params()` is the
+// whole of them.
+//
+// **`apply(x, training)` is the one call.** Whether a layer is training is an argument rather than a mode the model
+// is put into, so dropout and batch normalisation cannot be left in the wrong one by an earlier call.
+
+import { Vec } from "core";
+import { Device, Padding, Tensor, Variable } from "./tensor.wac";
+
+export enum Activation {
+  Linear,
+  Relu,
+  Relu6,
+  LeakyRelu,
+  Elu,
+  Selu,
+  Gelu,
+  Swish,
+  Sigmoid,
+  Tanh,
+  Softplus,
+  /** Along the last axis. */
+  Softmax,
+}
+
+export Tensor activate(Tensor x, Activation a) {
+  match (a) {
+    Linear: { return x; }
+    Relu: { return x.relu(); }
+    Relu6: { return x.relu6(); }
+    LeakyRelu: { return x.leakyRelu(0.2); }
+    Elu: { return x.elu(); }
+    Selu: { return x.selu(); }
+    Gelu: { return x.gelu(); }
+    Swish: { return x.swish(); }
+    Sigmoid: { return x.sigmoid(); }
+    Tanh: { return x.tanh(); }
+    Softplus: { return x.softplus(); }
+    Softmax: { return x.softmax(-1); }
+  }
+}
+
+/** Glorot and Bengio's uniform initialiser: what Keras gives a dense or convolutional layer's weights. */
+export Tensor glorotUniform(Device d, i32[] shape, i32 fanIn, i32 fanOut) {
+  f64 limit = (6.0 / ((fanIn + fanOut) as f64)).sqrt();
+  return d.uniform(shape, 0.0 - limit, limit);
+}
+
+/** He's normal initialiser, for layers followed by a ReLU. */
+export Tensor heNormal(Device d, i32[] shape, i32 fanIn) {
+  return d.truncatedNormal(shape, 0.0, (2.0 / (fanIn as f64)).sqrt());
+}
+
+/** A variable initialised from `init`, which is then disposed. */
+Variable weight(Device d, Tensor init, string name) {
+  Variable v = d.variable(init, name);
+  init.dispose();
+  return v;
+}
+
+export struct Layer {
+  virtual Tensor apply(this, Tensor x, bool training) { trap; }
+  /** The variables an optimizer trains. */
+  virtual Variable[] params(this) { return Variable[](); }
+  /** Every variable, trained or not — a batch normalisation's running statistics are the second kind. */
+  virtual Variable[] state(this) { return this.params(); }
+}
+
+/** `activation(x · kernel + bias)`, over the last axis. */
+export struct Dense : Layer {
+  Variable kernel;
+  Variable bias;
+  Activation activation;
+
+  Dense create(Device d, i32 inputs, i32 units, Activation activation) {
+    return Dense(weight(d, glorotUniform(d, [inputs, units], inputs, units), "kernel"),
+                 weight(d, d.zeros([units]), "bias"), activation);
+  }
+
+  override Tensor apply(this, Tensor x, bool training) { return activate(x.matmul(this.kernel).add(this.bias), this.activation); }
+  override Variable[] params(this) { return [this.kernel, this.bias]; }
+}
+
+/** A 2-D convolution over NHWC images, its filter `[kh, kw, in, out]`. */
+export struct Conv2d : Layer {
+  Variable filter;
+  Variable bias;
+  i32[] strides;
+  Padding padding;
+  Activation activation;
+
+  Conv2d create(Device d, i32 inChannels, i32 outChannels, i32 kernel, i32 stride, Padding padding, Activation activation) {
+    i32 fanIn = kernel * kernel * inChannels;
+    i32 fanOut = kernel * kernel * outChannels;
+    return Conv2d(weight(d, glorotUniform(d, [kernel, kernel, inChannels, outChannels], fanIn, fanOut), "filter"),
+                  weight(d, d.zeros([outChannels]), "bias"), [stride, stride], padding, activation);
+  }
+
+  override Tensor apply(this, Tensor x, bool training) {
+    return activate(x.conv2d(this.filter, this.strides, this.padding, [1, 1]).add(this.bias), this.activation);
+  }
+  override Variable[] params(this) { return [this.filter, this.bias]; }
+}
+
+export struct MaxPool : Layer {
+  i32 size;
+  i32 stride;
+
+  MaxPool create(i32 size, i32 stride) { return MaxPool(size, stride); }
+  override Tensor apply(this, Tensor x, bool training) {
+    return x.maxPool([this.size, this.size], [this.stride, this.stride], Padding.Valid);
+  }
+}
+
+/** Every axis but the first merged into one. */
+export struct Flatten : Layer {
+  Flatten create() { return Flatten(); }
+  override Tensor apply(this, Tensor x, bool training) { return x.reshape([x.shape[0], -1]); }
+}
+
+/** While training, each element zeroed with probability `rate` and the rest scaled up to keep the mean. */
+export struct Dropout : Layer {
+  f64 rate;
+
+  Dropout create(f64 rate) { return Dropout(rate); }
+  override Tensor apply(this, Tensor x, bool training) {
+    if (!training || this.rate == 0.0) { return x; }
+    Tensor keep = x.device.uniform(x.shape, 0.0, 1.0).greaterEqual(this.rate);
+    return x.mul(keep).div(1.0 - this.rate);
+  }
+}
+
+/** Rows of a table looked up by index: `[...] → [..., width]`. */
+export struct Embedding : Layer {
+  Variable table;
+
+  Embedding create(Device d, i32 rows, i32 width) {
+    return Embedding(weight(d, d.uniform([rows, width], -0.05, 0.05), "embeddings"));
+  }
+  override Tensor apply(this, Tensor indices, bool training) { return this.table.take(indices); }
+  override Variable[] params(this) { return [this.table]; }
+}
+
+/** Normalised over the last axis, then scaled and shifted — what a transformer block uses. */
+export struct LayerNorm : Layer {
+  Variable gamma;
+  Variable beta;
+  f64 epsilon;
+
+  LayerNorm create(Device d, i32 width) {
+    return LayerNorm(weight(d, d.ones([width]), "gamma"), weight(d, d.zeros([width]), "beta"), 0.001);
+  }
+  override Tensor apply(this, Tensor x, bool training) {
+    Tensor mean = x.mean([-1], true);
+    Tensor centred = x.sub(mean);
+    Tensor variance = centred.square().mean([-1], true);
+    return centred.mul(variance.add(this.epsilon).rsqrt()).mul(this.gamma).add(this.beta);
+  }
+  override Variable[] params(this) { return [this.gamma, this.beta]; }
+}
+
+/**
+ * Normalised per channel — the last axis — by the batch's statistics while training and by running averages of them
+ * otherwise, which training keeps up to date.
+ */
+export struct BatchNorm : Layer {
+  Variable gamma;
+  Variable beta;
+  Variable movingMean;
+  Variable movingVariance;
+  f64 momentum;
+  f64 epsilon;
+
+  BatchNorm create(Device d, i32 channels) {
+    return BatchNorm(weight(d, d.ones([channels]), "gamma"), weight(d, d.zeros([channels]), "beta"),
+                     weight(d, d.zeros([channels]), "moving_mean"), weight(d, d.ones([channels]), "moving_variance"),
+                     0.99, 0.001);
+  }
+
+  override Tensor apply(this, Tensor x, bool training) {
+    Tensor mean;
+    Tensor variance;
+    if (training) {
+      i32[] axes = i32[].filled(x.rank() - 1, 0);
+      for (i32 i = 0; i < axes.len(); i++) { axes[i] = i; }
+      mean = x.mean(axes, false);
+      variance = x.sub(mean).square().mean(axes, false);
+      // The running averages are bookkeeping, not part of what is differentiated.
+      Tensor m = mean.detach();
+      Tensor v = variance.detach();
+      this.movingMean.assign(this.movingMean.mul(this.momentum).add(m.mul(1.0 - this.momentum)));
+      this.movingVariance.assign(this.movingVariance.mul(this.momentum).add(v.mul(1.0 - this.momentum)));
+    } else {
+      mean = this.movingMean;
+      variance = this.movingVariance;
+    }
+    return x.sub(mean).mul(variance.add(this.epsilon).rsqrt()).mul(this.gamma).add(this.beta);
+  }
+
+  override Variable[] params(this) { return [this.gamma, this.beta]; }
+  override Variable[] state(this) { return [this.gamma, this.beta, this.movingMean, this.movingVariance]; }
+}
+
+/** Layers applied in order. */
+export struct Sequential : Layer {
+  Layer[] layers;
+
+  Sequential of(Layer[] layers) { return Sequential(layers); }
+
+  override Tensor apply(this, Tensor x, bool training) {
+    Tensor h = x;
+    for (Layer l in this.layers) { h = l.apply(h, training); }
+    return h;
+  }
+
+  override Variable[] params(this) {
+    Vec<Variable> all = Vec.create();
+    for (Layer l in this.layers) { for (Variable v in l.params()) { all.push(v); } }
+    return all.toArray();
+  }
+
+  override Variable[] state(this) {
+    Vec<Variable> all = Vec.create();
+    for (Layer l in this.layers) { for (Variable v in l.state()) { all.push(v); } }
+    return all.toArray();
+  }
+}
+
+// ── Losses ──────────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Each is the mean over the batch, as Keras reduces them by default.
+
+export Tensor meanSquaredError(Tensor predicted, Tensor target) { return predicted.squaredDifference(target).mean([], false); }
+
+export Tensor meanAbsoluteError(Tensor predicted, Tensor target) { return predicted.sub(target).abs().mean([], false); }
+
+/** Squared below `delta` and linear above it: a regression loss an outlier cannot dominate. */
+export Tensor huber(Tensor predicted, Tensor target, f64 delta) {
+  Tensor err = predicted.sub(target).abs();
+  Tensor quadratic = err.minimum(delta);
+  return quadratic.square().mul(0.5).add(err.sub(quadratic).mul(delta)).mean([], false);
+}
+
+/** Cross-entropy between `labels` — one row of probabilities per example — and the softmax of `logits`. */
+export Tensor softmaxCrossEntropy(Tensor logits, Tensor labels) {
+  return logits.logSoftmax(-1).mul(labels).sum([-1], false).neg().mean([], false);
+}
+
+/** `softmaxCrossEntropy` with each example's label a class index rather than a row. */
+export Tensor sparseSoftmaxCrossEntropy(Tensor logits, Tensor classes) {
+  return softmaxCrossEntropy(logits, classes.oneHot(logits.shape[logits.rank() - 1]));
+}
+
+/** Binary cross-entropy of `labels` in [0, 1] against `sigmoid(logits)`, in the form that does not overflow. */
+export Tensor sigmoidCrossEntropy(Tensor logits, Tensor labels) {
+  return logits.relu().sub(logits.mul(labels)).add(logits.abs().neg().exp().log1p()).mean([], false);
+}
+
+/** The fraction of examples whose largest logit is at their class index. */
+export Tensor accuracy(Tensor logits, Tensor classes) {
+  return logits.argMax(-1).equal(classes).mean([], false);
+}

@@ -4,7 +4,7 @@ import { Result, Vec, Map, hashString, stringEq, NumberLiteral, numberLiteralToF
 import { SqlError } from "./error.wac";
 import { Value } from "./value.wac";
 import { Token, tokenize, upper, lower, T_IDENT, T_STRING, T_INTEGER, T_FLOAT, T_BLOB, T_PARAM, T_OP, T_EOF } from "./lexer.wac";
-import { Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
+import { Cte, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
          CreateIndex, Assign, Upsert, Insert, Update, Delete, Stmt, JOIN_FIRST, JOIN_INNER, JOIN_LEFT,
          JOIN_CROSS, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 
@@ -519,9 +519,34 @@ export struct Parser {
 
   // ── SELECT ─────────────────────────────────────────────────────────────
 
+  // WITH [RECURSIVE] name [(cols)] AS [NOT] [MATERIALIZED] (select), …
+  Result<Cte[], SqlError> withClause(this) {
+    Vec<Cte> out;
+    while (true) {
+      string name = try this.name();
+      string[]? cols = null;
+      if (this.isOp("(")) { cols = try this.nameList(); }
+      try this.expectKw("AS");
+      if (this.eatKw("NOT")) { try this.expectKw("MATERIALIZED"); } else { this.eatKw("MATERIALIZED"); }
+      try this.expectOp("(");
+      Select sel = try this.select();
+      try this.expectOp(")");
+      out.push(Cte(name, cols, sel));
+      if (!this.eatOp(",")) { break; }
+    }
+    return Result.Ok(out.toArray());
+  }
+
   Result<Select, SqlError> select(this) {
-    if (this.isKw("WITH")) { return Result.Err(SqlError.unsupported("WITH")); }
+    Cte[] with = Cte[]();
+    bool recursive = false;
+    if (this.eatKw("WITH")) {
+      recursive = this.eatKw("RECURSIVE");
+      with = try this.withClause();
+    }
     Select first = try this.selectCore();
+    first.with = with;
+    first.recursive = recursive;
     Select cur = first;
     while (true) {
       string? op = null;
@@ -678,6 +703,32 @@ export struct Parser {
   // ── statements ─────────────────────────────────────────────────────────
 
   Result<Stmt, SqlError> statement(this) {
+    if (this.isKw("WITH")) {
+      // A WITH before INSERT, UPDATE or DELETE belongs to that statement; before SELECT, to the select.
+      i32 save = this.pos;
+      this.pos++;
+      bool recursive = this.eatKw("RECURSIVE");
+      Cte[] with = try this.withClause();
+      if (this.isKw("INSERT") || this.isKw("REPLACE")) {
+        Insert i = try this.insert();
+        i.with = with;
+        i.recursive = recursive;
+        return Result.Ok(Stmt.InsertStmt(i));
+      }
+      if (this.eatKw("UPDATE")) {
+        Update u = try this.update();
+        u.with = with;
+        u.recursive = recursive;
+        return Result.Ok(Stmt.UpdateStmt(u));
+      }
+      if (this.eatKw("DELETE")) {
+        Delete d = try this.delete();
+        d.with = with;
+        d.recursive = recursive;
+        return Result.Ok(Stmt.DeleteStmt(d));
+      }
+      this.pos = save;
+    }
     if (this.isKw("SELECT") || this.isKw("VALUES") || this.isKw("WITH")) { return Result.Ok(Stmt.SelectStmt(try this.select())); }
     if (this.isKw("INSERT") || this.isKw("REPLACE")) { return Result.Ok(Stmt.InsertStmt(try this.insert())); }
     if (this.eatKw("UPDATE")) { return Result.Ok(Stmt.UpdateStmt(try this.update())); }
@@ -685,7 +736,7 @@ export struct Parser {
     if (this.eatKw("CREATE")) { return this.create(); }
     if (this.eatKw("DROP")) {
       string kind = upper(this.advance().text);
-      if (kind != "TABLE" && kind != "INDEX") { return Result.Err(SqlError.unsupported("DROP \{kind}")); }
+      if (kind != "TABLE" && kind != "INDEX" && kind != "VIEW") { return Result.Err(SqlError.unsupported("DROP \{kind}")); }
       bool ifExists = false;
       if (this.eatKw("IF")) { try this.expectKw("EXISTS"); ifExists = true; }
       return Result.Ok(Stmt.DropStmt(kind, try this.qualifiedName(), ifExists));
@@ -796,7 +847,7 @@ export struct Parser {
     if (this.isKw("FROM")) { return Result.Err(SqlError.unsupported("UPDATE … FROM")); }
     Expr? where = null;
     if (this.eatKw("WHERE")) { where = try this.expr(); }
-    return Result.Ok(Update(t, orAct, sets, where, try this.returning()));
+    return Result.Ok(Update { table: t, orAction: orAct, sets: sets, where: where, returning: try this.returning() });
   }
 
   Result<Delete, SqlError> delete(this) {
@@ -804,7 +855,7 @@ export struct Parser {
     string t = try this.qualifiedName();
     Expr? where = null;
     if (this.eatKw("WHERE")) { where = try this.expr(); }
-    return Result.Ok(Delete(t, where, try this.returning()));
+    return Result.Ok(Delete { table: t, where: where, returning: try this.returning() });
   }
 
   Result<Stmt, SqlError> alter(this) {
@@ -831,7 +882,18 @@ export struct Parser {
     if (this.eatKw("INDEX")) { return Result.Ok(Stmt.CreateIndexStmt(try this.createIndex(unique))); }
     if (unique) { return Result.Err(this.fail("expected INDEX")); }
     if (this.eatKw("TABLE")) { return Result.Ok(Stmt.CreateTableStmt(try this.createTable())); }
-    if (this.isKw("VIEW") || this.isKw("TRIGGER") || this.isKw("VIRTUAL")) {
+    if (this.eatKw("VIEW")) {
+      bool ine = this.ifNotExists();
+      i32 nameStart = this.peek().start;
+      string n = try this.qualifiedName();
+      string[]? cols = null;
+      if (this.isOp("(")) { cols = try this.nameList(); }
+      try this.expectKw("AS");
+      Select sel = try this.select();
+      string sql = "CREATE VIEW " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
+      return Result.Ok(Stmt.CreateViewStmt(n, ine, cols, sel, sql));
+    }
+    if (this.isKw("TRIGGER") || this.isKw("VIRTUAL")) {
       return Result.Err(SqlError.unsupported("CREATE \{upper(this.peek().text)}"));
     }
     return Result.Err(this.fail("expected TABLE or INDEX"));

@@ -7,10 +7,10 @@ import { Value, compareValues, sameValue } from "./value.wac";
 import { Expr, Stmt, Select, Source, ResultCol, Insert, Update, Delete, Upsert, Assign, CreateTable,
          CreateIndex, ColumnDef, JOIN_FIRST, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 import { parseOne, Parsed, isBlank } from "./parser.wac";
-import { Table, Row, Index, Entry, Column, SchemaEntry, affinityOf, AFF_INTEGER } from "./schema.wac";
+import { Table, Row, Index, Entry, Column, View, SchemaEntry, affinityOf, AFF_INTEGER } from "./schema.wac";
 import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
-import { Exec, Scope, Ctx, bindExpr, eval, planSelect, runPlan, query } from "./query.wac";
+import { Exec, Scope, Ctx, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes } from "./query.wac";
 import { applyAffinity, isNull, textOf } from "./ops.wac";
 import { FnEnv } from "./functions.wac";
 import { lower } from "./lexer.wac";
@@ -21,7 +21,7 @@ enum Undo {
   UInserted(Table t, Row r),
   UDeleted(Table t, Row r),
   UReplaced(Table t, Row old, Row now),
-  USchema(Vec<SchemaEntry> order, Map<string, Table> tables, Map<string, Index> indexes),
+  USchema(Vec<SchemaEntry> order, Map<string, Table> tables, Map<string, Index> indexes, Map<string, View> views),
   UAddColumn(Table t, Column[] cols, string sql),
   UUserVersion(i64 v),
 }
@@ -129,7 +129,7 @@ export struct Connection {
       default: {}
     }
     Vec<Undo> undo;
-    Exec x = Exec { db: this.db, params: params, env: this.env };
+    Exec x = Exec { db: this.db, params: params, env: this.env, ctes: Vec.create() };
     this.env.changes = this.changes;
     Statement s = Statement(this, x, undo, 0, false, false, false);
     match (s.run(st)) {
@@ -169,7 +169,8 @@ void undoAll(Database db, Vec<Undo> undo) {
       UInserted(t, r): { removeRow(db, t, r); }
       UDeleted(t, r): { addRow(db, t, r); }
       UReplaced(t, old, now): { replaceRow(db, t, now, old); }
-      USchema(order, tables, indexes): {
+      USchema(order, tables, indexes, views): {
+        db.views = views;
         db.order = order;
         db.tables = tables;
         db.indexes = indexes;
@@ -279,16 +280,32 @@ struct Statement {
     Database d = this.conn.db;
     Vec<SchemaEntry> order = Vec.create();
     for (i32 i = 0; i < d.order.len(); i++) { order.push(d.order.get(i)); }
-    this.undo.push(Undo.USchema(order, copyMap(d.tables), copyMap(d.indexes)));
+    this.undo.push(Undo.USchema(order, copyMap(d.tables), copyMap(d.indexes), copyMap(d.views)));
     this.schema = true;
   }
 
   Result<Rows, SqlError> run(this, Stmt st) {
     match (st) {
       SelectStmt(s): { return query(s, this.x); }
-      InsertStmt(i): { return this.insert(i); }
-      UpdateStmt(u): { return this.update(u); }
-      DeleteStmt(d): { return this.delete(d); }
+      InsertStmt(i): {
+        i32 depth = pushCtes(i.with, i.recursive, this.x);
+        Result<Rows, SqlError> r = this.insert(i);
+        popCtes(this.x, depth);
+        return r;
+      }
+      UpdateStmt(u): {
+        i32 depth = pushCtes(u.with, u.recursive, this.x);
+        Result<Rows, SqlError> r = this.update(u);
+        popCtes(this.x, depth);
+        return r;
+      }
+      DeleteStmt(d): {
+        i32 depth = pushCtes(d.with, d.recursive, this.x);
+        Result<Rows, SqlError> r = this.delete(d);
+        popCtes(this.x, depth);
+        return r;
+      }
+      CreateViewStmt(name, ine, cols, sel, sql): { try this.createView(name, ine, cols, sel, sql); return Result.Ok(noRows()); }
       CreateTableStmt(c): { try this.createTable(c); return Result.Ok(noRows()); }
       CreateIndexStmt(c): { try this.createIndex(c); return Result.Ok(noRows()); }
       DropStmt(kind, name, ifExists): { try this.drop(kind, name, ifExists); return Result.Ok(noRows()); }
@@ -301,7 +318,10 @@ struct Statement {
 
   Result<Table, SqlError> table(this, string name) {
     Table? t = this.conn.db.table(name);
-    if (t is null) { return Result.Err(err("no such table: \{name}")); }
+    if (t is null) {
+      if (this.conn.db.view(name) is not null) { return Result.Err(err("cannot modify \{name} because it is a view")); }
+      return Result.Err(err("no such table: \{name}"));
+    }
     if (lower(name) == "sqlite_schema" || lower(name) == "sqlite_master") {
       return Result.Err(err("table \{name} may not be modified"));
     }
@@ -696,7 +716,21 @@ struct Statement {
   // ── schema ───────────────────────────────────────────────────────────────
 
   bool nameTaken(this, string name) {
-    return this.conn.db.table(name) is not null || this.conn.db.index(name) is not null;
+    return this.conn.db.table(name) is not null || this.conn.db.index(name) is not null ||
+           this.conn.db.view(name) is not null;
+  }
+
+  Result<void, SqlError> createView(this, string name, bool ifNotExists, string[]? cols, Select sel, string sql) {
+    if (this.nameTaken(name)) {
+      if (ifNotExists && this.conn.db.view(name) is not null) { return Result.Ok(); }
+      string what = this.conn.db.view(name) is not null ? "view" : (this.conn.db.table(name) is not null ? "table" : "index");
+      return Result.Err(err("\{what} \{name} already exists"));
+    }
+    // SQLite checks a view's query only when the view is used, not when it is made.
+    this.saveSchema();
+    this.conn.db.views.set(lower(name), View(name, sql, cols, sel));
+    this.conn.db.order.push(SchemaEntry("view", name, name));
+    return Result.Ok();
   }
 
   Result<void, SqlError> createTable(this, CreateTable c) {
@@ -748,8 +782,23 @@ struct Statement {
 
   Result<void, SqlError> drop(this, string kind, string name, bool ifExists) {
     Database d = this.conn.db;
+    if (kind == "VIEW") {
+      if (d.view(name) is null) {
+        if (ifExists) { return Result.Ok(); }
+        return Result.Err(err("no such view: \{name}"));
+      }
+      this.saveSchema();
+      Vec<SchemaEntry> rest;
+      for (i32 i = 0; i < d.order.len(); i++) {
+        if (!(d.order.get(i).kind == "view" && lower(d.order.get(i).name) == lower(name))) { rest.push(d.order.get(i)); }
+      }
+      d.order = rest;
+      d.views.remove(lower(name));
+      return Result.Ok();
+    }
     if (kind == "TABLE") {
       Table? t = d.table(name);
+      if (t is null && d.view(name) is not null) { return Result.Err(err("use DROP VIEW to delete view \{name}")); }
       if (t is null) {
         if (ifExists) { return Result.Ok(); }
         return Result.Err(err("no such table: \{name}"));

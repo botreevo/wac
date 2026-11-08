@@ -11,7 +11,7 @@ import { Chunked } from "./chunked.wac";
 import { parseOne } from "./parser.wac";
 import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef } from "./ast.wac";
 import { lower, upper } from "./lexer.wac";
-import { Column, Row, Index, Entry, Table, SchemaEntry, affinityOf, AFF_REAL } from "./schema.wac";
+import { Column, Row, Index, Entry, Table, View, SchemaEntry, affinityOf, AFF_REAL } from "./schema.wac";
 
 // What version of SQLite the file claims was the last to write it. Readers only print it.
 static i64 SQLITE_VERSION_NUMBER = 3045000;
@@ -20,6 +20,7 @@ export struct Database {
   Vec<SchemaEntry> order;
   Map<string, Table> tables;      // keyed by lower-case name
   Map<string, Index> indexes;
+  Map<string, View> views;
   i32 pageSize;
   i64 changeCounter;
   i64 schemaCookie;
@@ -33,13 +34,15 @@ export struct Database {
 
   Database empty() {
     return Database { order: Vec.create(), tables: Map.create(hashString, stringEq), indexes: Map.create(hashString, stringEq),
-                      pageSize: 4096, changeCounter: 0, schemaCookie: 0, userVersion: 0, applicationId: 0,
+                      views: Map.create(hashString, stringEq), pageSize: 4096, changeCounter: 0, schemaCookie: 0, userVersion: 0, applicationId: 0,
                       ixCache: Map.create(hashString, stringEq) };
   }
 
   Table? table(this, string name) { return this.tables.get(lower(name)); }
 
   Index? index(this, string name) { return this.indexes.get(lower(name)); }
+
+  View? view(this, string name) { return this.views.get(lower(name)); }
 
   // The indexes on a table, in schema order — the order SQLite checks uniqueness in.
   Index[] indexesOf(this, string table) {
@@ -308,6 +311,12 @@ export Result<Database, SqlError> openBytes(u8[] data) {
       } else if (db.index(name) is null) {
         return Result.Err(SqlError.corrupt("\{name} matches no constraint of its table"));
       }
+    } else if (kind == "view") {
+      if (sql is null) { return Result.Err(SqlError.corrupt("view \{name} has no sql")); }
+      match ((try parseOne(sql!)).stmt) {
+        CreateViewStmt(vn, ine, cols, sel, text): { db.views.set(lower(name), View(name, sql!, cols, sel)); }
+        default: { return Result.Err(SqlError.corrupt("schema entry for \{name} is not CREATE VIEW")); }
+      }
     } else if (kind != "table") {
       return Result.Err(SqlError.unsupported("schema entries of type \{kind}"));
     }
@@ -354,7 +363,10 @@ export u8[] toBytes(Database db) {
   ps.reserve();
   // Roots are reserved up front so the schema can name them; contents follow in schema order.
   i64[] roots = i64[].filled(db.order.len(), 0);
-  for (i32 i = 0; i < db.order.len(); i++) { roots[i] = ps.reserve(); }
+  for (i32 i = 0; i < db.order.len(); i++) {
+    string k = db.order.get(i).kind;
+    if (k == "table" || k == "index") { roots[i] = ps.reserve(); }
+  }
   Vec<i64> schemaIds;
   Vec<u8[]> schemaRecs;
   for (i32 i = 0; i < db.order.len(); i++) {
@@ -370,6 +382,10 @@ export u8[] toBytes(Database db) {
       buildTable(ps, roots[i], ids, recs);
       schemaRecs.push(encodeRecord([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
                                     Value.Int(roots[i]), Value.Text(t.sql)]));
+    } else if (e.kind == "view") {
+      View v = db.view(e.name)!;
+      schemaRecs.push(encodeRecord([Value.Text("view"), Value.Text(v.name), Value.Text(v.name),
+                                    Value.Int(0), Value.Text(v.sql)]));
     } else {
       Index ix = db.index(e.name)!;
       u8[][] recs = u8[][].defaulted(ix.entries.len());

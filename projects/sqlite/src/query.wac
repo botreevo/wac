@@ -5,8 +5,8 @@ import { Result, Vec, Map, hashBytes, bytesEq } from "core";
 import { SqlError } from "./error.wac";
 import { Value, compareValues } from "./value.wac";
 import { encodeRecord } from "./record.wac";
-import { Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
-import { Table, Row, Index, Column, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
+import { Cte, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
+import { Table, Row, Index, Column, View, SchemaEntry, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database } from "./database.wac";
 import { Node, BoundSource, AggSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT } from "./plan.wac";
 import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
@@ -15,10 +15,22 @@ import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, knownFunction, ret
 import { lower } from "./lexer.wac";
 
 // What a statement runs with: the database, its parameters, and the function environment.
+// A common table expression in scope while a statement runs, and its rows once computed: SQLite
+// computes each once per statement.
+export struct CteDef {
+  string name;           // lower case
+  string[]? cols;
+  Select sel;
+  bool recursive;
+  Table? rows;
+  bool busy = false;
+}
+
 export struct Exec {
   Database db;
   Value[] params;
   FnEnv env;
+  Vec<CteDef> ctes;
   // The last pattern LIKE saw, as bytes: the pattern is almost always the same for every row.
   string lastPattern = "";
   u8[] lastPatternBytes;
@@ -492,6 +504,229 @@ string defaultName(const ResultCol rc) {
 }
 
 export Result<SelectPlan, SqlError> planSelect(const Select s, Scope? outer, Exec x) {
+  if (s.with.len() == 0) { return planSelectBody(s, outer, x); }
+  i32 depth = pushCtes(s.with, s.recursive, x);
+  Result<SelectPlan, SqlError> r = planSelectBody(s, outer, x);
+  popCtes(x, depth);
+  return r;
+}
+
+// Brings a WITH clause's tables into scope; answers the depth to restore.
+export i32 pushCtes(const Cte[] with, bool recursive, Exec x) {
+  i32 depth = x.ctes.len();
+  for (i32 i = 0; i < with.len(); i++) {
+    x.ctes.push(CteDef { name: lower(with[i].name), cols: with[i].cols as string[]?, sel: with[i].sel as Select,
+                         recursive: recursive, rows: null });
+  }
+  return depth;
+}
+
+export void popCtes(Exec x, i32 depth) {
+  while (x.ctes.len() > depth) { x.ctes.pop(); }
+}
+
+struct Named {
+  Table table;
+  bool derived;   // computed rows (a CTE, a view, sqlite_schema) rather than a stored table
+}
+
+// What a name in FROM means: a CTE in scope, then a table, then a view, then the schema table.
+Result<Named, SqlError> resolveTable(string name, Exec x) {
+  string n = lower(name);
+  for (i32 i = x.ctes.len() - 1; i >= 0; i--) {
+    CteDef c = x.ctes.get(i);
+    if (c.name != n) { continue; }
+    if (c.rows is null) {
+      if (c.busy) {
+        return Result.Err(err(c.recursive ? "circular reference: \{name}" : "no such table: \{name}"));
+      }
+      c.busy = true;
+      // A CTE sees the CTEs before it, and itself only when recursive; not what comes after.
+      i32 keep = x.ctes.len();
+      Vec<CteDef> hidden;
+      while (x.ctes.len() > i + 1) { hidden.push(x.ctes.pop()!); }
+      Result<Table, SqlError> r = materializeCte(c, x);
+      for (i32 k = hidden.len() - 1; k >= 0; k--) { x.ctes.push(hidden.get(k)); }
+      c.busy = false;
+      c.rows = try r;
+    }
+    return Result.Ok(Named(c.rows!, true));
+  }
+  Table? t = x.db.table(name);
+  if (t is not null) { return Result.Ok(Named(t!, false)); }
+  View? v = x.db.view(name);
+  if (v is not null) {
+    // A view's query does not see the CTEs of the statement that names it.
+    Vec<CteDef> saved = x.ctes;
+    x.ctes = Vec.create();
+    Result<SelectPlan, SqlError> pr = planSelect(v!.sel, null, x);
+    x.ctes = saved;
+    SelectPlan sp = try pr;
+    x.ctes = Vec.create();
+    Result<Vec<Value[]>, SqlError> rr = runPlan(sp, Ctx(Row?[](), null, null, null), x);
+    x.ctes = saved;
+    Vec<Value[]> rows = try rr;
+    string[] names = try namesFor(v!.cols, sp.names, name);
+    return Result.Ok(Named(tableOfRows(v!.name, names, rows), true));
+  }
+  if (n == "sqlite_schema" || n == "sqlite_master") { return Result.Ok(Named(schemaTable(x.db), true)); }
+  return Result.Err(err("no such table: \{name}"));
+}
+
+Result<string[], SqlError> namesFor(string[]? cols, string[] names, string what) {
+  if (cols is null) { return Result.Ok(names); }
+  if (cols!.len() != names.len()) {
+    return Result.Err(err("table \{what} has \{names.len()} values for \{cols!.len()} columns"));
+  }
+  return Result.Ok(cols!);
+}
+
+// sqlite_schema as rows: type, name, tbl_name, rootpage, sql. Root pages are the ones this library's
+// writer gives them, in schema order.
+Table schemaTable(Database db) {
+  Vec<Value[]> rows;
+  i64 page = 2;
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    Value sql = Value.Null;
+    i64 root = 0;
+    if (e.kind == "table") { sql = Value.Text(db.table(e.name)!.sql); root = page; page++; }
+    else if (e.kind == "index") {
+      Index ix = db.index(e.name)!;
+      if (ix.sql is not null) { sql = Value.Text(ix.sql!); }
+      root = page;
+      page++;
+    } else if (e.kind == "view") { sql = Value.Text(db.view(e.name)!.sql); }
+    rows.push([Value.Text(e.kind), Value.Text(e.name), Value.Text(e.table), Value.Int(root), sql]);
+  }
+  return tableOfRows("sqlite_schema", ["type", "name", "tbl_name", "rootpage", "sql"], rows);
+}
+
+// Splits a compound select into its members, without the ORDER BY and LIMIT that belong to the whole.
+Vec<Select> members(const Select s) {
+  Vec<Select> out;
+  (const Select)? cur = s;
+  while (cur is not null) {
+    Select m = Select { with: Cte[](), cols: cur!.cols as ResultCol[], from: cur!.from as Source[],
+                        where: cur!.where, groupBy: cur!.groupBy as Expr[], having: cur!.having,
+                        orderBy: OrderTerm[](), values: cur!.values as Expr[][]?, distinct: cur!.distinct };
+    out.push(m);
+    cur = cur!.next;
+  }
+  return out;
+}
+
+Vec<string> ops(const Select s) {
+  Vec<string> out;
+  (const Select)? cur = s;
+  while (cur is not null && cur!.compound is not null) { out.push(cur!.compound!); cur = cur!.next; }
+  return out;
+}
+
+bool selectNames(const Select s, string n) {
+  (const Select)? cur = s;
+  while (cur is not null) {
+    for (i32 i = 0; i < cur!.from.len(); i++) {
+      const Source f = cur!.from[i];
+      if (f.table is not null && lower(f.table!) == n) { return true; }
+      if (f.sub is not null && selectNames(f.sub!, n)) { return true; }
+    }
+    cur = cur!.next;
+  }
+  return false;
+}
+
+Result<Table, SqlError> materializeCte(CteDef c, Exec x) {
+  if (!c.recursive || !selectNames(c.sel, c.name)) {
+    SelectPlan sp = try planSelect(c.sel, null, x);
+    Vec<Value[]> rows = try runPlan(sp, Ctx(Row?[](), null, null, null), x);
+    return Result.Ok(tableOfRows(c.name, try namesFor(c.cols, sp.names, c.name), rows));
+  }
+  // Recursive: the members before the first that names the CTE give the starting rows; each round runs
+  // the recursive members over the rows the last round added, until a round adds none — SQLite's queue,
+  // taken a generation at a time, which yields the same rows in the same order.
+  Vec<Select> ms = members(c.sel);
+  Vec<string> os = ops(c.sel);
+  i32 first = 0;
+  while (first < ms.len() && !selectNames(ms.get(first), c.name)) { first++; }
+  if (first == 0) { return Result.Err(err("recursive reference in a subquery: \{c.name}")); }
+  if (first == ms.len()) { return Result.Err(err("circular reference")); }
+  bool distinct = false;
+  for (i32 i = first - 1; i < os.len(); i++) { if (os.get(i) == "UNION") { distinct = true; } }
+  if (c.sel.orderBy.len() > 0) { return Result.Err(SqlError.unsupported("ORDER BY in a recursive CTE")); }
+  Ctx none = Ctx(Row?[](), null, null, null);
+  i64 limit = -1;
+  if (c.sel.limit is not null) {
+    Node ln = try bindExpr(c.sel.limit!, Scope(BoundSource[](), null, null, false), x);
+    limit = toInt(try eval(ln, none, x));
+  }
+  i64 offset = 0;
+  if (c.sel.offset is not null) {
+    Node on = try bindExpr(c.sel.offset!, Scope(BoundSource[](), null, null, false), x);
+    offset = toInt(try eval(on, none, x));
+  }
+  Vec<Value[]> all;
+  Map<u8[], bool> seen = Map.create(hashBytes, bytesEq);
+  string[] names = string[]();
+  Vec<Value[]> batch;
+  for (i32 i = 0; i < first; i++) {
+    SelectPlan sp = try planSelect(ms.get(i), null, x);
+    if (names.len() == 0) { names = try namesFor(c.cols, sp.names, c.name); }
+    Vec<Value[]> rows = try runPlan(sp, none, x);
+    for (i32 k = 0; k < rows.len(); k++) {
+      if (distinct) {
+        u8[] key = keyBytes(rows.get(k));
+        if (seen.has(key)) { continue; }
+        seen.set(key, true);
+      }
+      batch.push(rows.get(k));
+    }
+  }
+  i64 want = limit < 0 ? -1 : limit + (offset > 0 ? offset : 0);
+  while (batch.len() > 0) {
+    for (i32 k = 0; k < batch.len(); k++) {
+      if (want >= 0 && (all.len() as i64) >= want) { break; }
+      all.push(batch.get(k));
+    }
+    if (want >= 0 && (all.len() as i64) >= want) { break; }
+    Table working = tableOfRows(c.name, names, batch);
+    CteDef self = CteDef { name: c.name, cols: null, sel: c.sel, recursive: false, rows: working };
+    x.ctes.push(self);
+    Vec<Value[]> next;
+    for (i32 i = first; i < ms.len(); i++) {
+      Result<SelectPlan, SqlError> pr = planSelect(ms.get(i), null, x);
+      match (pr) {
+        Ok(sp): {
+          if (sp.names.len() != names.len()) {
+            x.ctes.pop();
+            return Result.Err(err("SELECTs to the left and right of UNION do not have the same number of result columns"));
+          }
+          match (runPlan(sp, none, x)) {
+            Ok(rows): {
+              for (i32 k = 0; k < rows.len(); k++) {
+                if (distinct) {
+                  u8[] key = keyBytes(rows.get(k));
+                  if (seen.has(key)) { continue; }
+                  seen.set(key, true);
+                }
+                next.push(rows.get(k));
+              }
+            }
+            Err(e): { x.ctes.pop(); return Result.Err(e); }
+          }
+        }
+        Err(e): { x.ctes.pop(); return Result.Err(e); }
+      }
+    }
+    x.ctes.pop();
+    batch = next;
+  }
+  Vec<Value[]> out;
+  for (i32 i = offset > 0 ? offset as! i32 : 0; i < all.len(); i++) { out.push(all.get(i)); }
+  return Result.Ok(tableOfRows(c.name, names, out));
+}
+
+Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x) {
   SelectPlan p = SelectPlan { ast: s as Select, srcs: BoundSource[](), results: Node[](), names: string[](),
                               groupBy: Node[](), order: Node[](), desc: bool[](), nulls: i32[](),
                               probeSpecs: ProbeSpec[][](), probeBuilt: bool[]() };
@@ -519,9 +754,8 @@ export Result<SelectPlan, SqlError> planSelect(const Select s, Scope? outer, Exe
         string nm = f.alias ?? "subquery_\{i}";
         srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true));
       } else {
-        Table? t = x.db.table(f.table!);
-        if (t is null) { return Result.Err(err("no such table: \{f.table!}")); }
-        srcs.push(BoundSource(lower(f.alias ?? f.table!), t!, f.join, null, false));
+        Named nt = try resolveTable(f.table!, x);
+        srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived));
       }
     }
     p.srcs = srcs.toArray();

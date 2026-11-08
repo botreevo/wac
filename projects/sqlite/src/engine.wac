@@ -7,8 +7,10 @@ import { Value, compareValues, compareColl, sameValue, collationId } from "./val
 import { CreateTrigger, Expr, Stmt, Select, Source, ResultCol, Insert, Update, Delete, Upsert, Assign, CreateTable,
          CreateIndex, ColumnDef, JOIN_FIRST, JOIN_CROSS, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 import { parseOne, Parsed, isBlank } from "./parser.wac";
-import { Table, Row, Index, Entry, Column, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_INTEGER, AFF_TEXT, AFF_NUMERIC, AFF_REAL } from "./schema.wac";
-import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
+import { Table, Row, RowCursor, Index, Column, View, Trigger, SchemaEntry, ForeignKey, affinityOf, sameRow, constValue, AFF_INTEGER, AFF_TEXT, AFF_NUMERIC, AFF_REAL } from "./schema.wac";
+import { Cursor } from "./btree.wac";
+import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, flush, buildImage, adopt, newPager } from "./database.wac";
+import { Pager } from "./pager.wac";
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
 import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable, ROWID_INTERNAL, nodeAff, rowParts } from "./query.wac";
 import { applyAffinity, isNull, textOf, AFF_NONE } from "./ops.wac";
@@ -17,13 +19,10 @@ import { FnEnv } from "./functions.wac";
 import { lower, upper } from "./lexer.wac";
 import { tableInfo, indexList, indexInfo, foreignKeyList, foreignKeyCheck, collationList, databaseList } from "./pragma.wac";
 import { renameTable, mentionsTable, renameColumnInTable, renameColumnElsewhere, dropColumnText, afterLastColumn } from "./alter.wac";
-import { Chunked } from "./chunked.wac";
 
-// What undoes one change, newest last.
+// What undoes one change to what the engine holds outside the pages, newest last. A change to rows is
+// undone by the pager, which keeps every page's old contents until a commit (see pager.wac).
 enum Undo {
-  UInserted(Table t, Row r),
-  UDeleted(Table t, Row r),
-  UReplaced(Table t, Row old, Row now),
   USchema(Vec<SchemaEntry> order, Map<string, Table> tables, Map<string, Index> indexes, Map<string, View> views,
           Map<string, Trigger> triggers),
   UAddColumn(Table t, Column[] cols, string sql),
@@ -88,9 +87,6 @@ export struct Connection {
 
   // The database as a file, with its change counter advanced, for storing after a commit.
   u8[] image(this) {
-    if (this.dirty) {
-      this.db.changeCounter++;
-    }
     this.dirty = false;
     this.schemaDirty = false;
     return toBytes(this.db);
@@ -134,6 +130,8 @@ export struct Connection {
         this.txUndo.clear();
         this.txChanged = false;
         this.txSchema = false;
+        this.db.main.savepoint();
+        this.db.aux.savepoint();
         return Result.Ok(noRows());
       }
       CommitStmt: {
@@ -149,7 +147,8 @@ export struct Connection {
           this.txChanged = false;
           this.txSchema = false;
         }
-        this.savepoints.push(Savepoint(lower(name), this.txUndo.len(), this.deferred.len(), starts));
+        this.savepoints.push(Savepoint(lower(name), this.txUndo.len(), this.deferred.len(), starts,
+                                       this.db.main.savepoint(), this.db.aux.savepoint()));
         return Result.Ok(noRows());
       }
       ReleaseStmt(name): {
@@ -158,6 +157,8 @@ export struct Connection {
         bool outermost = this.savepoints.get(at).startedTx;
         // Releasing the savepoint that began the transaction commits it.
         if (outermost) { try this.commit(params); return Result.Ok(noRows()); }
+        this.db.main.release(this.savepoints.get(at).mainDepth);
+        this.db.aux.release(this.savepoints.get(at).auxDepth);
         while (this.savepoints.len() > at) { this.savepoints.pop(); }
         return Result.Ok(noRows());
       }
@@ -168,6 +169,8 @@ export struct Connection {
         Vec<Undo> tail;
         while (this.txUndo.len() > sp.undoLen) { tail.insert(0, this.txUndo.pop()!); }
         undoAll(this.db, tail);
+        this.db.main.rollbackTo(sp.mainDepth);
+        this.db.aux.rollbackTo(sp.auxDepth);
         while (this.deferred.len() > sp.deferredLen) { this.deferred.pop(); }
         // The savepoint itself stays; the ones after it go.
         while (this.savepoints.len() > at + 1) { this.savepoints.pop(); }
@@ -183,8 +186,16 @@ export struct Connection {
     Vec<Undo> undo;
     Exec x = Exec { db: this.db, params: params, env: this.env, ctes: Vec.create() };
     this.env.changes = this.changes;
-    Statement s = Statement(this, x, undo, 0, false, false, false, Vec.create(), "", false);
+    Statement s = Statement(this, x, undo, 0, false, false, false, Vec.create(), "", false, false);
+    // The statement's changes to rows can be undone to here.
+    i32 mainAt = this.db.main.savepoint();
+    i32 auxAt = this.db.aux.savepoint();
     Result<Rows, SqlError> ran = s.run(st);
+    // A page that could not be read, or was not what a b-tree page should be, fails the statement.
+    if (ran.isOk()) {
+      string? fault = this.db.takeFault();
+      if (fault is not null) { ran = Result.Err(SqlError.corrupt(fault!)); }
+    }
     // Immediate foreign keys hold at the end of each statement; deferred ones at COMMIT, or now when
     // there is no transaction to wait for.
     SqlError? fkErr = null;
@@ -211,14 +222,15 @@ export struct Connection {
           undo.push(Undo.USchemaCookie(this.db.schemaCookie));
           this.db.schemaCookie++;
         }
-        bool changed = undo.len() > 0;
+        bool changed = undo.len() > 0 || s.wrote;
         if (this.inTx) {
           for (i32 i = 0; i < undo.len(); i++) { this.txUndo.push(undo.get(i)); }
           if (changed) { this.txChanged = true; }
           if (s.schema) { this.txSchema = true; }
+          this.db.main.release(mainAt);
+          this.db.aux.release(auxAt);
         } else {
-          if (changed) { this.dirty = true; }
-          if (s.schema) { this.schemaDirty = true; }
+          try this.finish(changed, s.schema);
         }
         return Result.Ok(rows);
       }
@@ -239,13 +251,19 @@ export struct Connection {
           if (s.counted) { this.changes = s.count; this.totalChanges += s.count; }
           if (this.inTx) {
             for (i32 i = 0; i < undo.len(); i++) { this.txUndo.push(undo.get(i)); }
-            if (undo.len() > 0) { this.txChanged = true; }
-          } else if (undo.len() > 0) {
-            this.dirty = true;
+            if (undo.len() > 0 || s.wrote) { this.txChanged = true; }
+            this.db.main.release(mainAt);
+            this.db.aux.release(auxAt);
+          } else {
+            try this.finish(undo.len() > 0 || s.wrote, s.schema);
           }
           return Result.Err(e);
         }
         undoAll(this.db, undo);
+        this.db.main.rollbackTo(mainAt);
+        this.db.main.release(mainAt);
+        this.db.aux.rollbackTo(auxAt);
+        this.db.aux.release(auxAt);
         if (s.rollbackTx && this.inTx) { this.rollback(); }
         return Result.Err(e);
       }
@@ -261,7 +279,7 @@ export struct Connection {
   // Deferred foreign keys are checked now; a failure leaves the transaction open, as in SQLite.
   Result<void, SqlError> commit(this, Value[] params) {
     Statement chk = Statement(this, Exec { db: this.db, params: params, env: this.env, ctes: Vec.create() },
-                              Vec.create(), 0, false, false, false, Vec.create(), "", false);
+                              Vec.create(), 0, false, false, false, Vec.create(), "", false, false);
     for (i32 i = 0; i < this.deferred.len(); i++) {
       if (!(try chk.holds(this.deferred.get(i)))) {
         return Result.Err(SqlError("constraint", "FOREIGN KEY constraint failed"));
@@ -272,13 +290,58 @@ export struct Connection {
     this.savepoints.clear();
     this.inTx = false;
     this.txUndo.clear();
-    if (this.txChanged) { this.dirty = true; }
-    if (this.txSchema) { this.schemaDirty = true; }
+    return this.finish(this.txChanged, this.txSchema);
+  }
+
+  // Ends the transaction, keeping what it changed: the pages it wrote are written onto page 1's header
+  // and sqlite_schema, and handed to the database's file to store (see `Database.persist`). When the file
+  // cannot take them, the transaction is undone.
+  Result<void, SqlError> finish(this, bool changed, bool schema) {
+    Database d = this.db;
+    if (changed || schema) {
+      d.changeCounter++;
+      this.dirty = true;
+      if (schema) { this.schemaDirty = true; }
+      if (d.autoVacuum != 0 || d.rebuild) {
+        // A whole new image: the pages written so far are let go, and the new ones are the database.
+        u8[] img = buildImage(d);
+        Pager np = Pager.fromBytes(d.pageSize, img, (img.len() / d.pageSize) as i64);
+        d.main.sps.clear();
+        d.main.dirty.clear();
+        match (adopt(d, np)) {
+          Ok: {}
+          Err(e): { return Result.Err(e); }
+        }
+        d.rebuild = false;
+        d.replaced = true;
+      } else {
+        flush(d, schema);
+      }
+    }
+    if (d.persist is not null) {
+      match (d.persist!(d)) {
+        Ok: {}
+        Err(e): {
+          d.main.rollbackTo(0);
+          d.main.release(0);
+          d.aux.rollbackTo(0);
+          d.aux.release(0);
+          return Result.Err(e);
+        }
+      }
+    }
+    d.replaced = false;
+    d.main.committed();
+    d.aux.committed();
     return Result.Ok();
   }
 
   void rollback(this) {
     this.savepoints.clear();
+    this.db.main.rollbackTo(0);
+    this.db.main.release(0);
+    this.db.aux.rollbackTo(0);
+    this.db.aux.release(0);
     undoAll(this.db, this.txUndo);
     this.txUndo.clear();
     this.deferred.clear();
@@ -292,9 +355,6 @@ Rows noRows() { return Rows(string[](), Vec.create()); }
 void undoAll(Database db, Vec<Undo> undo) {
   for (i32 i = undo.len() - 1; i >= 0; i--) {
     match (undo.get(i)) {
-      UInserted(t, r): { removeRow(db, t, r); }
-      UDeleted(t, r): { addRow(db, t, r); }
-      UReplaced(t, old, now): { replaceRow(db, t, now, old); }
       USchema(order, tables, indexes, views, triggers): {
         db.views = views;
         db.triggers = triggers;
@@ -303,12 +363,6 @@ void undoAll(Database db, Vec<Undo> undo) {
         db.indexes = indexes;
       }
       UAddColumn(t, cols, sql): {
-        for (i32 k = 0; k < t.rows.len(); k++) {
-          Row r = t.rows.get(k);
-          Value[] v = Value[].filled(cols.len(), Value.Null);
-          v.copyFrom(r.vals, 0, 0, cols.len());
-          r.vals = v;
-        }
         t.cols = cols;
         t.sql = sql;
       }
@@ -324,22 +378,20 @@ void undoAll(Database db, Vec<Undo> undo) {
 }
 
 void addRow(Database db, Table t, Row r) {
-  t.rows.insert(t.find(r.rowid), r);
+  t.put(r);
   Index[] ixs = db.indexesOf(t.name);
   for (i32 i = 0; i < ixs.len(); i++) { ixs[i].add(r); }
 }
 
 void removeRow(Database db, Table t, Row r) {
-  i32 at = t.find(r.rowid);
-  if (at < t.rows.len() && t.rows.get(at).rowid == r.rowid) { t.rows.remove(at); }
+  t.remove(r.rowid);
   Index[] ixs = db.indexesOf(t.name);
   for (i32 i = 0; i < ixs.len(); i++) { ixs[i].drop(r); }
 }
 
 // Swaps a row for another with the same rowid, touching only the indexes whose key changed.
 void replaceRow(Database db, Table t, Row old, Row now) {
-  i32 at = t.find(old.rowid);
-  t.rows.set(at, now);
+  t.put(now);
   Index[] ixs = db.indexesOf(t.name);
   for (i32 i = 0; i < ixs.len(); i++) {
     Index ix = ixs[i];
@@ -350,30 +402,6 @@ void replaceRow(Database db, Table t, Row old, Row now) {
       if (!sameValue(old.vals[ix.cols[k]], now.vals[ix.cols[k]])) { same = false; }
     }
     if (!same) { ix.drop(old); ix.add(now); }
-  }
-}
-
-// Removes many rows in one pass over the table and each index, rather than one shift per row.
-void removeRows(Database db, Table t, Map<i64, bool> gone) {
-  Vec<Row> keep = Vec.withCapacity(t.rows.len());
-  for (i32 i = 0; i < t.rows.len(); i++) {
-    Row r = t.rows.get(i);
-    if (!gone.has(r.rowid)) { keep.push(r); }
-  }
-  t.rows = keep;
-  Index[] ixs = db.indexesOf(t.name);
-  for (i32 i = 0; i < ixs.len(); i++) {
-    Index ix = ixs[i];
-    Vec<Entry> ek = Vec.withCapacity(ix.entries.len());
-    for (i32 k = 0; k < ix.entries.len(); k++) {
-      Entry en = ix.entries.get(k);
-      Value[] e = en.key;
-      match (e[e.len() - 1]) {
-        Int(id): { if (!gone.has(id)) { ek.push(en); } }
-        default: { ek.push(en); }
-      }
-    }
-    ix.entries = Chunked.fromArray(ek.toArray());
   }
 }
 
@@ -401,6 +429,7 @@ struct Statement {
   string activeTriggers = "";
   // OR FAIL stops the statement but keeps what it changed before the failure.
   bool failKeep = false;
+  bool wrote = false;      // it changed rows
 
   Database db(this) { return this.conn.db; }
 
@@ -464,16 +493,18 @@ struct Statement {
         default: { return false; }
       }
     }
-    for (i32 i = 0; i < parent.rows.len(); i++) {
-      if (this.keyMatches(parent, pcols, parent.rows.get(i), key)) { return true; }
+    RowCursor c = parent.cursor();
+    for (bool more = c.first(); more; more = c.next()) {
+      if (this.keyMatches(parent, pcols, c.row(), key)) { return true; }
     }
     return false;
   }
 
   Row[] childrenOf(this, Table child, ForeignKey fk, Table parent, i32[] pcols, Value[] key) {
     Vec<Row> out;
-    for (i32 i = 0; i < child.rows.len(); i++) {
-      Row r = child.rows.get(i);
+    RowCursor c = child.cursor();
+    for (bool more = c.first(); more; more = c.next()) {
+      Row r = c.row();
       bool all = true;
       for (i32 k = 0; k < fk.cols.len(); k++) {
         Value cv = r.vals[fk.cols[k]];
@@ -492,7 +523,7 @@ struct Statement {
     Table? parent = d.table(pd.fk.parent);
     if (pd.row is not null) {
       Row? now = pd.child.get(pd.row!.rowid);
-      if (now is null || now! is not pd.row!) { return Result.Ok(true); }
+      if (now is null || !sameRow(now!, pd.row!)) { return Result.Ok(true); }
       Value[] key = Value[].filled(pd.fk.cols.len(), Value.Null);
       for (i32 i = 0; i < key.len(); i++) {
         key[i] = pd.row!.vals[pd.fk.cols[i]];
@@ -593,7 +624,7 @@ struct Statement {
           try this.parentChanging(child, kid, nk);
           if (rowid == kid.rowid) {
             replaceRow(d, child, kid, nk);
-            this.undo.push(Undo.UReplaced(child, kid, nk));
+            this.wrote = true;
           } else {
             this.deleteRow(child, kid);
             this.insertRow(child, nk);
@@ -658,8 +689,9 @@ struct Statement {
     Node? cond = null;
     if (where is not null) { cond = try bindExpr(where!, vs, this.x); }
     Vec<Row> picked;
-    for (i32 i = 0; i < shape.rows.len(); i++) {
-      Row r = shape.rows.get(i);
+    RowCursor vc = shape.cursor();
+    for (bool more = vc.first(); more; more = vc.next()) {
+      Row r = vc.row();
       if (cond is null || truthOf(try eval(cond!, Ctx([r as Row?], null, null, null, null), this.x)) == 1) { picked.push(r); }
     }
     BoundSets? bs = null;
@@ -766,12 +798,12 @@ struct Statement {
 
   void insertRow(this, Table t, Row r) {
     addRow(this.conn.db, t, r);
-    this.undo.push(Undo.UInserted(t, r));
+    this.wrote = true;
   }
 
   void deleteRow(this, Table t, Row r) {
     removeRow(this.conn.db, t, r);
-    this.undo.push(Undo.UDeleted(t, r));
+    this.wrote = true;
   }
 
   void saveSchema(this) {
@@ -820,7 +852,11 @@ struct Statement {
           default: "",
         };
         bool existed = this.nameTaken(name) || this.conn.db.trigger(name) is not null;
-        Rows r = try this.run(inner);
+        bool wasTemp = this.conn.db.creatingTemp;
+        this.conn.db.creatingTemp = true;
+        Result<Rows, SqlError> made = this.run(inner);
+        this.conn.db.creatingTemp = wasTemp;
+        Rows r = try made;
         if (!existed && name != "") { this.conn.db.temps.set(lower(name), true); }
         return Result.Ok(r);
       }
@@ -846,6 +882,8 @@ struct Statement {
         // Every image this writes is already vacuumed; what VACUUM adds is a pending auto_vacuum change.
         if (this.conn.inTx) { return Result.Err(err("cannot VACUUM from within a transaction")); }
         Database d = this.conn.db;
+        d.rebuild = true;
+        this.wrote = true;
         if (d.pendingAutoVacuum >= 0) {
           this.undo.push(Undo.UAutoVacuum(d.autoVacuum, d.pendingAutoVacuum));
           d.autoVacuum = d.pendingAutoVacuum;
@@ -893,8 +931,9 @@ struct Statement {
   i64 sequence(this, string name) {
     Table? s = this.conn.db.table("sqlite_sequence");
     if (s is null) { return 0; }
-    for (i32 i = 0; i < s!.rows.len(); i++) {
-      Row r = s!.rows.get(i);
+    RowCursor c = s!.cursor();
+    for (bool more = c.first(); more; more = c.next()) {
+      Row r = c.row();
       match (r.vals[0]) {
         Text(n): {
           if (lower(n) == lower(name)) { match (r.vals[1]) { Int(v): { return v; } default: { return 0; } } }
@@ -908,8 +947,9 @@ struct Statement {
   void bumpSequence(this, Table t, i64 rowid) {
     Table? s = this.conn.db.table("sqlite_sequence");
     if (s is null || !t.autoincrement) { return; }
-    for (i32 i = 0; i < s!.rows.len(); i++) {
-      Row r = s!.rows.get(i);
+    RowCursor c = s!.cursor();
+    for (bool more = c.first(); more; more = c.next()) {
+      Row r = c.row();
       match (r.vals[0]) {
         Text(n): {
           if (lower(n) == lower(t.name)) {
@@ -1137,7 +1177,7 @@ struct Statement {
   Result<Row?, SqlError> upsertUpdate(this, Table t, Row existing, Row proposed, Upsert u) {
     // `excluded` is a scope outside the table's, so a bare name means the table's column and only
     // `excluded.x` reaches the proposed row, as in SQLite.
-    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "", -1);
+    Table ex = Table { name: "excluded", sql: "", cols: t.cols, rowidAlias: t.rowidAlias, rows: Vec.create(), checks: Expr[](), fks: ForeignKey[](), pk: i32[]() };
     Scope outer = Scope([BoundSource("excluded", ex, JOIN_FIRST, null, false, string[](), null)], null, null, false);
     Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)], outer, null, false);
     Ctx c = Ctx([existing as Row?], Ctx([proposed as Row?], null, null, null, null), null, null, null);
@@ -1212,7 +1252,7 @@ struct Statement {
     Row? now = t.get(old.rowid);
     if (now is null) { return Result.Ok(null); }
     Row was = now!;
-    if (was is not old) { old = was; }
+    old = was;
     if (rowid == old.rowid) {
       // The common case: the row keeps its rowid, so it is swapped in place, and only the indexes whose
       // key changed are touched. Its own entries do not count as conflicts.
@@ -1227,7 +1267,7 @@ struct Statement {
       try this.parentChanging(t, old, r);
       this.childWritten(t, r, old);
       replaceRow(this.conn.db, t, old, r);
-      this.undo.push(Undo.UReplaced(t, old, r));
+      this.wrote = true;
       this.count++;
       try this.fire(t.name, t, "AFTER", "UPDATE", old, r, bs.cols);
       return Result.Ok(r);
@@ -1255,28 +1295,27 @@ struct Statement {
   }
 
   // The rows a WHERE picks, by rowid, found with the same planner a SELECT uses.
-  Result<Row[], SqlError> matching(this, Table t, Expr? where) { return this.matchingAs(t, null, where); }
+  Result<i64[], SqlError> matching(this, Table t, Expr? where) { return this.matchingAs(t, null, where); }
 
-  Result<Row[], SqlError> matchingAs(this, Table t, string? alias, Expr? where) {
+  // The rowids only: each row is read again when its turn comes, as SQLite does, so a statement that
+  // touches a whole table holds no more than its rowids.
+  Result<i64[], SqlError> matchingAs(this, Table t, string? alias, Expr? where) {
     Select s = Select { cols: [ResultCol(Expr.Col(null, ROWID_INTERNAL), null, null, "rowid")],
                         from: [Source { table: t.name, alias: alias, join: JOIN_FIRST }], where: where };
     SelectPlan p = try planSelect(s, null, this.x);
     Vec<Value[]> ids = try runPlan(p, topCtx(this.x), this.x);
-    Vec<Row> out;
+    i64[] out = i64[].filled(ids.len(), 0);
     for (i32 i = 0; i < ids.len(); i++) {
-      match (ids.get(i)[0]) {
-        Int(id): { Row? r = t.get(id); if (r is not null) { out.push(r!); } }
-        default: {}
-      }
+      match (ids.get(i)[0]) { Int(id): { out[i] = id; } default: {} }
     }
-    return Result.Ok(out.toArray());
+    return Result.Ok(out);
   }
 
   Result<Rows, SqlError> update(this, Update u) {
     if (this.conn.db.view(u.table) is not null) { return this.changeView(u.table, u.where, u.sets, "UPDATE"); }
     Table t = try this.table(u.table);
     if (u.from is not null) { return this.updateFrom(t, u); }
-    Row[] rows = try this.matchingAs(t, u.alias, u.where);
+    i64[] rows = try this.matchingAs(t, u.alias, u.where);
     BoundSource[] srcs = [BoundSource(lower(u.alias ?? t.name), t, JOIN_FIRST, null, false, string[](), null)];
     Scope sc = Scope(srcs, this.x.triggerScope, null, false);
     RetPlan? ret = try this.returning(t, u.returning);
@@ -1286,7 +1325,7 @@ struct Statement {
     for (i32 i = 0; i < rows.len(); i++) {
       // The rowids are gathered first and each is then looked up afresh, as SQLite does: a row an earlier
       // REPLACE removed is skipped, and a row moved onto a rowid still to come is updated again there.
-      Row? cur = t.get(rows[i].rowid);
+      Row? cur = t.get(rows[i]);
       if (cur is null) { continue; }
       Ctx c = Ctx([cur], null, null, null, null);
       Row? changed = try this.applySets(t, cur!, bs, c, u.orAction);
@@ -1357,35 +1396,22 @@ struct Statement {
   Result<Rows, SqlError> delete(this, Delete d) {
     if (this.conn.db.view(d.table) is not null) { return this.changeView(d.table, d.where, Assign[](), "DELETE"); }
     Table t = try this.table(d.table);
-    Row[] rows = try this.matching(t, d.where);
+    i64[] ids = try this.matching(t, d.where);
     RetPlan? ret = try this.returning(t, d.returning);
     Vec<Value[]> out;
     this.counted = true;
-    bool triggers = this.conn.db.triggersOn(t.name, "BEFORE", "DELETE").len() > 0 ||
-                    this.conn.db.triggersOn(t.name, "AFTER", "DELETE").len() > 0;
-    if (rows.len() > 32 && !this.conn.foreignKeys && !triggers) {
-      Map<i64, bool> gone = Map.create(hashI64, i64Eq);
-      for (i32 i = 0; i < rows.len(); i++) {
-        if (ret is not null) { out.push(try this.evalReturning(ret!, rows[i])); }
-        gone.set(rows[i].rowid, true);
-        this.undo.push(Undo.UDeleted(t, rows[i]));
-      }
-      removeRows(this.conn.db, t, gone);
-      this.count += rows.len() as i64;
-    } else {
-      for (i32 i = 0; i < rows.len(); i++) {
-        if (ret is not null) { out.push(try this.evalReturning(ret!, rows[i])); }
-        // A CASCADE may already have taken this row.
-        Row? still = t.get(rows[i].rowid);
-        Row want = rows[i];
-        if (still is null || still! is not want) { continue; }
-        if (!(try this.fire(t.name, t, "BEFORE", "DELETE", rows[i], null, null))) { continue; }
-        Row? again = t.get(rows[i].rowid);
-        if (again is null || again! is not want) { continue; }
-        try this.removeUserRow(t, rows[i]);
-        this.count++;
-        try this.fire(t.name, t, "AFTER", "DELETE", rows[i], null, null);
-      }
+    for (i32 i = 0; i < ids.len(); i++) {
+      // A CASCADE may already have taken this row.
+      Row? still = t.get(ids[i]);
+      if (still is null) { continue; }
+      Row want = still!;
+      if (ret is not null) { out.push(try this.evalReturning(ret!, want)); }
+      if (!(try this.fire(t.name, t, "BEFORE", "DELETE", want, null, null))) { continue; }
+      Row? again = t.get(ids[i]);
+      if (again is null || !sameRow(again!, want)) { continue; }
+      try this.removeUserRow(t, want);
+      this.count++;
+      try this.fire(t.name, t, "AFTER", "DELETE", want, null, null);
     }
     if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
     return Result.Ok(noRows());
@@ -1470,16 +1496,22 @@ struct Statement {
     Table t = try tableFrom(c, autos);
     this.saveSchema();
     Database d = this.conn.db;
+    d.attachTable(t);
     d.tables.set(lower(t.name), t);
     d.order.push(SchemaEntry("table", t.name, t.name));
     for (i32 i = 0; i < autos.len(); i++) {
+      d.attachIndex(autos.get(i), t);
       d.indexes.set(lower(autos.get(i).name), autos.get(i));
       d.order.push(SchemaEntry("index", autos.get(i).name, t.name));
     }
     if (t.autoincrement && d.table("sqlite_sequence") is null) {
-      Table seq = Table("sqlite_sequence", "CREATE TABLE sqlite_sequence(name,seq)",
-                        [Column("name", "", 0, false, null, 0, null, false, "", -1), Column("seq", "", 0, false, null, 0, null, false, "", -1)], -1, false, Vec.create(), false,
-                        Expr[](), ForeignKey[](), i32[](), false, "", -1);
+      Table seq = Table { name: "sqlite_sequence", sql: "CREATE TABLE sqlite_sequence(name,seq)",
+                          cols: [Column("name", "", 0, false, null, 0, null, false, "", -1), Column("seq", "", 0, false, null, 0, null, false, "", -1)],
+                          rows: Vec.create(), checks: Expr[](), fks: ForeignKey[](), pk: i32[]() };
+      bool wasTemp = d.creatingTemp;
+      d.creatingTemp = false;
+      d.attachTable(seq);
+      d.creatingTemp = wasTemp;
       d.tables.set("sqlite_sequence", seq);
       d.order.push(SchemaEntry("table", "sqlite_sequence", "sqlite_sequence"));
     }
@@ -1541,6 +1573,7 @@ struct Statement {
           Vec<Index> none;
           Table st = try tableFrom(c, none);
           this.saveSchema();
+          d.attachTable(st);
           d.tables.set("sqlite_stat1", st);
           d.order.push(SchemaEntry("table", st.name, st.name));
         }
@@ -1555,17 +1588,18 @@ struct Statement {
       Table t = d.table(se.name)!;
       // The table's rows (or the one index's) go, and come again freshly counted.
       Vec<Row> old;
-      for (i32 i = 0; i < stat.rows.len(); i++) {
-        Row r = stat.rows.get(i);
+      RowCursor sc = stat.cursor();
+      for (bool more = sc.first(); more; more = sc.next()) {
+        Row r = sc.row();
         if (lower(textOf(r.vals[0])) != lower(t.name)) { continue; }
         if (onlyIndex is not null && lower(textOf(r.vals[1])) != lower(onlyIndex!)) { continue; }
         old.push(r);
       }
       for (i32 i = 0; i < old.len(); i++) { this.deleteRow(stat, old.get(i)); }
-      if (t.rows.len() == 0) { continue; }
+      if (t.isEmpty()) { continue; }
       Index[] ixs = d.indexesOf(t.name);
       if (ixs.len() == 0 && onlyIndex is null) {
-        this.insertRow(stat, Row(stat.maxRowid() + 1, [Value.Text(t.name), Value.Null, Value.Text("\{t.rows.len()}")], null));
+        this.insertRow(stat, Row(stat.maxRowid() + 1, [Value.Text(t.name), Value.Null, Value.Text("\{t.count()}")], null));
         continue;
       }
       for (i32 i = ixs.len() - 1; i >= 0; i--) {
@@ -1586,15 +1620,18 @@ struct Statement {
     if (lower(c.name).indexOf("sqlite_") == 0) { return Result.Err(err("object name reserved for internal use: \{c.name}")); }
     Table t = try this.table(c.table);
     Index ix = try indexFrom(c, t);
+    this.saveSchema();
+    this.conn.db.attachIndex(ix, t);
     rebuildIndex(ix, t);
     if (ix.unique) {
-      for (i32 i = 0; i < t.rows.len(); i++) {
-        if (ix.conflict(t.rows.get(i), t.rows.get(i).rowid) is not null) {
+      RowCursor rc = t.cursor();
+      for (bool more = rc.first(); more; more = rc.next()) {
+        Row r = rc.row();
+        if (ix.conflict(r, r.rowid) is not null) {
           return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, ix.cols)));
         }
       }
     }
-    this.saveSchema();
     this.conn.db.indexes.set(lower(ix.name), ix);
     this.conn.db.order.push(SchemaEntry("index", ix.name, t.name));
     return Result.Ok();
@@ -1648,21 +1685,25 @@ struct Statement {
       for (i32 i = 0; i < d.order.len(); i++) {
         SchemaEntry e = d.order.get(i);
         if (lower(e.table) == tn) {
-          if (e.kind == "index") { d.indexes.remove(lower(e.name)); }
+          if (e.kind == "index") { d.detachIndex(d.index(e.name)!); d.indexes.remove(lower(e.name)); }
           if (e.kind == "trigger") { d.triggers.remove(lower(e.name)); }
           continue;
         }
         keep.push(e);
       }
       d.order = keep;
+      d.detachTable(t!);
       d.tables.remove(tn);
       // The table's AUTOINCREMENT counter goes with it.
       Table? seq = d.table("sqlite_sequence");
       if (seq is not null) {
-        for (i32 i = seq!.rows.len() - 1; i >= 0; i--) {
-          Row r = seq!.rows.get(i);
-          match (r.vals[0]) { Text(n): { if (lower(n) == tn) { this.deleteRow(seq!, r); } } default: {} }
+        Vec<Row> gone;
+        RowCursor sc = seq!.cursor();
+        for (bool more = sc.first(); more; more = sc.next()) {
+          Row r = sc.row();
+          match (r.vals[0]) { Text(n): { if (lower(n) == tn) { gone.push(r); } } default: {} }
         }
+        for (i32 i = 0; i < gone.len(); i++) { this.deleteRow(seq!, gone.get(i)); }
       }
       return Result.Ok();
     }
@@ -1680,6 +1721,9 @@ struct Statement {
       if (lower(d.order.get(i).name) != lower(name)) { keep.push(d.order.get(i)); }
     }
     d.order = keep;
+    d.detachIndex(ix!);
+    Table? owner = d.table(ix!.table);
+    if (owner is not null && owner!.withoutRowid) { owner!.shadowDirty = true; }
     d.indexes.remove(lower(name));
     return Result.Ok();
   }
@@ -1775,19 +1819,24 @@ struct Statement {
           CreateTableStmt(ct): {
             Vec<Index> autos;
             Table nt = try tableFrom(ct, autos);
+            // The same b-tree: a dropped column goes from every record in it.
+            d.prepare(nt);
+            nt.pg = old.pg;
+            nt.root = old.root;
+            nt.fileRoot = old.fileRoot;
+            nt.shadowDirty = old.shadowDirty;
             if (dropAt >= 0 && lower(was.name) == tn) {
-              Vec<Row> rows = Vec.withCapacity(old.rows.len());
-              for (i32 k = 0; k < old.rows.len(); k++) {
-                Row r = old.rows.get(k);
+              RowCursor oc = old.cursor();
+              for (bool more = oc.first(); more; more = oc.next()) {
+                Row r = oc.row();
                 Value[] v = Value[].filled(r.vals.len() - 1, Value.Null);
                 for (i32 c = 0; c < r.vals.len(); c++) {
                   if (c < dropAt) { v[c] = r.vals[c]; } else if (c > dropAt) { v[c - 1] = r.vals[c]; }
                 }
-                rows.push(Row(r.rowid, v, null));
+                nt.put(Row(r.rowid, v, null));
               }
-              nt.rows = rows;
-            } else {
-              nt.rows = old.rows;
+              this.wrote = true;
+              nt.shadowDirty = true;
             }
             tables.set(lower(nt.name), nt);
             // The constraint indexes keep their entries, matched by number.
@@ -1797,7 +1846,7 @@ struct Statement {
               string suffix = ai.name.slice(17 + nt.name.len(), ai.name.len());
               for (i32 m = 0; m < oldIxs.len(); m++) {
                 if (oldIxs[m].sql is null && oldIxs[m].name.slice(17 + old.name.len(), oldIxs[m].name.len()) == suffix) {
-                  ai.entries = oldIxs[m].entries;
+                  shareIndex(ai, oldIxs[m]);
                 }
               }
               indexes.set(lower(ai.name), ai);
@@ -1816,7 +1865,7 @@ struct Statement {
         match ((try parseOne(text!)).stmt) {
           CreateIndexStmt(ci): {
             Index ni = try indexFrom(ci, tables.get(lower(e.table))!);
-            ni.entries = old.entries;
+            shareIndex(ni, old);
             indexes.set(lower(ni.name), ni);
           }
           default: { return Result.Err(err("malformed schema after ALTER TABLE")); }
@@ -1843,18 +1892,16 @@ struct Statement {
     if (kind == "rename") {
       Table? seq = d.table("sqlite_sequence");
       if (seq is not null) {
-        for (i32 i = 0; i < seq!.rows.len(); i++) {
-          Row r = seq!.rows.get(i);
-          match (r.vals[0]) {
-            Text(n): {
-              if (lower(n) == tn) {
-                Row nr = Row(r.rowid, [Value.Text(a), r.vals[1]], null);
-                replaceRow(d, seq!, r, nr);
-                this.undo.push(Undo.UReplaced(seq!, r, nr));
-              }
-            }
-            default: {}
-          }
+        Vec<Row> renamed;
+        RowCursor sc = seq!.cursor();
+        for (bool more = sc.first(); more; more = sc.next()) {
+          Row r = sc.row();
+          match (r.vals[0]) { Text(n): { if (lower(n) == tn) { renamed.push(r); } } default: {} }
+        }
+        for (i32 i = 0; i < renamed.len(); i++) {
+          Row r = renamed.get(i);
+          replaceRow(d, seq!, r, Row(r.rowid, [Value.Text(a), r.vals[1]], null));
+          this.wrote = true;
         }
       }
     }
@@ -1887,13 +1934,7 @@ struct Statement {
     cols.copyFrom(t.cols, 0, 0, t.cols.len());
     cols[t.cols.len()] = Column(c.name, c.typeName, affinityOf(c.typeName), c.notNull, c.dflt,
                                 c.collate is null ? 0 : collationId(c.collate!), c.generated, c.stored, "", c.notNullConflict);
-    Value stored = applyAffinity(dv, cols[t.cols.len()].affinity);
-    for (i32 i = 0; i < t.rows.len(); i++) {
-      Row r = t.rows.get(i);
-      Value[] v = Value[].filled(cols.len(), stored);
-      v.copyFrom(r.vals, 0, 0, r.vals.len());
-      r.vals = v;
-    }
+    // The rows stay as they are: a record shorter than the table reads the new column's default.
     t.cols = cols;
     t.sql = sql;
     return Result.Ok();
@@ -2068,6 +2109,8 @@ struct Savepoint {
   i32 undoLen;
   i32 deferredLen;
   bool startedTx;     // SAVEPOINT outside a transaction began one; releasing it commits
+  i32 mainDepth;      // the pagers' savepoints it is
+  i32 auxDepth;
 }
 
 // A foreign-key check left for the end of the statement (or the transaction): a child row that must have
@@ -2240,12 +2283,17 @@ i64 pragmaInt(Value v, string name) {
 // distinct prefix, rounded up (and 1 rather than 2 for a prefix that is nearly unique), NULLs counting
 // as equal, as SQLite's ANALYZE counts.
 string indexStat(Index ix) {
-  i64 n = ix.entries.len() as i64;
+  i64 n = 0;
   i32 cols = ix.cols.len();
   i64[] distinct = i64[].filled(cols, 0);
-  for (i32 i = 1; i < ix.entries.len(); i++) {
-    Value[] a = ix.entries.get(i - 1).key;
-    Value[] b = ix.entries.get(i).key;
+  Cursor c = ix.cursor();
+  Value[]? prev = null;
+  for (bool more = c.first(); more; more = c.next()) {
+    Value[] b = ix.keyOf(c.payload);
+    n++;
+    if (prev is null) { prev = b; continue; }
+    Value[] a = prev!;
+    prev = b;
     // The first column that differs: every prefix that long or longer has a new value here.
     for (i32 k = 0; k < cols; k++) {
       if (compareColl(a[k], b[k], ix.colls[k]) != 0) {
@@ -2262,4 +2310,12 @@ string indexStat(Index ix) {
     out += " \{v}";
   }
   return out;
+}
+
+// An index made again by ALTER TABLE keeps the b-tree its old self had.
+void shareIndex(Index to, Index from) {
+  to.pg = from.pg;
+  to.root = from.root;
+  to.enc = from.enc;
+  to.fileRoot = from.fileRoot;
 }

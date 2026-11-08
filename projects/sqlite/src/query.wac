@@ -7,7 +7,8 @@ import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY, 
 import { encodeRecord, toUtf16, fromUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
 import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
          JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
-import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
+import { Table, Row, RowCursor, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, rowsTable, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
+import { Cursor } from "./btree.wac";
 import { Database, isKeyIndex } from "./database.wac";
 import { jsonEachRows, JSON_EACH_COLS } from "./jsoneach.wac";
 import { pragmaRows } from "./pragma.wac";
@@ -850,7 +851,7 @@ Table tableOfRows(string name, const string[] names, Vec<Value[]> rows) {
   for (i32 i = 0; i < names.len(); i++) { cols[i] = Column(names[i], "", AFF_BLOB, false, null, 0, null, false, "", -1); }
   Vec<Row> rs;
   for (i32 i = 0; i < rows.len(); i++) { rs.push(Row((i + 1) as i64, rows.get(i), null)); }
-  return Table(name, "", cols, -1, false, rs, false, Expr[](), ForeignKey[](), i32[](), false, "", -1);
+  return rowsTable(name, cols, rs);
 }
 
 string defaultName(const ResultCol rc) {
@@ -945,23 +946,19 @@ Result<string[], SqlError> namesFor(string[]? cols, string[] names, string what)
 // a WITHOUT ROWID table answers too.
 export static string ROWID_INTERNAL = " rowid";
 
-// sqlite_schema as rows: type, name, tbl_name, rootpage, sql. Root pages are the ones this library's
-// writer gives them, in schema order.
+// sqlite_schema as rows: type, name, tbl_name, rootpage, sql.
 // With `temp`, the temporary objects' sqlite_temp_schema instead.
 Table schemaTable(Database db, bool temp) {
   Vec<Value[]> rows;
-  i64 page = 2;
   for (i32 i = 0; i < db.order.len(); i++) {
     SchemaEntry e = db.order.get(i);
     if (isKeyIndex(db, e) || db.isTemp(e) != temp) { continue; }
     Value sql = Value.Null;
-    i64 root = 0;
-    if (e.kind == "table") { sql = Value.Text(db.table(e.name)!.sql); root = page; page++; }
+    i64 root = db.rootOf(e);
+    if (e.kind == "table") { sql = Value.Text(db.table(e.name)!.sql); }
     else if (e.kind == "index") {
       Index ix = db.index(e.name)!;
       if (ix.sql is not null) { sql = Value.Text(ix.sql!); }
-      root = page;
-      page++;
     } else if (e.kind == "view") { sql = Value.Text(db.view(e.name)!.sql); }
     else if (e.kind == "trigger") { sql = Value.Text(db.trigger(e.name)!.def.sql); }
     rows.push([Value.Text(e.kind), Value.Text(e.name), Value.Text(e.table), Value.Int(root), sql]);
@@ -1147,7 +1144,7 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
         if (f.args is not null && f.args!.len() > 2) { return Result.Err(err("too many arguments on \{tvf}() - max 2")); }
         Column[] cols = Column[].filled(colNames.len(), Column("", "", 0, false, null, 0, null, false, "", -1));
         for (i32 c = 0; c < cols.len(); c++) { cols[c] = Column(colNames[c], "", 0, false, null, 0, null, false, "", -1); }
-        Table t = Table(tvf, "", cols, -1, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "", -1);
+        Table t = rowsTable(tvf, cols, Vec.create());
         srcs.push(BoundSource(lower(f.alias ?? tvf), t, f.join, null, true, string[](), TableFn(tvf, Node[](), visible, null)));
       } else {
         Named nt = try resolveTable(f.table!, x);
@@ -1430,14 +1427,127 @@ Result<Vec<Probe>, SqlError> probesFor(SelectPlan p, i32 k, const Vec<Node> wher
   return Result.Ok(out);
 }
 
-// How a source's rows will be read: in rowid order, or through an index, possibly backwards.
+// How a source's rows will be read: in rowid order between two rowids, or through an index between two
+// bounds, possibly backwards.
 struct Access {
   Index? ix;
-  i32 lo;           // positions in ix.entries, or in table.rows
-  i32 hi;
+  i64 loId;         // the rowids read, both included, when there is no index
+  i64 hiId;
+  Bound? lo;        // the index's entries read: from `lo` (null: its first) to before `hi` (null: its end)
+  Bound? hi;
   bool reverse;
   bool ordered;     // the order delivered is the ORDER BY's
   bool none;        // a probe that can match nothing
+}
+
+static i64 MIN_ID = -9223372036854775807 - 1;
+static i64 MAX_ID = 9223372036854775807;
+
+// A place among an index's entries: before the first that begins with `key` or comes after it, or with
+// `after`, after the last that begins with it.
+struct Bound {
+  Value[] key;
+  bool after;
+}
+
+// Which of two places comes first.
+i32 boundCmp(Index ix, Bound a, Bound b) {
+  i32 n = a.key.len() < b.key.len() ? a.key.len() : b.key.len();
+  for (i32 i = 0; i < n; i++) {
+    i32 c = ix.compareAt(i, a.key[i], b.key[i]);
+    if (c != 0) { return i < ix.desc.len() && ix.desc[i] ? -c : c; }
+  }
+  if (a.key.len() == b.key.len()) { return (a.after ? 1 : 0) - (b.after ? 1 : 0); }
+  // A shorter key's place is outside the longer's: before it, or with `after`, after it.
+  if (a.key.len() < b.key.len()) { return a.after ? 1 : -1; }
+  return b.after ? -1 : 1;
+}
+
+Access tableAccess(i64 lo, i64 hi, bool reverse, bool ordered, bool none) {
+  return Access(null, lo, hi, null, null, reverse, ordered, none);
+}
+
+Access indexAccess(Index ix, Bound? lo, Bound? hi, bool reverse, bool ordered) {
+  return Access(ix, MIN_ID, MAX_ID, lo, hi, reverse, ordered, false);
+}
+
+// The rows an access path reads, one at a time.
+struct Scan {
+  Table t;
+  Access a;
+  RowCursor rc;
+  Cursor? ic;
+  bool begun = false;
+  bool done = false;
+
+  Scan open(Table t, Access a) {
+    Cursor? ic = a.ix is null ? null : a.ix!.cursor() as Cursor?;
+    return Scan { t: t, a: a, rc: t.cursor(), ic: ic };
+  }
+
+  // The next row, or null at the end. A row an index names that is not in the table is passed over.
+  Row? next(this) {
+    while (!this.done) {
+      bool ok = false;
+      if (this.ic is null) {
+        if (!this.begun) {
+          this.begun = true;
+          if (!this.a.reverse) { ok = this.rc.seek(this.a.loId); }
+          else if (this.a.hiId == MAX_ID || !this.rc.seek(this.a.hiId + 1)) { ok = this.rc.last(); }
+          else { ok = this.rc.prev(); }
+        } else {
+          ok = this.a.reverse ? this.rc.prev() : this.rc.next();
+        }
+        if (!ok) { this.done = true; return null; }
+        i64 id = this.rc.rowid();
+        if (id < this.a.loId || id > this.a.hiId) { this.done = true; return null; }
+        return this.rc.row();
+      }
+      Index ix = this.a.ix!;
+      Cursor c = this.ic!;
+      if (!this.begun) {
+        this.begun = true;
+        if (!this.a.reverse) {
+          ok = this.a.lo is null ? c.first() : this.seekTo(this.a.lo!);
+        } else if (this.a.hi is null || !this.seekTo(this.a.hi!)) {
+          ok = c.last();
+        } else {
+          ok = c.prev();
+        }
+      } else {
+        ok = this.a.reverse ? c.prev() : c.next();
+      }
+      if (!ok) { this.done = true; return null; }
+      Value[] key = ix.keyOf(c.payload);
+      if (!this.within(ix, key)) { this.done = true; return null; }
+      match (key[key.len() - 1]) {
+        Int(id): {
+          Row? r = this.t.get(id);
+          if (r is not null) { return r; }
+        }
+        default: {}
+      }
+    }
+    return null;
+  }
+
+  bool seekTo(this, Bound b) {
+    return b.after ? this.a.ix!.seekAfter(this.ic!, b.key) : this.a.ix!.seekFrom(this.ic!, b.key);
+  }
+
+  bool within(this, Index ix, Value[] key) {
+    if (this.a.lo is not null) {
+      Bound lo = this.a.lo!;
+      if (key.len() < lo.key.len()) { return false; }
+      if (lo.after ? ix.comparePrefix(key, lo.key) <= 0 : ix.compare(key, lo.key) < 0) { return false; }
+    }
+    if (this.a.hi is not null) {
+      Bound hi = this.a.hi!;
+      if (key.len() < hi.key.len()) { return false; }
+      if (hi.after ? ix.comparePrefix(key, hi.key) > 0 : ix.compare(key, hi.key) >= 0) { return false; }
+    }
+    return true;
+  }
 }
 
 bool isInt(const Value v) { return match (v) { Int: true, default: false }; }
@@ -1521,10 +1631,8 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
     if (pr.col == -1 && pr.op == "=") {
       Value v = pr.v;
       match (pr.v) { Real(r): { i64? e = exactInt(r); if (e is not null) { v = Value.Int(e!); } } default: {} }
-      if (!isInt(v)) { return Result.Ok(Access(null, 0, 0, false, true, true)); }
-      i32 at = t.find(intOf(v));
-      bool hit = at < t.rows.len() && t.rows.get(at).rowid == intOf(v);
-      return Result.Ok(Access(null, at, hit ? at + 1 : at, false, true, false));
+      if (!isInt(v)) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+      return Result.Ok(tableAccess(intOf(v), intOf(v), false, true, false));
     }
   }
   // The best index: the most leading columns fixed by equality, then a range on the next.
@@ -1534,7 +1642,7 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
   Vec<Index> plain;
   for (i32 i = 0; i < all.len(); i++) { if (!all[i].special()) { plain.push(all[i]); } }
   Index[] ixs = plain.toArray();
-  if (p.srcs[k].isSub) { ixs = Index[](); }
+  if (p.srcs[k].isSub || !t.stored()) { ixs = Index[](); }
   for (i32 j = 0; j < ixs.len(); j++) {
     Index ix = ixs[j];
     i32 eq = 0;
@@ -1555,8 +1663,8 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
     while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=", ix.colls[eq]) >= 0) { eq++; }
     Value[] key = Value[].filled(eq, Value.Null);
     for (i32 i = 0; i < eq; i++) { key[i] = probes.get(findProbe(probes, ix.cols[i], "=", ix.colls[i])).v; }
-    i32 lo = ix.lowerBound(key);
-    i32 hi = ix.upperBound(key);
+    Bound lo = Bound(key, false);
+    Bound hi = Bound(key, true);
     if (eq < ix.cols.len() && !ix.desc[eq]) {
       i32 col = ix.cols[eq];
       // NULLs sort first, and a range never includes them.
@@ -1568,34 +1676,34 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
         k2.copyFrom(key, 0, 0, eq);
         k2[eq] = pr.v;
         if (pr.op == ">" || pr.op == ">=") {
-          i32 b = pr.op == ">=" ? ix.lowerBound(k2) : ix.upperBound(k2);
-          if (b > lo) { lo = b; }
+          Bound b = Bound(k2, pr.op == ">");
+          if (boundCmp(ix, b, lo) > 0) { lo = b; }
         } else {
-          i32 b = pr.op == "<=" ? ix.upperBound(k2) : ix.lowerBound(k2);
-          if (b < hi) { hi = b; }
+          Bound b = Bound(k2, pr.op == "<=");
+          if (boundCmp(ix, b, hi) < 0) { hi = b; }
           bounded = true;
         }
       }
       if (bounded) {
         Value[] kn = Value[].filled(eq + 1, Value.Null);
         kn.copyFrom(key, 0, 0, eq);
-        i32 afterNulls = ix.upperBound(kn);
-        if (afterNulls > lo) { lo = afterNulls; }
+        Bound afterNulls = Bound(kn, true);
+        if (boundCmp(ix, afterNulls, lo) > 0) { lo = afterNulls; }
       }
     }
-    if (hi < lo) { hi = lo; }
     i32 dir = wantOrder ? orderFromIndex(w!, ix, eq) : 0;
-    return Result.Ok(Access(ix, lo, hi, dir == 2, dir != 0, false));
+    if (boundCmp(ix, hi, lo) <= 0) { return Result.Ok(tableAccess(0, -1, false, dir != 0, true)); }
+    return Result.Ok(indexAccess(ix, eq == 0 && lo.key.len() == 0 ? null : lo as Bound?, eq == 0 && hi.key.len() == 0 ? null : hi as Bound?, dir == 2, dir != 0));
   }
   // A WITHOUT ROWID table is read in its key's order, as the file holds it.
-  if (t.withoutRowid && !p.srcs[k].isSub) {
+  if (t.withoutRowid && !p.srcs[k].isSub && t.stored()) {
     Index pk = x.db.index(t.pkIndex)!;
     i32 d2 = wantOrder ? orderFromIndex(w!, pk, 0) : 0;
-    return Result.Ok(Access(pk, 0, pk.entries.len(), d2 == 2, d2 != 0, false));
+    return Result.Ok(indexAccess(pk, null, null, d2 == 2, d2 != 0));
   }
   // A range of rowids.
-  i32 lo = 0;
-  i32 hi = t.rows.len();
+  i64 lo = MIN_ID;
+  i64 hi = MAX_ID;
   for (i32 i = 0; i < probes.len(); i++) {
     Probe pr = probes.get(i);
     if (pr.col != -1 || pr.op == "=") { continue; }
@@ -1605,27 +1713,35 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
     }
     f64 bound = toReal(v);
     if (pr.op == ">" || pr.op == ">=") {
+      if (bound >= 9.3e18) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+      if (bound < -9.3e18) { continue; }
       i64 b = bound.ceil() as~ i64;
-      if (pr.op == ">" && (b as~ f64) == bound) { b++; }
-      i32 at = t.find(b);
-      if (at > lo) { lo = at; }
+      if (pr.op == ">" && (b as~ f64) == bound) {
+        if (b == MAX_ID) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+        b++;
+      }
+      if (b > lo) { lo = b; }
     } else {
+      if (bound < -9.3e18) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+      if (bound >= 9.3e18) { continue; }
       i64 b = bound.floor() as~ i64;
-      if (pr.op == "<" && (b as~ f64) == bound) { b--; }
-      i32 at = t.find(b + 1);
-      if (at < hi) { hi = at; }
+      if (pr.op == "<" && (b as~ f64) == bound) {
+        if (b == MIN_ID) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+        b--;
+      }
+      if (b < hi) { hi = b; }
     }
   }
-  if (hi < lo) { hi = lo; }
   i32 dir = wantOrder ? orderFromRowid(w!, t) : 0;
+  if (hi < lo) { return Result.Ok(tableAccess(0, -1, false, dir != 0, true)); }
   // An index can still deliver the order when nothing narrows the rows.
-  if (dir == 0 && wantOrder && lo == 0 && hi == t.rows.len()) {
+  if (dir == 0 && wantOrder && lo == MIN_ID && hi == MAX_ID) {
     for (i32 j = 0; j < ixs.len(); j++) {
       i32 d2 = orderFromIndex(w!, ixs[j], 0);
-      if (d2 != 0) { return Result.Ok(Access(ixs[j], 0, ixs[j].entries.len(), d2 == 2, true, false)); }
+      if (d2 != 0) { return Result.Ok(indexAccess(ixs[j], null, null, d2 == 2, true)); }
     }
   }
-  return Result.Ok(Access(null, lo, hi, dir == 2, dir != 0, false));
+  return Result.Ok(tableAccess(lo, hi, dir == 2, dir != 0, false));
 }
 
 i32 findProbe(const Vec<Probe> probes, i32 col, string op, i32 coll) {
@@ -1640,15 +1756,6 @@ bool hasRange(const Vec<Probe> probes, i32 col, i32 coll) {
     if (probes.get(i).col == col && probes.get(i).op != "=" && probes.get(i).coll == coll) { return true; }
   }
   return false;
-}
-
-Row? rowAt(Table t, Access a, i32 i) {
-  if (a.ix is null) { return t.rows.get(i); }
-  Value[] e = a.ix!.entries.get(i).key;
-  match (e[e.len() - 1]) {
-    Int(id): { return t.get(id); }
-    default: { return null; }
-  }
 }
 
 // ── running ────────────────────────────────────────────────────────────────
@@ -1995,11 +2102,10 @@ Result<bool, SqlError> loop(SelectPlan p, i32 k, Ctx c, Exec x, Sink sink, const
   Access a = try chooseAccess(p, k, conds, c, x);
   bool matched = false;
   if (!a.none) {
-    i32 n = a.hi - a.lo;
-    for (i32 j = 0; j < n; j++) {
-      i32 i = a.reverse ? a.hi - 1 - j : a.lo + j;
-      Row? r = rowAt(src.table, a, i);
-      if (r is null) { continue; }
+    Scan scan = Scan.open(src.table, a);
+    while (true) {
+      Row? r = scan.next();
+      if (r is null) { break; }
       c.rows[k] = r;
       if (src.on is not null && truth(try eval(src.on!, c, x)) != 1) { continue; }
       bool pass = true;
@@ -2144,8 +2250,10 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
     for (i32 k = 0; k < p.srcs.len(); k++) {
       if (p.srcs[k].join != JOIN_RIGHT && p.srcs[k].join != JOIN_FULL) { continue; }
       Table t = p.srcs[k].table;
-      for (i32 i = 0; i < t.rows.len(); i++) {
-        Row r = t.rows.get(i);
+      RowCursor rc = t.cursor();
+      bool more = rc.first();
+      for (; more; more = rc.next()) {
+        Row r = rc.row();
         if (sink.hits.get(k).has(r.rowid)) { continue; }
         for (i32 j = 0; j < c.rows.len(); j++) { c.rows[j] = null; }
         c.rows[k] = r;

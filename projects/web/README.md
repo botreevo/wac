@@ -178,6 +178,15 @@ after everything else is in place — or, from the site's own build, with `index
 `webbuild` exports beside `buildPage`. A page opened from a file has no site, and `Site.of` says so. The page's policy
 allows its own origin to be read for this (`connect-src 'self'`), and nothing else.
 
+## A GPU — `wac.gpu`
+
+The browser's host also answers `wac.gpu` with `navigator.gpu`: WebGPU's compute half in five verbs — make a buffer,
+write it, run a WGSL program over buffers, read one back, free one — numbered by the program as elements are, and
+held and sent a batch at a time as `wac.page`'s changes are. Only a read waits, and what the GPU reports going wrong is
+answered as the next read's fault. The client, and the tensor library built on it, is
+[wac-tensor](https://git.voltrevo.com/wac-tensor.git)'s `src/gpu/line.wac`; this package holds only the host, in
+`programSide`. A browser without WebGPU answers the lookup with why.
+
 ## Testing a page without a browser
 
 `TestDoc` is such a host: `doc.page()` is a page over it, every request the program makes lands in its

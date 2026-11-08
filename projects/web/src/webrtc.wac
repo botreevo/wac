@@ -1,0 +1,127 @@
+// `wac.webrtc`: WebRTC peer connections and data channels, for a page built with `--grant webrtc`.
+//
+// **The browser's own WebRTC, as values.** A program makes a peer connection, data channels on it, an offer, and sets
+// descriptions — the RTCPeerConnection API, reduced to what a data channel needs. The document holds the objects (a
+// worker has no RTCPeerConnection); the program holds numbers for them, and what happens to them — a channel opened,
+// a message, a channel closed, the connection's state — arrives in order from `next()`.
+//
+// **It is the transport and nothing above it.** Signalling, identity and whatever protocol rides the channels are the
+// program's: wac-kps dials a KPS listener with this, munging its offer and synthesising the listener's answer as the
+// reference client does, and runs its own stream framing and flow control over the channels in wac.
+//
+// A data channel's bytes are binary both ways: a message the peer sent as a string arrives as its UTF-8.
+
+import { Answer, FAULT_NONE, OP_CAPABILITY, Sys, ask } from "std";
+import { Result } from "core";
+
+export string WEBRTC_CAPABILITY() { return "wac.webrtc"; }
+
+static i32 RTC_NEW = 0;
+static i32 RTC_CHANNEL = 1;
+static i32 RTC_OFFER = 2;
+static i32 RTC_LOCAL = 3;
+static i32 RTC_REMOTE = 4;
+static i32 RTC_SEND = 5;
+static i32 RTC_CLOSE = 6;
+static i32 RTC_END = 7;
+static i32 RTC_NEXT = 8;
+
+/** Something that happened to a peer connection or one of its channels. */
+export enum RtcEvent {
+  /** Channel `dc` is open: messages may be sent on it. */
+  Open(i32 dc),
+  /** A message on channel `dc`. */
+  Message(i32 dc, u8[] data),
+  /** Channel `dc` closed. */
+  Close(i32 dc),
+  /** Channel `dc` failed, saying why. */
+  Error(i32 dc, string why),
+  /** The peer opened channel `dc`, labelled `label`. */
+  Channel(i32 dc, string label),
+  /** The connection's state: `connecting`, `connected`, `disconnected`, `failed`, `closed`. */
+  State(string state),
+  /** Channel `dc`'s queue of unsent bytes has fallen to `buffered`. */
+  Low(i32 dc, i64 buffered),
+}
+
+/** The capability: peer connections are made from it. */
+export struct Rtc {
+  Sys sys;
+  i32 base;
+
+  /** `wac.webrtc`, if the page was built to have it; `Err` says why not. */
+  async Result<Rtc, string> of(Sys sys) {
+    Answer found = await ask(sys.host, OP_CAPABILITY(), 0 as i64, 0 as i64, WEBRTC_CAPABILITY(), "^1".toBytes());
+    if (found.fault != FAULT_NONE()) { return Result.Err(found.text); }
+    return Result.Ok(Rtc(sys, found.n as~ i32));
+  }
+
+  /** A new peer connection. `config` is RTCConfiguration as JSON — `{}` for none, which is no ICE servers. */
+  async PeerConnection peer(this, string config) {
+    Answer a = await ask(this.sys.host, this.base + RTC_NEW, 0 as i64, 0 as i64, config, u8[]());
+    return PeerConnection(this, a.n as~ i32);
+  }
+}
+
+/** One peer connection, by the number the page gave it. */
+export struct PeerConnection {
+  Rtc rtc;
+  i32 id;
+
+  /**
+   * A data channel. `options` is RTCDataChannelInit as JSON — `{"negotiated":true,"id":0}`, `{"ordered":false,
+   * "maxRetransmits":0}`, or `{}`. Answers the channel's number at once; `Open` follows when it is.
+   */
+  async i32 channel(this, string label, string options) {
+    Answer a = await ask(this.rtc.sys.host, this.rtc.base + RTC_CHANNEL, this.id as i64, 0 as i64, label, options.toBytes());
+    return a.n as~ i32;
+  }
+
+  /** An offer's SDP. */
+  async Result<string, string> offer(this) {
+    Answer a = await ask(this.rtc.sys.host, this.rtc.base + RTC_OFFER, this.id as i64, 0 as i64, "", u8[]());
+    if (a.fault != FAULT_NONE()) { return Result.Err(a.text); }
+    return Result.Ok(string.fromBytes(a.bytes));
+  }
+
+  /** Set the local description (`type` is `offer` or `answer`). */
+  async Result<bool, string> setLocal(this, string type, string sdp) {
+    Answer a = await ask(this.rtc.sys.host, this.rtc.base + RTC_LOCAL, this.id as i64, 0 as i64, type, sdp.toBytes());
+    return a.fault == FAULT_NONE() ? Result.Ok(true) : Result.Err(a.text);
+  }
+
+  /** Set the remote description. */
+  async Result<bool, string> setRemote(this, string type, string sdp) {
+    Answer a = await ask(this.rtc.sys.host, this.rtc.base + RTC_REMOTE, this.id as i64, 0 as i64, type, sdp.toBytes());
+    return a.fault == FAULT_NONE() ? Result.Ok(true) : Result.Err(a.text);
+  }
+
+  /** Send a binary message on channel `dc`. Nothing is answered: the channel's events say what became of it. */
+  void send(this, i32 dc, u8[] bytes) {
+    this.rtc.sys.host.tell(this.rtc.base + RTC_SEND, dc as i64, 0 as i64, "", bytes);
+  }
+
+  /** Close channel `dc`. */
+  void closeChannel(this, i32 dc) {
+    this.rtc.sys.host.tell(this.rtc.base + RTC_CLOSE, dc as i64, 0 as i64, "", u8[]());
+  }
+
+  /** Close the connection and every channel on it. */
+  void close(this) {
+    this.rtc.sys.host.tell(this.rtc.base + RTC_END, this.id as i64, 0 as i64, "", u8[]());
+  }
+
+  /** The next thing that happened to this connection, in the order it happened. */
+  async RtcEvent next(this) {
+    Answer a = await ask(this.rtc.sys.host, this.rtc.base + RTC_NEXT, this.id as i64, 0 as i64, "", u8[]());
+    i32 dc = a.n as~ i32;
+    string kind = a.text;
+    if (kind == "open") { return RtcEvent.Open(dc); }
+    if (kind == "message") { return RtcEvent.Message(dc, a.bytes); }
+    if (kind == "close") { return RtcEvent.Close(dc); }
+    if (kind == "error") { return RtcEvent.Error(dc, string.fromBytes(a.bytes)); }
+    if (kind == "channel") { return RtcEvent.Channel(dc, string.fromBytes(a.bytes)); }
+    if (kind == "low") { return RtcEvent.Low(dc, a.m); }
+    return RtcEvent.State(string.fromBytes(a.bytes));
+  }
+}

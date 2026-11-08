@@ -22,8 +22,9 @@ string repeat(string c, i32 n) {
   return b.toStr();
 }
 
+// Pads to the width, which counts bytes, or characters with the ! flag, as SQLite's does.
 string padTo(string s, i32 width, Flags f, string prefix) {
-  i32 len = codepoints(prefix + s).len();
+  i32 len = f.alt2 ? codepoints(prefix + s).len() : (prefix + s).toBytes().len();
   if (len >= width) { return prefix + s; }
   i32 n = width - len;
   if (f.left) { return prefix + s + repeat(" ", n); }
@@ -46,7 +47,8 @@ string formatFloat(f64 v0, u8 conv, i32 precision0, Flags f) {
   i32 precision = precision0 < 0 ? 6 : precision0;
   string prefix = "";
   f64 v = v0;
-  if (v < 0.0 || (v == 0.0 && f64.toBits(v) != f64.toBits(0.0))) { prefix = "-"; v = -v; }
+  // -0.0 is not below zero, and SQLite gives it no sign.
+  if (v < 0.0) { prefix = "-"; v = -v; }
   else if (f.plus) { prefix = "+"; }
   else if (f.space) { prefix = " "; }
   if (v != v) { return padTo(f.zero ? "null" : "NaN", 0, f, ""); }
@@ -126,7 +128,8 @@ export string sqlPrintf(string fmt, const Value[] args, i32 from) {
     Flags f = Flags { };
     while (i < b.len()) {
       u8 c = b[i];
-      if (c == '-') { f.left = true; } else if (c == '+') { f.plus = true; } else if (c == ' ') { f.space = true; }
+      // '+' and ' ' are one setting, the later of them winning, as in SQLite.
+      if (c == '-') { f.left = true; } else if (c == '+') { f.plus = true; f.space = false; } else if (c == ' ') { f.space = true; f.plus = false; }
       else if (c == '#') { f.alt = true; } else if (c == '!') { f.alt2 = true; } else if (c == '0') { f.zero = true; }
       else if (c == ',') { f.comma = true; } else { break; }
       i++;
@@ -185,12 +188,15 @@ export string sqlPrintf(string fmt, const Value[] args, i32 from) {
           digits = "\{mag % 8}" + digits;
           mag = mag / 8;
         } while (mag > 0);
-        if (f.alt && v != 0) { digits = "0" + digits; }
+        // The alternate form's 0 goes in front after the precision's zeros, as 0x does.
+        if (f.alt && v != 0) { prefix = "0"; }
       } else {
         digits = "\{mag}";
       }
+      // Zero padding fills the width less a sign; a 0x goes in front of the digits beyond it.
+      i32 sign = prefix == "-" || prefix == "+" || prefix == " " ? 1 : 0;
       i32 prec = precision;
-      if (f.zero && prec < width - prefix.len()) { prec = width - prefix.len(); }
+      if (f.zero && prec < width - sign) { prec = width - sign; }
       if (prec > digits.len()) { digits = repeat("0", prec - digits.len()) + digits; }
       if (f.comma && (conv == 'd' || conv == 'i' || conv == 'u')) { digits = thousands(digits); }
       Flags nf = Flags { left: f.left };
@@ -205,7 +211,7 @@ export string sqlPrintf(string fmt, const Value[] args, i32 from) {
         prefix = s.slice(0, 1);
         s = s.slice(1, s.len());
       }
-      if (v < 0.0 || f64.toBits(v) == f64.toBits(-0.0)) { prefix = "-"; }
+      if (v < 0.0) { prefix = "-"; }
       else if (f.plus) { prefix = "+"; } else if (f.space) { prefix = " "; }
       out.pushStr(padTo(s, width, f, prefix));
       continue;
@@ -213,30 +219,19 @@ export string sqlPrintf(string fmt, const Value[] args, i32 from) {
     if (conv == 'c') {
       string t = missing ? "" : textOf(arg);
       i32[] cps = codepoints(t);
-      string ch = cps.len() > 0 ? fromCodepoints(cps, 0, 1) : "";
+      // No character is a NUL, which SQLite writes as it is.
+      string ch = cps.len() > 0 ? fromCodepoints(cps, 0, 1) : string.fromBytes(u8[].filled(1, 0));
       i32 times = precision > 1 ? precision : 1;
-      Flags nf = Flags { left: f.left };
+      Flags nf = Flags { left: f.left, alt2: true };
       out.pushStr(padTo(repeat(ch, times), width, nf, ""));
       continue;
     }
     if (conv == 's' || conv == 'z' || conv == 'q' || conv == 'Q' || conv == 'w') {
       bool isNullArg = missing || isNull(arg);
       string t = isNullArg ? "" : textOf(arg);
-      if (conv == 'q' || conv == 'Q' || conv == 'w') {
-        string quote = conv == 'w' ? "\"" : "'";
-        if (conv == 'Q' && isNullArg) { t = "NULL"; }
-        else {
-          if (conv == 'q' && isNullArg) { t = "(NULL)"; }
-          Buf e = Buf.create();
-          u8[] tb = t.toBytes();
-          for (i32 k = 0; k < tb.len(); k++) {
-            e.push(tb[k]);
-            if (tb[k] == quote.toBytes()[0]) { e.push(tb[k]); }
-          }
-          t = e.toStr();
-          if (conv == 'Q') { t = "'" + t + "'"; }
-        }
-      }
+      bool escape = conv == 'q' || conv == 'Q' || conv == 'w';
+      if (escape && isNullArg) { t = conv == 'Q' ? "NULL" : "(NULL)"; }
+      // The precision cuts the text before it is escaped and quoted (for %q, %Q and %w as for %s).
       if (precision >= 0) {
         // The precision counts characters with "!", bytes otherwise, as in SQLite.
         if (f.alt2) {
@@ -249,7 +244,18 @@ export string sqlPrintf(string fmt, const Value[] args, i32 from) {
           t = t.slice(0, cut);
         }
       }
-      Flags nf = Flags { left: f.left };
+      if (escape && !(conv == 'Q' && isNullArg)) {
+        u8 quote = conv == 'w' ? '"' : '\'';
+        Buf e = Buf.create();
+        u8[] tb = t.toBytes();
+        for (i32 k = 0; k < tb.len(); k++) {
+          e.push(tb[k]);
+          if (tb[k] == quote) { e.push(tb[k]); }
+        }
+        t = e.toStr();
+        if (conv == 'Q') { t = "'" + t + "'"; }
+      }
+      Flags nf = Flags { left: f.left, alt2: f.alt2 };
       out.pushStr(padTo(t, width, nf, ""));
       continue;
     }

@@ -39,6 +39,7 @@ A project of your own starts from [`template/`](template/), which depends on thi
 | `key={…}` | which instance or element a node is, among its siblings |
 | `onclick={(ElementEvent e) => …}` and the other `on…` attributes | handlers; `prevent="Tab ArrowUp"` beside one says which defaults the document prevents, and `prevent="Ctrl+s"` prevents a key only with exactly those modifiers held; `prevent="* capture"` keeps each pointer pressed down on the element the element's until it lifts, and a pointer event's `pointer` says which — so two fingers are followed apart, and one slid off a button still lets go of it (`onpointercancel` when the browser takes a touch away) |
 | `e.at`; `onwheel`'s `e.value`; `element.on("resize", …)` | when an event happened, by `page.now()`'s clock — `page.now() - e.at` is how long it took to arrive; how far a wheel turned, in pixels down; an element's size on screen in device pixels, in `e.x` and `e.y`, as it changes |
+| `onscroll`'s `e.value`; `element.prop("scrollTop", …)` | where a scroller is now, in CSS pixels down; and putting it somewhere — so a list taken off the page and drawn again is scrolled where it was |
 
 **Only what changed renders.** A `set` marks the component that made the cell; a child whose attributes
 are unchanged — compared by the snapshots the compiler gives each component tag (`design/lang/0017`) —

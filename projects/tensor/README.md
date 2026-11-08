@@ -111,6 +111,31 @@ the same on both.
 environment is SwiftShader, a software rasteriser, which managed ten steps a minute. A real GPU is the point of the
 page, and is where a number for it should come from.
 
+## Handwritten digits
+
+`example/mnist/` trains a small convolutional network on MNIST — two 3×3 convolutions with ReLU and 2×2 max pooling,
+then dense layers of 64 and 10; 52,138 numbers — and serves it in a page where you draw a digit and watch it read.
+
+```sh
+wac task mnist:fetch    # the four files from Google's mirror, checked against their SHA-256 (not in the repository)
+wac task mnist:train    # three epochs on the CPU, about six minutes; writes example/mnist/mnist.weights
+wac task mnist:build    # the draw-a-digit page in dist/mnist, with the weights and the data beside it
+wac task mnist:check    # in headless Chromium: the loaded model and ten training steps, GPU against CPU
+```
+
+Trained on the 60,000 training images with Adam, batches of 64, it gets **98.59% of the 10,000 test images right**
+after three epochs on the CPU (98.02% after one). The page loads those weights from its site and classifies on WebGPU;
+or trains a new model there, on the GPU, from the same data. A drawing is prepared as MNIST's digits were — the ink's
+bounding box scaled to 20×20, its centre of mass moved to the middle of 28×28 — and the page shows what the model
+sees beside the ten probabilities. Its check requires the loaded model to give the same answers on the GPU as on the
+CPU (98.8% of the first thousand test images, on both) and ten training steps from one seed to agree, and drawing six
+digits with the mouse in Chromium reads all six correctly.
+
+**Weights are saved and loaded** for it: `saveWeights(model.params())` writes a model's variables — names, shapes and
+values — and `loadWeights` puts them back into a model built the same way, refusing, with the variable that differs,
+one that is not and changing nothing. A checkpoint loads into either precision and onto either backend: this one was
+written on the CPU and runs on the GPU. `example/mnist/mnist.weights` is the one the page loads, 208 KB.
+
 ## The backends
 
 Everything above is written once (`src/tensor.wac`) against sixteen kernels (`src/backend.wac`): elementwise unary
@@ -143,7 +168,7 @@ master commit that has it.
 ## Checking it
 
 ```sh
-wac task test             # 35 tests, about a second: every op, every gradient, every optimizer's first step, halves
+wac task test             # 39 tests, about a second: every op, every gradient, every optimizer's first step, halves
 wac task gpucheck:build   # the GPU check as a page
 wac task gpucheck         # ...run in headless Chromium: PASS 128
 wac task shaders          # every WGSL program, in both types, compiled in Chromium: 100 of them
@@ -167,8 +192,8 @@ wac task shaders          # every WGSL program, in both types, compiled in Chrom
 
 - Recurrent layers. An LSTM is expressible today — `matmul`, `sigmoid`, `tanh` and `concat` are all there and
   differentiable — but there is no `Lstm` layer.
-- Saving and loading weights. `Variable`s are plain tensors; a format is the missing piece — a trained GPT is gone
-  when its page closes.
+- Saving from a page. Checkpoints exist (`saveWeights`, `loadWeights`), and the digit page loads one, but neither
+  page offers what it trained as a download yet — a GPT trained in a tab is still gone when it closes.
 - Speed on the CPU. It is a reference. On the GPU the matrix product is tiled and the rest is one pass per kernel,
   with no fusion of elementwise chains.
 - GPU scatter-add is a gather over every index per output element — WGSL has no float atomics — so an embedding's

@@ -9,7 +9,8 @@ import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultC
          JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
 import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database, isKeyIndex } from "./database.wac";
-import { Node, BoundSource, AggSpec, WinSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT,
+import { jsonEachRows, JSON_EACH_COLS } from "./jsoneach.wac";
+import { Node, BoundSource, TableFn, AggSpec, WinSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT,
          AGG_JSON_ARRAY, AGG_JSON_OBJECT } from "./plan.wac";
 import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
@@ -69,7 +70,7 @@ string? needleOf(const u8[] b) {
 export Result<void, SqlError> fillGenerated(Table t, Row r, Database db) {
   Exec x = Exec { db: db, params: Value[](), env: FnEnv { nowMillis: 0, changes: 0, totalChanges: 0, lastInsertRowid: 0,
                   randomBytes: u8[].filled(8, 0), randomAt: 0 }, ctes: Vec.create() };
-  Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[]())], null, null, false);
+  Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)], null, null, false);
   Ctx c = Ctx([r as Row?], null, null, null, null);
   i32 passes = 0;
   for (i32 i = 0; i < t.cols.len(); i++) { if (t.cols[i].gen is not null) { passes++; } }
@@ -665,7 +666,13 @@ i32 planRefs(const SelectPlan p, i32 depth) {
   i32 m = 0;
   if (p.where is not null) { m = m | refs(p.where!, depth); }
   for (i32 i = 0; i < p.results.len(); i++) { m = m | refs(p.results[i], depth); }
-  for (i32 i = 0; i < p.srcs.len(); i++) { if (p.srcs[i].on is not null) { m = m | refs(p.srcs[i].on!, depth); } }
+  for (i32 i = 0; i < p.srcs.len(); i++) {
+    if (p.srcs[i].on is not null) { m = m | refs(p.srcs[i].on!, depth); }
+    if (p.srcs[i].call is not null) {
+      const Node[] args = p.srcs[i].call!.args;
+      for (i32 k = 0; k < args.len(); k++) { m = m | refs(args[k], depth); }
+    }
+  }
   if (p.having is not null) { m = m | refs(p.having!, depth); }
   for (i32 i = 0; i < p.order.len(); i++) { m = m | refs(p.order[i], depth); }
   for (i32 i = 0; i < p.groupBy.len(); i++) { m = m | refs(p.groupBy[i], depth); }
@@ -958,16 +965,25 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
         SelectPlan sp = try planSelect(f.sub!, outer, x);
         Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
         string nm = f.alias ?? "subquery_\{i}";
-        srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true, string[]()));
+        srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true, string[](), null));
+      } else if (f.args is not null) {
+        string tvf = lower(f.table!);
+        if (tvf != "json_each" && tvf != "json_tree") { return Result.Err(err("no such table-valued function: \{f.table!}")); }
+        if (f.args!.len() > 2) { return Result.Err(err("too many arguments on \{tvf}() - max 2")); }
+        Column[] cols = Column[].filled(JSON_EACH_COLS.len(), Column("", "", 0, false, null, 0, null, false, ""));
+        for (i32 c = 0; c < cols.len(); c++) { cols[c] = Column(JSON_EACH_COLS[c], "", 0, false, null, 0, null, false, ""); }
+        Table t = Table(tvf, "", cols, -1, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "");
+        srcs.push(BoundSource(lower(f.alias ?? tvf), t, f.join, null, true, string[](), TableFn(tvf == "json_tree", Node[]())));
       } else {
         Named nt = try resolveTable(f.table!, x);
-        srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived, string[]()));
+        srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived, string[](), null));
       }
     }
     p.srcs = srcs.toArray();
     Scope sc = Scope(p.srcs, outer, p, false);
     for (i32 i = 0; i < s.from.len(); i++) {
       const Source f = s.from[i];
+      if (f.args is not null) { p.srcs[i].call!.args = try bindAll(f.args!, sc, x); }
       if (f.on is not null) { p.srcs[i].on = try bindExpr(f.on!, sc, x); }
       if (f.join == JOIN_RIGHT || f.join == JOIN_FULL) { p.hasRight = true; }
       string[] usingCols = f.usingCols as string[];
@@ -1012,6 +1028,8 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
           Table t = p.srcs[k].table;
           for (i32 c = 0; c < t.cols.len(); c++) {
             if (rc.star! == "" && isHidden(p.srcs[k], t.cols[c].name)) { continue; }
+            // json_each's json and root columns are hidden: named, they answer, but `*` leaves them out.
+            if (p.srcs[k].call is not null && c >= 8) { continue; }
             results.push(Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity, t.cols[c].coll));
             names.push(t.cols[c].name);
           }
@@ -1689,6 +1707,19 @@ bool itemBefore(const AggSpec a, const Value[] x, const Value[] y) {
 }
 
 // The nested loops, from source k inward. Answers false when the sink has enough rows.
+// A table-valued function's rows, for its arguments as the rows before it make them.
+Result<void, SqlError> fillCall(BoundSource src, Ctx c, Exec x) {
+  TableFn f = src.call!;
+  if (f.args.len() == 0) { return Result.Err(err("wrong number of arguments to \{src.table.name}")); }
+  Value input = try eval(f.args[0], c, x);
+  Value? path = f.args.len() > 1 ? (try eval(f.args[1], c, x)) as Value? : null;
+  Vec<Value[]> made = try jsonEachRows(f.tree, input, path);
+  Vec<Row> rows = Vec.withCapacity(made.len());
+  for (i32 i = 0; i < made.len(); i++) { rows.push(Row((i + 1) as i64, made.get(i), null)); }
+  src.table.rows = rows;
+  return Result.Ok();
+}
+
 Result<bool, SqlError> loop(SelectPlan p, i32 k, Ctx c, Exec x, Sink sink, const Vec<Node>[] levels, const Vec<Node> conds) {
   if (k == p.srcs.len()) {
     const Vec<Node> fin = levels[k];
@@ -1697,6 +1728,7 @@ Result<bool, SqlError> loop(SelectPlan p, i32 k, Ctx c, Exec x, Sink sink, const
     return Result.Ok(!sink.done && (sink.stopAt < 0 || sink.rows.len() < sink.stopAt));
   }
   BoundSource src = p.srcs[k];
+  if (src.call is not null) { try fillCall(src, c, x); }
   // Conditions that may narrow this source: its ON, and for an inner join the WHERE's too.
   Access a = try chooseAccess(p, k, conds, c, x);
   bool matched = false;

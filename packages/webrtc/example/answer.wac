@@ -32,14 +32,14 @@
 import { Datagram, Sys, Clock, Input, Net, Output, Random, Datagrams } from "std";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { selfSignedP256 } from "../../tls/src/x509gen.wac";
-import { Association } from "../src/sctp.wac";
+import { Association } from "../src/association.wac";
 import { Consent } from "../src/ice.wac";
 import { Peer } from "../src/peer.wac";
-import { Session } from "../src/session.wac";
+import { Session, ChannelEvent } from "../src/session.wac";
 import { candidateLineOf, dataChannelDescription, attribute, fingerprintOf,
          hexColons } from "../src/sdp.wac";
 import { candidateLine, candidatePriority, prefHost, Candidate } from "../src/ice.wac";
-import { flatten } from "core";
+import { flatten, Vec } from "core";
 
 /** Ten years, in the seconds since the epoch a certificate counts in. */
 i64 notBefore() { return 1735689600 as i64; }      // 2025-01-01
@@ -80,6 +80,11 @@ u8[] ipv4(string s) {
 }
 
 /** A random printable fragment, since an ICE ufrag and password must be ASCII. */
+i32 randomI32(Random rnd) {
+  u8[] b = flatten(rnd.bytes(4).wait()).unwrap();
+  return (b[0] as i32 << 24) | (b[1] as i32 << 16) | (b[2] as i32 << 8) | b[3] as i32;
+}
+
 string fragment(Random rnd, i32 n) {
   u8[] raw = flatten(rnd.bytes(n).wait()).unwrap();
   u8[] out = u8[].filled(n, 0);
@@ -153,44 +158,58 @@ export i32 main(Sys sys) {
   Session session = Session.of(
     Peer.of(der, priv, flatten(rnd.bytes(32).wait()).unwrap(), flatten(rnd.bytes(32).wait()).unwrap(),
             flatten(rnd.bytes(32).wait()).unwrap(), flatten(rnd.bytes(8).wait()).unwrap()),
-    Association.of(0x77777777, 1, 65536),
+    Association.create(false, randomI32(rnd), randomI32(rnd), 1048576),
     Consent.of(5000 as i64, 30000 as i64, flatten(clock.nowMillis().wait()).unwrap()),
-    ourUfrag, ourPwd, theirUfrag, theirPwd, flatten(rnd.bytes(24).wait()).unwrap(),
+    ourUfrag, ourPwd, theirUfrag, theirPwd,
     // **The fingerprint from the offer, and it is the whole of the peer's identity.** Without it
     // the session carries nothing: a peer nobody named is a peer nobody vouched for.
     fingerprintOf(offer));
+  // **Two negotiated channels, as KPS has them**: id 0 ordered and reliable, id 1 unordered with no
+  // retransmissions. A peer that never uses them loses nothing; one that does needs no DCEP to start.
+  session.negotiate(0, true, -1);
+  session.negotiate(1, false, 0);
 
   // ── The loop, which is the whole program ────────────────────────────────────────────────────
   //
-  // Everything protocol-shaped is behind `receive`: a datagram goes in and the datagrams to send
-  // come out, whether that is a check response, a DTLS flight, a SACK or a data channel's ack.
-  for (i32 forever = 0; forever < 1000000; forever++) {
-    auto arrived = flatten(sock!.receive().wait());
-    if (arrived.isErr()) { break; }
-    Datagram in = arrived.unwrap();
+  // Everything protocol-shaped is behind `receive` and `tick`: datagrams go in and the datagrams to
+  // send come out, whether that is a check response, a DTLS flight, a SACK or a reset. A quiet socket
+  // still ticks every 50ms, which is what lets a lost packet be retransmitted when nothing arrives.
+  string peerHost = "";
+  i32 peerPort = 0;
+  for (i32 forever = 0; forever < 100000000; forever++) {
+    auto arrived = flatten(clock.within(sock!.receive(), 50).wait());
     i64 now = flatten(clock.nowMillis().wait()).unwrap();
-    u8[] fromIp = ipv4(in.peer);
-
-    u8[][] replies = session.receive(in.bytes, fromIp, in.port, now);
-    for (i32 i = 0; i < replies.len(); i++) {
-      sock!.sendTo(in.peer, in.port, replies[i]).wait();
+    Vec<u8[]> replies = Vec<u8[]>.create();
+    if (arrived.isOk()) {
+      Datagram in = arrived.unwrap();
+      if (in.error.len() > 0) { break; }
+      peerHost = in.peer;
+      peerPort = in.port;
+      u8[][] r = session.receive(in.bytes, ipv4(in.peer), in.port, now);
+      for (i32 i = 0; i < r.len(); i++) { replies.push(r[i]); }
     }
+    u8[][] t = session.tick(now);
+    for (i32 i = 0; i < t.len(); i++) { replies.push(t[i]); }
 
-    // **Echo whatever arrived whole**, which is what makes this demonstrable rather than merely
-    // connected — and it is also the only line here that is a choice rather than the protocol.
-    for (i32 guard = 0; guard < 64; guard++) {
-      u8[] msg = session.take();
-      if (msg.len() == 0) { break; }
-      out.line("received \{msg.len()} bytes");
-      u8[][] back = session.send(0, msg, now);
-      for (i32 i = 0; i < back.len(); i++) {
-        sock!.sendTo(in.peer, in.port, back[i]).wait();
+    // **Echo whatever arrived whole, on the channel it came in on** — which is what makes this
+    // demonstrable rather than merely connected, and the only part of the loop that is a choice.
+    ChannelEvent[] evs = session.events();
+    for (i32 e = 0; e < evs.len(); e++) {
+      match (evs[e]) {
+        Opened(id, label, ordered, rexmit): { out.line("opened \{id} \{label} \{ordered ? "ordered" : "unordered"} \{rexmit}"); }
+        Message(id, binary, data): {
+          out.line("received \{data.len()} bytes on \{id}");
+          u8[][] back = session.send(id, data, binary, now);
+          for (i32 i = 0; i < back.len(); i++) { replies.push(back[i]); }
+        }
+        Closed(id): { out.line("closed \{id}"); }
+        Up: { out.line("up"); }
+        Down(aborted): { out.line(aborted ? "aborted" : "down"); }
+        Acked(id): { }
       }
     }
-    // Whatever the congestion window now allows, which is where the rest of a large message goes.
-    u8[][] more = session.tick(now);
-    for (i32 i = 0; i < more.len(); i++) {
-      sock!.sendTo(in.peer, in.port, more[i]).wait();
+    if (peerPort > 0) {
+      for (i32 i = 0; i < replies.len(); i++) { sock!.sendTo(peerHost, peerPort, replies.get(i)).wait(); }
     }
   }
   sock!.close();

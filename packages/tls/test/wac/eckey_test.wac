@@ -1,0 +1,117 @@
+// SEC1 P-256 keys in PEM, judged by `openssl ec`, which has never seen this code.
+//
+//     wac test --allow-read --allow-write --allow-run packages/tls/test/wac/eckey_test.wac
+//
+// Both directions, because a key file is something two programs share: openssl must read the key we write
+// and find the scalar we put in it, and we must read the key openssl generates and derive the public key
+// openssl says it has.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { ecPrivateKeyP256, parseEcPrivateKeyP256 } from "../../src/eckey.wac";
+import { pemEncode, pemFind, pemBlocks } from "../../../codec/src/pem.wac";
+import { encode as hexEncode } from "../../../codec/src/hex.wac";
+import { p256PublicKey } from "../../../crypto/src/p256.wac";
+import { Exec, ChildEnv, Launch, Procs, Files, Sys } from "std";
+import { flatten } from "core";
+
+Exec sh(Procs procs, string script) {
+  return flatten(procs.exec("/bin/sh", ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+string hex(const u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+/** openssl's `-text` hex dump of a field, colons and line breaks removed: `priv:` then `pub:`. */
+string field(string text, string name) {
+  i32 at = text.indexOf("\{name}:");
+  if (at < 0) { return ""; }
+  string out = "";
+  string rest = text.slice(at + name.len() + 1, text.len());
+  u8[] b = rest.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 c = b[i] as i32;
+    if (c == ' ' || c == '\n' || c == ':') { continue; }
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) { out = out + rest.slice(i, i + 1); continue; }
+    break;
+  }
+  return out;
+}
+
+/**
+ * openssl reads what we write. Would catch: the version not 1, the scalar not in an OCTET STRING, the curve
+ * OID or the `[0]`/`[1]` tags wrong (openssl refuses the file or names another curve), and a public key that
+ * is not the scalar's (openssl prints a different `pub`).
+ */
+export string test_openssl_reads_the_key_we_write(Sys sys) {
+  T t = T.create();
+  Files fs = sys.files();
+  u8[] priv = u8[].filled(32, 0);
+  for (i32 i = 0; i < 32; i++) { priv[i] = ((i * 11 + 0x80) & 0xFF) as@ u8; }
+  u8[] der = ecPrivateKeyP256(priv);
+  t.isTrue(der.len() > 100, "a key was written");
+  string dir = trimmed(string.fromBytes(sh(sys.procs(), "mktemp -d").stdout));
+  fs.writeFile("\{dir}/key.pem", pemEncode("EC PRIVATE KEY", der)).wait();
+  Exec r = sh(sys.procs(), "openssl ec -in \{dir}/key.pem -noout -text 2>&1");
+  string text = string.fromBytes(r.stdout);
+  t.eqI32(r.status, 0, "openssl reads it: \{text}");
+  t.eqStr(field(text, "priv"), hex(priv), "and finds our scalar");
+  t.eqStr(field(text, "pub"), hex(p256PublicKey(priv)), "and the public key that goes with it");
+  t.isTrue(text.indexOf("prime256v1") >= 0, "on P-256");
+  sh(sys.procs(), "rm -rf \{dir}");
+  return t.report();
+}
+
+/**
+ * We read what openssl writes, and refuse a file whose halves disagree. Would catch: a parser that skips the
+ * optional fields wrongly (no scalar), takes the public key on trust (the edited file is accepted), or
+ * accepts trailing bytes.
+ */
+export string test_we_read_the_key_openssl_generates(Sys sys) {
+  T t = T.create();
+  Exec r = sh(sys.procs(), "openssl ecparam -name prime256v1 -genkey -noout 2>&1");
+  t.eqI32(r.status, 0, "openssl generated a key");
+  u8[]? der = pemFind(r.stdout, "EC PRIVATE KEY");
+  t.isTrue(der is not null, "and it is one PEM block labelled EC PRIVATE KEY");
+  if (der is null) { return t.report(); }
+  u8[]? priv = parseEcPrivateKeyP256(der!);
+  t.isTrue(priv is not null, "which we parse");
+  if (priv is null) { return t.report(); }
+
+  Exec text = sh(sys.procs(), "printf '%s' '\{string.fromBytes(r.stdout)}' | openssl ec -noout -text 2>/dev/null");
+  t.eqStr(hex(p256PublicKey(priv!)), field(string.fromBytes(text.stdout), "pub"),
+          "and the public key we derive is the one openssl reports");
+
+  // The last byte of the public key flipped: the file's halves now disagree.
+  u8[] edited = u8[].filled(der!.len(), 0);
+  edited.copyFrom(der!, 0, 0, der!.len());
+  edited[edited.len() - 1] = edited[edited.len() - 1] ^ 1;
+  t.isTrue(parseEcPrivateKeyP256(edited) is null, "a public key that is not the scalar's is refused");
+  u8[] longer = u8[].filled(der!.len() + 1, 0);
+  longer.copyFrom(der!, 0, 0, der!.len());
+  t.isTrue(parseEcPrivateKeyP256(longer) is null, "and so are trailing bytes");
+  return t.report();
+}
+
+/** PEM in and out: the line length, a mismatched END, and text between blocks. */
+export string test_pem_blocks_are_written_strictly_and_read_laxly() {
+  T t = T.create();
+  u8[] body = u8[].filled(100, 7);
+  string one = string.fromBytes(pemEncode("THING", body));
+  t.isTrue(one.indexOf("-----BEGIN THING-----\n") == 0, "BEGIN line first");
+  t.eqI32(one.slice(22, one.len()).indexOf("\n"), 64, "body lines are 64 characters");
+  t.isTrue(one.slice(one.len() - 1, one.len()) == "\n", "and it ends in a newline");
+
+  string mixed = "junk\n" + one + "-----BEGIN A-----\nAAAA\n-----END B-----\nmore junk\n" +
+                 string.fromBytes(pemEncode("OTHER", [1, 2, 3] as u8[]));
+  auto blocks = pemBlocks(mixed.toBytes());
+  t.eqI32(blocks.len(), 2, "two well-formed blocks; the one whose END names another label is not one");
+  t.eqStr(blocks[0].label, "THING", "first in order");
+  t.eqI32(blocks[0].der.len(), 100, "with its body");
+  t.eqStr(blocks[1].label, "OTHER", "and the second");
+  return t.report();
+}
+
+string trimmed(string s) {
+  i32 e = s.len();
+  while (e > 0 && (s.slice(e - 1, e) == "\n" || s.slice(e - 1, e) == " ")) { e--; }
+  return s.slice(0, e);
+}

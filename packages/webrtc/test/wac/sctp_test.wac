@@ -27,14 +27,14 @@ import { T } from "../../../wactest/src/assert.wac";
 import { Procs, Sys } from "std";
 import { Lines, check, hex } from "../../../wactest/src/oracle.wac";
 import { encode as hexEncode } from "../../../codec/src/hex.wac";
-import { Association, chunkAbort, chunkShutdown, chunkShutdownAck, chunkShutdownComplete,
-         dataFlagBegin, dataFlagEnd, dataPayload, dataPpid, dataStreamId, dataStreamSeq, dataTsn,
-         ppidDcep, ppidString, ppidStringEmpty, sackCumulative, sackGapEnd, sackGaps, sackGapStart,
-         tsnBefore } from "../../src/sctp.wac";
+import { chunkAbort, chunkSack, chunkShutdownAck, chunkData, dataFlagBegin, dataFlagEnd, dataPayload,
+         dataPpid, dataStreamId, dataStreamSeq, dataTsn, ppidDcep, ppidString, ppidStringEmpty, sackCumulative,
+         sackGapEnd, sackGaps, sackGapStart, tsnBefore } from "../../src/sctp.wac";
+import { Association, SctpEvent } from "../../src/association.wac";
 import { abortPacket, ackChannelPacket, chunkKindAt, chunkKinds, cookieEchoPacket, crcOf,
-         crcVerifies, dataPacket, firstChunkKind, firstChunkSize, firstChunkValue, initPacket,
-         labelOf, newAssociation, openChannelPacket, sackPacket, sackPacketGaps, shutdownAckPacket,
-         shutdownPacket, tagOf } from "./sctp_probe.wac";
+         crcVerifies, dataPacket, dataPacketFlags, firstChunkKind, firstChunkSize, firstChunkValue, initPacket,
+         labelOf, openChannelPacket, sackPacket, sackPacketGaps, shutdownPacket, tagOf, answering,
+         firstOfKind, lastOfKind, dataTsns, PEER_TAG } from "./sctp_probe.wac";
 
 static string ORACLE = "packages/webrtc/test/sctp_oracle.py";
 
@@ -239,60 +239,74 @@ export string test_an_empty_string_has_its_own_protocol_identifier() {
   return t.report();
 }
 
+// ── The association's receiving and sending rules, each a bug this package once had ──────────────
+//
+// These drove the one-stream association's internals until 2026-11-08. They drive `association.wac` through
+// packets now — a peer's DATA in, the SACK it answers with read back out — which is what the peer sees, and every
+// story below is a way that once went wrong.
+
+static i32 OUR = 0x11111111;
+
+/** The whole messages the association has handed up, as text. */
+string delivered(Association a) {
+  string out = "";
+  SctpEvent[] es = a.events();
+  for (i32 i = 0; i < es.len(); i++) {
+    match (es[i]) {
+      Message(stream, ppid, data): { out += (out.len() == 0 ? "" : "|") + string.fromBytes(data); }
+      default: { }
+    }
+  }
+  return out;
+}
+
 export string test_a_message_reassembles_when_its_chunks_are_reordered_on_the_path() {
-  // **Reordering is not loss.** UDP may deliver 1, 3, 2, 4 with nothing dropped at all, and a
-  // reassembler that concatenates in arrival order turns that into a message the checksum passes
-  // and the content is wrong — every piece intact, in the wrong order. There is no error, no alert,
-  // nothing in a log; the receiving application just gets rubbish.
+  // **Reordering is not loss.** UDP may deliver 1, 3, 2, 4 with nothing dropped at all, and a reassembler that
+  // concatenates in arrival order turns that into a message whose every piece is intact and in the wrong order.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
+  Association a = answering(OUR, 1, 1);
   i32 B = dataFlagBegin();
   i32 E = dataFlagEnd();
-
-  t.eqI32(a.reassemble(0, B, ("AAA").toBytes(), 1).len(), 0, "a begin, not an end");
-  // Now 3 arrives before 2 — it must be held, not appended.
-  t.eqI32(a.reassemble(0, 0, ("CCC").toBytes(), 3).len(), 0, "held, out of order");
-  t.eqI32(a.reassemble(0, 0, ("BBB").toBytes(), 2).len(), 0, "still no end");
-  t.eqStr(string.fromBytes(a.reassemble(0, E, ("DDD").toBytes(), 4)), "AAABBBCCCDDD",
-          "the chunks were put together in arrival order rather than TSN order");
+  a.receive(dataPacketFlags(OUR, 1, 0, 0, ppidString(), B, "AAA".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, 3, 0, 0, ppidString(), 0, "CCC".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, 2, 0, 0, ppidString(), 0, "BBB".toBytes()), 1 as i64);
+  t.eqStr(delivered(a), "", "no end yet, so nothing is handed up");
+  a.receive(dataPacketFlags(OUR, 4, 0, 0, ppidString(), E, "DDD".toBytes()), 1 as i64);
+  t.eqStr(delivered(a), "AAABBBCCCDDD", "the pieces joined in TSN order, not arrival order");
   return t.report();
 }
 
 export string test_and_it_reassembles_when_the_tsns_are_negative_as_an_i32() {
-  // **A TSN is unsigned 32-bit and chosen at random**, so held in an `i32` it is negative about
-  // half the time. This test exists because a `-1` sentinel for "no message in progress" was also
-  // a TSN Chromium really sent: the browser test failed on four runs in five, and it presented as
-  // the browser's message never arriving rather than as anything about a number.
+  // **A TSN is unsigned 32-bit and chosen at random**, so held in an `i32` it is negative about half the time. A
+  // `-1` sentinel for "no message in progress" was once also a TSN Chromium really sent, and it presented as the
+  // browser's message never arriving.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
   i32 base = -102851347;                       // an actual initial TSN from a Chromium run
+  Association a = answering(OUR, 1, base);
   i32 B = dataFlagBegin();
   i32 E = dataFlagEnd();
-
-  t.eqI32(a.reassemble(0, B | E, ("hi").toBytes(), base).len(), 2,
-          "a whole message in one chunk, at a negative TSN");
-  t.eqI32(a.reassemble(0, B, ("AA").toBytes(), base + 1).len(), 0, "a begin");
-  t.eqI32(a.reassemble(0, 0, ("CC").toBytes(), base + 3).len(), 0, "early");
-  t.eqI32(a.held(), 1, "and held rather than appended");
-  t.eqI32(a.reassemble(0, 0, ("BB").toBytes(), base + 2).len(), 0, "the one it was waiting for");
-  t.eqStr(string.fromBytes(a.reassemble(0, E, ("DD").toBytes(), base + 4)), "AABBCCDD",
-          "the whole message");
-  t.eqI32(a.held(), 0, "the hold list drained");
+  a.receive(dataPacketFlags(OUR, base, 0, 0, ppidString(), B | E, "hi".toBytes()), 1 as i64);
+  t.eqStr(delivered(a), "hi", "a whole message in one chunk, at a negative TSN");
+  a.receive(dataPacketFlags(OUR, base + 1, 0, 1, ppidString(), B, "AA".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, base + 3, 0, 1, ppidString(), 0, "CC".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, base + 2, 0, 1, ppidString(), 0, "BB".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, base + 4, 0, 1, ppidString(), E, "DD".toBytes()), 1 as i64);
+  t.eqStr(delivered(a), "AABBCCDD", "the whole message");
   return t.report();
 }
 
 export string test_a_duplicate_of_a_piece_already_consumed_is_ignored() {
-  // The peer resends what our SACK did not cover, so a piece we already joined on comes back.
-  // Holding it would leave an entry nothing ever drains — and once the list fills, a genuinely
-  // early piece has nowhere to go.
+  // The peer resends what our SACK did not cover, so a piece we already joined on comes back. It must neither be
+  // held for ever nor joined twice.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  a.reassemble(0, dataFlagBegin(), ("AA").toBytes(), 10);
-  a.reassemble(0, 0, ("BB").toBytes(), 11);
-  t.eqI32(a.reassemble(0, 0, ("BB").toBytes(), 11).len(), 0, "a duplicate");
-  t.eqI32(a.held(), 0, "which was dropped rather than held");
-  t.eqStr(string.fromBytes(a.reassemble(0, dataFlagEnd(), ("CC").toBytes(), 12)), "AABBCC",
-          "and the message is not doubled by it");
+  Association a = answering(OUR, 1, 10);
+  a.receive(dataPacketFlags(OUR, 10, 0, 0, ppidString(), dataFlagBegin(), "AA".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, 11, 0, 0, ppidString(), 0, "BB".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, 11, 0, 0, ppidString(), 0, "BB".toBytes()), 1 as i64);
+  a.receive(dataPacketFlags(OUR, 12, 0, 0, ppidString(), dataFlagEnd(), "CC".toBytes()), 1 as i64);
+  t.eqStr(delivered(a), "AABBCC", "the message is not doubled by the duplicate");
+  a.receive(dataPacketFlags(OUR, 11, 0, 0, ppidString(), 0, "BB".toBytes()), 1 as i64);
+  t.eqStr(delivered(a), "", "and a late copy of a consumed piece delivers nothing");
   return t.report();
 }
 
@@ -309,218 +323,148 @@ export string test_tsn_comparison_is_serial_so_it_survives_the_wrap_at_2_32() {
 }
 
 export string test_an_acknowledgement_clears_what_it_covers_across_2_31() {
-  // **The same mistake as the sentinel, one comparison along.** A TSN is unsigned and an
-  // association picks its first at random, so a sequence crosses the signed midpoint on about one
-  // session in a hundred thousand-odd — and there `flightTsn[i] <= acked` inverts. Nothing is
-  // reported: the chunks stay in flight forever, so the congestion window never reopens and the
-  // transfer stops, which looks like the peer went quiet.
+  // **The same mistake as the sentinel, one comparison along.** A sequence crosses the signed midpoint on some
+  // sessions, and there a plain `<=` inverts: the chunks stay in flight for ever, the congestion window never
+  // reopens, and the transfer stops.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 0x7FFFFFFE, 65536);
-  u8[] first = a.send(0, 51, ("one").toBytes(), 0);
-  a.send(0, 51, ("two").toBytes(), 0);
-  u8[] third = a.send(0, 51, ("three").toBytes(), 0);
-  t.eqI32(a.inFlight(), 3, "three sent and unacknowledged");
-
-  i32 lastTsn = dataTsn(firstChunkValue(third));
-  t.isTrue(lastTsn < 0, "the third TSN wrapped past 2^31 as expected: \{lastTsn}");
-  t.isTrue(dataTsn(firstChunkValue(first)) > 0, "and the first did not");
-
-  a.receive(sackPacket(0x11111111, lastTsn, 65536), u8[](), 1);
-  t.eqI32(a.inFlight(), 0,
-          "the SACK covers all three, but a signed comparison says the first two are outstanding");
+  Association a = answering(OUR, 0x7FFFFFFE, 1);
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.send(0, 51, "two".toBytes(), false, -1, 0 as i64);
+  a.send(0, 51, "three".toBytes(), false, -1, 0 as i64);
+  i32[] tsns = dataTsns(a.take());
+  t.eqI32(tsns.len(), 3, "three sent");
+  t.isTrue(tsns[2] < 0 && tsns[0] > 0, "the TSNs cross 2^31: \{tsns[0]} … \{tsns[2]}");
+  a.receive(sackPacket(OUR, tsns[2], 65536), 1 as i64);
+  t.eqI32(a.outstanding(), 0, "the SACK covers all three");
   return t.report();
 }
 
 export string test_the_receivers_cumulative_point_starts_empty() {
-  // `cumulativeTsn` used -1 for "nothing yet" — and -1 is 0xFFFFFFFF, a TSN a peer really sends.
+  // A cumulative point of -1 for "nothing yet" is also 0xFFFFFFFF, a TSN a peer really sends.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  t.isTrue(a.accept(-1), "0xFFFFFFFF is the first chunk we ever see");
-  t.eqI32(a.cumulativeTsn, -1, "and it is the cumulative point");
-  t.isFalse(a.accept(1),
-            "a chunk two past it is out of order — with -1 as the sentinel this was taken as the " +
-            "first chunk all over again, jumping the cumulative point over one that never arrived");
-  t.isTrue(a.accept(0), "the immediate successor, across the wrap");
-  t.eqI32(a.cumulativeTsn, 1,
-          "and it carries 1 with it — that one was recorded when it arrived early, so closing the " +
-          "hole in front of it moves the cumulative point over both");
+  Association a = answering(OUR, 1, -1);
+  a.receive(dataPacket(OUR, -1, 0, 0, ppidString(), "a".toBytes()), 1 as i64);
+  t.eqI32(sackCumulative(firstOfKind(a.take(), chunkSack())), -1, "0xFFFFFFFF is the first chunk, and cumulative");
+  a.receive(dataPacket(OUR, 1, 0, 2, ppidString(), "c".toBytes()), 1 as i64);
+  u8[] sack = firstOfKind(a.take(), chunkSack());
+  t.eqI32(sackCumulative(sack), -1, "a chunk two past it is out of order, not a new start");
+  t.eqI32(sackGaps(sack), 1, "and is reported as a gap");
+  a.receive(dataPacket(OUR, 0, 0, 1, ppidString(), "b".toBytes()), 1 as i64);
+  t.eqI32(sackCumulative(firstOfKind(a.take(), chunkSack())), 1, "the successor across the wrap carries 1 with it");
+  t.eqStr(delivered(a), "a|b|c", "and the messages come up in stream order");
   return t.report();
 }
 
 export string test_a_sack_reports_the_chunks_that_arrived_out_of_order() {
-  // **A cumulative point alone understates what arrived.** If 5 is lost and 6, 7, 8 arrive, a SACK
-  // saying only "4" makes the peer resend all four — three of which we are holding. Gap blocks are
-  // the exceptions to the cumulative number, as offsets from it, and they are what turns one loss
-  // into one retransmission.
+  // **A cumulative point alone understates what arrived.** If 5 is lost and 6, 7, 8 arrive, a SACK saying only "4"
+  // makes the peer resend all four. Gap blocks — offsets from the cumulative TSN — make one loss one retransmission.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  i32[] arrived = [1, 2, 3, 4];
+  Association a = answering(OUR, 1, 1);
+  i32[] arrived = [1, 2, 3, 4, 6, 7, 8, 10];
   for (i32 i = 0; i < arrived.len(); i++) {
-    t.isTrue(a.accept(arrived[i]), "TSN \{arrived[i]} is in order");
+    a.receive(dataPacketFlags(OUR, arrived[i], 0, 0, ppidString(), dataFlagBegin() | dataFlagEnd() | 0x04, "x".toBytes()), 1 as i64);
   }
-  t.eqI32(sackGaps(a.sack()), 0, "nothing is missing yet");
-
-  // 5 is lost; 6, 7, 8 arrive, then 10 after a second hole at 9.
-  i32[] early = [6, 7, 8, 10];
-  for (i32 i = 0; i < early.len(); i++) {
-    t.isFalse(a.accept(early[i]), "TSN \{early[i]} is early");
-  }
-  u8[] sack = a.sack();
-  t.eqI32(sackCumulative(sack), 4, "the cumulative point is still 4 — 5 never came");
+  u8[] sack = lastOfKind(a.take(), chunkSack());
+  t.eqI32(sackCumulative(sack), 4, "the cumulative point is 4 — 5 never came");
   t.eqI32(sackGaps(sack), 2, "two runs arrived above it: 6-8 and 10");
-  // Offsets from the cumulative TSN, per RFC 4960: 6 is +2, 8 is +4.
   t.eqI32(sackGapStart(sack, 0), 2, "the first run starts at +2");
   t.eqI32(sackGapEnd(sack, 0), 4, "and ends at +4");
   t.eqI32(sackGapStart(sack, 1), 6, "and 10 is +6, on its own");
   t.eqI32(sackGapEnd(sack, 1), 6, "starting and ending there");
-
-  // When 5 finally arrives the cumulative point jumps over everything already held.
-  t.isTrue(a.accept(5), "5 closes the hole");
-  u8[] after = a.sack();
+  a.receive(dataPacketFlags(OUR, 5, 0, 0, ppidString(), dataFlagBegin() | dataFlagEnd() | 0x04, "x".toBytes()), 1 as i64);
+  u8[] after = firstOfKind(a.take(), chunkSack());
   t.eqI32(sackCumulative(after), 8, "5 closed the first hole and 6, 7, 8 were already here");
   t.eqI32(sackGaps(after), 1, "10 is still a gap, because 9 is still missing");
   return t.report();
 }
 
 export string test_three_sacks_reporting_a_tsn_missing_resend_it() {
-  // **A gap is not a timeout.** A SACK naming later TSNs proves the path is still delivering, so
-  // one chunk was dropped rather than the path having failed — and waiting a whole RTO for that is
-  // most of the delay a lossy path costs. RFC 4960 §7.2.4: after three further SACKs still report
-  // it missing, send it again immediately. Three rather than one, because reordering also produces
-  // a gap and resending on the first one would double traffic on a path that lost nothing.
+  // **A gap is not a timeout.** A SACK naming later TSNs proves the path is delivering, so after three such reports
+  // the missing chunk goes again at once (RFC 4960 §7.2.4) — three, because reordering produces a gap too.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
+  Association a = answering(OUR, 1, 1);
   string[] bodies = ["one", "two", "three", "four", "five"];
-  for (string body in bodies) { a.send(0, 51, body.toBytes(), 0); }
-  t.eqI32(a.inFlight(), 5, "five sent");
-
+  for (string body in bodies) { a.send(0, 51, body.toBytes(), false, -1, 0 as i64); }
+  t.eqI32(dataTsns(a.take()).len(), 5, "five sent");
   // The peer got 1, lost 2, and has 3, 4, 5: cumulative 1, one gap block at +2..+4.
-  u8[][] sent = a.receive(gapSack(), u8[](), 1);
-  t.eqI32(a.inFlight(), 4, "1 is acknowledged; 2 through 5 are not yet");
-  t.eqI32(sent.len(), 0, "one report is not enough — a reorder looks the same");
-  a.receive(gapSack(), u8[](), 2);
-  t.eqI32(a.fastResent(), 0, "nor two");
-
-  sent = a.receive(gapSack(), u8[](), 3);
-  t.eqI32(a.fastResent(), 1, "the third report resends it");
-  t.eqI32(sent.len(), 1, "and exactly one packet goes out — 2, not 2 through 5");
-  if (sent.len() == 1) {
-    t.eqI32(dataTsn(firstChunkValue(sent[0])), 2, "the missing one, at its own TSN");
-  }
-
-  // And it is not resent again on the next report, or a lossy path would see a burst per SACK.
-  a.receive(gapSack(), u8[](), 4);
-  t.eqI32(a.fastResent(), 1, "once, until something changes");
+  a.receive(gapSack(), 1 as i64);
+  t.eqI32(dataTsns(a.take()).len(), 0, "one report is not enough — a reorder looks the same");
+  a.receive(gapSack(), 2 as i64);
+  t.eqI32(dataTsns(a.take()).len(), 0, "nor two");
+  a.receive(gapSack(), 3 as i64);
+  i32[] again = dataTsns(a.take());
+  t.eqI32(again.len(), 1, "the third report resends exactly one chunk — 2, not 2 through 5");
+  if (again.len() == 1) { t.eqI32(again[0], 2, "the missing one, at its own TSN"); }
+  a.receive(gapSack(), 4 as i64);
+  t.eqI32(dataTsns(a.take()).len(), 0, "and not again on the next report");
   return t.report();
 }
 
 u8[] gapSack() {
-  return sackPacketGaps(0x11111111, 1, 65536, [2] as i32[], [4] as i32[]);
+  return sackPacketGaps(OUR, 1, 65536, [2] as i32[], [4] as i32[]);
 }
 
 export string test_aiortc_reads_our_gap_blocks_back_as_the_runs_we_meant(Sys sys) {
   Procs procs = sys.procs();
-  // **A foreign parser, not ours.** Our own tests read our own bytes with our own reader, so a
-  // field at the wrong offset or the wrong width agrees with itself perfectly. aiortc's SCTP is a
-  // full implementation written by somebody who never saw this code, and it unpacks a SACK with
-  // `!LLHH` and then `!HH` per gap — so it disagrees the moment a field moves.
+  // **A foreign parser, not ours.** aiortc unpacks a SACK with `!LLHH` and then `!HH` per gap, so it disagrees the
+  // moment a field moves.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  i32[] inOrder = [1, 2, 3, 4];
-  for (i32 i = 0; i < inOrder.len(); i++) { a.accept(inOrder[i]); }
-  i32[] outOfOrder = [6, 7, 8, 10, 13, 14];
-  for (i32 i = 0; i < outOfOrder.len(); i++) { a.accept(outOfOrder[i]); }
-
-  // Three runs above 4 — 6-8, 10 and 13-14 — as offsets from the cumulative TSN. `0` duplicates,
-  // and the count must say so or the gaps would be read four bytes further on.
+  Association a = answering(OUR, 1, 1);
+  i32[] arrived = [1, 2, 3, 4, 6, 7, 8, 10, 13, 14];
+  for (i32 i = 0; i < arrived.len(); i++) {
+    a.receive(dataPacketFlags(OUR, arrived[i], 0, 0, ppidString(), dataFlagBegin() | dataFlagEnd() | 0x04, "x".toBytes()), 1 as i64);
+  }
+  u8[] sack = lastOfKind(a.take(), chunkSack());
   Lines lines = Lines.create();
-  lines.add("sackbody \{hexOf(a.sack())} \{h32(4)} 65536 0 2-4,6-6,9-10");
+  lines.add("sackbody \{hexOf(sack)} \{h32(4)} 65536 0 2-4,6-6,9-10");
   ask(t, procs, lines, "aiortc's gap blocks");
   return t.report();
 }
 
 export string test_and_a_sack_with_nothing_out_of_order_still_parses(Sys sys) {
   Procs procs = sys.procs();
-  // The empty case is the one an implementation gets wrong by shortening the chunk: a SACK is 16
-  // bytes on the wire even with no gaps, because the two counts are part of it.
+  // The empty case is the one an implementation gets wrong by shortening the chunk: a SACK is 16 bytes on the wire
+  // even with no gaps, because the two counts are part of it.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  a.accept(1);
-  u8[] sack = a.sack();
+  Association a = answering(OUR, 1, 1);
+  a.receive(dataPacket(OUR, 1, 0, 0, ppidString(), "x".toBytes()), 1 as i64);
+  u8[] sack = firstOfKind(a.take(), chunkSack());
   t.eqI32(sack.len(), 12, "twelve bytes of value; the four-byte chunk header is added around it");
-
   Lines lines = Lines.create();
   lines.add("sackbody \{hexOf(sack)} \{h32(1)} 65536 0 -");
   ask(t, procs, lines, "aiortc's empty SACK");
   return t.report();
 }
 
-export string test_an_association_shuts_down_in_three_chunks(Sys sys) {
-  Procs procs = sys.procs();
-  // **A close is not just stopping.** A peer that goes quiet leaves the other end holding a
-  // half-open association with data it believes is still on the way; RFC 4960 §9.2's exchange is
-  // what tells it otherwise, and it carries the cumulative TSN so the last acknowledgement is not
-  // the thing that gets lost.
+export string test_a_peers_shutdown_is_answered_and_nothing_is_sent_after() {
+  // RFC 4960 §9.2: a SHUTDOWN is answered with SHUTDOWN-ACK, and **refusing to send afterwards is the point** — an
+  // association that answers a shutdown and keeps putting DATA on the path makes the peer abort. (This end never
+  // starts the exchange: Chromium closes with ABORT, and nothing here has needed to.)
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  i32[] arrived = [1, 2, 3];
-  for (i32 i = 0; i < arrived.len(); i++) { a.accept(arrived[i]); }
-
-  u8[] shutdown = a.shutdown();
-  t.eqI32(firstChunkKind(shutdown), chunkShutdown(), "SHUTDOWN");
-  t.isFalse(a.closed(), "asked for, not finished — the peer must answer");
-
-  Lines lines = Lines.create();
-  lines.add("chunkkind \{hexOf(shutdown)} ShutdownChunk \{h32(3)}");
-
-  // The peer answers, and we finish the exchange.
-  u8[][] done = a.receive(shutdownAckPacket(0x11111111), u8[](), 1);
-  t.eqI32(done.len(), 1, "one packet back");
-  if (done.len() == 1) {
-    t.eqI32(firstChunkKind(done[0]), chunkShutdownComplete(), "SHUTDOWN_COMPLETE, and now it is over");
-    lines.add("chunkkind \{hexOf(done[0])} ShutdownCompleteChunk");
-  }
-  t.isTrue(a.closed(), "the association is closed");
-  ask(t, procs, lines, "aiortc's shutdown exchange");
-  return t.report();
-}
-
-export string test_and_the_other_side_of_it_a_peers_shutdown_is_answered() {
-  T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  u8[][] reply = a.receive(shutdownPacket(0x11111111, 9), u8[](), 0);
-  t.eqI32(reply.len(), 1, "one packet back");
-  if (reply.len() == 1) {
-    t.eqI32(firstChunkKind(reply[0]), chunkShutdownAck(), "SHUTDOWN_ACK");
-  }
-
-  // **Refusing to send afterwards is the point.** An association that answers a shutdown and then
-  // keeps putting DATA on the path makes the peer abort, which is a worse close than none.
-  t.eqI32(a.send(0, 51, ("late").toBytes(), 0).len(), 0,
-          "nothing goes out after a shutdown has been agreed");
-  t.eqI32(a.inFlight(), 0, "and nothing is recorded as being in flight");
+  Association a = answering(OUR, 1, 1);
+  a.receive(shutdownPacket(OUR, 0), 1 as i64);
+  u8[][] reply = a.take();
+  t.isTrue(firstOfKind(reply, chunkShutdownAck()).len() == 0 && reply.len() == 1 && firstChunkKind(reply[0]) == chunkShutdownAck(),
+           "one packet back, a SHUTDOWN-ACK");
+  t.isFalse(a.send(0, 51, "late".toBytes(), false, -1, 2 as i64), "nothing goes out after a shutdown was agreed");
   return t.report();
 }
 
 export string test_an_abort_closes_the_association_at_once() {
-  // **This is the chunk a browser actually sends.** Chromium closing a peer connection sends ABORT
-  // and never SHUTDOWN — measured in `browser.test.ts`, not assumed — so the graceful exchange is
-  // the one we may initiate and this is the one we will receive. Ignoring it leaves an association
-  // that believes it is live, keeps retransmitting into a peer that has gone, and never reports the
-  // close to whatever is above it.
+  // **This is the chunk a browser actually sends.** Ignoring it leaves an association that believes it is live,
+  // retransmits into a peer that has gone, and never reports the close to whatever is above it.
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-  a.send(0, 51, ("one").toBytes(), 0);
-  t.eqI32(a.inFlight(), 1, "one in flight");
-
-  // RFC 4960 §8.5.1: an ABORT is never answered with an ABORT, and there is nothing else to say.
-  t.eqI32(a.receive(abortPacket(0x11111111), u8[](), 0).len(), 0,
-          "nothing goes back — answering would be a packet-doubling loop");
-  t.isTrue(a.abortedByPeer(), "and it is recorded, not merely ignored");
-  t.isTrue(a.closed(), "an abort is a close, however ungraceful");
-  t.eqI32(a.inFlight(), 0,
-          "and what was in flight is dropped rather than retransmitted at a peer that has gone");
-  t.eqI32(a.send(0, 51, ("two").toBytes(), 1).len(), 0, "no more sending");
+  Association a = answering(OUR, 1, 1);
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.take();
+  a.receive(abortPacket(OUR), 1 as i64);
+  t.eqI32(a.take().len(), 0, "nothing goes back — an ABORT is never answered (§8.5.1)");
+  bool reported = false;
+  SctpEvent[] es = a.events();
+  for (i32 i = 0; i < es.len(); i++) { match (es[i]) { Down(aborted): { reported = aborted; } default: { } } }
+  t.isTrue(reported, "the abort is reported, not merely ignored");
+  t.eqI32(a.outstanding(), 0, "and what was in flight is dropped rather than retransmitted at a peer that has gone");
+  t.isFalse(a.send(0, 51, "two".toBytes(), false, -1, 2 as i64), "no more sending");
   return t.report();
 }
 
@@ -537,72 +481,27 @@ string repeated(string s, i32 n) {
 }
 
 /**
- * **The peer says in its INIT which TSN it will start at, and nothing reads it.**
- *
- * `Association.receive`'s INIT branch takes `initiateTag(c.value)` out of the INIT and drops the
- * rest of the same value on the floor — including `initTsn`, which `sctp.wac` exports and documents
- * as *"the initial TSN an INIT or INIT-ACK carries — the first data it will send."* So the
- * association starts with `haveCumulative == 0` and the **first DATA chunk that arrives** becomes
- * the cumulative point, whether or not it is the first one sent.
- *
- * Cumulative means *everything up to and including it arrived*. Adopting 101 as the cumulative point
- * is therefore a statement that 100 arrived, made about a chunk still on the wire. `accept` then
- * refuses the real 100 as a duplicate — `tsnBefore(101, 100)` is false, so it is not even recorded
- * as a gap — and the SACK never mentions it, so the peer stops resending. **The payload is lost and
- * both ends believe it was delivered.**
- *
- * `test_a_message_reassembles_when_its_chunks_are_reordered_on_the_path` is the neighbouring case
- * and does not reach this: it drives `reassemble` directly, which is downstream of `accept`, and it
- * starts from a cumulative point that has already been established. The first chunk is the one the
- * gap machinery cannot cover for, because there is nothing yet to have a gap in.
- *
- * The assertion is on the SACK rather than on internal state, because the SACK is what the peer
- * acts on: a cumulative point of 101 is the lie, and 99 — one below what the peer said it would
- * start at — is the truth that nothing has arrived in order yet.
+ * **The peer says in its INIT which TSN it will start at**, and the first DATA chunk to *arrive* must not be taken
+ * for it. Cumulative means everything up to and including it arrived; adopting an overtaking 101 as the cumulative
+ * point is a statement that 100 arrived, made about a chunk still on the wire — and 100 is then refused as a
+ * duplicate, never named in a gap block, and lost with both ends believing it was delivered.
  */
 export string test_the_peers_declared_first_tsn_is_believed_over_the_first_to_arrive() {
   T t = T.create();
-  Association a = newAssociation(0x11111111, 1, 65536);
-
-  // The peer's INIT: it will start sending at TSN 100.
-  u8[][] answer = a.receive(initPacket(0x22222222, 65536, 16, 16, 100), u8[](), 0 as i64);
-  t.isTrue(answer.len() > 0, "the INIT was not answered, so nothing below was set up");
-
-  // 101 overtakes 100 on the path, which is a reorder and not a loss.
-  u8[][] sacks = a.receive(dataPacket(0x11111111, 101, 0, 0, ppidString(), "B".toBytes()),
-                           u8[](), 0 as i64);
-  t.isTrue(sacks.len() > 0, "a DATA chunk was not acknowledged at all");
-  i32 cumulative = sackCumulative(firstChunkValue(sacks[0]));
-  t.eqI32(cumulative, 99,
-          "the SACK claims everything through \{cumulative} arrived, but the peer said " +
-          "it starts at 100 and 100 has not arrived");
-  t.eqI32(sackGaps(firstChunkValue(sacks[0])), 1, "101 was not reported as a gap");
-
-  // And the chunk that was overtaken is still accepted when it turns up, rather than being refused
-  // as a duplicate of something the association already claimed to have.
-  u8[][] after = a.receive(dataPacket(0x11111111, 100, 0, 0, ppidString(), "A".toBytes()),
-                           u8[](), 0 as i64);
-  t.isTrue(after.len() > 0, "the overtaken chunk was not acknowledged");
-  t.eqI32(sackCumulative(firstChunkValue(after[0])), 101,
-          "100 arrived and closed the hole, so everything through 101 is now delivered");
-  t.eqI32(sackGaps(firstChunkValue(after[0])), 0, "the gap was not closed");
-
-  // The control: in order, from the declared start, there is never a gap.
-  Association b = newAssociation(0x11111111, 1, 65536);
-  b.receive(initPacket(0x22222222, 65536, 16, 16, 100), u8[](), 0 as i64);
-  u8[][] one = b.receive(dataPacket(0x11111111, 100, 0, 0, ppidString(), "A".toBytes()),
-                         u8[](), 0 as i64);
-  t.eqI32(sackCumulative(firstChunkValue(one[0])), 100, "an in-order first chunk was not cumulative");
-  t.eqI32(sackGaps(firstChunkValue(one[0])), 0, "an in-order first chunk reported a gap");
-
-  // **A retransmitted INIT must not rewind a receive point that has moved.** An INIT is resent when
-  // its INIT-ACK is lost, and the copy carries the same initial TSN — so seeding unconditionally
-  // would throw away everything received in between and re-request it, or worse, make chunks already
-  // delivered look new. The guard is `haveCumulative == 0`, and this is what it is for.
-  b.receive(initPacket(0x22222222, 65536, 16, 16, 100), u8[](), 0 as i64);
-  u8[][] again = b.receive(dataPacket(0x11111111, 101, 0, 0, ppidString(), "B".toBytes()),
-                           u8[](), 0 as i64);
-  t.eqI32(sackCumulative(firstChunkValue(again[0])), 101,
-          "a repeated INIT rewound the cumulative point, so what had arrived was forgotten");
+  Association a = answering(OUR, 1, 100);
+  a.receive(dataPacket(OUR, 101, 0, 1, ppidString(), "B".toBytes()), 0 as i64);
+  u8[] sack = firstOfKind(a.take(), chunkSack());
+  t.eqI32(sackCumulative(sack), 99, "nothing in order has arrived: the peer said it starts at 100");
+  t.eqI32(sackGaps(sack), 1, "101 is reported as a gap");
+  a.receive(dataPacket(OUR, 100, 0, 0, ppidString(), "A".toBytes()), 0 as i64);
+  u8[] after = firstOfKind(a.take(), chunkSack());
+  t.eqI32(sackCumulative(after), 101, "100 arrived and closed the hole, so everything through 101 is delivered");
+  t.eqI32(sackGaps(after), 0, "and the gap is closed");
+  t.eqStr(delivered(a), "A|B", "in stream order");
+  // **A retransmitted INIT must not rewind a receive point that has moved.**
+  a.receive(initPacket(PEER_TAG, 65536, 16, 16, 100), 0 as i64);
+  a.take();
+  a.receive(dataPacket(OUR, 102, 0, 2, ppidString(), "C".toBytes()), 0 as i64);
+  t.eqI32(sackCumulative(firstOfKind(a.take(), chunkSack())), 102, "a repeated INIT did not rewind the cumulative point");
   return t.report();
 }

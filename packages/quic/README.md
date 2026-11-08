@@ -26,6 +26,30 @@ i32 n = encode(out, 0, 494878333 as i64);
 The direction is [design/system 0007](../../design/system/0007-quic-and-the-datagram-capability.md),
 which has the decisions, the order of work and a state of play. This file says only what exists.
 
+## The endpoint
+
+**`src/endpoint.wac`** is a whole QUIC version 1 connection, either end, without a socket — `QuicConn.client` or
+`QuicConn.server`, then `receive` a datagram, `tick` the clock, `take` what to send, and read `events`. It is what
+wac-kps's KPS listener and dialer run on, and it is judged there against quic-go (Go's client and server) and quiche
+(`@kpstreams/server`, which answers the first Initial with a Retry). What it has:
+
+- **TLS 1.3 at three levels** (`src/tlsq.wac`), either role: x25519, TLS_AES_128_GCM_SHA256, ECDSA P-256
+  certificates, ALPN required, transport parameters both ways. A client pins the server's certificate by its
+  SHA-256 instead of any PKI. **No parser in it traps on what a peer sends** — `packages/tls`'s do, which is fine for
+  a test and fatal for a listener.
+- **Packet protection** in every space with real packet-number decoding, the Initial keys discarded when RFC 9001
+  says, and a peer's 1-RTT key update followed. **Retry**, as a client.
+- **ACKs** with all their ranges; **loss detection and the probe timeout** of RFC 9002; **NewReno**; the server's
+  anti-amplification limit until the client's address is validated.
+- **Bidirectional streams** with flow control both ways, FIN, RESET_STREAM and STOP_SENDING (answered with a
+  reset), and MAX_STREAMS credited back only when a peer's stream is finished both ways and read to the end.
+- **DATAGRAM frames**; CONNECTION_CLOSE of both kinds with the closing and draining periods; the idle timeout.
+
+Not there: unidirectional streams (none are allowed), 0-RTT, sending a Retry, version negotiation, migration, PMTU
+discovery (every datagram is at most 1200 bytes). `test/wac/endpoint_test.wac` runs a client against a server in one
+process — 5 MiB past both windows both ways, loss in the handshake and in the data, datagrams, resets, stop-sending,
+an application close, a pin mismatch, 250 streams through a limit of 100.
+
 ## What exists
 
 **`src/varint.wac`** — the variable-length integer of RFC 9000 §16, which almost every other field

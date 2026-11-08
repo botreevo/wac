@@ -12,6 +12,7 @@
 //   aeadopen <suite> <key> <nonce> <aad> <ct>           →  `aeadopen <hex>`, empty if the tag fails
 //   rsakey                                              →  `rsakey <n-hex> <e-hex> <d-hex>`
 //   cert <der-hex>                                      →  `cert <0|1> <subject-hex> <keytype-hex>`
+//   anon <der-hex>                                      →  `anon <0|1> <serial-hex> <subject-hex> <sha256-hex> <ca 0|1>`
 //
 // `cert` is the one op that is not `node:crypto` at all: it shells out to `openssl x509` and
 // `openssl verify`, which have never seen this code. It is here rather than driven from wac
@@ -23,7 +24,7 @@
 // every AES record down the ChaCha path — and the tag then failed, so it read as our sealing being
 // wrong rather than as the oracle mistaking the suite.
 
-import { createDecipheriv, createHmac, generateKeyPairSync } from "node:crypto";
+import { X509Certificate, createDecipheriv, createHmac, generateKeyPairSync } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -141,6 +142,21 @@ for (const line of lines) {
   } else if (op === "aeadopen") {
     const [suite, key, nonce, aad, ct] = rest;
     out.push(`aeadopen ${hex(aeadOpen(suite, bytes(key), bytes(nonce), bytes(aad), bytes(ct)))}`);
+  } else if (op === "anon") {
+    // **Two readers, neither ours**: openssl for the self-signature, Node's X509Certificate (which is
+    // BoringSSL-free OpenSSL underneath, but a different code path from the CLI) for the serial, the subject
+    // and the digest — the digest being what a KPS client pins, so it is the number that has to agree.
+    const der = bytes(rest[0]);
+    const f = certFacts(der);
+    let serial = "", subject = "-", digest = "", ca = 0;
+    try {
+      const x = new X509Certificate(der);
+      serial = x.serialNumber.toLowerCase();
+      subject = x.subject;
+      digest = x.fingerprint256.replaceAll(":", "").toLowerCase();
+      ca = x.ca ? 1 : 0;
+    } catch { /* left empty: the wac side reports what is missing */ }
+    out.push(`anon ${f.ok} ${serial} ${hex(new TextEncoder().encode(subject))} ${digest} ${ca}`);
   } else if (op === "cert") {
     const f = certFacts(bytes(rest[0]));
     const text = (v) => hex(new TextEncoder().encode(v));

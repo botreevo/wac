@@ -1,34 +1,22 @@
 // The retransmission timers, on a clock made of numbers.
 //
-// Both `Association.due` and `Peer.due` take the time as an argument, because wac has no ambient
-// capabilities and nothing in this package reads a clock. The usual reading of that is a constraint;
-// here it is the reason this file exists at all — **a timer tested against a real clock is a slow
-// test and a flaky one**, and every case below runs in microseconds because the clock is `1`, `2`,
-// `1000`.
+// The association and `Peer` both take the time as an argument, because wac has no ambient capabilities and
+// nothing in this package reads a clock. The usual reading of that is a constraint; here it is the reason this
+// file exists at all — **a timer tested against a real clock is a slow test and a flaky one**, and every case
+// below runs in microseconds because the clock is `1`, `2`, `1000`.
 //
-// The tests in `dtlsserver_test.wac` and `browser.test.ts` prove that a *lost* thing is recovered, by
-// throwing it away and watching a real peer receive the retransmission. What they cannot show is
-// *when*: they rely on the peer's own timer firing. This shows the rule.
-//
-// Host-side until 2026-08-17, `issues/system/0161`. Both probes are imported rather than bound.
+// The tests in `dtlsserver_test.wac`, `channels_test.wac` and `browser.test.ts` prove that a *lost* thing is
+// recovered, by throwing it away and watching a real peer receive the retransmission. What they cannot show is
+// *when*: that the timer waits, that it backs off, that an acknowledgement stops it, and how the congestion window
+// responds. That is this file.
 
 import { T } from "../../../wactest/src/assert.wac";
-import { Association } from "../../src/sctp.wac";
+import { Association, MAX_PACKET } from "../../src/association.wac";
 import { Peer } from "../../src/peer.wac";
-import { newAssociation, associationReceive, associationSend, associationDue, associationInFlight,
-         associationAccept, associationCumulative, associationRto, associationSmoothed,
-         associationSendLarge, associationFlush, associationWindow, associationThreshold,
-         associationAvailable, associationWaiting, initPacket, sackPacket, firstChunkValue,
-         tsnOf } from "./sctp_probe.wac";
+import { answering, sackPacket, dataTsns } from "./sctp_probe.wac";
 import { newPeer, peerDue, peerFlightSize } from "./peer_probe.wac";
 
 static i32 OUR_TAG = 0x77777777;
-
-u8[] cookie() {
-  u8[] out = u8[].filled(8, 0);
-  for (i32 i = 0; i < 8; i++) { out[i] = i as@ u8; }
-  return out;
-}
 
 u8[] filled(i32 n, i32 v) {
   u8[] out = u8[].filled(n, 0);
@@ -36,104 +24,65 @@ u8[] filled(i32 n, i32 v) {
   return out;
 }
 
-/** An association with a peer that has introduced itself, so it has a tag to answer under. */
-Association associated() {
-  Association a = newAssociation(OUR_TAG, 1, 65536);
-  associationReceive(a, initPacket(0x1234, 65536, 16, 16, 1), cookie(), 0);
-  return a;
-}
+/** An association a peer has completed the handshake with, so it has a tag to answer under. */
+Association associated() { return answering(OUR_TAG, 1, 1); }
 
-i32 tsnSent(u8[] packet) { return tsnOf(firstChunkValue(packet)); }
+/** How many DATA chunks the association sends when its timers are asked about `now`. */
+i32 resentAt(Association a, i64 now) {
+  a.tick(now);
+  return dataTsns(a.take()).len();
+}
 
 export string test_a_chunk_is_not_due_before_its_timer_and_is_due_after() {
   T t = T.create();
   Association a = associated();
-  associationSend(a, 0, 51, "one".toBytes(), 1000);
-  t.eqI32(associationInFlight(a), 1, "one chunk in flight");
-
-  t.eqI32(associationDue(a, 1000, 500).len(), 0, "not at the moment it was sent");
-  t.eqI32(associationDue(a, 1499, 500).len(), 0, "nor a millisecond before the timeout");
-  t.eqI32(associationDue(a, 1500, 500).len(), 1, "and due exactly at it");
+  a.send(0, 51, "one".toBytes(), false, -1, 1000 as i64);
+  t.eqI32(dataTsns(a.take()).len(), 1, "one chunk sent");
+  t.eqI32(resentAt(a, 1000 as i64), 0, "not at the moment it was sent");
+  t.eqI32(resentAt(a, 1999 as i64), 0, "nor a millisecond before the timeout — a second, with nothing measured");
+  t.eqI32(resentAt(a, 2000 as i64), 1, "and due exactly at it");
   return t.report();
 }
 
 export string test_and_the_timeout_doubles_per_attempt() {
   T t = T.create();
   Association a = associated();
-  associationSend(a, 0, 51, "one".toBytes(), 0);
-
-  // First attempt: 500ms.
-  t.eqI32(associationDue(a, 499, 500).len(), 0, "not before 500");
-  t.eqI32(associationDue(a, 500, 500).len(), 1, "resent at 500");
-  // Second: 1000ms from the resend, not another 500.
-  t.eqI32(associationDue(a, 999, 500).len(), 0,
-          "a fixed interval would have resent here — and a path that has lost one packet is more " +
-          "likely to lose the next, so retrying at the same rate adds to the congestion that " +
-          "caused it");
-  t.eqI32(associationDue(a, 1500, 500).len(), 1, "resent at +1000");
-  // Third: 2000ms.
-  t.eqI32(associationDue(a, 3000, 500).len(), 0, "not yet at +1500");
-  t.eqI32(associationDue(a, 3500, 500).len(), 1, "resent at +2000");
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.take();
+  t.eqI32(resentAt(a, 999 as i64), 0, "not before a second");
+  t.eqI32(resentAt(a, 1000 as i64), 1, "resent at one second");
+  t.eqI32(resentAt(a, 2999 as i64), 0,
+          "a fixed interval would have resent here — and a path that has lost one packet is more likely to lose the " +
+          "next, so retrying at the same rate adds to the congestion that caused it");
+  t.eqI32(resentAt(a, 3000 as i64), 1, "resent two seconds after the last");
+  t.eqI32(resentAt(a, 6999 as i64), 0, "not yet at +4000 less one");
+  t.eqI32(resentAt(a, 7000 as i64), 1, "resent four seconds after that");
   return t.report();
 }
 
 export string test_an_acknowledged_chunk_stops_being_due_at_all() {
   T t = T.create();
   Association a = associated();
-  i32 tsn = tsnSent(associationSend(a, 0, 51, "one".toBytes(), 0));
-
-  // The peer acknowledges it, which is the only thing that takes it out of flight.
-  associationReceive(a, sackPacket(OUR_TAG, tsn, 65536), cookie(), 0);
-  t.eqI32(associationInFlight(a), 0, "nothing left in flight");
-  t.eqI32(associationDue(a, 100000, 500).len(), 0,
-          "and nothing becomes due however long is waited — a timer that fired for acknowledged " +
-          "data would resend it forever");
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  i32 tsn = dataTsns(a.take())[0];
+  a.receive(sackPacket(OUR_TAG, tsn, 65536), 0 as i64);
+  t.eqI32(a.outstanding(), 0, "nothing left in flight");
+  t.eqI32(resentAt(a, 100000 as i64), 0,
+          "and nothing becomes due however long is waited — a timer that fired for acknowledged data would resend it " +
+          "for ever");
   return t.report();
 }
 
 export string test_a_cumulative_acknowledgement_covers_everything_below_it() {
   T t = T.create();
   Association a = associated();
-  associationSend(a, 0, 51, "one".toBytes(), 0);
-  associationSend(a, 0, 51, "two".toBytes(), 0);
-  u8[] third = associationSend(a, 0, 51, "three".toBytes(), 0);
-  t.eqI32(associationInFlight(a), 3, "three in flight");
-
-  associationReceive(a, sackPacket(OUR_TAG, tsnSent(third), 65536), cookie(), 0);
-  t.eqI32(associationInFlight(a), 0,
-          "one SACK for the last TSN clears all three, because cumulative means everything up to it");
-  return t.report();
-}
-
-export string test_the_cumulative_point_only_advances_in_order() {
-  // The bug this pins: taking the *highest* TSN seen rather than the highest *in order* tells the
-  // peer that a chunk we never received has been delivered. It then never resends it, and the
-  // message it belonged to is never completed — intermittently, since it needs a reorder to show.
-  T t = T.create();
-  Association a = associated();
-  // **The numbers here start at 1 because `associated()`'s INIT says the peer starts at 1**, and
-  // since 2026-08-24 the association believes it — see
-  // `sctp_test.wac`'s `test_the_peers_declared_first_tsn_is_believed_over_the_first_to_arrive`.
-  //
-  // This used to open at TSN 5 over a comment saying *the first chunk is taken wherever it is*.
-  // That was a true description of the code and the code was wrong: adopting whatever arrives first
-  // as the cumulative point is a claim that everything below it arrived, which is the same lie this
-  // test was written to catch, one chunk earlier. So the sequence is renumbered rather than the
-  // assertion relaxed — what is pinned below is unchanged, and the setup is now consistent with what
-  // the peer announced.
-  t.isTrue(associationAccept(a, 1), "the chunk the peer said it would start at is the next one");
-  t.eqI32(associationCumulative(a), 1, "at one");
-  t.isTrue(associationAccept(a, 2), "the successor advances it");
-  t.isFalse(associationAccept(a, 4), "a gap does not");
-  t.eqI32(associationCumulative(a), 2, "so the peer is told 2 and resends 3");
-  // But 4 is remembered rather than thrown away, and the SACK says so as a gap block, so the peer
-  // resends 3 alone. Closing the hole then moves the point over both at once.
-  t.isTrue(associationAccept(a, 3), "3 arrives");
-  t.eqI32(associationCumulative(a), 4, "3 arrived and 4 was already here");
-  t.isFalse(associationAccept(a, 4), "4 again is a duplicate now, not the next one");
-  // And a chunk below the declared start is a duplicate too, which is the arm the renumbering
-  // exposes: before the seeding there was no point below which anything could be.
-  t.isFalse(associationAccept(a, 0), "a TSN below what the peer said it would start at was accepted");
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.send(0, 51, "two".toBytes(), false, -1, 0 as i64);
+  a.send(0, 51, "three".toBytes(), false, -1, 0 as i64);
+  i32[] tsns = dataTsns(a.take());
+  t.eqI32(tsns.len(), 3, "three in flight");
+  a.receive(sackPacket(OUR_TAG, tsns[2], 65536), 0 as i64);
+  t.eqI32(a.outstanding(), 0, "one SACK for the last TSN clears all three, because cumulative means everything up to it");
   return t.report();
 }
 
@@ -150,94 +99,64 @@ export string test_a_dtls_flight_is_due_on_the_same_rule() {
 }
 
 export string test_the_timeout_is_measured_rather_than_assumed() {
-  // RFC 6298's estimator, which SCTP and TCP share. Before anything is measured the answer is a
-  // second — long enough not to flood a path nothing is known about, which is what every
-  // implementation starts at.
+  // RFC 6298's estimator, which SCTP and TCP share. Before anything is measured the answer is a second.
   T t = T.create();
   Association a = associated();
-  t.eqI64(associationSmoothed(a), -1, "nothing measured yet");
-  t.eqI64(associationRto(a), 1000, "so a second");
+  t.eqI64(a.srtt, -1 as i64, "nothing measured yet");
+  t.eqI64(a.rto(), 1000 as i64, "so a second");
 
-  // One round trip of 200: the first sample seeds the average rather than being folded into zero,
-  // which would make the first timeout far too short.
-  i32 t1 = tsnSent(associationSend(a, 0, 51, "one".toBytes(), 0));
-  associationReceive(a, sackPacket(OUR_TAG, t1, 65536), cookie(), 200);
-  t.eqI64(associationSmoothed(a), 200, "seeded by the first sample");
-  // srtt 200, rttvar 100 → 200 + 400 = 600, below the floor.
-  t.eqI64(associationRto(a), 1000,
-          "and still a second, because RFC 4960 floors it there — a timeout under a second retries " +
-          "faster than many real paths answer");
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.receive(sackPacket(OUR_TAG, dataTsns(a.take())[0], 65536), 200 as i64);
+  t.eqI64(a.srtt, 200 as i64, "seeded by the first sample rather than folded into zero");
+  t.eqI64(a.rto(), 1000 as i64,
+          "and still a second, because RFC 4960 floors it there — srtt 200 + 4 × rttvar 100 is 600");
 
-  // A slower trip moves the average by an eighth and the variation by a quarter.
-  i32 t2 = tsnSent(associationSend(a, 0, 51, "two".toBytes(), 1000));
-  associationReceive(a, sackPacket(OUR_TAG, t2, 65536), cookie(), 2000);
-  t.eqI64(associationSmoothed(a), 300,
-          "200 + (1000 - 200)/8 = 300: one sample moves the average an eighth of the way, so a " +
-          "single slow answer does not stretch the timeout to match it");
+  a.send(0, 51, "two".toBytes(), false, -1, 1000 as i64);
+  a.receive(sackPacket(OUR_TAG, dataTsns(a.take())[0], 65536), 2000 as i64);
+  t.eqI64(a.srtt, 300 as i64, "200 + (1000 - 200)/8 = 300: one slow answer moves the average an eighth of the way");
 
-  // **And a chunk that was retransmitted contributes nothing.** Its acknowledgement could be
-  // answering either transmission, so a sample taken from it measures a trip that never happened.
-  i64 before = associationSmoothed(a);
-  i32 t3 = tsnSent(associationSend(a, 0, 51, "three".toBytes(), 3000));
-  t.eqI32(associationDue(a, 9000, 1000).len(), 1, "its timer expires and it is resent");
-  associationReceive(a, sackPacket(OUR_TAG, t3, 65536), cookie(), 9100);
-  t.eqI64(associationSmoothed(a), before,
-          "the average did not move: Karn's rule, and the reason `flightTries` is kept rather than " +
-          "just a timestamp — the count is what makes a sample trustworthy");
+  // **A chunk that was retransmitted contributes nothing** (Karn): its acknowledgement could answer either copy.
+  i64 before = a.srtt;
+  a.send(0, 51, "three".toBytes(), false, -1, 3000 as i64);
+  i32 t3 = dataTsns(a.take())[0];
+  t.eqI32(resentAt(a, 9000 as i64), 1, "its timer expires and it is resent");
+  a.receive(sackPacket(OUR_TAG, t3, 65536), 9100 as i64);
+  t.eqI64(a.srtt, before, "the average did not move");
   return t.report();
 }
 
 export string test_the_congestion_window_paces_a_large_message() {
   T t = T.create();
   Association a = associated();
-  // RFC 4960's initial window is 4,380 bytes — a few packets rather than one, so a short exchange
-  // does not spend a round trip per chunk.
-  t.eqI32(associationWindow(a), 4380, "the initial window");
-
-  u8[][] sent = associationSendLarge(a, 0, 51, filled(20000, 65), 1100, 0);
-  t.isTrue(sent.len() < 5,
-           "\{sent.len() as i64} chunks went out at once; 4,380 bytes of window holds " +
-           "about three");
-  t.isTrue(associationWaiting(a) > 10,
-           "and the rest is queued — built and numbered, waiting for the path to allow it");
-  // Not zero: there is room left, just less than the next chunk needs. A window is a byte count and
-  // a chunk is indivisible, so "full" means "the next one does not fit" rather than "nothing left".
-  t.isTrue(associationAvailable(a) < 1100,
-           "\{associationAvailable(a) as i64} bytes remain, which is less than one more " +
-           "chunk");
-
-  // **An acknowledgement opens it.** In slow start the window grows by the bytes acknowledged,
-  // capped at one MTU each, so it roughly doubles per round trip.
-  i32 before = associationWindow(a);
-  associationReceive(a, sackPacket(OUR_TAG, tsnSent(sent[0]), 65536), cookie(), 100);
-  t.isTrue(associationWindow(a) > before,
-           "the window grew on an acknowledgement, so something can be sent again");
-
-  // And the queue drains as it opens.
-  t.isTrue(associationFlush(a, 100).len() > 0, "more chunks are released once there is room");
+  t.eqI32(a.cwnd, 4380, "RFC 4960's initial window: a few packets rather than one");
+  a.send(0, 51, filled(20000, 65), false, -1, 0 as i64);
+  i32[] first = dataTsns(a.take());
+  t.isTrue(first.len() <= 4, "\{first.len()} chunks went out at once; 4,380 bytes of window holds about four");
+  t.isTrue(a.queued.len() > 10, "and the rest is queued — built and numbered, waiting for the path to allow it");
+  i32 before = a.cwnd;
+  a.receive(sackPacket(OUR_TAG, first[0], 65536), 100 as i64);
+  t.isTrue(a.cwnd > before, "an acknowledgement grows the window");
+  t.isTrue(dataTsns(a.take()).len() > 0, "and more chunks are released once there is room");
   return t.report();
 }
 
 export string test_and_a_timeout_closes_it_hard() {
   T t = T.create();
   Association a = associated();
-  associationSendLarge(a, 0, 51, filled(20000, 65), 1100, 0);
-
-  // Grow it first, so the collapse is visible.
-  for (i32 i = 0; i < 6; i++) {
-    associationReceive(a, sackPacket(OUR_TAG, i + 1, 65536), cookie(), 10);
-    associationFlush(a, 10);
+  a.send(0, 51, filled(20000, 65), false, -1, 0 as i64);
+  for (i32 i = 0; i < 3; i++) {
+    i32[] sent = dataTsns(a.take());
+    if (sent.len() == 0) { break; }
+    a.receive(sackPacket(OUR_TAG, sent[sent.len() - 1], 65536), 10 as i64);
   }
-  i32 grown = associationWindow(a);
-  t.isTrue(grown > 4380, "the window grew to \{grown as i64}");
-
-  // Now let a timer expire.
-  t.isTrue(associationDue(a, 100000, 1000).len() > 0, "something was resent");
-  t.eqI32(associationWindow(a), 1200,
-          "the window drops to one MTU — a timeout is the strongest evidence a path has that it is " +
-          "overloaded, unlike a gap, which says the path is delivering and dropped one");
-  t.isTrue(associationThreshold(a) >= 4 * 1200,
-           "and the threshold halves rather than collapsing, so the recovery is slow-start then " +
-           "linear");
+  a.take();
+  i32 grown = a.cwnd;
+  t.isTrue(grown > 4380, "the window grew to \{grown}");
+  t.isTrue(a.outstanding() > 0, "with some of the message still unacknowledged");
+  t.isTrue(resentAt(a, 100000 as i64) > 0, "something was resent when the timer ran out");
+  t.eqI32(a.cwnd, MAX_PACKET,
+          "the window drops to one packet — a timeout is the strongest evidence a path has that it is overloaded, " +
+          "unlike a gap, which says the path is delivering and dropped one");
+  t.isTrue(a.ssthresh >= 4 * MAX_PACKET, "and the threshold halves rather than collapsing");
   return t.report();
 }

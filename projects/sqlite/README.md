@@ -94,8 +94,10 @@ So:
   Batch writes into a transaction where it matters.
 - **One writer.** SQLite's locks are not taken. Readers, the real SQLite included, are safe — they see
   the old file or the new one.
-- **A database with a `-wal` or hot `-journal` beside it is refused**: those hold changes the main file
-  does not. Checkpoint with SQLite first (`PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE`).
+- **WAL mode is kept, and a `-wal` beside the file is read**: its committed transactions are laid over
+  the file on opening, and checkpointed into it (then the log and `-shm` removed) before the first
+  write. That assumes no other connection is using the database meanwhile. A hot `-journal` (a crashed
+  rollback-mode writer's) is refused: open the database with SQLite once to recover it.
 - Memory is the whole database, decoded.
 
 ## Not yet

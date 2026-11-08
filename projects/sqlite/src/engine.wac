@@ -26,6 +26,7 @@ enum Undo {
           Map<string, Trigger> triggers),
   UAddColumn(Table t, Column[] cols, string sql),
   UUserVersion(i64 v),
+  UWal(bool was),
 }
 
 export struct Connection {
@@ -46,18 +47,22 @@ export struct Connection {
   bool foreignKeys;          // PRAGMA foreign_keys
   Vec<Savepoint> savepoints;
   Vec<Pending> deferred;     // foreign keys to check at COMMIT
+  // Whether the database lives only in memory, as SQLite's ":memory:" does, rather than in a file
+  // whose image someone stores: its journal mode is always "memory".
+  bool inMemory;
 
-  Connection over(Database db) {
+  Connection over(Database db, bool inMemory) {
     return Connection(db, false, Vec.create(), false, false, false, false, 0, 0, 0,
                       FnEnv { nowMillis: 0, changes: 0, totalChanges: 0, lastInsertRowid: 0, randomBytes: u8[].filled(64, 7), randomAt: 0 }, Map.create(hashString, stringEq),
-                      false, Vec.create(), Vec.create());
+                      false, Vec.create(), Vec.create(), inMemory);
   }
 
-  Connection memory() { return Connection.over(Database.empty()); }
+  Connection memory() { return Connection.over(Database.empty(), true); }
 
+  // A database for a file: from its image, or new and empty when there are no bytes yet.
   Result<Connection, SqlError> openImage(u8[] bytes) {
-    if (bytes.len() == 0) { return Result.Ok(Connection.memory()); }
-    return Result.Ok(Connection.over(try openBytes(bytes)));
+    if (bytes.len() == 0) { return Result.Ok(Connection.over(Database.empty(), false)); }
+    return Result.Ok(Connection.over(try openBytes(bytes), false));
   }
 
   // The time `CURRENT_TIMESTAMP` and friends answer, and fresh bytes for random(): the engine has no
@@ -277,6 +282,7 @@ void undoAll(Database db, Vec<Undo> undo) {
         t.sql = sql;
       }
       UUserVersion(v): { db.userVersion = v; }
+      UWal(was): { db.wal = was; }
     }
   }
   undo.clear();
@@ -1626,7 +1632,26 @@ struct Statement {
       }
       return Result.Ok(noRows());
     }
-    if (name == "journal_mode") { return Result.Ok(one("journal_mode", Value.Text("delete"))); }
+    if (name == "journal_mode" && this.conn.inMemory) { return Result.Ok(one("journal_mode", Value.Text("memory"))); }
+    if (name == "journal_mode") {
+      // WAL is the one mode the file records; the rollback-journal modes are all the same here, since
+      // no journal is written (each commit replaces the file whole).
+      if (value is not null) {
+        string want = lower(textOf(try this.constant(value!)));
+        bool wal = want == "wal";
+        if (wal || want == "delete" || want == "truncate" || want == "persist") {
+          if (wal != d.wal) {
+            if (this.conn.inTx) {
+              return Result.Err(err("cannot change \{wal ? "into" : "out of"} wal mode from within a transaction"));
+            }
+            this.undo.push(Undo.UWal(d.wal));
+            d.wal = wal;
+          }
+          if (!wal) { return Result.Ok(one("journal_mode", Value.Text(want))); }
+        }
+      }
+      return Result.Ok(one("journal_mode", Value.Text(d.wal ? "wal" : "delete")));
+    }
     if (name == "integrity_check" || name == "quick_check") { return Result.Ok(one(name, Value.Text("ok"))); }
     if (name == "foreign_keys") {
       if (value is null) { return Result.Ok(one("foreign_keys", Value.Int(this.conn.foreignKeys ? 1 : 0))); }

@@ -7,7 +7,8 @@ import sqlite3, sys
 
 def dump(path):
     con = sqlite3.connect(path)
-    out = []
+    out = [("journal_mode", con.execute("PRAGMA journal_mode").fetchone()[0]),
+           ("auto_vacuum", con.execute("PRAGMA auto_vacuum").fetchone()[0])]
     for (name, kind, sql) in con.execute("SELECT name, type, sql FROM sqlite_schema ORDER BY rowid"):
         out.append((kind, name, sql))
         if kind == "table":

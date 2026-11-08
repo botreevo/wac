@@ -7,40 +7,55 @@
 //
 // One writer at a time. SQLite's locks are not taken, so another program writing the same file at the
 // same time would lose one side's changes; readers (the real SQLite included) are safe.
+//
+// A database in WAL mode may have a log beside it holding committed transactions the file does not yet
+// have. Opening reads them over the file. Before the first write, the file is brought up to date with
+// exactly those pages (a checkpoint) and only then is the log removed, so a crash at any point leaves
+// either the log over the old file or a file that already holds what the log would add: replaying it
+// again changes nothing. That needs no other connection to be using the database meanwhile.
 
 import { Result, flatten } from "core";
 import { Files, NotFound } from "std";
 import { SqlError } from "./error.wac";
 import { Value } from "./value.wac";
 import { Connection } from "./engine.wac";
+import { applyWal } from "./wal.wac";
 import { Rows } from "./plan.wac";
 
 export struct SqliteFile {
   Files fs;
   string path;
   Connection conn;
+  u8[]? checkpoint;   // the file as the log leaves it, to be written before anything else
 
   // Opens a database file, or starts an empty one that is created at the first commit.
   Result<SqliteFile, SqlError> open(Files fs, string path) {
-    // A database with a write-ahead log or a hot journal beside it holds changes the file itself does
-    // not; checkpoint it with SQLite first (`PRAGMA wal_checkpoint(TRUNCATE)`, `journal_mode=DELETE`).
-    for (string side in ["-wal", "-journal"]) {
-      match (flatten(fs.stat(path + side).wait())) {
-        Ok(st): {
-          if (st.exists && st.size > 0) {
-            return Result.Err(SqlError.unsupported("\{path}\{side} exists: checkpoint the database with SQLite first"));
-          }
+    // A hot journal holds what a crashed writer had half done, to be undone; that is SQLite's to do.
+    match (flatten(fs.stat(path + "-journal").wait())) {
+      Ok(st): {
+        if (st.exists && st.size > 0) {
+          return Result.Err(SqlError.unsupported("\{path}-journal exists: open the database with SQLite first to recover it"));
         }
-        Err(e): {}
       }
+      Err(e): {}
     }
+    u8[] bytes = u8[]();
+    bool found = true;
     match (flatten(fs.readFile(path).wait())) {
-      Ok(bytes): { return Result.Ok(SqliteFile(fs, path, try Connection.openImage(bytes))); }
+      Ok(b): { bytes = b; }
       Err(e): {
-        if (e is NotFound) { return Result.Ok(SqliteFile(fs, path, Connection.memory())); }
-        return Result.Err(SqlError("io", "cannot read \{path}"));
+        if (!(e is NotFound)) { return Result.Err(SqlError("io", "cannot read \{path}")); }
+        found = false;
       }
     }
+    u8[]? merged = null;
+    match (flatten(fs.readFile(path + "-wal").wait())) {
+      Ok(wal): { merged = applyWal(bytes, wal); }
+      Err(e): {}
+    }
+    if (merged is not null) { return Result.Ok(SqliteFile(fs, path, try Connection.openImage(merged!), merged)); }
+    if (!found) { return Result.Ok(SqliteFile(fs, path, try Connection.openImage(u8[]()), null)); }
+    return Result.Ok(SqliteFile(fs, path, try Connection.openImage(bytes), null));
   }
 
   // Runs one statement, and writes the file if it committed a change.
@@ -59,8 +74,23 @@ export struct SqliteFile {
 
   Result<void, SqlError> saveIfChanged(this) {
     if (!this.conn.dirty || this.conn.inTx) { return Result.Ok(); }
+    if (this.checkpoint is not null) {
+      try this.replace(this.checkpoint!);
+      for (string side in ["-wal", "-shm"]) {
+        match (flatten(this.fs.remove(this.path + side, false).wait())) {
+          Ok: {}
+          Err(e): {}
+        }
+      }
+      this.checkpoint = null;
+    }
+    return this.replace(this.conn.image());
+  }
+
+  // The file's contents replaced whole, through a temporary file renamed over it.
+  Result<void, SqlError> replace(this, u8[] image) {
     string tmp = this.path + "-wac-tmp";
-    match (flatten(this.fs.writeFile(tmp, this.conn.image()).wait())) {
+    match (flatten(this.fs.writeFile(tmp, image).wait())) {
       Ok: {}
       Err(e): { return Result.Err(SqlError("io", "cannot write \{tmp}")); }
     }

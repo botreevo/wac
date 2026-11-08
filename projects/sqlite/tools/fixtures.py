@@ -73,9 +73,49 @@ def without_rowid(con):
     con.execute("ALTER TABLE names ADD COLUMN extra DEFAULT 'd'")
     con.execute("INSERT INTO names VALUES ('zz', -1, 'x')")
 
+def make_wal(path):
+    """A database in WAL mode whose log holds what the file does not: transactions after a checkpoint
+    that restarted the log (so stale frames with the old salts follow the new ones), then frames of a
+    transaction that never committed. The dump is what SQLite itself reads from a copy of the pair."""
+    import shutil
+    for side in ("", "-wal", "-shm"):
+        if os.path.exists(path + side): os.remove(path + side)
+    con = sqlite3.connect(path, isolation_level=None)
+    con.execute("PRAGMA page_size = 1024")
+    con.execute("PRAGMA journal_mode = WAL")
+    con.execute("PRAGMA wal_autocheckpoint = 0")
+    con.execute("PRAGMA cache_size = 5")
+    con.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, s TEXT)")
+    con.execute("CREATE INDEX w_s ON w (s)")
+    for i in range(300): con.execute("INSERT INTO w (s) VALUES (?)", ("before checkpoint %d " % i + "x" * (i % 40),))
+    con.execute("PRAGMA wal_checkpoint(RESTART)")
+    # The log starts over: these overwrite its first frames and leave older ones, with old salts, after.
+    con.execute("INSERT INTO w (s) VALUES ('after restart')")
+    con.execute("UPDATE w SET s = upper(s) WHERE id % 50 = 0")
+    con.execute("CREATE TABLE later (x)")
+    con.execute("INSERT INTO later VALUES (1), (2)")
+    # A transaction too big for the cache spills frames to the log, none of them a commit.
+    con.execute("BEGIN")
+    for i in range(400): con.execute("INSERT INTO w (s) VALUES (?)", ("uncommitted %d " % i + "y" * 50,))
+    shutil.copy(path + "-wal", path + "-wal.keep")
+    shutil.copy(path, path + ".keep")
+    con.execute("ROLLBACK")
+    con.close()   # checkpoints and removes the log, so the copies made mid-transaction stand in
+    os.replace(path + ".keep", path)
+    os.replace(path + "-wal.keep", path + "-wal")
+    if os.path.exists(path + "-shm"): os.remove(path + "-shm")
+    # SQLite's own reading of the pair, from a copy, since reading checkpoints it.
+    shutil.copy(path, "/tmp/wal-oracle.db"); shutil.copy(path + "-wal", "/tmp/wal-oracle.db-wal")
+    dump("/tmp/wal-oracle.db")
+    shutil.copy("/tmp/wal-oracle.txt", path[:-3] + ".txt")
+    for side in ("", "-wal", "-shm"):
+        if os.path.exists("/tmp/wal-oracle.db" + side): os.remove("/tmp/wal-oracle.db" + side)
+    os.remove("/tmp/wal-oracle.txt")
+
 os.makedirs("test/data", exist_ok=True)
 make("test/data/small.db", 4096, small)
 make("test/data/big.db", 1024, big)
 make("test/data/big4k.db", 4096, big)
 # Not vacuumed, which would rewrite the short records.
 make("test/data/without_rowid.db", 1024, without_rowid, vacuum=False)
+make_wal("test/data/wal.db")

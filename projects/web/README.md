@@ -69,6 +69,8 @@ key, or, where there is none (an iPhone's browser), the window — and `fullscre
 | `await sleep(ms)`, `await nextFrame()`, `await painted()` | time: answering `now()` when they settle |
 | `await nextFile()` | the next file the user picks with an `<input type="file">` or drops on the page — one per file for a folder, picked with `webkitdirectory` or dropped, named by its path inside it |
 | `download(name, bytes)` | offer bytes to the user as a file |
+| `visible()`, `onVisible(f)` | whether the reader can see the page — false with its tab in the background, the screen off or the page being left — and each change of it: where a clock stops and what is unsaved is saved |
+| `zoneAt(ms)` | how many minutes the reader's local time is ahead of UTC at a moment, milliseconds since the epoch — what saying which day it is where they are takes, which the clock alone cannot |
 | `location()`, `onLocation(f)`, `go(where, push)` | where the reader is — the address's `#` part — each change of it, and a new place: added to the browser's history, so Back returns from it, or in place of this one |
 | `sound(samples, rate)` → `Sound`; `.play(volume)`, `.loop(volume)`, `.playAt(volume, loop, at, offset)` → `Voice`; `.stop()`, `.fade(volume, ms)` | sound the program made — samples from -1 to 1, one channel — sent once and played as often as it likes, now or at a moment by `now()`'s clock — voices started for one moment start together, to the sample — and faded smoothly; heard once the person has clicked or pressed a key on the page |
 | `sys` | what the build granted — see below |
@@ -94,6 +96,11 @@ while (true) {
   if (key.settled()) { handle(key.value()); key = screen.next(); }
 }
 ```
+
+**SVG is drawn with quoted tags** — `<"svg" width="120" height="60"><"line" x1="10%" … /></"svg">` — and the
+document makes an `svg` and everything inside one in SVG's namespace, where it draws. Attribute names are held to
+`[a-z][a-z0-9-]*` there as everywhere, so a drawing is laid out in percentages of its box rather than with a
+`viewBox`.
 
 **Everything is text.** A string reaches the page as a text node, and `htmlOf`, which writes a tree out
 as HTML, escapes every one — there is no call that hands the browser a string as markup. A `<style>`'s

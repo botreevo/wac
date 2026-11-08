@@ -243,8 +243,10 @@ export string programSide() {
   return """
       const wacPageServer = (next, answer, post, where, site) => {
         // **Where `wac.page`'s numbers start here** — above every request std numbers, below the 2^20 a parent
-        // numbers the capabilities it provides from.
-        const BASE = 4096, COUNT = 23;
+        // numbers the capabilities it provides from — and how many there are: `src/line.wac`'s `PAGE_COUNT`, which
+        // a request asked directly rather than sent in a batch is routed by. It stayed at 23 while the changes after
+        // that were added, which nobody saw because each of them travels in a batch; `PAGE_ZONE` is asked.
+        const BASE = 4096, COUNT = 32;
         const NONE = new Uint8Array(0), dec = new TextDecoder(), enc = new TextEncoder();
         const lo = (v) => Number(BigInt.asIntN(32, v)), hi = (v) => Number(v >> 32n);
         const pair = (high, low) => (BigInt(high) << 32n) | BigInt(low >>> 0);
@@ -266,6 +268,13 @@ export string programSide() {
         // program on in a turn of its own, and renders before the next.
         const events = [], eventAsks = [], files = [], fileAsks = [], frames = new Map(), values = new Map();
         let at = where, locationAsks = [], lastFrame = 0, lastValue = 0;
+        // Whether the page is seen, as the document last said — `""` until it has — and who waits to hear it change.
+        let seen = "", seenAsks = [];
+        const seenNow = () => {
+          const waiting = seenAsks;
+          seenAsks = [];
+          for (const w of waiting) { if (seen !== "" && seen !== w.known) answer(w.id, 0, seen, NONE, 0n, 0n, 0); else seenAsks.push(w); }
+        };
         const strip = (h) => h.startsWith("#") ? h.slice(1) : h;
         const giveEvent = (id, [seq, kind, target, listener, value, x, y, mods, selStart, selEnd, at, pointer]) => {
           const k = enc.encode(kind), b = new Uint8Array(24 + k.length), v = new DataView(b.buffer);
@@ -310,6 +319,10 @@ export string programSide() {
             case 19: fileAsks.push(id); return queueMicrotask(flush);
             case 20: { const f = ++lastFrame; frames.set(f, id); return send(["frame", f]); }
             case 21: locationAsks.push({ id, known: text }); return located();
+            // The reader's zone is this thread's as much as the document's — a worker's `Date` knows it — so it is
+            // answered here, at once. Minutes ahead of UTC, which is `getTimezoneOffset` the other way round.
+            case 30: return answer(id, 0, "", NONE, BigInt(-new Date(Number(a)).getTimezoneOffset()), 0n, 0);
+            case 31: seenAsks.push({ id, known: text }); return seenNow();
             case 23: return send(["sound", lo(a), Number(b), bytes], wacOwn(bytes));
             case 24: {
               // When, by the page's clock, and how far in: two little-endian f64s, when the program gave them.
@@ -396,6 +409,7 @@ export string programSide() {
             case "el": events.push(m.slice(1)); return flush();
             case "file": files.push(m.slice(1)); return flush();
             case "where": at = m[1]; return located();
+            case "seen": seen = m[1]; return seenNow();
             case "value": { const id = values.get(m[1]); values.delete(m[1]); if (id !== undefined) answer(id, 0, m[2], NONE, 0n, 0n, 0); return; }
             case "timer": { const id = frames.get(m[1]); frames.delete(m[1]); if (id !== undefined) answer(id, 0, "", NONE, 0n, 0n, 0); return; }
           }
@@ -1192,6 +1206,7 @@ export string documentSide() {
         // What an element filling the window, where there is no full screen, is styled with: above everything, edge to edge.
         const WAC_FILL = [["position", "fixed"], ["inset", "0"], ["z-index", "2147483647"], ["width", "auto"],
                           ["height", "auto"], ["margin", "0"], ["max-width", "none"], ["max-height", "none"]];
+        const WAC_SVG = "http://www.w3.org/2000/svg";
         const ops = {
           make: (id, parent, tag, before) => {
             // `#shadow` is the parent's shadow root, opened — a page of its own inside it (`Element.shadow`).
@@ -1205,7 +1220,11 @@ export string documentSide() {
               nodes.set(id, sr); handleOf.set(sr, id);
               return;
             }
-            const el = document.createElement(tag);
+            // **SVG is a namespace, not a tag**: an `svg` element, and everything made inside one, is made in it, or
+            // the browser makes an unknown HTML element that draws nothing. The program names tags the same way either way.
+            const above = nodes.get(parent);
+            const svg = tag === "svg" || (above && above.namespaceURI === WAC_SVG && above.localName !== "foreignObject");
+            const el = svg ? document.createElementNS(WAC_SVG, tag) : document.createElement(tag);
             nodes.set(id, el); handleOf.set(el, id); place(parent, el, before);
           },
           makeText: (id, parent, text, before) => {
@@ -1496,6 +1515,15 @@ export string documentSide() {
         root.addEventListener("change", changed);
         // A link to `#/somewhere`, and the browser's back and forward, move the location; the program follows.
         addEventListener("hashchange", () => emit(["where", location.hash]));
+        // **Whether the page is seen**: said once now and at each change. `pagehide` as well as `visibilitychange`,
+        // because a page being left is not always hidden first, and what it has not saved by then is lost.
+        // The first after this returns: whoever made this document starts the program only then, and a message before
+        // the program exists would be taken for the one that starts it.
+        const seeing = (on) => emit(["seen", on ? "1" : "0"]);
+        queueMicrotask(() => seeing(document.visibilityState !== "hidden"));
+        document.addEventListener("visibilitychange", () => seeing(document.visibilityState !== "hidden"));
+        addEventListener("pagehide", () => seeing(false));
+        addEventListener("pageshow", () => seeing(document.visibilityState !== "hidden"));
         // Without preventing dragover a dropped file replaces the page.
         document.addEventListener("dragover", (ev) => ev.preventDefault());
         document.addEventListener("drop", (ev) => { ev.preventDefault(); dropped(ev.dataTransfer); });

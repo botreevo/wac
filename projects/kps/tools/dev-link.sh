@@ -1,7 +1,8 @@
 #!/bin/sh
-# Point the locked wac commit at a local checkout, so edits there are seen here without a commit.
+# Point the locked wac commit — and, given a second checkout, wac-web's — at local checkouts, so edits there are seen
+# here without a commit.
 #
-#     sh tools/dev-link.sh ~/src/wac
+#     sh tools/dev-link.sh ~/src/wac [~/src/wac-web]
 #
 # wac's package cache is one plain checkout per locked commit (`$WAC_HOME/cache/git/<escaped url>/<commit>`).
 # During development the transport work lands in wac's own packages, so this makes that cache entry a symlink
@@ -17,3 +18,12 @@ mkdir -p "$dir"
 rm -rf "$dir/$commit"
 ln -s "$clone" "$dir/$commit"
 echo "dev-link: wac $commit -> $clone"
+if [ -n "${2:-}" ]; then
+  web=$(cd "$2" && pwd)
+  wcommit=$(tr '\n' ' ' < "$root/wac.lock" | sed -n 's/.*"web" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
+  wdir="${WAC_HOME:-$HOME/.wac}/cache/git/https%3A%2F%2Fgithub.com%2Fvoltrevo%2Fwac-web.git"
+  mkdir -p "$wdir"
+  rm -rf "$wdir/$wcommit"
+  ln -s "$web" "$wdir/$wcommit"
+  echo "dev-link: wac-web $wcommit -> $web"
+fi

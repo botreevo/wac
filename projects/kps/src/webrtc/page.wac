@@ -1,0 +1,154 @@
+// Dialling a KPS listener from a browser tab — the WebRTC client of SPEC §5.2, as a wac page runs it.
+//
+// **The browser does the transport; wac does KPS.** ICE, DTLS and SCTP are the browser's own RTCPeerConnection,
+// reached through `web`'s `wac.webrtc` capability (a page built with `--grant webrtc`). The stream framing, HELLO,
+// flow control and everything else above the channels are this repository's engine (`conn.wac`), the same one the
+// listener runs over wac's own WebRTC stack — so a page and the listener it dials agree because they are one
+// implementation of the mapping, judged against the reference clients and servers rather than against each other.
+//
+// The dial is the reference client's: two negotiated channels made before the offer (which forces the SCTP m-line),
+// a real offer with its ICE credentials rewritten to a random ufrag and the password both ends derive from the
+// certhash, and the listener's answer synthesised from the address. The browser checks the listener's DTLS
+// certificate against the fingerprint in that answer — the certhash — so a listener holding another key fails the
+// handshake and the dial with it.
+
+import { Map, Result, Ticket, hashI32, i32Eq } from "core";
+import { Sys } from "std";
+import { Rtc, PeerConnection, RtcEvent } from "web";
+import { Address, parseAddress, decodeCerthash } from "../address.wac";
+import { Code, Reason } from "../errors.wac";
+import { Connection, Endpoint } from "../api.wac";
+import { Channel, Driver, WebrtcConn, WebrtcStream, CONTROL_LABEL, DATAGRAM_LABEL } from "./conn.wac";
+import { Limits } from "./flow.wac";
+import { icePassword, ufragFrom } from "./ice.wac";
+import { rewriteOfferUfrag, synthesizeAnswer } from "./sdp.wac";
+
+/** One dial's state: the peer connection, which channel is which, and each channel's queue as last reported. */
+struct PageLink {
+  PeerConnection pc;
+  i32 control;
+  i32 datagram;
+  WebrtcConn? conn;
+  Map<i32, WebrtcStream> streams;
+  Map<i32, bool> opened;
+  Map<i32, i64> buffered;
+  bool down;
+}
+
+/**
+ * Dial `address` from this page. `Ok` once the HELLOs have crossed; `Err` if the address is not one, the page cannot
+ * make a peer connection, the browser's ICE or DTLS fails (a wrong certhash fails here), or `timeoutMs` passes.
+ */
+export async Result<Connection, Reason> dialFromPage(Sys sys, Rtc rtc, string address, Limits limits, i64 timeoutMs) {
+  Address? a = parseAddress(address).ok();
+  if (a is null) { return Result.Err(Reason.saying(Code.InternalError, "not a KPS address: \{address}")); }
+  u8[]? digest = decodeCerthash(a!.certhash);
+  if (digest is null) { return Result.Err(Reason.saying(Code.InternalError, "not a sha-256 certhash: \{a!.certhash}")); }
+  PeerConnection pc = await rtc.peer("{}");
+  i32 control = await pc.channel(CONTROL_LABEL, "{\"negotiated\":true,\"id\":0}");
+  i32 datagram = await pc.channel(DATAGRAM_LABEL, "{\"negotiated\":true,\"id\":1,\"ordered\":false,\"maxRetransmits\":0}");
+  string offer = "";
+  match (await pc.offer()) {
+    Ok(sdp): { offer = sdp; }
+    Err(why): { pc.close(); return Result.Err(Reason.saying(Code.NetworkError, "no offer: \{why}")); }
+  }
+  u8[] r = (await sys.random().bytes(8)).ok() ?? u8[].filled(8, 7);
+  string ufrag = ufragFrom(r);
+  string pwd = icePassword(digest!, ufrag);
+  if ((await pc.setLocal("offer", rewriteOfferUfrag(offer, ufrag, pwd))).isErr() ||
+      (await pc.setRemote("answer", synthesizeAnswer(a!, digest!, ufrag, pwd))).isErr()) {
+    pc.close();
+    return Result.Err(Reason.saying(Code.NetworkError, "the browser refused the descriptions"));
+  }
+  i64 now = (await sys.clock().nowMillis()).ok() ?? 0 as i64;
+  PageLink link = PageLink(pc, control, datagram, null, Map<i32, WebrtcStream>.create(hashI32, i32Eq),
+                           Map<i32, bool>.create(hashI32, i32Eq), Map<i32, i64>.create(hashI32, i32Eq), false);
+  Driver d = Driver(channelOf(link, control), channelOf(link, datagram), (WebrtcStream s) => openFor(link, s),
+                    () => { link.down = true; link.pc.close(); }, Endpoint(a!.ip, a!.port));
+  WebrtcConn conn = WebrtcConn.make(d, limits, now);
+  conn.helloDeadline = now + timeoutMs;
+  link.conn = conn;
+  pump(link);
+  clock(sys, link);
+  Result<bool, Reason> up = await conn.established();
+  if (up.isErr()) { return Result.Err(up.err()!); }
+  return Result.Ok(conn);
+}
+
+/** The engine's view of channel `dc`. */
+Channel channelOf(PageLink link, i32 dc) {
+  return Channel(() => !link.down && link.opened.getOr(dc, false),
+                 (u8[] m) => {
+                   link.buffered.set(dc, link.buffered.getOr(dc, 0 as i64) + (m.len() as i64));
+                   link.pc.send(dc, m);
+                 },
+                 () => link.buffered.getOr(dc, 0 as i64),
+                 () => { link.pc.closeChannel(dc); });
+}
+
+/** A stream the engine opens: a channel the browser makes, given to the engine once the page has its number. */
+async Channel? openFor(PageLink link, WebrtcStream s) {
+  i32 dc = await link.pc.channel("kps", "{}");
+  link.streams.set(dc, s);
+  return channelOf(link, dc);
+}
+
+/** The connection's events, in order, as calls on the engine. */
+async void pump(PageLink link) {
+  WebrtcConn conn = link.conn!;
+  while (conn.ended is null) {
+    RtcEvent e = await link.pc.next();
+    match (e) {
+      Open(dc): {
+        link.opened.set(dc, true);
+        if (dc == link.control) { conn.controlOpened(); }
+        else {
+          WebrtcStream? s = link.streams.get(dc);
+          if (s is not null) { s!.opened(); }
+        }
+      }
+      Message(dc, data): {
+        if (dc == link.control) { conn.controlMessage(data); }
+        else if (dc == link.datagram) { conn.datagram(data); }
+        else {
+          WebrtcStream? s = link.streams.get(dc);
+          if (s is not null) { s!.message(data); }
+        }
+      }
+      Close(dc): {
+        link.opened.set(dc, false);
+        if (dc == link.control) { conn.reservedLost("control"); }
+        else if (dc == link.datagram) { conn.reservedLost("datagram"); }
+        else {
+          WebrtcStream? s = link.streams.get(dc);
+          link.streams.remove(dc);
+          if (s is not null) { s!.channelGone(); }
+        }
+      }
+      Error(dc, why): { }
+      Channel(dc, label): {
+        WebrtcStream? s = conn.incomingChannel(channelOf(link, dc));
+        if (s is not null) { link.streams.set(dc, s!); }
+      }
+      State(state): {
+        if (state == "failed" || state == "unsupported") { conn.transportFailed("the peer connection \{state}"); }
+        else if (state == "closed") { conn.transportClosed(); }
+      }
+      Low(dc, buffered): {
+        link.buffered.set(dc, buffered);
+        WebrtcStream? s = link.streams.get(dc);
+        if (s is not null) { s!.drained(); }
+      }
+    }
+  }
+}
+
+/** The HELLO deadline, kept: a tick every quarter second until the connection is up or over. */
+async void clock(Sys sys, PageLink link) {
+  WebrtcConn conn = link.conn!;
+  while (conn.state == 0 && conn.ended is null) {
+    await sys.clock().sleepMillis(250);
+    i64 now = (await sys.clock().nowMillis()).ok() ?? 0 as i64;
+    conn.tick(now);
+  }
+}

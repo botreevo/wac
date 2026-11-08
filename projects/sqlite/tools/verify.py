@@ -11,7 +11,11 @@ def dump(path):
     for (name, kind, sql) in con.execute("SELECT name, type, sql FROM sqlite_schema ORDER BY rowid"):
         out.append((kind, name, sql))
         if kind == "table":
-            out.extend(con.execute(f'SELECT rowid, * FROM "{name}" ORDER BY rowid').fetchall())
+            try:
+                out.extend(con.execute(f'SELECT rowid, * FROM "{name}" ORDER BY rowid').fetchall())
+            except sqlite3.OperationalError:
+                # A WITHOUT ROWID table: its rows in its key's order, which a plain scan gives.
+                out.extend(con.execute(f'SELECT * FROM "{name}"').fetchall())
         elif kind == "index":
             # Every index lookup path, forced through the index.
             out.append(con.execute(f'SELECT count(*) FROM "{con.execute("SELECT tbl_name FROM sqlite_schema WHERE name = ?", (name,)).fetchone()[0]}" INDEXED BY "{name}"').fetchone() if not name.startswith("sqlite_autoindex") else ("auto",))

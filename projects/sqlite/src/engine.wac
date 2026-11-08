@@ -10,7 +10,7 @@ import { parseOne, Parsed, isBlank } from "./parser.wac";
 import { Table, Row, Index, Entry, Column, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_INTEGER } from "./schema.wac";
 import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
-import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable } from "./query.wac";
+import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable, ROWID_INTERNAL } from "./query.wac";
 import { applyAffinity, isNull, textOf } from "./ops.wac";
 import { FnEnv } from "./functions.wac";
 import { lower } from "./lexer.wac";
@@ -890,7 +890,7 @@ struct Statement {
         target[i] = t.colIndex(names[i]);
         if (target[i] < 0) {
           string n = lower(names[i]);
-          if (t.rowidAlias < 0 && (n == "rowid" || n == "oid" || n == "_rowid_")) { target[i] = -1; continue; }
+          if (t.rowidAlias < 0 && !t.withoutRowid && (n == "rowid" || n == "oid" || n == "_rowid_")) { target[i] = -1; continue; }
           return Result.Err(err("table \{t.name} has no column named \{names[i]}"));
         }
       }
@@ -976,8 +976,10 @@ struct Statement {
       try this.fire(t.name, t, "AFTER", "INSERT", null, r, null);
       this.bumpSequence(t, rowid);
       this.count++;
-      this.conn.lastInsertRowid = rowid;
-      this.conn.env.lastInsertRowid = rowid;
+      if (!t.withoutRowid) {
+        this.conn.lastInsertRowid = rowid;
+        this.conn.env.lastInsertRowid = rowid;
+      }
       if (ret is not null) { out.push(try this.evalReturning(ret!, r)); }
     }
     if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
@@ -989,7 +991,7 @@ struct Statement {
   Result<Row?, SqlError> upsertUpdate(this, Table t, Row existing, Row proposed, Upsert u) {
     // `excluded` is a scope outside the table's, so a bare name means the table's column and only
     // `excluded.x` reaches the proposed row, as in SQLite.
-    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[]());
+    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "");
     Scope outer = Scope([BoundSource("excluded", ex, JOIN_FIRST, null, false, string[]())], null, null, false);
     Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[]())], outer, null, false);
     Ctx c = Ctx([existing as Row?], Ctx([proposed as Row?], null, null, null, null), null, null, null);
@@ -1014,7 +1016,7 @@ struct Statement {
       i32 col = t.colIndex(a.cols[0]);
       if (col < 0) {
         string nm = lower(a.cols[0]);
-        if (t.rowidAlias >= 0 || (nm != "rowid" && nm != "oid" && nm != "_rowid_")) {
+        if (t.rowidAlias >= 0 || t.withoutRowid || (nm != "rowid" && nm != "oid" && nm != "_rowid_")) {
           return Result.Err(err("no such column: \{a.cols[0]}"));
         }
       }
@@ -1095,7 +1097,7 @@ struct Statement {
 
   // The rows a WHERE picks, by rowid, found with the same planner a SELECT uses.
   Result<Row[], SqlError> matching(this, Table t, Expr? where) {
-    Select s = Select { cols: [ResultCol(Expr.Col(null, "rowid"), null, null, "rowid")],
+    Select s = Select { cols: [ResultCol(Expr.Col(null, ROWID_INTERNAL), null, null, "rowid")],
                         from: [Source { table: t.name, join: JOIN_FIRST }], where: where };
     SelectPlan p = try planSelect(s, null, this.x);
     Vec<Value[]> ids = try runPlan(p, topCtx(this.x), this.x);
@@ -1256,7 +1258,7 @@ struct Statement {
     if (t.autoincrement && d.table("sqlite_sequence") is null) {
       Table seq = Table("sqlite_sequence", "CREATE TABLE sqlite_sequence(name,seq)",
                         [Column("name", "", 0, false, null, 0, null, false, ""), Column("seq", "", 0, false, null, 0, null, false, "")], -1, false, Vec.create(), false,
-                        Expr[](), ForeignKey[](), i32[]());
+                        Expr[](), ForeignKey[](), i32[](), false, "");
       d.tables.set("sqlite_sequence", seq);
       d.order.push(SchemaEntry("table", "sqlite_sequence", "sqlite_sequence"));
     }

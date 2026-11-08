@@ -140,7 +140,8 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
     }
     cols.push(col);
   }
-  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create(), c.strict, Expr[](), ForeignKey[](), i32[]());
+  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create(), c.strict, Expr[](), ForeignKey[](), i32[](), false, "");
+  t.withoutRowid = c.withoutRowid;
   i32 pkCount = 0;
   for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].primaryKey) { pkCount++; } }
   for (i32 i = 0; i < c.constraints.len(); i++) {
@@ -151,7 +152,16 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
   for (i32 i = 0; i < c.cols.len(); i++) {
     const ColumnDef d = c.cols[i];
     if (d.primaryKey) {
-      if (isIntegerType(d.typeName) && !d.pkDesc) {
+      if (c.withoutRowid && d.autoincrement) {
+        return Result.Err(SqlError.schema("AUTOINCREMENT not allowed on WITHOUT ROWID tables"));
+      }
+      if (c.withoutRowid) {
+        n++;
+        Index pk = autoIndex(t, n, [i]);
+        pk.desc[0] = d.pkDesc;
+        t.pkIndex = pk.name;
+        autos.push(pk);
+      } else if (isIntegerType(d.typeName) && !d.pkDesc) {
         t.rowidAlias = i;
         t.autoincrement = d.autoincrement;
       } else {
@@ -169,16 +179,35 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
     // Only keys make indexes; CHECK and FOREIGN KEY constraints are handled below.
     if (c.constraints[i].kind != "UNIQUE" && c.constraints[i].kind.indexOf("PRIMARY KEY") != 0) { continue; }
     const string[] names = c.constraints[i].cols;
-    i32[] pos = i32[].filled(names.len(), 0);
+    // A column named twice counts once.
+    Vec<i32> posV;
+    Vec<bool> descV;
     for (i32 k = 0; k < names.len(); k++) {
-      pos[k] = t.colIndex(names[k]);
-      if (pos[k] < 0) { return Result.Err(SqlError.schema("no such column: \{names[k]}")); }
+      i32 at = t.colIndex(names[k]);
+      if (at < 0) { return Result.Err(SqlError.schema("no such column: \{names[k]}")); }
+      bool seen = false;
+      for (i32 m = 0; m < posV.len(); m++) { if (posV.get(m) == at) { seen = true; } }
+      if (seen) { continue; }
+      posV.push(at);
+      descV.push(k < c.constraints[i].desc.len() && c.constraints[i].desc[k]);
     }
+    i32[] pos = posV.toArray();
     bool pk = c.constraints[i].kind.indexOf("PRIMARY KEY") == 0;
     for (i32 k = 0; pk && k < pos.len(); k++) {
       if (t.cols[pos[k]].gen is not null) {
         return Result.Err(SqlError.schema("generated columns cannot be part of the PRIMARY KEY"));
       }
+    }
+    if (pk && c.withoutRowid) {
+      if (c.constraints[i].kind == "PRIMARY KEY AUTOINCREMENT") {
+        return Result.Err(SqlError.schema("AUTOINCREMENT not allowed on WITHOUT ROWID tables"));
+      }
+      n++;
+      Index ix = autoIndex(t, n, pos);
+      ix.desc = descV.toArray();
+      t.pkIndex = ix.name;
+      autos.push(ix);
+      continue;
     }
     if (pk && pos.len() == 1 && isIntegerType(t.cols[pos[0]].typeName)) {
       t.rowidAlias = pos[0];
@@ -211,6 +240,12 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
   }
   t.checks = checks.toArray();
   t.fks = fks.toArray();
+  if (c.withoutRowid) {
+    if (t.pkIndex == "") { return Result.Err(SqlError.schema("PRIMARY KEY missing on table \{c.name}")); }
+    // Its key is the index's columns, a column named twice counted once, and none of them may be NULL.
+    for (i32 i = 0; i < autos.len(); i++) { if (autos.get(i).name == t.pkIndex) { t.pk = autos.get(i).cols; } }
+    for (i32 col in t.pk) { t.cols[col].notNull = true; }
+  }
   // A primary key's column is NOT NULL in effect only for the rowid alias; elsewhere SQLite allows
   // NULL there, for compatibility, and so does this.
   return Result.Ok(t);
@@ -285,15 +320,19 @@ export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
 // is shorter, and its missing values are the column's default.
 Row rowFrom(Table t, i64 rowid, Value[] stored0) {
   Value[] stored = stored0;
-  if (t.hasVirtual()) {
-    // A VIRTUAL generated column is not in the record: spread the record over the other columns, and
-    // leave the virtual ones to be computed.
+  if (t.hasVirtual() || t.withoutRowid) {
+    // The record is not the columns in order: a VIRTUAL generated column is not in it, and a WITHOUT
+    // ROWID table's key comes first. Put each value in its column; a column the record is too short
+    // for (added by ALTER TABLE since) takes its default, and a virtual one is computed later.
+    i32[] order = t.recordOrder();
     Value[] spread = Value[].filled(t.cols.len(), Value.Null);
-    i32 k = 0;
-    for (i32 i = 0; i < t.cols.len(); i++) {
-      if (t.cols[i].gen is not null && !t.cols[i].stored) { continue; }
-      if (k < stored0.len()) { spread[i] = stored0[k]; }
-      k++;
+    for (i32 k = 0; k < order.len(); k++) {
+      i32 col = order[k];
+      if (k < stored0.len()) { spread[col] = stored0[k]; }
+      else if (t.cols[col].dflt is not null) {
+        Value? v = constValue(t.cols[col].dflt!);
+        if (v is not null) { spread[col] = v!; }
+      }
     }
     stored = spread;
   }
@@ -340,7 +379,9 @@ export void rebuildIndex(Index ix, Table t) {
 // entries cannot simply be taken: a count that disagrees with the table, or a REAL column, whose
 // integral values the file may hold as integers.
 Index? indexFromFile(Index ix, Table t, Image img, i64 root) {
-  if (ix.special()) { return null; }
+  // A WITHOUT ROWID table's index ends with its key rather than a rowid: rebuild it with the rowids
+  // held here.
+  if (ix.special() || t.withoutRowid) { return null; }
   for (i32 c in ix.cols) { if (t.cols[c].affinity == AFF_REAL) { return null; } }
   match (readIndex(img, root)) {
     Ok(raw): {
@@ -418,6 +459,18 @@ export Result<Database, SqlError> openBytes(u8[] data) {
         Table t = try tableFrom(c, autos);
         i64 root = 0;
         match (v[3]) { Int(r): { root = r; } default: {} }
+        if (t.withoutRowid) {
+          // Its records, in key order, become rows numbered in that order.
+          Vec<u8[]> recs = try readIndex(img, root);
+          for (i32 k = 0; k < recs.len(); k++) {
+            Row r = rowFrom(t, (k + 1) as i64, try decode(recs.get(k)));
+            r.rec = recs.get(k);
+            if (t.hasVirtual()) { try fillGenerated(t, r, db); }
+            t.rows.push(r);
+          }
+          db.tables.set(lower(t.name), t);
+          continue;
+        }
         Vec<RawRow> raw = try readTable(img, root);
         for (i32 k = 0; k < raw.len(); k++) {
           Row r = rowFrom(t, raw.get(k).rowid, try decode(raw.get(k).payload));
@@ -466,11 +519,22 @@ export Result<Database, SqlError> openBytes(u8[] data) {
       return Result.Err(SqlError.unsupported("schema entries of type \{kind}"));
     }
     db.order.push(SchemaEntry(kind, name, tbl ?? name));
+    // A WITHOUT ROWID table's key index is the table itself in the file, with no entry of its own; it
+    // is listed here, after its table, as the engine lists it on CREATE TABLE.
+    if (kind == "table") {
+      Table t = db.table(name)!;
+      if (t.withoutRowid) {
+        db.order.push(SchemaEntry("index", t.pkIndex, t.name));
+        rebuildIndex(db.index(t.pkIndex)!, t);
+      }
+    }
   }
   // An automatic index the schema does not list would be a table this did not understand.
   for (i32 i = 0; i < autos.len(); i++) {
     bool listed = false;
     for (i32 k = 0; k < db.order.len(); k++) { if (db.order.get(k).name == autos.get(i).name) { listed = true; } }
+    Table owner = db.table(autos.get(i).table)!;
+    if (owner.withoutRowid && owner.pkIndex == autos.get(i).name) { listed = true; }
     if (!listed) { return Result.Err(SqlError.corrupt("\{autos.get(i).name} is missing from the schema")); }
   }
   for (i32 i = 0; i < schema.len(); i++) {
@@ -494,19 +558,66 @@ export u8[] rowRecord(Table t, Row r) {
 }
 
 u8[] encodeRow(Table t, Row r) {
-  if (t.hasVirtual()) {
-    Vec<Value> v;
-    for (i32 i = 0; i < r.vals.len(); i++) {
-      if (t.cols[i].gen is not null && !t.cols[i].stored) { continue; }
-      v.push(i == t.rowidAlias ? Value.Null : r.vals[i]);
-    }
-    return encodeRecord(v.toArray());
+  if (t.hasVirtual() || t.withoutRowid) {
+    i32[] order = t.recordOrder();
+    Value[] v = Value[].filled(order.len(), Value.Null);
+    for (i32 k = 0; k < order.len(); k++) { v[k] = order[k] == t.rowidAlias ? Value.Null : r.vals[order[k]]; }
+    return encodeRecord(v);
   }
   if (t.rowidAlias < 0) { return encodeRecord(r.vals); }
   Value[] v = Value[].filled(r.vals.len(), Value.Null);
   v.copyFrom(r.vals, 0, 0, r.vals.len());
   v[t.rowidAlias] = Value.Null;
   return encodeRecord(v);
+}
+
+// Whether a schema entry is a WITHOUT ROWID table's key index, which the file holds as the table itself
+// and does not list.
+export bool isKeyIndex(Database db, const SchemaEntry e) {
+  if (e.kind != "index") { return false; }
+  Table? t = db.table(e.table);
+  return t is not null && t!.withoutRowid && lower(t!.pkIndex) == lower(e.name);
+}
+
+// The records of an index on a WITHOUT ROWID table, as the file holds them: each entry's values, then
+// the table's key columns the index does not already hold (in the key's collations and directions) in
+// place of the rowid, and sorted that way.
+u8[][] keyedRecords(Index ix, Table t, Index pk) {
+  Vec<i32> extra;
+  Vec<bool> extraDesc;
+  for (i32 j = 0; j < pk.cols.len(); j++) {
+    bool held = false;
+    if (ix.keyFn is null) { for (i32 d in ix.cols) { if (d == pk.cols[j]) { held = true; } } }
+    if (!held) { extra.push(pk.cols[j]); extraDesc.push(pk.desc[j]); }
+  }
+  i32 n = ix.cols.len();
+  bool[] desc = bool[].filled(n + extra.len(), false);
+  i32[] colls = i32[].filled(n + extra.len(), 0);
+  desc.copyFrom(ix.desc, 0, 0, n);
+  colls.copyFrom(ix.colls, 0, 0, n);
+  for (i32 k = 0; k < extra.len(); k++) {
+    colls[n + k] = t.cols[extra.get(k)].coll;
+    desc[n + k] = extraDesc.get(k);
+  }
+  Index order = Index(ix.name, ix.table, null, ix.cols, desc, colls, false, null, null, Chunked<Entry>.create());
+  Entry[] es = Entry[].filled(ix.entries.len(), Entry(Value[](), null));
+  for (i32 i = 0; i < es.len(); i++) {
+    Value[] key = ix.entries.get(i).key;
+    Value[] fk = Value[].filled(n + extra.len(), Value.Null);
+    fk.copyFrom(key, 0, 0, n);
+    match (key[n]) {
+      Int(id): {
+        Row r = t.get(id)!;
+        for (i32 k = 0; k < extra.len(); k++) { fk[n + k] = r.vals[extra.get(k)]; }
+      }
+      default: {}
+    }
+    es[i] = Entry(fk, null);
+  }
+  sortEntries(order, es);
+  u8[][] out = u8[][].defaulted(es.len());
+  for (i32 i = 0; i < es.len(); i++) { out[i] = encodeRecord(es[i].key); }
+  return out;
 }
 
 // The whole database as a file image. `changeCounter` and the schema cookie are the caller's to
@@ -518,13 +629,25 @@ export u8[] toBytes(Database db) {
   i64[] roots = i64[].filled(db.order.len(), 0);
   for (i32 i = 0; i < db.order.len(); i++) {
     string k = db.order.get(i).kind;
-    if (k == "table" || k == "index") { roots[i] = ps.reserve(); }
+    if ((k == "table" || k == "index") && !isKeyIndex(db, db.order.get(i))) { roots[i] = ps.reserve(); }
   }
   Vec<i64> schemaIds;
   Vec<u8[]> schemaRecs;
   for (i32 i = 0; i < db.order.len(); i++) {
     SchemaEntry e = db.order.get(i);
-    if (e.kind == "table") {
+    if (isKeyIndex(db, e)) { continue; }
+    if (e.kind == "table" && db.table(e.name)!.withoutRowid) {
+      Table t = db.table(e.name)!;
+      Index pk = db.index(t.pkIndex)!;
+      u8[][] recs = u8[][].defaulted(pk.entries.len());
+      for (i32 k = 0; k < recs.len(); k++) {
+        Value[] key = pk.entries.get(k).key;
+        match (key[key.len() - 1]) { Int(id): { recs[k] = rowRecord(t, t.get(id)!); } default: {} }
+      }
+      buildIndex(ps, roots[i], recs);
+      schemaRecs.push(encodeRecord([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
+                                    Value.Int(roots[i]), Value.Text(t.sql)]));
+    } else if (e.kind == "table") {
       Table t = db.table(e.name)!;
       i64[] ids = i64[].filled(t.rows.len(), 0);
       u8[][] recs = u8[][].defaulted(t.rows.len());
@@ -545,11 +668,16 @@ export u8[] toBytes(Database db) {
                                     Value.Int(0), Value.Text(v.sql)]));
     } else {
       Index ix = db.index(e.name)!;
+      Table owner = db.table(ix.table)!;
       u8[][] recs = u8[][].defaulted(ix.entries.len());
-      for (i32 k = 0; k < recs.len(); k++) {
-        Entry en = ix.entries.get(k);
-        if (en.rec is null) { en.rec = encodeRecord(en.key); }
-        recs[k] = en.rec!;
+      if (owner.withoutRowid) {
+        recs = keyedRecords(ix, owner, db.index(owner.pkIndex)!);
+      } else {
+        for (i32 k = 0; k < recs.len(); k++) {
+          Entry en = ix.entries.get(k);
+          if (en.rec is null) { en.rec = encodeRecord(en.key); }
+          recs[k] = en.rec!;
+        }
       }
       buildIndex(ps, roots[i], recs);
       Value sql = ix.sql is null ? Value.Null : Value.Text(ix.sql!);

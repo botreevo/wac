@@ -94,9 +94,10 @@ export struct Parser {
   string sql;
   i32 maxParam;
   Map<string, i32> named;
+  bool[] lastDesc;   // the directions nameList last read, which only a PRIMARY KEY keeps
 
   Parser over(Token[] toks, string sql) {
-    return Parser(toks, 0, sql, 0, Map.create(hashString, stringEq));
+    return Parser(toks, 0, sql, 0, Map.create(hashString, stringEq), bool[]());
   }
 
   Token peek(this) { return this.toks[this.pos]; }
@@ -179,15 +180,19 @@ export struct Parser {
   Result<string[], SqlError> nameList(this) {
     try this.expectOp("(");
     Vec<string> out;
+    Vec<bool> desc;
     while (true) {
       out.push(try this.name());
       // An indexed column in a constraint may carry a collation and an order, which a uniqueness
       // constraint does not need to remember.
       if (this.eatKw("COLLATE")) { try this.name(); }
-      if (!this.eatKw("ASC")) { this.eatKw("DESC"); }
+      bool d = false;
+      if (!this.eatKw("ASC")) { d = this.eatKw("DESC"); }
+      desc.push(d);
       if (!this.eatOp(",")) { break; }
     }
     try this.expectOp(")");
+    this.lastDesc = desc.toArray();
     return Result.Ok(out.toArray());
   }
 
@@ -1251,22 +1256,23 @@ export struct Parser {
       if (this.eatKw("PRIMARY")) {
         try this.expectKw("KEY");
         string[] names = try this.nameList();
+        bool[] desc = this.lastDesc;
         bool auto = this.eatKw("AUTOINCREMENT");
         try this.conflictClause();
-        cons.push(TableConstraint(auto ? "PRIMARY KEY AUTOINCREMENT" : "PRIMARY KEY", names, null, null));
+        cons.push(TableConstraint(auto ? "PRIMARY KEY AUTOINCREMENT" : "PRIMARY KEY", names, null, null, desc));
       } else if (this.eatKw("UNIQUE")) {
-        cons.push(TableConstraint("UNIQUE", try this.nameList(), null, null));
+        cons.push(TableConstraint("UNIQUE", try this.nameList(), null, null, bool[]()));
         try this.conflictClause();
       } else if (this.eatKw("CHECK")) {
         try this.expectOp("(");
         Expr e = try this.expr();
         try this.expectOp(")");
-        cons.push(TableConstraint("CHECK", string[](), e, null));
+        cons.push(TableConstraint("CHECK", string[](), e, null, bool[]()));
       } else if (this.eatKw("FOREIGN")) {
         try this.expectKw("KEY");
         string[] fcols = try this.nameList();
         try this.expectKw("REFERENCES");
-        cons.push(TableConstraint("FOREIGN KEY", fcols, null, try this.foreignKeyRest()));
+        cons.push(TableConstraint("FOREIGN KEY", fcols, null, try this.foreignKeyRest(), bool[]()));
       } else {
         if (cons.len() > 0) { return Result.Err(this.fail("a column after a table constraint")); }
         cols.push(try this.columnDef());
@@ -1287,9 +1293,8 @@ export struct Parser {
       }
       if (!this.eatOp(",")) { break; }
     }
-    if (withoutRowid) { return Result.Err(SqlError.unsupported("WITHOUT ROWID tables")); }
     string sql = "CREATE TABLE " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
-    return Result.Ok(CreateTable(n, ine, cols.toArray(), cons.toArray(), false, sql, strict));
+    return Result.Ok(CreateTable(n, ine, cols.toArray(), cons.toArray(), withoutRowid, sql, strict));
   }
 }
 

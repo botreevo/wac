@@ -8,7 +8,7 @@ import { encodeRecord } from "./record.wac";
 import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
          JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
 import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
-import { Database } from "./database.wac";
+import { Database, isKeyIndex } from "./database.wac";
 import { Node, BoundSource, AggSpec, WinSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT,
          AGG_JSON_ARRAY, AGG_JSON_OBJECT } from "./plan.wac";
 import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
@@ -130,8 +130,10 @@ Result<Node, SqlError> bindColumn(string? table, string name, Scope s0) {
       if (table is null && isHidden(b, n)) { continue; }
       i32 c = b.table.colIndex(n);
       if (c < 0) {
-        // Not a column; the rowid's names reach the rowid when no column has taken them.
-        if (b.isSub || (n != "rowid" && n != "oid" && n != "_rowid_")) { continue; }
+        // Not a column; the rowid's names reach the rowid when no column has taken them, and a
+        // WITHOUT ROWID table has none, but for the engine's own name for it.
+        if (b.isSub) { continue; }
+        if (n != ROWID_INTERNAL && (b.table.withoutRowid || (n != "rowid" && n != "oid" && n != "_rowid_"))) { continue; }
         c = -1;
       }
       if (foundSrc >= 0) { return Result.Err(err("ambiguous column name: \{name}")); }
@@ -689,7 +691,7 @@ Table tableOfRows(string name, const string[] names, Vec<Value[]> rows) {
   for (i32 i = 0; i < names.len(); i++) { cols[i] = Column(names[i], "", AFF_BLOB, false, null, 0, null, false, ""); }
   Vec<Row> rs;
   for (i32 i = 0; i < rows.len(); i++) { rs.push(Row((i + 1) as i64, rows.get(i), null)); }
-  return Table(name, "", cols, -1, false, rs, false, Expr[](), ForeignKey[](), i32[]());
+  return Table(name, "", cols, -1, false, rs, false, Expr[](), ForeignKey[](), i32[](), false, "");
 }
 
 string defaultName(const ResultCol rc) {
@@ -779,6 +781,10 @@ Result<string[], SqlError> namesFor(string[]? cols, string[] names, string what)
   return Result.Ok(cols!);
 }
 
+// The name the engine itself reaches a row's rowid by, which SQL text cannot spell unquoted, and which
+// a WITHOUT ROWID table answers too.
+export static string ROWID_INTERNAL = " rowid";
+
 // sqlite_schema as rows: type, name, tbl_name, rootpage, sql. Root pages are the ones this library's
 // writer gives them, in schema order.
 Table schemaTable(Database db) {
@@ -786,6 +792,7 @@ Table schemaTable(Database db) {
   i64 page = 2;
   for (i32 i = 0; i < db.order.len(); i++) {
     SchemaEntry e = db.order.get(i);
+    if (isKeyIndex(db, e)) { continue; }
     Value sql = Value.Null;
     i64 root = 0;
     if (e.kind == "table") { sql = Value.Text(db.table(e.name)!.sql); root = page; page++; }
@@ -1378,6 +1385,12 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
     if (hi < lo) { hi = lo; }
     i32 dir = wantOrder ? orderFromIndex(w!, ix, eq) : 0;
     return Result.Ok(Access(ix, lo, hi, dir == 2, dir != 0, false));
+  }
+  // A WITHOUT ROWID table is read in its key's order, as the file holds it.
+  if (t.withoutRowid && !p.srcs[k].isSub) {
+    Index pk = x.db.index(t.pkIndex)!;
+    i32 d2 = wantOrder ? orderFromIndex(w!, pk, 0) : 0;
+    return Result.Ok(Access(pk, 0, pk.entries.len(), d2 == 2, d2 != 0, false));
   }
   // A range of rowids.
   i32 lo = 0;

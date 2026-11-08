@@ -38,10 +38,10 @@ data.
 
 | | |
 | --- | --- |
-| Statements | `SELECT` (joins, `LEFT JOIN`, subqueries in `FROM` and expressions, correlated or not, `GROUP BY`/`HAVING`, `DISTINCT`, `UNION [ALL]`/`INTERSECT`/`EXCEPT`, `VALUES`, `LIMIT`/`OFFSET`), `INSERT` (`OR IGNORE`/`OR REPLACE`, `ON CONFLICT … DO UPDATE`/`DO NOTHING`, `DEFAULT VALUES`, `INSERT … SELECT`), `UPDATE`, `DELETE`, `RETURNING` on all three, `CREATE TABLE`/`INDEX` (`IF NOT EXISTS`, `UNIQUE`), `DROP`, `ALTER TABLE ADD COLUMN`, `BEGIN`/`COMMIT`/`ROLLBACK` |
+| Statements | `SELECT` (inner, `LEFT`, `RIGHT`, `FULL` and `NATURAL` joins, `USING`, subqueries anywhere, correlated or not, `GROUP BY`/`HAVING`, `DISTINCT`, `UNION [ALL]`/`INTERSECT`/`EXCEPT`, `VALUES`, `LIMIT`/`OFFSET`), `WITH [RECURSIVE]`, `INSERT` (`OR IGNORE`/`OR REPLACE`/…, `ON CONFLICT … DO UPDATE`/`DO NOTHING`, `DEFAULT VALUES`, `INSERT … SELECT`), `UPDATE`, `DELETE`, `RETURNING` on all three, `CREATE TABLE`/`INDEX`/`VIEW`/`TRIGGER`, `DROP`, `ALTER TABLE` (`ADD COLUMN`, `RENAME TO`, `RENAME COLUMN`, `DROP COLUMN`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` |
 | Typing | storage classes, column affinity, comparison affinity, `CAST`, integer overflow to real, SQLite's text for reals (`%!.15g`) |
-| Constraints | `INTEGER PRIMARY KEY` as the rowid, `AUTOINCREMENT` with `sqlite_sequence`, `PRIMARY KEY`/`UNIQUE` (with their automatic indexes), `NOT NULL`, `DEFAULT` |
-| Functions | `count sum total avg min max group_concat`, `coalesce ifnull nullif iif length lower upper substr instr replace trim ltrim rtrim abs round sign hex unhex quote typeof unicode char zeroblob random randomblob changes last_insert_rowid`, `json json_extract json_set json_insert json_replace json_remove json_object json_array json_type json_valid json_array_length`, `->`, `->>`, `LIKE`/`GLOB` (with `ESCAPE`) |
+| Schema | `INTEGER PRIMARY KEY` as the rowid, `AUTOINCREMENT` with `sqlite_sequence`, `PRIMARY KEY`/`UNIQUE` (with their automatic indexes), `NOT NULL`, `DEFAULT`, `CHECK`, foreign keys (enforced under `PRAGMA foreign_keys`, with `CASCADE`/`SET NULL`/`SET DEFAULT`/`RESTRICT` and `DEFERRABLE`), `COLLATE` (`BINARY`, `NOCASE`, `RTRIM`), generated columns (`VIRTUAL` and `STORED`), `STRICT` tables, partial and expression indexes, views (and `INSTEAD OF` triggers on them), triggers (`BEFORE`/`AFTER`, `UPDATE OF`, `WHEN`, `RAISE`) |
+| Functions | aggregates (`count sum total avg min max group_concat string_agg json_group_array json_group_object`, with `DISTINCT`, `FILTER` and `ORDER BY`), window functions (`row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value` and every aggregate, over `ROWS`/`RANGE`/`GROUPS` frames with `EXCLUDE`, named windows), the core scalar functions, `printf`/`format`, the date and time functions, the math functions, the JSON functions, `->`, `->>`, `LIKE`/`GLOB` (with `ESCAPE`) |
 | Pragmas | `user_version`, `page_size`, `table_info`, and the ones an application sets and does not read back (`journal_mode`, `foreign_keys`, `busy_timeout`, …) |
 | Planning | an index (equality on leading columns, then a range) or the rowid narrows each source of a join; an index that delivers the `ORDER BY` lets a `LIMIT` stop early; a lone `min`/`max` reads one entry |
 
@@ -100,12 +100,11 @@ So:
 
 ## Not yet
 
-Foreign keys are parsed, kept in the schema and **not enforced** — SQLite's default too, but an
-application that turns them on and relies on `ON DELETE CASCADE` (autonag does) needs them. Also absent:
-views, triggers, `WITH`, window functions, `WITHOUT ROWID` tables, partial and expression indexes,
-collations other than `BINARY`, `printf`/`format`, the date and time functions (only `CURRENT_TIMESTAMP`,
-`CURRENT_DATE` and `CURRENT_TIME`, from a clock the caller sets), `ALTER TABLE RENAME`, savepoints, and
-text encodings other than UTF-8. Each is refused with an `unsupported` error rather than half done.
+`WITHOUT ROWID` tables, `json_each`/`json_tree` and other table-valued functions, virtual tables
+(FTS5, R*Tree), `ATTACH`, `VACUUM`/`ANALYZE`, constraint-level `ON CONFLICT` clauses in `CREATE TABLE`,
+and text encodings other than UTF-8. Partial and expression indexes are kept and enforced, but the
+planner does not yet read through them. Each missing feature is refused with an error rather than half
+done.
 
 ## Using it from another project
 

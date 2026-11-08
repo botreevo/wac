@@ -1,0 +1,183 @@
+// The identity of a source tree or a file: design/system/0016 H1.
+//
+//     leaf(content)  = keccak256(0x00 || content)
+//     node(entries)  = keccak256(0x01 || entry*)       entries sorted by name, bytewise
+//     entry          = u16be(len(name)) || name || kind || hash
+//     kind           = 0x00 file | 0x01 executable file | 0x02 directory
+//
+// written `kt1:<hex>` for a tree and `kb1:<hex>` for a file. Nothing here knows where the bytes came from: a
+// working tree, a commit read out of git, and a cache entry all hash through the same `Node`.
+//
+// **Refused, not hashed:** a symlink, a submodule, a name that is empty, `.`, `..`, holds `/`, or is longer
+// than a u16 can say. A tree that cannot be named is better than one named under a rule nobody chose.
+
+import { crypto.keccak256, codec.hexEncode, codec.hexDecode } from "wac";
+import { Result } from "core";
+
+export static u8 KIND_FILE = 0;
+export static u8 KIND_EXEC = 1;
+export static u8 KIND_DIR = 2;
+
+/** The hash of one file's bytes. */
+export u8[] leafHash(u8[] content) {
+  u8[] buf = u8[].filled(content.len() + 1, 0);
+  for (i32 i = 0; i < content.len(); i++) { buf[i + 1] = content[i]; }
+  return keccak256(buf);
+}
+
+/** One name in a directory: what it is and its hash. */
+export struct Entry {
+  string name;
+  u8 kind = 0;
+  u8[] hash;
+}
+
+/** Why a name cannot be in a tree, or "" when it can. */
+export string nameFault(string name) {
+  if (name.len() == 0) { return "an empty name"; }
+  if (name == "." || name == "..") { return "the name \"\{name}\""; }
+  if (name.indexOf("/") >= 0) { return "a name holding '/': \{name}"; }
+  if (name.len() > 65535) { return "a name longer than 65535 bytes"; }
+  return "";
+}
+
+/** The hash of a directory, from its entries in any order. Two entries with one name is a fault. */
+export Result<u8[], string> nodeHash(Entry[] entries) {
+  Entry[] sorted = sortByName(entries);
+  i32 size = 1;
+  for (i32 i = 0; i < sorted.len(); i++) {
+    string fault = nameFault(sorted[i].name);
+    if (fault != "") { return Result.Err(fault); }
+    if (i > 0 && sorted[i].name == sorted[i - 1].name) { return Result.Err("two entries named \{sorted[i].name}"); }
+    if (sorted[i].hash.len() != 32) { return Result.Err("a hash that is not 32 bytes, for \{sorted[i].name}"); }
+    size += 2 + sorted[i].name.len() + 1 + 32;
+  }
+  u8[] buf = u8[].filled(size, 0);
+  buf[0] = 1;
+  i32 at = 1;
+  for (i32 i = 0; i < sorted.len(); i++) {
+    u8[] name = sorted[i].name.toBytes();
+    buf[at] = (name.len() >> 8) as@ u8;
+    buf[at + 1] = name.len() as@ u8;
+    at += 2;
+    for (i32 k = 0; k < name.len(); k++) { buf[at + k] = name[k]; }
+    at += name.len();
+    buf[at] = sorted[i].kind;
+    at++;
+    for (i32 k = 0; k < 32; k++) { buf[at + k] = sorted[i].hash[k]; }
+    at += 32;
+  }
+  return Result.Ok(keccak256(buf));
+}
+
+/** Insertion sort by name, bytewise — `<` on strings compares bytes. A directory is small. */
+Entry[] sortByName(Entry[] entries) {
+  Entry[] out = Entry[].defaulted(entries.len());
+  for (i32 i = 0; i < entries.len(); i++) {
+    Entry e = entries[i];
+    i32 j = i;
+    while (j > 0 && out[j - 1].name > e.name) { out[j] = out[j - 1]; j--; }
+    out[j] = e;
+  }
+  return out;
+}
+
+/** `kt1:<hex>` */
+export string treeId(u8[] hash) { return "kt1:" + string.fromBytes(hexEncode(hash)); }
+/** `kb1:<hex>` */
+export string blobId(u8[] hash) { return "kb1:" + string.fromBytes(hexEncode(hash)); }
+
+/** The 32 bytes an id names, and whether it is a tree; null for anything that is not a `kt1:` or `kb1:` id. */
+export struct Id {
+  bool tree;
+  u8[] hash;
+}
+
+export Id? parseId(string id) {
+  if (id.len() != 68) { return null; }
+  string tag = id.slice(0, 4);
+  if (tag != "kt1:" && tag != "kb1:") { return null; }
+  u8[]? h = hexDecode(id.slice(4, 68).toBytes());
+  if (h is null || h!.len() != 32) { return null; }
+  return Id(tag == "kt1:", h!);
+}
+
+/**
+ * A tree being assembled from paths, for sources that list files rather than walk directories — a commit
+ * read out of git, which says `a/b/c.wac` and never `a/b`.
+ */
+export struct Builder {
+  Dir root;
+
+  Builder create() { return Builder(Dir { }); }
+
+  /** Add one file at a `/`-separated path. A path through a file, or a file named twice, is a fault. */
+  string add(this, string path, bool executable, u8[] content) {
+    Dir at = this.root;
+    string rest = path;
+    while (rest.indexOf("/") >= 0) {
+      string part = rest.slice(0, rest.indexOf("/"));
+      rest = rest.slice(rest.indexOf("/") + 1, rest.len());
+      string fault = nameFault(part);
+      if (fault != "") { return "\{path}: \{fault}"; }
+      if (at.hasFile(part)) { return "\{path}: \{part} is a file"; }
+      at = at.child(part);
+    }
+    string fault = nameFault(rest);
+    if (fault != "") { return "\{path}: \{fault}"; }
+    if (at.hasFile(rest) || at.childIndex(rest) >= 0) { return "\{path}: named twice"; }
+    at.files = push(at.files, Entry(rest, executable ? KIND_EXEC : KIND_FILE, leafHash(content)));
+    return "";
+  }
+
+  Result<u8[], string> hash(this) { return this.root.hash(); }
+}
+
+struct Dir {
+  Entry[] files;
+  string[] names;
+  Dir[] dirs;
+
+  bool hasFile(this, string name) {
+    for (i32 i = 0; i < this.files.len(); i++) { if (this.files[i].name == name) { return true; } }
+    return false;
+  }
+
+  i32 childIndex(this, string name) {
+    for (i32 i = 0; i < this.names.len(); i++) { if (this.names[i] == name) { return i; } }
+    return -1;
+  }
+
+  Dir child(this, string name) {
+    i32 i = this.childIndex(name);
+    if (i >= 0) { return this.dirs[i]; }
+    Dir d = Dir { };
+    string[] names = string[].defaulted(this.names.len() + 1);
+    Dir[] dirs = Dir[].defaulted(this.dirs.len() + 1);
+    for (i32 k = 0; k < this.names.len(); k++) { names[k] = this.names[k]; dirs[k] = this.dirs[k]; }
+    names[this.names.len()] = name;
+    dirs[this.dirs.len()] = d;
+    this.names = names;
+    this.dirs = dirs;
+    return d;
+  }
+
+  Result<u8[], string> hash(this) {
+    Entry[] all = Entry[].defaulted(this.files.len() + this.dirs.len());
+    for (i32 i = 0; i < this.files.len(); i++) { all[i] = this.files[i]; }
+    for (i32 i = 0; i < this.dirs.len(); i++) {
+      match (this.dirs[i].hash()) {
+        Err(e): { return Result.Err(e); }
+        Ok(h): { all[this.files.len() + i] = Entry(this.names[i], KIND_DIR, h); }
+      }
+    }
+    return nodeHash(all);
+  }
+}
+
+Entry[] push(Entry[] xs, Entry e) {
+  Entry[] out = Entry[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = e;
+  return out;
+}

@@ -1,0 +1,173 @@
+// SQL text into tokens. Keywords are not a token kind: SQLite lets most keywords be names, so the
+// parser asks whether an identifier spells a keyword, and a quoted identifier never does.
+
+import { Result, Vec, Buf } from "core";
+import { SqlError } from "./error.wac";
+
+export static i32 T_IDENT = 1;     // text is the name, unquoted
+export static i32 T_STRING = 2;    // text is the value, quotes undone
+export static i32 T_INTEGER = 3;   // text as written (decimal or 0x hex)
+export static i32 T_FLOAT = 4;
+export static i32 T_BLOB = 5;      // text is the hex digits
+export static i32 T_PARAM = 6;     // text is "?", "?3", ":name", "@name" or "$name"
+export static i32 T_OP = 7;        // text is the operator
+export static i32 T_EOF = 8;
+
+export struct Token {
+  i32 kind;
+  string text;
+  bool quoted;      // an identifier written in quotes, which is never a keyword
+  i32 start;        // byte offsets into the statement
+  i32 end;
+}
+
+bool isIdentStart(i32 c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80; }
+
+bool isIdentPart(i32 c) { return isIdentStart(c) || (c >= '0' && c <= '9') || c == '$'; }
+
+bool isDigit(i32 c) { return c >= '0' && c <= '9'; }
+
+bool isHex(i32 c) { return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+// ASCII lower case, which is all SQLite folds when it compares names and keywords.
+export string lower(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] >= 'A' && b[i] <= 'Z') { b[i] = b[i] + 32; }
+  }
+  return string.fromBytes(b);
+}
+
+export string upper(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] >= 'a' && b[i] <= 'z') { b[i] = b[i] - 32; }
+  }
+  return string.fromBytes(b);
+}
+
+// Three-character, then two-character operators are tried before single characters.
+static string[] OPS2 = ["||", "<=", ">=", "==", "!=", "<>", "<<", ">>", "->"];
+static string OPS1 = "+-*/%<>=(),.;&|~";
+
+i32 quotedEnd(u8[] b, i32 from, i32 close, Buf out) {
+  i32 i = from;
+  while (i < b.len()) {
+    i32 c = b[i] as i32;
+    if (c == close) {
+      if (i + 1 < b.len() && (b[i + 1] as i32) == close) { out.push(b[i]); i += 2; continue; }
+      return i + 1;
+    }
+    out.push(b[i]);
+    i++;
+  }
+  return -1;
+}
+
+export Result<Token[], SqlError> tokenize(string sql) {
+  u8[] b = sql.toBytes();
+  Vec<Token> out;
+  i32 i = 0;
+  while (i < b.len()) {
+    i32 c = b[i] as i32;
+    i32 start = i;
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 12) { i++; continue; }
+    if (c == '-' && i + 1 < b.len() && b[i + 1] == '-') {
+      while (i < b.len() && b[i] != '\n') { i++; }
+      continue;
+    }
+    if (c == '/' && i + 1 < b.len() && b[i + 1] == '*') {
+      i += 2;
+      while (i < b.len() && !(b[i] == '*' && i + 1 < b.len() && b[i + 1] == '/')) { i++; }
+      i = i + 2 > b.len() ? b.len() : i + 2;
+      continue;
+    }
+    if ((c == 'x' || c == 'X') && i + 1 < b.len() && b[i + 1] == '\'') {
+      Buf hex = Buf.create();
+      i32 e = quotedEnd(b, i + 2, '\'', hex);
+      if (e < 0) { return Result.Err(SqlError.syntax("unterminated blob literal")); }
+      string h = hex.toStr();
+      u8[] hb = h.toBytes();
+      bool good = hb.len() % 2 == 0;
+      for (i32 k = 0; k < hb.len(); k++) { if (!isHex(hb[k] as i32)) { good = false; } }
+      if (!good) { return Result.Err(SqlError.syntax("malformed blob literal")); }
+      out.push(Token(T_BLOB, h, false, start, e));
+      i = e;
+      continue;
+    }
+    if (isIdentStart(c)) {
+      while (i < b.len() && isIdentPart(b[i] as i32)) { i++; }
+      out.push(Token(T_IDENT, sql.slice(start, i), false, start, i));
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`' || c == '[') {
+      Buf v = Buf.create();
+      i32 e = quotedEnd(b, i + 1, c == '[' ? ']' : c, v);
+      if (e < 0) { return Result.Err(SqlError.syntax("unterminated quoted text")); }
+      out.push(Token(c == '\'' ? T_STRING : T_IDENT, v.toStr(), c != '\'', start, e));
+      i = e;
+      continue;
+    }
+    if (isDigit(c) || (c == '.' && i + 1 < b.len() && isDigit(b[i + 1] as i32))) {
+      if (c == '0' && i + 1 < b.len() && (b[i + 1] == 'x' || b[i + 1] == 'X')) {
+        i += 2;
+        while (i < b.len() && isHex(b[i] as i32)) { i++; }
+        out.push(Token(T_INTEGER, sql.slice(start, i), false, start, i));
+        continue;
+      }
+      bool real = false;
+      while (i < b.len() && isDigit(b[i] as i32)) { i++; }
+      if (i < b.len() && b[i] == '.') {
+        real = true;
+        i++;
+        while (i < b.len() && isDigit(b[i] as i32)) { i++; }
+      }
+      if (i < b.len() && (b[i] == 'e' || b[i] == 'E')) {
+        i32 j = i + 1;
+        if (j < b.len() && (b[j] == '+' || b[j] == '-')) { j++; }
+        if (j < b.len() && isDigit(b[j] as i32)) {
+          real = true;
+          i = j;
+          while (i < b.len() && isDigit(b[i] as i32)) { i++; }
+        }
+      }
+      out.push(Token(real ? T_FLOAT : T_INTEGER, sql.slice(start, i), false, start, i));
+      continue;
+    }
+    if (c == '?') {
+      i++;
+      while (i < b.len() && isDigit(b[i] as i32)) { i++; }
+      out.push(Token(T_PARAM, sql.slice(start, i), false, start, i));
+      continue;
+    }
+    if ((c == ':' || c == '@' || c == '$') && i + 1 < b.len() && isIdentPart(b[i + 1] as i32)) {
+      i++;
+      while (i < b.len() && isIdentPart(b[i] as i32)) { i++; }
+      out.push(Token(T_PARAM, sql.slice(start, i), false, start, i));
+      continue;
+    }
+    if (i + 1 < b.len()) {
+      string two = sql.slice(i, i + 2);
+      bool hit = false;
+      for (string op in OPS2) { if (op == two) { hit = true; } }
+      if (hit) {
+        if (two == "->" && i + 2 < b.len() && b[i + 2] == '>') {
+          out.push(Token(T_OP, "->>", false, start, i + 3));
+          i += 3;
+        } else {
+          out.push(Token(T_OP, two, false, start, i + 2));
+          i += 2;
+        }
+        continue;
+      }
+    }
+    if (OPS1.indexOf(sql.slice(i, i + 1)) >= 0) {
+      out.push(Token(T_OP, sql.slice(i, i + 1), false, start, i + 1));
+      i++;
+      continue;
+    }
+    return Result.Err(SqlError.syntax("unrecognized token at offset \{i}: \"\{sql.slice(i, i + 1)}\""));
+  }
+  out.push(Token(T_EOF, "", false, b.len(), b.len()));
+  return Result.Ok(out.toArray());
+}

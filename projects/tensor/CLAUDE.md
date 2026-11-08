@@ -15,8 +15,8 @@ README.md says what this is and where it stands; read it first.
 - **Every kernel has an `F16` path, and the GPU check runs every case in both types.** A new kernel reads its inputs
   through `L_<name>` and, if elementwise, is a `value(i)` that `elementwise` wraps (`src/gpu/wgsl.wac`); one that
   writes anything else writes `F32` and the backend `settle`s it. On the CPU, `made` does the rounding.
-- **The pin on wac-web is to its `gpu` branch**, which adds `wac.gpu` to the browser host. Until that commit is on
-  GitHub, `wac update` cannot fetch it: put it in the cache by hand — `git archive <commit> | tar -x -C
+- **The pin on wac-web is a master commit with `wac.gpu` in the browser host.** The pin names GitHub, as wac's do;
+  until the owner syncs that commit there, `wac update` cannot fetch it: put it in the cache by hand — `git archive <commit> | tar -x -C
   ~/.wac/cache/git/https%3A%2F%2Fgithub.com%2Fvoltrevo%2Fwac-web.git/<commit>` and `touch pack.pack` there, which is
   what wac's `tools/fill-cache.sh` does.
 - **wac is pinned by the `wac` you build**: this was written against wac `701028301`. When wac gets in the way, write it

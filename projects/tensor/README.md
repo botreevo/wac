@@ -137,8 +137,8 @@ export async i32 main(Page page) {
 }
 ```
 
-The host side is on wac-web's `gpu` branch (`tools/build.wac`, `wac.gpu` in `programSide`), and this repository's
-`wac.json5` pins that commit.
+The host side is in wac-web (`tools/build.wac`, `wac.gpu` in `programSide`), and this repository's `wac.json5` pins a
+master commit that has it.
 
 ## Checking it
 

@@ -9,7 +9,7 @@ import { Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOI
 import { Table, Row, Index, Column, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database } from "./database.wac";
 import { Node, BoundSource, AggSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT } from "./plan.wac";
-import { AFF_NONE, intPrefix, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
+import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
 import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, knownFunction, returnsJson, FnEnv, likeMatch, likeBytes, globMatch, codepoints } from "./functions.wac";
 import { lower } from "./lexer.wac";
@@ -865,6 +865,11 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
     if (wantOrder && orderFromIndex(w!, ix, eq) != 0) { score++; }
     if (score > bestScore) { best = ix; bestScore = score; }
   }
+  // A range on the rowid beats a range on an index with nothing fixed by equality: it reads the table
+  // directly, and it is what SQLite chooses.
+  bool rowidRange = false;
+  for (i32 i = 0; i < probes.len(); i++) { if (probes.get(i).col == -1 && probes.get(i).op != "=") { rowidRange = true; } }
+  if (rowidRange && bestScore < 4) { best = null; }
   if (best is not null && bestScore >= 2) {
     Index ix = best!;
     i32 eq = 0;
@@ -1068,9 +1073,16 @@ Result<bool, SqlError> step(const AggSpec a, AggState s, Ctx c, Exec x) {
   s.count++;
   string n = a.name;
   if (a.kind == AGG_SUM) {
-    // Anything but an integer makes the sum a real, text included, as SQLite does.
-    match (v) { Int: {} default: { s.anyReal = true; } }
-    Value num = toNumeric(v);
+    // Anything but an integer makes the sum a real — text included, unless it reads as an integer
+    // ('3' does, 'x' does not), which is SQLite's sqlite3_value_numeric_type.
+    Value num = v as Value;
+    match (v) {
+      // Text reads as the number it spells, keeping '2.0' a real; text that is no number stays text.
+      Text(t): { Value? w = wholeNumber(t); if (w is not null) { num = w!; } }
+      default: {}
+    }
+    match (num) { Int: {} default: { s.anyReal = true; } }
+    num = toNumeric(num);
     match (num) {
       Int(i): {
         i64 sum = s.sumI + i;
@@ -1284,6 +1296,51 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
   return Result.Ok(sink);
 }
 
+i32 compareRows(const Value[] a, const Value[] b) {
+  for (i32 i = 0; i < a.len() && i < b.len(); i++) {
+    i32 c = compareValues(a[i], b[i]);
+    if (c != 0) { return c; }
+  }
+  return 0;
+}
+
+// The distinct rows, in order, as SQLite's UNION, INTERSECT and EXCEPT produce them: through a sorted
+// temporary index, where a row equal to one already there replaces it — so the last of equal rows (3.0
+// after 3) is the one kept.
+Vec<Value[]> sortedSet(Vec<Value[]> rows) {
+  i32 n = rows.len();
+  Value[][] a = rows.toArray();
+  Value[][] tmp = Value[][].defaulted(n);
+  i32 width = 1;
+  Value[][] src = a;
+  Value[][] dst = tmp;
+  while (width < n) {
+    for (i32 lo = 0; lo < n; lo += 2 * width) {
+      i32 mid = lo + width < n ? lo + width : n;
+      i32 hi = lo + 2 * width < n ? lo + 2 * width : n;
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) {
+        if (compareRows(src[j], src[i]) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        k++;
+      }
+      while (i < mid) { dst[k] = src[i]; i++; k++; }
+      while (j < hi) { dst[k] = src[j]; j++; k++; }
+    }
+    Value[][] sw = src;
+    src = dst;
+    dst = sw;
+    width *= 2;
+  }
+  Vec<Value[]> out;
+  for (i32 i = 0; i < n; i++) {
+    if (i + 1 < n && compareRows(src[i], src[i + 1]) == 0) { continue; }
+    out.push(src[i]);
+  }
+  return out;
+}
+
 void dedupe(Vec<Value[]> rows, Vec<Value[]> keys) {
   Map<u8[], bool> seen = Map.create(hashBytes, bytesEq);
   Vec<Value[]> r2;
@@ -1318,18 +1375,22 @@ export Result<Vec<Value[]>, SqlError> runPlan(SelectPlan p, Ctx outer, Exec x) {
     SelectPlan nextPlan = part!.next! as SelectPlan;
     Sink s2 = try runCore(nextPlan, outer, x, -1);
     if (nextPlan.distinct) { dedupe(s2.rows, s2.keys); }
-    if (op == "UNION ALL" || op == "UNION") {
+    if (op == "UNION ALL") {
       for (i32 i = 0; i < s2.rows.len(); i++) { rows.push(s2.rows.get(i)); keys.push(rekey(p, s2.rows.get(i))); }
-      if (op == "UNION") { dedupe(rows, keys); }
+    } else if (op == "UNION") {
+      for (i32 i = 0; i < s2.rows.len(); i++) { rows.push(s2.rows.get(i)); }
+      rows = sortedSet(rows);
+      keys = Vec.create();
+      for (i32 i = 0; i < rows.len(); i++) { keys.push(rekey(p, rows.get(i))); }
     } else {
       Map<u8[], bool> other = Map.create(hashBytes, bytesEq);
       for (i32 i = 0; i < s2.rows.len(); i++) { other.set(keyBytes(s2.rows.get(i)), true); }
-      dedupe(rows, keys);
+      Vec<Value[]> left = sortedSet(rows);
       Vec<Value[]> r2;
       Vec<Value[]> k2;
-      for (i32 i = 0; i < rows.len(); i++) {
-        bool inOther = other.has(keyBytes(rows.get(i)));
-        if ((op == "INTERSECT") == inOther) { r2.push(rows.get(i)); k2.push(keys.get(i)); }
+      for (i32 i = 0; i < left.len(); i++) {
+        bool inOther = other.has(keyBytes(left.get(i)));
+        if ((op == "INTERSECT") == inOther) { r2.push(left.get(i)); k2.push(rekey(p, left.get(i))); }
       }
       rows = r2;
       keys = k2;

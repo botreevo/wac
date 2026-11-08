@@ -510,11 +510,12 @@ struct Statement {
   // ON CONFLICT … DO UPDATE: the existing row changed by the SET list, which may read the row that
   // was being inserted as `excluded`. Answers the row as it now is, or null when WHERE declined it.
   Result<Row?, SqlError> upsertUpdate(this, Table t, Row existing, Row proposed, Upsert u) {
+    // `excluded` is a scope outside the table's, so a bare name means the table's column and only
+    // `excluded.x` reaches the proposed row, as in SQLite.
     Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create());
-    BoundSource[] srcs = [BoundSource(lower(t.name), t, JOIN_FIRST, null, false),
-                          BoundSource("excluded", ex, JOIN_FIRST, null, false)];
-    Scope sc = Scope(srcs, null, null, false);
-    Ctx c = Ctx([existing as Row?, proposed as Row?], null, null, null);
+    Scope outer = Scope([BoundSource("excluded", ex, JOIN_FIRST, null, false)], null, null, false);
+    Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false)], outer, null, false);
+    Ctx c = Ctx([existing as Row?], Ctx([proposed as Row?], null, null, null), null, null);
     if (u.where is not null) {
       Node w = try bindExpr(u.where!, sc, this.x);
       match (eval(w, c, this.x)) {
@@ -626,12 +627,12 @@ struct Statement {
     Vec<Value[]> out;
     this.counted = true;
     for (i32 i = 0; i < rows.len(); i++) {
-      // A row an earlier REPLACE removed is no longer there to update.
+      // The rowids are gathered first and each is then looked up afresh, as SQLite does: a row an earlier
+      // REPLACE removed is skipped, and a row moved onto a rowid still to come is updated again there.
       Row? cur = t.get(rows[i].rowid);
-      Row want = rows[i];
-      if (cur is null || cur! is not want) { continue; }
-      Ctx c = Ctx([rows[i] as Row?], null, null, null);
-      Row? changed = try this.applySets(t, rows[i], bs, c, u.orAction);
+      if (cur is null) { continue; }
+      Ctx c = Ctx([cur], null, null, null);
+      Row? changed = try this.applySets(t, cur!, bs, c, u.orAction);
       if (changed is not null && ret is not null) { out.push(try this.evalReturning(ret!, changed!)); }
     }
     if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }

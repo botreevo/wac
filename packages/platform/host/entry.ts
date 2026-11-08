@@ -14,7 +14,7 @@
 import { type Bridge, bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import { denoWorld } from "./deno.ts";
-import { callMain, mainArgs, WacExit } from "./provider.ts";
+import { callMain, failureText, mainArgs, WacExit } from "./provider.ts";
 
 /**
  * The generated module of an application.
@@ -230,7 +230,7 @@ async function runAsWorker(app: AppModule, cov?: Coverage): Promise<void> {
         if (cov !== undefined) dumpCoverage(app, cov);
         // `sys.exit`: the program ended itself, abandoning what was left — a status, not a failure.
         if (err instanceof WacExit) { worker.postMessage({ ok: true, code: err.code }); continue; }
-        worker.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        worker.postMessage({ ok: false, error: failureText(app, err) });
       }
     }
   }

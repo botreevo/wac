@@ -571,3 +571,13 @@ export function callMain(b: Bridge, app: Record<string, unknown>, args: unknown[
 }
 
 export { HostCallError };
+
+/**
+ * The sentence a failed `main` is reported with: the program's own `trap "…"` message when it gave one, and the
+ * engine's otherwise — "unreachable" says nothing a reader can use.
+ */
+export function failureText(app: unknown, err: unknown): string {
+  const said = (app as { __wacTrapSaid?: () => string }).__wacTrapSaid?.() ?? "";
+  if (said !== "") return "trapped: " + said;
+  return err instanceof Error ? err.message : String(err);
+}

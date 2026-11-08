@@ -1148,6 +1148,7 @@ fn run_child(
     let stdout = streams.stdout.clone();
     let stderr = streams.stderr.clone();
     let fsreq = streams.fsreq.clone();
+    let inherit_out = streams.inherit_out;
     host.as_child = Some(streams);
     // A child's relative paths resolve from where its parent said — the thing `spawn` got wrong in the
     // JavaScript hosts, where a spawned program inherited the *host's* directory instead of the shell's.
@@ -1164,9 +1165,24 @@ fn run_child(
         // one has no status of its own to report".
         Err(_) if stop.load(Ordering::Relaxed) => -1,
         Err(e) => {
-            // The child's own error stream, so a parent that reads it sees what went wrong rather
-            // than a status with no sentence attached.
-            let _ = stderr.write(format!("{e}\n").as_bytes());
+            // **Said as the other hosts say it** — `wac: prog trapped: why` — with the engine's own reason
+            // (`wasm trap: call stack exhausted`) rather than a page of backtrace, and the program's message
+            // when it gave one, which `enter` has already put in that form.
+            let shown = format!("{e}");
+            let line = if shown.contains(" trapped: ") {
+                format!("wac: {shown}\n")
+            } else {
+                format!("wac: {} trapped: {}\n", m.entry, e.root_cause())
+            };
+            // **Where the child writes**: the process's own error stream when it inherited it — `wac run`
+            // hands a program the terminal — and its queue otherwise, for a parent that reads it. This
+            // wrote the queue always, and an inheriting child's queue has no reader, so every trap under
+            // `wac run` on this host was silent: an exit status and not a word (wac-sqlite).
+            if inherit_out {
+                eprint!("{line}");
+            } else {
+                let _ = stderr.write(line.as_bytes());
+            }
             1
         }
     };

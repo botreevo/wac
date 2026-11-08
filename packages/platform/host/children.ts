@@ -383,6 +383,16 @@ class WriteThrough extends ByteQueue {
     this.#write(b);
     return Promise.resolve(true);
   }
+  /**
+   * **The last line goes through too.** A child's trap reason is written with `endWith`, which this did not
+   * override, so for a child that inherited the terminal — every program `wac run` starts — the reason went into
+   * the zero-sized queue underneath, which nothing reads: a trap, a stack overflow included, was an exit status
+   * and not a word (wac-sqlite).
+   */
+  override endWith(b: Uint8Array): void {
+    this.#write(b);
+    this.end();
+  }
 }
 
 export function spawnChild(

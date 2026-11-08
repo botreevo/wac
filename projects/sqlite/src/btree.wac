@@ -94,8 +94,8 @@ struct PayloadAt {
   i32 local;
 }
 
-PayloadAt payloadOf(const u8[] cell, i32 kind, i32 usable) {
-  i32 at = kind == INDEX_INTERIOR ? 4 : 0;
+PayloadAt payloadOf(const u8[] cell, i32 kind, i32 usable, i32 base) {
+  i32 at = base + (kind == INDEX_INTERIOR ? 4 : 0);
   Varint p = readVarint(cell, at);
   at += p.size;
   if (kind == TABLE_LEAF) { at += readVarint(cell, at).size; }
@@ -104,7 +104,7 @@ PayloadAt payloadOf(const u8[] cell, i32 kind, i32 usable) {
 
 // A cell's whole payload, its overflow pages followed.
 export u8[] cellPayload(Pager pg, const u8[] cell, i32 kind) {
-  PayloadAt pa = payloadOf(cell, kind, pg.pageSize);
+  PayloadAt pa = payloadOf(cell, kind, pg.pageSize, 0);
   if (pa.size < 0 || pa.size > 1000000000) { pg.failed("payload of \{pa.size} bytes"); return u8[](); }
   u8[] out = u8[].filled(pa.size as! i32, 0);
   out.copyFrom(cell, pa.start, 0, pa.local);
@@ -164,7 +164,7 @@ u8[] indexLeafCell(Pager pg, const u8[] payload) {
 // Gives a cell's overflow pages back to the freelist.
 void freeOverflow(Pager pg, const u8[] cell, i32 kind) {
   if (kind == TABLE_INTERIOR) { return; }
-  PayloadAt pa = payloadOf(cell, kind, pg.pageSize);
+  PayloadAt pa = payloadOf(cell, kind, pg.pageSize, 0);
   if ((pa.local as i64) >= pa.size) { return; }
   i64 next = be32(cell, pa.start + pa.local);
   i64 left = (pa.size - pa.local as i64 + (pg.pageSize - 5) as i64) / (pg.pageSize - 4) as i64;
@@ -288,6 +288,7 @@ void freeBelow(Pager pg, Node nd, i32 depth) {
 export struct Path {
   Vec<i64> pages;
   Vec<i32> slots;
+  bool append = false;   // the position found is at the end of the last leaf
 }
 
 i64 childAt(const Node nd, i32 i) { return i < nd.cells.len() ? cellChild(nd.cells.get(i)) : nd.right; }
@@ -353,7 +354,7 @@ bool put(Pager pg, Path path, i32 d, Node nd, bool pack) {
     i64 c = pg.allocate();
     Node child = Node(c, nd.kind, nd.cells, nd.right);
     Node root = Node(nd.pgno, tableKind(nd.kind) ? TABLE_INTERIOR : INDEX_INTERIOR, Vec.create(), c);
-    Path p2 = Path(Vec.fromArray([nd.pgno]), Vec.fromArray([0]));
+    Path p2 = Path(Vec.fromArray([nd.pgno]), Vec.fromArray([0]), false);
     splitInto(pg, p2, 1, child, root, 0, pack);
     return true;
   }
@@ -401,7 +402,7 @@ void removeEmpty(Pager pg, Path path, i32 d, Node nd) {
     // The root's one child comes up into it.
     Node child = load(pg, nd.right);
     pg.free(child.pgno);
-    put(pg, Path(Vec.fromArray([nd.pgno]), Vec.fromArray([0])), 0, Node(nd.pgno, child.kind, child.cells, child.right), false);
+    put(pg, Path(Vec.fromArray([nd.pgno]), Vec.fromArray([0]), false), 0, Node(nd.pgno, child.kind, child.cells, child.right), false);
     return;
   }
   Node parent = load(pg, path.pages.get(d - 1));
@@ -446,7 +447,7 @@ void removeEmpty(Pager pg, Path path, i32 d, Node nd) {
     sibSlot = n - 1;
   }
   store(pg, parent);
-  Path p2 = Path(Vec.create(), Vec.create());
+  Path p2 = Path(Vec.create(), Vec.create(), false);
   for (i32 i = 0; i < d; i++) { p2.pages.push(path.pages.get(i)); p2.slots.push(path.slots.get(i)); }
   p2.slots.set(d - 1, sibSlot);
   p2.pages.push(sib.pgno);
@@ -455,44 +456,152 @@ void removeEmpty(Pager pg, Path path, i32 d, Node nd) {
   if (!split && parent.cells.len() == 0) { removeEmpty(pg, path, d - 1, parent); }
 }
 
+// Takes cell `i` off a page without laying it out again: its pointer goes, and its bytes become free
+// space as SQLite's freeSpace() frees them — joined to a free block or to the free area they touch, so
+// no two free blocks are less than four bytes apart, which SQLite's checks require. Answers false (and
+// changes nothing) when the page has no other cell, which the caller handles by removing the page.
+bool removeInPlace(Pager pg, i64 pgno, i32 i) {
+  u8[] page = pg.page(pgno);
+  i32 h = hdrOf(pgno);
+  i32 kind = page[h] as i32;
+  i32 n = be16(page, h + 3);
+  if (n <= 1 || i >= n) { return false; }
+  i32 pb = h + ptrBase(kind);
+  i32 off = be16(page, pb + 2 * i);
+  i32 size = cellSize(page, off, kind, pg.pageSize);
+  if (size < 4) { return false; }
+  // Where the free blocks around it are, checked before anything changes.
+  i32 iStart = off;
+  i32 iEnd = off + size;
+  i32 iPtr = h + 1;
+  i32 iFree = be16(page, iPtr);
+  while (iFree != 0 && iFree < iStart) {
+    if (iFree <= iPtr || iFree > pg.pageSize - 4) { return false; }
+    iPtr = iFree;
+    iFree = be16(page, iFree);
+  }
+  i32 nFrag = 0;
+  if (iFree != 0 && iEnd + 3 >= iFree) {
+    if (iEnd > iFree) { return false; }
+    nFrag = iFree - iEnd;
+    iEnd = iFree + be16(page, iFree + 2);
+    iFree = be16(page, iFree);
+  }
+  if (iPtr > h + 1) {
+    i32 ptrEnd = iPtr + be16(page, iPtr + 2);
+    if (ptrEnd + 3 >= iStart) {
+      if (ptrEnd > iStart) { return false; }
+      nFrag += iStart - ptrEnd;
+      iStart = iPtr;
+    }
+  }
+  if (nFrag > (page[h + 7] as i32)) { return false; }
+  i32 top = be16(page, h + 5);
+  if (top == 0) { top = 65536; }
+  if (iStart < top || (iStart == top && iPtr != h + 1)) { return false; }
+  u8[] p = pg.write(pgno);
+  for (i32 k = pb + 2 * i; k < pb + 2 * (n - 1); k++) { p[k] = p[k + 2]; }
+  p[pb + 2 * (n - 1)] = 0;
+  p[pb + 2 * (n - 1) + 1] = 0;
+  put16(p, h + 3, n - 1);
+  p[h + 7] = ((p[h + 7] as i32) - nFrag) as@ u8;
+  if (iStart == top) {
+    // At the start of the cell content: the free area grows instead.
+    put16(p, h + 1, iFree);
+    put16(p, h + 5, iEnd);
+  } else {
+    put16(p, iPtr, iStart);
+    put16(p, iStart, iFree);
+    put16(p, iStart + 2, iEnd - iStart);
+  }
+  return true;
+}
+
 // Takes the cell at the end of `path` off its leaf, and gives back its overflow when `drop`.
 void leafRemove(Pager pg, Path path, bool drop) {
   i32 d = path.pages.len() - 1;
-  Node leaf = load(pg, path.pages.get(d));
+  i64 pgno = path.pages.get(d);
   i32 i = path.slots.get(d);
-  if (drop) { freeOverflow(pg, leaf.cells.get(i), leaf.kind); }
+  if (drop) {
+    u8[] page = pg.page(pgno);
+    i32 h = hdrOf(pgno);
+    i32 kind = page[h] as i32;
+    i32 off = cellOff(page, h, kind, i);
+    i32 sz = cellSize(page, off, kind, pg.pageSize);
+    if (sz > 0) {
+      u8[] c = u8[].filled(sz, 0);
+      c.copyFrom(page, off, 0, sz);
+      freeOverflow(pg, c, kind);
+    }
+  }
+  if (removeInPlace(pg, pgno, i)) { return; }
+  Node leaf = load(pg, pgno);
   leaf.cells.remove(i);
   if (leaf.cells.len() > 0 || d == 0) { store(pg, leaf); } else { removeEmpty(pg, path, d, leaf); }
 }
 
 // ── tables ────────────────────────────────────────────────────────────────
 
-// The leaf where `rowid` is or would go, and its position there.
+// The page bytes of cell `i` start here.
+i32 cellOff(const u8[] page, i32 h, i32 kind, i32 i) { return be16(page, h + ptrBase(kind) + 2 * i); }
+
+// A table cell's key, read off the page where it lies.
+i64 rowidAt(const u8[] page, i32 off, i32 kind) {
+  if (kind == TABLE_INTERIOR) { return readVarint(page, off + 4).value; }
+  return readVarint(page, off + readVarint(page, off).size).value;
+}
+
+// The leaf where `rowid` is or would go, and its position there. `path.append` says whether that
+// position is the end of the last leaf.
 Path findLeaf(Pager pg, i64 root, i64 rowid) {
-  Path path = Path(Vec.create(), Vec.create());
+  Path path = Path(Vec.create(), Vec.create(), false);
   i64 p = root;
+  bool last = true;
   for (i32 depth = 0; depth < 40; depth++) {
-    Node nd = load(pg, p);
+    u8[] page = pg.page(p);
+    i32 h = hdrOf(p);
+    i32 kind = page[h] as i32;
+    if (!validKind(kind)) { pg.failed("page \{p} is not a b-tree page"); path.pages.push(p); path.slots.push(0); return path; }
+    i32 n = be16(page, h + 3);
     i32 lo = 0;
-    i32 hi = nd.cells.len();
+    i32 hi = n;
     while (lo < hi) {
       i32 mid = (lo + hi) / 2;
-      if (cellRowid(nd.cells.get(mid), nd.kind) < rowid) { lo = mid + 1; } else { hi = mid; }
+      if (rowidAt(page, cellOff(page, h, kind, mid), kind) < rowid) { lo = mid + 1; } else { hi = mid; }
     }
     path.pages.push(p);
     path.slots.push(lo);
-    if (leafKind(nd.kind)) { return path; }
-    p = childAt(nd, lo);
+    if (leafKind(kind)) {
+      path.append = last && lo == n;
+      return path;
+    }
+    if (lo < n) { last = false; }
+    p = lo < n ? be32(page, cellOff(page, h, kind, lo)) : be32(page, h + 8);
     if (p < 1 || p > pg.count) { pg.failed("child page \{p} out of range"); return path; }
   }
   pg.failed("b-tree too deep");
   return path;
 }
 
-bool rightmost(Pager pg, Path path) {
-  for (i32 i = 0; i < path.pages.len() - 1; i++) {
-    if (path.slots.get(i) != load(pg, path.pages.get(i)).cells.len()) { return false; }
-  }
+// Puts a cell at position `i` of a leaf without laying the page out again, when the space between its
+// pointers and its cells holds it. Answers whether it did.
+bool insertInPlace(Pager pg, i64 pgno, i32 i, const u8[] cell) {
+  u8[] page = pg.page(pgno);
+  i32 h = hdrOf(pgno);
+  i32 kind = page[h] as i32;
+  i32 n = be16(page, h + 3);
+  i32 pb = h + ptrBase(kind);
+  i32 top = be16(page, h + 5);
+  if (top == 0) { top = 65536; }
+  if (top - (pb + 2 * n) < cell.len() + 2 || i > n) { return false; }
+  u8[] p = pg.write(pgno);
+  i32 at = top - cell.len();
+  p.copyFrom(cell, 0, at, cell.len());
+  // The pointers from i on move up one.
+  for (i32 k = pb + 2 * n - 1; k >= pb + 2 * i; k--) { p[k + 2] = p[k]; }
+  put16(p, pb + 2 * i, at);
+  put16(p, h + 3, n + 1);
+  put16(p, h + 5, at);
   return true;
 }
 
@@ -501,18 +610,38 @@ export void tableInsert(Pager pg, i64 root, i64 rowid, const u8[] payload) {
   pg.version++;
   Path path = findLeaf(pg, root, rowid);
   i32 d = path.pages.len() - 1;
-  Node leaf = load(pg, path.pages.get(d));
+  i64 leafNo = path.pages.get(d);
   i32 i = path.slots.get(d);
+  u8[] page = pg.page(leafNo);
+  i32 h = hdrOf(leafNo);
+  bool replacing = i < be16(page, h + 3) && rowidAt(page, cellOff(page, h, TABLE_LEAF, i), TABLE_LEAF) == rowid;
   u8[] cell = tableLeafCell(pg, rowid, payload);
-  bool append = false;
-  if (i < leaf.cells.len() && cellRowid(leaf.cells.get(i), TABLE_LEAF) == rowid) {
+  if (!replacing && insertInPlace(pg, leafNo, i, cell)) { return; }
+  if (replacing) {
+    // The old cell out and the new one in, on the page as it is, when there is room.
+    i32 off = cellOff(page, h, TABLE_LEAF, i);
+    i32 sz = cellSize(page, off, TABLE_LEAF, pg.pageSize);
+    if (sz > 0) {
+      u8[] old = u8[].filled(sz, 0);
+      old.copyFrom(page, off, 0, sz);
+      if (removeInPlace(pg, leafNo, i)) {
+        freeOverflow(pg, old, TABLE_LEAF);
+        if (insertInPlace(pg, leafNo, i, cell)) { return; }
+        Node leaf2 = load(pg, leafNo);
+        leaf2.cells.insert(i, cell);
+        put(pg, path, d, leaf2, false);
+        return;
+      }
+    }
+  }
+  Node leaf = load(pg, leafNo);
+  if (replacing) {
     freeOverflow(pg, leaf.cells.get(i), TABLE_LEAF);
     leaf.cells.set(i, cell);
   } else {
-    append = i == leaf.cells.len() && rightmost(pg, path);
     leaf.cells.insert(i, cell);
   }
-  put(pg, path, d, leaf, append);
+  put(pg, path, d, leaf, path.append && !replacing);
 }
 
 // Removes the row with a rowid from a table b-tree. Answers whether there was one.
@@ -529,40 +658,73 @@ export bool tableDelete(Pager pg, i64 root, i64 rowid) {
 
 // ── indexes ───────────────────────────────────────────────────────────────
 
-// The leaf where a record would go, by its comparison, and its position there.
-Path findIndexLeaf(Pager pg, i64 root, KeyCmp cmp) {
-  Path path = Path(Vec.create(), Vec.create());
+// The leaf where a record would go, by its comparison, and its position there; `found` when a record
+// equal to it is already in the tree (in that leaf or above it).
+struct IndexSpot {
+  Path path;
+  bool found;
+}
+
+IndexSpot findIndexLeaf(Pager pg, i64 root, KeyCmp cmp) {
+  Path path = Path(Vec.create(), Vec.create(), false);
   i64 p = root;
+  bool last = true;
+  bool found = false;
   for (i32 depth = 0; depth < 40; depth++) {
-    Node nd = load(pg, p);
+    u8[] page = pg.page(p);
+    i32 h = hdrOf(p);
+    i32 kind = page[h] as i32;
+    if (!validKind(kind)) { pg.failed("page \{p} is not a b-tree page"); path.pages.push(p); path.slots.push(0); return IndexSpot(path, false); }
+    i32 n = be16(page, h + 3);
     i32 lo = 0;
-    i32 hi = nd.cells.len();
+    i32 hi = n;
     while (lo < hi) {
       i32 mid = (lo + hi) / 2;
-      if (cmp(cellPayload(pg, nd.cells.get(mid), nd.kind)) < 0) { lo = mid + 1; } else { hi = mid; }
+      i32 c = cmp(payloadAt(pg, page, cellOff(page, h, kind, mid), kind));
+      if (c == 0) { found = true; }
+      if (c < 0) { lo = mid + 1; } else { hi = mid; }
     }
     path.pages.push(p);
     path.slots.push(lo);
-    if (leafKind(nd.kind)) { return path; }
-    p = childAt(nd, lo);
-    if (p < 1 || p > pg.count) { pg.failed("child page \{p} out of range"); return path; }
+    if (leafKind(kind)) {
+      path.append = last && lo == n;
+      return IndexSpot(path, found);
+    }
+    if (lo < n) { last = false; }
+    p = lo < n ? be32(page, cellOff(page, h, kind, lo)) : be32(page, h + 8);
+    if (p < 1 || p > pg.count) { pg.failed("child page \{p} out of range"); return IndexSpot(path, found); }
   }
   pg.failed("b-tree too deep");
-  return path;
+  return IndexSpot(path, found);
+}
+
+// The payload of the cell at `off` on a page, its overflow followed.
+u8[] payloadAt(Pager pg, const u8[] page, i32 off, i32 kind) {
+  i32 sz = cellSize(page, off, kind, pg.pageSize);
+  if (sz < 0) { pg.failed("a cell runs off its page"); return u8[](); }
+  PayloadAt pa = payloadOf(page, kind, pg.pageSize, off);
+  if ((pa.local as i64) == pa.size) {
+    u8[] out = u8[].filled(pa.local, 0);
+    out.copyFrom(page, pa.start, 0, pa.local);
+    return out;
+  }
+  u8[] c = u8[].filled(sz, 0);
+  c.copyFrom(page, off, 0, sz);
+  return cellPayload(pg, c, kind);
 }
 
 // Adds a record to an index b-tree; `cmp` is its own comparison. A record already there is left.
 export void indexInsert(Pager pg, i64 root, const u8[] rec, KeyCmp cmp) {
   pg.version++;
-  Cursor c = Cursor.over(pg, root, false);
-  if (c.seek((u8[] s) => cmp(s) >= 0) && cmp(c.payload) == 0) { return; }
-  Path path = findIndexLeaf(pg, root, cmp);
+  IndexSpot spot = findIndexLeaf(pg, root, cmp);
+  if (spot.found) { return; }
+  Path path = spot.path;
   i32 d = path.pages.len() - 1;
+  u8[] cell = indexLeafCell(pg, rec);
+  if (insertInPlace(pg, path.pages.get(d), path.slots.get(d), cell)) { return; }
   Node leaf = load(pg, path.pages.get(d));
-  i32 i = path.slots.get(d);
-  bool append = i == leaf.cells.len() && rightmost(pg, path);
-  leaf.cells.insert(i, indexLeafCell(pg, rec));
-  put(pg, path, d, leaf, append);
+  leaf.cells.insert(path.slots.get(d), cell);
+  put(pg, path, d, leaf, path.append);
 }
 
 // Removes the record that compares equal under `cmp`. An entry on an interior page is replaced by the
@@ -606,7 +768,7 @@ export bool indexDelete(Pager pg, i64 root, KeyCmp cmp, KeyCmpOf cmpOf) {
     leafRemove(pg, p2, true);
     u8[] predRec = cellPayload(pg, pred, INDEX_LEAF);
     KeyCmp pc = cmpOf(predRec);
-    Path p3 = findIndexLeaf(pg, root, pc);
+    Path p3 = findIndexLeaf(pg, root, pc).path;
     i32 d3 = p3.pages.len() - 1;
     Node leaf = load(pg, p3.pages.get(d3));
     leaf.cells.insert(p3.slots.get(d3), pred);
@@ -656,13 +818,21 @@ export struct Cursor {
   i64 rowid = 0;
   u8[] payload;
   KeyCmpOf? cmpOf = null;  // an index cursor's way of finding its place again
+  // A table cursor that reads its row's payload only when `body()` asks for it: one whose rows are
+  // mostly found already decoded (Table's cache) copies nothing for them.
+  bool lazy = false;
+  bool loaded = true;
+  u8[] top;                // the page at the top of the path, while it is good (see topPage)
+  i64 topNo = 0;
+  i64 topSeen = -1;
+  i32 topCached = -1;
 
   Cursor over(Pager pg, i64 root, bool table) {
-    return Cursor { pg: pg, root: root, table: table, pages: Vec.create(), slots: Vec.create(), payload: u8[]() };
+    return Cursor { pg: pg, root: root, table: table, pages: Vec.create(), slots: Vec.create(), payload: u8[](), top: u8[]() };
   }
 
   Path path(const this) {
-    Path p = Path(Vec.create(), Vec.create());
+    Path p = Path(Vec.create(), Vec.create(), false);
     for (i32 i = 0; i < this.pages.len(); i++) { p.pages.push(this.pages.get(i)); p.slots.push(this.slots.get(i)); }
     return p;
   }
@@ -675,16 +845,31 @@ export struct Cursor {
   }
 
   // The page at the top, its kind, and its cell count.
+  // The page at the top of the path, kept while nothing changes so stepping along a leaf reads it once.
+  u8[] topPage(this) {
+    i64 p = this.pages.get(this.pages.len() - 1);
+    if (p != this.topNo || this.topSeen != this.pg.version || this.pg.cache.len() != this.topCached) {
+      this.top = this.pg.page(p);
+      this.topNo = p;
+      this.topSeen = this.pg.version;
+      this.topCached = this.pg.cache.len();
+    }
+    return this.top;
+  }
+
   i32 topCount(this) {
-    i64 p = this.pages.last()!;
-    u8[] page = this.pg.page(p);
-    return be16(page, hdrOf(p) + 3);
+    u8[] page = this.topPage();
+    return be16(page, hdrOf(this.topNo) + 3);
   }
 
   i32 topKind(this) {
-    i64 p = this.pages.last()!;
-    return this.pg.page(p)[hdrOf(p)] as i32;
+    u8[] page = this.topPage();
+    return page[hdrOf(this.topNo)] as i32;
   }
+
+  i64 topNumber(this) { return this.pages.get(this.pages.len() - 1); }
+
+  i32 topSlot(this) { return this.slots.get(this.slots.len() - 1); }
 
   u8[] cellAt(this, i64 p, i32 i) {
     u8[] page = this.pg.page(p);
@@ -722,8 +907,17 @@ export struct Cursor {
 
   // Keeps the entry at the top.
   bool hold(this) {
-    i64 p = this.pages.last()!;
-    i32 i = this.slots.last()!;
+    i64 p = this.topNumber();
+    i32 i = this.topSlot();
+    if (this.lazy) {
+      u8[] page = this.topPage();
+      i32 h = hdrOf(p);
+      this.rowid = rowidAt(page, cellOff(page, h, TABLE_LEAF, i), TABLE_LEAF);
+      this.loaded = false;
+      this.valid = true;
+      this.seen = this.pg.version;
+      return true;
+    }
     u8[] cell = this.cellAt(p, i);
     i32 kind = this.topKind();
     if (kind == TABLE_LEAF) { this.rowid = cellRowid(cell, kind); }
@@ -802,6 +996,19 @@ export struct Cursor {
     }
     this.valid = false;
     return false;
+  }
+
+  // The entry's payload; a lazy cursor reads it now, finding its place again first if the tree changed.
+  u8[] body(this) {
+    if (!this.loaded) {
+      if (this.seen != this.pg.version) { this.refind(); }
+      if (this.valid) {
+        u8[] cell = this.cellAt(this.pages.last()!, this.slots.last()!);
+        this.payload = cellPayload(this.pg, cell, TABLE_LEAF);
+      }
+      this.loaded = true;
+    }
+    return this.payload;
   }
 
   bool first(this) {
@@ -887,7 +1094,7 @@ export struct Cursor {
       if (!this.refind()) { return this.valid; }
     }
     i32 n = this.topCount();
-    i32 i = this.slots.last()!;
+    i32 i = this.topSlot();
     if (!leafKind(this.topKind())) {
       // On an index entry in an interior page: next is the first entry of the child after it.
       this.slots.set(this.slots.len() - 1, i + 1);

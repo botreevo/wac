@@ -2,11 +2,12 @@
 // are in b-trees on a pager (see btree.wac), read when wanted; a table of computed rows (a subquery's, a
 // view's, a table-valued function's) keeps them in memory.
 
-import { Vec } from "core";
-import { Value, compareValues, compareColl, COLL_BINARY } from "./value.wac";
+import { Vec, Map, hashI64, i64Eq } from "core";
+import { Value, compareValues, compareColl, classRank, COLL_BINARY } from "./value.wac";
+import { readVarint, Varint, beSigned, sliceBytes } from "./bytes.wac";
 import { Pager } from "./pager.wac";
 import { Cursor, KeyCmp, KeyCmpOf, tableInsert, tableDelete, indexInsert, indexDelete, countEntries } from "./btree.wac";
-import { encodeRecordIn, decodeRecordIn, toUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
+import { encodeRecordIn, decodeRecordIn, serialSize, toUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
 import { applyAffinity } from "./ops.wac";
 import { Expr, IndexCol, Select, CreateTrigger } from "./ast.wac";
 import { lower, upper } from "./lexer.wac";
@@ -139,7 +140,68 @@ export struct Index {
     return v!;
   }
 
-  KeyCmp cmpTo(this, Value[] target) { return (u8[] s) => this.compare(this.keyOf(s), target); }
+  KeyCmp cmpTo(this, Value[] target) {
+    // Text compared as BINARY is compared as bytes, without making a string of the stored side.
+    u8[][] tb = u8[][].defaulted(target.len());
+    for (i32 i = 0; i < target.len(); i++) {
+      match (target[i]) {
+        Text(t): { tb[i] = t.toBytes(); }
+        Blob(b): { tb[i] = b; }
+        default: {}
+      }
+    }
+    return (u8[] s) => this.compareRec(s, target, tb);
+  }
+
+  // How a stored record compares with `target`, as compare(keyOf(rec), target) would, reading only the
+  // fields it gets to. `tb` holds the target's text and blobs as bytes.
+  i32 compareRec(this, const u8[] rec, Value[] target, u8[][] tb) {
+    if (this.enc != ENC_UTF8 || rec.len() == 0) { return this.compare(this.keyOf(rec), target); }
+    Varint h = readVarint(rec, 0);
+    if (h.value < 1 || h.value > rec.len() as i64) { return this.compare(this.keyOf(rec), target); }
+    i32 hdrEnd = h.value as! i32;
+    i32 at = h.size;
+    i32 body = hdrEnd;
+    i32 i = 0;
+    while (at < hdrEnd) {
+      i64 t = 0;
+      if ((rec[at] & 0x80) == 0) { t = rec[at] as i64; at++; }
+      else { Varint tv = readVarint(rec, at); t = tv.value; at += tv.size; }
+      i32 n = serialSize(t);
+      if (t < 0 || t == 10 || t == 11 || body + n > rec.len()) { return this.compare(this.keyOf(rec), target); }
+      // Every column the target has is equal and the record has more: it comes after.
+      if (i >= target.len()) { return 1; }
+      i32 c = this.fieldCmp(rec, t, body, n, i, target[i], tb[i]);
+      if (c != 0) { return i < this.desc.len() && this.desc[i] ? -c : c; }
+      body += n;
+      i++;
+    }
+    return i < target.len() ? -1 : 0;
+  }
+
+  i32 fieldCmp(this, const u8[] rec, i64 t, i32 off, i32 n, i32 col, Value tv, u8[] b) {
+    i32 rank = t == 0 ? 0 : (t <= 9 ? 1 : ((t & 1) == 1 ? 2 : 3));
+    i32 trank = classRank(tv);
+    if (rank != trank) { return rank < trank ? -1 : 1; }
+    if (rank == 0) { return 0; }
+    if (rank == 1) {
+      Value v = Value.Null;
+      if (t >= 1 && t <= 6) { v = Value.Int(beSigned(rec, off, n)); }
+      else if (t == 7) { v = Value.Real(f64.fromBits(beSigned(rec, off, 8) as@ u64)); }
+      else { v = Value.Int(t == 9 ? 1 : 0); }
+      return compareValues(v, tv);
+    }
+    i32 coll = col < this.colls.len() ? this.colls[col] : COLL_BINARY;
+    if (rank == 3 || coll == COLL_BINARY) {
+      i32 m = n < b.len() ? n : b.len();
+      for (i32 k = 0; k < m; k++) {
+        if (rec[off + k] != b[k]) { return rec[off + k] < b[k] ? -1 : 1; }
+      }
+      return n < b.len() ? -1 : (n > b.len() ? 1 : 0);
+    }
+    Value v = Value.Text(string.fromBytes(sliceBytes(rec, off, off + n)));
+    return compareColl(v, tv, coll);
+  }
 
   KeyCmpOf cmpOf(this) { return (u8[] rec) => this.cmpTo(this.keyOf(rec)); }
 
@@ -237,6 +299,11 @@ export struct Table {
   // b-tree in the file, written again from it at a commit after `shadowDirty` is set.
   i64 fileRoot = 0;
   bool shadowDirty = false;
+  // Rows read lately, decoded, by the leaf page they are on: a table read again (a join's inner table,
+  // a scan repeated) is not decoded again. A page's rows are good while its change stamp is the one they
+  // were read at; there are at most RECENT_PAGES pages of them.
+  Map<i64, PageRows>? recent = null;
+  i64 recentEpoch = -1;
 
   // The columns in the order the file's record holds them: for a WITHOUT ROWID table, the primary
   // key's first; and never a VIRTUAL generated column.
@@ -287,9 +354,42 @@ export struct Table {
       return null;
     }
     Cursor c = Cursor.over(this.pg!, this.root, true);
+    c.lazy = true;
     if (!c.seekRowid(rowid) || c.rowid != rowid) { return null; }
-    return this.decode(c.rowid, c.payload);
+    return this.rowAt(c, this.pageRows(c.topNumber()));
   }
+
+  // The decoded rows of a leaf page, as far as they have been read.
+  PageRows pageRows(this, i64 page) {
+    if (this.recent is null || this.recentEpoch != this.pg!.epoch) {
+      this.recent = Map<i64, PageRows>.create(hashI64, i64Eq);
+      this.recentEpoch = this.pg!.epoch;
+    }
+    Map<i64, PageRows> m = this.recent!;
+    i64 stamp = this.pg!.stampOf(page);
+    PageRows? hit = m.get(page);
+    if (hit is not null && hit!.stamp == stamp) { return hit!; }
+    if (m.len() >= RECENT_PAGES) { m.clear(); }
+    PageRows pr = PageRows(stamp, Row?[].defaulted(this.pg!.pageSize / 4));
+    m.set(page, pr);
+    return pr;
+  }
+
+  // The row a cursor is on, from its page's decoded rows or decoded now.
+  Row rowAt(this, Cursor c, PageRows pr) {
+    i32 i = c.topSlot();
+    if (i < pr.rows.len() && c.seen == this.pg!.version) {
+      Row? r = pr.rows[i];
+      if (r is not null && r!.rowid == c.rowid) { return r!; }
+      Row d = this.decode(c.rowid, c.body());
+      pr.rows[i] = d;
+      return d;
+    }
+    return this.decode(c.rowid, c.body());
+  }
+
+  // What was read of every row is read again next time (its columns changed).
+  void forgetAll(this) { this.recent = null; }
 
   i64 maxRowid(this) {
     if (this.pg is null) {
@@ -313,6 +413,7 @@ export struct Table {
   RowCursor cursor(this) {
     if (this.pg is null) { return RowCursor { t: this }; }
     Cursor c = Cursor.over(this.pg!, this.root, true);
+    c.lazy = true;
     return RowCursor { t: this, c: c };
   }
 
@@ -409,6 +510,14 @@ export struct Table {
   }
 }
 
+// How many leaf pages' decoded rows a table keeps (see Table.recent).
+static i32 RECENT_PAGES = 1024;
+
+export struct PageRows {
+  i64 stamp;
+  Row?[] rows;
+}
+
 // A place in a table's rows, in rowid order, moved either way.
 export struct RowCursor {
   Table t;
@@ -416,6 +525,9 @@ export struct RowCursor {
   i32 at = -1;
   bool valid = false;
   Row? cached = null;
+  i64 page = 0;            // the leaf the cursor was last on, and its decoded rows
+  PageRows? rowsHere = null;
+  i64 rowsVersion = -1;
 
   bool settle(this, bool ok) {
     this.valid = ok;
@@ -449,7 +561,17 @@ export struct RowCursor {
 
   Row row(this) {
     if (this.c is null) { return this.t.rows.get(this.at); }
-    if (this.cached is null) { this.cached = this.t.decode(this.c!.rowid, this.c!.payload); }
+    if (this.cached is null) {
+      Cursor c = this.c!;
+      i64 p = c.topNumber();
+      // Nothing has changed since the page's rows were found: no need to look again.
+      if (this.rowsHere is null || p != this.page || this.rowsVersion != this.t.pg!.version) {
+        this.rowsHere = this.t.pageRows(p);
+        this.page = p;
+        this.rowsVersion = this.t.pg!.version;
+      }
+      this.cached = this.t.rowAt(c, this.rowsHere!);
+    }
     return this.cached!;
   }
 }

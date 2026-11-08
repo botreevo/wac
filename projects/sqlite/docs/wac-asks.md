@@ -35,8 +35,6 @@ It answers wac's fetcher 401, so a project depending on this one fills the cache
 
 std read and wrote whole files, so every commit rewrote the whole database and opening one read it
 all into memory. **Added** to std as `Files.openRandom(path, write)` → `RandomFile` (`readAt`,
-`writeAt`, `size`, `truncate`, `sync`, `close`), requests 69–73, on wac's `random-access-files`
-branch, with the Node, Deno and wasmtime hosts answering it (the V8 binary's arm is written but was not
+`writeAt`, `size`, `truncate`, `sync`, `close`), requests 69–73, on wac's master since `4085b2e9c`, with the Node, Deno and wasmtime hosts answering it (the V8 binary's arm is written but was not
 built). This library now reads pages as it needs them and commits only the pages it changed, behind a
-rollback journal synced before the file is touched; it needs a wac built from that branch until the
-change reaches master.
+rollback journal synced before the file is touched.

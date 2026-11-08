@@ -25,7 +25,7 @@ db.execute("INSERT INTO events (id, seq) VALUES (?, ?)", [Value.Text("e1"), Valu
 
 A database file is read a page at a time and written a page at a time, behind a rollback journal in
 SQLite's format: opening a large file costs what reading its schema costs, and a commit writes the pages
-it changed. This needs a wac whose std has `Files.openRandom` (wac's `random-access-files` branch).
+it changed. This needs a wac whose std has `Files.openRandom` (wac master from `4085b2e9c`).
 
 ## Where it stands
 

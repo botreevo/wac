@@ -3,14 +3,18 @@
 //     wactrust tree DIR                         kt1 of a directory (a top-level .git left out)
 //     wactrust tree --git REPO COMMIT [SUBDIR]  kt1 of a commit, every hash from the bytes git hands over
 //     wactrust blob FILE                        kb1 of one file
+//     wactrust lock pin|check                   wac.lock pinned by tree, and the cache checked against it
+//     wactrust lock fetch NAME [--from URL]     fetch one entry with git, installed only if it hashes to its pin
 
 import { Sys } from "std";
 import { treeId, blobId, leafHash } from "../src/tree.wac";
 import { hashDir, hashCommit } from "../src/walk.wac";
+import { LockEntry, readLock, writeLock, pin, check, fetchInto } from "../src/lock.wac";
 
 string usage() {
   return """
     usage: wactrust tree DIR | tree --git REPO COMMIT [SUBDIR] | blob FILE
+           wactrust lock pin | lock check | lock fetch NAME [--from URL]
     """;
 }
 
@@ -35,6 +39,58 @@ export async i32 main(Sys sys) {
       Err(e): { sys.warn("wactrust: \{e}"); return 1; }
       Ok(b): { sys.log(blobId(leafHash(b))); return 0; }
     }
+  }
+  if (cmd == "lock" && args.len() >= 2) { return await lockCmd(sys, args); }
+  sys.warn(usage());
+  return 2;
+}
+
+export async string envOr(Sys sys, string name, string fallback) {
+  match (await sys.env().get(name)) {
+    Err(e): { return fallback; }
+    Ok(v): { return v is null || v!.len() == 0 ? fallback : string.fromBytes(v!); }
+  }
+}
+
+async i32 lockCmd(Sys sys, string[] args) {
+  string home = await envOr(sys, "WAC_HOME", (await envOr(sys, "HOME", "")) + "/.wac");
+  LockEntry[] es;
+  match (await sys.readFile("wac.lock")) {
+    Err(e): { sys.warn("wactrust: no wac.lock here"); return 1; }
+    Ok(b): {
+      match (readLock(b)) {
+        Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+        Ok(x): { es = x; }
+      }
+    }
+  }
+  if (args[1] == "pin") {
+    match (await pin(sys.files(), home, es)) {
+      Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+      Ok(lines): {
+        for (string l in lines) { sys.log(l); }
+        await sys.writeFile("wac.lock", writeLock(es).toBytes());
+        return 0;
+      }
+    }
+  }
+  if (args[1] == "check") {
+    match (await check(sys.files(), home, es)) {
+      Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+      Ok(lines): { for (string l in lines) { sys.log(l); } return 0; }
+    }
+  }
+  if (args[1] == "fetch" && args.len() >= 3) {
+    for (LockEntry e in es) {
+      if (e.name != args[2]) { continue; }
+      string from = args.len() >= 5 && args[3] == "--from" ? args[4] : e.git;
+      match (await fetchInto(sys, home, e, from)) {
+        Err(x): { sys.warn("wactrust: \{x}"); return 1; }
+        Ok(line): { sys.log(line); return 0; }
+      }
+    }
+    sys.warn("wactrust: no entry named \{args[2]}");
+    return 1;
   }
   sys.warn(usage());
   return 2;

@@ -7,15 +7,19 @@
 import { Buf, Vec } from "core";
 import { Value } from "./value.wac";
 import { encodeRecord } from "./record.wac";
-import { put16, put32, pushVarint, varintLen } from "./bytes.wac";
+import { put16, put32, pushVarint, varintLen, be16, be32, readVarint, Varint } from "./bytes.wac";
 import { localSize } from "./reader.wac";
 
 // Pages under construction. Page n is pages[n - 1]; a reserved page is an empty array until filled.
 export struct Pages {
   i32 pageSize;
   Vec<u8[]> pages;
+  // An auto-vacuum database keeps pointer-map pages at fixed places, which b-tree pages step over; they
+  // are filled once every page is written (fillPtrmap).
+  bool autoVacuum;
 
   i64 reserve(this) {
+    this.skipPtrmap();
     this.pages.push(u8[]());
     return this.pages.len() as i64;
   }
@@ -23,9 +27,94 @@ export struct Pages {
   void fill(this, i64 n, u8[] page) { this.pages.set((n - 1) as! i32, page); }
 
   i64 add(this, u8[] page) {
+    this.skipPtrmap();
     this.pages.push(page);
     return this.pages.len() as i64;
   }
+
+  void skipPtrmap(this) {
+    if (this.autoVacuum && isPtrmapPage(this.pageSize, (this.pages.len() + 1) as i64)) {
+      this.pages.push(u8[].filled(this.pageSize, 0));
+    }
+  }
+}
+
+// Pointer-map pages: page 2, then one after every usable/5 pages it describes.
+export bool isPtrmapPage(i32 usable, i64 n) {
+  i64 per = (usable / 5) as i64;
+  return n >= 2 && (n - 2) % (per + 1) == 0;
+}
+
+// ── the pointer map ────────────────────────────────────────────────────────
+
+static u8 PTR_ROOT = 1;
+static u8 PTR_OVERFLOW1 = 3;
+static u8 PTR_OVERFLOW2 = 4;
+static u8 PTR_BTREE = 5;
+
+// Fills every pointer-map page: for each page, what it is and which page points at it. The b-trees are
+// walked as a reader would, from their roots, so the map follows from the pages as written.
+export void fillPtrmap(Pages ps, const i64[] roots) {
+  i32 n = ps.pages.len();
+  u8[] kinds = u8[].filled(n + 1, 0);
+  i64[] parents = i64[].filled(n + 1, 0);
+  for (i64 r in roots) {
+    if (r != 1) { kinds[r as! i32] = PTR_ROOT; }
+    walkPage(ps, r, kinds, parents);
+  }
+  i32 per = ps.pageSize / 5;
+  for (i32 p = 3; p <= n; p++) {
+    if (isPtrmapPage(ps.pageSize, p as i64)) { continue; }
+    // The map page that describes p is the last one before it.
+    i32 map = p - 1 - ((p - 3) % (per + 1));
+    u8[] page = ps.pages.get(map - 1);
+    i32 at = 5 * (p - map - 1);
+    page[at] = kinds[p];
+    put32(page, at + 1, parents[p]);
+  }
+}
+
+void walkPage(Pages ps, i64 pageNo, u8[] kinds, i64[] parents) {
+  u8[] page = ps.pages.get((pageNo - 1) as! i32);
+  i32 hdr = pageNo == 1 ? 100 : 0;
+  i32 kind = page[hdr] as i32;
+  bool interior = kind == 2 || kind == 5;
+  bool table = kind == 5 || kind == 13;
+  i32 cells = be16(page, hdr + 3);
+  i32 ptrs = hdr + (interior ? 12 : 8);
+  for (i32 i = 0; i < cells; i++) {
+    i32 at = be16(page, ptrs + 2 * i);
+    if (interior) {
+      child(ps, be32(page, at), pageNo, kinds, parents);
+      at += 4;
+      // A table's interior cells hold only a key; an index's carry a whole entry.
+      if (table) { continue; }
+    }
+    Varint size = readVarint(page, at);
+    at += size.size;
+    if (table) { at += readVarint(page, at).size; }
+    i32 local = localSize(ps.pageSize, table, size.value);
+    if ((local as i64) < size.value) {
+      // The overflow chain: its first page points back at this one, each next at the one before.
+      i64 prev = pageNo;
+      i64 ov = be32(page, at + local);
+      u8 kindOf = PTR_OVERFLOW1;
+      while (ov != 0) {
+        kinds[ov as! i32] = kindOf;
+        parents[ov as! i32] = prev;
+        prev = ov;
+        kindOf = PTR_OVERFLOW2;
+        ov = be32(ps.pages.get((ov - 1) as! i32), 0);
+      }
+    }
+  }
+  if (interior) { child(ps, be32(page, hdr + 8), pageNo, kinds, parents); }
+}
+
+void child(Pages ps, i64 page, i64 parent, u8[] kinds, i64[] parents) {
+  kinds[page as! i32] = PTR_BTREE;
+  parents[page as! i32] = parent;
+  walkPage(ps, page, kinds, parents);
 }
 
 // A cell's bytes as they sit on a b-tree page, its overflow pages already written.

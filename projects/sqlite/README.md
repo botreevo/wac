@@ -42,7 +42,7 @@ data.
 | Typing | storage classes, column affinity, comparison affinity, `CAST`, integer overflow to real, SQLite's text for reals (`%!.15g`) |
 | Schema | `INTEGER PRIMARY KEY` as the rowid, `AUTOINCREMENT` with `sqlite_sequence`, `PRIMARY KEY`/`UNIQUE` (with their automatic indexes), `NOT NULL`, `DEFAULT`, `CHECK`, foreign keys (enforced under `PRAGMA foreign_keys`, with `CASCADE`/`SET NULL`/`SET DEFAULT`/`RESTRICT` and `DEFERRABLE`), `COLLATE` (`BINARY`, `NOCASE`, `RTRIM`), generated columns (`VIRTUAL` and `STORED`), `STRICT` tables, `WITHOUT ROWID` tables, partial and expression indexes, views (and `INSTEAD OF` triggers on them), triggers (`BEFORE`/`AFTER`, `UPDATE OF`, `WHEN`, `RAISE`) |
 | Functions | aggregates (`count sum total avg min max group_concat string_agg json_group_array json_group_object`, with `DISTINCT`, `FILTER` and `ORDER BY`), window functions (`row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value` and every aggregate, over `ROWS`/`RANGE`/`GROUPS` frames with `EXCLUDE`, named windows), the core scalar functions, `printf`/`format`, the date and time functions, the math functions, the JSON functions and `json_each`/`json_tree`, `->`, `->>`, `LIKE`/`GLOB` (with `ESCAPE`) |
-| Pragmas | `user_version`, `page_size`, `table_info`, and the ones an application sets and does not read back (`journal_mode`, `foreign_keys`, `busy_timeout`, …) |
+| Pragmas | `user_version`, `page_size`, `table_info`, `journal_mode` (WAL is kept), `auto_vacuum` (full and incremental files are written with their pointer maps; `VACUUM` applies a change, as in SQLite), and the ones an application sets and does not read back (`journal_mode`, `foreign_keys`, `busy_timeout`, …) |
 | Planning | an index (equality on leading columns, then a range) or the rowid narrows each source of a join; an index that delivers the `ORDER BY` lets a `LIMIT` stop early; a lone `min`/`max` reads one entry |
 
 ## Against SQLite's own wasm build
@@ -103,7 +103,7 @@ So:
 ## Not yet
 
 Table-valued functions other than `json_each`/`json_tree`, virtual tables (FTS5, R*Tree), `ATTACH`,
-`VACUUM`/`ANALYZE`, and text encodings other than UTF-8. Partial and expression indexes are kept and
+`ANALYZE`, and text encodings other than UTF-8. Partial and expression indexes are kept and
 enforced, but the planner does not yet read through them. Each missing feature is refused with an error
 rather than half done.
 

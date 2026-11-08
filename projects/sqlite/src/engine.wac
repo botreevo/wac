@@ -27,6 +27,7 @@ enum Undo {
   UAddColumn(Table t, Column[] cols, string sql),
   UUserVersion(i64 v),
   UWal(bool was),
+  UAutoVacuum(i32 mode, i32 pending),
 }
 
 export struct Connection {
@@ -283,6 +284,7 @@ void undoAll(Database db, Vec<Undo> undo) {
       }
       UUserVersion(v): { db.userVersion = v; }
       UWal(was): { db.wal = was; }
+      UAutoVacuum(mode, pending): { db.autoVacuum = mode; db.pendingAutoVacuum = pending; }
     }
   }
   undo.clear();
@@ -767,6 +769,17 @@ struct Statement {
       RenameColumnStmt(table, from, to): { try this.alterTable("rename column", table, from, to); return Result.Ok(noRows()); }
       DropColumnStmt(table, col): { try this.alterTable("drop column", table, col, ""); return Result.Ok(noRows()); }
       PragmaStmt(name, value): { return this.pragma(name, value); }
+      VacuumStmt: {
+        // Every image this writes is already vacuumed; what VACUUM adds is a pending auto_vacuum change.
+        if (this.conn.inTx) { return Result.Err(err("cannot VACUUM from within a transaction")); }
+        Database d = this.conn.db;
+        if (d.pendingAutoVacuum >= 0) {
+          this.undo.push(Undo.UAutoVacuum(d.autoVacuum, d.pendingAutoVacuum));
+          d.autoVacuum = d.pendingAutoVacuum;
+          d.pendingAutoVacuum = -1;
+        }
+        return Result.Ok(noRows());
+      }
       default: { return Result.Err(err("unexpected statement")); }
     }
   }
@@ -1652,6 +1665,30 @@ struct Statement {
       }
       return Result.Ok(one("journal_mode", Value.Text(d.wal ? "wal" : "delete")));
     }
+    if (name == "auto_vacuum") {
+      if (value is null) { return Result.Ok(one("auto_vacuum", Value.Int(d.autoVacuum as i64))); }
+      Value v = try this.constant(value!);
+      // Anything but the three names and numbers means none, as SQLite reads it.
+      i32 mode = 0;
+      match (v) {
+        Int(n): { if (n >= 0 && n <= 2) { mode = n as! i32; } }
+        Text(t): {
+          string w = lower(t);
+          mode = w == "full" || w == "1" ? 1 : (w == "incremental" || w == "2" ? 2 : 0);
+        }
+        default: {}
+      }
+      if (mode == d.autoVacuum) { return Result.Ok(noRows()); }
+      // As in SQLite: free to change while there are no tables, and between full and incremental, which
+      // keep the same pages; to or from none waits for VACUUM.
+      bool anyTable = false;
+      for (i32 i = 0; i < d.order.len(); i++) { if (d.order.get(i).kind == "table") { anyTable = true; } }
+      this.undo.push(Undo.UAutoVacuum(d.autoVacuum, d.pendingAutoVacuum));
+      if (!anyTable || (d.autoVacuum != 0 && mode != 0)) { d.autoVacuum = mode; d.pendingAutoVacuum = -1; }
+      else { d.pendingAutoVacuum = mode; }
+      return Result.Ok(noRows());
+    }
+    if (name == "incremental_vacuum") { return Result.Ok(noRows()); }
     if (name == "integrity_check" || name == "quick_check") { return Result.Ok(one(name, Value.Text("ok"))); }
     if (name == "foreign_keys") {
       if (value is null) { return Result.Ok(one("foreign_keys", Value.Int(this.conn.foreignKeys ? 1 : 0))); }

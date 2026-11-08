@@ -6,7 +6,7 @@ import { Value, collationId } from "./value.wac";
 import { encodeRecord, decodeRecord } from "./record.wac";
 import { put16, put32 } from "./bytes.wac";
 import { openImage, Image, readTable, readIndex, RawRow, decode, MAGIC } from "./reader.wac";
-import { Pages, buildTable, buildIndex } from "./writer.wac";
+import { Pages, buildTable, buildIndex, fillPtrmap } from "./writer.wac";
 import { Chunked } from "./chunked.wac";
 import { parseOne, callsWhere, nondeterministic } from "./parser.wac";
 import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef, TableConstraint, ForeignKeyDef, JOIN_FIRST } from "./ast.wac";
@@ -32,6 +32,8 @@ export struct Database {
   i64 userVersion;
   i64 applicationId;
   bool wal = false;               // in WAL mode, which the file header records and SQLite keeps
+  i32 autoVacuum = 0;             // PRAGMA auto_vacuum: 0 none, 1 full, 2 incremental
+  i32 pendingAutoVacuum = -1;     // a change to or from none, which waits for VACUUM, or -1
   // indexesOf's answers, valid while `order` is the same list at the same length: every schema change
   // either appends to it or replaces it.
   Vec<SchemaEntry>? cacheOrder;
@@ -453,6 +455,7 @@ export Result<Database, SqlError> openBytes(u8[] data) {
   db.userVersion = img.header.userVersion;
   db.applicationId = img.header.applicationId;
   db.wal = img.header.wal;
+  db.autoVacuum = img.header.autoVacuum;
   if (img.header.reserved != 0) { return Result.Err(SqlError.unsupported("reserved bytes per page")); }
   Vec<RawRow> schema = try readTable(img, 1);
   // Tables first, so an index can find its table whatever order the entries come in.
@@ -635,7 +638,7 @@ u8[][] keyedRecords(Index ix, Table t, Index pk) {
 // The whole database as a file image. `changeCounter` and the schema cookie are the caller's to
 // advance; this writes what the database holds.
 export u8[] toBytes(Database db) {
-  Pages ps = Pages(db.pageSize, Vec.create());
+  Pages ps = Pages(db.pageSize, Vec.create(), db.autoVacuum != 0);
   ps.reserve();
   // Roots are reserved up front so the schema can name them; contents follow in schema order.
   i64[] roots = i64[].filled(db.order.len(), 0);
@@ -699,14 +702,27 @@ export u8[] toBytes(Database db) {
     schemaIds.push((i + 1) as i64);
   }
   buildTable(ps, 1, schemaIds.toArray(), schemaRecs.toArray());
+  // Auto-vacuum: every root was reserved before any other page, so they are the first pages after the
+  // header's, and the largest of them is what the header records.
+  i64 largestRoot = 0;
+  if (db.autoVacuum != 0) {
+    largestRoot = 1;
+    Vec<i64> all;
+    all.push(1);
+    for (i64 r in roots) {
+      if (r > 0) { all.push(r); }
+      if (r > largestRoot) { largestRoot = r; }
+    }
+    fillPtrmap(ps, all.toArray());
+  }
   i32 n = ps.pages.len();
   u8[] out = u8[].filled(n * db.pageSize, 0);
   for (i32 i = 0; i < n; i++) { out.copyFrom(ps.pages.get(i), 0, i * db.pageSize, db.pageSize); }
-  writeHeader(out, db, n as i64);
+  writeHeader(out, db, n as i64, largestRoot);
   return out;
 }
 
-void writeHeader(u8[] b, const Database db, i64 pages) {
+void writeHeader(u8[] b, const Database db, i64 pages, i64 largestRoot) {
   u8[] m = MAGIC.toBytes();
   b.copyFrom(m, 0, 0, 16);
   put16(b, 16, db.pageSize == 65536 ? 1 : db.pageSize);
@@ -723,10 +739,10 @@ void writeHeader(u8[] b, const Database db, i64 pages) {
   put32(b, 40, db.schemaCookie);
   put32(b, 44, 4);
   put32(b, 48, 0);
-  put32(b, 52, 0);
+  put32(b, 52, largestRoot);
   put32(b, 56, 1);
   put32(b, 60, db.userVersion);
-  put32(b, 64, 0);
+  put32(b, 64, db.autoVacuum == 2 ? 1 : 0);
   put32(b, 68, db.applicationId);
   put32(b, 92, db.changeCounter);
   put32(b, 96, SQLITE_VERSION_NUMBER);

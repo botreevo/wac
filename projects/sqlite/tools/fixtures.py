@@ -112,6 +112,16 @@ def make_wal(path):
         if os.path.exists("/tmp/wal-oracle.db" + side): os.remove("/tmp/wal-oracle.db" + side)
     os.remove("/tmp/wal-oracle.txt")
 
+def auto_vacuum(con):
+    # Set before the first table, as SQLite requires; rows long enough for overflow chains and trees
+    # several levels deep, so the pointer map has every kind of entry.
+    con.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    rnd = random.Random(5)
+    con.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, s TEXT, b BLOB)")
+    con.execute("CREATE INDEX a_s ON a (s)")
+    con.executemany("INSERT INTO a (s, b) VALUES (?, ?)",
+                    [("s%05d" % rnd.randint(0, 99999) + "z" * rnd.randint(0, 600), bytes(rnd.randint(0, 2500))) for _ in range(120)])
+
 os.makedirs("test/data", exist_ok=True)
 make("test/data/small.db", 4096, small)
 make("test/data/big.db", 1024, big)
@@ -119,3 +129,4 @@ make("test/data/big4k.db", 4096, big)
 # Not vacuumed, which would rewrite the short records.
 make("test/data/without_rowid.db", 1024, without_rowid, vacuum=False)
 make_wal("test/data/wal.db")
+make("test/data/autovacuum.db", 1024, auto_vacuum)

@@ -10,7 +10,7 @@ import { parseOne, Parsed, isBlank } from "./parser.wac";
 import { Table, Row, Index, Entry, Column, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_INTEGER } from "./schema.wac";
 import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
-import { Exec, Scope, Ctx, Named, topCtx, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable } from "./query.wac";
+import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable } from "./query.wac";
 import { applyAffinity, isNull, textOf } from "./ops.wac";
 import { FnEnv } from "./functions.wac";
 import { lower } from "./lexer.wac";
@@ -820,7 +820,12 @@ struct Statement {
   Result<bool, SqlError> prepareRow(this, Table t, Row r, i32 orAction) {
     for (i32 i = 0; i < t.cols.len(); i++) {
       if (i == t.rowidAlias) { r.vals[i] = Value.Int(r.rowid); continue; }
-      r.vals[i] = applyAffinity(r.vals[i], t.cols[i].affinity);
+      if (t.cols[i].gen is null) { r.vals[i] = applyAffinity(r.vals[i], t.cols[i].affinity); }
+    }
+    if (t.hasGenerated()) { try fillGenerated(t, r, this.conn.db); }
+    if (t.strict) { try this.strictHolds(t, r); }
+    for (i32 i = 0; i < t.cols.len(); i++) {
+      if (i == t.rowidAlias) { continue; }
       if (t.cols[i].notNull && isNull(r.vals[i])) {
         if (orAction == OR_IGNORE) { return Result.Ok(false); }
         if (orAction == OR_REPLACE && t.cols[i].dflt is not null) {
@@ -832,6 +837,19 @@ struct Statement {
       }
     }
     return this.checksHold(t, r, orAction);
+  }
+
+  // A STRICT table's values are of their column's type once its affinity has been applied.
+  Result<void, SqlError> strictHolds(this, Table t, Row r) {
+    for (i32 i = 0; i < t.cols.len(); i++) {
+      string ty = t.cols[i].strictType;
+      if (ty == "" || ty == "ANY") { continue; }
+      Value v = r.vals[i];
+      string have = match (v) { Null: "", Int: "INTEGER", Real: "REAL", Text: "TEXT", Blob: "BLOB" };
+      if (have == "" || have == ty) { continue; }
+      return Result.Err(constraint("cannot store \{have} value in \{ty} column \{t.name}.\{t.cols[i].name}"));
+    }
+    return Result.Ok();
   }
 
   string describeKey(this, Table t, i32[] cols) {
@@ -877,8 +895,15 @@ struct Statement {
         }
       }
     } else {
-      target = i32[].filled(t.cols.len(), 0);
-      for (i32 i = 0; i < target.len(); i++) { target[i] = i; }
+      // Without a column list, the values go to every column but the generated ones.
+      Vec<i32> all;
+      for (i32 i = 0; i < t.cols.len(); i++) { if (t.cols[i].gen is null) { all.push(i); } }
+      target = all.toArray();
+    }
+    for (i32 i = 0; i < target.len(); i++) {
+      if (target[i] >= 0 && t.cols[target[i]].gen is not null) {
+        return Result.Err(err("cannot INSERT into generated column \"\{t.cols[target[i]].name}\""));
+      }
     }
     Vec<Value[]> source;
     if (ins.defaultValues) {
@@ -908,7 +933,7 @@ struct Statement {
         set[target[i]] = true;
       }
       for (i32 i = 0; i < vals.len(); i++) {
-        if (!set[i] && i != t.rowidAlias) { vals[i] = try this.defaultFor(t.cols[i]); }
+        if (!set[i] && i != t.rowidAlias && t.cols[i].gen is null) { vals[i] = try this.defaultFor(t.cols[i]); }
       }
       if (t.rowidAlias >= 0 && set[t.rowidAlias]) { rowidGiven = vals[t.rowidAlias]; }
       i64 rowid = 0;
@@ -964,7 +989,7 @@ struct Statement {
   Result<Row?, SqlError> upsertUpdate(this, Table t, Row existing, Row proposed, Upsert u) {
     // `excluded` is a scope outside the table's, so a bare name means the table's column and only
     // `excluded.x` reaches the proposed row, as in SQLite.
-    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create(), Expr[](), ForeignKey[](), i32[]());
+    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[]());
     Scope outer = Scope([BoundSource("excluded", ex, JOIN_FIRST, null, false, string[]())], null, null, false);
     Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[]())], outer, null, false);
     Ctx c = Ctx([existing as Row?], Ctx([proposed as Row?], null, null, null, null), null, null, null);
@@ -992,6 +1017,9 @@ struct Statement {
         if (t.rowidAlias >= 0 || (nm != "rowid" && nm != "oid" && nm != "_rowid_")) {
           return Result.Err(err("no such column: \{a.cols[0]}"));
         }
+      }
+      if (col >= 0 && t.cols[col].gen is not null) {
+        return Result.Err(err("cannot UPDATE generated column \"\{t.cols[col].name}\""));
       }
       if (col == t.rowidAlias) { col = -1; }
       cols[i] = col;
@@ -1227,7 +1255,7 @@ struct Statement {
     }
     if (t.autoincrement && d.table("sqlite_sequence") is null) {
       Table seq = Table("sqlite_sequence", "CREATE TABLE sqlite_sequence(name,seq)",
-                        [Column("name", "", 0, false, null, 0), Column("seq", "", 0, false, null, 0)], -1, false, Vec.create(),
+                        [Column("name", "", 0, false, null, 0, null, false, ""), Column("seq", "", 0, false, null, 0, null, false, "")], -1, false, Vec.create(), false,
                         Expr[](), ForeignKey[](), i32[]());
       d.tables.set("sqlite_sequence", seq);
       d.order.push(SchemaEntry("table", "sqlite_sequence", "sqlite_sequence"));
@@ -1542,7 +1570,7 @@ struct Statement {
     Column[] cols = Column[].defaulted(t.cols.len() + 1);
     cols.copyFrom(t.cols, 0, 0, t.cols.len());
     cols[t.cols.len()] = Column(c.name, c.typeName, affinityOf(c.typeName), c.notNull, c.dflt,
-                                c.collate is null ? 0 : collationId(c.collate!));
+                                c.collate is null ? 0 : collationId(c.collate!), c.generated, c.stored, "");
     Value stored = applyAffinity(dv, cols[t.cols.len()].affinity);
     for (i32 i = 0; i < t.rows.len(); i++) {
       Row r = t.rows.get(i);

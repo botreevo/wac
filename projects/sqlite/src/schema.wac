@@ -29,6 +29,9 @@ export struct Column {
   bool notNull = false;
   Expr? dflt;
   i32 coll = 0;
+  Expr? gen;              // a generated column's expression
+  bool stored = false;    // STORED; otherwise a generated column is VIRTUAL and not in the record
+  string strictType = ""; // in a STRICT table: INTEGER, REAL, TEXT, BLOB or ANY
 }
 
 export struct Row {
@@ -57,6 +60,10 @@ export struct Index {
   bool[] desc;
   i32[] colls;          // each column's collation
   bool unique = false;
+  // A partial index holds only the rows its WHERE accepts; an index on expressions computes its key.
+  // Either makes it unfit for the planner, which looks rows up by column values.
+  fn<bool(Row)>? pred;
+  fn<Value[](Row)>? keyFn;
   // Every entry, sorted: the indexed values, then the rowid — exactly the record the file stores.
   Chunked<Entry> entries;
 
@@ -69,7 +76,18 @@ export struct Index {
     return a.len() < b.len() ? -1 : (a.len() > b.len() ? 1 : 0);
   }
 
+  bool special(const this) { return this.pred is not null || this.keyFn is not null; }
+
+  bool holds(this, Row r) { return this.pred is null || this.pred!(r); }
+
   Value[] entryFor(this, Row r) {
+    if (this.keyFn is not null) {
+      Value[] k = this.keyFn!(r);
+      Value[] e2 = Value[].filled(k.len() + 1, Value.Null);
+      e2.copyFrom(k, 0, 0, k.len());
+      e2[k.len()] = Value.Int(r.rowid);
+      return e2;
+    }
     Value[] e = Value[].filled(this.cols.len() + 1, Value.Null);
     for (i32 i = 0; i < this.cols.len(); i++) { e[i] = r.vals[this.cols[i]]; }
     e[this.cols.len()] = Value.Int(r.rowid);
@@ -107,11 +125,13 @@ export struct Index {
   }
 
   void add(this, Row r) {
+    if (!this.holds(r)) { return; }
     Value[] e = this.entryFor(r);
     this.entries.insert(this.lowerBound(e), Entry(e, null));
   }
 
   void drop(this, Row r) {
+    if (!this.holds(r)) { return; }
     Value[] e = this.entryFor(r);
     i32 at = this.lowerBound(e);
     if (at < this.entries.len() && this.compare(this.entries.get(at).key, e) == 0) { this.entries.remove(at); }
@@ -120,7 +140,7 @@ export struct Index {
   // The rowid of a row other than `self` holding the same key, when this index is unique. NULLs are
   // distinct from each other, so a key with one never conflicts.
   i64? conflict(this, Row r, i64 self) {
-    if (!this.unique) { return null; }
+    if (!this.unique || !this.holds(r)) { return null; }
     Value[] e = this.entryFor(r);
     Value[] key = Value[].filled(this.cols.len(), Value.Null);
     for (i32 i = 0; i < key.len(); i++) {
@@ -157,9 +177,20 @@ export struct Table {
   i32 rowidAlias = -1;   // the INTEGER PRIMARY KEY column, or -1
   bool autoincrement = false;
   Vec<Row> rows;         // sorted by rowid
+  bool strict = false;
   Expr[] checks;
   ForeignKey[] fks;
   i32[] pk;              // the PRIMARY KEY's columns, in order; empty when there is none
+
+  bool hasVirtual(const this) {
+    for (i32 i = 0; i < this.cols.len(); i++) { if (this.cols[i].gen is not null && !this.cols[i].stored) { return true; } }
+    return false;
+  }
+
+  bool hasGenerated(const this) {
+    for (i32 i = 0; i < this.cols.len(); i++) { if (this.cols[i].gen is not null) { return true; } }
+    return false;
+  }
 
   i32 colIndex(const this, string name) {
     string n = lower(name);

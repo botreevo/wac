@@ -44,29 +44,45 @@ bool isZero(const Expr e) {
 }
 
 // Whether an expression calls a function anywhere in it (SQLite's EP_HasFunc).
-bool hasCall(const Expr e) {
+bool hasCall(const Expr e) { return callsWhere(e, (string n) => true); }
+
+// Whether an expression calls a function whose name `pick` accepts, at any depth.
+export bool callsWhere(const Expr e, fn<bool(string)> pick) {
   match (e) {
-    Call: { return true; }
-    Unary(op, x): { return hasCall(x); }
-    Binary(op, l, r): { return hasCall(l) || hasCall(r); }
-    IsNull(x, n): { return hasCall(x); }
-    Between(x, lo, hi, n): { return hasCall(x) || hasCall(lo) || hasCall(hi); }
+    Call(name, args, star, distinct): {
+      if (pick(name)) { return true; }
+      for (i32 i = 0; i < args.len(); i++) { if (callsWhere(args[i], pick)) { return true; } }
+      return false;
+    }
+    Unary(op, x): { return callsWhere(x, pick); }
+    Binary(op, l, r): { return callsWhere(l, pick) || callsWhere(r, pick); }
+    IsNull(x, n): { return callsWhere(x, pick); }
+    Between(x, lo, hi, n): { return callsWhere(x, pick) || callsWhere(lo, pick) || callsWhere(hi, pick); }
     InList(x, items, n): {
-      if (hasCall(x)) { return true; }
-      for (i32 i = 0; i < items.len(); i++) { if (hasCall(items[i])) { return true; } }
+      if (callsWhere(x, pick)) { return true; }
+      for (i32 i = 0; i < items.len(); i++) { if (callsWhere(items[i], pick)) { return true; } }
       return false;
     }
-    InSelect(x, sub, n): { return hasCall(x); }
+    InSelect(x, sub, n): { return callsWhere(x, pick); }
     Case(base, whens, thens, other): {
-      if (base is not null && hasCall(base!)) { return true; }
-      if (other is not null && hasCall(other!)) { return true; }
-      for (i32 i = 0; i < whens.len(); i++) { if (hasCall(whens[i]) || hasCall(thens[i])) { return true; } }
+      if (base is not null && callsWhere(base!, pick)) { return true; }
+      if (other is not null && callsWhere(other!, pick)) { return true; }
+      for (i32 i = 0; i < whens.len(); i++) {
+        if (callsWhere(whens[i], pick) || callsWhere(thens[i], pick)) { return true; }
+      }
       return false;
     }
-    Cast(x, t): { return hasCall(x); }
-    Collate(x, c): { return hasCall(x); }
+    Cast(x, t): { return callsWhere(x, pick); }
+    Collate(x, c): { return callsWhere(x, pick); }
     default: { return false; }
   }
+}
+
+// The functions whose answer can change between calls with the same arguments, which an index,
+// a CHECK constraint or a generated column may not use.
+export bool nondeterministic(string name) {
+  return name == "random" || name == "randomblob" || name == "changes" || name == "total_changes" ||
+         name == "last_insert_rowid";
 }
 
 // A real literal's value, read as SQLite reads it (fp.wac's port of sqlite3AtoF).
@@ -1090,15 +1106,25 @@ export struct Parser {
     try this.expectOp("(");
     Vec<IndexCol> cols;
     while (true) {
+      // A term is a column name, or any expression (an index on an expression).
+      i32 at = this.pos;
       Token c = this.peek();
-      if (c.kind != T_IDENT && c.kind != T_STRING) { return Result.Err(SqlError.unsupported("indexes on expressions")); }
-      this.pos++;
-      if (this.isOp("(") || this.isOp(".")) { return Result.Err(SqlError.unsupported("indexes on expressions")); }
-      string? coll = null;
-      if (this.eatKw("COLLATE")) { coll = lower(try this.name()); }
-      bool desc = false;
-      if (this.eatKw("DESC")) { desc = true; } else { this.eatKw("ASC"); }
-      cols.push(IndexCol(c.text, desc, coll));
+      Expr e = try this.expr();
+      IndexCol ic = IndexCol { name: "", desc: false };
+      match (e) {
+        Col(tb, nm): { if (tb is null) { ic.name = nm; } else { ic.expr = e as Expr; } }
+        Collate(inner, coll): {
+          ic.collate = coll;
+          match (inner) { Col(tb, nm): { if (tb is null) { ic.name = nm; } else { ic.expr = inner as Expr; } } default: { ic.expr = inner as Expr; } }
+        }
+        default: { ic.expr = e as Expr; }
+      }
+      if (c.kind == T_STRING && ic.expr is not null) {
+        // A string literal as a term names a column, as SQLite has always allowed.
+        match (e) { Lit(v): { ic.expr = null; ic.name = c.text; } default: {} }
+      }
+      if (this.eatKw("DESC")) { ic.desc = true; } else { this.eatKw("ASC"); }
+      cols.push(ic);
       if (!this.eatOp(",")) { break; }
     }
     try this.expectOp(")");
@@ -1150,7 +1176,12 @@ export struct Parser {
       } else if (this.eatKw("REFERENCES")) {
         c.fk = try this.foreignKeyRest();
       } else if (this.isKw("GENERATED") || this.isKw("AS")) {
-        return Result.Err(SqlError.unsupported("generated columns"));
+        if (this.eatKw("GENERATED")) { try this.expectKw("ALWAYS"); }
+        try this.expectKw("AS");
+        try this.expectOp("(");
+        c.generated = try this.expr();
+        try this.expectOp(")");
+        if (this.eatKw("STORED")) { c.stored = true; } else { this.eatKw("VIRTUAL"); }
       } else {
         break;
       }
@@ -1244,18 +1275,21 @@ export struct Parser {
     }
     try this.expectOp(")");
     bool withoutRowid = false;
+    bool strict = false;
     while (true) {
       if (this.eatKw("WITHOUT")) {
         try this.expectKw("ROWID");
         withoutRowid = true;
-      } else if (!this.eatKw("STRICT")) {
+      } else if (this.eatKw("STRICT")) {
+        strict = true;
+      } else {
         break;
       }
       if (!this.eatOp(",")) { break; }
     }
     if (withoutRowid) { return Result.Err(SqlError.unsupported("WITHOUT ROWID tables")); }
     string sql = "CREATE TABLE " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
-    return Result.Ok(CreateTable(n, ine, cols.toArray(), cons.toArray(), false, sql));
+    return Result.Ok(CreateTable(n, ine, cols.toArray(), cons.toArray(), false, sql, strict));
   }
 }
 

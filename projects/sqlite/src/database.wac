@@ -8,9 +8,13 @@ import { put16, put32 } from "./bytes.wac";
 import { openImage, Image, readTable, readIndex, RawRow, decode, MAGIC } from "./reader.wac";
 import { Pages, buildTable, buildIndex } from "./writer.wac";
 import { Chunked } from "./chunked.wac";
-import { parseOne } from "./parser.wac";
-import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef, TableConstraint, ForeignKeyDef } from "./ast.wac";
+import { parseOne, callsWhere, nondeterministic } from "./parser.wac";
+import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef, TableConstraint, ForeignKeyDef, JOIN_FIRST } from "./ast.wac";
 import { lower, upper } from "./lexer.wac";
+import { Exec, Scope, Ctx, bindExpr, eval, fillGenerated } from "./query.wac";
+import { Node, BoundSource } from "./plan.wac";
+import { FnEnv } from "./functions.wac";
+import { truth } from "./ops.wac";
 import { Column, Row, Index, Entry, Table, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_REAL } from "./schema.wac";
 
 // What version of SQLite the file claims was the last to write it. Readers only print it.
@@ -119,9 +123,24 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
       coll = collationId(d.collate!);
       if (coll < 0) { return Result.Err(err0("no such collation sequence: \{d.collate!}")); }
     }
-    cols.push(Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt, coll));
+    Column col = Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt, coll, d.generated, d.stored, "");
+    if (c.strict) {
+      string ty = upper(d.typeName);
+      if (ty == "INT") { ty = "INTEGER"; }
+      if (ty == "") { return Result.Err(SqlError.schema("missing datatype for \{c.name}.\{d.name}")); }
+      if (ty != "INTEGER" && ty != "REAL" && ty != "TEXT" && ty != "BLOB" && ty != "ANY") {
+        return Result.Err(SqlError.schema("unknown datatype for \{c.name}.\{d.name}: \"\{d.typeName}\""));
+      }
+      col.strictType = ty;
+      // ANY keeps values exactly as given.
+      if (ty == "ANY") { col.affinity = 0; }
+    }
+    if (d.generated is not null && (d.primaryKey || d.dflt is not null)) {
+      return Result.Err(SqlError.schema("generated columns cannot be part of the PRIMARY KEY or have a default"));
+    }
+    cols.push(col);
   }
-  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create(), Expr[](), ForeignKey[](), i32[]());
+  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create(), c.strict, Expr[](), ForeignKey[](), i32[]());
   i32 pkCount = 0;
   for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].primaryKey) { pkCount++; } }
   for (i32 i = 0; i < c.constraints.len(); i++) {
@@ -156,6 +175,11 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
       if (pos[k] < 0) { return Result.Err(SqlError.schema("no such column: \{names[k]}")); }
     }
     bool pk = c.constraints[i].kind.indexOf("PRIMARY KEY") == 0;
+    for (i32 k = 0; pk && k < pos.len(); k++) {
+      if (t.cols[pos[k]].gen is not null) {
+        return Result.Err(SqlError.schema("generated columns cannot be part of the PRIMARY KEY"));
+      }
+    }
     if (pk && pos.len() == 1 && isIntegerType(t.cols[pos[0]].typeName)) {
       t.rowidAlias = pos[0];
       t.autoincrement = c.constraints[i].kind == "PRIMARY KEY AUTOINCREMENT";
@@ -201,7 +225,7 @@ Index autoIndex(Table t, i32 n, i32[] cols) {
   i32[] colls = i32[].filled(cols.len(), 0);
   for (i32 i = 0; i < cols.len(); i++) { colls[i] = t.cols[cols[i]].coll; }
   return Index("sqlite_autoindex_\{t.name}_\{n}", t.name, null, cols, bool[].filled(cols.len(), false), colls, true,
-               Chunked<Entry>.create());
+               null, null, Chunked<Entry>.create());
 }
 
 export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
@@ -209,6 +233,15 @@ export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
   bool[] desc = bool[].filled(c.cols.len(), false);
   i32[] colls = i32[].filled(c.cols.len(), 0);
   for (i32 i = 0; i < c.cols.len(); i++) {
+    if (c.cols[i].expr is not null) {
+      if (callsWhere(c.cols[i].expr!, nondeterministic)) {
+        return Result.Err(err0("non-deterministic functions prohibited in index expressions"));
+      }
+      pos[i] = 0;
+      if (c.cols[i].collate is not null) { colls[i] = collationId(c.cols[i].collate!); }
+      desc[i] = c.cols[i].desc;
+      continue;
+    }
     pos[i] = t.colIndex(c.cols[i].name);
     if (pos[i] < 0) { return Result.Err(SqlError.schema("no such column: \{c.cols[i].name}")); }
     desc[i] = c.cols[i].desc;
@@ -218,13 +251,52 @@ export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
       if (colls[i] < 0) { return Result.Err(err0("no such collation sequence: \{c.cols[i].collate!}")); }
     }
   }
-  if (c.where is not null) { return Result.Err(SqlError.unsupported("partial indexes")); }
-  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, colls, c.unique, Chunked<Entry>.create()));
+  Index ix = Index(c.name, t.name, c.sql, pos, desc, colls, c.unique, null, null, Chunked<Entry>.create());
+  // A partial index's WHERE and an expression index's terms are evaluated against each row.
+  Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[]())], null, null, false);
+  Exec x = Exec { db: Database.empty(), params: Value[](), env: FnEnv { nowMillis: 0, changes: 0, totalChanges: 0,
+                  lastInsertRowid: 0, randomBytes: u8[].filled(8, 0), randomAt: 0 }, ctes: Vec.create() };
+  if (c.where is not null) {
+    if (callsWhere(c.where!, nondeterministic)) {
+      return Result.Err(err0("non-deterministic functions prohibited in partial index WHERE clauses"));
+    }
+    Node w = try bindExpr(c.where!, sc, x);
+    ix.pred = (Row r) => truth(eval(w, Ctx([r as Row?], null, null, null, null), x).orElse(Value.Null)) == 1;
+  }
+  bool anyExpr = false;
+  for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].expr is not null) { anyExpr = true; } }
+  if (anyExpr) {
+    Node[] terms = Node[].filled(c.cols.len(), Node.NLit(Value.Null));
+    for (i32 i = 0; i < c.cols.len(); i++) {
+      if (c.cols[i].expr is not null) { terms[i] = try bindExpr(c.cols[i].expr!, sc, x); }
+      else { terms[i] = Node.NCol(0, 0, pos[i], t.cols[pos[i]].affinity, t.cols[pos[i]].coll); }
+    }
+    ix.keyFn = (Row r) => {
+      Value[] k = Value[].filled(terms.len(), Value.Null);
+      Ctx cx = Ctx([r as Row?], null, null, null, null);
+      for (i32 i = 0; i < terms.len(); i++) { k[i] = eval(terms[i], cx, x).orElse(Value.Null); }
+      return k;
+    };
+  }
+  return Result.Ok(ix);
 }
 
 // A row as the file has it, widened to the table's columns: a row written before ALTER TABLE ADD COLUMN
 // is shorter, and its missing values are the column's default.
-Row rowFrom(Table t, i64 rowid, Value[] stored) {
+Row rowFrom(Table t, i64 rowid, Value[] stored0) {
+  Value[] stored = stored0;
+  if (t.hasVirtual()) {
+    // A VIRTUAL generated column is not in the record: spread the record over the other columns, and
+    // leave the virtual ones to be computed.
+    Value[] spread = Value[].filled(t.cols.len(), Value.Null);
+    i32 k = 0;
+    for (i32 i = 0; i < t.cols.len(); i++) {
+      if (t.cols[i].gen is not null && !t.cols[i].stored) { continue; }
+      if (k < stored0.len()) { spread[i] = stored0[k]; }
+      k++;
+    }
+    stored = spread;
+  }
   // Usually the record is exactly the row: take its array rather than copying it.
   if (stored.len() == t.cols.len()) {
     for (i32 i = 0; i < stored.len(); i++) {
@@ -255,8 +327,11 @@ Row rowFrom(Table t, i64 rowid, Value[] stored) {
 }
 
 export void rebuildIndex(Index ix, Table t) {
-  Entry[] arr = Entry[].filled(t.rows.len(), Entry(Value[](), null));
-  for (i32 i = 0; i < t.rows.len(); i++) { arr[i] = Entry(ix.entryFor(t.rows.get(i)), null); }
+  Vec<Entry> some;
+  for (i32 i = 0; i < t.rows.len(); i++) {
+    if (ix.holds(t.rows.get(i))) { some.push(Entry(ix.entryFor(t.rows.get(i)), null)); }
+  }
+  Entry[] arr = some.toArray();
   sortEntries(ix, arr);
   ix.entries = Chunked.fromArray(arr);
 }
@@ -265,6 +340,7 @@ export void rebuildIndex(Index ix, Table t) {
 // entries cannot simply be taken: a count that disagrees with the table, or a REAL column, whose
 // integral values the file may hold as integers.
 Index? indexFromFile(Index ix, Table t, Image img, i64 root) {
+  if (ix.special()) { return null; }
   for (i32 c in ix.cols) { if (t.cols[c].affinity == AFF_REAL) { return null; } }
   match (readIndex(img, root)) {
     Ok(raw): {
@@ -346,6 +422,7 @@ export Result<Database, SqlError> openBytes(u8[] data) {
         for (i32 k = 0; k < raw.len(); k++) {
           Row r = rowFrom(t, raw.get(k).rowid, try decode(raw.get(k).payload));
           r.rec = raw.get(k).payload;
+          if (t.hasVirtual()) { try fillGenerated(t, r, db); }
           t.rows.push(r);
         }
         db.tables.set(lower(t.name), t);
@@ -417,6 +494,14 @@ export u8[] rowRecord(Table t, Row r) {
 }
 
 u8[] encodeRow(Table t, Row r) {
+  if (t.hasVirtual()) {
+    Vec<Value> v;
+    for (i32 i = 0; i < r.vals.len(); i++) {
+      if (t.cols[i].gen is not null && !t.cols[i].stored) { continue; }
+      v.push(i == t.rowidAlias ? Value.Null : r.vals[i]);
+    }
+    return encodeRecord(v.toArray());
+  }
   if (t.rowidAlias < 0) { return encodeRecord(r.vals); }
   Value[] v = Value[].filled(r.vals.len(), Value.Null);
   v.copyFrom(r.vals, 0, 0, r.vals.len());

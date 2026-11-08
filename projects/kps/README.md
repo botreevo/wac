@@ -23,8 +23,8 @@ repository is the KPS layer: addresses and pinning, the WebRTC stream framing an
 | the WebRTC mapping (framing, HELLO, credit) | **done**, one engine under every WebRTC end (`src/webrtc/conn.wac`, `test/engine_test.wac`) |
 | the listener, WebRTC | **done**: Chromium running `@kpstreams/webrtc-client` passes as many scenarios against it as against `@kpstreams/server`, and Go's pion client echoes, crosses the window, and closes with a code (`test/listener_test.wac`) |
 | the dialer from a page | **done**: a page built with `--grant webrtc` drives the browser's own RTCPeerConnection through wac-web's `wac.webrtc` and runs the same scenarios, 8 of 8, against `@kpstreams/server` and the wac listener (`src/webrtc/page.wac`, `test/page_test.wac`) |
-| the native WebRTC dialer | next |
-| QUIC: the dialer, and the listener's QUIC path | not started |
+| the native WebRTC dialer | **done**: wac's own ICE (controlling), DTLS client and SCTP initiator, upstream in wac's `webrtc` package; the same scenarios pass against `@kpstreams/server` (libdatachannel), the wac listener, and Go's `kps-server` (pion) as far as its example server serves them, and a certhash naming another key is not dialled (`src/webrtc/dial.wac`, `test/dial_test.wac`) |
+| QUIC: the dialer, and the listener's QUIC path | next |
 
 ## Running it
 
@@ -38,4 +38,4 @@ During development the transport work is in a local wac checkout, and the page c
 
 A page that dials: `wac run --allow-read --allow-write --allow-run <wac-web>/tools/build.wac cmd/dialpage.wac <dir>
 --grant webrtc`, then open `<dir>/index.html#<address>` — or `node interop/js/page-dial.mjs <dir> <address>` to run it
-in Chromium and print what it reports.
+in Chromium and print what it reports. Natively: `wac run --allow-net cmd/dial.wac <address>`.

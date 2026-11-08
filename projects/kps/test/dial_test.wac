@@ -1,0 +1,108 @@
+// The native dialer, judged against every listener there is: `@kpstreams/server` (libdatachannel — libjuice ICE,
+// OpenSSL DTLS, usrsctp), Go's `kps-server` (pion), and wac-kps's own.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-net test/dial_test.wac
+//
+// `cmd/dial.wac` is built once and run against each with the scenarios the page runs (`cmd/scenarios.wac`). Go's
+// example server echoes streams and nothing else — no datagrams, and a reset stream is answered with a FIN — so
+// against it those two lines are expected to fail, and the reset is checked from its log instead. A dial whose
+// certhash names a different key must fail: the pin is the whole of KPS's authentication.
+
+import { Check } from "./check.wac";
+import { splitLines } from "./oracle.wac";
+import { Vec, flatten } from "core";
+import { ChildEnv, Exec, Launch, Procs, Sys } from "std";
+
+Exec sh(Procs procs, string script) {
+  return flatten(procs.exec("/bin/sh", ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+/** Start a server with `cmd`, which prints its address somewhere matching `pattern`; answer it, or "". */
+string started(Procs procs, string cmd, string log, string pattern) {
+  sh(procs, "(\{cmd} > \{log} 2>&1 &)");
+  for (i32 i = 0; i < 100; i++) {
+    Exec e = sh(procs, "grep -o '\{pattern}' \{log} | head -1 | grep -o '[0-9.]*:[0-9]*:u[A-Za-z0-9_-]*'; sleep 0.1");
+    string a = string.fromBytes(e.stdout);
+    while (a.len() > 0 && a.slice(a.len() - 1, a.len()) == "\n") { a = a.slice(0, a.len() - 1); }
+    if (a.len() > 0) { return a; }
+  }
+  return "";
+}
+
+/** Dial `addr`; answer the lines that passed and failed, `PASS`/`FAIL` prefixes kept, and whether it finished. */
+struct Run {
+  string[] passed;
+  string[] failed;
+  bool done;
+  string out;
+}
+
+Run dialled(Procs procs, string addr) {
+  Exec e = sh(procs, "timeout 240 wac .tmp/dialtest/dial.wasm '\{addr}' 2>&1");
+  string out = string.fromBytes(e.stdout);
+  Vec<string> passed = Vec<string>.create();
+  Vec<string> failed = Vec<string>.create();
+  bool done = false;
+  for (string line in splitLines(out)) {
+    if (line.indexOf("PASS ") == 0) { passed.push(line.slice(5, line.len())); }
+    if (line.indexOf("FAIL ") == 0) { failed.push(line.slice(5, line.len())); }
+    if (line.indexOf("DONE ") == 0) { done = true; }
+  }
+  return Run(passed.toArray(), failed.toArray(), done, out);
+}
+
+export string test_the_native_dialer_against_libdatachannel_pion_and_wac(Sys sys) {
+  Check c = Check.create();
+  Procs procs = sys.procs();
+  sh(procs, "mkdir -p .tmp/dialtest && rm -f .tmp/dialtest/*.log");
+  Exec built = sh(procs, "wac build cmd/dial.wac -o .tmp/dialtest/dial --allow-net --quiet 2>&1 && " +
+                         "wac build cmd/echo.wac -o .tmp/dialtest/echo --allow-net --allow-read --allow-write --quiet 2>&1");
+  c.eqI32(built.status, 0, "the dialer and the echo server build: \{string.fromBytes(built.stdout)}");
+  if (built.status != 0) { return c.report(); }
+
+  string js = started(procs, "timeout 300 node interop/js/js-echo-server.mjs .tmp/dialtest 41994", ".tmp/dialtest/js.log", "kps [^ ]*");
+  c.ok(js.len() > 0, "the reference listener started");
+  if (js.len() > 0) {
+    Run r = dialled(procs, js);
+    c.ok(r.done && r.failed.len() == 0 && r.passed.len() == 8, "@kpstreams/server: every scenario passes: \{r.out}");
+  }
+  sh(procs, "pkill -f 'js-echo-server.mjs .tmp/dialtest' || true");
+
+  string wac = started(procs, "timeout 300 wac .tmp/dialtest/echo.wasm .tmp/dialtest/id 0 127.0.0.1", ".tmp/dialtest/wac.log", "kps [^ ]*");
+  c.ok(wac.len() > 0, "the wac listener started");
+  if (wac.len() > 0) {
+    Run r = dialled(procs, wac);
+    c.ok(r.done && r.failed.len() == 0 && r.passed.len() == 8, "wac-kps: every scenario passes: \{r.out}");
+    // The same listener under a certhash naming some other key: the handshake runs, the pin refuses it.
+    string other = wac.slice(0, lastColon(wac) + 1) + js.slice(lastColon(js) + 1, js.len());
+    if (js.len() > 0) {
+      Run wrong = dialled(procs, other);
+      c.ok(wrong.passed.len() == 0 && wrong.failed.len() == 1 && wrong.failed[0].indexOf("the dial establishes") == 0,
+           "a certhash naming another key is not dialled: \{wrong.out}");
+    }
+  }
+  sh(procs, "pkill -f 'dialtest/echo.wasm' || true");
+
+  string go = started(procs, "timeout 300 interop/go/bin/kps-server -listen 127.0.0.1:41993 -key .tmp/dialtest/go.key",
+                      ".tmp/dialtest/go.log", "dial(\"[^\"]*");
+  c.ok(go.len() > 0, "Go's listener started");
+  if (go.len() > 0) {
+    Run r = dialled(procs, go);
+    c.ok(r.done && r.passed.len() == 6, "pion: the stream scenarios pass: \{r.out}");
+    bool onlyTheTwo = r.failed.len() == 2 && r.failed[0].indexOf("datagrams cross") == 0 &&
+                      r.failed[1].indexOf("a reset reaches") == 0;
+    c.ok(onlyTheTwo, "and only the two its example server does not serve fail: \{r.out}");
+    Exec log = sh(procs, "grep -c 'stream reset (code 4)' .tmp/dialtest/go.log");
+    c.eqStr(string.fromBytes(log.stdout), "1\n", "the reset reached pion with its code (4, timeout)");
+  }
+  sh(procs, "pkill -f 'kps-server -listen 127.0.0.1:41993' || true");
+  return c.report();
+}
+
+/** Where an address's certhash starts, less one: its last colon. */
+i32 lastColon(string s) {
+  i32 at = -1;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == ':') { at = i; } }
+  return at;
+}

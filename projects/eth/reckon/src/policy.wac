@@ -1,0 +1,297 @@
+// The policy a user owns, and the engine that applies it: design/system/0016 H5.
+//
+// The engine is a pure function: statements (already verified), a policy, a subject and what it is for, and
+// what the chain said about revocations and deny lists — in, a decision and its reasons out. It knows nothing
+// about Ethereum beyond the shape of an address; `registry.wac` is what fills in `Chain`.
+//
+//     {
+//       signers: { alice: '0x…', rebuild1: '0x…' },
+//       app:        { built: { of: ['rebuild1', 'rebuild2'], at_least: 2 }, reviewed: { of: ['alice'], at_least: 1 } },
+//       dependency: { reviewed: { of: ['alice'], at_least: 1 } },
+//       toolchains: ['kt1:…'],                 // a built statement counts only with one of these; empty means any
+//       deny: ['0x…'],                         // deny lists, each the address that keeps it
+//       freshness: { max_age: 3600, on_stale: 'refuse' },
+//       follow: { min_delay: 60 },             // a name whose changes wait less than this is not followed
+//       chain: { rpc: '127.0.0.1:8545', registry: '0x…', code_hash: '0x…', anchor: '' },
+//     }
+
+import { Result } from "core";
+import { json.parseJson5, json.JsonValue, json.JsonObject } from "wac";
+import { Claim, Verified, hex, unhex } from "./statement.wac";
+
+export struct Signer {
+  string name;
+  u8[] address;
+}
+
+export struct Need {
+  string[] of;
+  i32 atLeast = 0;
+}
+
+export struct Rule {
+  Need built;
+  Need reviewed;
+}
+
+export struct ChainConf {
+  string host;
+  i32 port = 0;
+  u8[] registry;
+  u8[] codeHash;
+  u8[] anchor;
+}
+
+export struct Policy {
+  Signer[] signers;
+  Rule app;
+  Rule dependency;
+  string[] toolchains;
+  u8[][] deny;
+  i64 maxAge = 0 as i64;
+  bool refuseStale = true;
+  i64 minDelay = 0 as i64;
+  ChainConf? chain;
+}
+
+/** What the chain said, for the statements and hashes a decision touches. `known` is false without a chain. */
+export struct Chain {
+  bool known;
+  /** Seconds old, the proved header against the local clock. */
+  i64 age;
+  bool anchored;
+  /** `signer ‖ id` hex, for each revoked statement. */
+  string[] revoked;
+  /** `list ‖ hash` hex, for each deny-list entry that is set. */
+  string[] denied;
+
+  Chain unknown() { return Chain(false, 0 as i64, false, string[](), string[]()); }
+}
+
+export struct Decision {
+  bool allowed;
+  string[] reasons;
+}
+
+// ---------------------------------------------------------------- reading the file
+
+string[] texts(JsonValue? v) {
+  if (v is null || v!.array() is null) { return string[](); }
+  string[] out = string[].defaulted(v!.array()!.len());
+  for (i32 i = 0; i < out.len(); i++) { out[i] = v!.array()!.get(i).text() ?? ""; }
+  return out;
+}
+
+i64 num(JsonValue? v, i64 fallback) {
+  f64? n = v?.number();
+  return n is null ? fallback : n! as~ i64;
+}
+
+Need needOf(JsonValue? v) {
+  if (v is null) { return Need { }; }
+  return Need(texts(v!.member("of")), num(v!.member("at_least"), 0 as i64) as! i32);
+}
+
+Rule ruleOf(JsonValue? v) {
+  if (v is null) { return Rule { }; }
+  return Rule(needOf(v!.member("built")), needOf(v!.member("reviewed")));
+}
+
+export Result<Policy, string> readPolicy(u8[] text) {
+  JsonValue doc;
+  match (parseJson5(text)) {
+    Err(e): { return Result.Err("the policy: \{e.text()}"); }
+    Ok(v): { doc = v; }
+  }
+  Signer[] signers = Signer[]();
+  JsonObject? s = doc.member("signers")?.object();
+  if (s is not null) {
+    signers = Signer[].defaulted(s!.len());
+    for (i32 i = 0; i < s!.len(); i++) {
+      u8[]? a = unhex(s!.at(i).value.text() ?? "");
+      if (a is null || a!.len() != 20) { return Result.Err("the policy: signer \{s!.at(i).keyStr()} is not a 20-byte address"); }
+      signers[i] = Signer(s!.at(i).keyStr(), a!);
+    }
+  }
+  string[] lists = texts(doc.member("deny"));
+  u8[][] deny = u8[][].filled(lists.len(), u8[]());
+  for (i32 i = 0; i < lists.len(); i++) {
+    u8[]? a = unhex(lists[i]);
+    if (a is null || a!.len() != 20) { return Result.Err("the policy: deny list \{lists[i]} is not an address"); }
+    deny[i] = a!;
+  }
+  JsonValue? f = doc.member("freshness");
+  ChainConf? chain = null;
+  JsonValue? c = doc.member("chain");
+  if (c is not null) {
+    string rpc = c!.member("rpc")?.text() ?? "127.0.0.1:8545";
+    i32 colon = rpc.indexOf(":");
+    u8[]? reg = unhex(c!.member("registry")?.text() ?? "");
+    if (reg is null || reg!.len() != 20) { return Result.Err("the policy: chain.registry is not an address"); }
+    chain = ChainConf(rpc.slice(0, colon), parsePort(rpc.slice(colon + 1, rpc.len())), reg!,
+                      unhex(c!.member("code_hash")?.text() ?? "") ?? u8[](), unhex(c!.member("anchor")?.text() ?? "") ?? u8[]());
+  }
+  return Result.Ok(Policy(signers, ruleOf(doc.member("app")), ruleOf(doc.member("dependency")), texts(doc.member("toolchains")),
+                          deny, num(f?.member("max_age"), 3600 as i64), (f?.member("on_stale")?.text() ?? "refuse") != "allow",
+                          num(doc.member("follow")?.member("min_delay"), 0 as i64), chain));
+}
+
+i32 parsePort(string s) {
+  i32 n = 0;
+  for (u8 b in s.toBytes()) { n = n * 10 + ((b - '0') as i32); }
+  return n;
+}
+
+// ---------------------------------------------------------------- deciding
+
+/** The policy's name for an address, or "" for a signer it does not know. */
+export string nameOf(Policy p, u8[] address) {
+  for (i32 i = 0; i < p.signers.len(); i++) { if (hex(p.signers[i].address) == hex(address)) { return p.signers[i].name; } }
+  return "";
+}
+
+bool has(string[] xs, string x) {
+  for (i32 i = 0; i < xs.len(); i++) { if (xs[i] == x) { return true; } }
+  return false;
+}
+
+string[] plus(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+/** The revocation slots and deny-list entries a decision about `subject` reads, as (who, what) pairs. */
+export struct Asks {
+  u8[][] revokedSigner;
+  u8[][] revokedId;
+  u8[][] deniedList;
+  u8[][] deniedHash;
+}
+
+u8[] bytesOfId(string id) { return unhex(id.slice(4, id.len())) ?? u8[](); }
+
+/** Everything the chain must answer before `decide` can: each known signer's statements, each list × each hash. */
+export Asks asks(Policy p, string subject, Verified[] vs) {
+  u8[][] rs = u8[][]();
+  u8[][] ri = u8[][]();
+  string[] hashes = [subject];
+  for (i32 i = 0; i < vs.len(); i++) {
+    if (nameOf(p, vs[i].signer) == "") { continue; }
+    rs = add(rs, vs[i].signer);
+    ri = add(ri, vs[i].id);
+    match (vs[i].claim) {
+      Built(source, _, _, _, _, output): { if (output == subject && !has(hashes, source)) { hashes = plus(hashes, source); } }
+      Reviewed(_, _): { }
+    }
+  }
+  u8[][] dl = u8[][]();
+  u8[][] dh = u8[][]();
+  for (i32 l = 0; l < p.deny.len(); l++) {
+    for (i32 h = 0; h < hashes.len(); h++) { dl = add(dl, p.deny[l]); dh = add(dh, bytesOfId(hashes[h])); }
+  }
+  return Asks(rs, ri, dl, dh);
+}
+
+u8[][] add(u8[][] xs, u8[] x) {
+  u8[][] out = u8[][].filled(xs.len() + 1, u8[]());
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+/**
+ * Whether `subject` may be used for `purpose` ("app" or "dependency").
+ *
+ * An app is allowed when some one source S has `app.built.at_least` distinct named signers from `app.built.of`
+ * saying S builds to it, with an allowed toolchain, and `app.reviewed.at_least` distinct reviewers from
+ * `app.reviewed.of` having reviewed S (or the app itself) — counting only statements not revoked by their signer,
+ * and refusing outright if any followed deny list holds the app or that source, or if the chain's answer is
+ * older than the policy allows and it says to refuse then. A dependency is a source, so only `reviewed` applies.
+ */
+export Decision decide(Policy p, string purpose, string subject, Verified[] vs, Chain chain) {
+  string[] why = string[]();
+  // Freshness first: without a current answer about revocations, nothing below can be known to still stand.
+  if (!chain.known) {
+    why = plus(why, "no chain configured: revocations and deny lists cannot be checked");
+    if (p.refuseStale) { return Decision(false, plus(why, "refused: on_stale is refuse")); }
+  } else {
+    if (!chain.anchored) { why = plus(why, "the header is anchored only to the node's own word (no light client)"); }
+    if (chain.age > p.maxAge) {
+      why = plus(why, "the chain's answer is \{chain.age}s old, more than the \{p.maxAge}s allowed");
+      if (p.refuseStale) { return Decision(false, plus(why, "refused: on_stale is refuse")); }
+    }
+  }
+  Rule r = purpose == "app" ? p.app : p.dependency;
+  // The statements that count: a signer the policy names, not revoked.
+  Verified[] live = Verified[]();
+  for (i32 i = 0; i < vs.len(); i++) {
+    string who = nameOf(p, vs[i].signer);
+    if (who == "") { continue; }
+    if (has(chain.revoked, hex(vs[i].signer) + hex(vs[i].id))) { why = plus(why, "\{who} revoked statement 0x\{hex(vs[i].id).slice(0, 12)}…"); continue; }
+    live = addV(live, vs[i]);
+  }
+  // The sources the subject is claimed to come from.
+  string[] sources = purpose == "app" ? string[]() : [subject];
+  if (purpose == "app") {
+    for (i32 i = 0; i < live.len(); i++) {
+      match (live[i].claim) {
+        Built(source, _, _, _, toolchain, output): {
+          if (output != subject) { continue; }
+          if (p.toolchains.len() > 0 && !has(p.toolchains, toolchain)) {
+            why = plus(why, "\{nameOf(p, live[i].signer)} built it with toolchain \{toolchain.slice(0, 16)}…, which the policy does not allow");
+            continue;
+          }
+          if (!has(sources, source)) { sources = plus(sources, source); }
+        }
+        Reviewed(_, _): { }
+      }
+    }
+  }
+  if (deniedAny(p, chain, subject)) { return Decision(false, plus(why, "refused: \{subject} is on a deny list you follow")); }
+  for (i32 s = 0; s < sources.len(); s++) {
+    string src = sources[s];
+    if (deniedAny(p, chain, src)) { why = plus(why, "source \{src} is on a deny list you follow"); continue; }
+    string[] builders = string[]();
+    string[] reviewers = string[]();
+    for (i32 i = 0; i < live.len(); i++) {
+      string who = nameOf(p, live[i].signer);
+      match (live[i].claim) {
+        Built(source, _, _, _, toolchain, output): {
+          if (source == src && output == subject && has(r.built.of, who) && !has(builders, who)
+              && (p.toolchains.len() == 0 || has(p.toolchains, toolchain))) { builders = plus(builders, who); }
+        }
+        Reviewed(rsub, _): {
+          if ((rsub == src || rsub == subject) && has(r.reviewed.of, who) && !has(reviewers, who)) { reviewers = plus(reviewers, who); }
+        }
+      }
+    }
+    bool builtOk = purpose != "app" || builders.len() >= r.built.atLeast;
+    bool reviewedOk = reviewers.len() >= r.reviewed.atLeast;
+    string summary = "source \{src.slice(0, 16)}…: built by \{list(builders)} (need \{r.built.atLeast}), reviewed by \{list(reviewers)} (need \{r.reviewed.atLeast})";
+    why = plus(why, summary);
+    if (builtOk && reviewedOk) { return Decision(true, plus(why, "allowed")); }
+  }
+  if (sources.len() == 0) { why = plus(why, "no statement from a signer you trust says anything builds to \{subject}"); }
+  return Decision(false, plus(why, "refused: no source meets the policy"));
+}
+
+bool deniedAny(Policy p, Chain chain, string id) {
+  for (i32 l = 0; l < p.deny.len(); l++) { if (has(chain.denied, hex(p.deny[l]) + hex(bytesOfId(id)))) { return true; } }
+  return false;
+}
+
+string list(string[] xs) {
+  if (xs.len() == 0) { return "nobody"; }
+  string out = "";
+  for (i32 i = 0; i < xs.len(); i++) { out += (i > 0 ? ", " : "") + xs[i]; }
+  return out;
+}
+
+Verified[] addV(Verified[] xs, Verified x) {
+  Verified[] out = Verified[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}

@@ -1,0 +1,152 @@
+// The policy engine (design/system/0016 H5), on statements signed here by four keys. Every case is a
+// question the engine must answer both ways; each refusal is checked to say why, so a refusal for the
+// wrong reason does not pass.
+
+import { Result } from "core";
+import { Claim, Statement, Verified, signClaim, verify, addressOfKey, hex, unhex } from "../src/statement.wac";
+import { Policy, Chain, Decision, readPolicy, decide, asks, Asks } from "../src/policy.wac";
+import { Check } from "./check.wac";
+
+string rep(string two) { string out = ""; for (i32 i = 0; i < 32; i++) { out += two; } return out; }
+u8[] key(string two) { return unhex(rep(two))!; }
+string addr(string two) { return "0x" + hex(addressOfKey(key(two))); }
+
+static string APP = "kb1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+static string SRC = "kt1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+static string OTHER_SRC = "kt1:abababababababababababababababababababababababababababababababab";
+static string TOOL = "kt1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+static string BAD_TOOL = "kt1:bdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbd";
+
+Policy policy(string extra) {
+  string text = "{ signers: { pub: '\{addr("11")}', r1: '\{addr("22")}', r2: '\{addr("33")}', alice: '\{addr("44")}' },"
+              + " app: { built: { of: ['pub', 'r1', 'r2'], at_least: 2 }, reviewed: { of: ['alice'], at_least: 1 } },"
+              + " dependency: { reviewed: { of: ['alice'], at_least: 1 } },"
+              + " toolchains: ['\{TOOL}'], deny: ['\{addr("55")}'], freshness: { max_age: 600, on_stale: 'refuse' } \{extra} }";
+  return readPolicy(text.toBytes()).ok()!;
+}
+
+Verified built(string signer, string source, string tool) {
+  Claim c = Claim.Built(source, "examples/notes", ["wac", "run", "build.wac"], "dist/index.html", tool, APP);
+  return verify(signClaim(c, key(signer)).ok()!).ok()!;
+}
+Verified reviewed(string signer, string subject) { return verify(signClaim(Claim.Reviewed(subject, "all"), key(signer)).ok()!).ok()!; }
+
+Chain fresh() { return Chain(true, 5 as i64, true, string[](), string[]()); }
+
+bool says(Decision d, string phrase) {
+  for (string r in d.reasons) { if (r.indexOf(phrase) >= 0) { return true; } }
+  return false;
+}
+
+string all(Decision d) {
+  string out = "";
+  for (string r in d.reasons) { out += r + " | "; }
+  return out;
+}
+
+export string test_a_quorum_of_rebuilders_and_a_review_allows() {
+  Check c = Check.create();
+  Verified[] vs = [built("11", SRC, TOOL), built("22", SRC, TOOL), reviewed("44", SRC)];
+  Decision d = decide(policy(""), "app", APP, vs, fresh());
+  c.ok(d.allowed, "two builders and a review: \{all(d)}");
+  return c.report();
+}
+
+export string test_too_few_builders_or_no_review_refuses() {
+  Check c = Check.create();
+  Decision one = decide(policy(""), "app", APP, [built("11", SRC, TOOL), reviewed("44", SRC)], fresh());
+  c.ok(!one.allowed && says(one, "need 2"), "one builder: \{all(one)}");
+  Decision unreviewed = decide(policy(""), "app", APP, [built("11", SRC, TOOL), built("22", SRC, TOOL)], fresh());
+  c.ok(!unreviewed.allowed && says(unreviewed, "reviewed by nobody"), "no review: \{all(unreviewed)}");
+  return c.report();
+}
+
+export string test_one_signer_twice_is_one_signer() {
+  Check c = Check.create();
+  Verified[] vs = [built("11", SRC, TOOL), built("11", SRC, TOOL), reviewed("44", SRC)];
+  c.ok(!decide(policy(""), "app", APP, vs, fresh()).allowed, "the same builder twice made a quorum");
+  return c.report();
+}
+
+export string test_a_stranger_counts_for_nothing() {
+  Check c = Check.create();
+  Verified[] vs = [built("11", SRC, TOOL), built("66", SRC, TOOL), reviewed("44", SRC)];
+  c.ok(!decide(policy(""), "app", APP, vs, fresh()).allowed, "an unknown signer made up the quorum");
+  // alice is known, but not as a builder.
+  Verified[] wrongRole = [built("11", SRC, TOOL), built("44", SRC, TOOL), reviewed("44", SRC)];
+  c.ok(!decide(policy(""), "app", APP, wrongRole, fresh()).allowed, "a reviewer counted as a builder");
+  return c.report();
+}
+
+export string test_builders_must_agree_on_the_source() {
+  Check c = Check.create();
+  Verified[] vs = [built("11", SRC, TOOL), built("22", OTHER_SRC, TOOL), reviewed("44", SRC), reviewed("44", OTHER_SRC)];
+  c.ok(!decide(policy(""), "app", APP, vs, fresh()).allowed, "two builders of two different sources made a quorum");
+  return c.report();
+}
+
+export string test_a_toolchain_the_policy_does_not_name_does_not_count() {
+  Check c = Check.create();
+  Decision d = decide(policy(""), "app", APP, [built("11", SRC, TOOL), built("22", SRC, BAD_TOOL), reviewed("44", SRC)], fresh());
+  c.ok(!d.allowed && says(d, "does not allow"), "an unlisted toolchain counted: \{all(d)}");
+  return c.report();
+}
+
+export string test_a_revocation_drops_a_statement() {
+  Check c = Check.create();
+  Verified b2 = built("22", SRC, TOOL);
+  Verified[] vs = [built("11", SRC, TOOL), b2, reviewed("44", SRC)];
+  Chain ch = Chain(true, 5 as i64, true, [hex(b2.signer) + hex(b2.id)], string[]());
+  Decision d = decide(policy(""), "app", APP, vs, ch);
+  c.ok(!d.allowed && says(d, "r1 revoked"), "a revoked build still counted: \{all(d)}");
+  // A revocation is the signer's own: the same id under another signer revokes nothing. (Not pub's: two
+  // builders' identical claims have one id, so pub revoking it withdraws pub's own statement — correctly.)
+  Chain other = Chain(true, 5 as i64, true, [hex(addressOfKey(key("44"))) + hex(b2.id)], string[]());
+  c.ok(decide(policy(""), "app", APP, vs, other).allowed, "someone else's revocation counted");
+  return c.report();
+}
+
+export string test_a_deny_list_refuses_the_app_or_its_source() {
+  Check c = Check.create();
+  Verified[] vs = [built("11", SRC, TOOL), built("22", SRC, TOOL), reviewed("44", SRC)];
+  string list = hex(addressOfKey(key("55")));
+  Decision app = decide(policy(""), "app", APP, vs, Chain(true, 5 as i64, true, string[](), [list + rep("cc")]));
+  c.ok(!app.allowed && says(app, "deny list"), "a denied app: \{all(app)}");
+  Decision src = decide(policy(""), "app", APP, vs, Chain(true, 5 as i64, true, string[](), [list + rep("aa")]));
+  c.ok(!src.allowed && says(src, "deny list"), "a denied source: \{all(src)}");
+  // A list the policy does not follow says nothing.
+  Decision unfollowed = decide(policy(""), "app", APP, vs, Chain(true, 5 as i64, true, string[](), [hex(addressOfKey(key("66"))) + rep("cc")]));
+  c.ok(unfollowed.allowed, "an unfollowed list refused");
+  return c.report();
+}
+
+export string test_stale_or_absent_chain_answers_follow_on_stale() {
+  Check c = Check.create();
+  Verified[] vs = [built("11", SRC, TOOL), built("22", SRC, TOOL), reviewed("44", SRC)];
+  Chain old = Chain(true, 3600 as i64, true, string[](), string[]());
+  c.ok(!decide(policy(""), "app", APP, vs, old).allowed, "an hour-old answer was accepted under max_age 600");
+  c.ok(!decide(policy(""), "app", APP, vs, Chain.unknown()).allowed, "no chain at all was accepted under refuse");
+  Policy lax = readPolicy(("{ signers: { pub: '\{addr("11")}', r1: '\{addr("22")}', alice: '\{addr("44")}' },"
+                         + " app: { built: { of: ['pub', 'r1'], at_least: 2 }, reviewed: { of: ['alice'], at_least: 1 } },"
+                         + " freshness: { max_age: 600, on_stale: 'allow' } }").toBytes()).ok()!;
+  Decision d = decide(lax, "app", APP, vs, Chain.unknown());
+  c.ok(d.allowed && says(d, "cannot be checked"), "on_stale allow, and it says what it could not check: \{all(d)}");
+  return c.report();
+}
+
+export string test_a_dependency_needs_a_review_of_itself() {
+  Check c = Check.create();
+  c.ok(decide(policy(""), "dependency", SRC, [reviewed("44", SRC)], fresh()).allowed, "a reviewed dependency");
+  c.ok(!decide(policy(""), "dependency", SRC, [reviewed("44", OTHER_SRC)], fresh()).allowed, "a review of something else");
+  return c.report();
+}
+
+export string test_asks_covers_every_signer_and_every_list_by_hash() {
+  Check c = Check.create();
+  Verified[] vs = [built("11", SRC, TOOL), built("22", OTHER_SRC, TOOL), reviewed("44", SRC), built("66", SRC, TOOL)];
+  Asks a = asks(policy(""), APP, vs);
+  c.ok(a.revokedId.len() == 3, "three known signers' statements, not the stranger's: \{a.revokedId.len()}");
+  // One list, three hashes: the app and both sources claimed for it.
+  c.ok(a.deniedHash.len() == 3, "the app and its two claimed sources: \{a.deniedHash.len()}");
+  return c.report();
+}

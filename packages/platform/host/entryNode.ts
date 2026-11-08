@@ -161,8 +161,12 @@ export async function runLauncherNode(
     rm(p: string, o: { recursive: boolean; force: boolean }): Promise<void>;
     rename(from: string, to: string): Promise<void>;
     open(p: string, flags: string): Promise<{
-      read(b: Uint8Array, off: number, len: number): Promise<{ bytesRead: number }>;
-      write(b: Uint8Array): Promise<unknown>;
+      // `position` is the random-access read and write `openRandom` makes; left out, the file's own offset moves.
+      read(b: Uint8Array, off: number, len: number, position?: number): Promise<{ bytesRead: number }>;
+      write(b: Uint8Array, off?: number, len?: number, position?: number): Promise<{ bytesWritten: number }>;
+      stat(): Promise<{ size: number }>;
+      truncate(n: number): Promise<void>;
+      sync(): Promise<void>;
       close(): Promise<void>;
     }>;
     stat(

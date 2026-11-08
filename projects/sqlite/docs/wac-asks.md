@@ -5,8 +5,8 @@ Written down with a reproduction, worked around here.
 ## An async function awaiting inside a `match` arm does not emit
 
 `SqliteFile` was first written `async`, awaiting `Files.stat`, `readFile`, `writeFile` and `rename`. It
-checked clean and then trapped at run time on the first `await` inside a `for … in` loop, and a smaller
-program awaiting a stdout write inside a `match` arm stopped at emission:
+checked clean and then trapped at run time inside `open`, with no message; the cause was not isolated.
+A smaller program awaiting a stdout write inside a `match` arm stopped at emission:
 
     wacc: cannot emit dbg2.wac — a call to __wacCo___wacMain, declined: an assignment between related
     reference types: never[][] into never[]

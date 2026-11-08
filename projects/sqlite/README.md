@@ -5,7 +5,7 @@ runs the SQL that applications use, written in wac with nothing borrowed from th
 format and the language.
 
 ```wac
-import { Connection, Value } from "sqlite";
+import { Connection, Rows, Value } from "sqlite";
 
 Connection c = Connection.memory();
 c.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)").unwrap();
@@ -17,7 +17,7 @@ Rows r = c.execute("SELECT id, name FROM t WHERE name = ?", [Value.Text("alice")
 A file on disk:
 
 ```wac
-import { SqliteFile } from "sqlite";
+import { SqliteFile, Value } from "sqlite";
 
 SqliteFile db = SqliteFile.open(sys.files(), "data/app.db").unwrap();   // created at the first commit
 db.execute("INSERT INTO events (id, seq) VALUES (?, ?)", [Value.Text("e1"), Value.Int(1)]).unwrap();

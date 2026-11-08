@@ -12,8 +12,10 @@ import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, const
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
 import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable, ROWID_INTERNAL, nodeAff, rowParts } from "./query.wac";
 import { applyAffinity, isNull, textOf, AFF_NONE } from "./ops.wac";
+import { signed32 } from "./reader.wac";
 import { FnEnv } from "./functions.wac";
 import { lower, upper } from "./lexer.wac";
+import { tableInfo, indexList, indexInfo, foreignKeyList, foreignKeyCheck, collationList, databaseList } from "./pragma.wac";
 import { renameTable, mentionsTable, renameColumnInTable, renameColumnElsewhere, dropColumnText } from "./alter.wac";
 import { Chunked } from "./chunked.wac";
 
@@ -29,6 +31,8 @@ enum Undo {
   UWal(bool was),
   UAutoVacuum(i32 mode, i32 pending),
   UEncoding(i32 enc),
+  UApplicationId(i64 v),
+  USchemaCookie(i64 v),
 }
 
 export struct Connection {
@@ -52,11 +56,18 @@ export struct Connection {
   // Whether the database lives only in memory, as SQLite's ":memory:" does, rather than in a file
   // whose image someone stores: its journal mode is always "memory".
   bool inMemory;
+  // Pragmas that are settings of the connection: their values, read back as set.
+  Map<string, Value> settings;
 
   Connection over(Database db, bool inMemory) {
     return Connection(db, false, Vec.create(), false, false, false, false, 0, 0, 0,
                       FnEnv { nowMillis: 0, changes: 0, totalChanges: 0, lastInsertRowid: 0, randomBytes: u8[].filled(64, 7), randomAt: 0 }, Map.create(hashString, stringEq),
-                      false, Vec.create(), Vec.create(), inMemory);
+                      false, Vec.create(), Vec.create(), inMemory, Map.create(hashString, stringEq));
+  }
+
+  bool setting(this, string name) {
+    Value? v = this.settings.get(name);
+    return v is not null && truthOf(v!) == 1;
   }
 
   Connection memory() { return Connection.over(Database.empty(), true); }
@@ -79,7 +90,6 @@ export struct Connection {
   u8[] image(this) {
     if (this.dirty) {
       this.db.changeCounter++;
-      if (this.schemaDirty) { this.db.schemaCookie++; }
     }
     this.dirty = false;
     this.schemaDirty = false;
@@ -195,6 +205,12 @@ export struct Connection {
           for (i32 i = 0; i < s.pending.len(); i++) { if (s.pending.get(i).deferred) { this.deferred.push(s.pending.get(i)); } }
         }
         if (s.counted) { this.changes = s.count; this.totalChanges += s.count; }
+        // As SQLite does, every statement that changes the schema advances its cookie, which a rollback
+        // takes back.
+        if (s.schema) {
+          undo.push(Undo.USchemaCookie(this.db.schemaCookie));
+          this.db.schemaCookie++;
+        }
         bool changed = undo.len() > 0;
         if (this.inTx) {
           for (i32 i = 0; i < undo.len(); i++) { this.txUndo.push(undo.get(i)); }
@@ -241,6 +257,7 @@ export struct Connection {
       }
     }
     this.deferred.clear();
+    this.settings.remove("defer_foreign_keys");
     this.savepoints.clear();
     this.inTx = false;
     this.txUndo.clear();
@@ -254,6 +271,7 @@ export struct Connection {
     undoAll(this.db, this.txUndo);
     this.txUndo.clear();
     this.deferred.clear();
+    this.settings.remove("defer_foreign_keys");
     this.inTx = false;
   }
 }
@@ -287,6 +305,8 @@ void undoAll(Database db, Vec<Undo> undo) {
       UWal(was): { db.wal = was; }
       UAutoVacuum(mode, pending): { db.autoVacuum = mode; db.pendingAutoVacuum = pending; }
       UEncoding(enc): { db.encoding = enc; }
+      UApplicationId(v): { db.applicationId = v; }
+      USchemaCookie(v): { db.schemaCookie = v; }
     }
   }
   undo.clear();
@@ -382,7 +402,7 @@ struct Statement {
 
   // Every CHECK holds for the row, or the row is refused; NULL counts as holding, as in SQLite.
   Result<bool, SqlError> checksHold(this, Table t, Row r, i32 orAction) {
-    if (t.checks.len() == 0) { return Result.Ok(true); }
+    if (t.checks.len() == 0 || this.conn.setting("ignore_check_constraints")) { return Result.Ok(true); }
     Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)], null, null, false);
     Ctx c = Ctx([r as Row?], null, null, null, null);
     for (i32 i = 0; i < t.checks.len(); i++) {
@@ -485,7 +505,7 @@ struct Statement {
         for (i32 k in fk.cols) { if (!sameValue(old!.vals[k], r.vals[k])) { same = false; } }
         if (same) { continue; }
       }
-      this.pending.push(Pending(t, fk, r, Value[](), fk.deferred));
+      this.pending.push(Pending(t, fk, r, Value[](), fk.deferred || this.conn.setting("defer_foreign_keys")));
     }
   }
 
@@ -516,7 +536,7 @@ struct Statement {
         if (hasNull || !changed) { continue; }
         string action = now is null ? fk.onDelete : fk.onUpdate;
         if (action == "NO ACTION") {
-          this.pending.push(Pending(child, fk, null, key, fk.deferred));
+          this.pending.push(Pending(child, fk, null, key, fk.deferred || this.conn.setting("defer_foreign_keys")));
           continue;
         }
         Row[] kids = this.childrenOf(child, fk, parent, pcols, key);
@@ -1743,7 +1763,7 @@ struct Statement {
       if (value is null) { return Result.Ok(one("user_version", Value.Int(d.userVersion))); }
       Value v = try this.constant(value!);
       this.undo.push(Undo.UUserVersion(d.userVersion));
-      d.userVersion = match (applyAffinity(v, AFF_INTEGER)) { Int(i): i, default: 0 as i64 };
+      d.userVersion = match (applyAffinity(v, AFF_INTEGER)) { Int(i): signed32(i & 0xffffffff), default: 0 as i64 };
       return Result.Ok(noRows());
     }
     if (name == "page_size") {
@@ -1829,24 +1849,57 @@ struct Statement {
       }
       return Result.Ok(noRows());
     }
-    if (name == "busy_timeout" || name == "synchronous" || name == "cache_size" ||
-        name == "temp_store" || name == "mmap_size" || name == "recursive_triggers" || name == "wal_autocheckpoint") {
-      if (value is null) { return Result.Ok(one(name, Value.Int(0))); }
+    // The schema, described.
+    if (name == "table_info" || name == "table_xinfo" || name == "index_list" || name == "index_info" ||
+        name == "index_xinfo" || name == "foreign_key_list") {
+      if (value is null) { return Result.Ok(noRows()); }
+      string arg = textOf(try this.constant(value!));
+      if (name == "table_info" || name == "table_xinfo") { return Result.Ok(tableInfo(d, arg, name == "table_xinfo")); }
+      if (name == "index_list") { return Result.Ok(indexList(d, arg)); }
+      if (name == "foreign_key_list") { return Result.Ok(foreignKeyList(d, arg)); }
+      return Result.Ok(indexInfo(d, arg, name == "index_xinfo"));
+    }
+    if (name == "foreign_key_check") {
+      string? arg = null;
+      if (value is not null) { arg = textOf(try this.constant(value!)); }
+      if (arg is not null && d.table(arg!) is null) { return Result.Err(err("no such table: \{arg!}")); }
+      return foreignKeyCheck(d, arg);
+    }
+    if (name == "collation_list") { return Result.Ok(collationList()); }
+    if (name == "database_list") { return Result.Ok(databaseList()); }
+    if (name == "schema_version") {
+      if (value is null) { return Result.Ok(one(name, Value.Int(d.schemaCookie))); }
       return Result.Ok(noRows());
     }
-    if (name == "table_info") {
-      if (value is null) { return Result.Ok(noRows()); }
-      string tn = textOf(try this.constant(value!));
-      Table? t = d.table(tn);
-      Vec<Value[]> rows;
-      if (t is not null) {
-        for (i32 i = 0; i < t!.cols.len(); i++) {
-          Column c = t!.cols[i];
-          rows.push([Value.Int(i as i64), Value.Text(c.name), Value.Text(c.typeName), Value.Int(c.notNull ? 1 : 0),
-                     Value.Null, Value.Int(i == t!.rowidAlias ? 1 : 0)]);
-        }
+    if (name == "application_id") {
+      if (value is null) { return Result.Ok(one(name, Value.Int(d.applicationId))); }
+      Value v = try this.constant(value!);
+      this.undo.push(Undo.UApplicationId(d.applicationId));
+      d.applicationId = match (applyAffinity(v, AFF_INTEGER)) { Int(i): signed32(i & 0xffffffff), default: 0 as i64 };
+      return Result.Ok(noRows());
+    }
+    // LIKE folds case unless this is on; SQLite reports nothing for it.
+    if (name == "case_sensitive_like") {
+      if (value is not null) { this.conn.env.caseSensitiveLike = pragmaInt(try this.constant(value!), "") == 1; }
+      return Result.Ok(noRows());
+    }
+    // Settings of the connection: kept and read back, and the few with an effect here honoured
+    // (ignore_check_constraints, defer_foreign_keys).
+    i32 at = -1;
+    for (i32 i = 0; i < SETTING_NAMES.len(); i++) { if (SETTING_NAMES[i] == name) { at = i; } }
+    if (at >= 0) {
+      if (value is null) {
+        Value? v = this.conn.settings.get(name);
+        return Result.Ok(one(name, v ?? SETTING_DEFAULTS[at]));
       }
-      return Result.Ok(Rows(["cid", "name", "type", "notnull", "dflt_value", "pk"], rows));
+      Value given = try this.constant(value!);
+      Value stored = name == "locking_mode" ? Value.Text(lower(textOf(given))) : Value.Int(pragmaInt(given, name));
+      this.conn.settings.set(name, stored);
+      if (name == "locking_mode" || name == "max_page_count" || name == "journal_size_limit" ||
+          name == "soft_heap_limit" || name == "hard_heap_limit" || name == "threads" || name == "analysis_limit") {
+        return Result.Ok(one(name, stored));
+      }
+      return Result.Ok(noRows());
     }
     return Result.Ok(noRows());
   }
@@ -2004,3 +2057,37 @@ static string[] SQL_KEYWORDS = ["ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER
   "REPLACE", "RESTRICT", "RETURNING", "RIGHT", "ROLLBACK", "ROW", "ROWS", "SAVEPOINT", "SELECT", "SET", "TABLE",
   "TEMP", "TEMPORARY", "THEN", "TIES", "TO", "TRANSACTION", "TRIGGER", "UNBOUNDED", "UNION", "UNIQUE", "UPDATE",
   "USING", "VACUUM", "VALUES", "VIEW", "VIRTUAL", "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT"];
+
+// ── pragma settings ─────────────────────────────────────────────────────────
+
+// The connection's settings and SQLite's defaults for them (an in-memory database's, where they differ).
+static string[] SETTING_NAMES = ["cache_size", "synchronous", "temp_store", "recursive_triggers", "secure_delete",
+  "reverse_unordered_selects", "defer_foreign_keys", "automatic_index", "cell_size_check", "trusted_schema",
+  "writable_schema", "max_page_count", "locking_mode", "journal_size_limit", "threads", "hard_heap_limit",
+  "soft_heap_limit", "analysis_limit", "wal_autocheckpoint", "ignore_check_constraints", "count_changes",
+  "short_column_names", "full_column_names", "busy_timeout", "query_only", "read_uncommitted",
+  "legacy_alter_table", "fullfsync", "checkpoint_fullfsync", "empty_result_callbacks"];
+static Value[] SETTING_DEFAULTS = [Value.Int(-2000), Value.Int(2), Value.Int(0), Value.Int(0), Value.Int(0),
+  Value.Int(0), Value.Int(0), Value.Int(1), Value.Int(0), Value.Int(1),
+  Value.Int(0), Value.Int(4294967294), Value.Text("normal"), Value.Int(-1), Value.Int(0), Value.Int(0),
+  Value.Int(0), Value.Int(0), Value.Int(1000), Value.Int(0), Value.Int(0),
+  Value.Int(1), Value.Int(0), Value.Int(0), Value.Int(0), Value.Int(0),
+  Value.Int(0), Value.Int(0), Value.Int(0), Value.Int(0)];
+
+// A pragma's value as SQLite reads it: a number, or one of the words for on and off (and, for
+// synchronous and temp_store, their levels).
+i64 pragmaInt(Value v, string name) {
+  match (v) {
+    Int(i): { return i; }
+    Real(r): { return r as~ i64; }
+    Text(t): {
+      string w = lower(t);
+      if (w == "on" || w == "yes" || w == "true" || w == "full") { return name == "synchronous" ? 2 : 1; }
+      if (w == "off" || w == "no" || w == "false") { return 0; }
+      if (name == "synchronous") { return w == "normal" ? 1 : (w == "extra" ? 3 : 0); }
+      if (name == "temp_store") { return w == "file" ? 1 : (w == "memory" ? 2 : 0); }
+      match (applyAffinity(v, AFF_INTEGER)) { Int(i): { return i; } default: { return 0; } }
+    }
+    default: { return 0; }
+  }
+}

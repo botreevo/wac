@@ -1,0 +1,59 @@
+// Applying a git delta, with the output allocated once and every copy a bulk copy.
+//
+// wac's `applyDelta` (`packages/git/src/pack.wac`) builds its result a byte at a time through a growable buffer.
+// The result's length is the second number in the delta's header, so it can be allocated exactly, and a copy
+// instruction — most of any delta — is one `copyFrom` of up to 64 KB rather than as many single-byte pushes.
+// Resolving deltas is what indexing a push and serving a clone spend their time on, so this is on both paths.
+
+/** A delta header's size: little-endian groups of seven bits. Advances `pos[0]`. */
+i32 varint(u8[] d, i32[] pos) {
+  i32 v = 0;
+  i32 shift = 0;
+  while (pos[0] < d.len()) {
+    i32 c = d[pos[0]] as i32;
+    pos[0] = pos[0] + 1;
+    v = v | ((c & 0x7f) << shift);
+    shift = shift + 7;
+    if ((c & 0x80) == 0 || shift > 28) { break; }
+  }
+  return v;
+}
+
+/** `delta` applied to `base`, or null when it does not apply — wrong base length, a copy outside it, a bad op. */
+export u8[]? applyDelta(u8[] base, u8[] delta) {
+  i32[] pos = [0];
+  if (varint(delta, pos) != base.len()) { return null; }
+  i32 size = varint(delta, pos);
+  if (size < 0) { return null; }
+  u8[] out = u8[].filled(size, 0);
+  i32 n = 0;
+  i32 at = pos[0];
+  i32 end = delta.len();
+  while (at < end) {
+    i32 cmd = delta[at] as i32;
+    at = at + 1;
+    if ((cmd & 0x80) != 0) {
+      i32 off = 0;
+      i32 len = 0;
+      if ((cmd & 0x01) != 0) { if (at >= end) { return null; } off = off | (delta[at] as i32); at = at + 1; }
+      if ((cmd & 0x02) != 0) { if (at >= end) { return null; } off = off | ((delta[at] as i32) << 8); at = at + 1; }
+      if ((cmd & 0x04) != 0) { if (at >= end) { return null; } off = off | ((delta[at] as i32) << 16); at = at + 1; }
+      if ((cmd & 0x08) != 0) { if (at >= end) { return null; } off = off | ((delta[at] as i32) << 24); at = at + 1; }
+      if ((cmd & 0x10) != 0) { if (at >= end) { return null; } len = len | (delta[at] as i32); at = at + 1; }
+      if ((cmd & 0x20) != 0) { if (at >= end) { return null; } len = len | ((delta[at] as i32) << 8); at = at + 1; }
+      if ((cmd & 0x40) != 0) { if (at >= end) { return null; } len = len | ((delta[at] as i32) << 16); at = at + 1; }
+      // A length of zero means 65,536, which three bytes cannot otherwise say.
+      if (len == 0) { len = 0x10000; }
+      if (off < 0 || off + len > base.len() || n + len > size) { return null; }
+      out.copyFrom(base, off, n, len);
+      n = n + len;
+    } else {
+      if (cmd == 0 || at + cmd > end || n + cmd > size) { return null; }
+      out.copyFrom(delta, at, n, cmd);
+      n = n + cmd;
+      at = at + cmd;
+    }
+  }
+  if (n != size) { return null; }
+  return out;
+}

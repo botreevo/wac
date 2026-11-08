@@ -1,0 +1,107 @@
+// Reading only what a server needs out of trees and commits, straight from the bytes.
+//
+// wac's `parseTree` and `parseCommit` build a string for every mode, name, author and message, which is right for
+// a client showing them and wasted on a server that only follows hashes. A full clone of a 7,000-commit repository
+// walks every commit and every tree; at hundreds of thousands of entries, those strings were a large share of
+// the time.
+//
+// These read the same formats — `<mode> <name>\0<20-byte hash>` repeated, and a commit's `tree`, `parent` and
+// `committer` headers — and answer only hashes, kinds and a time. They refuse what does not parse, as the full
+// parsers do, rather than guess.
+
+import { Vec } from "core";
+import { decode } from "../vendor/wac/packages/codec/src/hex.wac";
+
+/** What a tree entry names. */
+export i32 ENTRY_TREE() { return 1; }
+export i32 ENTRY_BLOB() { return 2; }
+/** A submodule's commit, in another repository: never followed. */
+export i32 ENTRY_GITLINK() { return 3; }
+
+export struct Entries {
+  Vec<u8[]> hashes;
+  Vec<i32> kinds;
+}
+
+/** A tree's entries as hashes and kinds, or null if it is not a tree. */
+export Entries? scanTree(u8[] d) {
+  Entries out = Entries(Vec.create(), Vec.create());
+  i32 at = 0;
+  i32 n = d.len();
+  while (at < n) {
+    // The mode: `40000` is a tree, `160000` a gitlink, anything else (100644, 100755, 120000) a blob.
+    i32 start = at;
+    while (at < n && d[at] != 32) { at++; }
+    if (at >= n) { return null; }
+    i32 modeLen = at - start;
+    i32 kind = ENTRY_BLOB();
+    if (modeLen == 5 && d[start] == '4') { kind = ENTRY_TREE(); }
+    else if (modeLen == 6 && d[start] == '1' && d[start + 1] == '6') { kind = ENTRY_GITLINK(); }
+    at++;
+    // The name, up to its NUL; then twenty bytes of hash.
+    while (at < n && d[at] != 0) { at++; }
+    if (at + 21 > n) { return null; }
+    at++;
+    u8[] h = u8[].filled(20, 0);
+    h.copyFrom(d, at, 0, 20);
+    at = at + 20;
+    out.hashes.push(h);
+    out.kinds.push(kind);
+  }
+  return out;
+}
+
+export struct CommitHead {
+  u8[] tree;
+  Vec<u8[]> parents;
+  /** The committer's time, in Unix seconds. */
+  i64 when;
+}
+
+bool lineStarts(u8[] d, i32 at, string word) {
+  u8[] w = word.toBytes();
+  if (at + w.len() > d.len()) { return false; }
+  for (i32 i = 0; i < w.len(); i++) { if (d[at + i] != w[i]) { return false; } }
+  return true;
+}
+
+u8[]? hexAt(u8[] d, i32 at) {
+  if (at + 40 > d.len()) { return null; }
+  u8[] hex = u8[].filled(40, 0);
+  hex.copyFrom(d, at, 0, 40);
+  u8[]? b = decode(hex);
+  if (b is null || b!.len() != 20) { return null; }
+  return b;
+}
+
+/** A commit's tree, parents and committer time, from its headers alone; null if they do not parse. */
+export CommitHead? scanCommit(u8[] d) {
+  if (!lineStarts(d, 0, "tree ")) { return null; }
+  u8[]? tree = hexAt(d, 5);
+  if (tree is null) { return null; }
+  Vec<u8[]> parents = Vec.create();
+  i64 when = 0;
+  i32 at = 46;
+  while (at < d.len() && d[at] != 10) {
+    i32 eol = at;
+    while (eol < d.len() && d[eol] != 10) { eol++; }
+    if (lineStarts(d, at, "parent ")) {
+      u8[]? p = hexAt(d, at + 7);
+      if (p is null) { return null; }
+      parents.push(p!);
+    } else if (lineStarts(d, at, "committer ")) {
+      // `committer Name <email> <seconds> <zone>`: the time is the second field from the end.
+      i32 e = eol - 1;
+      while (e > at && d[e] != 32) { e--; }
+      i32 s = e - 1;
+      while (s > at && d[s] != 32) { s--; }
+      for (i32 i = s + 1; i < e; i++) {
+        u8 c = d[i];
+        if (c < 48 || c > 57) { return null; }
+        when = when * 10 + ((c - 48) as i64);
+      }
+    }
+    at = eol + 1;
+  }
+  return CommitHead(tree!, parents, when);
+}

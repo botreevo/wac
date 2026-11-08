@@ -38,7 +38,8 @@ POST /<repo>/git-receive-pack                      the updates and their pack
 - **receive-pack**: create, fast-forward, force and delete, with `report-status`, `delete-refs`, `atomic`
   and `ofs-delta`.
   - Each ref moves by compare-and-swap on the old value the client sent, under a lock per repository.
-  - A pushed pack is indexed, completed first if it is thin, and stored beside the others.
+  - A pushed pack is indexed, completed if it is thin, and stored beside the others. The bases that complete a
+    thin pack are appended uncompressed; this costs disk until a `git gc` and saves deflating them during the push.
   - **Every object a new tip reaches is checked to be present before any ref moves.**
   - Ref names are held to `git check-ref-format`'s rules, so none reaches outside `refs/`.
 - **HTTP**: chunked bodies (git sends a push larger than `http.postBuffer` that way) and gzip bodies (a large
@@ -52,10 +53,13 @@ POST /<repo>/git-receive-pack                      the updates and their pack
 | | |
 | --- | --- |
 | `src/serve.wac` | The protocol: advertisements, upload-pack v2 and v0, receive-pack, choosing and assembling packs. Functions from a repository and a request body to a response body, with no socket in them. |
-| `src/indexpack.wac` | Indexing a pushed pack, in time proportional to its size (see below). |
+| `src/indexpack.wac` | Indexing a pushed pack in time proportional to its size, completing a thin one in the same pass (see below). |
+| `src/store.wac` | Objects read through a cache of resolved delta bases. |
+| `src/walk.wac` | Which commits are new: both sides walked together by date, stopping when nothing new is left. |
+| `src/scan.wac`, `src/delta.wac`, `src/sha1.wac` | Tree and commit headers read from the bytes, delta application with bulk copies, and a faster streaming SHA-1. |
 | `cmd/gitserve.wac` | HTTP around it: routing, auth, chunked and gzip bodies, connection limits, open repositories kept between requests. |
 | `test/e2e.sh` | Real git against the server (`wac task e2e`). |
-| `test/*_test.wac` | Ref-name rules and v2 request parsing; the indexer against `git index-pack`, byte for byte (`wac task test`). |
+| `test/*_test.wac` | Ref-name rules and v2 request parsing; the indexer, thin completion included, against `git index-pack`, byte for byte; SHA-1 against vectors and wac's own (`wac task test`). |
 | `bench/` | The comparison with git's own servers (`wac task bench`). |
 
 **wac is fetched rather than imported.** wac's root library does not export its `git` package, and a `subdir`
@@ -112,4 +116,14 @@ A repository's packs are held in memory while it is open.
 
 ## Performance against git's servers
 
-See [BENCHMARKS.md](BENCHMARKS.md).
+The server was measured against `git http-backend` and `git daemon`, serving the same repositories to the same
+git:
+
+- **Small and medium repositories**: it is as fast as `git http-backend`.
+- **The 83,117-object wac repository**:
+  - a full clone takes 4.0 s, against 3.2 s;
+  - a 50-commit fetch takes 0.32 s, against 0.37 s;
+  - a push takes 0.72 s, against 0.49 s.
+- **Memory** is the largest remaining gap: 480 MB at peak against git's 150 MB.
+
+[BENCHMARKS.md](BENCHMARKS.md) has every number, how the gap closed from 5–11×, and what is left.

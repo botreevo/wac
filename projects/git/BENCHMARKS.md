@@ -24,94 +24,104 @@ every 20 ms. Reproduce with `wac task build && wac task bench`.
 
 | | server | wall | server CPU | server peak RSS | pack received |
 |---|---|---:|---:|---:|---:|
-| ls-remote (each) | wac | 15 ms | 9 ms | 201.9 MB |  |
-| ls-remote (each) | http-backend | 15 ms | 7 ms | 22.0 MB |  |
-| ls-remote (each) | git-daemon | 49 ms | n/a | 13.3 MB |  |
-| full clone | wac | 258 ms | 230 ms | 277.1 MB | 4.0 MB |
-| full clone | http-backend | 135 ms | 40 ms | 32.7 MB | 4.0 MB |
-| full clone | git-daemon | 132 ms | n/a | 21.9 MB | 4.0 MB |
-| incremental fetch | wac | 257 ms | 170 ms | 311.1 MB | 4.0 MB |
-| incremental fetch | http-backend | 144 ms | 50 ms | 34.5 MB | 4.0 MB |
-| incremental fetch | git-daemon | 154 ms | n/a | 22.8 MB | 4.0 MB |
-| push | wac | 648 ms | 660 ms | 323.5 MB |  |
-| push | http-backend | 167 ms | 130 ms | 43.0 MB |  |
-| push | git-daemon | 191 ms | n/a | 21.0 MB |  |
+| ls-remote (each) | wac | 16 ms | 8 ms | 202.5 MB |  |
+| ls-remote (each) | http-backend | 19 ms | 10 ms | 22.8 MB |  |
+| ls-remote (each) | git-daemon | 50 ms | n/a | 13.4 MB |  |
+| full clone | wac | 134 ms | 100 ms | 251.3 MB | 4.0 MB |
+| full clone | http-backend | 130 ms | 50 ms | 30.8 MB | 4.0 MB |
+| full clone | git-daemon | 143 ms | n/a | 22.1 MB | 4.0 MB |
+| incremental fetch | wac | 137 ms | 70 ms | 258.6 MB | 4.0 MB |
+| incremental fetch | http-backend | 151 ms | 60 ms | 42.2 MB | 4.0 MB |
+| incremental fetch | git-daemon | 164 ms | n/a | 22.7 MB | 4.0 MB |
+| push | wac | 349 ms | 360 ms | 306.0 MB |  |
+| push | http-backend | 204 ms | 160 ms | 39.5 MB |  |
+| push | git-daemon | 213 ms | n/a | 21.1 MB |  |
 
 ### wacuum — 894 objects, 693 KB packed; fetch and push carry 50 commits
 
 | | server | wall | server CPU | server peak RSS | pack received |
 |---|---|---:|---:|---:|---:|
-| ls-remote (each) | wac | 18 ms | 9 ms | 180.2 MB |  |
-| ls-remote (each) | http-backend | 21 ms | 11 ms | 24.7 MB |  |
-| ls-remote (each) | git-daemon | 50 ms | n/a | 13.4 MB |  |
-| full clone | wac | 238 ms | 240 ms | 195.2 MB | 704 KB |
-| full clone | http-backend | 85 ms | 30 ms | 19.3 MB | 693 KB |
-| full clone | git-daemon | 102 ms | n/a | 14.0 MB | 693 KB |
-| incremental fetch | wac | 133 ms | 110 ms | 200.3 MB | 285 KB |
-| incremental fetch | http-backend | 84 ms | 40 ms | 37.7 MB | 302 KB |
-| incremental fetch | git-daemon | 140 ms | n/a | 22.2 MB | 302 KB |
-| push | wac | 367 ms | 340 ms | 223.9 MB |  |
-| push | http-backend | 126 ms | 80 ms | 34.8 MB |  |
-| push | git-daemon | 195 ms | n/a | 21.1 MB |  |
+| ls-remote (each) | wac | 16 ms | 9 ms | 180.4 MB |  |
+| ls-remote (each) | http-backend | 22 ms | 11 ms | 28.7 MB |  |
+| ls-remote (each) | git-daemon | 50 ms | n/a | 13.5 MB |  |
+| full clone | wac | 87 ms | 60 ms | 196.3 MB | 704 KB |
+| full clone | http-backend | 88 ms | 30 ms | 25.5 MB | 693 KB |
+| full clone | git-daemon | 100 ms | n/a | 14.0 MB | 693 KB |
+| incremental fetch | wac | 56 ms | 30 ms | 211.3 MB | 285 KB |
+| incremental fetch | http-backend | 88 ms | 40 ms | 37.9 MB | 302 KB |
+| incremental fetch | git-daemon | 138 ms | n/a | 21.8 MB | 302 KB |
+| push | wac | 108 ms | 90 ms | 217.0 MB |  |
+| push | http-backend | 120 ms | 70 ms | 34.6 MB |  |
+| push | git-daemon | 197 ms | n/a | 21.1 MB |  |
 
 ### wac — 83,117 objects, 38.9 MB packed; fetch and push carry 50 commits
 
 | | server | wall | server CPU | server peak RSS | pack received |
 |---|---|---:|---:|---:|---:|
-| ls-remote (each) | wac | 16 ms | 8 ms | 331.9 MB |  |
-| ls-remote (each) | http-backend | 19 ms | 10 ms | 24.7 MB |  |
-| ls-remote (each) | git-daemon | 50 ms | n/a | 13.6 MB |  |
-| full clone | wac | 16.12 s | 13.90 s | 833.4 MB | 39.9 MB |
-| full clone | http-backend | 3.27 s | 770 ms | 149.9 MB | 38.9 MB |
-| full clone | git-daemon | 3.02 s | n/a | 97.7 MB | 38.9 MB |
-| incremental fetch | wac | 2.00 s | 2.01 s | 420.6 MB | 2.0 MB |
-| incremental fetch | http-backend | 379 ms | 150 ms | 77.4 MB | 2.3 MB |
-| incremental fetch | git-daemon | 401 ms | n/a | 63.2 MB | 2.3 MB |
-| push | wac | 5.24 s | 5.24 s | 574.1 MB |  |
-| push | http-backend | 481 ms | 280 ms | 50.6 MB |  |
-| push | git-daemon | 519 ms | n/a | 36.6 MB |  |
-
+| ls-remote (each) | wac | 13 ms | 8 ms | 256.4 MB |  |
+| ls-remote (each) | http-backend | 19 ms | 9 ms | 24.8 MB |  |
+| ls-remote (each) | git-daemon | 50 ms | n/a | 13.4 MB |  |
+| full clone | wac | 4.02 s | 1.67 s | 481.5 MB | 39.9 MB |
+| full clone | http-backend | 3.24 s | 810 ms | 148.9 MB | 38.9 MB |
+| full clone | git-daemon | 3.06 s | n/a | 97.2 MB | 38.9 MB |
+| incremental fetch | wac | 318 ms | 210 ms | 474.5 MB | 2.0 MB |
+| incremental fetch | http-backend | 369 ms | 150 ms | 77.4 MB | 2.3 MB |
+| incremental fetch | git-daemon | 392 ms | n/a | 62.1 MB | 2.3 MB |
+| push | wac | 719 ms | 670 ms | 554.7 MB |  |
+| push | http-backend | 493 ms | 290 ms | 49.6 MB |  |
+| push | git-daemon | 551 ms | n/a | 36.5 MB |  |
 
 ## What the numbers say
 
-**Small requests are on par.** `ls-remote` takes 15–18 ms on wac and 15–21 ms on http-backend. That holds
-only because open repositories are kept between requests. Before that change, every request re-read the
-packs, and an `ls-remote` cost wac 45 ms of CPU on a 4 MB repository.
+**On small and medium repositories the wac server matches git's.** Clone, fetch and push of `wac-sudoku`
+(4 MB) and `wacuum` (0.7 MB) take the same wall time as `git http-backend`, give or take 20 ms, and are
+sometimes faster. `ls-remote` is 13–16 ms against git's 19–22 ms.
 
-**The packs are as good as git's.** A full clone of wac's 83,117 objects arrives as 39.9 MB from this server
-and 38.9 MB from git, because stored deltas are reused rather than recomputed. The 50-commit incremental fetch
-is slightly smaller from wac (2.0 MB against 2.3 MB). The wac server sends exactly what the new commits reach
-beyond their parents' trees.
+**On the 83,117-object wac repository it is within 1.5×:**
 
-**Bulk work is several times slower:**
+| wac repo | wac server | http-backend | ratio | the first version of this server |
+| --- | ---: | ---: | ---: | ---: |
+| full clone, wall | 4.02 s | 3.24 s | 1.24× | 16.1 s |
+| full clone, server CPU | 1.67 s | 0.81 s | 2.1× | 13.9 s |
+| incremental fetch | 318 ms | 369 ms | 0.86× | 2.00 s |
+| push | 719 ms | 493 ms | 1.46× | 5.24 s |
 
-| | full clone | incremental fetch | push |
-| --- | ---: | ---: | ---: |
-| small and medium repos, wall time vs http-backend | about 2–3× | about 1.5–2× | about 3–4× |
-| the wac repo, wall time vs http-backend | 4.9× | 5.3× | 11× |
-| the wac repo, CPU vs http-backend | 18× | 13× | 19× |
+**The packs are as good as git's.** The clone arrives as 39.9 MB against git's 38.9 MB, because stored deltas
+are reused rather than recomputed. The fetch is smaller than git's (2.0 MB against 2.3 MB).
 
-**Memory is the largest gap.** The wac server sits at 180–330 MB, most of it the Node runtime and wasm heap,
-and peaks at 833 MB serving the 39 MB clone. git peaks at 150 MB.
+**Memory is the gap that remains.** The wac server holds 180–260 MB at rest, most of it the Node runtime and wasm
+heap. It peaks at 480–555 MB on the large repository; git peaks at 150 MB. That peak is the open packs (40 MB),
+the 96 MB delta-base cache, and objects resolved during the request.
 
-## Where the time goes, and what would close the gap
+## How the gap closed
 
-The costs are in the algorithms, not the protocol. Each one has a known fix:
+The first measurements had the wac server 5× slower than git on a large clone and 11× slower on a push, with
+13–19× the CPU. None of that turned out to be the language. It was the algorithms, and each fix is a file:
 
-1. **No delta-base cache.** wac's `readObject` resolves a deltified object by re-inflating its whole base
-   chain every time, and git's chains run 50 deep. A full clone walks every commit and tree, so it inflates
-   the same bases over and over. git keeps a cache of recently resolved bases. Adding one is the biggest
-   single win for clone time.
-2. **Walking whole histories.** To find what the client already has, the server walks the entire history
-   behind every common commit. A push does the same behind every existing ref, to know where its connectivity
-   check can stop. On wac's 2,000-commit history, that is most of the 2 s fetch and the 5 s push. git walks
-   both sides together by commit date and stops early. With a commit-graph file, it does not need to inflate
-   commits at all.
-3. **Whole files in memory.** Packs are read whole into the heap, and so are request and response bodies.
-   That is most of the peak RSS. Streaming the response and reading packs a window at a time would bound it.
-4. **The engine.** Some gap will remain: this is a GC language compiled to wasm on V8, against C. How much of
-   the 13–19× is the engine and how much is 1–3 is not measured here. Fixing 1–3 first is what would tell.
+| | what it was | what it is now | file |
+| --- | --- | --- | --- |
+| delta resolution | the whole chain re-inflated on every read | resolved bases cached, 96 MB budget | `src/store.wac` |
+| "what does the other side have" | every commit behind every `have` or ref, each time | git's walk: both sides together by date, stopping when nothing new is queued | `src/walk.wac` |
+| a push's connectivity check | every blob read in full | blobs looked up in an index; only trees the new commits add are walked | `src/serve.wac` |
+| completing a thin push | bases deflated and appended, then the whole pack re-indexed | one pass with the bases as roots, appended as stored zlib blocks | `src/indexpack.wac` |
+| indexing a push | n² SHA-1s (wac's `indexPack`) | linear: each object resolved and hashed once | `src/indexpack.wac` |
+| applying a delta | a byte at a time into a growing buffer | the output allocated once, copies in bulk | `src/delta.wac` |
+| reading trees and commits | a string per mode, name and author | hashes, kinds and a time, read from the bytes | `src/scan.wac` |
+| SHA-1 | 80 words allocated per block, a branch per round, byte-wise input | 16 words reused, whole blocks from the input: 2.3× faster | `src/sha1.wac` |
+| the response | the pack concatenated three times | about 1 MB pieces, hashed as they are made, sent one by one | `src/serve.wac`, `cmd/gitserve.wac` |
+| opening a repository | every request | once per server, kept until its pack directory changes | `cmd/gitserve.wac` |
 
-A first version of the push path showed how much the algorithms matter. It used wac's `indexPack`, whose
-reference-delta resolution is quadratic, and a 4 MB push of 400 objects took more than five minutes. With
-`src/indexpack.wac`, the same push indexes in 180 ms.
+Four of these work around code in wac's own packages: the quadratic indexer, slow SHA-1, byte-wise delta
+application, and string-building parsers. They would speed up wac's git client as much as this server, and
+belong upstream.
+
+## What is left
+
+- **The full clone's 0.9 s of extra CPU.** About 0.6 s walks every tree in the history to list objects, and the
+  rest copies 40 MB of entries and hashes them. git answers the listing from a reachability bitmap when the
+  repository has one, and reads packs through `mmap`. A bitmap reader is the next large step.
+- **Opening a repository** reads every pack into the heap: 0.4 s and 40 MB for this one, once per server
+  process. Reading packs a window at a time, through `Files.openRandom`, would make it instant and shrink the
+  resident size.
+- **The baseline**: about 200 MB of Node and wasm before any repository is open. That belongs to the host and
+  is not this server's to fix.

@@ -148,6 +148,23 @@ case "$(cat "$T/stale.out")" in
 esac
 same "and main did not move" "$(git -C "$T/root/demo.git" rev-parse main)" "$head"
 
+# A pack carrying a commit without its tree: the connectivity check must refuse it, and the ref stay put.
+cd "$T/c2"
+echo orphan > orphan.txt && git add orphan.txt && git commit -qm "tree not sent"
+lonely=$(git rev-parse HEAD)
+head=$(git -C "$T/root/demo.git" rev-parse main)
+line="$head $lonely refs/heads/main"
+printf '%04x%s\000report-status\n0000' $((${#line} + 4 + 15)) "$line" > "$T/lonely.req"
+echo "$lonely" | git pack-objects --stdout -q >> "$T/lonely.req"
+curl -s -u x:secret-token -H 'Content-Type: application/x-git-receive-pack-request' \
+  --data-binary @"$T/lonely.req" "$URL/demo.git/git-receive-pack" > "$T/lonely.out"
+case "$(cat "$T/lonely.out")" in
+  *"ng refs/heads/main missing necessary objects"*) ok "a commit whose tree was not sent is refused";;
+  *) bad "a commit whose tree was not sent is refused"; echo "     $(cat "$T/lonely.out")";;
+esac
+same "and main did not move" "$(git -C "$T/root/demo.git" rev-parse main)" "$head"
+git reset -q --hard HEAD~1
+
 # atomic: one good update and one bad one, and neither happens.
 before=$(git -C "$T/root/demo.git" rev-parse main)
 echo atomic >> a.txt && git commit -qam atomic

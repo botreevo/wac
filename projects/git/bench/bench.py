@@ -78,8 +78,8 @@ def tree_rss(root):
         try:
             with open(f"/proc/{p}/statm") as f:
                 total += int(f.read().split()[1]) * PAGE
-        except FileNotFoundError:
-            pass
+        except (FileNotFoundError, ProcessLookupError):
+            pass  # a child that exited between listing and reading
         todo.extend(children.get(p, []))
     return total
 

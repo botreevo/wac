@@ -28,6 +28,7 @@ import { decode as base64 } from "../vendor/wac/packages/codec/src/base64.wac";
 import { gunzipBytesResult } from "../vendor/wac/packages/gzip/src/inflate.wac";
 import { writeText, flushPkt } from "../vendor/wac/packages/git/src/pktline.wac";
 import { Repo, RepoAt, openRepo } from "../vendor/wac/packages/git/src/repo.wac";
+import { Store, storeOf } from "../src/store.wac";
 import { Pushed, advertiseV0, advertiseV2, errPkt, initBare, receivePack, uploadPackV0, uploadPackV2 } from "../src/serve.wac";
 
 struct Config {
@@ -59,9 +60,21 @@ struct Response {
   string contentType;
   string[] headers;
   u8[] body;
+  /** More of the body after `body`, sent piece by piece: a pack is never joined into one array to be sent. */
+  Vec<u8[]> rest;
 }
 
-Response text(i32 status, string t) { return Response(status, "text/plain; charset=utf-8", string[](), t.toBytes()); }
+Response respond(i32 status, string contentType, string[] headers, u8[] body) {
+  return Response(status, contentType, headers, body, Vec<u8[]>.create());
+}
+
+i32 bodyLength(Response r) {
+  i32 n = r.body.len();
+  for (i32 i = 0; i < r.rest.len(); i++) { n = n + r.rest.get(i).len(); }
+  return n;
+}
+
+Response text(i32 status, string t) { return respond(status, "text/plain; charset=utf-8", string[](), t.toBytes()); }
 
 export async i32 main(Sys sys) {
   string[] argv = sys.args();
@@ -186,13 +199,20 @@ enum Arrived {
 async void answer(Sys sys, Config c, Locks locks, Conns conns, Open o) {
   match (await readRequest(o.sock, c.maxBody)) {
     Whole(r): {
+      i64 started = (await sys.clock().nowMillis()).orElse(0 as i64);
       Response out = await route(sys, c, locks, r);
-      if (r.method == "HEAD") { out.body = u8[](); }
-      await o.sock.send(responseBytes(out));
-      sys.log("gitserve: \{r.method} \{r.path}\{r.query == "" ? "" : "?" + r.query} \{out.status} \{out.body.len()}");
+      i32 length = bodyLength(out);
+      if (r.method == "HEAD") { out.body = u8[](); out.rest = Vec<u8[]>.create(); }
+      await o.sock.send(responseBytes(out, length));
+      for (i32 i = 0; i < out.rest.len(); i++) {
+        await o.sock.send(out.rest.get(i));
+        // Let the piece go: what is sent is not kept.
+        out.rest.set(i, u8[]());
+      }
+      sys.log("gitserve: \{r.method} \{r.path}\{r.query == "" ? "" : "?" + r.query} \{out.status} \{length} \{(await sys.clock().nowMillis()).orElse(0 as i64) - started}ms");
     }
-    TooLarge: { await o.sock.send(responseBytes(text(413, "too large\n"))); }
-    Malformed(why): { await o.sock.send(responseBytes(text(400, "bad request: \{why}\n"))); }
+    TooLarge: { await o.sock.send(responseBytes(text(413, "too large\n"), -1)); }
+    Malformed(why): { await o.sock.send(responseBytes(text(400, "bad request: \{why}\n"), -1)); }
     Gone: { }
   }
   close(o);
@@ -382,8 +402,10 @@ string trim(string s) {
   return s.slice(a, b);
 }
 
-u8[] responseBytes(Response r) {
-  string head = "HTTP/1.1 \{r.status} \{reason(r.status)}\r\nContent-Type: \{r.contentType}\r\nContent-Length: \{r.body.len()}\r\n";
+/** The status line, the headers and `body`; `length` is the whole body's, `rest` included (-1: just `body`). */
+u8[] responseBytes(Response r, i32 length) {
+  i32 n = length < 0 ? r.body.len() : length;
+  string head = "HTTP/1.1 \{r.status} \{reason(r.status)}\r\nContent-Type: \{r.contentType}\r\nContent-Length: \{n}\r\n";
   for (string h in r.headers) {
     if (h.indexOf("\r") < 0 && h.indexOf("\n") < 0) { head += h + "\r\n"; }
   }
@@ -471,7 +493,7 @@ async Response route(Sys sys, Config c, Locks locks, Request r) {
   if (push) {
     if (!c.anonymousPush && c.token == "") { return text(403, "pushing is not enabled on this server\n"); }
     if (!c.anonymousPush && !authorized(r, c.token)) {
-      return Response(401, "text/plain; charset=utf-8", ["WWW-Authenticate: Basic realm=\"git\""], "credentials required to push\n".toBytes());
+      return respond(401, "text/plain; charset=utf-8", ["WWW-Authenticate: Basic realm=\"git\""], "credentials required to push\n".toBytes());
     }
   }
 
@@ -497,13 +519,14 @@ async Response route(Sys sys, Config c, Locks locks, Request r) {
 
 /**
  * An open repository, kept between requests: opening one reads every pack and its index into memory, which
- * for a repository of 50 MB is most of what a request would otherwise cost.
+ * for a repository of 50 MB is most of what a request would otherwise cost — and its store's cache of resolved
+ * delta bases goes with it.
  *
  * It is reopened when the names in `objects/pack` change — a push stored one, or `git gc` rewrote them.
  * Loose objects and refs are read from disk on every request, so nothing else can go stale.
  */
 struct Cached {
-  Repo repo;
+  Store repo;
   string packs;
 }
 
@@ -528,14 +551,16 @@ async Response serveRepo(Files fs, Locks locks, string dir, Request r, string wh
   if (hit is not null && hit!.packs == packs) { return await serveOpen(fs, locks, dir, hit!.repo, r, what, service); }
   match ((await openRepo(fs, dir, dir))) {
     NoRepo(why): { return text(500, "cannot open the repository: \{why}\n"); }
-    Opened(repo): {
+    Opened(opened): {
+      // The store keeps resolved delta bases between requests too: the next clone starts warm.
+      Store repo = storeOf(opened);
       locks.repos.set(dir, Cached(repo, packs));
       return await serveOpen(fs, locks, dir, repo, r, what, service);
     }
   }
 }
 
-async Response serveOpen(Files fs, Locks locks, string dir, Repo repo, Request r, string what, string service) {
+async Response serveOpen(Files fs, Locks locks, string dir, Store repo, Request r, string what, string service) {
   bool v2 = header(r, "git-protocol").indexOf("version=2") >= 0 && service == "git-upload-pack";
   string[] nocache = ["Cache-Control: no-cache, max-age=0, must-revalidate", "Expires: Fri, 01 Jan 1980 00:00:00 GMT", "Pragma: no-cache"];
   if (what == "/info/refs") {
@@ -548,16 +573,16 @@ async Response serveOpen(Files fs, Locks locks, string dir, Repo repo, Request r
       body.pushAll(flushPkt());
       body.pushAll(await advertiseV0(repo, service));
     }
-    return Response(200, "application/x-\{service}-advertisement", nocache, body.take());
+    return respond(200, "application/x-\{service}-advertisement", nocache, body.take());
   }
   if (service == "git-upload-pack") {
-    u8[] answer = v2 ? await uploadPackV2(repo, r.body) : await uploadPackV0(repo, r.body);
-    return Response(200, "application/x-git-upload-pack-result", nocache, answer);
+    Vec<u8[]> answer = v2 ? await uploadPackV2(repo, r.body) : await uploadPackV0(repo, r.body);
+    return Response(200, "application/x-git-upload-pack-result", nocache, u8[](), answer);
   }
   Pushed done = await receivePack(repo, r.body);
   // A stored pack is already in `repo.packs`, so the open repository stays current: record its new listing.
   locks.repos.set(dir, Cached(repo, await packNames(fs, dir)));
-  return Response(200, "application/x-git-receive-pack-result", nocache, done.report);
+  return respond(200, "application/x-git-receive-pack-result", nocache, done.report);
 }
 
 /** Basic credentials whose password is `token`; any user name. Compared without stopping at the first difference. */
@@ -597,7 +622,7 @@ async Response listing(Files fs, string root) {
   await collect(fs, root, "", found, 2);
   Buf out = Buf.create();
   for (i32 i = 0; i < found.len(); i++) { out.pushAll("\{found.get(i)}\n".toBytes()); }
-  return Response(200, "text/plain; charset=utf-8", string[](), out.take());
+  return respond(200, "text/plain; charset=utf-8", string[](), out.take());
 }
 
 async void collect(Files fs, string root, string rel, Vec<string> found, i32 depth) {

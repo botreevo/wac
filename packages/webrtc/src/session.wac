@@ -91,6 +91,8 @@ export struct Session {
   Map<i32, ChannelState> channels = Map<i32, ChannelState>.create(hashI32, i32Eq);
   Vec<ChannelEvent> happened = Vec<ChannelEvent>.create();
   i32 checksAnswered = 0;
+  /** The next stream id `open` tries; -1 before the first. */
+  i32 nextOpen = -1;
   /**
    * Whether this end is ICE's controlling agent: the one that sends checks and nominates (`connect`). A KPS dialer
    * is, against a listener that is ICE-lite and only answers.
@@ -244,9 +246,20 @@ export struct Session {
    */
   i32 open(this, string label, bool ordered, i32 maxRetransmits, i64 now, Vec<u8[]> out) {
     if (!this.assoc.established() || !this.peerIsExpected()) { return -1; }
-    i32 id = this.dtlsClient ? 0 : 1;
-    while (this.channels.has(id) && id < 65534) { id += 2; }
-    if (this.channels.has(id)) { return -1; }
+    // **Ids are taken in turn, not lowest-free.** A channel's id is free here once both directions are reset, but
+    // the peer may still be finishing the close of the channel that had it — libdatachannel delivered a reopened
+    // id's data to the old channel, intermittently, when the lowest free id came straight back. Going round the
+    // whole id space before reusing one gives every close all the time it needs.
+    i32 parity = this.dtlsClient ? 0 : 1;
+    if (this.nextOpen < 0 || (this.nextOpen & 1) != parity) { this.nextOpen = parity; }
+    i32 id = -1;
+    for (i32 tries = 0; tries < 32768; tries++) {
+      i32 candidate = this.nextOpen;
+      this.nextOpen += 2;
+      if (this.nextOpen > 65534) { this.nextOpen = parity; }
+      if (!this.channels.has(candidate)) { id = candidate; break; }
+    }
+    if (id < 0) { return -1; }
     this.channels.set(id, ChannelState(ordered, maxRetransmits, false, false, false));
     i32 type = (ordered ? 0 : CHANNEL_UNORDERED) | (maxRetransmits >= 0 ? CHANNEL_PARTIAL_RELIABLE_REXMIT : CHANNEL_RELIABLE);
     u8[] msg = dcepOpenMessage(type, 0, maxRetransmits >= 0 ? maxRetransmits : 0, label, "");

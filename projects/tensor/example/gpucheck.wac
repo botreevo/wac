@@ -4,6 +4,7 @@
 
 import { Page } from "web";
 import { Result, Vec } from "core";
+import { DType, dtypeName, sameDType } from "../src/backend.wac";
 import { Device, Gradients, Padding, Tensor } from "../src/tensor.wac";
 import { gpuDevice } from "../src/gpu/backend.wac";
 import { Activation, Dense, Layer, Sequential, sigmoidCrossEntropy } from "../src/nn.wac";
@@ -33,7 +34,7 @@ struct Verdict {
       if (scale < 1.0) { scale = 1.0; }
       f64 d = got - want;
       if (d < 0.0) { d = 0.0 - d; }
-      bool bothNan = got != got && want != want;
+      bool bothNan = (got != got && want != want) || got == want;
       if (!bothNan && !(d <= tol * scale)) {
         this.failures.push("\{name}[\{i}]: \{got} on the GPU, \{want} on the CPU");
         return;
@@ -42,9 +43,9 @@ struct Verdict {
   }
 }
 
-Tensor[] inputsOn(Device d, f32[][] values, i32[][] shapes) {
+Tensor[] inputsOn(Device d, f32[][] values, i32[][] shapes, DType t) {
   Tensor[] out = Tensor[].filled(shapes.len(), d.scalar(0.0));
-  for (i32 i = 0; i < shapes.len(); i++) { out[i] = d.tensor(values[i], shapes[i]); }
+  for (i32 i = 0; i < shapes.len(); i++) { out[i] = d.tensorOf(values[i], shapes[i], t); }
   return out;
 }
 
@@ -149,18 +150,41 @@ export async i32 main(Page page) {
   cpu.seed(11 as i64);
   Verdict v = Verdict { failures: Vec.create() };
 
-  for (Case c in cases()) {
-    f32[][] values = f32[][].defaulted(c.shapes.len());
-    for (i32 i = 0; i < c.shapes.len(); i++) {
-      Tensor t = c.positive ? cpu.uniform(c.shapes[i], 0.5, 2.0) : cpu.normal(c.shapes[i], 0.0, 1.0);
-      values[i] = t.valuesNow();
+  // Every case in each type. Both devices round the same inputs the same way, so a half case differs only where the
+  // two backends round one result differently: by a unit in the last place of a half, about one part in a thousand,
+  // and a few of those where a case chains several operations.
+  DType[] types = [DType.F32, DType.F16];
+  for (DType t in types) {
+    f64 tol = sameDType(t, DType.F16) ? 0.008 : 0.002;
+    for (Case c in cases()) {
+      f32[][] values = f32[][].defaulted(c.shapes.len());
+      for (i32 i = 0; i < c.shapes.len(); i++) {
+        Tensor r = c.positive ? cpu.uniform(c.shapes[i], 0.5, 2.0) : cpu.normal(c.shapes[i], 0.0, 1.0);
+        values[i] = r.valuesNow();
+      }
+      Tensor want = c.f(inputsOn(cpu, values, c.shapes, t));
+      Tensor got = gpu.tidy(() => c.f(inputsOn(gpu, values, c.shapes, t)));
+      f32[] g = await got.values();
+      string name = c.name + " (" + dtypeName(t) + ")";
+      if (!sameDType(got.dtype(), want.dtype())) { v.failures.push(name + ": the two backends answered different types"); }
+      v.compare(name, got.shape, g, want.shape, want.valuesNow(), tol);
+      got.dispose();
     }
-    Tensor want = c.f(inputsOn(cpu, values, c.shapes));
-    Tensor got = gpu.tidy(() => c.f(inputsOn(gpu, values, c.shapes)));
-    f32[] g = await got.values();
-    v.compare(c.name, got.shape, g, want.shape, want.valuesNow(), 0.002);
-    got.dispose();
   }
+
+  // A whole model in halves learns on the GPU — the same property the CPU's test holds it to.
+  gpu.dtype = DType.F16;
+  gpu.seed(7 as i64);
+  Tensor hx = gpu.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], [4, 2]);
+  Tensor hy = gpu.tensor([0.0, 1.0, 1.0, 0.0], [4, 1]);
+  Sequential hm = xorModel(gpu);
+  Adam ho = Adam.create(0.05);
+  for (i32 step = 0; step < 299; step++) { ho.minimize(() => sigmoidCrossEntropy(hm.apply(hx, true), hy), hm.params()).dispose(); }
+  Tensor hl = ho.minimize(() => sigmoidCrossEntropy(hm.apply(hx, true), hy), hm.params());
+  f32 halfLoss = (await hl.values())[0];
+  v.checks++;
+  if (!(halfLoss < 0.1)) { v.failures.push("a half-precision model on the GPU did not learn xor: loss \{halfLoss}"); }
+  gpu.dtype = DType.F32;
 
   // A model trained on the GPU from the same weights as one on the CPU follows the same path.
   Tensor x = cpu.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], [4, 2]);

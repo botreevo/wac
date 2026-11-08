@@ -22,7 +22,7 @@ Tensor loss = opt.minimize(() => sparseSoftmaxCrossEntropy(model.apply(x, true),
 
 ## What is the same as TensorFlow
 
-The capabilities: n-dimensional `f32` tensors with NumPy broadcasting; elementwise maths and activations; reductions
+The capabilities: n-dimensional `f32` and `f16` tensors with NumPy broadcasting; elementwise maths and activations; reductions
 over any axes; matrix products with batching and either side transposed; reshape, transpose, slice, pad, concat,
 split, tile, gather and one-hot; 2-D convolution (strides, `Same`/`Valid` padding, dilation), its transpose, and max
 and average pooling, in NHWC with `[kh, kw, in, out]` filters; reverse-mode gradients of anything built from those,
@@ -68,13 +68,23 @@ set of variables.
 returned; `optimizer.minimize` is already a tidy step that keeps only the loss. On the CPU this is bookkeeping; on a
 GPU it is the difference between a training loop and a leak. A use after dispose traps on both.
 
-**Every tensor is `f32`.** It is what WebGPU computes in everywhere and what TensorFlow trains in by default. Index
-tensors (`take`, `argMax`, `oneHot`) hold their integers as `f32`, exact to 2²⁴. There are no other dtypes.
+**Two element types: `F32` and `F16`, both computed in `f32`.** A half tensor is stored as halves — half the memory
+and bandwidth — and every operation reads it as `f32`, computes, and rounds its result once, which is what
+mixed-precision training does: a sum of 4096 halves is 4096, where accumulating in halves would stop at 2048. Types
+never mix silently: `a.add(b)` with one of each traps, and `t.cast(DType.F16)` says it, its gradient cast back — so
+f32 weights under an f16 computation train. A number takes its tensor's type (`half * 2.0` stays half). `d.dtype =
+DType.F16` before a model is made makes every new tensor, and so every weight, a half. Index tensors (`take`,
+`argMax`, `oneHot`) hold their integers as floats — `argMax` always answers `F32`, exact to 2²⁴.
+
+*Why only these two:* WGSL computes in `f32`, `i32` and `u32`, with `f16` as an optional extension (`shader-f16`) not
+every adapter has; there is no `f64`, no `bfloat16`, and no 8- or 64-bit integer arithmetic. So halves here are packed
+two to a `u32` and unpacked with core WGSL's `unpack2x16float` — no extension, every adapter, the arithmetic in `f32`
+either way. An `I32` type for integer arithmetic is the natural next one; it is not here yet.
 
 ## The backends
 
-Everything above is written once (`src/tensor.wac`) against fifteen kernels (`src/backend.wac`): elementwise unary
-and binary (broadcast by strides), select, row reduction and arg-reduction, batched matrix product, strided gather,
+Everything above is written once (`src/tensor.wac`) against sixteen kernels (`src/backend.wac`): elementwise unary
+and binary (broadcast by strides), cast, select, row reduction and arg-reduction, batched matrix product, strided gather,
 pad, im2col and col2im, take and scatter-add, fill. A transpose, slice and broadcast are one `gather`; a convolution is
 `im2col` and a matrix product; pooling is `im2col` and a reduction. Adding an operation almost never needs a kernel.
 
@@ -103,9 +113,10 @@ The host side is on wac-web's `gpu` branch (`tools/build.wac`, `wac.gpu` in `pro
 ## Checking it
 
 ```sh
-wac task test             # 26 tests, about a second: every op, every gradient, every optimizer's first step
+wac task test             # 32 tests, about a second: every op, every gradient, every optimizer's first step, halves
 wac task gpucheck:build   # the GPU check as a page
-wac task gpucheck         # ...run in headless Chromium: PASS 64
+wac task gpucheck         # ...run in headless Chromium: PASS 128
+wac task shaders          # every WGSL program, in both types, compiled in Chromium: 100 of them
 ```
 
 - **Gradients against finite differences.** Every backward rule — 21 unary, 10 binary with broadcasting, 9 reductions,
@@ -113,8 +124,12 @@ wac task gpucheck         # ...run in headless Chromium: PASS 64
   (`test/grad_test.wac`). It needs no second implementation to agree with.
 - **The GPU against the CPU.** `example/gpucheck.wac` runs 63 cases — every kernel and every unary and binary
   operation, large and awkward shapes (more rows than a dispatch grid is wide, matrices that do not divide into
-  tiles), gradients through convolution, gather and pooling — and 200 steps of training, on both backends from the
-  same numbers. A mutation in one shader turns it red. Run on SwiftShader, Chromium's software Vulkan, it needs no GPU.
+  tiles), gradients through convolution, gather and pooling — in `F32` and again in `F16`, on both backends from the
+  same numbers; then 200 steps of training compared step for step, and a model in halves trained on the GPU. A
+  mutation in one shader turns it red, as does swapping the two halves of a packed word. Run on SwiftShader,
+  Chromium's software Vulkan, it needs no GPU.
+- **Halves bit for bit.** The conversions agree with IEEE 754 (and NumPy) at the edges — ties to even, the largest
+  finite half, overflow to infinity, the subnormals — and every one of the 65536 halves survives the round trip.
 - **Optimizers exactly.** Each optimizer's first one or two steps are compared with the numbers worked by hand.
 - **Models learn.** An MLP learns XOR; a small CNN tells bright rows from bright columns.
 

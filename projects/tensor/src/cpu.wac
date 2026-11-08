@@ -4,9 +4,14 @@
 // `backend.wac`, and the GPU backend is tested by agreeing with it. Where speed is nearly free it is taken — an
 // operation is chosen once per kernel call, not once per element, and the matrix product runs its loops in the order
 // that reads memory forwards — and nowhere else.
+//
+// **An `F16` storage is an `f32[]` whose every element is a half**: each kernel computes as for `F32` and rounds its
+// result once (`made`), which is what the GPU does with halves packed two to a word. The memory the GPU saves is not
+// saved here; the reference is for the numbers.
 
 import { Ticket, math } from "core";
-import { Backend, Binary, Conv, Reduce, Storage, Unary } from "./backend.wac";
+import { Backend, Binary, Conv, DType, Reduce, Storage, Unary, sameDType } from "./backend.wac";
+import { toHalf } from "./half.wac";
 import { cos, sigmoid, sin, softplus, tanh } from "./scalar.wac";
 import { sizeOf } from "./shape.wac";
 
@@ -94,14 +99,20 @@ export struct CpuBackend : Backend {
     return (s as! CpuStorage).data;
   }
 
-  CpuStorage made(this, f32[] data) { return CpuStorage { size: data.len(), data: data }; }
+  /** `data` as a storage of `dtype` — each element rounded to a half, in place, when that is `F16`. */
+  CpuStorage made(this, f32[] data, DType dtype) {
+    if (sameDType(dtype, DType.F16)) {
+      for (i32 i = 0; i < data.len(); i++) { data[i] = toHalf(data[i]); }
+    }
+    return CpuStorage { size: data.len(), dtype: dtype, data: data };
+  }
 
   override string name(const this) { return "cpu"; }
 
-  override Storage upload(this, f32[] values) {
+  override Storage upload(this, f32[] values, DType dtype) {
     f32[] copy = f32[].filled(values.len(), 0.0);
     copy.copyFrom(values, 0, 0, values.len());
-    return this.made(copy);
+    return this.made(copy, dtype);
   }
 
   override Ticket<f32[]> download(this, Storage s) {
@@ -113,7 +124,14 @@ export struct CpuBackend : Backend {
     return t;
   }
 
-  override Storage fill(this, i32 n, f32 value) { return this.made(f32[].filled(n, value)); }
+  override Storage fill(this, i32 n, f32 value, DType dtype) { return this.made(f32[].filled(n, value), dtype); }
+
+  override Storage cast(this, Storage x, DType to) {
+    f32[] a = this.of(x);
+    f32[] o = f32[].filled(a.len(), 0.0);
+    o.copyFrom(a, 0, 0, a.len());
+    return this.made(o, to);
+  }
 
   // The collector frees the array; marking it is what makes a use after `free` trap here as it would on a GPU.
   override void free(this, Storage s) { s.freed = true; }
@@ -123,7 +141,7 @@ export struct CpuBackend : Backend {
     fn<f32(f32)> f = unaryFn(op);
     f32[] o = f32[].filled(a.len(), 0.0);
     for (i32 i = 0; i < a.len(); i++) { o[i] = f(a[i]); }
-    return this.made(o);
+    return this.made(o, x.dtype);
   }
 
   override Storage binary(this, Binary op, Storage a, Storage b, i32[] out, i32[] sa, i32[] sb) {
@@ -134,7 +152,7 @@ export struct CpuBackend : Backend {
     i32[] ib = offsetsOf(out, sb, 0);
     f32[] o = f32[].filled(ia.len(), 0.0);
     for (i32 i = 0; i < o.len(); i++) { o[i] = f(x[ia[i]], y[ib[i]]); }
-    return this.made(o);
+    return this.made(o, a.dtype);
   }
 
   override Storage select(this, Storage c, Storage a, Storage b, i32[] out, i32[] sc, i32[] sa, i32[] sb) {
@@ -146,7 +164,7 @@ export struct CpuBackend : Backend {
     i32[] ib = offsetsOf(out, sb, 0);
     f32[] o = f32[].filled(ic.len(), 0.0);
     for (i32 i = 0; i < o.len(); i++) { o[i] = cv[ic[i]] != 0.0 ? x[ia[i]] : y[ib[i]]; }
-    return this.made(o);
+    return this.made(o, a.dtype);
   }
 
   override Storage reduce(this, Reduce op, Storage x, i32 outer, i32 inner) {
@@ -164,7 +182,7 @@ export struct CpuBackend : Backend {
       }
       o[r] = nan ? 0.0 / 0.0 : acc as~ f32;
     }
-    return this.made(o);
+    return this.made(o, x.dtype);
   }
 
   override Storage argReduce(this, bool max, Storage x, i32 outer, i32 inner) {
@@ -180,7 +198,7 @@ export struct CpuBackend : Backend {
       }
       o[r] = best as~ f32;
     }
-    return this.made(o);
+    return this.made(o, DType.F32);
   }
 
   override Storage matmul(this, Storage a, Storage b, i32 batch, i32 m, i32 k, i32 n, bool ta, bool tb,
@@ -207,7 +225,7 @@ export struct CpuBackend : Backend {
         }
       }
     }
-    return this.made(o);
+    return this.made(o, a.dtype);
   }
 
   override Storage gather(this, Storage x, i32[] out, i32[] strides, i32 offset) {
@@ -215,7 +233,7 @@ export struct CpuBackend : Backend {
     i32[] offs = offsetsOf(out, strides, offset);
     f32[] o = f32[].filled(offs.len(), 0.0);
     for (i32 i = 0; i < o.len(); i++) { o[i] = a[offs[i]]; }
-    return this.made(o);
+    return this.made(o, x.dtype);
   }
 
   override Storage pad(this, Storage x, i32[] inShape, i32[] out, i32[] begin, f32 value) {
@@ -232,7 +250,7 @@ export struct CpuBackend : Backend {
     }
     i32[] offs = offsetsOf(inShape, os, base);
     for (i32 i = 0; i < a.len(); i++) { o[offs[i]] = a[i]; }
-    return this.made(o);
+    return this.made(o, x.dtype);
   }
 
   override Storage im2col(this, Storage x, Conv c, f32 padValue) {
@@ -255,7 +273,7 @@ export struct CpuBackend : Backend {
         }
       }
     }
-    return this.made(o);
+    return this.made(o, x.dtype);
   }
 
   override Storage col2im(this, Storage cols, Conv c) {
@@ -280,7 +298,7 @@ export struct CpuBackend : Backend {
         }
       }
     }
-    return this.made(o);
+    return this.made(o, cols.dtype);
   }
 
   override Storage take(this, Storage table, i32 width, Storage indices, i32 n) {
@@ -294,7 +312,7 @@ export struct CpuBackend : Backend {
       if (r < 0 || r >= rows) { continue; }
       o.copyFrom(t, r * width, i * width, width);
     }
-    return this.made(o);
+    return this.made(o, table.dtype);
   }
 
   override Storage scatterAdd(this, Storage values, i32 width, Storage indices, i32 n, i32 rows) {
@@ -306,6 +324,6 @@ export struct CpuBackend : Backend {
       if (r < 0 || r >= rows) { continue; }
       for (i32 j = 0; j < width; j++) { o[r * width + j] += v[i * width + j]; }
     }
-    return this.made(o);
+    return this.made(o, values.dtype);
   }
 }

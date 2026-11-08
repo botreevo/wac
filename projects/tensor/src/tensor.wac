@@ -20,7 +20,7 @@
 // use after it.
 
 import { Map, Ticket, Vec, hashI32, i32Eq, operators } from "core";
-import { Backend, Binary, Conv, Reduce, Storage, Unary } from "./backend.wac";
+import { Backend, Binary, Conv, DType, Reduce, Storage, Unary, dtypeName, sameDType } from "./backend.wac";
 import { CpuBackend } from "./cpu.wac";
 import { Random } from "./random.wac";
 import {
@@ -61,13 +61,19 @@ export enum Padding {
 
 export struct Device {
   Backend backend;
+  /**
+   * What new tensors are made as — by `tensor`, `zeros`, the random makers, and so every layer's weights. `F32` unless
+   * set: `d.dtype = DType.F16` before a model is made makes the whole model half precision. An operation's result has
+   * its inputs' type whatever this says.
+   */
+  DType dtype;
   i32 lastId = 0;
   Vec<Tape> tapes;
   Vec<Vec<Tensor>> scopes;
   Random random;
 
   /** A device on `backend`, its random numbers seeded with 0. */
-  Device on(Backend backend) { return Device { backend: backend, tapes: Vec.create(), scopes: Vec.create(), random: Random.seeded(0 as i64) }; }
+  Device on(Backend backend) { return Device { backend: backend, dtype: DType.F32, tapes: Vec.create(), scopes: Vec.create(), random: Random.seeded(0 as i64) }; }
   Device cpu() { return Device.on(CpuBackend.create()); }
 
   string name(const this) { return this.backend.name(); }
@@ -86,14 +92,21 @@ export struct Device {
   }
 
   /** `values` laid out row-major in `shape`. Traps when the two disagree on how many there are. */
-  Tensor tensor(this, f32[] values, i32[] shape) {
+  Tensor tensor(this, f32[] values, i32[] shape) { return this.tensorOf(values, shape, this.dtype); }
+
+  /** `tensor`, as `dtype` rather than the device's default — each value rounded to it. */
+  Tensor tensorOf(this, f32[] values, i32[] shape, DType dtype) {
     if (values.len() != sizeOf(shape)) { trap; }
-    return this.wrap(copyShape(shape), this.backend.upload(values));
+    return this.wrap(copyShape(shape), this.backend.upload(values, dtype));
   }
 
-  Tensor scalar(this, f64 v) { return this.wrap(i32[](), this.backend.fill(1, v as~ f32)); }
+  Tensor scalar(this, f64 v) { return this.scalarOf(v, this.dtype); }
+  Tensor scalarOf(this, f64 v, DType dtype) { return this.fillOf(i32[](), v, dtype); }
   Tensor vector(this, f32[] values) { return this.tensor(values, [values.len()]); }
-  Tensor fill(this, i32[] shape, f64 v) { return this.wrap(copyShape(shape), this.backend.fill(sizeOf(shape), v as~ f32)); }
+  Tensor fill(this, i32[] shape, f64 v) { return this.fillOf(shape, v, this.dtype); }
+  Tensor fillOf(this, i32[] shape, f64 v, DType dtype) {
+    return this.wrap(copyShape(shape), this.backend.fill(sizeOf(shape), v as~ f32, dtype));
+  }
   Tensor zeros(this, i32[] shape) { return this.fill(shape, 0.0); }
   Tensor ones(this, i32[] shape) { return this.fill(shape, 1.0); }
 
@@ -232,7 +245,7 @@ export struct Device {
     this.tapes.pop();
 
     Map<i32, Tensor> grads = Map.create(hashI32, i32Eq);
-    grads.set(y.id, this.ones(y.shape));
+    grads.set(y.id, this.fillOf(y.shape, 1.0, y.dtype()));
     for (i32 i = tape.entries.len() - 1; i >= 0; i--) {
       Entry e = tape.entries.get(i);
       Tensor? dy = grads.get(e.output.id);
@@ -249,7 +262,7 @@ export struct Device {
     Tensor[] out = Tensor[].filled(wrt.len(), y);
     for (i32 i = 0; i < wrt.len(); i++) {
       Tensor? g = grads.get(wrt[i].id);
-      out[i] = g is null ? this.zeros(wrt[i].shape) : g!;
+      out[i] = g is null ? this.fillOf(wrt[i].shape, 0.0, wrt[i].dtype()) : g!;
     }
     Tensor[] keep = Tensor[].filled(wrt.len() + 1, y);
     keep.copyFrom(out, 0, 1, out.len());
@@ -269,6 +282,7 @@ export struct Tensor {
   i32 id;
 
   i32 rank(const this) { return this.shape.len(); }
+  DType dtype(const this) { return this.storage.dtype; }
   i32 size(const this) { return sizeOf(this.shape); }
 
   /** The numbers, row-major, once the device has them ready. */
@@ -297,7 +311,7 @@ export struct Tensor {
 
   string toString(this) {
     f32[] v = this.valuesNow();
-    string s = "Tensor\{shapeText(this.shape)} [";
+    string s = "Tensor<\{dtypeName(this.dtype())}>\{shapeText(this.shape)} [";
     for (i32 i = 0; i < v.len(); i++) {
       if (i > 0) { s += ", "; }
       if (i == 16) { s += "…"; break; }
@@ -313,9 +327,13 @@ export struct Tensor {
   Tensor other(this, union<Tensor, f64> x) {
     if (Tensor t matches x) {
       if (!(t.device is this.device)) { return this.foreign(); }
+      // Two element types meet only through a `cast` the caller writes, as in TensorFlow: a silent widening would
+      // hide which precision an operation ran in.
+      if (!sameDType(t.dtype(), this.dtype())) { trap; }
       return t;
     }
-    if (f64 v matches x) { return this.device.scalar(v); }
+    // A number takes the tensor's type, so `half * 2.0` stays half.
+    if (f64 v matches x) { return this.device.scalarOf(v, this.dtype()); }
     trap;
   }
 
@@ -324,6 +342,18 @@ export struct Tensor {
 
   void note(this, Tensor out, Tensor[] inputs, fn<Tensor?[](Tensor)> backward) {
     if (this.device.recording()) { this.device.record(out, inputs, backward); }
+  }
+
+  /**
+   * This tensor's values as `to` — rounded, when `to` is the narrower. This tensor itself when it is `to` already. The
+   * gradient is cast back, so a half-precision computation over single-precision weights trains the weights.
+   */
+  Tensor cast(this, DType to) {
+    if (sameDType(to, this.dtype())) { return this; }
+    Tensor x = this;
+    Tensor y = this.made(copyShape(this.shape), this.device.backend.cast(this.storage, to));
+    this.note(y, [x], (Tensor dy) => [dy.cast(x.dtype())]);
+    return y;
   }
 
   /** The same numbers with no history: gradients stop here. */
@@ -393,9 +423,9 @@ export struct Tensor {
   Tensor [operators.divide](this, union<Tensor, f64> x) { return this.div(x); }
   Tensor [operators.negate](this) { return this.neg(); }
   Tensor [operators.addFromLeft](this, f64 x) { return this.add(x); }
-  Tensor [operators.subtractFromLeft](this, f64 x) { return this.device.scalar(x).sub(this); }
+  Tensor [operators.subtractFromLeft](this, f64 x) { return this.device.scalarOf(x, this.dtype()).sub(this); }
   Tensor [operators.multiplyFromLeft](this, f64 x) { return this.mul(x); }
-  Tensor [operators.divideFromLeft](this, f64 x) { return this.device.scalar(x).div(this); }
+  Tensor [operators.divideFromLeft](this, f64 x) { return this.device.scalarOf(x, this.dtype()).div(this); }
 
   /** `(this - x)²`. */
   Tensor squaredDifference(this, union<Tensor, f64> x) { return this.sub(x).square(); }
@@ -406,8 +436,9 @@ export struct Tensor {
   /** `whenTrue` where this is non-zero and `whenFalse` elsewhere, all three broadcast together. No gradient flows to this. */
   Tensor where(this, union<Tensor, f64> whenTrue, union<Tensor, f64> whenFalse) {
     Tensor c = this;
-    Tensor a = this.other(whenTrue);
-    Tensor b = this.other(whenFalse);
+    // The two branches agree on a type, which a number among them takes; the condition may be any type.
+    Tensor a = branchOf(c, whenTrue, whenFalse);
+    Tensor b = a.other(whenFalse);
     i32[]? ab = broadcastShapes(a.shape, b.shape);
     if (ab is null) { trap; }
     i32[]? out = broadcastShapes(c.shape, ab!);
@@ -416,7 +447,7 @@ export struct Tensor {
                                            broadcastStrides(a.shape, out!), broadcastStrides(b.shape, out!));
     Tensor y = this.made(out!, s);
     this.note(y, [a, b], (Tensor dy) => {
-      Tensor zero = dy.device.scalar(0.0);
+      Tensor zero = dy.device.scalarOf(0.0, dy.dtype());
       return [c.where(dy, zero).sumTo(a.shape), c.where(zero, dy).sumTo(b.shape)];
     });
     return y;
@@ -690,7 +721,7 @@ export struct Tensor {
 
   /** `depth`-long rows of zeros with a 1 at each index this holds. */
   Tensor oneHot(this, i32 depth) {
-    Tensor classes = this.device.range(0.0, depth as f64, 1.0);
+    Tensor classes = this.device.range(0.0, depth as f64, 1.0).cast(this.dtype());
     return this.expandDims(-1).equal(classes);
   }
 
@@ -710,7 +741,7 @@ export struct Tensor {
     i32 k = ta ? a.shape[a.rank() - 2] : a.shape[a.rank() - 1];
     i32 kb = tb ? b.shape[b.rank() - 1] : b.shape[b.rank() - 2];
     i32 n = tb ? b.shape[b.rank() - 2] : b.shape[b.rank() - 1];
-    if (k != kb) { trap; }
+    if (k != kb || !sameDType(a.dtype(), b.dtype())) { trap; }
     i32[] batchShape = a.rank() >= b.rank() ? a.shape : b.shape;
     i32 batchRank = batchShape.len() - 2;
     if (a.rank() > 2 && b.rank() > 2) {
@@ -789,7 +820,7 @@ export struct Tensor {
     Tensor total = this.patches(c, 0.0).reshape([c.n, c.oh, c.ow, c.kh * c.kw, c.c]).sum([3], false);
     // How many pixels of each window are inside the image: the same windows, read from a field of ones.
     Conv one = geometry([1, c.h, c.w, 1], c.kh, c.kw, strides, padding, [1, 1]);
-    Tensor counts = this.device.ones([1, c.h, c.w, 1]).patches(one, 0.0).sum([1], false).reshape([1, c.oh, c.ow, 1]);
+    Tensor counts = this.device.fillOf([1, c.h, c.w, 1], 1.0, this.dtype()).patches(one, 0.0).sum([1], false).reshape([1, c.oh, c.ow, 1]);
     return total.div(counts);
   }
 
@@ -846,7 +877,7 @@ export struct Tensor {
   /** This tensor's numbers on another device. */
   async Tensor to(this, Device device) {
     f32[] v = await this.values();
-    return device.tensor(v, this.shape);
+    return device.tensorOf(v, this.shape, this.dtype());
   }
 }
 
@@ -860,13 +891,25 @@ export struct Variable : Tensor {
 
   /** Take `value`'s numbers, which must be the same shape. `value` itself can be disposed afterwards. */
   void assign(this, Tensor value) {
-    if (!sameShape(value.shape, this.shape)) { trap; }
+    if (!sameShape(value.shape, this.shape) || !sameDType(value.dtype(), this.dtype())) { trap; }
     Storage old = this.storage;
     value.storage.holders++;
     this.storage = value.storage;
     old.holders--;
     if (old.holders <= 0 && !old.freed) { this.device.backend.free(old); }
   }
+}
+
+/** `x` as a tensor: itself, or a number in the type of `other` when that is a tensor, else of `c`. */
+Tensor branchOf(Tensor c, union<Tensor, f64> x, union<Tensor, f64> other) {
+  if (Tensor t matches x) {
+    if (!(t.device is c.device)) { trap; }
+    return t;
+  }
+  DType dt = c.dtype();
+  if (Tensor o matches other) { dt = o.dtype(); }
+  if (f64 v matches x) { return c.device.scalarOf(v, dt); }
+  trap;
 }
 
 /** A convolution's geometry as TensorFlow computes it: `shape` is the input's, `[n, h, w, c]`. */

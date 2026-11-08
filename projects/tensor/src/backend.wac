@@ -6,10 +6,23 @@
 // A transpose, a slice and a broadcast are all `gather` with different strides; a convolution is `im2col` and a matrix
 // product; pooling is `im2col` and a reduction. Adding an operation to the library almost never means adding a kernel.
 //
-// **Every tensor is `f32`.** It is what WebGPU computes in everywhere and what TensorFlow trains in by default; an
-// index tensor (`take`, `argMax`, `oneHot`) holds its integers as `f32`, exact to 2^24.
+// **Two element types, one arithmetic.** A tensor is `F32` or `F16`; every kernel computes in `f32` and rounds its result
+// to the output's type once, as mixed-precision training does — half the memory and bandwidth for an `F16` tensor, and
+// none of the error a sum accumulated in halves would gather. A kernel's output has its first input's type, except
+// `argReduce`, whose indices are always `F32`, and `cast`. An index tensor (`take`, `argMax`, `oneHot`) holds its
+// integers as floats: exact to 2^24 in `F32`, and to 2048 in `F16`.
 
 import { Ticket } from "core";
+
+export enum DType {
+  F32,
+  /** IEEE half precision, stored as halves and computed in `f32` (`half.wac`). */
+  F16,
+}
+
+export string dtypeName(DType t) { return match (t) { F32: "f32", F16: "f16" }; }
+
+export bool sameDType(DType a, DType b) { return dtypeName(a) == dtypeName(b); }
 
 export enum Unary {
   Neg,
@@ -66,8 +79,9 @@ export enum Reduce {
  * and an upload, said out loud (`Tensor.to`).
  */
 export struct Storage {
-  /** How many `f32`s. */
+  /** How many elements. */
   i32 size;
+  DType dtype;
   /** Set by `Backend.free`, so a use after it traps rather than reading a buffer something else now owns. */
   bool freed = false;
   /**
@@ -114,10 +128,13 @@ export struct Conv {
 export struct Backend {
   virtual string name(const this) { return "none"; }
 
-  virtual Storage upload(this, f32[] values) { trap; }
+  /** `values`, each rounded to `dtype`. */
+  virtual Storage upload(this, f32[] values, DType dtype) { trap; }
   /** The numbers, as soon as they are available — at once on the CPU, after the queue drains on a GPU. */
   virtual Ticket<f32[]> download(this, Storage s) { trap; }
-  virtual Storage fill(this, i32 n, f32 value) { trap; }
+  virtual Storage fill(this, i32 n, f32 value, DType dtype) { trap; }
+  /** `x`'s values as `to`, each rounded when `to` is the narrower. */
+  virtual Storage cast(this, Storage x, DType to) { trap; }
   virtual void free(this, Storage s) { trap; }
 
   virtual Storage unary(this, Unary op, Storage x) { trap; }
@@ -134,7 +151,7 @@ export struct Backend {
   /** Each of `outer` contiguous rows of `inner` numbers reduced to one. */
   virtual Storage reduce(this, Reduce op, Storage x, i32 outer, i32 inner) { trap; }
 
-  /** The index of each row's largest (`max`) or smallest number — the first, on a tie. */
+  /** The index of each row's largest (`max`) or smallest number — the first, on a tie — as `F32` whatever `x` is. */
   virtual Storage argReduce(this, bool max, Storage x, i32 outer, i32 inner) { trap; }
 
   /**

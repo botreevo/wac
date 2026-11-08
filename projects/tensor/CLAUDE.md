@@ -10,8 +10,11 @@ README.md says what this is and where it stands; read it first.
   gets its gradient and its GPU version free. A kernel is for something no composition can do efficiently.
 - **The GPU check needs Chromium with WebGPU**: `NODE_PATH=$(npm root -g) node tools/gpucheck.js dist/gpucheck`
   after `wac task gpucheck:build`. Headless Chromium gets WebGPU from `--enable-unsafe-webgpu --use-angle=swiftshader`
-  on a page served from localhost (not `about:blank`, which is not a secure context). `wac task shaders` prints every
-  WGSL program, for compiling them without running a model.
+  on a page served from localhost (not `about:blank`, which is not a secure context). `wac task shaders` compiles every
+  WGSL program, in both element types, the same way (`tools/shadercheck.js`).
+- **Every kernel has an `F16` path, and the GPU check runs every case in both types.** A new kernel reads its inputs
+  through `L_<name>` and, if elementwise, is a `value(i)` that `elementwise` wraps (`src/gpu/wgsl.wac`); one that
+  writes anything else writes `F32` and the backend `settle`s it. On the CPU, `made` does the rounding.
 - **The pin on wac-web is to its `gpu` branch**, which adds `wac.gpu` to the browser host. Until that commit is on
   GitHub, `wac update` cannot fetch it: put it in the cache by hand — `git archive <commit> | tar -x -C
   ~/.wac/cache/git/https%3A%2F%2Fgithub.com%2Fvoltrevo%2Fwac-web.git/<commit>` and `touch pack.pack` there, which is

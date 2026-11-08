@@ -30,3 +30,17 @@ written `fn<T?[](T)>` emits, as does the alias with a lambda that returns `t.v` 
 
 **Here:** the backward rule's type is written out in full, `fn<Tensor?[](Tensor)>`, where `tensor.wac` would rather
 have named it once.
+
+## An `override` with a different parameter list is accepted, and emits a module that will not load
+
+```wac
+struct A { virtual i32 f(this, i32 x) { return 1; } }
+struct B : A { override i32 f(this, i32 x, i32 y) { return 2; } }
+export string test_o() { A a = B(); return "\{a.f(1)}"; }
+```
+
+`wac check` is clean; `wac test` says *the module just built will not load — not enough arguments on the stack for
+call (need 3, got 2)*. Found when the backend interface gained a `DType` parameter: the GPU backend's overrides still
+had the old one, and only the GPU check page — not `wac check` — would have said so.
+
+**Here:** nothing to work around; the overrides were brought up to date. It is the check that is missing.

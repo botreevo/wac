@@ -5,14 +5,16 @@ import { Result, Vec, Map, hashBytes, bytesEq } from "core";
 import { SqlError } from "./error.wac";
 import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY } from "./value.wac";
 import { encodeRecord } from "./record.wac";
-import { Cte, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
+import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
 import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database } from "./database.wac";
-import { Node, BoundSource, AggSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT } from "./plan.wac";
+import { Node, BoundSource, AggSpec, WinSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT,
+         AGG_JSON_ARRAY, AGG_JSON_OBJECT } from "./plan.wac";
 import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
 import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, knownFunction, returnsJson, FnEnv, likeMatch, likeBytes, globMatch, codepoints } from "./functions.wac";
 import { lower } from "./lexer.wac";
+import { Json, parseJson, jsonText, jsonOf, escape } from "./json.wac";
 
 // What a statement runs with: the database, its parameters, and the function environment.
 // A common table expression in scope while a statement runs, and its rows once computed: SQLite
@@ -63,7 +65,7 @@ string? needleOf(const u8[] b) {
 
 // The context a statement's outermost select runs in: none, or a trigger's NEW and OLD, which the
 // select's scope has outside it.
-export Ctx topCtx(Exec x) { return x.triggerCtx ?? Ctx(Row?[](), null, null, null); }
+export Ctx topCtx(Exec x) { return x.triggerCtx ?? Ctx(Row?[](), null, null, null, null); }
 
 // Names visible to an expression: this select's sources, then the enclosing selects'.
 export struct Scope {
@@ -78,9 +80,11 @@ export struct Ctx {
   Ctx? outer;
   Value[]? aggs;
   Value[]? result;
+  Value[]? wins;      // window functions' values for this row
 }
 
-static string[] AGGREGATES = ["count", "sum", "total", "avg", "group_concat", "string_agg"];
+static string[] AGGREGATES = ["count", "sum", "total", "avg", "group_concat", "string_agg", "json_group_array",
+                              "json_group_object"];
 
 bool isAggregate(string name, i32 nargs) {
   if ((name == "min" || name == "max") && nargs == 1) { return true; }
@@ -186,23 +190,7 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
       return Result.Ok(Node.NInRows(try bindExpr(a, s, x), p, neg));
     }
     Call(name, args, star, distinct): {
-      if (isAggregate(name, args.len())) {
-        if (!s.aggOk || s.plan is null) { return Result.Err(err("misuse of aggregate function \{name}()")); }
-        if (name == "count" && args.len() > 1) { return Result.Err(err("wrong number of arguments to function count()")); }
-        if ((name == "sum" || name == "total" || name == "avg") && args.len() != 1) {
-          return Result.Err(err("wrong number of arguments to function \{name}()"));
-        }
-        // An aggregate's arguments are row expressions; an aggregate inside one is a misuse.
-        Scope inner = Scope(s.srcs, s.outer, s.plan, false);
-        Node[] bound = try bindAll(args, inner, x);
-        SelectPlan p = s.plan!;
-        i32 kind = AGG_COUNT;
-        if (name == "sum" || name == "total" || name == "avg") { kind = AGG_SUM; }
-        else if (name == "min" || name == "max") { kind = AGG_MINMAX; }
-        else if (name == "group_concat" || name == "string_agg") { kind = AGG_CONCAT; }
-        p.aggs.push(AggSpec(name, kind, bound, distinct, star));
-        return Result.Ok(Node.NAgg(p.aggs.len() - 1));
-      }
+      if (isAggregate(name, args.len())) { return makeAgg(name, args, star, distinct, null, OrderTerm[](), s, x); }
       if (star) { return Result.Err(err("wrong number of arguments to function \{name}()")); }
       if (name == "raise") {
         if (x.triggerScope is null) { return Result.Err(err("RAISE() may only be used within a trigger-program")); }
@@ -214,6 +202,14 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
       bool[] js = bool[].filled(args.len(), false);
       for (i32 i = 0; i < args.len(); i++) { js[i] = exprIsJson(args[i]); }
       return Result.Ok(Node.NCall(name, functionId(name), try bindAll(args, s, x), js));
+    }
+    AggCall(name, args, star, distinct, filter, order, over): {
+      if (over is not null) { return makeWindow(name, args, star, distinct, filter, over!, s, x); }
+      if (!isAggregate(name, args.len())) {
+        string what = filter is not null ? "FILTER" : "ORDER BY";
+        return Result.Err(err("\{what} may not be used with non-aggregate \{name}()"));
+      }
+      return makeAgg(name, args, star, distinct, filter, order, s, x);
     }
     Case(base, whens, thens, otherwise): {
       Node? b = null;
@@ -234,6 +230,119 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
       return Result.Ok(Node.NCollate(try bindExpr(a, s, x), id));
     }
   }
+}
+
+Result<AggSpec, SqlError> aggSpec(string name, const Expr[] args, bool star, bool distinct, const Expr? filter,
+                                 const OrderTerm[] order, Scope s, Exec x) {
+  if (name == "count" && args.len() > 1) { return Result.Err(err("wrong number of arguments to function count()")); }
+  if ((name == "sum" || name == "total" || name == "avg" || name == "json_group_array") && args.len() != 1) {
+    return Result.Err(err("wrong number of arguments to function \{name}()"));
+  }
+  if (name == "json_group_object" && args.len() != 2) { return Result.Err(err("wrong number of arguments to function json_group_object()")); }
+  // An aggregate's arguments are row expressions; an aggregate inside one is a misuse.
+  Scope inner = Scope(s.srcs, s.outer, s.plan, false);
+  Node[] bound = try bindAll(args, inner, x);
+  i32 kind = AGG_COUNT;
+  if (name == "sum" || name == "total" || name == "avg") { kind = AGG_SUM; }
+  else if (name == "min" || name == "max") { kind = AGG_MINMAX; }
+  else if (name == "group_concat" || name == "string_agg") { kind = AGG_CONCAT; }
+  else if (name == "json_group_array") { kind = AGG_JSON_ARRAY; }
+  else if (name == "json_group_object") { kind = AGG_JSON_OBJECT; }
+  Node? f = null;
+  if (filter is not null) { f = try bindExpr(filter!, inner, x); }
+  Node[] ord = Node[].filled(order.len(), Node.NLit(Value.Null));
+  bool[] od = bool[].filled(order.len(), false);
+  for (i32 i = 0; i < order.len(); i++) {
+    ord[i] = try bindExpr(order[i].expr, inner, x);
+    od[i] = order[i].desc;
+  }
+  bool js = false;
+  i32 vi = kind == AGG_JSON_OBJECT ? 1 : 0;
+  if (vi < args.len()) { js = exprIsJson(args[vi]); }
+  return Result.Ok(AggSpec { name: name, kind: kind, args: bound, distinct: distinct, star: star, filter: f,
+                             order: ord, orderDesc: od, jsonArg: js });
+}
+
+Result<Node, SqlError> makeAgg(string name, const Expr[] args, bool star, bool distinct, const Expr? filter,
+                               const OrderTerm[] order, Scope s, Exec x) {
+  if (!s.aggOk || s.plan is null) { return Result.Err(err("misuse of aggregate function \{name}()")); }
+  AggSpec a = try aggSpec(name, args, star, distinct, filter, order, s, x);
+  SelectPlan p = s.plan!;
+  p.aggs.push(a);
+  return Result.Ok(Node.NAgg(p.aggs.len() - 1));
+}
+
+static string[] WINDOW_ONLY = ["row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead",
+                               "first_value", "last_value", "nth_value"];
+
+bool isWindowOnly(string name) {
+  for (string w in WINDOW_ONLY) { if (w == name) { return true; } }
+  return false;
+}
+
+// A window spec with its base window's parts filled in: the base gives the partition, and the order
+// and frame when this one has none.
+Result<WindowSpec, SqlError> resolveWindow(const WindowSpec w, const SelectPlan p) {
+  if (w.base is null) { return Result.Ok(w as WindowSpec); }
+  const NamedWindow[] named = p.ast.windows;
+  for (i32 i = 0; i < named.len(); i++) {
+    if (lower(named[i].name) != lower(w.base!)) { continue; }
+    WindowSpec b = try resolveWindow(named[i].spec, p);
+    WindowSpec out = WindowSpec { partition: b.partition, order: b.order, units: b.units, start: b.start, end: b.end,
+                                  exclude: b.exclude };
+    if (w.partition.len() > 0) { return Result.Err(err("cannot override PARTITION clause of window \{w.base!}")); }
+    if (w.order.len() > 0) { out.order = w.order as OrderTerm[]; }
+    if (w.units is not null) {
+      out.units = w.units;
+      out.start = w.start as FrameBound?;
+      out.end = w.end as FrameBound?;
+      out.exclude = w.exclude;
+    }
+    return Result.Ok(out);
+  }
+  return Result.Err(err("no such window: \{w.base!}"));
+}
+
+Result<Node, SqlError> makeWindow(string name, const Expr[] args, bool star, bool distinct, const Expr? filter,
+                                  const WindowSpec over, Scope s, Exec x) {
+  if (!s.aggOk || s.plan is null) { return Result.Err(err("misuse of window function \{name}()")); }
+  if (!isWindowOnly(name) && !isAggregate(name, args.len())) {
+    return Result.Err(err("\{name}() may not be used as a window function"));
+  }
+  SelectPlan p = s.plan!;
+  WindowSpec w = try resolveWindow(over, p);
+  // The function's arguments, partition and order are row (or group) expressions.
+  Scope sc = Scope(s.srcs, s.outer, s.plan, true);
+  AggSpec a = AggSpec { name: name, args: try bindAll(args, sc, x), distinct: distinct, star: star, order: Node[](),
+                        orderDesc: bool[]() };
+  if (isAggregate(name, args.len())) {
+    // A window aggregate's arguments may hold the query's own aggregates, so they bind in the group scope.
+    a = try aggSpec(name, args, star, distinct, filter, OrderTerm[](), Scope(s.srcs, s.outer, s.plan, true), x);
+  }
+  Node[] part = try bindAll(w.partition, sc, x);
+  Node[] ord = Node[].filled(w.order.len(), Node.NLit(Value.Null));
+  bool[] desc = bool[].filled(w.order.len(), false);
+  i32[] nulls = i32[].filled(w.order.len(), 0);
+  i32[] colls = i32[].filled(w.order.len(), 0);
+  for (i32 i = 0; i < ord.len(); i++) {
+    ord[i] = try bindExpr(w.order[i].expr, sc, x);
+    desc[i] = w.order[i].desc;
+    nulls[i] = w.order[i].nulls;
+    colls[i] = ownColl(ord[i]);
+  }
+  Scope none = Scope(BoundSource[](), s.outer, null, false);
+  string units = w.units ?? (w.order.len() > 0 ? "RANGE" : "ROWS");
+  string sk = w.start is null ? "UNBOUNDED PRECEDING" : w.start!.kind;
+  string ek = w.end is null ? (w.order.len() > 0 ? "CURRENT ROW" : "UNBOUNDED FOLLOWING") : w.end!.kind;
+  Node? sn = null;
+  Node? en = null;
+  if (w.start is not null && w.start!.n is not null) { sn = try bindExpr(w.start!.n!, none, x); }
+  if (w.end is not null && w.end!.n is not null) { en = try bindExpr(w.end!.n!, none, x); }
+  if (units == "RANGE" && (sn is not null || en is not null) && ord.len() != 1) {
+    return Result.Err(err("RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY term"));
+  }
+  p.wins.push(WinSpec(name, a, part, ord, desc, nulls, colls, units, sk, sn, ek, en, w.exclude));
+  return Result.Ok(Node.NWin(p.wins.len() - 1));
 }
 
 // ── evaluation ─────────────────────────────────────────────────────────────
@@ -433,6 +542,10 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       if (c.aggs is null) { return Result.Err(err("misuse of aggregate")); }
       return Result.Ok(c.aggs![slot]);
     }
+    NWin(slot): {
+      if (c.wins is null) { return Result.Err(err("misuse of window function")); }
+      return Result.Ok(c.wins![slot]);
+    }
     NCase(base, whens, thens, otherwise): {
       Value? b = null;
       if (base is not null) { b = try eval(base!, c, x); }
@@ -508,6 +621,7 @@ export i32 refs(const Node n, i32 depth) {
     }
     NLike(v, p, g): { return refs(v, depth) | refs(p, depth); }
     NAgg: { return 1 << 30; }
+    NWin: { return 1 << 30; }
     NCase(base, whens, thens, otherwise): {
       i32 m = base is null ? 0 : refs(base!, depth);
       for (i32 i = 0; i < whens.len(); i++) { m = m | refs(whens[i], depth) | refs(thens[i], depth); }
@@ -717,7 +831,7 @@ Result<Table, SqlError> materializeCte(CteDef c, Exec x) {
   bool distinct = false;
   for (i32 i = first - 1; i < os.len(); i++) { if (os.get(i) == "UNION") { distinct = true; } }
   if (c.sel.orderBy.len() > 0) { return Result.Err(SqlError.unsupported("ORDER BY in a recursive CTE")); }
-  Ctx none = Ctx(Row?[](), null, null, null);
+  Ctx none = Ctx(Row?[](), null, null, null, null);
   i64 limit = -1;
   if (c.sel.limit is not null) {
     Node ln = try bindExpr(c.sel.limit!, Scope(BoundSource[](), null, null, false), x);
@@ -1287,6 +1401,7 @@ struct AggState {
   string text = "";
   bool any = false;
   Map<u8[], bool>? seen;
+  Vec<Value[]>? items;     // for an aggregate with ORDER BY: each row's order keys, then its arguments
 }
 
 struct Group {
@@ -1304,6 +1419,7 @@ struct Sink {
   Map<u8[], i32> groupIndex;
   Vec<Group> groups;
   Vec<Value[]> groupKeys;
+  Vec<Ctx> pend;     // with window functions: each row's context, held until the windows are computed
 }
 
 // A key for hashing values that compare equal: integral reals as integers.
@@ -1355,6 +1471,10 @@ Result<void, SqlError> emit(SelectPlan p, Ctx c, Exec x, Sink sink) {
     if (sink.minMaxStop && g.states[0].best is not null) { sink.done = true; }
     return Result.Ok();
   }
+  if (p.wins.len() > 0) {
+    sink.pend.push(Ctx(copyRows(c.rows), c.outer, null, null, null));
+    return Result.Ok();
+  }
   Value[] out = Value[].filled(p.results.len(), Value.Null);
   for (i32 i = 0; i < out.len(); i++) { out[i] = try eval(p.results[i], c, x); }
   try pushRow(p, c, x, sink, out);
@@ -1363,7 +1483,7 @@ Result<void, SqlError> emit(SelectPlan p, Ctx c, Exec x, Sink sink) {
 
 Result<void, SqlError> pushRow(SelectPlan p, Ctx c, Exec x, Sink sink, Value[] out) {
   Value[] keys = Value[].filled(p.order.len(), Value.Null);
-  Ctx kc = Ctx(c.rows, c.outer, c.aggs, out);
+  Ctx kc = Ctx(c.rows, c.outer, c.aggs, out, c.wins);
   for (i32 i = 0; i < keys.len(); i++) { keys[i] = try eval(p.order[i], kc, x); }
   sink.rows.push(out);
   sink.keys.push(keys);
@@ -1372,11 +1492,45 @@ Result<void, SqlError> pushRow(SelectPlan p, Ctx c, Exec x, Sink sink, Value[] o
 
 // Feeds one row into an aggregate. Answers whether a min or max changed, for the bare columns.
 Result<bool, SqlError> step(const AggSpec a, AggState s, Ctx c, Exec x) {
+  if (a.filter is not null && truth(try eval(a.filter!, c, x)) != 1) { return Result.Ok(false); }
   if (a.star) { s.count++; return Result.Ok(false); }
   Value[] args = Value[].filled(a.args.len(), Value.Null);
   for (i32 i = 0; i < args.len(); i++) { args[i] = try eval(a.args[i], c, x); }
-  if (args.len() == 0) { s.count++; return Result.Ok(false); }
+  if (a.order.len() > 0) {
+    // Kept until the group is complete, then fed in order.
+    Value[] item = Value[].filled(a.order.len() + args.len(), Value.Null);
+    for (i32 i = 0; i < a.order.len(); i++) { item[i] = try eval(a.order[i], c, x); }
+    for (i32 i = 0; i < args.len(); i++) { item[a.order.len() + i] = args[i]; }
+    if (s.items is null) { s.items = Vec<Value[]>.create(); }
+    s.items!.push(item);
+    return Result.Ok(false);
+  }
+  return stepValues(a, s, args);
+}
+
+// Feeds one row's argument values into an aggregate. Answers whether a min or max changed.
+Result<bool, SqlError> stepValues(const AggSpec a, AggState s, const Value[] args) {
+  if (a.star || args.len() == 0) { s.count++; return Result.Ok(false); }
   Value v = args[0];
+  if (a.kind == AGG_JSON_ARRAY || a.kind == AGG_JSON_OBJECT) {
+    // These keep NULLs, as JSON null.
+    string member = "";
+    if (a.kind == AGG_JSON_OBJECT) {
+      match (v) {
+        Text(k): { member = "\"" + escape(k) + "\":"; }
+        Null: { return Result.Ok(false); }
+        default: { return Result.Err(err("json_group_object() labels must be TEXT")); }
+      }
+      v = args[1];
+    }
+    Json j = jsonOf(v);
+    if (a.jsonArg) { match (v) { Text(t): { Json? pj = parseJson(t); if (pj is not null) { j = pj!; } } default: {} } }
+    match (v) { Blob: { return Result.Err(err("JSON cannot hold BLOB values")); } default: {} }
+    s.text = s.any ? s.text + "," + member + jsonText(j) : member + jsonText(j);
+    s.any = true;
+    s.count++;
+    return Result.Ok(false);
+  }
   if (isNull(v)) { return Result.Ok(false); }
   if (a.distinct) {
     if (s.seen is null) { s.seen = Map<u8[], bool>.create(hashBytes, bytesEq); }
@@ -1425,8 +1579,22 @@ Result<bool, SqlError> step(const AggSpec a, AggState s, Ctx c, Exec x) {
   return Result.Ok(false);
 }
 
-Result<Value, SqlError> finish(const AggSpec a, AggState s) {
+Result<Value, SqlError> finish(const AggSpec a, AggState s0) {
+  AggState s = s0;
+  if (s0.items is not null) {
+    // An ORDER BY among the arguments: the rows, sorted, through a fresh state.
+    Value[][] items = s0.items!.toArray();
+    sortItems(a, items);
+    s = AggState { };
+    for (i32 i = 0; i < items.len(); i++) {
+      Value[] args = Value[].filled(items[i].len() - a.order.len(), Value.Null);
+      args.copyFrom(items[i], a.order.len(), 0, args.len());
+      try stepValues(a, s, args);
+    }
+  }
   string n = a.name;
+  if (a.kind == AGG_JSON_ARRAY) { return Result.Ok(Value.Text("[" + s.text + "]")); }
+  if (a.kind == AGG_JSON_OBJECT) { return Result.Ok(Value.Text("{" + s.text + "}")); }
   if (n == "count") { return Result.Ok(Value.Int(s.count)); }
   if (n == "sum") {
     if (s.count == 0) { return Result.Ok(Value.Null); }
@@ -1438,6 +1606,24 @@ Result<Value, SqlError> finish(const AggSpec a, AggState s) {
   if (n == "avg") { return Result.Ok(s.count == 0 ? Value.Null : Value.Real(s.sumR / (s.count as~ f64))); }
   if (n == "min" || n == "max") { return Result.Ok(s.best ?? Value.Null); }
   return Result.Ok(s.any ? Value.Text(s.text) : Value.Null);
+}
+
+void sortItems(const AggSpec a, Value[][] items) {
+  // Insertion into a stable merge would do as well; groups are small enough for a simple stable sort.
+  for (i32 i = 1; i < items.len(); i++) {
+    Value[] cur = items[i];
+    i32 j = i - 1;
+    while (j >= 0 && itemBefore(a, cur, items[j])) { items[j + 1] = items[j]; j--; }
+    items[j + 1] = cur;
+  }
+}
+
+bool itemBefore(const AggSpec a, const Value[] x, const Value[] y) {
+  for (i32 i = 0; i < a.order.len(); i++) {
+    i32 c = compareValues(x[i], y[i]);
+    if (c != 0) { return a.orderDesc[i] ? c > 0 : c < 0; }
+  }
+  return false;
 }
 
 // The nested loops, from source k inward. Answers false when the sink has enough rows.
@@ -1544,9 +1730,10 @@ Result<i64, SqlError> limitValue(Node? n, Ctx c, Exec x, i64 dflt) {
 
 // One select's rows, before a compound combines them: unordered unless `ordered` is set.
 Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
-  Sink sink = Sink(false, false, Vec.create(), Vec.create(), -1, Map.create(hashBytes, bytesEq), Vec.create(), Vec.create());
+  Sink sink = Sink(false, false, Vec.create(), Vec.create(), -1, Map.create(hashBytes, bytesEq), Vec.create(), Vec.create(),
+                   Vec.create());
   if (p.values is not null) {
-    Ctx c = Ctx(Row?[](), outer, null, null);
+    Ctx c = Ctx(Row?[](), outer, null, null, null);
     const Node[][] vs = p.values!;
     for (i32 i = 0; i < vs.len(); i++) {
       Value[] out = Value[].filled(vs[i].len(), Value.Null);
@@ -1555,7 +1742,7 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
     }
     return Result.Ok(sink);
   }
-  Ctx c = Ctx(Row?[].defaulted(p.srcs.len()), outer, null, null);
+  Ctx c = Ctx(Row?[].defaulted(p.srcs.len()), outer, null, null, null);
   // Split WHERE into conditions and file each at the innermost source it reads, so a failing row is
   // dropped before the loops go deeper. A condition reading a LEFT JOIN's source waits for the end, where
   // the missing row has been made NULL.
@@ -1572,7 +1759,7 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
     levels[level].push(conds.get(i));
   }
   // Without an ORDER BY to satisfy, or with one the access path delivers, the loops can stop early.
-  if (!p.aggregate && !p.distinct && p.compound is null && stopAt >= 0) {
+  if (!p.aggregate && !p.distinct && p.compound is null && stopAt >= 0 && p.wins.len() == 0) {
     if (p.order.len() == 0) { sink.stopAt = stopAt as! i32; }
     else if (orderable(p)) {
       Access a = try chooseAccess(p, 0, conds, c, x);
@@ -1600,14 +1787,267 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
       Group g = sink.groups.get(gi);
       Value[] aggs = Value[].filled(p.aggs.len(), Value.Null);
       for (i32 i = 0; i < aggs.len(); i++) { aggs[i] = try finish(p.aggs.get(i), g.states[i]); }
-      Ctx gc = Ctx(g.rep, outer, aggs, null);
+      Ctx gc = Ctx(g.rep, outer, aggs, null, null);
       if (p.having is not null && truth(try eval(p.having!, gc, x)) != 1) { continue; }
+      if (p.wins.len() > 0) { sink.pend.push(gc); continue; }
       Value[] out = Value[].filled(p.results.len(), Value.Null);
       for (i32 i = 0; i < out.len(); i++) { out[i] = try eval(p.results[i], gc, x); }
       try pushRow(p, gc, x, sink, out);
     }
   }
+  // Window functions are computed over all the rows (or groups) at once, then each row is finished.
+  if (p.wins.len() > 0) {
+    Value[][] wv = try computeWindows(p, sink.pend, x);
+    for (i32 i = 0; i < sink.pend.len(); i++) {
+      Ctx pc = sink.pend.get(i);
+      Ctx wc = Ctx(pc.rows, pc.outer, pc.aggs, null, wv[i]);
+      Value[] out = Value[].filled(p.results.len(), Value.Null);
+      for (i32 k = 0; k < out.len(); k++) { out[k] = try eval(p.results[k], wc, x); }
+      try pushRow(p, wc, x, sink, out);
+    }
+  }
   return Result.Ok(sink);
+}
+
+// ── window functions ───────────────────────────────────────────────────────
+
+i32 compareWinOrder(const WinSpec w, const Value[] a, const Value[] b) {
+  for (i32 i = 0; i < a.len(); i++) {
+    bool an = isNull(a[i]);
+    bool bn = isNull(b[i]);
+    if (an || bn) {
+      if (an && bn) { continue; }
+      bool nullsFirst = w.nulls[i] == 0 ? !w.desc[i] : w.nulls[i] == 1;
+      return an ? (nullsFirst ? -1 : 1) : (nullsFirst ? 1 : -1);
+    }
+    i32 c = compareColl(a[i], b[i], w.orderColl[i]);
+    if (c != 0) { return w.desc[i] ? -c : c; }
+  }
+  return 0;
+}
+
+i32 compareParts(const Value[] a, const Value[] b) {
+  for (i32 i = 0; i < a.len(); i++) {
+    i32 c = compareValues(a[i], b[i]);
+    if (c != 0) { return c; }
+  }
+  return 0;
+}
+
+Result<i64, SqlError> frameOffset(Node? n, Exec x) {
+  if (n is null) { return Result.Ok(0); }
+  Value v = try eval(n!, topCtx(x), x);
+  match (applyAffinity(v, AFF_INTEGER)) {
+    Int(i): { if (i >= 0) { return Result.Ok(i); } }
+    default: {}
+  }
+  return Result.Err(err("frame starting offset must be a non-negative integer"));
+}
+
+// Each row's value of every window function in the plan.
+Result<Value[][], SqlError> computeWindows(SelectPlan p, Vec<Ctx> rows, Exec x) {
+  i32 n = rows.len();
+  Value[][] out = Value[][].defaulted(n);
+  for (i32 i = 0; i < n; i++) { out[i] = Value[].filled(p.wins.len(), Value.Null); }
+  for (i32 w = 0; w < p.wins.len(); w++) {
+    WinSpec ws = p.wins.get(w);
+    Value[][] part = Value[][].defaulted(n);
+    Value[][] ord = Value[][].defaulted(n);
+    Value[][] args = Value[][].defaulted(n);
+    bool[] pass = bool[].filled(n, true);
+    for (i32 i = 0; i < n; i++) {
+      Ctx c = rows.get(i);
+      part[i] = Value[].filled(ws.partition.len(), Value.Null);
+      for (i32 k = 0; k < ws.partition.len(); k++) { part[i][k] = try eval(ws.partition[k], c, x); }
+      ord[i] = Value[].filled(ws.order.len(), Value.Null);
+      for (i32 k = 0; k < ws.order.len(); k++) { ord[i][k] = try eval(ws.order[k], c, x); }
+      args[i] = Value[].filled(ws.agg.args.len(), Value.Null);
+      for (i32 k = 0; k < ws.agg.args.len(); k++) { args[i][k] = try eval(ws.agg.args[k], c, x); }
+      if (ws.agg.filter is not null) { pass[i] = truth(try eval(ws.agg.filter!, c, x)) == 1; }
+    }
+    // Rows in partition order, then window order; stable, so ties keep the rows' own order.
+    i32[] idx = i32[].filled(n, 0);
+    for (i32 i = 0; i < n; i++) { idx[i] = i; }
+    for (i32 i = 1; i < n; i++) {
+      i32 cur = idx[i];
+      i32 j = i - 1;
+      while (j >= 0) {
+        i32 c = compareParts(part[cur], part[idx[j]]);
+        if (c == 0) { c = compareWinOrder(ws, ord[cur], ord[idx[j]]); }
+        if (c >= 0) { break; }
+        idx[j + 1] = idx[j];
+        j--;
+      }
+      idx[j + 1] = cur;
+    }
+    i64 startN = try frameOffset(ws.startN, x);
+    i64 endN = try frameOffset(ws.endN, x);
+    i32 ps = 0;
+    while (ps < n) {
+      i32 pe = ps + 1;
+      while (pe < n && compareParts(part[idx[pe]], part[idx[ps]]) == 0) { pe++; }
+      i32 m = pe - ps;
+      // Peer groups: rows equal in the window's order.
+      i32[] gid = i32[].filled(m, 0);
+      Vec<i32> gStart;
+      Vec<i32> gEnd;
+      for (i32 j = 0; j < m; j++) {
+        if (j > 0 && compareWinOrder(ws, ord[idx[ps + j]], ord[idx[ps + j - 1]]) == 0) { gid[j] = gid[j - 1]; }
+        else {
+          gid[j] = gStart.len();
+          if (j > 0) { gEnd.push(j - 1); }
+          gStart.push(j);
+        }
+      }
+      gEnd.push(m - 1);
+      AggState? running = null;
+      i32 runEnd = -1;
+      bool incremental = ws.startKind == "UNBOUNDED PRECEDING" && ws.exclude == "NO OTHERS" && !ws.agg.distinct;
+      for (i32 j = 0; j < m; j++) {
+        i32 row = idx[ps + j];
+        Value v = Value.Null;
+        string f = ws.name;
+        i32 g = gid[j];
+        if (f == "row_number") { v = Value.Int((j + 1) as i64); }
+        else if (f == "rank") { v = Value.Int((gStart.get(g) + 1) as i64); }
+        else if (f == "dense_rank") { v = Value.Int((g + 1) as i64); }
+        else if (f == "percent_rank") {
+          v = Value.Real(m > 1 ? (gStart.get(g) as f64) / ((m - 1) as f64) : 0.0);
+        } else if (f == "cume_dist") {
+          v = Value.Real(((gEnd.get(g) + 1) as f64) / (m as f64));
+        } else if (f == "ntile") {
+          i64 buckets = 0;
+          if (args[row].len() > 0) { match (applyAffinity(args[row][0], AFF_INTEGER)) { Int(b): { buckets = b; } default: {} } }
+          if (buckets <= 0) { return Result.Err(err("argument of ntile must be a positive integer")); }
+          i64 q = (m as i64) / buckets;
+          i64 r = (m as i64) % buckets;
+          i64 jj = j as i64;
+          if (q == 0) { v = Value.Int(jj + 1); }
+          else if (jj < r * (q + 1)) { v = Value.Int(jj / (q + 1) + 1); }
+          else { v = Value.Int((jj - r * (q + 1)) / q + r + 1); }
+        } else if (f == "lag" || f == "lead") {
+          i64 off = 1;
+          if (args[row].len() > 1) { off = toInt(args[row][1]); }
+          i64 k = f == "lag" ? (j as i64) - off : (j as i64) + off;
+          if (k >= 0 && k < m as i64) { v = args[idx[ps + (k as! i32)]][0]; }
+          else if (args[row].len() > 2) { v = args[row][2]; }
+        } else {
+          // Frame functions: first_value, last_value, nth_value, and the aggregates.
+          i32 fs = 0;
+          i32 fe = m - 1;
+          if (ws.units == "ROWS") {
+            fs = rowsBound(ws.startKind, startN, j, m);
+            fe = rowsBound(ws.endKind, endN, j, m);
+          } else if (ws.units == "GROUPS") {
+            fs = groupsBound(ws.startKind, startN, g, gStart, gEnd, true, m);
+            fe = groupsBound(ws.endKind, endN, g, gStart, gEnd, false, m);
+          } else {
+            fs = rangeBound(ws, ws.startKind, startN, j, m, ps, idx, ord, gStart, gEnd, g, true);
+            fe = rangeBound(ws, ws.endKind, endN, j, m, ps, idx, ord, gStart, gEnd, g, false);
+          }
+          if (fs < 0) { fs = 0; }
+          if (fe > m - 1) { fe = m - 1; }
+          if (f == "first_value" || f == "last_value" || f == "nth_value") {
+            i64 want = 1;
+            if (f == "nth_value") {
+              match (applyAffinity(args[row].len() > 1 ? args[row][1] : Value.Null, AFF_INTEGER)) {
+                Int(b): { want = b; }
+                default: { want = 0; }
+              }
+              if (want <= 0) { return Result.Err(err("second argument to nth_value must be a positive integer")); }
+            }
+            Vec<i32> inFrame;
+            for (i32 k = fs; k <= fe; k++) { if (!excluded(ws.exclude, k, j, gid)) { inFrame.push(k); } }
+            if (inFrame.len() > 0) {
+              if (f == "first_value") { v = args[idx[ps + inFrame.get(0)]][0]; }
+              else if (f == "last_value") { v = args[idx[ps + inFrame.get(inFrame.len() - 1)]][0]; }
+              else if (want <= inFrame.len() as i64) { v = args[idx[ps + inFrame.get((want - 1) as! i32)]][0]; }
+            }
+          } else if (incremental) {
+            // A frame that starts at the partition's start only grows: add the new rows to a running total.
+            if (running is null) { running = AggState { }; }
+            while (runEnd < fe) {
+              runEnd++;
+              i32 r2 = idx[ps + runEnd];
+              if (pass[r2]) { try stepValues(ws.agg, running!, args[r2]); }
+            }
+            v = try finish(ws.agg, running!);
+          } else {
+            AggState st = AggState { };
+            for (i32 k = fs; k <= fe; k++) {
+              if (excluded(ws.exclude, k, j, gid)) { continue; }
+              i32 r2 = idx[ps + k];
+              if (pass[r2]) { try stepValues(ws.agg, st, args[r2]); }
+            }
+            v = try finish(ws.agg, st);
+          }
+        }
+        out[row][w] = v;
+      }
+      ps = pe;
+    }
+  }
+  return Result.Ok(out);
+}
+
+bool excluded(string exclude, i32 k, i32 j, const i32[] gid) {
+  if (exclude == "CURRENT ROW") { return k == j; }
+  if (exclude == "GROUP") { return gid[k] == gid[j]; }
+  if (exclude == "TIES") { return k != j && gid[k] == gid[j]; }
+  return false;
+}
+
+i32 rowsBound(string kind, i64 n, i32 j, i32 m) {
+  if (kind == "UNBOUNDED PRECEDING") { return 0; }
+  if (kind == "UNBOUNDED FOLLOWING") { return m - 1; }
+  if (kind == "CURRENT ROW") { return j; }
+  i64 v = kind == "PRECEDING" ? (j as i64) - n : (j as i64) + n;
+  if (v < -1) { return -1; }
+  if (v > m as i64) { return m; }
+  return v as! i32;
+}
+
+i32 groupsBound(string kind, i64 n, i32 g, const Vec<i32> gs, const Vec<i32> ge, bool start, i32 m) {
+  if (kind == "UNBOUNDED PRECEDING") { return 0; }
+  if (kind == "UNBOUNDED FOLLOWING") { return m - 1; }
+  i64 t = g as i64;
+  if (kind == "PRECEDING") { t = t - n; }
+  if (kind == "FOLLOWING") { t = t + n; }
+  if (t < 0) { return start ? 0 : -1; }
+  if (t >= gs.len() as i64) { return start ? m : m - 1; }
+  return start ? gs.get(t as! i32) : ge.get(t as! i32);
+}
+
+// RANGE bounds: by peers for CURRENT ROW, and by value for n PRECEDING or FOLLOWING on the single
+// ORDER BY term.
+i32 rangeBound(const WinSpec ws, string kind, i64 n, i32 j, i32 m, i32 ps, const i32[] idx, const Value[][] ord,
+               const Vec<i32> gs, const Vec<i32> ge, i32 g, bool start) {
+  if (kind == "UNBOUNDED PRECEDING") { return 0; }
+  if (kind == "UNBOUNDED FOLLOWING") { return m - 1; }
+  if (kind == "CURRENT ROW") { return start ? gs.get(g) : ge.get(g); }
+  Value cur = ord[idx[ps + j]][0];
+  if (isNull(cur)) { return start ? gs.get(g) : ge.get(g); }
+  // Shifted toward the start of the ordering for PRECEDING, toward its end for FOLLOWING.
+  f64 delta = n as~ f64;
+  bool towardStart = kind == "PRECEDING";
+  f64 c = toReal(cur);
+  f64 target = (towardStart != ws.desc[0]) ? c - delta : c + delta;
+  if (start) {
+    for (i32 k = 0; k < m; k++) {
+      Value kv = ord[idx[ps + k]][0];
+      if (isNull(kv)) { continue; }
+      f64 x = toReal(kv);
+      if (ws.desc[0] ? x <= target : x >= target) { return k; }
+    }
+    return m;
+  }
+  for (i32 k = m - 1; k >= 0; k--) {
+    Value kv = ord[idx[ps + k]][0];
+    if (isNull(kv)) { continue; }
+    f64 x = toReal(kv);
+    if (ws.desc[0] ? x >= target : x <= target) { return k; }
+  }
+  return -1;
 }
 
 i32 compareRows(const Value[] a, const Value[] b) {
@@ -1687,7 +2127,7 @@ void dedupe(Vec<Value[]> rows, Vec<Value[]> keys, const i32[] colls) {
 
 // Every row a plan produces, ordered and limited.
 export Result<Vec<Value[]>, SqlError> runPlan(SelectPlan p, Ctx outer, Exec x) {
-  Ctx none = Ctx(Row?[](), outer, null, null);
+  Ctx none = Ctx(Row?[](), outer, null, null, null);
   i64 limit = try limitValue(p.limit, none, x, -1);
   i64 offset = try limitValue(p.offset, none, x, 0);
   if (offset < 0) { offset = 0; }

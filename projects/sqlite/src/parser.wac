@@ -4,7 +4,7 @@ import { Result, Vec, Map, hashString, stringEq, NumberLiteral, numberLiteralToF
 import { SqlError } from "./error.wac";
 import { Value } from "./value.wac";
 import { Token, tokenize, upper, lower, T_IDENT, T_STRING, T_INTEGER, T_FLOAT, T_BLOB, T_PARAM, T_OP, T_EOF } from "./lexer.wac";
-import { Cte, CreateTrigger, ForeignKeyDef, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
+import { Cte, CreateTrigger, ForeignKeyDef, FrameBound, WindowSpec, NamedWindow, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
          CreateIndex, Assign, Upsert, Insert, Update, Delete, Stmt, JOIN_FIRST, JOIN_INNER, JOIN_LEFT,
          JOIN_CROSS, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 
@@ -464,7 +464,7 @@ export struct Parser {
       bool distinct = this.eatKw("DISTINCT");
       if (this.eatOp("*")) {
         try this.expectOp(")");
-        return Result.Ok(Expr.Call(lower(t.text), Expr[](), true, false));
+        return this.callRest(lower(t.text), Expr[](), true, false, OrderTerm[]());
       }
       Vec<Expr> args;
       if (!this.isOp(")")) {
@@ -473,11 +473,13 @@ export struct Parser {
           if (!this.eatOp(",")) { break; }
         }
       }
-      try this.expectOp(")");
-      if (this.isKw("FILTER") || this.isKw("OVER")) {
-        return Result.Err(SqlError.unsupported("window functions and FILTER"));
+      OrderTerm[] order = OrderTerm[]();
+      if (this.eatKw("ORDER")) {
+        try this.expectKw("BY");
+        order = try this.orderTerms();
       }
-      return Result.Ok(Expr.Call(lower(t.text), args.toArray(), false, distinct));
+      try this.expectOp(")");
+      return this.callRest(lower(t.text), args.toArray(), false, distinct, order);
     }
     if (this.isOp(".") && this.peekAt(1).kind == T_IDENT) {
       this.pos++;
@@ -491,6 +493,84 @@ export struct Parser {
       return Result.Ok(Expr.Col(t.text, c.text));
     }
     return Result.Ok(Expr.Col(null, t.text));
+  }
+
+  // What may follow a call's parentheses: FILTER (WHERE …) and OVER.
+  Result<Expr, SqlError> callRest(this, string name, Expr[] args, bool star, bool distinct, OrderTerm[] order) {
+    Expr? filter = null;
+    if (this.eatKw("FILTER")) {
+      try this.expectOp("(");
+      try this.expectKw("WHERE");
+      filter = try this.expr();
+      try this.expectOp(")");
+    }
+    WindowSpec? over = null;
+    if (this.eatKw("OVER")) {
+      if (this.eatOp("(")) {
+        over = try this.windowSpec();
+        try this.expectOp(")");
+      } else {
+        over = WindowSpec { base: try this.name(), partition: Expr[](), order: OrderTerm[]() };
+      }
+    }
+    if (filter is null && over is null && order.len() == 0) { return Result.Ok(Expr.Call(name, args, star, distinct)); }
+    return Result.Ok(Expr.AggCall(name, args, star, distinct, filter, order, over));
+  }
+
+  // The inside of OVER ( … ) or WINDOW w AS ( … ).
+  Result<WindowSpec, SqlError> windowSpec(this) {
+    WindowSpec w = WindowSpec { partition: Expr[](), order: OrderTerm[]() };
+    if (this.peek().kind == T_IDENT && !this.isKw("PARTITION") && !this.isKw("ORDER") && !this.isKw("ROWS") &&
+        !this.isKw("RANGE") && !this.isKw("GROUPS")) {
+      w.base = this.advance().text;
+    }
+    if (this.eatKw("PARTITION")) {
+      try this.expectKw("BY");
+      Vec<Expr> ps;
+      while (true) {
+        ps.push(try this.expr());
+        if (!this.eatOp(",")) { break; }
+      }
+      w.partition = ps.toArray();
+    }
+    if (this.eatKw("ORDER")) {
+      try this.expectKw("BY");
+      w.order = try this.orderTerms();
+    }
+    if (this.isKw("ROWS") || this.isKw("RANGE") || this.isKw("GROUPS")) {
+      w.units = upper(this.advance().text);
+      if (this.eatKw("BETWEEN")) {
+        w.start = try this.frameBound();
+        try this.expectKw("AND");
+        w.end = try this.frameBound();
+      } else {
+        w.start = try this.frameBound();
+        w.end = FrameBound("CURRENT ROW", null);
+      }
+      if (this.eatKw("EXCLUDE")) {
+        if (this.eatKw("NO")) { try this.expectKw("OTHERS"); w.exclude = "NO OTHERS"; }
+        else if (this.eatKw("CURRENT")) { try this.expectKw("ROW"); w.exclude = "CURRENT ROW"; }
+        else if (this.eatKw("GROUP")) { w.exclude = "GROUP"; }
+        else { try this.expectKw("TIES"); w.exclude = "TIES"; }
+      }
+    }
+    return Result.Ok(w);
+  }
+
+  Result<FrameBound, SqlError> frameBound(this) {
+    if (this.eatKw("UNBOUNDED")) {
+      if (this.eatKw("PRECEDING")) { return Result.Ok(FrameBound("UNBOUNDED PRECEDING", null)); }
+      try this.expectKw("FOLLOWING");
+      return Result.Ok(FrameBound("UNBOUNDED FOLLOWING", null));
+    }
+    if (this.eatKw("CURRENT")) {
+      try this.expectKw("ROW");
+      return Result.Ok(FrameBound("CURRENT ROW", null));
+    }
+    Expr n = try this.expr();
+    if (this.eatKw("PRECEDING")) { return Result.Ok(FrameBound("PRECEDING", n)); }
+    try this.expectKw("FOLLOWING");
+    return Result.Ok(FrameBound("FOLLOWING", n));
   }
 
   Result<Expr, SqlError> caseRest(this) {
@@ -629,6 +709,18 @@ export struct Parser {
       s.groupBy = g.toArray();
     }
     if (this.eatKw("HAVING")) { s.having = try this.expr(); }
+    if (this.eatKw("WINDOW")) {
+      Vec<NamedWindow> ws;
+      while (true) {
+        string wn = try this.name();
+        try this.expectKw("AS");
+        try this.expectOp("(");
+        ws.push(NamedWindow(wn, try this.windowSpec()));
+        try this.expectOp(")");
+        if (!this.eatOp(",")) { break; }
+      }
+      s.windows = ws.toArray();
+    }
     return Result.Ok(s);
   }
 

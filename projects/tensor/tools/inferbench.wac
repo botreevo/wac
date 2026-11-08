@@ -1,0 +1,39 @@
+// Inference speed on the CPU: the digit model one image at a time and in batches, and the tiny GPT a token at a time.
+//
+//     wac run --allow-read tools/inferbench.wac
+import { Sys } from "std";
+import { Device, Tensor } from "../src/tensor.wac";
+import { Sequential } from "../src/nn.wac";
+import { loadWeights } from "../src/checkpoint.wac";
+import { digitModel } from "../example/mnist/mnist.wac";
+import { Gpt, GptConfig } from "../example/gpt/model.wac";
+
+async f64 msPer(Sys sys, i32 reps, fn<void()> f) {
+  f();
+  i64 t0 = await sys.monotonicNanos();
+  for (i32 i = 0; i < reps; i++) { f(); }
+  return ((await sys.monotonicNanos()) - t0) as~ f64 / 1000000.0 / (reps as f64);
+}
+
+export async i32 main(Sys sys) {
+  Device d = Device.cpu();
+  Sequential m = digitModel(d);
+  u8[] w = (await sys.readFile("example/mnist/mnist.weights")).orElse(u8[]());
+  if (loadWeights(m.params(), w).isErr()) { sys.log("no weights"); return 1; }
+  i32[] batches = [1, 8, 64, 500];
+  for (i32 b in batches) {
+    Tensor x = d.uniform([b, 28, 28, 1], 0.0, 1.0);
+    i32 reps = b == 1 ? 200 : (b == 8 ? 50 : 10);
+    f64 ms = await msPer(sys, reps, () => { d.tidy(() => m.apply(x, false).softmax(-1)).values().value(); });
+    sys.log("digits, batch \{b}: \{ms} ms a batch, \{ms / (b as f64)} ms an image, \{(b as f64) * 1000.0 / ms} images a second");
+  }
+  // The GPT as the names model is built, weights random: speed does not depend on what they are.
+  Gpt g = Gpt.create(d, GptConfig(27, 16, 64, 4, 2, 0.0));
+  i32[] lens = [1, 8, 16];
+  for (i32 t in lens) {
+    Tensor idx = d.fill([1, t], 3.0);
+    f64 ms = await msPer(sys, 50, () => { d.tidy(() => g.apply(idx, false)).values().value(); });
+    sys.log("gpt, one sequence of \{t}: \{ms} ms a forward pass");
+  }
+  return 0;
+}

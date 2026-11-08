@@ -44,4 +44,12 @@ own source, which spells the bare name and is resolved in the linked program.
 The emitter's decline now names the first untyped lambda's file and position (`; the first at std:2488:5`), which is
 what found this — the count alone sent the bisection to the wrong files.
 
-Workaround: name the struct something else (`wac-kps` calls it `Driver`).
+**A second instance, the same class:** `packages/webrtc`'s `Session` holds a `Map<i32, Channel>` of a private
+`struct Channel`, and a program that also declares a `Channel` (wac-kps's engine does) is refused at emission with
+*"a call to `Map<i32,Channel>.create`, which this expression is emitted as and which is not in the program"* —
+the instantiation is named by the bare struct name and finds the program's `Channel` rather than the session's.
+`wac check` is clean. So it is not only `Host`, and not only lambdas: a generic instantiated at a type whose name
+is declared twice in the program can resolve to the wrong one.
+
+Workaround: name the struct something else (`wac-kps` calls its host `Driver`; the session's private struct is
+`ChannelState`).

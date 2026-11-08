@@ -54,7 +54,7 @@ export enum ChannelEvent {
 }
 
 /** One channel's settings and where its close has got to. */
-struct Channel {
+struct ChannelState {
   bool ordered;
   /** -1 for reliable. */
   i32 maxRetransmits;
@@ -80,7 +80,15 @@ export struct Session {
   string expectFingerprint;
   /** Whether this end is the DTLS client: decides the parity of the stream ids it opens channels on. */
   bool dtlsClient;
-  Map<i32, Channel> channels = Map<i32, Channel>.create(hashI32, i32Eq);
+  /**
+   * Whether the peer's certificate must be the one `expectFingerprint` names. **True unless a caller says
+   * otherwise**, and the one caller that does is a server that pins nobody: a KPS listener, whose clients offer a
+   * placeholder fingerprint because the server's identity is what is being authenticated, not theirs. Turning it
+   * off still requires the peer to prove it holds its certificate's key — `Peer` checks the CertificateVerify — it
+   * only stops asking whose certificate that is.
+   */
+  bool pinPeer = true;
+  Map<i32, ChannelState> channels = Map<i32, ChannelState>.create(hashI32, i32Eq);
   Vec<ChannelEvent> happened = Vec<ChannelEvent>.create();
   i32 checksAnswered = 0;
 
@@ -96,8 +104,9 @@ export struct Session {
    * establish otherwise), and that key's certificate is the one the SDP promised.
    */
   bool peerIsExpected(const this) {
-    if (this.expectFingerprint.len() == 0) { return false; }
     if (!this.peer.peerAuthenticated()) { return false; }
+    if (!this.pinPeer) { return true; }
+    if (this.expectFingerprint.len() == 0) { return false; }
     const u8[] der = this.peer.peerCertificate();
     if (der.len() == 0) { return false; }
     return hexColons(sha256(der)) == this.expectFingerprint;
@@ -172,7 +181,7 @@ export struct Session {
    * (RFC 8831 §6.5's "negotiated" — KPS's control channel is id 0, its datagram channel id 1).
    */
   void negotiate(this, i32 id, bool ordered, i32 maxRetransmits) {
-    this.channels.set(id, Channel(ordered, maxRetransmits, false, false, false));
+    this.channels.set(id, ChannelState(ordered, maxRetransmits, false, false, false));
   }
 
   /**
@@ -185,7 +194,7 @@ export struct Session {
     i32 id = this.dtlsClient ? 0 : 1;
     while (this.channels.has(id) && id < 65534) { id += 2; }
     if (this.channels.has(id)) { return -1; }
-    this.channels.set(id, Channel(ordered, maxRetransmits, false, false, false));
+    this.channels.set(id, ChannelState(ordered, maxRetransmits, false, false, false));
     i32 type = (ordered ? 0 : CHANNEL_UNORDERED) | (maxRetransmits >= 0 ? CHANNEL_PARTIAL_RELIABLE_REXMIT : CHANNEL_RELIABLE);
     u8[] msg = dcepOpenMessage(type, 0, maxRetransmits >= 0 ? maxRetransmits : 0, label, "");
     // DCEP messages travel ordered and reliable whatever the channel is (RFC 8832 §6).
@@ -201,7 +210,7 @@ export struct Session {
    */
   u8[][] send(this, i32 id, u8[] payload, bool binary, i64 now) {
     Vec<u8[]> out = Vec<u8[]>.create();
-    Channel? ch = this.channels.get(id);
+    ChannelState? ch = this.channels.get(id);
     if (ch is null || ch!.closingOut || !this.peerIsExpected()) { return out.toArray(); }
     i32 ppid = payload.len() == 0 ? (binary ? ppidBinaryEmpty() : ppidStringEmpty()) : (binary ? ppidBinary() : ppidString());
     u8[] body = payload.len() == 0 ? u8[].filled(1, 0) : payload;
@@ -213,7 +222,7 @@ export struct Session {
   /** Close a channel: reset its outgoing stream. `Closed` follows once the peer has reset its own. */
   u8[][] close(this, i32 id, i64 now) {
     Vec<u8[]> out = Vec<u8[]>.create();
-    Channel? ch = this.channels.get(id);
+    ChannelState? ch = this.channels.get(id);
     if (ch is null || ch!.closingOut) { return out.toArray(); }
     ch!.closingOut = true;
     this.assoc.resetStream(id, now);
@@ -235,7 +244,7 @@ export struct Session {
         Reset(id): {
           // The peer reset its outgoing stream: the far end closed the channel. Reset ours back if we have not
           // (RFC 8831 §6.7); the channel is closed when both directions are.
-          Channel? ch = this.channels.get(id);
+          ChannelState? ch = this.channels.get(id);
           if (ch is null) { continue; }
           ch!.closedIn = true;
           if (!ch!.closingOut) {
@@ -245,7 +254,7 @@ export struct Session {
           this.closedIfBoth(id, ch!);
         }
         ResetDone(id): {
-          Channel? ch = this.channels.get(id);
+          ChannelState? ch = this.channels.get(id);
           if (ch is null) { continue; }
           ch!.closedOut = true;
           this.closedIfBoth(id, ch!);
@@ -254,7 +263,7 @@ export struct Session {
     }
   }
 
-  void closedIfBoth(this, i32 id, Channel ch) {
+  void closedIfBoth(this, i32 id, ChannelState ch) {
     if (!ch.closedIn || !ch.closedOut) { return; }
     this.channels.remove(id);
     this.happened.push(ChannelEvent.Closed(id));
@@ -268,7 +277,7 @@ export struct Session {
         i32 reliability = (data[4] as i32 << 24) | (data[5] as i32 << 16) | (data[6] as i32 << 8) | data[7] as i32;
         bool ordered = (type & CHANNEL_UNORDERED) == 0;
         i32 rexmit = (type & 0x7F) == CHANNEL_PARTIAL_RELIABLE_REXMIT ? reliability : -1;
-        this.channels.set(id, Channel(ordered, rexmit, false, false, false));
+        this.channels.set(id, ChannelState(ordered, rexmit, false, false, false));
         this.assoc.send(id, ppidDcep(), dcepAckMessage(), false, -1, now);
         this.happened.push(ChannelEvent.Opened(id, labelOf(data), ordered, rexmit));
       } else if (data.len() > 0 && data[0] as i32 == dcepAck()) {

@@ -11,6 +11,7 @@ import { Address, parseAddress, decodeCerthash } from "../address.wac";
 import { Code, Reason } from "../errors.wac";
 import { Connection, Endpoint } from "../api.wac";
 import { QuicKpsConn } from "./conn.wac";
+import { Receiver } from "../net.wac";
 
 /** Dial `address` over QUIC. `Ok` once the handshake is complete; `Err` on a bad address, a pin mismatch, or a timeout. */
 export async Result<Connection, Reason> dialQuic(Sys sys, string address, i64 timeoutMs) {
@@ -35,7 +36,7 @@ export async Result<Connection, Reason> dialQuic(Sys sys, string address, i64 ti
   QuicTls tls = QuicTls.client(cfg.alpn, transportParams(cfg, scid, u8[](), false), bytesAt(r, 16, 32), bytesAt(r, 48, 32),
                                digest!);
   QuicConn q = QuicConn.client(cfg, tls, scid, dcid, now);
-  Link link = Link(sys, sock!, a!, false, now + timeoutMs);
+  Link link = Link(sys, sock!, Receiver.of(sys, sock!), a!, false, now + timeoutMs);
   QuicKpsConn c = QuicKpsConn.make(q, Endpoint(a!.ip, a!.port), () => { link.kicked = true; });
   driveQuic(link, c);
   Result<bool, Reason> ok = await c.ready();
@@ -46,6 +47,7 @@ export async Result<Connection, Reason> dialQuic(Sys sys, string address, i64 ti
 struct Link {
   Sys sys;
   Datagrams sock;
+  Receiver rx;
   Address a;
   bool kicked;
   /** When the handshake must be done by. */
@@ -56,11 +58,11 @@ struct Link {
 async void driveQuic(Link l, QuicKpsConn c) {
   while (!c.q.isClosed()) {
     // Short waits while the application is busy (a kick), so its writes go out without waiting for a tick.
-    auto got = await l.sys.clock().within(l.sock.receive(), l.kicked ? 1 : 10);
+    Datagram? got = await l.rx.next(l.kicked ? 1 : 10);
     l.kicked = false;
     i64 now = (await l.sys.clock().nowMillis()).ok() ?? 0 as i64;
-    if (got.isOk()) {
-      Datagram d = got.unwrap();
+    if (got is not null) {
+      Datagram d = got!;
       if (d.error.len() == 0 && d.port == l.a.port) { c.q.receive(d.bytes, now); }
     }
     c.q.tick(now);
@@ -71,7 +73,7 @@ async void driveQuic(Link l, QuicKpsConn c) {
     for (u8[] out in c.q.take(now)) { await l.sock.sendTo(l.a.ip, l.a.port, out); }
     c.pump();
   }
-  l.sock.close();
+  l.rx.close();
 }
 
 u8[] bytesAt(u8[] b, i32 from, i32 n) {

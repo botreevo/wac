@@ -22,6 +22,7 @@ import { webrtc.Session, webrtc.Association, webrtc.Peer, webrtc.Consent, webrtc
          webrtc.attrUsername, webrtc.bindingRequest, webrtc.integrityOk, quic.QuicConn, quic.QuicConfig, quic.QuicTls,
          quic.transportParams, quic.parseLong, quic.LongHeader } from "wac";
 import { QuicKpsConn } from "./quic/conn.wac";
+import { Receiver } from "./net.wac";
 import { Identity, loadOrCreateIdentity } from "./identity.wac";
 import { Address, formatAddress } from "./address.wac";
 import { Code, Reason } from "./errors.wac";
@@ -56,6 +57,7 @@ struct QuicPeer {
 export struct Listener {
   Sys sys;
   Datagrams sock;
+  Receiver rx;
   Identity id;
   u8[] digest;
   i32 port;
@@ -113,7 +115,7 @@ export async Result<Listener, string> listen(Sys sys, ListenOptions opts) {
     Ok(s): { sock = s; }
     Err(e): { return Result.Err("kps: cannot bind \{opts.host}:\{opts.port}: \{e}"); }
   }
-  Listener l = Listener { sys: sys, sock: sock!, id: id, digest: id.digest(), port: sock!.port, opts: opts };
+  Listener l = Listener { sys: sys, sock: sock!, rx: Receiver.of(sys, sock!), id: id, digest: id.digest(), port: sock!.port, opts: opts };
   serve(l);
   return Result.Ok(l);
 }
@@ -133,11 +135,11 @@ async void serve(Listener l) {
     // A QUIC connection whose application just wrote wants to send now, not at the next quarter-tick.
     bool kicked = false;
     for (i32 i = 0; i < l.quicPeers.len(); i++) { if (l.quicPeers.get(i).kicked) { kicked = true; } }
-    auto got = await l.sys.clock().within(l.sock.receive(), kicked ? 1 : 10);
+    Datagram? got = await l.rx.next(kicked ? 1 : 10);
     i64 now = 0 as i64;
     match (await l.sys.clock().nowMillis()) { Ok(ms): { now = ms; } Err(_): { } }
-    if (got.isOk()) {
-      Datagram d = got.unwrap();
+    if (got is not null) {
+      Datagram d = got!;
       if (d.error.len() == 0) { await route(l, d, now); }
     }
     string[] ufrags = l.peers.keys();
@@ -156,7 +158,7 @@ async void serve(Listener l) {
       quicSettle(l, qp, i);
     }
   }
-  l.sock.close();
+  l.rx.close();
 }
 
 /**
@@ -392,6 +394,10 @@ async void quicRoute(Listener l, Datagram d, i64 now) {
     if (h is null || h!.version != 1 || h!.packetType != 0 || b.len() < 1200 || dcid.len() < 8) { return; }
     qp = await quicAdmit(l, d, h!, now);
     if (qp is null) { return; }
+    // The admission opened this datagram already.
+    qp!.c.pump();
+    await quicFlush(l, qp!, now);
+    return;
   }
   // The client's address is wherever its packets come from now (NAT rebinding moves it).
   qp!.host = d.peer;
@@ -419,6 +425,11 @@ async QuicPeer? quicAdmit(Listener l, Datagram d, LongHeader h, i64 now) {
   QuicPeer qp = QuicPeer(QuicKpsConn.make(q, Endpoint(d.peer, d.port), () => { }), d.peer, d.port,
                          [hexOf(scid), hexOf(h.dcid)], false, false);
   qp.c.kick = () => { qp.kicked = true; };
+  // **Nothing is held for an Initial that does not open.** Its keys come from the id in its own header, so a
+  // forged one costs its sender nothing to make — admitted on sight, sixty-four of them would fill every half-open
+  // slot for the idle timeout and turn real clients away. A real ClientHello authenticates; only then is it kept.
+  q.receive(d.bytes, now);
+  if (!q.authenticatedAny()) { return null; }
   for (string k in qp.cids) { l.quicByCid.set(k, qp); }
   l.quicPeers.push(qp);
   if (l.opts.trace) { l.sys.warn("kps: admitted QUIC \{d.peer}:\{d.port}"); }

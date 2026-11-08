@@ -10,8 +10,9 @@ import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultC
 import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database, isKeyIndex } from "./database.wac";
 import { jsonEachRows, JSON_EACH_COLS } from "./jsoneach.wac";
+import { pragmaRows } from "./pragma.wac";
 import { Node, BoundSource, TableFn, AggSpec, WinSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT,
-         AGG_JSON_ARRAY, AGG_JSON_OBJECT } from "./plan.wac";
+         AGG_JSON_ARRAY, AGG_JSON_OBJECT, AGG_PERCENTILE } from "./plan.wac";
 import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
 import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, F_HEX, F_OCTET_LENGTH, knownFunction, returnsJson, FnEnv, likeMatch, likeMatchCase, likeBytes, globMatch, codepoints } from "./functions.wac";
@@ -105,6 +106,7 @@ export struct Ctx {
 }
 
 static string[] AGGREGATES = ["count", "sum", "total", "avg", "group_concat", "string_agg", "json_group_array",
+                               "median", "percentile", "percentile_cont", "percentile_disc",
                               "json_group_object"];
 
 bool isAggregate(string name, i32 nargs) {
@@ -337,6 +339,9 @@ Result<AggSpec, SqlError> aggSpec(string name, const Expr[] args, bool star, boo
     return Result.Err(err("wrong number of arguments to function \{name}()"));
   }
   if (name == "json_group_object" && args.len() != 2) { return Result.Err(err("wrong number of arguments to function json_group_object()")); }
+  if ((name == "median" && args.len() != 1) || (name.indexOf("percentile") == 0 && args.len() != 2)) {
+    return Result.Err(err("wrong number of arguments to function \{name}()"));
+  }
   // An aggregate's arguments are row expressions; an aggregate inside one is a misuse.
   Scope inner = Scope(s.srcs, s.outer, s.plan, false);
   Node[] bound = try bindAll(args, inner, x);
@@ -346,6 +351,7 @@ Result<AggSpec, SqlError> aggSpec(string name, const Expr[] args, bool star, boo
   else if (name == "group_concat" || name == "string_agg") { kind = AGG_CONCAT; }
   else if (name == "json_group_array") { kind = AGG_JSON_ARRAY; }
   else if (name == "json_group_object") { kind = AGG_JSON_OBJECT; }
+  else if (name == "median" || name.indexOf("percentile") == 0) { kind = AGG_PERCENTILE; }
   Node? f = null;
   if (filter is not null) { f = try bindExpr(filter!, inner, x); }
   Node[] ord = Node[].filled(order.len(), Node.NLit(Value.Null));
@@ -1091,14 +1097,29 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
         Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
         string nm = f.alias ?? "subquery_\{i}";
         srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true, string[](), null));
-      } else if (f.args is not null) {
+      } else if (f.args is not null || isPragmaTable(f.table!, x)) {
         string tvf = lower(f.table!);
-        if (tvf != "json_each" && tvf != "json_tree") { return Result.Err(err("no such table-valued function: \{f.table!}")); }
-        if (f.args!.len() > 2) { return Result.Err(err("too many arguments on \{tvf}() - max 2")); }
-        Column[] cols = Column[].filled(JSON_EACH_COLS.len(), Column("", "", 0, false, null, 0, null, false, "", -1));
-        for (i32 c = 0; c < cols.len(); c++) { cols[c] = Column(JSON_EACH_COLS[c], "", 0, false, null, 0, null, false, "", -1); }
+        string[] colNames = string[].filled(JSON_EACH_COLS.len(), "");
+        for (i32 c = 0; c < colNames.len(); c++) { colNames[c] = JSON_EACH_COLS[c]; }
+        i32 visible = 8;
+        if (tvf.indexOf("pragma_") == 0) {
+          Rows? shape = pragmaRows(tvf.slice(7, tvf.len()), x.db, "");
+          if (shape is null) { return Result.Err(err("no such table-valued function: \{f.table!}")); }
+          // A pragma's columns, then its argument and schema, hidden.
+          visible = shape!.columns.len();
+          string[] all = string[].filled(visible + 2, "");
+          all.copyFrom(shape!.columns, 0, 0, visible);
+          all[visible] = "arg";
+          all[visible + 1] = "schema";
+          colNames = all;
+        } else if (tvf != "json_each" && tvf != "json_tree") {
+          return Result.Err(err("no such table-valued function: \{f.table!}"));
+        }
+        if (f.args is not null && f.args!.len() > 2) { return Result.Err(err("too many arguments on \{tvf}() - max 2")); }
+        Column[] cols = Column[].filled(colNames.len(), Column("", "", 0, false, null, 0, null, false, "", -1));
+        for (i32 c = 0; c < cols.len(); c++) { cols[c] = Column(colNames[c], "", 0, false, null, 0, null, false, "", -1); }
         Table t = Table(tvf, "", cols, -1, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "", -1);
-        srcs.push(BoundSource(lower(f.alias ?? tvf), t, f.join, null, true, string[](), TableFn(tvf == "json_tree", Node[]())));
+        srcs.push(BoundSource(lower(f.alias ?? tvf), t, f.join, null, true, string[](), TableFn(tvf, Node[](), visible)));
       } else {
         Named nt = try resolveTable(f.table!, x);
         srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived, string[](), null));
@@ -1108,7 +1129,7 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
     Scope sc = Scope(p.srcs, outer, p, false);
     for (i32 i = 0; i < s.from.len(); i++) {
       const Source f = s.from[i];
-      if (f.args is not null) { p.srcs[i].call!.args = try bindAll(f.args!, sc, x); }
+      if (f.args is not null && p.srcs[i].call is not null) { p.srcs[i].call!.args = try bindAll(f.args!, sc, x); }
       if (f.on is not null) { p.srcs[i].on = try bindExpr(f.on!, sc, x); }
       if (f.join == JOIN_RIGHT || f.join == JOIN_FULL) { p.hasRight = true; }
       string[] usingCols = f.usingCols as string[];
@@ -1154,7 +1175,7 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
           for (i32 c = 0; c < t.cols.len(); c++) {
             if (rc.star! == "" && isHidden(p.srcs[k], t.cols[c].name)) { continue; }
             // json_each's json and root columns are hidden: named, they answer, but `*` leaves them out.
-            if (p.srcs[k].call is not null && c >= 8) { continue; }
+            if (p.srcs[k].call is not null && c >= p.srcs[k].call!.visible) { continue; }
             results.push(Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity, t.cols[c].coll));
             names.push(t.cols[c].name);
           }
@@ -1606,6 +1627,8 @@ struct AggState {
   bool any = false;
   Map<u8[], bool>? seen;
   Vec<Value[]>? items;     // for an aggregate with ORDER BY: each row's order keys, then its arguments
+  Vec<f64>? nums;          // median and the percentiles: every value
+  f64 frac = -1.0;         // and the fraction asked for, from 0 to 1
 }
 
 struct Group {
@@ -1745,6 +1768,36 @@ Result<bool, SqlError> stepValues(const AggSpec a, AggState s, const Value[] arg
   }
   s.count++;
   string n = a.name;
+  if (a.kind == AGG_PERCENTILE) {
+    // As SQLite's percentile extension: numbers only (text is not converted), and one fraction for
+    // every row.
+    f64 x = 0.0;
+    match (v) {
+      Int(i): { x = i as~ f64; }
+      Real(r): { x = r; }
+      default: { return Result.Err(err("input to \{n}() is not numeric")); }
+    }
+    f64 frac = 0.5;
+    if (n != "median") {
+      f64 scale = n == "percentile" ? 100.0 : 1.0;
+      bool ok = false;
+      match (applyAffinity(args[1], AFF_NUMERIC)) {
+        Int(i): { frac = (i as~ f64) / scale; ok = true; }
+        Real(r): { frac = r / scale; ok = true; }
+        default: {}
+      }
+      if (!ok || frac < 0.0 || frac > 1.0) {
+        return Result.Err(err("the fraction argument to \{n}() is not between 0.0 and \{n == "percentile" ? "100.0" : "1.0"}"));
+      }
+      if (s.frac >= 0.0 && s.frac != frac) {
+        return Result.Err(err("the fraction argument to \{n}() is not the same for all input rows"));
+      }
+    }
+    s.frac = frac;
+    if (s.nums is null) { s.nums = Vec<f64>.create(); }
+    s.nums!.push(x);
+    return Result.Ok(false);
+  }
   if (a.kind == AGG_SUM) {
     // Anything but an integer makes the sum a real — text included, unless it reads as an integer
     // ('3' does, 'x' does not), which is SQLite's sqlite3_value_numeric_type.
@@ -1810,6 +1863,17 @@ Result<Value, SqlError> finish(const AggSpec a, AggState s0) {
   if (n == "total") { return Result.Ok(Value.Real(s.sumR)); }
   if (n == "avg") { return Result.Ok(s.count == 0 ? Value.Null : Value.Real(s.sumR / (s.count as~ f64))); }
   if (n == "min" || n == "max") { return Result.Ok(s.best ?? Value.Null); }
+  if (a.kind == AGG_PERCENTILE) {
+    if (s.nums is null || s.nums!.len() == 0) { return Result.Ok(Value.Null); }
+    f64[] v = s.nums!.toArray();
+    sortReals(v);
+    // The position between two values, interpolated, or for percentile_disc the lower of them.
+    f64 ix = s.frac * ((v.len() - 1) as f64);
+    i32 i1 = ix as~ i32;
+    if (n == "percentile_disc") { return Result.Ok(Value.Real(v[i1])); }
+    i32 i2 = ix == (i1 as f64) || i1 == v.len() - 1 ? i1 : i1 + 1;
+    return Result.Ok(Value.Real(v[i1] + (v[i2] - v[i1]) * (ix - (i1 as f64))));
+  }
   return Result.Ok(s.any ? Value.Text(s.text) : Value.Null);
 }
 
@@ -1832,13 +1896,35 @@ bool itemBefore(const AggSpec a, const Value[] x, const Value[] y) {
 }
 
 // The nested loops, from source k inward. Answers false when the sink has enough rows.
+// A pragma read as a table without arguments (FROM pragma_collation_list), when no table has the name.
+bool isPragmaTable(string name, Exec x) {
+  string n = lower(name);
+  return n.indexOf("pragma_") == 0 && x.db.table(n) is null && x.db.view(n) is null;
+}
+
 // A table-valued function's rows, for its arguments as the rows before it make them.
 Result<void, SqlError> fillCall(BoundSource src, Ctx c, Exec x) {
   TableFn f = src.call!;
-  if (f.args.len() == 0) { return Result.Err(err("wrong number of arguments to \{src.table.name}")); }
-  Value input = try eval(f.args[0], c, x);
-  Value? path = f.args.len() > 1 ? (try eval(f.args[1], c, x)) as Value? : null;
-  Vec<Value[]> made = try jsonEachRows(f.tree, input, path);
+  Vec<Value[]> made;
+  if (f.name.indexOf("pragma_") == 0) {
+    // A pragma's rows, each with the argument it was given and the schema.
+    Value arg = f.args.len() > 0 ? try eval(f.args[0], c, x) : Value.Null;
+    Rows? r = pragmaRows(f.name.slice(7, f.name.len()), x.db, isNull(arg) ? "" : textOf(arg));
+    if (r is not null) {
+      for (i32 i = 0; i < r!.rows.len(); i++) {
+        Value[] row = Value[].filled(f.visible + 2, Value.Null);
+        row.copyFrom(r!.rows.get(i), 0, 0, f.visible);
+        row[f.visible] = arg;
+        row[f.visible + 1] = Value.Null;
+        made.push(row);
+      }
+    }
+  } else {
+    if (f.args.len() == 0) { return Result.Err(err("wrong number of arguments to \{src.table.name}")); }
+    Value input = try eval(f.args[0], c, x);
+    Value? path = f.args.len() > 1 ? (try eval(f.args[1], c, x)) as Value? : null;
+    made = try jsonEachRows(f.name == "json_tree", input, path);
+  }
   Vec<Row> rows = Vec.withCapacity(made.len());
   for (i32 i = 0; i < made.len(); i++) { rows.push(Row((i + 1) as i64, made.get(i), null)); }
   src.table.rows = rows;
@@ -2035,7 +2121,10 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
   // Window functions are computed over all the rows (or groups) at once, then each row is finished.
   if (p.wins.len() > 0) {
     Value[][] wv = try computeWindows(p, sink.pend, x);
-    for (i32 i = 0; i < sink.pend.len(); i++) {
+    // The rows come out as SQLite's do: sorted by the first window's partition and order.
+    i32[] seq = try windowRowOrder(p.wins.get(0), sink.pend, x);
+    for (i32 q = 0; q < seq.len(); q++) {
+      i32 i = seq[q];
       Ctx pc = sink.pend.get(i);
       Ctx wc = Ctx(pc.rows, pc.outer, pc.aggs, null, wv[i]);
       Value[] out = Value[].filled(p.results.len(), Value.Null);
@@ -2082,6 +2171,45 @@ Result<i64, SqlError> frameOffset(Node? n, Exec x) {
 }
 
 // Each row's value of every window function in the plan.
+// Rows by a window's partition, then its order; a stable sort, so ties keep their order.
+Result<i32[], SqlError> windowRowOrder(const WinSpec ws, Vec<Ctx> rows, Exec x) {
+  i32 n = rows.len();
+  Value[][] part = Value[][].defaulted(n);
+  Value[][] ord = Value[][].defaulted(n);
+  for (i32 i = 0; i < n; i++) {
+    Ctx c = rows.get(i);
+    part[i] = Value[].filled(ws.partition.len(), Value.Null);
+    for (i32 k = 0; k < ws.partition.len(); k++) { part[i][k] = try eval(ws.partition[k], c, x); }
+    ord[i] = Value[].filled(ws.order.len(), Value.Null);
+    for (i32 k = 0; k < ws.order.len(); k++) { ord[i][k] = try eval(ws.order[k], c, x); }
+  }
+  i32[] idx = i32[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { idx[i] = i; }
+  if (ws.partition.len() == 0 && ws.order.len() == 0) { return Result.Ok(idx); }
+  i32[] tmp = i32[].filled(n, 0);
+  i32 width = 1;
+  while (width < n) {
+    for (i32 lo = 0; lo < n; lo += 2 * width) {
+      i32 mid = lo + width < n ? lo + width : n;
+      i32 hi = lo + 2 * width < n ? lo + 2 * width : n;
+      i32 a = lo;
+      i32 b = mid;
+      i32 k = lo;
+      while (a < mid && b < hi) {
+        i32 c = compareParts(part[idx[b]], part[idx[a]]);
+        if (c == 0) { c = compareWinOrder(ws, ord[idx[b]], ord[idx[a]]); }
+        if (c < 0) { tmp[k] = idx[b]; b++; } else { tmp[k] = idx[a]; a++; }
+        k++;
+      }
+      while (a < mid) { tmp[k] = idx[a]; a++; k++; }
+      while (b < hi) { tmp[k] = idx[b]; b++; k++; }
+    }
+    idx.copyFrom(tmp, 0, 0, n);
+    width *= 2;
+  }
+  return Result.Ok(idx);
+}
+
 Result<Value[][], SqlError> computeWindows(SelectPlan p, Vec<Ctx> rows, Exec x) {
   i32 n = rows.len();
   Value[][] out = Value[][].defaulted(n);
@@ -2432,4 +2560,25 @@ export Result<Rows, SqlError> query(const Select s, Exec x) {
   SelectPlan p = try planSelect(s, null, x);
   Vec<Value[]> rows = try runPlan(p, topCtx(x), x);
   return Result.Ok(Rows(p.names, rows));
+}
+
+// Sorts reals ascending (a merge sort: these come one per row of a group).
+void sortReals(f64[] a) {
+  if (a.len() < 2) { return; }
+  f64[] tmp = f64[].filled(a.len(), 0.0);
+  i32 width = 1;
+  while (width < a.len()) {
+    for (i32 lo = 0; lo < a.len(); lo += 2 * width) {
+      i32 mid = lo + width < a.len() ? lo + width : a.len();
+      i32 hi = lo + 2 * width < a.len() ? lo + 2 * width : a.len();
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) { if (a[j] < a[i]) { tmp[k] = a[j]; j++; } else { tmp[k] = a[i]; i++; } k++; }
+      while (i < mid) { tmp[k] = a[i]; i++; k++; }
+      while (j < hi) { tmp[k] = a[j]; j++; k++; }
+    }
+    a.copyFrom(tmp, 0, 0, a.len());
+    width *= 2;
+  }
 }

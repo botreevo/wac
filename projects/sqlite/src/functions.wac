@@ -9,7 +9,8 @@ import { Value, compareValues } from "./value.wac";
 import { textOf, toNumeric, toInt, toReal, isNull, typeName, exactInt, wholeNumber, intPrefix } from "./ops.wac";
 import { formatReal, hexOf } from "./format.wac";
 import { lower, upper } from "./lexer.wac";
-import { Json, parseJson, jsonText, jsonOf, sqlOf, parsePath, lookup, setPath, removePath, Step, jsonType, escape, extractFast } from "./json.wac";
+import { Json, parseJson, jsonText, jsonOf, sqlOf, parsePath, lookup, setPath, removePath, Step, jsonType, escape, extractFast, writeJson } from "./json.wac";
+import { hexDigit } from "./parser.wac";
 
 // Codepoints of UTF-8 text, for the functions that count characters rather than bytes.
 export i32[] codepoints(string s) {
@@ -132,6 +133,9 @@ export bool knownFunction(string name, i32 n) {
   if (name == "concat") { return n >= 1; }
   if (name == "concat_ws") { return n >= 2; }
   if (name == "likely" || name == "unlikely") { return n == 1; }
+  if (name == "unistr" || name == "sqlite_compileoption_used" || name == "sqlite_compileoption_get") { return n == 1; }
+  if (name == "sqlite_source_id") { return n == 0; }
+  if (name == "json_pretty") { return n == 1 || n == 2; }
   if (name == "likelihood") { return n == 2; }
   if (name == "coalesce") { return n >= 2; }
   if (name == "max" || name == "min") { return n >= 1; }
@@ -337,6 +341,28 @@ Result<Value, SqlError> callNamed(string name, const Value[] a, FnEnv env) {
     return Result.Ok(dateFunction(name, a, env.nowMillis));
   }
   if (name == "likely" || name == "unlikely" || name == "likelihood") { return Result.Ok(a[0] as Value); }
+  if (name == "sqlite_source_id") { return Result.Ok(Value.Text(SQLITE_SOURCE_ID)); }
+  if (name == "sqlite_compileoption_used") { return Result.Ok(Value.Int(0)); }
+  if (name == "sqlite_compileoption_get") { return Result.Ok(Value.Null); }
+  if (name == "unistr") {
+    match (a[0]) {
+      Null: { return Result.Ok(Value.Null); }
+      default: {
+        string? s = unistr(textOf(a[0]));
+        if (s is null) { return Result.Err(SqlError("error", "invalid Unicode escape")); }
+        return Result.Ok(Value.Text(s!));
+      }
+    }
+  }
+  if (name == "json_pretty") {
+    if (isNull(a[0])) { return Result.Ok(Value.Null); }
+    Json? j = parseJson(textOf(a[0]));
+    if (j is null) { return Result.Err(malformed()); }
+    string indent = a.len() > 1 && !isNull(a[1]) ? textOf(a[1]) : "    ";
+    Buf out = Buf.create();
+    prettyJson(out, j!, indent, 0);
+    return Result.Ok(Value.Text(out.toStr()));
+  }
   if (name == "concat" || name == "concat_ws") {
     bool ws = name == "concat_ws";
     if (ws && isNull(a[0])) { return Result.Ok(Value.Null); }
@@ -817,4 +843,65 @@ export bool likeBytes(const u8[] p, const u8[] s, i32 esc) {
   }
   while (pi < p.len() && p[pi] == '%') { pi++; }
   return pi == p.len();
+}
+
+// The source that SQLite 3.53.1, whose answers this library gives, was built from.
+static string SQLITE_SOURCE_ID = "2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9";
+
+// unistr(): backslash escapes \XXXX, \uXXXX, \+XXXXXX and \UXXXXXXXX for code points, and \\ for a
+// backslash. Null when an escape is malformed.
+string? unistr(string s) {
+  u8[] b = s.toBytes();
+  Buf out = Buf.create();
+  i32 i = 0;
+  while (i < b.len()) {
+    if (b[i] != '\\') { out.push(b[i]); i++; continue; }
+    if (i + 1 < b.len() && b[i + 1] == '\\') { out.push(b[i]); i += 2; continue; }
+    i32 start = i + 1;
+    i32 digits = 4;
+    if (start < b.len() && b[start] == 'u') { start++; }
+    else if (start < b.len() && b[start] == '+') { start++; digits = 6; }
+    else if (start < b.len() && b[start] == 'U') { start++; digits = 8; }
+    if (start + digits > b.len()) { return null; }
+    i32 cp = 0;
+    for (i32 k = start; k < start + digits; k++) {
+      i32 h = hexDigit(b[k] as i32);
+      if (h < 0 || h > 15) { return null; }
+      cp = cp * 16 + h;
+    }
+    if (cp > 0x10ffff) { return null; }
+    out.pushCodepoint(cp);
+    i = start + digits;
+  }
+  return out.toStr();
+}
+
+// json_pretty(): one element per line, nested ones indented by `indent` per level.
+void prettyJson(Buf out, const Json j, string indent, i32 depth) {
+  match (j) {
+    JArr(items): {
+      if (items.len() == 0) { out.pushStr("[]"); return; }
+      out.pushStr("[\n");
+      for (i32 i = 0; i < items.len(); i++) {
+        for (i32 d = 0; d <= depth; d++) { out.pushStr(indent); }
+        prettyJson(out, items.get(i), indent, depth + 1);
+        out.pushStr(i + 1 < items.len() ? ",\n" : "\n");
+      }
+      for (i32 d = 0; d < depth; d++) { out.pushStr(indent); }
+      out.pushStr("]");
+    }
+    JObj(keys, vals): {
+      if (keys.len() == 0) { out.pushStr("{}"); return; }
+      out.pushStr("{\n");
+      for (i32 i = 0; i < keys.len(); i++) {
+        for (i32 d = 0; d <= depth; d++) { out.pushStr(indent); }
+        out.pushStr("\"" + keys.get(i) + "\": ");
+        prettyJson(out, vals.get(i), indent, depth + 1);
+        out.pushStr(i + 1 < keys.len() ? ",\n" : "\n");
+      }
+      for (i32 d = 0; d < depth; d++) { out.pushStr(indent); }
+      out.pushStr("}");
+    }
+    default: { writeJson(out, j); }
+  }
 }

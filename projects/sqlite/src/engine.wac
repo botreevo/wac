@@ -5,12 +5,12 @@ import { Result, Vec, Map, hashString, stringEq, hashI64, i64Eq } from "core";
 import { SqlError } from "./error.wac";
 import { Value, compareValues, compareColl, sameValue, collationId } from "./value.wac";
 import { CreateTrigger, Expr, Stmt, Select, Source, ResultCol, Insert, Update, Delete, Upsert, Assign, CreateTable,
-         CreateIndex, ColumnDef, JOIN_FIRST, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
+         CreateIndex, ColumnDef, JOIN_FIRST, JOIN_CROSS, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 import { parseOne, Parsed, isBlank } from "./parser.wac";
 import { Table, Row, Index, Entry, Column, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_INTEGER, AFF_TEXT, AFF_NUMERIC, AFF_REAL } from "./schema.wac";
 import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
-import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable, ROWID_INTERNAL, nodeAff } from "./query.wac";
+import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable, ROWID_INTERNAL, nodeAff, rowParts } from "./query.wac";
 import { applyAffinity, isNull, textOf, AFF_NONE } from "./ops.wac";
 import { FnEnv } from "./functions.wac";
 import { lower, upper } from "./lexer.wac";
@@ -1049,26 +1049,37 @@ struct Statement {
   // Computes and stores an updated row. Null when OR IGNORE skipped it.
   // A SET list resolved once per statement: each target column (-1 for the rowid) and its expression.
   Result<BoundSets, SqlError> bindSets(this, Table t, Assign[] sets, Scope sc) {
-    i32[] cols = i32[].filled(sets.len(), 0);
-    Node[] nodes = Node[].filled(sets.len(), Node.NLit(Value.Null));
+    Vec<i32> cols;
+    Vec<Node> nodes;
     for (i32 i = 0; i < sets.len(); i++) {
       Assign a = sets[i];
-      if (a.cols.len() != 1) { return Result.Err(SqlError.unsupported("assigning a row value")); }
-      i32 col = t.colIndex(a.cols[0]);
-      if (col < 0) {
-        string nm = lower(a.cols[0]);
-        if (t.rowidAlias >= 0 || t.withoutRowid || (nm != "rowid" && nm != "oid" && nm != "_rowid_")) {
-          return Result.Err(err("no such column: \{a.cols[0]}"));
+      // SET (a, b) = (…, …) or = (SELECT …, …): one assignment per column.
+      Node[] values = Node[]();
+      if (a.cols.len() == 1) {
+        values = [try bindExpr(a.value, sc, this.x)];
+      } else {
+        Node[]? parts = try rowParts(a.value, sc, this.x);
+        i32 n = parts is null ? 1 : parts!.len();
+        if (n != a.cols.len()) { return Result.Err(err("\{a.cols.len()} columns assigned \{n} values")); }
+        values = parts!;
+      }
+      for (i32 k = 0; k < a.cols.len(); k++) {
+        i32 col = t.colIndex(a.cols[k]);
+        if (col < 0) {
+          string nm = lower(a.cols[k]);
+          if (t.rowidAlias >= 0 || t.withoutRowid || (nm != "rowid" && nm != "oid" && nm != "_rowid_")) {
+            return Result.Err(err("no such column: \{a.cols[k]}"));
+          }
         }
+        if (col >= 0 && t.cols[col].gen is not null) {
+          return Result.Err(err("cannot UPDATE generated column \"\{t.cols[col].name}\""));
+        }
+        if (col == t.rowidAlias) { col = -1; }
+        cols.push(col);
+        nodes.push(values[k]);
       }
-      if (col >= 0 && t.cols[col].gen is not null) {
-        return Result.Err(err("cannot UPDATE generated column \"\{t.cols[col].name}\""));
-      }
-      if (col == t.rowidAlias) { col = -1; }
-      cols[i] = col;
-      nodes[i] = try bindExpr(a.value, sc, this.x);
     }
-    return Result.Ok(BoundSets(cols, nodes));
+    return Result.Ok(BoundSets(cols.toArray(), nodes.toArray()));
   }
 
   // Computes and stores an updated row. Null when OR IGNORE skipped it.
@@ -1138,9 +1149,11 @@ struct Statement {
   }
 
   // The rows a WHERE picks, by rowid, found with the same planner a SELECT uses.
-  Result<Row[], SqlError> matching(this, Table t, Expr? where) {
+  Result<Row[], SqlError> matching(this, Table t, Expr? where) { return this.matchingAs(t, null, where); }
+
+  Result<Row[], SqlError> matchingAs(this, Table t, string? alias, Expr? where) {
     Select s = Select { cols: [ResultCol(Expr.Col(null, ROWID_INTERNAL), null, null, "rowid")],
-                        from: [Source { table: t.name, join: JOIN_FIRST }], where: where };
+                        from: [Source { table: t.name, alias: alias, join: JOIN_FIRST }], where: where };
     SelectPlan p = try planSelect(s, null, this.x);
     Vec<Value[]> ids = try runPlan(p, topCtx(this.x), this.x);
     Vec<Row> out;
@@ -1156,8 +1169,9 @@ struct Statement {
   Result<Rows, SqlError> update(this, Update u) {
     if (this.conn.db.view(u.table) is not null) { return this.changeView(u.table, u.where, u.sets, "UPDATE"); }
     Table t = try this.table(u.table);
-    Row[] rows = try this.matching(t, u.where);
-    BoundSource[] srcs = [BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)];
+    if (u.from is not null) { return this.updateFrom(t, u); }
+    Row[] rows = try this.matchingAs(t, u.alias, u.where);
+    BoundSource[] srcs = [BoundSource(lower(u.alias ?? t.name), t, JOIN_FIRST, null, false, string[](), null)];
     Scope sc = Scope(srcs, this.x.triggerScope, null, false);
     RetPlan? ret = try this.returning(t, u.returning);
     BoundSets bs = try this.bindSets(t, u.sets, sc);
@@ -1170,6 +1184,64 @@ struct Statement {
       if (cur is null) { continue; }
       Ctx c = Ctx([cur], null, null, null, null);
       Row? changed = try this.applySets(t, cur!, bs, c, u.orAction);
+      if (changed is not null && ret is not null) { out.push(try this.evalReturning(ret!, changed!)); }
+    }
+    if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
+    return Result.Ok(noRows());
+  }
+
+  // UPDATE … FROM: the table joined with the FROM sources under the WHERE, the new values computed in
+  // that join; a row the join meets more than once takes the first meeting's, as SQLite leaves it.
+  Result<Rows, SqlError> updateFrom(this, Table t, Update u) {
+    // Each assigned column and the expression it gets, row values spread over their columns.
+    Vec<string> names;
+    Vec<Expr> values;
+    for (i32 i = 0; i < u.sets.len(); i++) {
+      Assign a = u.sets[i];
+      if (a.cols.len() == 1) { names.push(a.cols[0]); values.push(a.value); continue; }
+      match (a.value) {
+        Vector(items): {
+          if (items.len() != a.cols.len()) { return Result.Err(err("\{a.cols.len()} columns assigned \{items.len()} values")); }
+          for (i32 k = 0; k < items.len(); k++) { names.push(a.cols[k]); values.push(items[k] as Expr); }
+        }
+        default: { return Result.Err(SqlError.unsupported("a row-valued subquery in UPDATE … FROM")); }
+      }
+    }
+    Vec<ResultCol> cols;
+    cols.push(ResultCol(Expr.Col(u.alias ?? t.name, ROWID_INTERNAL), null, null, "rowid"));
+    for (i32 i = 0; i < values.len(); i++) { cols.push(ResultCol(values.get(i), null, null, "v")); }
+    Vec<Source> from;
+    from.push(Source { table: t.name, alias: u.alias, join: JOIN_FIRST });
+    Source[] more = u.from!;
+    for (i32 i = 0; i < more.len(); i++) {
+      Source s = more[i];
+      if (s.join == JOIN_FIRST) { s.join = JOIN_CROSS; }
+      from.push(s);
+    }
+    Select q = Select { cols: cols.toArray(), from: from.toArray(), where: u.where };
+    SelectPlan p = try planSelect(q, null, this.x);
+    Vec<Value[]> found = try runPlan(p, topCtx(this.x), this.x);
+    // The assignments' targets, checked as a plain UPDATE checks them; their values come from the join.
+    Vec<Assign> single;
+    for (i32 i = 0; i < names.len(); i++) { single.push(Assign([names.get(i)], Expr.Lit(Value.Null))); }
+    BoundSource[] srcs = [BoundSource(lower(u.alias ?? t.name), t, JOIN_FIRST, null, false, string[](), null)];
+    Scope sc = Scope(srcs, this.x.triggerScope, null, false);
+    BoundSets targets = try this.bindSets(t, single.toArray(), sc);
+    RetPlan? ret = try this.returning(t, u.returning);
+    Vec<Value[]> out;
+    this.counted = true;
+    Map<i64, bool> done = Map.create(hashI64, i64Eq);
+    for (i32 i = 0; i < found.len(); i++) {
+      Value[] row = found.get(i);
+      i64 id = match (row[0]) { Int(n): n, default: -1 as i64 };
+      if (done.has(id)) { continue; }
+      done.set(id, true);
+      Row? cur = t.get(id);
+      if (cur is null) { continue; }
+      Node[] lits = Node[].filled(targets.cols.len(), Node.NLit(Value.Null));
+      for (i32 k = 0; k < lits.len(); k++) { lits[k] = Node.NLit(row[k + 1]); }
+      Ctx c = Ctx([cur], null, null, null, null);
+      Row? changed = try this.applySets(t, cur!, BoundSets(targets.cols, lits), c, u.orAction);
       if (changed is not null && ret is not null) { out.push(try this.evalReturning(ret!, changed!)); }
     }
     if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }

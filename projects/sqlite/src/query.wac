@@ -178,8 +178,61 @@ bool exprIsJson(const Expr e) {
   }
 }
 
+// ── row values ─────────────────────────────────────────────────────────────
+
+SqlError rowMisused() { return err("row value misused"); }
+
+// The parts of a row value: a (…, …) list, or a subquery of more than one column. Null for a scalar.
+export Result<Node[]?, SqlError> rowParts(const Expr e, Scope s, Exec x) {
+  match (e) {
+    Vector(items): { return Result.Ok((try bindAll(items, s, x)) as Node[]?); }
+    Subquery(sub): {
+      SelectPlan p = try planSelect(sub, s, x);
+      if (p.names.len() < 2) { return Result.Ok(null); }
+      Node[] out = Node[].filled(p.names.len(), Node.NLit(Value.Null));
+      for (i32 i = 0; i < out.len(); i++) { out[i] = Node.NSubCol(p, i); }
+      return Result.Ok(out as Node[]?);
+    }
+    default: { return Result.Ok(null); }
+  }
+}
+
+bool isRow(const Expr e) {
+  match (e) {
+    Vector: { return true; }
+    Subquery(sub): { return sub.cols.len() > 1 || (sub.cols.len() == 1 && sub.cols[0].star is not null); }
+    default: { return false; }
+  }
+}
+
+// Two row values compared, as the scalar comparisons that give SQLite's answer, NULLs included:
+// equal when every pair is; ordered by the first pair that differs.
+Result<Node, SqlError> rowCompare(string op, const Expr l, const Expr r, Scope s, Exec x) {
+  Node[]? a0 = try rowParts(l, s, x);
+  Node[]? b0 = try rowParts(r, s, x);
+  // A starred subquery that turned out to have one column is a scalar after all.
+  if (a0 is null && b0 is null) { return Result.Ok(Node.NCompare(op, try bindExpr(l, s, x), try bindExpr(r, s, x))); }
+  if (a0 is null || b0 is null || a0!.len() != b0!.len()) { return Result.Err(rowMisused()); }
+  Node[] a = a0!;
+  Node[] b = b0!;
+  i32 n = a.len();
+  if (op == "=" || op == "!=" || op == "IS" || op == "IS NOT") {
+    string each = op == "IS" || op == "IS NOT" ? "IS" : "=";
+    Node all = Node.NCompare(each, a[0], b[0]);
+    for (i32 i = 1; i < n; i++) { all = Node.NAnd(all, Node.NCompare(each, a[i], b[i])); }
+    return Result.Ok(op == "=" || op == "IS" ? all : Node.NNot(all));
+  }
+  string strict = op == "<=" ? "<" : (op == ">=" ? ">" : op);
+  Node res = Node.NCompare(op, a[n - 1], b[n - 1]);
+  for (i32 i = n - 2; i >= 0; i--) {
+    res = Node.NOr(Node.NCompare(strict, a[i], b[i]), Node.NAnd(Node.NCompare("=", a[i], b[i]), res));
+  }
+  return Result.Ok(res);
+}
+
 export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
   match (e) {
+    Vector: { return Result.Err(rowMisused()); }
     Lit(v): { return Result.Ok(Node.NLit(v)); }
     Param(n): { return Result.Ok(Node.NParam(n)); }
     Col(t, name): { return bindColumn(t, name, s); }
@@ -189,6 +242,8 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
       return Result.Ok(Node.NUnary(op, n));
     }
     Binary(op, l, r): {
+      bool cmp = op == "=" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "IS" || op == "IS NOT";
+      if (cmp && (isRow(l) || isRow(r))) { return rowCompare(op, l, r, s, x); }
       Node a = try bindExpr(l, s, x);
       Node b = try bindExpr(r, s, x);
       if (op == "AND") { return Result.Ok(Node.NAnd(a, b)); }
@@ -206,11 +261,29 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
     }
     IsNull(a, neg): { return Result.Ok(Node.NIsNull(try bindExpr(a, s, x), neg)); }
     Between(a, lo, hi, neg): {
+      if (isRow(a)) {
+        Node both = Node.NAnd(try rowCompare(">=", a, lo, s, x), try rowCompare("<=", a, hi, s, x));
+        return Result.Ok(neg ? Node.NNot(both) : both);
+      }
       return Result.Ok(Node.NBetween(try bindExpr(a, s, x), try bindExpr(lo, s, x), try bindExpr(hi, s, x), neg));
     }
-    InList(a, items, neg): { return Result.Ok(Node.NIn(try bindExpr(a, s, x), try bindAll(items, s, x), neg)); }
+    InList(a, items, neg): {
+      if (isRow(a)) {
+        // (a, b) IN ((1, 2), (3, 4)): equal to any of them, with IN's NULLs.
+        if (items.len() == 0) { return Result.Ok(Node.NLit(Value.Int(neg ? 1 : 0))); }
+        Node any = try rowCompare("=", a, items[0], s, x);
+        for (i32 i = 1; i < items.len(); i++) { any = Node.NOr(any, try rowCompare("=", a, items[i], s, x)); }
+        return Result.Ok(neg ? Node.NNot(any) : any);
+      }
+      return Result.Ok(Node.NIn(try bindExpr(a, s, x), try bindAll(items, s, x), neg));
+    }
     InSelect(a, sub, neg): {
       SelectPlan p = try planSelect(sub, s, x);
+      if (isRow(a)) {
+        Node[] parts = (try rowParts(a, s, x))!;
+        if (parts.len() != p.names.len()) { return Result.Err(err("sub-select returns \{p.names.len()} columns - expected \{parts.len()}")); }
+        return Result.Ok(Node.NInRowsVec(parts, p, neg));
+      }
       if (p.names.len() != 1) { return Result.Err(err("sub-select returns \{p.names.len()} columns - expected 1")); }
       return Result.Ok(Node.NInRows(try bindExpr(a, s, x), p, neg));
     }
@@ -612,6 +685,31 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       if (rows.len() == 0) { return Result.Ok(Value.Null); }
       return Result.Ok(rows.get(0)[0]);
     }
+    NSubCol(sub, col): {
+      Vec<Value[]> rows = try subRows(sub, c, x);
+      if (rows.len() == 0) { return Result.Ok(Value.Null); }
+      return Result.Ok(rows.get(0)[col]);
+    }
+    NInRowsVec(es, sub, neg): {
+      Value[] vs = Value[].filled(es.len(), Value.Null);
+      for (i32 i = 0; i < es.len(); i++) { vs[i] = try eval(es[i], c, x); }
+      Vec<Value[]> rows = try subRows(sub, c, x);
+      bool sawNull = false;
+      for (i32 r = 0; r < rows.len(); r++) {
+        Value[] row = rows.get(r);
+        bool equal = true;
+        bool unknown = false;
+        for (i32 i = 0; i < es.len() && equal; i++) {
+          if (isNull(vs[i]) || isNull(row[i])) { unknown = true; continue; }
+          Value[] ab = comparable(vs[i], nodeAff(es[i]), row[i], AFF_NONE);
+          i32 coll = cmpColl(es[i], i < sub.results.len() ? sub.results[i] : Node.NLit(Value.Null));
+          if (compareColl(ab[0], ab[1], coll) != 0) { equal = false; }
+        }
+        if (equal && !unknown) { return Result.Ok(boolValue(!neg)); }
+        if (equal) { sawNull = true; }
+      }
+      return Result.Ok(sawNull ? Value.Null : boolValue(neg));
+    }
     NExists(sub, neg): {
       Vec<Value[]> rows = try subRows(sub, c, x);
       return Result.Ok(boolValue(neg ? rows.len() == 0 : rows.len() > 0));
@@ -675,6 +773,12 @@ export i32 refs(const Node n, i32 depth) {
     NCollate(e, coll): { return refs(e, depth); }
     NSub(sub): { return planRefs(sub, depth + 1); }
     NExists(sub, neg): { return planRefs(sub, depth + 1); }
+    NSubCol(sub, col): { return planRefs(sub, depth + 1); }
+    NInRowsVec(es, sub, neg): {
+      i32 m = planRefs(sub, depth + 1);
+      for (i32 i = 0; i < es.len(); i++) { m = m | refs(es[i], depth); }
+      return m;
+    }
     default: { return 0; }
   }
 }

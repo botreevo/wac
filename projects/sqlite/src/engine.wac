@@ -16,7 +16,7 @@ import { signed32 } from "./reader.wac";
 import { FnEnv } from "./functions.wac";
 import { lower, upper } from "./lexer.wac";
 import { tableInfo, indexList, indexInfo, foreignKeyList, foreignKeyCheck, collationList, databaseList } from "./pragma.wac";
-import { renameTable, mentionsTable, renameColumnInTable, renameColumnElsewhere, dropColumnText } from "./alter.wac";
+import { renameTable, mentionsTable, renameColumnInTable, renameColumnElsewhere, dropColumnText, afterLastColumn } from "./alter.wac";
 import { Chunked } from "./chunked.wac";
 
 // What undoes one change, newest last.
@@ -223,7 +223,18 @@ export struct Connection {
         return Result.Ok(rows);
       }
       Err(e): {
-        if (s.failKeep && !s.rollbackTx) {
+        // OR FAIL keeps what came before the failure, unless that breaks an immediate foreign key: then
+        // the statement is undone whole, as SQLite does.
+        bool keep = s.failKeep && !s.rollbackTx;
+        for (i32 i = 0; keep && i < s.pending.len(); i++) {
+          Pending pd = s.pending.get(i);
+          if (this.inTx && pd.deferred) { continue; }
+          match (s.holds(pd)) {
+            Ok(fine): { if (!fine) { keep = false; } }
+            Err(fe): { keep = false; }
+          }
+        }
+        if (keep) {
           // OR FAIL: what the statement did before failing stays, and counts.
           if (s.counted) { this.changes = s.count; this.totalChanges += s.count; }
           if (this.inTx) {
@@ -332,9 +343,11 @@ void replaceRow(Database db, Table t, Row old, Row now) {
   Index[] ixs = db.indexesOf(t.name);
   for (i32 i = 0; i < ixs.len(); i++) {
     Index ix = ixs[i];
-    bool same = true;
-    for (i32 k = 0; k < ix.cols.len(); k++) {
-      if (!sameValue(old.vals[ix.cols[k]], now.vals[ix.cols[k]])) { same = false; break; }
+    // A partial index's WHERE or an expression index's terms can change with any column: those are
+    // always taken out and put back.
+    bool same = !ix.special();
+    for (i32 k = 0; same && k < ix.cols.len(); k++) {
+      if (!sameValue(old.vals[ix.cols[k]], now.vals[ix.cols[k]])) { same = false; }
     }
     if (!same) { ix.drop(old); ix.add(now); }
   }
@@ -543,10 +556,17 @@ struct Statement {
         if (kids.len() == 0) { continue; }
         if (action == "RESTRICT") { return Result.Err(constraint("FOREIGN KEY constraint failed")); }
         for (i32 i = 0; i < kids.len(); i++) {
-          Row kid = kids[i];
+          // A foreign key's action is a change to the child like any other: its triggers fire.
+          Row? still = child.get(kids[i].rowid);
+          if (still is null) { continue; }
+          Row kid = still!;
           if (action == "CASCADE" && now is null) {
-            try this.parentChanging(child, kid, null);
-            this.deleteRow(child, kid);
+            if (!(try this.fire(child.name, child, "BEFORE", "DELETE", kid, null, null))) { continue; }
+            Row? gone = child.get(kid.rowid);
+            if (gone is null) { continue; }
+            try this.parentChanging(child, gone!, null);
+            this.deleteRow(child, gone!);
+            try this.fire(child.name, child, "AFTER", "DELETE", gone!, null, null);
             continue;
           }
           Value[] vals = Value[].filled(kid.vals.len(), Value.Null);
@@ -567,7 +587,9 @@ struct Statement {
             match (vals[child.rowidAlias]) { Int(id): { rowid = id; } default: {} }
           }
           Row nk = Row(rowid, vals, null);
-          if (!(try this.prepareRow(child, nk, OR_ABORT))) { continue; }
+          try this.coerceRow(child, nk);
+          if (!(try this.fire(child.name, child, "BEFORE", "UPDATE", kid, nk, fk.cols))) { continue; }
+          if (!(try this.checkRow(child, nk, OR_ABORT))) { continue; }
           try this.parentChanging(child, kid, nk);
           if (rowid == kid.rowid) {
             replaceRow(d, child, kid, nk);
@@ -576,8 +598,9 @@ struct Statement {
             this.deleteRow(child, kid);
             this.insertRow(child, nk);
           }
-          // SET DEFAULT can point at a parent that is not there.
-          if (action == "SET DEFAULT") { this.childWritten(child, nk, kid); }
+          // SET DEFAULT can point at a parent that is not there, even when the default is the key it had.
+          if (action == "SET DEFAULT") { this.pending.push(Pending(child, fk, nk, Value[](), fk.deferred || this.conn.setting("defer_foreign_keys"))); }
+          try this.fire(child.name, child, "AFTER", "UPDATE", kid, nk, fk.cols);
         }
       }
     }
@@ -905,15 +928,29 @@ struct Statement {
     this.insertRow(s!, Row(s!.maxRowid() + 1, [Value.Text(t.name), Value.Int(rowid)], null));
   }
 
-  // Coerces a row's values to its columns' affinities and checks NOT NULL. Answers false when the row
-  // is to be skipped (OR IGNORE).
+  // Coerces a row's values to its columns' affinities and checks its constraints. Answers false when
+  // the row is to be skipped (OR IGNORE).
   Result<bool, SqlError> prepareRow(this, Table t, Row r, i32 orAction) {
+    try this.coerceRow(t, r);
+    return this.checkRow(t, r, orAction);
+  }
+
+  // A row's values with their columns' affinities, and its generated columns computed: what BEFORE
+  // triggers see.
+  Result<void, SqlError> coerceRow(this, Table t, Row r) {
     for (i32 i = 0; i < t.cols.len(); i++) {
       if (i == t.rowidAlias) { r.vals[i] = Value.Int(r.rowid); continue; }
       if (t.cols[i].gen is null) { r.vals[i] = applyAffinity(r.vals[i], t.cols[i].affinity); }
     }
     if (t.hasGenerated()) { try fillGenerated(t, r, this.conn.db); }
-    if (t.strict) { try this.strictHolds(t, r); }
+    return Result.Ok();
+  }
+
+  // The row's NOT NULL columns, STRICT types and CHECK constraints, in SQLite's order. Answers false
+  // when the row is to be skipped (OR IGNORE). A STRICT type error is not one the OR clauses resolve: it
+  // fails the statement, whatever they say.
+  Result<bool, SqlError> checkRow(this, Table t, Row r, i32 orAction) {
+    bool replaced = false;
     for (i32 i = 0; i < t.cols.len(); i++) {
       if (i == t.rowidAlias) { continue; }
       if (t.cols[i].notNull && isNull(r.vals[i])) {
@@ -921,11 +958,15 @@ struct Statement {
         if (action == OR_IGNORE) { return Result.Ok(false); }
         if (action == OR_REPLACE && t.cols[i].dflt is not null) {
           r.vals[i] = applyAffinity(try this.defaultFor(t.cols[i]), t.cols[i].affinity);
+          replaced = true;
           if (!isNull(r.vals[i])) { continue; }
         }
         return Result.Err(this.failing(action, constraint("NOT NULL constraint failed: \{t.name}.\{t.cols[i].name}")));
       }
     }
+    // A default put in place of a NULL changes what the generated columns compute from.
+    if (replaced && t.hasGenerated()) { try fillGenerated(t, r, this.conn.db); }
+    if (t.strict) { try this.strictHolds(t, r); }
     return this.checksHold(t, r, orAction);
   }
 
@@ -953,20 +994,28 @@ struct Statement {
 
   // The first constraint a row breaks, other than against itself: the rowid, then each unique index in
   // schema order. Null when there is none.
-  Conflict? firstConflict(this, Table t, Row r, i64 self) {
+  // The uniqueness conflict to resolve first, in SQLite's order: one an upsert clause handles; then
+  // the rowid's, then each index's, the newest index first; and those resolved by REPLACE after all
+  // the rest, so that a conflict that fails, aborts or ignores the row is met before anything is
+  // deleted for it.
+  Conflict? firstConflict(this, Table t, Row r, i64 self, i32 orAction) {
+    return this.nextConflict(t, r, self, orAction, Upsert[]());
+  }
+
+  Conflict? nextConflict(this, Table t, Row r, i64 self, i32 orAction, Upsert[] ups) {
+    Vec<Conflict> all;
     if (r.rowid != self) {
       Row? other = t.get(r.rowid);
-      if (other is not null) {
-        i32[] key = t.rowidAlias >= 0 ? [t.rowidAlias] : [-1];
-        return Conflict(other!, key, null);
-      }
+      if (other is not null) { all.push(Conflict(other!, t.rowidAlias >= 0 ? [t.rowidAlias] : [-1], null)); }
     }
     Index[] ixs = this.conn.db.indexesOf(t.name);
-    for (i32 i = 0; i < ixs.len(); i++) {
+    for (i32 i = ixs.len() - 1; i >= 0; i--) {
       i64? hit = ixs[i].conflict(r, self);
-      if (hit is not null) { return Conflict(t.get(hit!)!, ixs[i].cols, ixs[i]); }
+      if (hit is not null) { all.push(Conflict(t.get(hit!)!, ixs[i].cols, ixs[i])); }
     }
-    return null;
+    for (i32 i = 0; i < all.len(); i++) { if (matchUpsert(ups, t, all.get(i)) is not null) { return all.get(i); } }
+    for (i32 i = 0; i < all.len(); i++) { if (actionFor(orAction, all.get(i).mode(t)) != OR_REPLACE) { return all.get(i); } }
+    return all.len() > 0 ? all.get(0) as Conflict? : null;
   }
 
   Result<Rows, SqlError> insert(this, Insert ins) {
@@ -1034,13 +1083,21 @@ struct Statement {
           default: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
         }
       }
-      if (!haveRowid) { rowid = try this.newRowid(t); }
-      Row r = Row(rowid, vals, null);
-      if (!(try this.prepareRow(t, r, ins.orAction))) { continue; }
+      // As in SQLite: values take their affinity and generated columns are computed, BEFORE triggers
+      // run (seeing -1 for a rowid still to be chosen), the rowid is chosen, and only then are the
+      // constraints checked.
+      Row r = Row(haveRowid ? rowid : -1, vals, null);
+      try this.coerceRow(t, r);
       if (!(try this.fire(t.name, t, "BEFORE", "INSERT", null, r, null))) { continue; }
+      if (!haveRowid) {
+        rowid = try this.newRowid(t);
+        r.rowid = rowid;
+        if (t.rowidAlias >= 0) { r.vals[t.rowidAlias] = Value.Int(rowid); }
+      }
+      if (!(try this.checkRow(t, r, ins.orAction))) { continue; }
       bool skip = false;
       while (true) {
-        Conflict? c = this.firstConflict(t, r, -9223372036854775807 - 1);
+        Conflict? c = this.nextConflict(t, r, -9223372036854775807 - 1, ins.orAction, ins.upserts);
         if (c is null) { break; }
         Upsert? u = matchUpsert(ins.upserts, t, c!);
         if (u is not null) {
@@ -1148,8 +1205,9 @@ struct Statement {
       vals[col] = v;
     }
     Row r = Row(rowid, vals, null);
-    if (!(try this.prepareRow(t, r, orAction))) { return Result.Ok(null); }
+    try this.coerceRow(t, r);
     if (!(try this.fire(t.name, t, "BEFORE", "UPDATE", old, r, bs.cols))) { return Result.Ok(null); }
+    if (!(try this.checkRow(t, r, orAction))) { return Result.Ok(null); }
     // A BEFORE trigger may have changed or removed the row; SQLite then updates what is there now.
     Row? now = t.get(old.rowid);
     if (now is null) { return Result.Ok(null); }
@@ -1159,7 +1217,7 @@ struct Statement {
       // The common case: the row keeps its rowid, so it is swapped in place, and only the indexes whose
       // key changed are touched. Its own entries do not count as conflicts.
       while (true) {
-        Conflict? cf = this.firstConflict(t, r, old.rowid);
+        Conflict? cf = this.firstConflict(t, r, old.rowid, orAction);
         if (cf is null) { break; }
         i32 action = actionFor(orAction, cf!.mode(t));
         if (action == OR_IGNORE) { return Result.Ok(null); }
@@ -1177,7 +1235,7 @@ struct Statement {
     // The old row is out of the way while the new one is checked, so a row may keep its own key.
     this.deleteRow(t, old);
     while (true) {
-      Conflict? cf = this.firstConflict(t, r, -9223372036854775807 - 1);
+      Conflict? cf = this.firstConflict(t, r, -9223372036854775807 - 1, orAction);
       if (cf is null) { break; }
       i32 action = actionFor(orAction, cf!.mode(t));
       if (action == OR_IGNORE) {
@@ -1819,8 +1877,9 @@ struct Statement {
       dv = v!;
     }
     if (c.notNull && isNull(dv)) { return Result.Err(err("Cannot add a NOT NULL column with default value NULL")); }
-    i32 close = t.sql.len() - 1;
-    while (close > 0 && t.sql.slice(close, close + 1) != ")") { close--; }
+    // The new column goes after the last one, before any table constraint, as SQLite puts it.
+    i32 close = afterLastColumn(t.sql);
+    if (close < 0) { return Result.Err(err("malformed table definition for \{t.name}")); }
     this.undo.push(Undo.UAddColumn(t, t.cols, t.sql));
     this.schema = true;
     string sql = t.sql.slice(0, close) + ", " + text + t.sql.slice(close, t.sql.len());
@@ -2050,6 +2109,8 @@ Upsert? matchUpsert(Upsert[] ups, Table t, Conflict c) {
   for (i32 i = 0; i < ups.len(); i++) {
     Upsert u = ups[i];
     if (u.target.len() == 0) { return u; }
+    // A target of columns names neither an index on expressions nor a partial one.
+    if (c.ix is not null && c.ix!.special()) { continue; }
     if (u.target.len() != c.cols.len()) { continue; }
     bool all = true;
     for (string n in u.target) {

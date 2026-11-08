@@ -59,8 +59,9 @@ empty file added.
 wac's secp256k1 signatures (wacuum's) are identical to ethers' for the same key and claim. A statement signed with
 MetaMask would verify here.
 
-**Builds reproduced.** Both apps came out byte-identical when rebuilt from a fresh clone in another directory, by two
-rebuilders. The first rebuild *failed*, and usefully: `wac build -o dist/hello` does not create `dist/`, and the
+**Builds reproduced, across hosts too.** Both apps came out byte-identical when rebuilt from a fresh clone in another
+directory, by two rebuilders. They also came out byte-identical when built by a `wac` on wasmtime, the host with no
+JavaScript in it, as by the one on Node. The first rebuild *failed*, and usefully: `wac build -o dist/hello` does not create `dist/`, and the
 publisher's build had only passed because an ignored `dist/` was already on disk. That is exactly what a rebuild is for.
 
 ## Findings worth acting on
@@ -106,7 +107,7 @@ In the order I would act on them.
 - **wac's own fetch and build do not enforce pins** (finding 1); `wactrust lock check` runs beside them.
 - **Stock browsers are not protected.** The page path is `wactrust run` writing checked bytes to open from `file://`.
   A loader page and an extension (0016 H9 options 2 and 3) are not built.
-- **Builds were reproduced only on the Node host.** See `docs/` for the wasmtime-host result, if it is there.
+- **Reproduction was measured on two hosts (Node, wasmtime) on one machine**, not on several machines or the V8 host.
 - **Signing in wac is for tests and the demo only.** wacuum's secp256k1 says it is not constant-time. Real signers use
   wallets, as `tools/wallet` does.
 

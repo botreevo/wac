@@ -3,7 +3,7 @@
 
 import { Result, Vec, Map, hashBytes, bytesEq, hashI64, i64Eq } from "core";
 import { SqlError } from "./error.wac";
-import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY } from "./value.wac";
+import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY, sameValue } from "./value.wac";
 import { encodeRecord, toUtf16, fromUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
 import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
          JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
@@ -616,7 +616,8 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       for (i32 i = 0; i < rows.len(); i++) {
         Value it = rows.get(i)[0];
         if (isNull(it)) { sawNull = true; continue; }
-        Value[] ab = comparable(v, nodeAff(e), it, AFF_NONE);
+        // The subquery's column has its own affinity (a column with no type has BLOB's), unlike a list.
+        Value[] ab = comparable(v, nodeAff(e), it, sub.results.len() > 0 ? nodeAff(sub.results[0]) : AFF_NONE);
         i32 coll = cmpColl(e, sub.results.len() > 0 ? sub.results[0] : Node.NLit(Value.Null));
         if (compareColl(ab[0], ab[1], coll) == 0) { return Result.Ok(boolValue(!neg)); }
       }
@@ -728,7 +729,7 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
         bool unknown = false;
         for (i32 i = 0; i < es.len() && equal; i++) {
           if (isNull(vs[i]) || isNull(row[i])) { unknown = true; continue; }
-          Value[] ab = comparable(vs[i], nodeAff(es[i]), row[i], AFF_NONE);
+          Value[] ab = comparable(vs[i], nodeAff(es[i]), row[i], i < sub.results.len() ? nodeAff(sub.results[i]) : AFF_NONE);
           i32 coll = cmpColl(es[i], i < sub.results.len() ? sub.results[i] : Node.NLit(Value.Null));
           if (compareColl(ab[0], ab[1], coll) != 0) { equal = false; }
         }
@@ -820,6 +821,8 @@ i32 planRefs(const SelectPlan p, i32 depth) {
     if (p.srcs[i].call is not null) {
       const Node[] args = p.srcs[i].call!.args;
       for (i32 k = 0; k < args.len(); k++) { m = m | refs(args[k], depth); }
+      // A subquery in FROM sees from where this query does, a level the same as this one's.
+      if (p.srcs[i].call!.sub is not null) { m = m | planRefs(p.srcs[i].call!.sub!, depth); }
     }
   }
   if (p.having is not null) { m = m | refs(p.having!, depth); }
@@ -1114,9 +1117,15 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
       const Source f = s.from[i];
       if (f.sub is not null) {
         SelectPlan sp = try planSelect(f.sub!, outer, x);
-        Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
         string nm = f.alias ?? "subquery_\{i}";
-        srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true, string[](), null));
+        if (dependsOnOuter(sp)) {
+          // It reads an enclosing query's row, so it is made again for each.
+          Table empty = tableOfRows(nm, sp.names, Vec.create());
+          srcs.push(BoundSource(lower(nm), empty, f.join, null, true, string[](), TableFn("subquery", Node[](), sp.names.len(), sp)));
+        } else {
+          Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
+          srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true, string[](), null));
+        }
       } else if (f.args is not null || isPragmaTable(f.table!, x)) {
         string tvf = lower(f.table!);
         string[] colNames = string[].filled(JSON_EACH_COLS.len(), "");
@@ -1139,7 +1148,7 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
         Column[] cols = Column[].filled(colNames.len(), Column("", "", 0, false, null, 0, null, false, "", -1));
         for (i32 c = 0; c < cols.len(); c++) { cols[c] = Column(colNames[c], "", 0, false, null, 0, null, false, "", -1); }
         Table t = Table(tvf, "", cols, -1, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "", -1);
-        srcs.push(BoundSource(lower(f.alias ?? tvf), t, f.join, null, true, string[](), TableFn(tvf, Node[](), visible)));
+        srcs.push(BoundSource(lower(f.alias ?? tvf), t, f.join, null, true, string[](), TableFn(tvf, Node[](), visible, null)));
       } else {
         Named nt = try resolveTable(f.table!, x);
         srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived, string[](), null));
@@ -1237,6 +1246,12 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
     p.next = np;
   }
   try planOrder(p, s, outer, x);
+  if (p.aggregate && p.groupBy.len() > 0 && p.aggs.len() == 1 && p.aggs.get(0).kind == AGG_MINMAX) {
+    p.keyed = true;
+    for (i32 i = 0; i < p.results.len(); i++) { p.results[i] = keyed(p.results[i], p.groupBy, 1); }
+    if (p.having is not null) { p.having = keyed(p.having!, p.groupBy, 1); }
+    for (i32 i = 0; i < p.order.len(); i++) { p.order[i] = keyed(p.order[i], p.groupBy, 1); }
+  }
   Scope none = Scope(BoundSource[](), outer, null, false);
   if (s.limit is not null) { p.limit = try bindExpr(s.limit!, none, x); }
   if (s.offset is not null) { p.offset = try bindExpr(s.offset!, none, x); }
@@ -1939,7 +1954,10 @@ bool isPragmaTable(string name, Exec x) {
 Result<void, SqlError> fillCall(BoundSource src, Ctx c, Exec x) {
   TableFn f = src.call!;
   Vec<Value[]> made;
-  if (f.name.indexOf("pragma_") == 0) {
+  if (f.sub is not null) {
+    // Its outer scope is this query's: it runs in the context this query's row is in.
+    made = try runPlan(f.sub!, c.outer ?? topCtx(x), x);
+  } else if (f.name.indexOf("pragma_") == 0) {
     // A pragma's rows, each with the argument it was given and the schema.
     Value arg = f.args.len() > 0 ? try eval(f.args[0], c, x) : Value.Null;
     Rows? r = pragmaRows(f.name.slice(7, f.name.len()), x.db, isNull(arg) ? "" : textOf(arg));
@@ -2141,8 +2159,10 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
     }
     for (i32 gi = 0; gi < sink.groups.len(); gi++) {
       Group g = sink.groups.get(gi);
-      Value[] aggs = Value[].filled(p.aggs.len(), Value.Null);
-      for (i32 i = 0; i < aggs.len(); i++) { aggs[i] = try finish(p.aggs.get(i), g.states[i]); }
+      i32 nk = p.keyed ? p.groupBy.len() : 0;
+      Value[] aggs = Value[].filled(p.aggs.len() + nk, Value.Null);
+      for (i32 i = 0; i < p.aggs.len(); i++) { aggs[i] = try finish(p.aggs.get(i), g.states[i]); }
+      for (i32 i = 0; i < nk; i++) { aggs[p.aggs.len() + i] = sink.groupKeys.get(gi)[i]; }
       Ctx gc = Ctx(g.rep, outer, aggs, null, null);
       if (p.having is not null && truth(try eval(p.having!, gc, x)) != 1) { continue; }
       if (p.wins.len() > 0) { sink.pend.push(gc); continue; }
@@ -2582,5 +2602,62 @@ void sortReals(f64[] a) {
     }
     a.copyFrom(tmp, 0, 0, a.len());
     width *= 2;
+  }
+}
+
+// ── GROUP BY terms in the output ───────────────────────────────────────────
+
+// Whether two bound expressions are the same expression.
+bool sameNode(const Node a, const Node b) {
+  match (a) {
+    NCol(d, s, c, aff, coll): { match (b) { NCol(d2, s2, c2, aff2, coll2): { return d == d2 && s == s2 && c == c2; } default: { return false; } } }
+    NLit(v): { match (b) { NLit(v2): { return sameValue(v, v2); } default: { return false; } } }
+    NParam(n): { match (b) { NParam(n2): { return n == n2; } default: { return false; } } }
+    NUnary(op, e): { match (b) { NUnary(op2, e2): { return op == op2 && sameNode(e, e2); } default: { return false; } } }
+    NArith(op, l, r): { match (b) { NArith(op2, l2, r2): { return op == op2 && sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NBits(op, l, r): { match (b) { NBits(op2, l2, r2): { return op == op2 && sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NConcat(l, r): { match (b) { NConcat(l2, r2): { return sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NCompare(op, l, r): { match (b) { NCompare(op2, l2, r2): { return op == op2 && sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NCast(e, aff): { match (b) { NCast(e2, aff2): { return aff == aff2 && sameNode(e, e2); } default: { return false; } } }
+    NCollate(e, coll): { match (b) { NCollate(e2, coll2): { return coll == coll2 && sameNode(e, e2); } default: { return false; } } }
+    NIsNull(e, neg): { match (b) { NIsNull(e2, neg2): { return neg == neg2 && sameNode(e, e2); } default: { return false; } } }
+    NCall(name, fid, args, js): {
+      match (b) {
+        NCall(name2, fid2, args2, js2): {
+          if (name != name2 || args.len() != args2.len()) { return false; }
+          for (i32 i = 0; i < args.len(); i++) { if (!sameNode(args[i], args2[i])) { return false; } }
+          return true;
+        }
+        default: { return false; }
+      }
+    }
+    default: { return false; }
+  }
+}
+
+// An expression with each GROUP BY term in it read from the group's key (NAgg slot base + i). A term
+// that is a bare column is not: SQLite reads columns from the min() or max() row, keys or not.
+Node keyed(const Node n, const Node[] keys, i32 base) {
+  for (i32 i = 0; i < keys.len(); i++) {
+    bool column = match (keys[i]) { NCol: true, default: false };
+    if (!column && sameNode(n, keys[i])) { return Node.NAgg(base + i); }
+  }
+  match (n) {
+    NUnary(op, e): { return Node.NUnary(op, keyed(e, keys, base)); }
+    NArith(op, l, r): { return Node.NArith(op, keyed(l, keys, base), keyed(r, keys, base)); }
+    NBits(op, l, r): { return Node.NBits(op, keyed(l, keys, base), keyed(r, keys, base)); }
+    NConcat(l, r): { return Node.NConcat(keyed(l, keys, base), keyed(r, keys, base)); }
+    NCompare(op, l, r): { return Node.NCompare(op, keyed(l, keys, base), keyed(r, keys, base)); }
+    NAnd(l, r): { return Node.NAnd(keyed(l, keys, base), keyed(r, keys, base)); }
+    NOr(l, r): { return Node.NOr(keyed(l, keys, base), keyed(r, keys, base)); }
+    NNot(e): { return Node.NNot(keyed(e, keys, base)); }
+    NCast(e, aff): { return Node.NCast(keyed(e, keys, base), aff); }
+    NIsNull(e, neg): { return Node.NIsNull(keyed(e, keys, base), neg); }
+    NCall(name, fid, args, js): {
+      Node[] a = Node[].filled(args.len(), Node.NLit(Value.Null));
+      for (i32 i = 0; i < args.len(); i++) { a[i] = keyed(args[i], keys, base); }
+      return Node.NCall(name, fid, a, js as bool[]);
+    }
+    default: { return n as Node; }
   }
 }

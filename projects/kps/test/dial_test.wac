@@ -1,5 +1,5 @@
-// The native dialer, judged against every listener there is: `@kpstreams/server` (libdatachannel — libjuice ICE,
-// OpenSSL DTLS, usrsctp), Go's `kps-server` (pion), and wac-kps's own.
+// The native dialers, WebRTC and QUIC, judged against every listener there is: `@kpstreams/server` (libdatachannel —
+// libjuice ICE, OpenSSL DTLS, usrsctp — and quiche for QUIC), Go's `kps-server` (pion, quic-go), and wac-kps's own.
 //
 //     wac test --allow-read --allow-write --allow-run --allow-net test/dial_test.wac
 //
@@ -37,8 +37,11 @@ struct Run {
   string out;
 }
 
-Run dialled(Procs procs, string addr) {
-  Exec e = sh(procs, "timeout 240 wac .tmp/dialtest/dial.wasm '\{addr}' 2>&1");
+Run dialled(Procs procs, string addr) { return dialledOver(procs, "", addr); }
+
+/** The same over a transport: "" for WebRTC, "quic" for QUIC. */
+Run dialledOver(Procs procs, string transport, string addr) {
+  Exec e = sh(procs, "timeout 240 wac .tmp/dialtest/dial.wasm \{transport} '\{addr}' 2>&1");
   string out = string.fromBytes(e.stdout);
   Vec<string> passed = Vec<string>.create();
   Vec<string> failed = Vec<string>.create();
@@ -65,6 +68,11 @@ export string test_the_native_dialer_against_libdatachannel_pion_and_wac(Sys sys
   if (js.len() > 0) {
     Run r = dialled(procs, js);
     c.ok(r.done && r.failed.len() == 0 && r.passed.len() == 8, "@kpstreams/server: every scenario passes: \{r.out}");
+    // Over QUIC (quiche, which answers the first Initial with a Retry). Its QUIC streams reset with code 0 whatever
+    // the reason (`@infisical/quic`'s default `reasonToCode`), so the echo's reset comes back as `reset`.
+    Run q = dialledOver(procs, "quic", js);
+    c.ok(q.done && q.passed.len() == 7 && q.failed.len() == 1 && q.failed[0].indexOf("a reset reaches") == 0 &&
+         q.failed[0].indexOf(": reset") > 0, "@kpstreams/server over QUIC: every scenario but the code its resets lose: \{q.out}");
   }
   sh(procs, "pkill -f 'js-echo-server.mjs .tmp/dialtest' || true");
 
@@ -73,6 +81,8 @@ export string test_the_native_dialer_against_libdatachannel_pion_and_wac(Sys sys
   if (wac.len() > 0) {
     Run r = dialled(procs, wac);
     c.ok(r.done && r.failed.len() == 0 && r.passed.len() == 8, "wac-kps: every scenario passes: \{r.out}");
+    Run q = dialledOver(procs, "quic", wac);
+    c.ok(q.done && q.failed.len() == 0 && q.passed.len() == 8, "wac-kps over QUIC: every scenario passes: \{q.out}");
     // The same listener under a certhash naming some other key: the handshake runs, the pin refuses it.
     string other = wac.slice(0, lastColon(wac) + 1) + js.slice(lastColon(js) + 1, js.len());
     if (js.len() > 0) {
@@ -94,6 +104,12 @@ export string test_the_native_dialer_against_libdatachannel_pion_and_wac(Sys sys
     c.ok(onlyTheTwo, "and only the two its example server does not serve fail: \{r.out}");
     Exec log = sh(procs, "grep -c 'stream reset (code 4)' .tmp/dialtest/go.log");
     c.eqStr(string.fromBytes(log.stdout), "1\n", "the reset reached pion with its code (4, timeout)");
+    // Over QUIC: quic-go, the same two scenarios its example server does not serve.
+    Run q = dialledOver(procs, "quic", go);
+    c.ok(q.done && q.passed.len() == 6 && q.failed.len() == 2 && q.failed[0].indexOf("datagrams cross") == 0 &&
+         q.failed[1].indexOf("a reset reaches") == 0, "quic-go: the stream scenarios pass: \{q.out}");
+    Exec qlog = sh(procs, "grep -c 'canceled by remote with error code 4' .tmp/dialtest/go.log");
+    c.eqStr(string.fromBytes(qlog.stdout), "1\n", "and the reset reached quic-go with its code");
   }
   sh(procs, "pkill -f 'kps-server -listen 127.0.0.1:41993' || true");
   return c.report();

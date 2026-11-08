@@ -24,7 +24,7 @@ repository is the KPS layer: addresses and pinning, the WebRTC stream framing an
 | the listener, WebRTC | **done**: Chromium running `@kpstreams/webrtc-client` passes as many scenarios against it as against `@kpstreams/server`, and Go's pion client echoes, crosses the window, and closes with a code (`test/listener_test.wac`) |
 | the dialer from a page | **done**: a page built with `--grant webrtc` drives the browser's own RTCPeerConnection through wac-web's `wac.webrtc` and runs the same scenarios, 8 of 8, against `@kpstreams/server` and the wac listener (`src/webrtc/page.wac`, `test/page_test.wac`) |
 | the native WebRTC dialer | **done**: wac's own ICE (controlling), DTLS client and SCTP initiator, upstream in wac's `webrtc` package; the same scenarios pass against `@kpstreams/server` (libdatachannel), the wac listener, and Go's `kps-server` (pion) as far as its example server serves them, and a certhash naming another key is not dialled (`src/webrtc/dial.wac`, `test/dial_test.wac`) |
-| QUIC: the dialer, and the listener's QUIC path | next |
+| QUIC: the dialer, and the listener's QUIC path | **done**, on wac's new QUIC endpoint (`packages/quic/src/endpoint.wac`): the listener takes QUIC on the WebRTC port under the same certhash, and Go's quic-go client echoes, crosses the window, sends a datagram and closes with a code against it; the QUIC dialer passes every scenario against the wac listener, every one quic-go's and quiche's example servers serve, and follows quiche's Retry (`src/quic/`, `test/dial_test.wac`, `test/listener_test.wac`) |
 
 ## Running it
 
@@ -38,4 +38,4 @@ During development the transport work is in a local wac checkout, and the page c
 
 A page that dials: `wac run --allow-read --allow-write --allow-run <wac-web>/tools/build.wac cmd/dialpage.wac <dir>
 --grant webrtc`, then open `<dir>/index.html#<address>` — or `node interop/js/page-dial.mjs <dir> <address>` to run it
-in Chromium and print what it reports. Natively: `wac run --allow-net cmd/dial.wac <address>`.
+in Chromium and print what it reports. Natively: `wac run --allow-net cmd/dial.wac [quic] <address>`.

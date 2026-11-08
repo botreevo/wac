@@ -7,13 +7,13 @@ import { Value, compareValues, compareColl, sameValue, collationId } from "./val
 import { CreateTrigger, Expr, Stmt, Select, Source, ResultCol, Insert, Update, Delete, Upsert, Assign, CreateTable,
          CreateIndex, ColumnDef, JOIN_FIRST, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 import { parseOne, Parsed, isBlank } from "./parser.wac";
-import { Table, Row, Index, Entry, Column, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_INTEGER } from "./schema.wac";
+import { Table, Row, Index, Entry, Column, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_INTEGER, AFF_TEXT, AFF_NUMERIC, AFF_REAL } from "./schema.wac";
 import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
-import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable, ROWID_INTERNAL } from "./query.wac";
-import { applyAffinity, isNull, textOf } from "./ops.wac";
+import { Exec, Scope, Ctx, Named, topCtx, fillGenerated, bindExpr, eval, planSelect, runPlan, query, pushCtes, popCtes, resolveTable, ROWID_INTERNAL, nodeAff } from "./query.wac";
+import { applyAffinity, isNull, textOf, AFF_NONE } from "./ops.wac";
 import { FnEnv } from "./functions.wac";
-import { lower } from "./lexer.wac";
+import { lower, upper } from "./lexer.wac";
 import { renameTable, mentionsTable, renameColumnInTable, renameColumnElsewhere, dropColumnText } from "./alter.wac";
 import { Chunked } from "./chunked.wac";
 
@@ -1282,6 +1282,7 @@ struct Statement {
   }
 
   Result<void, SqlError> createTable(this, CreateTable c) {
+    if (c.asSelect is not null && !this.nameTaken(c.name)) { return this.createTableAs(c); }
     if (this.nameTaken(c.name)) {
       if (c.ifNotExists && this.conn.db.table(c.name) is not null) { return Result.Ok(); }
       return Result.Err(err("\{this.conn.db.table(c.name) is not null ? "table" : "index"} \{c.name} already exists"));
@@ -1303,6 +1304,43 @@ struct Statement {
                         Expr[](), ForeignKey[](), i32[](), false, "", -1);
       d.tables.set("sqlite_sequence", seq);
       d.order.push(SchemaEntry("table", "sqlite_sequence", "sqlite_sequence"));
+    }
+    return Result.Ok();
+  }
+
+  // CREATE TABLE … AS SELECT: a table with the query's columns, typed by their affinity, made from the
+  // CREATE TABLE text SQLite would write for it, then filled with the query's rows.
+  Result<void, SqlError> createTableAs(this, CreateTable c) {
+    SelectPlan sp = try planSelect(c.asSelect!, null, this.x);
+    Vec<Value[]> rows = try runPlan(sp, topCtx(this.x), this.x);
+    // A column the query reads as it is takes the table's own spelling of its name.
+    string[] given = string[].filled(sp.names.len(), "");
+    for (i32 i = 0; i < given.len(); i++) {
+      given[i] = sp.names[i];
+      if (i >= sp.results.len()) { continue; }
+      match (sp.results[i]) {
+        NCol(d, s, col, aff, coll): {
+          if (d == 0 && col >= 0 && s < sp.srcs.len() && lower(sp.srcs[s].table.cols[col].name) == lower(given[i])) {
+            given[i] = sp.srcs[s].table.cols[col].name;
+          }
+        }
+        default: {}
+      }
+    }
+    string[] names = distinctNames(given);
+    i32[] affs = i32[].filled(names.len(), AFF_NONE);
+    for (i32 i = 0; i < names.len() && i < sp.results.len(); i++) { affs[i] = nodeAff(sp.results[i]); }
+    string sql = createTableText(c.name, names, affs);
+    match ((try parseOne(sql)).stmt) {
+      CreateTableStmt(def): { try this.createTable(def); }
+      default: { return Result.Err(err("malformed CREATE TABLE … AS SELECT")); }
+    }
+    Table t = this.conn.db.table(c.name)!;
+    for (i32 i = 0; i < rows.len(); i++) {
+      Value[] src = rows.get(i);
+      Value[] vals = Value[].filled(t.cols.len(), Value.Null);
+      for (i32 k = 0; k < vals.len() && k < src.len(); k++) { vals[k] = applyAffinity(src[k], t.cols[k].affinity); }
+      this.insertRow(t, Row((i + 1) as i64, vals, null));
     }
     return Result.Ok();
   }
@@ -1816,3 +1854,81 @@ Upsert? matchUpsert(Upsert[] ups, Table t, Conflict c) {
   }
   return null;
 }
+
+// ── CREATE TABLE … AS SELECT ─────────────────────────────────────────────────
+
+// Column names made distinct as SQLite makes them: a repeated name gets ":1", ":2", ….
+string[] distinctNames(const string[] names) {
+  Vec<string> out;
+  for (i32 i = 0; i < names.len(); i++) {
+    string base = names[i];
+    string n = base;
+    i32 cnt = 0;
+    while (true) {
+      bool taken = false;
+      for (i32 k = 0; k < out.len(); k++) { if (lower(out.get(k)) == lower(n)) { taken = true; } }
+      if (!taken) { break; }
+      cnt++;
+      n = base + ":" + "\{cnt}";
+    }
+    out.push(n);
+  }
+  return out.toArray();
+}
+
+// SQLite's text for a table it makes from a query (build.c's createTableStmt): each column with only its
+// affinity's type, on one line when the names are short and one per line when not.
+string createTableText(string name, const string[] cols, const i32[] affs) {
+  i32 n = identLength(name);
+  for (string c in cols) { n += identLength(c) + 5; }
+  string sep = n < 50 ? "" : "\n  ";
+  string sep2 = n < 50 ? "," : ",\n  ";
+  string end = n < 50 ? ")" : "\n)";
+  string out = "CREATE TABLE " + identText(name) + "(";
+  for (i32 i = 0; i < cols.len(); i++) {
+    out += sep + identText(cols[i]);
+    sep = sep2;
+    i32 a = affs[i];
+    out += a == AFF_TEXT ? " TEXT" : (a == AFF_NUMERIC ? " NUM" : (a == AFF_INTEGER ? " INT" : (a == AFF_REAL ? " REAL" : "")));
+  }
+  return out + end;
+}
+
+i32 identLength(string z) {
+  i32 n = 0;
+  for (u8 b in z.toBytes()) { n += b == '"' ? 2 : 1; }
+  return n + 2;
+}
+
+// A name as SQLite writes it: bare when it is a plain identifier and not a keyword, quoted otherwise.
+string identText(string z) {
+  u8[] b = z.toBytes();
+  bool plain = b.len() > 0 && !(b[0] >= '0' && b[0] <= '9');
+  for (u8 c in b) {
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) { plain = false; }
+  }
+  if (plain) {
+    string u = upper(z);
+    for (string k in SQL_KEYWORDS) { if (k == u) { plain = false; } }
+  }
+  if (plain) { return z; }
+  string out = "\"";
+  for (i32 i = 0; i < b.len(); i++) { out += b[i] == '"' ? "\"\"" : z.slice(i, i + 1); }
+  return out + "\"";
+}
+
+// Every word SQLite's tokenizer knows as a keyword.
+static string[] SQL_KEYWORDS = ["ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ALWAYS", "ANALYZE", "AND", "AS",
+  "ASC", "ATTACH", "AUTOINCREMENT", "BEFORE", "BEGIN", "BETWEEN", "BY", "CASCADE", "CASE", "CAST", "CHECK",
+  "COLLATE", "COLUMN", "COMMIT", "CONFLICT", "CONSTRAINT", "CREATE", "CROSS", "CURRENT", "CURRENT_DATE",
+  "CURRENT_TIME", "CURRENT_TIMESTAMP", "DATABASE", "DEFAULT", "DEFERRABLE", "DEFERRED", "DELETE", "DESC",
+  "DETACH", "DISTINCT", "DO", "DROP", "EACH", "ELSE", "END", "ESCAPE", "EXCEPT", "EXCLUDE", "EXCLUSIVE",
+  "EXISTS", "EXPLAIN", "FAIL", "FILTER", "FIRST", "FOLLOWING", "FOR", "FOREIGN", "FROM", "FULL", "GENERATED",
+  "GLOB", "GROUP", "GROUPS", "HAVING", "IF", "IGNORE", "IMMEDIATE", "IN", "INDEX", "INDEXED", "INITIALLY",
+  "INNER", "INSERT", "INSTEAD", "INTERSECT", "INTO", "IS", "ISNULL", "JOIN", "KEY", "LAST", "LEFT", "LIKE",
+  "LIMIT", "MATCH", "MATERIALIZED", "NATURAL", "NO", "NOT", "NOTHING", "NOTNULL", "NULL", "NULLS", "OF",
+  "OFFSET", "ON", "OR", "ORDER", "OTHERS", "OUTER", "OVER", "PARTITION", "PLAN", "PRAGMA", "PRECEDING",
+  "PRIMARY", "QUERY", "RAISE", "RANGE", "RECURSIVE", "REFERENCES", "REGEXP", "REINDEX", "RELEASE", "RENAME",
+  "REPLACE", "RESTRICT", "RETURNING", "RIGHT", "ROLLBACK", "ROW", "ROWS", "SAVEPOINT", "SELECT", "SET", "TABLE",
+  "TEMP", "TEMPORARY", "THEN", "TIES", "TO", "TRANSACTION", "TRIGGER", "UNBOUNDED", "UNION", "UNIQUE", "UPDATE",
+  "USING", "VACUUM", "VALUES", "VIEW", "VIRTUAL", "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT"];

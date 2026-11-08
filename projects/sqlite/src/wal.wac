@@ -7,6 +7,8 @@
 // it, agrees; and only frames up to the last commit frame (one that records the database's size) are
 // part of the database. Later frames belong to a transaction that never committed.
 
+import { Map, hashI64, i64Eq } from "core";
+
 i64 word(const u8[] b, i32 at, bool bigEndian) {
   if (bigEndian) {
     return ((b[at] as i64) << 24) | ((b[at + 1] as i64) << 16) | ((b[at + 2] as i64) << 8) | (b[at + 3] as i64);
@@ -26,6 +28,70 @@ i64[] checksum(const u8[] b, i32 from, i32 n, bool bigEndian, i64 s0in, i64 s1in
     s1 = (s1 + word(b, i + 4, bigEndian) + s0) & mask;
   }
   return [s0, s1];
+}
+
+// The committed pages a log holds, the latest of each, and the database's size in pages as its last
+// commit records it. Null when the log holds no committed frame (or is not a log), so the file alone is
+// the database.
+export WalPages? walPages(const u8[] wal) {
+  WalScan? sc = scanWal(wal);
+  if (sc is null) { return null; }
+  Map<i64, u8[]> pages = Map.create(hashI64, i64Eq);
+  i32 ps = sc!.pageSize;
+  for (i32 f = 32; f < sc!.committedEnd; f += 24 + ps) {
+    i64 page = be(wal, f);
+    if (page < 1 || page > sc!.dbPages) { continue; }
+    u8[] p = u8[].filled(ps, 0);
+    p.copyFrom(wal, f + 24, 0, ps);
+    pages.set(page, p);
+  }
+  return WalPages(ps, sc!.dbPages, pages);
+}
+
+export struct WalPages {
+  i32 pageSize;
+  i64 dbPages;
+  Map<i64, u8[]> pages;
+}
+
+struct WalScan {
+  i32 pageSize;
+  i32 committedEnd;
+  i64 dbPages;
+}
+
+// How far a log's valid, committed frames reach.
+WalScan? scanWal(const u8[] wal) {
+  if (wal.len() < 32) { return null; }
+  i64 magic = be(wal, 0);
+  if (magic != 0x377f0682 && magic != 0x377f0683) { return null; }
+  bool bigEndian = magic == 0x377f0683;
+  i64 pageSize = be(wal, 8);
+  if (pageSize == 1) { pageSize = 65536; }
+  if (pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) != 0) { return null; }
+  i32 ps = pageSize as! i32;
+  i64[] sum = checksum(wal, 0, 24, bigEndian, 0, 0);
+  if (sum[0] != be(wal, 24) || sum[1] != be(wal, 28)) { return null; }
+  i64 salt1 = be(wal, 16);
+  i64 salt2 = be(wal, 20);
+  i32 frame = 24 + ps;
+  i32 at = 32;
+  i32 committedEnd = 32;
+  i64 dbPages = 0;
+  while (at + frame <= wal.len()) {
+    if (be(wal, at + 8) != salt1 || be(wal, at + 12) != salt2) { break; }
+    sum = checksum(wal, at, 8, bigEndian, sum[0], sum[1]);
+    sum = checksum(wal, at + 24, ps, bigEndian, sum[0], sum[1]);
+    if (sum[0] != be(wal, at + 16) || sum[1] != be(wal, at + 20)) { break; }
+    i64 commit = be(wal, at + 4);
+    at += frame;
+    if (commit != 0) {
+      committedEnd = at;
+      dbPages = commit;
+    }
+  }
+  if (committedEnd == 32) { return null; }
+  return WalScan(ps, committedEnd, dbPages);
 }
 
 // The database as the log leaves it: `main` with every committed frame's page in place, sized as the

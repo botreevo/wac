@@ -3,7 +3,9 @@
 # row-by-row comparison with what SQLite itself produces from the same input.
 #
 #   - each fixture in test/data, read and written back;
-#   - each corpus script in test/corpus, run into a file here and by SQLite into another.
+#   - each corpus script in test/corpus, run into a file here and by SQLite into another;
+#   - the files test/paging_test.wac leaves (run `wac task test` first), and the journal of a commit it
+#     stopped before its commit point, which SQLite must play back.
 set -eu
 mkdir -p dist
 status=0
@@ -24,4 +26,5 @@ for f in test/corpus/*.sql; do
   python3 tools/script_db.py "$f" "dist/$name.ref.db"
   python3 tools/verify.py "dist/$name.ref.db" "dist/$name.db" || status=1
 done
+python3 tools/journal_check.py || status=1
 exit $status

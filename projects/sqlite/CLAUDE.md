@@ -13,8 +13,13 @@ README.md says what this is and where it stands; read it first.
 - **Python's sqlite3 cannot decode every answer**: text SQLite builds from surrogates, or cuts mid
   character (a byte precision in printf), comes back as an error in the `.out` files. Keep the fuzzers
   and scripts away from those rather than imitating the error.
-- **wac is pinned by the `wac` you build**: this was written against wac `701028301`. When wac gets in the
-  way, write it down in `docs/wac-asks.md` with a reproduction and work around it here.
+- **wac is pinned by the `wac` you build**: this needs `Files.openRandom`, which is on wac's
+  `random-access-files` branch (git.voltrevo.com/wac) until it reaches master; build wac from there
+  (`./bootstrap.sh --host nodejs -o <path>`). When wac gets in the way, write it down in
+  `docs/wac-asks.md` with a reproduction and work around it here.
+- **The database is its pages.** Tables and indexes are b-trees on a pager (src/pager.wac,
+  src/btree.wac); `tools/btreefuzz.wac` + `tools/btreecheck.py` check the b-trees alone, and
+  `test/paging_test.wac` + `tools/journal_check.py` (run by verify.sh) the file layer and its journal.
 - Comments explain *why*, in full sentences, as wac's own do.
 - `const` in wac is deep and travels: a value read through a `const` reference cannot be stored in a
   plain one. Most structs here are passed without `const` for that reason.

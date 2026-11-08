@@ -140,6 +140,25 @@ Under flattening the two would arrive as one value, and nothing the caller wrote
 A slot a `pop` or `remove` vacates is cleared where it could hold a reference, so the `Vec` does not keep the removed
 value alive.
 
+## Sorting
+
+```wac
+// expect: sorted() = 12345
+import { Vec } from "core";
+export i32 sorted() {
+  Vec<i32> v = Vec<i32>.create();
+  v.push(3); v.push(1); v.push(5); v.push(2); v.push(4);
+  v.sort((i32 a, i32 b) => a - b);
+  i32 n = 0;
+  for (i32 i = 0; i < v.len(); i++) { n = n * 10 + v.get(i); }
+  return n;
+}
+```
+
+`[§wac-vec-sort-stable-q8n4c2w]` `v.sort(cmp)` orders the elements by `cmp`, which answers below zero when its first
+argument goes first, above zero when the second does, and zero when either may; elements `cmp` calls equal keep the
+order they had.
+
 ## Iterating
 
 A `Vec` can be walked with `for … in` ([25](../3-expressions/25-control-flow.md)):

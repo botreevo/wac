@@ -80,6 +80,7 @@ import { hashString, stringEq } from "core";
 | `hypothetical.wac` | `hypothetical<T>()`, an expression of any type for `typeof` to read, which traps if run |
 | `operators.wac`, `markup.wac` | `operators` and `markup`: the symbols operators and markup call (spec ch22, ch23) |
 | `math.wac` | `math`: `log`, `log2`, `log10`, `log1p`, `exp`, `expm1` and `pow`, ported from fdlibm (spec ch43) |
+| `strings.wac` | `strings`: `contains`, `startsWith`, `endsWith`, `indexOfFrom`, `lastIndexOf`, `split`, `join`, `replace`, `replaceFirst`, `trim`, `trimStart`, `trimEnd`, `toLower`, `toUpper` and `repeat`, on bytes (spec ch37) |
 
 This package exists because wac gained generics ([wac issue
 0034](../issues/lang/closed/0034-generics.md)). Before that a container could only be

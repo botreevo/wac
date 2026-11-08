@@ -55,6 +55,25 @@ export T hypothetical<T>() { trap; }
 `[§wac-hypothetical-irymyyf]` `hypothetical<T>()` has type `T` and traps when called. It exists to be written inside
 `typeof` ([30](../4-static/30-computed-types.md)), where it is checked and never run.
 
+## Text: `strings`
+
+`strings` is `core`'s namespace of text functions beyond a `string`'s own `len`, `slice`, `indexOf` and `+`:
+
+```wac
+// expect: words() = "b|c|a"
+// expect: tidy() = "hello, world"
+import { strings } from "core";
+export string words() { return strings.join(strings.split("a,b,c", ",").len() == 3 ? ["b", "c", "a"] : [""], "|"); }
+export string tidy() { return strings.toLower(strings.replace(strings.trim("  HELLO; WORLD \n"), ";", ",")); }
+```
+
+`[§wac-strings-bytes-k3w8q2n]` Every position `strings` answers or takes is a byte offset into the UTF-8 text, as
+`slice`'s and `indexOf`'s are; `split`, `replace` and the searches never cut a character, because valid UTF-8 cannot
+match inside one. `toLower` and `toUpper` change ASCII letters and leave every other byte as it was.
+
+`[§wac-strings-split-join-m5r2v8t]` `split(s, sep)` cuts `s` at every `sep` and keeps empty pieces, so a string with no
+`sep` is one piece and `join(split(s, sep), sep)` is `s`. An empty `sep` traps.
+
 ## Why these are in `core`
 
 A name belongs in `core` when the language needs one agreed declaration of it. A symbol is the strongest case: the

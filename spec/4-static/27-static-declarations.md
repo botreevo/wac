@@ -34,6 +34,11 @@ export i32 twoBlocks() { return TWO_BLOCKS; }
 export i32 squareOfEight() { return SIZE; }
 ```
 
+A module has no mutable state, and that is a decision rather than a gap: a static is computed once, at compile
+time, and is the same value in every call of every instance of the program, so nothing a function does can be seen
+by the next call except through what it was handed. State a program needs across calls — a database's text
+encoding, say — is a value passed to what reads it, or a field of a struct those functions are methods of.
+
 `[§wac-modconst-h3kq8wn]` A static declaration is its value wherever it is read: `BLOCK` reads as `64` and
 `TWO_BLOCKS` as `128`.
 

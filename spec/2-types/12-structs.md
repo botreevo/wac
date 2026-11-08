@@ -123,6 +123,10 @@ the same as `Point(3, 4)`.
 `[§wac-struct-named-defaults-y5em4qj]` Named construction may leave out a field that has a default, which
 it then takes; a field with no default must be named.
 
+Positional construction gives every field, defaults included, and that is deliberate: a call that reads in order
+is only unambiguous when it is complete. Named construction is how a struct's defaults are relied on, and a
+struct widely built positionally that gains a defaulted field is the case for moving those call sites to braces.
+
 A nullable field's default is `null`, so it may always be left out of braces. `null` is an ordinary
 positional argument:
 

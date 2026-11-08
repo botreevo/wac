@@ -1,6 +1,9 @@
 // Scalar SQL functions, LIKE and GLOB.
 
-import { Result, Buf, Vec } from "core";
+import { Result, Buf, Vec, math } from "core";
+import { dateFunction } from "./datetime.wac";
+import { sqlPrintf } from "./printf.wac";
+import { sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh } from "./mathfn.wac";
 import { SqlError } from "./error.wac";
 import { Value, compareValues } from "./value.wac";
 import { textOf, toNumeric, toInt, toReal, isNull, typeName, exactInt, wholeNumber, intPrefix } from "./ops.wac";
@@ -105,7 +108,26 @@ export bool globMatch(const i32[] p, i32 pi, const i32[] s, i32 si) {
 }
 
 // The functions that take any number of arguments, and the fixed arities of the rest; -1 is variadic.
+static string[] MATH1 = ["acos", "acosh", "asin", "asinh", "atan", "atanh", "ceil", "ceiling", "cos", "cosh", "degrees",
+                        "exp", "floor", "ln", "log10", "log2", "radians", "sin", "sinh", "sqrt", "tan", "tanh", "trunc"];
+
+bool isMath1(string name) {
+  for (string m in MATH1) { if (m == name) { return true; } }
+  return false;
+}
+
 export bool knownFunction(string name, i32 n) {
+  if (isMath1(name)) { return n == 1; }
+  if (name == "log") { return n == 1 || n == 2; }
+  if (name == "pow" || name == "power" || name == "atan2" || name == "mod") { return n == 2; }
+  if (name == "pi") { return n == 0; }
+  if (name == "date" || name == "time" || name == "datetime" || name == "julianday" || name == "unixepoch") { return n >= 0; }
+  if (name == "strftime") { return n >= 1; }
+  if (name == "timediff") { return n == 2; }
+  if (name == "concat") { return n >= 1; }
+  if (name == "concat_ws") { return n >= 2; }
+  if (name == "likely" || name == "unlikely") { return n == 1; }
+  if (name == "likelihood") { return n == 2; }
   if (name == "coalesce") { return n >= 2; }
   if (name == "max" || name == "min") { return n >= 1; }
   if (name == "json_extract" || name == "json_set" || name == "json_insert" || name == "json_replace") { return n >= 2; }
@@ -302,7 +324,94 @@ export i32 functionId(string name) {
   return -1;
 }
 
+// The functions outside callScalar's numbered table, by name.
+Result<Value, SqlError> callNamed(string name, const Value[] a, FnEnv env) {
+  if (name == "date" || name == "time" || name == "datetime" || name == "julianday" || name == "unixepoch" ||
+      name == "strftime" || name == "timediff") {
+    return Result.Ok(dateFunction(name, a, env.nowMillis));
+  }
+  if (name == "likely" || name == "unlikely" || name == "likelihood") { return Result.Ok(a[0] as Value); }
+  if (name == "concat" || name == "concat_ws") {
+    bool ws = name == "concat_ws";
+    if (ws && isNull(a[0])) { return Result.Ok(Value.Null); }
+    string sep = ws ? textOf(a[0]) : "";
+    Buf out = Buf.create();
+    bool first = true;
+    for (i32 i = ws ? 1 : 0; i < a.len(); i++) {
+      if (isNull(a[i])) { continue; }
+      if (!first) { out.pushStr(sep); }
+      out.pushStr(textOf(a[i]));
+      first = false;
+    }
+    return Result.Ok(Value.Text(out.toStr()));
+  }
+  if (name == "pi") { return Result.Ok(Value.Real(3.141592653589793)); }
+  // The math functions take numbers only: NULL, and text or blobs that are not numbers, give NULL, and
+  // so does an answer that is not a number.
+  Value[] nums = Value[].filled(a.len(), Value.Null);
+  for (i32 i = 0; i < a.len(); i++) {
+    match (a[i]) {
+      Int: { nums[i] = a[i] as Value; }
+      Real: { nums[i] = a[i] as Value; }
+      Text(t): { Value? w = wholeNumber(t); if (w is null) { return Result.Ok(Value.Null); } nums[i] = w!; }
+      default: { return Result.Ok(Value.Null); }
+    }
+  }
+  if (name == "ceil" || name == "ceiling" || name == "floor" || name == "trunc") {
+    match (nums[0]) {
+      Int: { return Result.Ok(nums[0]); }
+      default: {}
+    }
+    f64 r = toReal(nums[0]);
+    f64 v = name == "floor" ? r.floor() : (name == "trunc" ? r.trunc() : r.ceil());
+    return Result.Ok(Value.Real(v));
+  }
+  f64 x = toReal(nums[0]);
+  f64 r = 0.0;
+  if (name == "pow" || name == "power") { r = math.pow(x, toReal(nums[1])); }
+  else if (name == "atan2") { r = atan2(x, toReal(nums[1])); }
+  else if (name == "mod") {
+    f64 y = toReal(nums[1]);
+    if (y == 0.0) { return Result.Ok(Value.Null); }
+    r = x % y;
+  }
+  else if (name == "log") {
+    if (a.len() == 2) {
+      f64 b = x;
+      f64 v = toReal(nums[1]);
+      if (b <= 0.0 || b == 1.0 || v <= 0.0) { return Result.Ok(Value.Null); }
+      r = math.log(v) / math.log(b);
+    } else {
+      if (x <= 0.0) { return Result.Ok(Value.Null); }
+      r = math.log10(x);
+    }
+  }
+  else if (name == "ln") { if (x <= 0.0) { return Result.Ok(Value.Null); } r = math.log(x); }
+  else if (name == "log10") { if (x <= 0.0) { return Result.Ok(Value.Null); } r = math.log10(x); }
+  else if (name == "log2") { if (x <= 0.0) { return Result.Ok(Value.Null); } r = math.log2(x); }
+  else if (name == "exp") { r = math.exp(x); }
+  else if (name == "sqrt") { r = x.sqrt(); }
+  else if (name == "degrees") { r = x * (180.0 / 3.141592653589793); }
+  else if (name == "radians") { r = x * (3.141592653589793 / 180.0); }
+  else if (name == "sin") { r = sin(x); }
+  else if (name == "cos") { r = cos(x); }
+  else if (name == "tan") { r = tan(x); }
+  else if (name == "asin") { r = asin(x); }
+  else if (name == "acos") { r = acos(x); }
+  else if (name == "atan") { r = atan(x); }
+  else if (name == "sinh") { r = sinh(x); }
+  else if (name == "cosh") { r = cosh(x); }
+  else if (name == "tanh") { r = tanh(x); }
+  else if (name == "asinh") { r = asinh(x); }
+  else if (name == "acosh") { r = acosh(x); }
+  else if (name == "atanh") { r = atanh(x); }
+  else { return Result.Err(SqlError("error", "no such function: \{name}")); }
+  if (r != r) { return Result.Ok(Value.Null); }
+  return Result.Ok(Value.Real(r));
+}
+
 export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a, const bool[] isJson, FnEnv env) {
+  if (fid < 0) { return callNamed(name, a, env); }
   if (fid == F_COALESCE || fid == F_IFNULL) {
     for (i32 i = 0; i < a.len(); i++) { if (!isNull(a[i])) { return Result.Ok(a[i] as Value); } }
     return Result.Ok(Value.Null);
@@ -357,7 +466,10 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
     for (i32 i = 0; i < a.len(); i++) { out.pushCodepoint(toInt(a[i]) as~ i32); }
     return Result.Ok(Value.Text(out.toStr()));
   }
-  if (fid == F_PRINTF || fid == F_FORMAT) { return Result.Err(SqlError.unsupported("printf")); }
+  if (fid == F_PRINTF || fid == F_FORMAT) {
+    if (a.len() == 0 || isNull(a[0])) { return Result.Ok(Value.Null); }
+    return Result.Ok(Value.Text(sqlPrintf(textOf(a[0]), a, 1)));
+  }
   if (fid == F_QUOTE && isNull(a[0])) { return Result.Ok(Value.Text("NULL")); }
   if (fid == F_HEX && isNull(a[0])) { return Result.Ok(Value.Text("")); }
   if (fid == F_ZEROBLOB && isNull(a[0])) { return Result.Ok(Value.Blob(u8[]())); }

@@ -1,0 +1,260 @@
+// printf() and format(): SQLite's printf over SQL values, after its src/printf.c (public domain).
+
+import { Buf } from "core";
+import { Value } from "./value.wac";
+import { textOf, toReal, isNull, intPrefix } from "./ops.wac";
+import { fpDecode, FpDigits } from "./fp.wac";
+import { codepoints, fromCodepoints } from "./functions.wac";
+
+struct Flags {
+  bool left = false;
+  bool plus = false;
+  bool space = false;
+  bool alt = false;     // #
+  bool alt2 = false;    // !
+  bool zero = false;
+  bool comma = false;
+}
+
+string repeat(string c, i32 n) {
+  Buf b = Buf.create();
+  for (i32 i = 0; i < n; i++) { b.pushStr(c); }
+  return b.toStr();
+}
+
+string padTo(string s, i32 width, Flags f, string prefix) {
+  i32 len = codepoints(prefix + s).len();
+  if (len >= width) { return prefix + s; }
+  i32 n = width - len;
+  if (f.left) { return prefix + s + repeat(" ", n); }
+  if (f.zero) { return prefix + repeat("0", n) + s; }
+  return repeat(" ", n) + prefix + s;
+}
+
+string thousands(string digits) {
+  Buf b = Buf.create();
+  i32 n = digits.len();
+  for (i32 i = 0; i < n; i++) {
+    if (i > 0 && (n - i) % 3 == 0) { b.pushStr(","); }
+    b.pushStr(digits.slice(i, i + 1));
+  }
+  return b.toStr();
+}
+
+// %f, %e, %g and their capitals.
+string formatFloat(f64 v0, u8 conv, i32 precision0, Flags f) {
+  i32 precision = precision0 < 0 ? 6 : precision0;
+  string prefix = "";
+  f64 v = v0;
+  if (v < 0.0 || (v == 0.0 && f64.toBits(v) != f64.toBits(0.0))) { prefix = "-"; v = -v; }
+  else if (f.plus) { prefix = "+"; }
+  else if (f.space) { prefix = " "; }
+  if (v != v) { return padTo(f.zero ? "null" : "NaN", 0, f, ""); }
+  if (v == 1.0 / 0.0) { return padTo("Inf", 0, f, prefix == "-" ? "-" : (prefix == "+" ? "+" : "")); }
+  i32 xtype = conv == 'f' ? 0 : ((conv == 'e' || conv == 'E') ? 1 : 2);
+  i32 iRound = 0;
+  if (xtype == 0) { iRound = -precision; }
+  else if (xtype == 2) { if (precision == 0) { precision = 1; } iRound = precision; }
+  else { iRound = precision + 1; }
+  FpDigits s = v == 0.0 ? FpDigits("0", 1) : fpDecode(v, iRound, f.alt2 ? 20 : 16);
+  i32 exp = s.dp - 1;
+  bool rtz = false;
+  if (xtype == 2) {
+    precision--;
+    rtz = !f.alt;
+    if (exp < -4 || exp > precision) { xtype = 1; } else { precision = precision - exp; xtype = 0; }
+  } else {
+    rtz = f.alt2;
+  }
+  i32 e2 = xtype == 1 ? 0 : s.dp - 1;
+  bool dp = precision > 0 || f.alt || f.alt2;
+  Buf out = Buf.create();
+  i32 j = 0;
+  if (e2 < 0) { out.pushStr("0"); }
+  else {
+    j = e2 + 1;
+    if (j > s.digits.len()) { j = s.digits.len(); }
+    string intPart = s.digits.slice(0, j) + repeat("0", e2 + 1 - j);
+    out.pushStr(f.comma ? thousands(intPart) : intPart);
+  }
+  if (dp) { out.pushStr("."); }
+  if (e2 < -1 && precision > 0) {
+    i32 nn = -1 - e2;
+    if (nn > precision) { nn = precision; }
+    out.pushStr(repeat("0", nn));
+    precision -= nn;
+  }
+  if (precision > 0) {
+    i32 nn = s.digits.len() - j;
+    if (nn > precision) { nn = precision; }
+    if (nn > 0) { out.pushStr(s.digits.slice(j, j + nn)); precision -= nn; }
+    if (precision > 0 && !rtz) { out.pushStr(repeat("0", precision)); }
+  }
+  string body = out.toStr();
+  if (rtz && dp) {
+    i32 end = body.len();
+    while (end > 0 && body.slice(end - 1, end) == "0") { end--; }
+    body = body.slice(0, end);
+    if (body.slice(body.len() - 1, body.len()) == ".") {
+      body = f.alt2 ? body + "0" : body.slice(0, body.len() - 1);
+    }
+  }
+  if (xtype == 1) {
+    i32 ex = s.dp - 1;
+    body += (conv == 'E' || conv == 'G') ? "E" : "e";
+    if (ex < 0) { body += "-"; ex = -ex; } else { body += "+"; }
+    if (ex >= 100) { body += "\{ex / 100}"; ex = ex % 100; }
+    body += "\{ex / 10}\{ex % 10}";
+  }
+  return body;
+}
+
+export string sqlPrintf(string fmt, const Value[] args, i32 from) {
+  u8[] b = fmt.toBytes();
+  Buf out = Buf.create();
+  i32 ai = from;
+  i32 i = 0;
+  while (i < b.len()) {
+    if (b[i] != '%') {
+      i32 s = i;
+      while (i < b.len() && b[i] != '%') { i++; }
+      out.pushBytes(b, s, i - s);
+      continue;
+    }
+    i++;
+    if (i >= b.len()) { break; }
+    Flags f = Flags { };
+    while (i < b.len()) {
+      u8 c = b[i];
+      if (c == '-') { f.left = true; } else if (c == '+') { f.plus = true; } else if (c == ' ') { f.space = true; }
+      else if (c == '#') { f.alt = true; } else if (c == '!') { f.alt2 = true; } else if (c == '0') { f.zero = true; }
+      else if (c == ',') { f.comma = true; } else { break; }
+      i++;
+    }
+    i32 width = 0;
+    if (i < b.len() && b[i] == '*') {
+      i64 w = ai < args.len() ? intPrefix(args[ai]) : 0;
+      ai++;
+      if (w < 0) { f.left = true; w = -w; }
+      width = w > 100000000 ? 100000000 : w as! i32;
+      i++;
+    } else {
+      while (i < b.len() && b[i] >= '0' && b[i] <= '9') { width = width * 10 + (b[i] - '0') as i32; i++; }
+    }
+    i32 precision = -1;
+    if (i < b.len() && b[i] == '.') {
+      i++;
+      precision = 0;
+      if (i < b.len() && b[i] == '*') {
+        i64 pv = ai < args.len() ? intPrefix(args[ai]) : 0;
+        ai++;
+        precision = pv < 0 ? (pv == -9223372036854775807 - 1 ? -1 : (0 - pv) as! i32) : (pv > 100000000 ? 100000000 : pv as! i32);
+        i++;
+      } else {
+        while (i < b.len() && b[i] >= '0' && b[i] <= '9') { precision = precision * 10 + (b[i] - '0') as i32; i++; }
+      }
+    }
+    // Length modifiers mean nothing to SQL values.
+    while (i < b.len() && (b[i] == 'l' || b[i] == 'h')) { i++; }
+    if (i >= b.len()) { break; }
+    u8 conv = b[i];
+    i++;
+    if (conv == '%') { out.pushStr("%"); continue; }
+    Value arg = ai < args.len() ? args[ai] : Value.Null;
+    bool missing = ai >= args.len();
+    if (conv != 'n') { ai++; }
+    if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o' || conv == 'p') {
+      i64 v = missing ? 0 : intPrefix(arg);
+      string prefix = "";
+      u64 mag = v as@ u64;
+      if (conv == 'd' || conv == 'i') {
+        if (v < 0) { prefix = "-"; mag = (0 - v) as@ u64; }
+        else if (f.plus) { prefix = "+"; } else if (f.space) { prefix = " "; }
+      }
+      string digits = "";
+      if (conv == 'x' || conv == 'X' || conv == 'p') {
+        string cs = conv == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
+        do {
+          i32 d = (mag % 16) as! i32;
+          digits = cs.slice(d, d + 1) + digits;
+          mag = mag / 16;
+        } while (mag > 0);
+        if (f.alt && v != 0) { prefix = conv == 'X' ? "0X" : "0x"; }
+      } else if (conv == 'o') {
+        do {
+          digits = "\{mag % 8}" + digits;
+          mag = mag / 8;
+        } while (mag > 0);
+        if (f.alt && v != 0) { digits = "0" + digits; }
+      } else {
+        digits = "\{mag}";
+      }
+      i32 prec = precision;
+      if (f.zero && prec < width - prefix.len()) { prec = width - prefix.len(); }
+      if (prec > digits.len()) { digits = repeat("0", prec - digits.len()) + digits; }
+      if (f.comma && (conv == 'd' || conv == 'i' || conv == 'u')) { digits = thousands(digits); }
+      Flags nf = Flags { left: f.left };
+      out.pushStr(padTo(digits, width, nf, prefix));
+      continue;
+    }
+    if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G') {
+      f64 v = missing ? 0.0 : toReal(arg);
+      string s = formatFloat(v, conv, precision, f);
+      string prefix = "";
+      if (s.len() > 0 && (s.slice(0, 1) == "-" || s.slice(0, 1) == "+" || s.slice(0, 1) == " ")) {
+        prefix = s.slice(0, 1);
+        s = s.slice(1, s.len());
+      }
+      if (v < 0.0 || f64.toBits(v) == f64.toBits(-0.0)) { prefix = "-"; }
+      else if (f.plus) { prefix = "+"; } else if (f.space) { prefix = " "; }
+      out.pushStr(padTo(s, width, f, prefix));
+      continue;
+    }
+    if (conv == 'c') {
+      string t = missing ? "" : textOf(arg);
+      i32[] cps = codepoints(t);
+      string ch = cps.len() > 0 ? fromCodepoints(cps, 0, 1) : "";
+      i32 times = precision > 1 ? precision : 1;
+      Flags nf = Flags { left: f.left };
+      out.pushStr(padTo(repeat(ch, times), width, nf, ""));
+      continue;
+    }
+    if (conv == 's' || conv == 'z' || conv == 'q' || conv == 'Q' || conv == 'w') {
+      bool isNullArg = missing || isNull(arg);
+      string t = isNullArg ? "" : textOf(arg);
+      if (conv == 'q' || conv == 'Q' || conv == 'w') {
+        string quote = conv == 'w' ? "\"" : "'";
+        if (conv == 'Q' && isNullArg) { t = "NULL"; }
+        else {
+          if (conv == 'q' && isNullArg) { t = "(NULL)"; }
+          Buf e = Buf.create();
+          u8[] tb = t.toBytes();
+          for (i32 k = 0; k < tb.len(); k++) {
+            e.push(tb[k]);
+            if (tb[k] == quote.toBytes()[0]) { e.push(tb[k]); }
+          }
+          t = e.toStr();
+          if (conv == 'Q') { t = "'" + t + "'"; }
+        }
+      }
+      if (precision >= 0) {
+        // The precision counts characters with "!", bytes otherwise, as in SQLite.
+        if (f.alt2) {
+          i32[] cps = codepoints(t);
+          if (precision < cps.len()) { t = fromCodepoints(cps, 0, precision); }
+        } else if (precision < t.len()) {
+          u8[] tb = t.toBytes();
+          i32 cut = precision;
+          while (cut > 0 && (tb[cut] & 0xC0) == 0x80) { cut--; }
+          t = t.slice(0, cut);
+        }
+      }
+      Flags nf = Flags { left: f.left };
+      out.pushStr(padTo(t, width, nf, ""));
+      continue;
+    }
+    // An unknown conversion ends the output, as in SQLite.
+    break;
+  }
+  return out.toStr();
+}

@@ -608,6 +608,11 @@ struct HostState {
     /// Which socket each outstanding `receiveFrom` ticket is reading, so a dropped one knows where
     /// to put back an answer that arrived first.
     receiving: Arc<std::sync::Mutex<HashMap<i32, i32>>>,
+    /// The `receiveFrom` tickets waiting on each datagram socket, oldest first — and a socket's presence here says one
+    /// reader thread is serving it. **One reader per socket, not one per call**: a thread blocked in `recv_from` cannot
+    /// be unblocked by cancelling its ticket, and `clock().within(sock.receive(), 10)` on an idle socket left a blocked
+    /// thread and a descriptor behind every ten milliseconds — 440 a second, measured by wac-kps (`issues/system/0379d`).
+    rx_waiting: Arc<std::sync::Mutex<HashMap<i32, std::collections::VecDeque<i32>>>>,
     next_handle: i32,
     /// Standard output and standard error, once `closeOutput` has ended them: a write after it is refused.
     out_closed: [bool; 2],
@@ -1113,6 +1118,7 @@ fn run_as_with(m: &Manifest, wasm: &[u8], manifest_text: &str, as_child: AsChild
             reading: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             receiving: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rx_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             // Above `STDIN_HANDLE` and `PARENT_FS_HANDLE`: wac reserves those two numbers as
             // channels, and this counter used to collide with the second of them — 0148.
             next_handle: FIRST_FREE_HANDLE,
@@ -2781,33 +2787,65 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 r.lock().unwrap().insert(id, handle);
             }
             let registry = HOST.with(|h| h.borrow().as_ref().map(|st| st.receiving.clone()));
-            std::thread::spawn(move || {
-                // 65535 is the largest a UDP payload can be, so a buffer of it cannot truncate one.
-                // Truncation here would be silent and would look like a peer sending short datagrams.
-                let mut buf = vec![0u8; 65535];
-                let a = match sk.recv_from(&mut buf) {
-                    Ok((n, from)) => {
-                        buf.truncate(n);
-                        Answer::Datagram(buf, from.ip().to_string(), from.port() as i32, String::new())
+            let Some(waiting_map) = HOST.with(|h| h.borrow().as_ref().map(|st| st.rx_waiting.clone())) else {
+                return no_table();
+            };
+            // Joined to the socket's queue; a reader is started only when none is serving it.
+            let start = {
+                let mut m = waiting_map.lock().unwrap();
+                match m.get_mut(&handle) {
+                    Some(q) => { q.push_back(id); false }
+                    None => {
+                        let mut q = std::collections::VecDeque::new();
+                        q.push_back(id);
+                        m.insert(handle, q);
+                        true
                     }
-                    Err(e) => Answer::Datagram(Vec::new(), String::new(), 0, e.to_string()),
-                };
-                if let Some(unclaimed) = worker.complete(id, a) {
-                    // Nobody was waiting. A read error is nothing to keep — it describes a call that
-                    // no longer exists — but a datagram is a packet, and it waits for the next
-                    // reader on this socket.
-                    if let Answer::Datagram(ref bytes, _, _, ref err) = unclaimed {
+                }
+            };
+            if start {
+                std::thread::spawn(move || loop {
+                    // 65535 is the largest a UDP payload can be, so a buffer of it cannot truncate one.
+                    // Truncation here would be silent and would look like a peer sending short datagrams.
+                    let mut buf = vec![0u8; 65535];
+                    let (a, failed) = match sk.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            buf.truncate(n);
+                            (Answer::Datagram(buf, from.ip().to_string(), from.port() as i32, String::new()), false)
+                        }
+                        Err(e) => (Answer::Datagram(Vec::new(), String::new(), 0, e.to_string()), true),
+                    };
+                    // To the oldest ticket still waiting: one cancelled since it queued hands the answer back, and
+                    // the next is tried.
+                    let mut pending = Some(a);
+                    while pending.is_some() {
+                        let next = waiting_map.lock().unwrap().get_mut(&handle).and_then(|q| q.pop_front());
+                        let Some(tid) = next else { break };
+                        if let Some(r) = &registry { r.lock().unwrap().remove(&tid); }
+                        let ans = pending.take().unwrap();
+                        let again = if failed { ans.clone() } else { ans };
+                        if let Some(back) = worker.complete(tid, again) { pending = Some(back); }
+                        else if failed { pending = Some(Answer::Datagram(Vec::new(), String::new(), 0, "the socket failed".into())); }
+                    }
+                    // Nobody was waiting. A read error describes a call that no longer exists; a datagram is a
+                    // packet, and waits for the next reader on this socket.
+                    if let Some(Answer::Datagram(bytes, from, port, err)) = pending {
                         if err.is_empty() && !bytes.is_empty() {
-                            if let Some(q) = parked {
-                                q.lock().unwrap().entry(handle).or_default().push_back(unclaimed);
+                            if let Some(q) = &parked {
+                                q.lock().unwrap().entry(handle).or_default()
+                                    .push_back(Answer::Datagram(bytes, from, port, err));
                             }
                         }
                     }
-                }
-                if let Some(r) = registry {
-                    r.lock().unwrap().remove(&id);
-                }
-            });
+                    // **The reader ends when nobody waits**, or when the socket has failed; the next `receiveFrom`
+                    // starts another. Decided under the lock a caller joins the queue under, so none is stranded.
+                    let mut m = waiting_map.lock().unwrap();
+                    if failed || m.get(&handle).map_or(true, |q| q.is_empty()) {
+                        m.remove(&handle);
+                        break;
+                    }
+                });
+            }
             return Reply::Later(id);
         }
         Cap::SendTo => {

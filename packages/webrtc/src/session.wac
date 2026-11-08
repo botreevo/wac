@@ -23,8 +23,8 @@
 
 import { Map, Vec, hashI32, i32Eq } from "core";
 import { Association, SctpEvent } from "./association.wac";
-import { Consent, checkRejected, successFor } from "./ice.wac";
-import { Peer } from "./peer.wac";
+import { Consent, candidatePriority, checkFor, checkRejected, prefHost, successFor } from "./ice.wac";
+import { Dtls } from "./peer.wac";
 import { hexColons } from "./sdp.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { recordSize } from "./dtls.wac";
@@ -64,7 +64,7 @@ struct ChannelState {
 }
 
 export struct Session {
-  Peer peer;
+  Dtls peer;
   Association assoc;
   Consent consent;
   string ourUfrag;
@@ -91,8 +91,20 @@ export struct Session {
   Map<i32, ChannelState> channels = Map<i32, ChannelState>.create(hashI32, i32Eq);
   Vec<ChannelEvent> happened = Vec<ChannelEvent>.create();
   i32 checksAnswered = 0;
+  /**
+   * Whether this end is ICE's controlling agent: the one that sends checks and nominates (`connect`). A KPS dialer
+   * is, against a listener that is ICE-lite and only answers.
+   */
+  bool controlling = false;
+  /** Whether a check of ours has been answered, which is when the DTLS handshake starts. */
+  bool iceUp = false;
+  /** Our tie-breaker, and where our transaction ids come from: twelve bytes, a counter folded into the last four. */
+  u8[] tiebreaker = u8[]();
+  u8[] tidBase = u8[]();
+  i32 checksSent = 0;
+  i64 lastCheckAt = 0 as i64;
 
-  Session of(Peer peer, Association assoc, Consent consent, string ourUfrag, string ourPwd,
+  Session of(Dtls peer, Association assoc, Consent consent, string ourUfrag, string ourPwd,
              string theirUfrag, string theirPwd, string expectFingerprint) {
     return Session { peer: peer, assoc: assoc, consent: consent, ourUfrag: ourUfrag, ourPwd: ourPwd,
                      theirUfrag: theirUfrag, theirPwd: theirPwd, expectFingerprint: expectFingerprint,
@@ -128,6 +140,8 @@ export struct Session {
     // **Nothing crosses until the peer is the one the SDP named.** The handshake may run — refusing it is
     // `Peer`'s job — but application data is where a wrong peer would actually get something.
     if (!this.peerIsExpected()) { return out.toArray(); }
+    // The end that started DTLS starts SCTP: `start` sends the INIT once and does nothing after.
+    if (this.assoc.initiator) { this.assoc.start(now); }
     i32 at = 0;
     while (recordSize(datagram, at) > 0) {
       u8[] sctp = this.peer.application(datagram, at);
@@ -147,13 +161,52 @@ export struct Session {
       out[0] = successFor(transactionOf(datagram), this.ourPwd.toBytes(), fromIp.len() == 16 ? 2 : 1, fromIp, fromPort);
       return out;
     }
-    this.consent.answered(datagram, this.theirPwd.toBytes(), now);
+    if (this.consent.answered(datagram, this.theirPwd.toBytes(), now) && this.controlling && !this.iceUp) {
+      // **The pair works**: our check, nominating it, came back authenticated. DTLS goes now, on it.
+      this.iceUp = true;
+      return this.peer.begin(now);
+    }
     return u8[][]();
+  }
+
+  /**
+   * Become the controlling agent and send the first check, nominating the one pair there is (aggressive nomination:
+   * a KPS dialer has one address for the listener and one socket). `seed` is twenty random bytes — eight of
+   * tie-breaker, twelve of transaction id. Checks repeat from `tick` until one is answered, and then every
+   * consent interval (RFC 7675) for as long as the session lives.
+   */
+  u8[][] connect(this, u8[] seed, i64 now) {
+    this.controlling = true;
+    this.tiebreaker = u8[].filled(8, 0);
+    this.tiebreaker.copyFrom(seed, 0, 0, 8);
+    this.tidBase = u8[].filled(12, 0);
+    this.tidBase.copyFrom(seed, 8, 0, 12);
+    return [this.check(now)];
+  }
+
+  u8[] check(this, i64 now) {
+    u8[] tid = u8[].filled(12, 0);
+    tid.copyFrom(this.tidBase, 0, 0, 12);
+    this.checksSent += 1;
+    tid[8] = tid[8] ^ ((this.checksSent >> 24) & 0xFF) as@ u8;
+    tid[9] = tid[9] ^ ((this.checksSent >> 16) & 0xFF) as@ u8;
+    tid[10] = tid[10] ^ ((this.checksSent >> 8) & 0xFF) as@ u8;
+    tid[11] = tid[11] ^ (this.checksSent & 0xFF) as@ u8;
+    this.consent.sent(tid, now);
+    this.lastCheckAt = now;
+    return checkFor(tid, this.theirUfrag, this.ourUfrag, this.theirPwd.toBytes(),
+                    candidatePriority(prefHost(), 65535, 1), true, this.tiebreaker, true);
   }
 
   /** Whatever the timers say is due — retransmissions, the window's release — sealed and ready to send. */
   u8[][] tick(this, i64 now) {
     Vec<u8[]> out = Vec<u8[]>.create();
+    // **The controlling agent's checks**: every half second until one is answered, then at the consent interval.
+    if (this.controlling && (this.iceUp ? this.consent.due(now) : now - this.lastCheckAt >= 500 as i64)) {
+      out.push(this.check(now));
+    }
+    u8[][] again = this.peer.timers(now);
+    for (i32 i = 0; i < again.len(); i++) { out.push(again[i]); }
     if (!this.peerIsExpected()) { return out.toArray(); }
     this.assoc.tick(now);
     this.react(now);

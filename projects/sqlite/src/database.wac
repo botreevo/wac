@@ -2,10 +2,10 @@
 
 import { Result, Vec, Map, hashString, stringEq } from "core";
 import { SqlError } from "./error.wac";
-import { Value, collationId } from "./value.wac";
-import { encodeRecord, decodeRecord } from "./record.wac";
+import { Value, collationId, compareValues, compareColl, COLL_BINARY } from "./value.wac";
+import { encodeRecord, decodeRecord, encodeRecordIn, decodeRecordIn, toUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
 import { put16, put32 } from "./bytes.wac";
-import { openImage, Image, readTable, readIndex, RawRow, decode, MAGIC } from "./reader.wac";
+import { openImage, Image, readTable, readIndex, RawRow, decode, decodeIn, MAGIC } from "./reader.wac";
 import { Pages, buildTable, buildIndex, fillPtrmap } from "./writer.wac";
 import { Chunked } from "./chunked.wac";
 import { parseOne, callsWhere, nondeterministic } from "./parser.wac";
@@ -34,6 +34,7 @@ export struct Database {
   bool wal = false;               // in WAL mode, which the file header records and SQLite keeps
   i32 autoVacuum = 0;             // PRAGMA auto_vacuum: 0 none, 1 full, 2 incremental
   i32 pendingAutoVacuum = -1;     // a change to or from none, which waits for VACUUM, or -1
+  i32 encoding = 1;               // text in the file: 1 UTF-8, 2 UTF-16le, 3 UTF-16be
   // indexesOf's answers, valid while `order` is the same list at the same length: every schema change
   // either appends to it or replaces it.
   Vec<SchemaEntry>? cacheOrder;
@@ -394,14 +395,14 @@ export void rebuildIndex(Index ix, Table t) {
 Index? indexFromFile(Index ix, Table t, Image img, i64 root) {
   // A WITHOUT ROWID table's index ends with its key rather than a rowid: rebuild it with the rowids
   // held here.
-  if (ix.special() || t.withoutRowid) { return null; }
+  if (ix.special() || t.withoutRowid || img.header.encoding != ENC_UTF8) { return null; }
   for (i32 c in ix.cols) { if (t.cols[c].affinity == AFF_REAL) { return null; } }
   match (readIndex(img, root)) {
     Ok(raw): {
       if (raw.len() != t.rows.len()) { return null; }
       Entry[] arr = Entry[].filled(raw.len(), Entry(Value[](), null));
       for (i32 i = 0; i < raw.len(); i++) {
-        Value[]? key = decodeRecord(raw.get(i));
+        Value[]? key = decodeRecordIn(raw.get(i), img.header.encoding);
         if (key is null || key!.len() != ix.cols.len() + 1) { return null; }
         arr[i] = Entry(key!, raw.get(i));
       }
@@ -412,8 +413,54 @@ Index? indexFromFile(Index ix, Table t, Image img, i64 root) {
   }
 }
 
+void sortEntries(Index ix, Entry[] a) { sortBy(a, (Value[] x, Value[] y) => ix.compare(x, y)); }
+
+// Index entries in the order SQLite keeps them in a database of encoding `enc`. In UTF-16 that is not
+// this library's order: SQLite's BINARY collation compares text as its bytes in the file's encoding,
+// which in UTF-16 is not code point order (little-endian least of all), and its indexes are sorted so.
+Entry[] inFileOrder(Index ix, Entry[] es, i32 enc) {
+  if (enc == ENC_UTF8) { return es; }
+  Entry[] out = Entry[].filled(es.len(), Entry(Value[](), null));
+  out.copyFrom(es, 0, 0, es.len());
+  bool be = enc == ENC_UTF16BE;
+  sortBy(out, (Value[] a, Value[] b) => {
+    for (i32 i = 0; i < a.len() && i < b.len(); i++) {
+      i32 c = 0;
+      bool binaryText = false;
+      if (i >= ix.colls.len() || ix.colls[i] == COLL_BINARY) {
+        match (a[i]) {
+          Text(sa): {
+            match (b[i]) {
+              Text(sb): { binaryText = true; c = compareBytes(toUtf16(sa, be), toUtf16(sb, be)); }
+              default: {}
+            }
+          }
+          default: {}
+        }
+      }
+      if (!binaryText) { c = i < ix.colls.len() ? compareColl(a[i], b[i], ix.colls[i]) : compareValues(a[i], b[i]); }
+      if (c != 0) { return i < ix.desc.len() && ix.desc[i] ? -c : c; }
+    }
+    return a.len() < b.len() ? -1 : (a.len() > b.len() ? 1 : 0);
+  });
+  return out;
+}
+
+Entry[] entriesOf(Index ix) {
+  Entry[] out = Entry[].filled(ix.entries.len(), Entry(Value[](), null));
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ix.entries.get(i); }
+  return out;
+}
+
+i32 compareBytes(const u8[] a, const u8[] b) {
+  for (i32 i = 0; i < a.len() && i < b.len(); i++) {
+    if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+  }
+  return a.len() < b.len() ? -1 : (a.len() > b.len() ? 1 : 0);
+}
+
 // A merge sort, stable, over index entries.
-void sortEntries(Index ix, Entry[] a) {
+void sortBy(Entry[] a, fn<i32(Value[], Value[])> cmp) {
   if (a.len() < 2) { return; }
   Entry[] tmp = Entry[].filled(a.len(), a[0]);
   i32 width = 1;
@@ -427,7 +474,7 @@ void sortEntries(Index ix, Entry[] a) {
       i32 j = mid;
       i32 k = lo;
       while (i < mid && j < hi) {
-        if (ix.compare(src[j].key, src[i].key) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        if (cmp(src[j].key, src[i].key) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
         k++;
       }
       while (i < mid) { dst[k] = src[i]; i++; k++; }
@@ -456,12 +503,13 @@ export Result<Database, SqlError> openBytes(u8[] data) {
   db.applicationId = img.header.applicationId;
   db.wal = img.header.wal;
   db.autoVacuum = img.header.autoVacuum;
+  db.encoding = img.header.encoding;
   if (img.header.reserved != 0) { return Result.Err(SqlError.unsupported("reserved bytes per page")); }
   Vec<RawRow> schema = try readTable(img, 1);
   // Tables first, so an index can find its table whatever order the entries come in.
   Vec<Index> autos;
   for (i32 i = 0; i < schema.len(); i++) {
-    Value[] v = try decode(schema.get(i).payload);
+    Value[] v = try decodeIn(schema.get(i).payload, img.header.encoding);
     string? kind = textAt(v, 0);
     string? name = textAt(v, 1);
     string? sql = textAt(v, 4);
@@ -478,7 +526,7 @@ export Result<Database, SqlError> openBytes(u8[] data) {
           // Its records, in key order, become rows numbered in that order.
           Vec<u8[]> recs = try readIndex(img, root);
           for (i32 k = 0; k < recs.len(); k++) {
-            Row r = rowFrom(t, (k + 1) as i64, try decode(recs.get(k)));
+            Row r = rowFrom(t, (k + 1) as i64, try decodeIn(recs.get(k), img.header.encoding));
             r.rec = recs.get(k);
             if (t.hasVirtual()) { try fillGenerated(t, r, db); }
             t.rows.push(r);
@@ -488,7 +536,7 @@ export Result<Database, SqlError> openBytes(u8[] data) {
         }
         Vec<RawRow> raw = try readTable(img, root);
         for (i32 k = 0; k < raw.len(); k++) {
-          Row r = rowFrom(t, raw.get(k).rowid, try decode(raw.get(k).payload));
+          Row r = rowFrom(t, raw.get(k).rowid, try decodeIn(raw.get(k).payload, img.header.encoding));
           r.rec = raw.get(k).payload;
           if (t.hasVirtual()) { try fillGenerated(t, r, db); }
           t.rows.push(r);
@@ -500,7 +548,7 @@ export Result<Database, SqlError> openBytes(u8[] data) {
   }
   for (i32 i = 0; i < autos.len(); i++) { db.indexes.set(lower(autos.get(i).name), autos.get(i)); }
   for (i32 i = 0; i < schema.len(); i++) {
-    Value[] v = try decode(schema.get(i).payload);
+    Value[] v = try decodeIn(schema.get(i).payload, img.header.encoding);
     string kind = textAt(v, 0)!;
     string name = textAt(v, 1)!;
     string? tbl = textAt(v, 2);
@@ -553,7 +601,7 @@ export Result<Database, SqlError> openBytes(u8[] data) {
     if (!listed) { return Result.Err(SqlError.corrupt("\{autos.get(i).name} is missing from the schema")); }
   }
   for (i32 i = 0; i < schema.len(); i++) {
-    Value[] v = try decode(schema.get(i).payload);
+    Value[] v = try decodeIn(schema.get(i).payload, img.header.encoding);
     if (textAt(v, 0)! != "index") { continue; }
     Index ix = db.index(textAt(v, 1)!)!;
     Table t = db.table(ix.table)!;
@@ -565,25 +613,25 @@ export Result<Database, SqlError> openBytes(u8[] data) {
 }
 
 // The record a row is stored as: the alias column, if any, is NULL in the file.
-export u8[] rowRecord(Table t, Row r) {
+export u8[] rowRecord(Table t, Row r, i32 enc) {
   if (r.rec is not null) { return r.rec!; }
-  u8[] out = encodeRow(t, r);
+  u8[] out = encodeRow(t, r, enc);
   r.rec = out;
   return out;
 }
 
-u8[] encodeRow(Table t, Row r) {
+u8[] encodeRow(Table t, Row r, i32 enc) {
   if (t.hasVirtual() || t.withoutRowid) {
     i32[] order = t.recordOrder();
     Value[] v = Value[].filled(order.len(), Value.Null);
     for (i32 k = 0; k < order.len(); k++) { v[k] = order[k] == t.rowidAlias ? Value.Null : r.vals[order[k]]; }
-    return encodeRecord(v);
+    return encodeRecordIn(v, enc);
   }
-  if (t.rowidAlias < 0) { return encodeRecord(r.vals); }
+  if (t.rowidAlias < 0) { return encodeRecordIn(r.vals, enc); }
   Value[] v = Value[].filled(r.vals.len(), Value.Null);
   v.copyFrom(r.vals, 0, 0, r.vals.len());
   v[t.rowidAlias] = Value.Null;
-  return encodeRecord(v);
+  return encodeRecordIn(v, enc);
 }
 
 // Whether a schema entry is a WITHOUT ROWID table's key index, which the file holds as the table itself
@@ -597,7 +645,7 @@ export bool isKeyIndex(Database db, const SchemaEntry e) {
 // The records of an index on a WITHOUT ROWID table, as the file holds them: each entry's values, then
 // the table's key columns the index does not already hold (in the key's collations and directions) in
 // place of the rowid, and sorted that way.
-u8[][] keyedRecords(Index ix, Table t, Index pk) {
+u8[][] keyedRecords(Index ix, Table t, Index pk, i32 enc) {
   Vec<i32> extra;
   Vec<bool> extraDesc;
   for (i32 j = 0; j < pk.cols.len(); j++) {
@@ -630,8 +678,9 @@ u8[][] keyedRecords(Index ix, Table t, Index pk) {
     es[i] = Entry(fk, null);
   }
   sortEntries(order, es);
+  es = inFileOrder(order, es, enc);
   u8[][] out = u8[][].defaulted(es.len());
-  for (i32 i = 0; i < es.len(); i++) { out[i] = encodeRecord(es[i].key); }
+  for (i32 i = 0; i < es.len(); i++) { out[i] = encodeRecordIn(es[i].key, enc); }
   return out;
 }
 
@@ -654,50 +703,54 @@ export u8[] toBytes(Database db) {
     if (e.kind == "table" && db.table(e.name)!.withoutRowid) {
       Table t = db.table(e.name)!;
       Index pk = db.index(t.pkIndex)!;
-      u8[][] recs = u8[][].defaulted(pk.entries.len());
+      Entry[] keys = inFileOrder(pk, entriesOf(pk), db.encoding);
+      u8[][] recs = u8[][].defaulted(keys.len());
       for (i32 k = 0; k < recs.len(); k++) {
-        Value[] key = pk.entries.get(k).key;
-        match (key[key.len() - 1]) { Int(id): { recs[k] = rowRecord(t, t.get(id)!); } default: {} }
+        Value[] key = keys[k].key;
+        match (key[key.len() - 1]) { Int(id): { recs[k] = rowRecord(t, t.get(id)!, db.encoding); } default: {} }
       }
       buildIndex(ps, roots[i], recs);
-      schemaRecs.push(encodeRecord([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
-                                    Value.Int(roots[i]), Value.Text(t.sql)]));
+      schemaRecs.push(encodeRecordIn([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
+                                    Value.Int(roots[i]), Value.Text(t.sql)], db.encoding));
     } else if (e.kind == "table") {
       Table t = db.table(e.name)!;
       i64[] ids = i64[].filled(t.rows.len(), 0);
       u8[][] recs = u8[][].defaulted(t.rows.len());
       for (i32 k = 0; k < t.rows.len(); k++) {
         ids[k] = t.rows.get(k).rowid;
-        recs[k] = rowRecord(t, t.rows.get(k));
+        recs[k] = rowRecord(t, t.rows.get(k), db.encoding);
       }
       buildTable(ps, roots[i], ids, recs);
-      schemaRecs.push(encodeRecord([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
-                                    Value.Int(roots[i]), Value.Text(t.sql)]));
+      schemaRecs.push(encodeRecordIn([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
+                                    Value.Int(roots[i]), Value.Text(t.sql)], db.encoding));
     } else if (e.kind == "trigger") {
       Trigger tr = db.trigger(e.name)!;
-      schemaRecs.push(encodeRecord([Value.Text("trigger"), Value.Text(tr.def.name), Value.Text(tr.def.table),
-                                    Value.Int(0), Value.Text(tr.def.sql)]));
+      schemaRecs.push(encodeRecordIn([Value.Text("trigger"), Value.Text(tr.def.name), Value.Text(tr.def.table),
+                                    Value.Int(0), Value.Text(tr.def.sql)], db.encoding));
     } else if (e.kind == "view") {
       View v = db.view(e.name)!;
-      schemaRecs.push(encodeRecord([Value.Text("view"), Value.Text(v.name), Value.Text(v.name),
-                                    Value.Int(0), Value.Text(v.sql)]));
+      schemaRecs.push(encodeRecordIn([Value.Text("view"), Value.Text(v.name), Value.Text(v.name),
+                                    Value.Int(0), Value.Text(v.sql)], db.encoding));
     } else {
       Index ix = db.index(e.name)!;
       Table owner = db.table(ix.table)!;
       u8[][] recs = u8[][].defaulted(ix.entries.len());
       if (owner.withoutRowid) {
-        recs = keyedRecords(ix, owner, db.index(owner.pkIndex)!);
+        recs = keyedRecords(ix, owner, db.index(owner.pkIndex)!, db.encoding);
+      } else if (db.encoding != ENC_UTF8) {
+        Entry[] es = inFileOrder(ix, entriesOf(ix), db.encoding);
+        for (i32 k = 0; k < recs.len(); k++) { recs[k] = encodeRecordIn(es[k].key, db.encoding); }
       } else {
         for (i32 k = 0; k < recs.len(); k++) {
           Entry en = ix.entries.get(k);
-          if (en.rec is null) { en.rec = encodeRecord(en.key); }
+          if (en.rec is null) { en.rec = encodeRecordIn(en.key, db.encoding); }
           recs[k] = en.rec!;
         }
       }
       buildIndex(ps, roots[i], recs);
       Value sql = ix.sql is null ? Value.Null : Value.Text(ix.sql!);
-      schemaRecs.push(encodeRecord([Value.Text("index"), Value.Text(ix.name), Value.Text(ix.table),
-                                    Value.Int(roots[i]), sql]));
+      schemaRecs.push(encodeRecordIn([Value.Text("index"), Value.Text(ix.name), Value.Text(ix.table),
+                                    Value.Int(roots[i]), sql], db.encoding));
     }
     schemaIds.push((i + 1) as i64);
   }
@@ -740,7 +793,7 @@ void writeHeader(u8[] b, const Database db, i64 pages, i64 largestRoot) {
   put32(b, 44, 4);
   put32(b, 48, 0);
   put32(b, 52, largestRoot);
-  put32(b, 56, 1);
+  put32(b, 56, db.encoding as i64);
   put32(b, 60, db.userVersion);
   put32(b, 64, db.autoVacuum == 2 ? 1 : 0);
   put32(b, 68, db.applicationId);

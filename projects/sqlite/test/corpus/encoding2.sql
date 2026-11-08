@@ -1,0 +1,10 @@
+PRAGMA encoding = 'UTF-16le';
+CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT);
+CREATE INDEX u_s ON u (s);
+CREATE TABLE k (w TEXT PRIMARY KEY, v) WITHOUT ROWID;
+INSERT INTO u (s) VALUES ('é'), ('Ā'), ('a'), ('日'), ('😀'), ('！'), ('ab'), ('é2'), (NULL), ('');
+INSERT INTO k SELECT s, id FROM u WHERE s IS NOT NULL;
+SELECT id FROM u WHERE s = 'é';
+SELECT v FROM k WHERE w = '😀';
+SELECT hex(s) FROM u WHERE id = 2;
+PRAGMA encoding;

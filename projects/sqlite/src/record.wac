@@ -23,7 +23,15 @@ export i32 serialSize(i64 t) {
 
 // Decodes a whole record. A record from a file this did not write is untrusted, so a malformed one is
 // null rather than a trap.
-export Value[]? decodeRecord(const u8[] p) {
+export Value[]? decodeRecord(const u8[] p) { return decodeRecordIn(p, ENC_UTF8); }
+
+// The text encodings a database may use, as its header numbers them.
+export static i32 ENC_UTF8 = 1;
+export static i32 ENC_UTF16LE = 2;
+export static i32 ENC_UTF16BE = 3;
+
+// A record from a database whose text is in encoding `enc`.
+export Value[]? decodeRecordIn(const u8[] p, i32 enc) {
   if (p.len() == 0) { return null; }
   Varint h = readVarint(p, 0);
   if (h.value < 1 || h.value > p.len() as i64) { return null; }
@@ -52,7 +60,8 @@ export Value[]? decodeRecord(const u8[] p) {
     else if (t == 8) { out[i] = Value.Int(0); }
     else if (t == 9) { out[i] = Value.Int(1); }
     else if ((t & 1) == 0) { out[i] = Value.Blob(sliceBytes(p, body, body + n)); }
-    else { out[i] = Value.Text(string.fromBytes(sliceBytes(p, body, body + n))); }
+    else if (enc == ENC_UTF8) { out[i] = Value.Text(string.fromBytes(sliceBytes(p, body, body + n))); }
+    else { out[i] = Value.Text(fromUtf16(p, body, body + n, enc == ENC_UTF16BE)); }
     body += n;
   }
   return out;
@@ -81,11 +90,24 @@ export i64 serialType(const Value v) {
   };
 }
 
-export u8[] encodeRecord(const Value[] vals) {
+export u8[] encodeRecord(const Value[] vals) { return encodeRecordIn(vals, ENC_UTF8); }
+
+// A record for a database whose text is in encoding `enc`.
+export u8[] encodeRecordIn(const Value[] vals, i32 enc) {
   i64[] types = i64[].filled(vals.len(), 0);
+  u8[][] texts = u8[][].defaulted(enc == ENC_UTF8 ? 0 : vals.len());
   i32 hdr = 0;
   for (i32 i = 0; i < vals.len(); i++) {
     types[i] = serialType(vals[i]);
+    if (enc != ENC_UTF8) {
+      match (vals[i]) {
+        Text(s): {
+          texts[i] = toUtf16(s, enc == ENC_UTF16BE);
+          types[i] = (texts[i].len() * 2 + 13) as i64;
+        }
+        default: {}
+      }
+    }
     hdr += varintLen(types[i]);
   }
   // The header size counts itself, and its own varint may grow when it does.
@@ -102,9 +124,97 @@ export u8[] encodeRecord(const Value[] vals) {
         if (t >= 1 && t <= 6) { pushBe(out, x, intWidth(t)); }
       }
       Real(r): { pushBe(out, f64.toBits(r) as@ i64, 8); }
-      Text(s): { out.pushAll(s.toBytes()); }
+      Text(s): { out.pushAll(enc == ENC_UTF8 ? s.toBytes() : texts[i]); }
       Blob(b): { out.pushAll(b); }
     }
   }
   return out.take();
+}
+
+// ── UTF-16 ─────────────────────────────────────────────────────────────────
+
+// Text (UTF-8) as UTF-16, characters beyond the basic plane as surrogate pairs.
+export u8[] toUtf16(string s, bool bigEndian) {
+  u8[] b = s.toBytes();
+  Buf out = Buf.create();
+  i32 i = 0;
+  while (i < b.len()) {
+    i32 c = b[i] as i32;
+    i32 cp = c;
+    i32 n = 1;
+    if (c >= 0xf0 && i + 3 < b.len()) {
+      cp = ((c & 0x07) << 18) | (((b[i + 1] as i32) & 0x3f) << 12) | (((b[i + 2] as i32) & 0x3f) << 6) | ((b[i + 3] as i32) & 0x3f);
+      n = 4;
+    } else if (c >= 0xe0 && i + 2 < b.len()) {
+      cp = ((c & 0x0f) << 12) | (((b[i + 1] as i32) & 0x3f) << 6) | ((b[i + 2] as i32) & 0x3f);
+      n = 3;
+    } else if (c >= 0xc0 && i + 1 < b.len()) {
+      cp = ((c & 0x1f) << 6) | ((b[i + 1] as i32) & 0x3f);
+      n = 2;
+    }
+    i += n;
+    if (cp >= 0x10000) {
+      i32 v = cp - 0x10000;
+      pushUnit(out, 0xd800 | (v >> 10), bigEndian);
+      pushUnit(out, 0xdc00 | (v & 0x3ff), bigEndian);
+    } else {
+      pushUnit(out, cp, bigEndian);
+    }
+  }
+  return out.take();
+}
+
+void pushUnit(Buf out, i32 u, bool bigEndian) {
+  u8 hi = ((u >> 8) & 0xff) as@ u8;
+  u8 lo = (u & 0xff) as@ u8;
+  if (bigEndian) { out.push(hi); out.push(lo); } else { out.push(lo); out.push(hi); }
+}
+
+// UTF-16 bytes [from, to) as text; a lone surrogate becomes U+FFFD, as SQLite's conversion does.
+export string fromUtf16(const u8[] p, i32 from, i32 to, bool bigEndian) {
+  Buf out = Buf.create();
+  i32 i = from;
+  while (i + 1 < to) {
+    i32 u = unitAt(p, i, bigEndian);
+    i += 2;
+    i32 cp = u;
+    if (u >= 0xd800 && u <= 0xdbff) {
+      if (i + 1 < to) {
+        i32 lo = unitAt(p, i, bigEndian);
+        if (lo >= 0xdc00 && lo <= 0xdfff) {
+          cp = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00);
+          i += 2;
+        } else {
+          cp = 0xfffd;
+        }
+      } else {
+        cp = 0xfffd;
+      }
+    } else if (u >= 0xdc00 && u <= 0xdfff) {
+      cp = 0xfffd;
+    }
+    pushUtf8(out, cp);
+  }
+  return out.toStr();
+}
+
+i32 unitAt(const u8[] p, i32 i, bool bigEndian) {
+  return bigEndian ? ((p[i] as i32) << 8) | (p[i + 1] as i32) : ((p[i + 1] as i32) << 8) | (p[i] as i32);
+}
+
+void pushUtf8(Buf out, i32 cp) {
+  if (cp < 0x80) { out.push(cp as@ u8); }
+  else if (cp < 0x800) {
+    out.push((0xc0 | (cp >> 6)) as@ u8);
+    out.push((0x80 | (cp & 0x3f)) as@ u8);
+  } else if (cp < 0x10000) {
+    out.push((0xe0 | (cp >> 12)) as@ u8);
+    out.push((0x80 | ((cp >> 6) & 0x3f)) as@ u8);
+    out.push((0x80 | (cp & 0x3f)) as@ u8);
+  } else {
+    out.push((0xf0 | (cp >> 18)) as@ u8);
+    out.push((0x80 | ((cp >> 12) & 0x3f)) as@ u8);
+    out.push((0x80 | ((cp >> 6) & 0x3f)) as@ u8);
+    out.push((0x80 | (cp & 0x3f)) as@ u8);
+  }
 }

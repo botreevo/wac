@@ -4,7 +4,7 @@
 import { Result, Vec, Map, hashBytes, bytesEq, hashI64, i64Eq } from "core";
 import { SqlError } from "./error.wac";
 import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY } from "./value.wac";
-import { encodeRecord } from "./record.wac";
+import { encodeRecord, toUtf16, fromUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
 import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
          JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
 import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
@@ -14,7 +14,7 @@ import { Node, BoundSource, TableFn, AggSpec, WinSpec, SelectPlan, ProbeSpec, Ro
          AGG_JSON_ARRAY, AGG_JSON_OBJECT } from "./plan.wac";
 import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
-import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, knownFunction, returnsJson, FnEnv, likeMatch, likeBytes, globMatch, codepoints } from "./functions.wac";
+import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, F_HEX, F_OCTET_LENGTH, knownFunction, returnsJson, FnEnv, likeMatch, likeBytes, globMatch, codepoints } from "./functions.wac";
 import { lower } from "./lexer.wac";
 import { Json, parseJson, jsonText, jsonOf, escape } from "./json.wac";
 
@@ -545,6 +545,13 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
         string kind = textOf(vals[0]);
         return Result.Err(SqlError("raise-" + lower(kind), vals.len() > 1 ? textOf(vals[1]) : ""));
       }
+      // In a UTF-16 database hex() and octet_length() see text as its UTF-16 bytes.
+      if (x.db.encoding != ENC_UTF8 && (fid == F_HEX || fid == F_OCTET_LENGTH) && vals.len() == 1) {
+        match (vals[0]) {
+          Text(s): { vals[0] = Value.Blob(toUtf16(s, x.db.encoding == ENC_UTF16BE)); }
+          default: {}
+        }
+      }
       return callScalar(name, fid, vals, isJson, x.env);
     }
     NLike(value, pattern, glob): {
@@ -588,7 +595,18 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       if (otherwise is not null) { return eval(otherwise!, c, x); }
       return Result.Ok(Value.Null);
     }
-    NCast(e, aff): { return Result.Ok(castTo(try eval(e, c, x), aff)); }
+    NCast(e, aff): {
+      Value v = try eval(e, c, x);
+      // In a UTF-16 database text and blobs convert through UTF-16 bytes.
+      if (x.db.encoding != ENC_UTF8) {
+        match (v) {
+          Text(s): { if (aff == AFF_BLOB) { return Result.Ok(Value.Blob(toUtf16(s, x.db.encoding == ENC_UTF16BE))); } }
+          Blob(b): { if (aff == AFF_TEXT) { return Result.Ok(Value.Text(fromUtf16(b, 0, b.len(), x.db.encoding == ENC_UTF16BE))); } }
+          default: {}
+        }
+      }
+      return Result.Ok(castTo(v, aff));
+    }
     NSub(sub): {
       Vec<Value[]> rows = try subRows(sub, c, x);
       if (rows.len() == 0) { return Result.Ok(Value.Null); }

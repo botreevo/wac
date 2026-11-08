@@ -122,6 +122,19 @@ def auto_vacuum(con):
     con.executemany("INSERT INTO a (s, b) VALUES (?, ?)",
                     [("s%05d" % rnd.randint(0, 99999) + "z" * rnd.randint(0, 600), bytes(rnd.randint(0, 2500))) for _ in range(120)])
 
+def utf16(con):
+    # Little-endian, where SQLite's BINARY order (the bytes) is furthest from code point order.
+    con.execute("PRAGMA encoding = 'UTF-16le'")
+    rnd = random.Random(3)
+    alphabet = "aZé日本Ā😀！ßж" 
+    def word(): return "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 6)))
+    con.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT, n TEXT COLLATE NOCASE)")
+    con.execute("CREATE INDEX u_s ON u (s)")
+    con.execute("CREATE INDEX u_n ON u (n, s)")
+    con.execute("CREATE TABLE k (w TEXT PRIMARY KEY, v) WITHOUT ROWID")
+    con.executemany("INSERT INTO u (s, n) VALUES (?, ?)", [(word(), word()) for _ in range(300)])
+    con.executemany("INSERT OR IGNORE INTO k VALUES (?, ?)", [(word() + str(i), i) for i in range(200)])
+
 os.makedirs("test/data", exist_ok=True)
 make("test/data/small.db", 4096, small)
 make("test/data/big.db", 1024, big)
@@ -130,3 +143,4 @@ make("test/data/big4k.db", 4096, big)
 make("test/data/without_rowid.db", 1024, without_rowid, vacuum=False)
 make_wal("test/data/wal.db")
 make("test/data/autovacuum.db", 1024, auto_vacuum)
+make("test/data/utf16.db", 1024, utf16)

@@ -52,10 +52,20 @@ browser answers every check, which the test takes from Chromium's own `getStats(
 counting what our socket happened to read — the two are not the same number, and mistaking one for
 the other cost `issues/system/0152` a while.
 
+**Many channels, each with its own reliability.** `src/association.wac` is the SCTP association
+as a data channel needs it: any number of streams, ordered and unordered delivery, partial
+reliability (RFC 3758 — a channel opened `maxRetransmits: 0` sends once, and a FORWARD-TSN moves the
+peer past what was given up on), stream reset (RFC 6525 — how a channel closes), and both ends of
+the handshake, including the collision when both start at once. aiortc refuses an unreliable channel
+from a peer whose INIT does not say it speaks FORWARD-TSN, and Chromium never resets a stream on a
+peer that does not say it speaks RE-CONFIG; `test/wac/channels_test.wac` has aiortc open a
+negotiated reliable channel, a negotiated unreliable one, three DCEP channels and a 50 KB message,
+and close one by stream reset while the others carry on.
+
 **The layers are joined.** `Session` in `src/session.wac` owns the DTLS peer, the SCTP
 association and the consent timer together: `receive` takes a datagram and answers with the
-datagrams to send, `send` takes a message, `tick` releases whatever the congestion window now
-allows. A caller supplies a socket and a clock and nothing else — which datagram is a check and
+datagrams to send, `send`, `open` and `close` take a channel, `negotiate` declares one both ends
+agreed on out of band, `tick` runs the timers, and `events` says what happened. A caller supplies a socket and a clock and nothing else — which datagram is a check and
 which is DTLS, where an application record sits inside one, that a packet holds several chunks, that
 DCEP's open must be answered before anything flows, and that a large message is a run of DATA
 chunks are all decisions this package should be making, and every one of them has been got wrong
@@ -127,6 +137,8 @@ server half is where wac first produces an ECDSA signature something else verifi
                       Finished — and AEAD records with the half-explicit nonce
     src/sctp.wac      RFC 4960: the common header, chunks, CRC-32c, INIT and
                       COOKIE-ECHO, DATA and SACK, and RFC 8832's DCEP messages
+    src/association.wac  the association: streams, ordering, retransmission, the
+                      congestion window, FORWARD-TSN, stream reset, both roles
     src/sdp.wac       RFC 8866, the dozen lines a data channel needs: ICE
                       credentials, the DTLS fingerprint, and the m= line
     src/peer.wac      the DTLS server handshake as a struct: reassembly, the

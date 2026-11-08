@@ -1,0 +1,983 @@
+// An SCTP association — RFC 4960 — with the three extensions a WebRTC data channel stands on: partial
+// reliability (RFC 3758, FORWARD-TSN), stream reconfiguration (RFC 6525, how a channel closes), and both ends of
+// the handshake.
+//
+// **It is the engine; `sctp.wac` is the codecs it is built from.** Datagrams of SCTP go in with `receive`, the
+// packets to send come out of `take`, and what happened comes out of `events`: the association came up, a whole
+// message arrived on a stream, the peer reset a stream, the association went down. Time is the caller's — every
+// entry point takes `now` — so nothing here reads a clock and a test drives the timers with numbers.
+//
+// What a data channel needs from it, and so what it does:
+//
+//   - **Many streams.** One per channel, numbered up to 65535; state is kept per stream that has been used, in maps,
+//     not in tables sized in advance.
+//   - **Ordered and unordered delivery.** A channel chooses per channel; an unordered message is delivered the
+//     moment it is whole, an ordered one in stream-sequence order.
+//   - **Partial reliability.** A channel opened `maxRetransmits: 0` (KPS's datagram channel is one) sends each
+//     message once: lost is lost, and a FORWARD-TSN tells the receiver to stop waiting for it. Received
+//     FORWARD-TSNs move the cumulative point past what the peer gave up on — without that, a browser's unreliable
+//     channel leaves a permanent gap and the association's cumulative point never moves again.
+//   - **Stream reset.** Closing a channel is resetting its outgoing stream (RFC 8831 §6.7); the peer answers by
+//     resetting its own. `resetStream` asks, and a peer's request is performed once every TSN it covers has
+//     arrived, then reported as `Reset`.
+//   - **Both roles.** `start` sends an INIT for an end that initiates; an end that answers waits for one. A WebRTC
+//     peer may do both at once — each side's SCTP connects when its DTLS is up — and the collision is handled as
+//     RFC 4960 §5.2.1 says: an INIT met in COOKIE-WAIT is answered with an INIT-ACK carrying our own tag.
+//
+// **What it does not do**, deliberately: authenticate the state cookie (the association is in memory either way,
+// and DTLS has already authenticated the peer), multi-homing, or I-DATA interleaving.
+
+import { Map, Vec, hashI32, i32Eq } from "core";
+import { chunkData, chunkInit, chunkInitAck, chunkSack, chunkHeartbeat, chunkHeartbeatAck, chunkAbort,
+         chunkShutdown, chunkShutdownAck, chunkCookieEcho, chunkCookieAck, chunkShutdownComplete,
+         chunkForwardTsn, chunk, chunkSize, parseChunk, Chunk, packet, checksumOk, chunksAt, initValue,
+         initiateTag, initTsn, initWindow, tsnBefore, dataValue, dataFlagBegin, dataFlagEnd, dataFlagUnordered,
+         sackValueGaps, stateCookie } from "./sctp.wac";
+
+/** RE-CONFIG, RFC 6525. */
+export static i32 CHUNK_RECONFIG = 130;
+/** Its parameters: an outgoing SSN reset request, and a response. */
+export static i32 PARAM_OUTGOING_RESET = 13;
+export static i32 PARAM_RECONFIG_RESPONSE = 16;
+/** Response results: performed, and in progress (ask again). */
+export static i32 RECONFIG_PERFORMED = 1;
+export static i32 RECONFIG_IN_PROGRESS = 6;
+
+/** The largest SCTP packet built: under a 1200-byte path once DTLS wraps it in a record. */
+export static i32 MAX_PACKET = 1150;
+/** The most user data in one DATA chunk: MAX_PACKET less the common header and the DATA header. */
+export static i32 MAX_CHUNK_DATA = 1100;
+
+/** Association states, RFC 4960 §4, reduced to what this end passes through. */
+static i32 CLOSED = 0;
+static i32 COOKIE_WAIT = 1;
+static i32 COOKIE_ECHOED = 2;
+static i32 ESTABLISHED = 3;
+static i32 SHUTTING_DOWN = 4;
+
+/** What happened, for the layer above. */
+export enum SctpEvent {
+  /** The association is established: DATA may flow. */
+  Up,
+  /** A whole message on `stream`. */
+  Message(i32 stream, i32 ppid, u8[] data),
+  /** The peer reset its outgoing `stream` — for a data channel, the far end closed it. */
+  Reset(i32 stream),
+  /** One of our own resets was performed by the peer: nothing more goes out on `stream` under its old numbering. */
+  ResetDone(i32 stream),
+  /** The association has ended; `aborted` when by ABORT rather than an agreed shutdown. */
+  Down(bool aborted),
+}
+
+/** A DATA chunk this end numbered: queued, in flight, or acknowledged by a gap block. */
+struct Outgoing {
+  i32 tsn;
+  i32 stream;
+  i32 ssn;
+  bool unordered;
+  /** How many retransmissions it may have; -1 is reliable. */
+  i32 maxRetransmits;
+  /** The chunk as it goes on the wire, header included. */
+  u8[] bytes;
+  i64 sentAt;
+  /** Transmissions so far: 0 while queued. */
+  i32 tries;
+  /** How many SACKs have reported it missing since it was last sent. */
+  i32 missing;
+  /** Reported received by a gap block: not to be resent, though not yet covered by the cumulative point. */
+  bool gapAcked;
+  /** Given up on (partial reliability): to be skipped by a FORWARD-TSN, never resent. */
+  bool abandoned;
+}
+
+/** A received DATA chunk waiting for the rest of its message, or for its turn. */
+struct Fragment {
+  i32 tsn;
+  i32 ssn;
+  i32 flags;
+  i32 ppid;
+  u8[] data;
+}
+
+/** One stream's receiving state. */
+struct Inbound {
+  /** The stream sequence number the next ordered message must carry. */
+  i32 nextSsn;
+  Vec<Fragment> frags;
+}
+
+/** One stream reset we asked for and are waiting to have answered. */
+struct ResetAsk {
+  i32 seq;
+  i32[] streams;
+  u8[] chunk;
+  i64 sentAt;
+  i32 tries;
+}
+
+/** A peer's reset request we have taken but cannot perform yet: data it covers is still on the way. */
+struct ResetWaiting {
+  i32 seq;
+  i32 lastTsn;
+  i32[] streams;
+}
+
+export struct Association {
+  bool initiator;
+  i32 state = 0;
+  i32 ourTag;
+  i32 theirTag = 0;
+  /** What we advertise as our receive window. The layer above consumes every message as it arrives. */
+  i32 window;
+  // ── sending ──
+  i32 nextTsn;
+  Map<i32, i32> nextSsn = Map<i32, i32>.create(hashI32, i32Eq);
+  Vec<Outgoing> queued = Vec<Outgoing>.create();
+  Vec<Outgoing> flight = Vec<Outgoing>.create();
+  /** The highest TSN the peer has acknowledged cumulatively. */
+  i32 peerCumAck;
+  i32 peerRwnd = 65536;
+  i32 cwnd = 4380;
+  i32 ssthresh = 1048576;
+  i32 partialAcked = 0;
+  i64 srtt = -1;
+  i64 rttvar = 0;
+  /** RFC 3758's Advanced.Peer.Ack.Point: everything up to it is acknowledged or abandoned. */
+  i32 advancedAckPoint;
+  bool forwardTsnDue = false;
+  // ── receiving ──
+  bool haveCum = false;
+  i32 cumTsn = 0;
+  /** TSNs above the cumulative point that arrived, kept sorted. */
+  Vec<i32> above = Vec<i32>.create();
+  Map<i32, Inbound> inbound = Map<i32, Inbound>.create(hashI32, i32Eq);
+  bool sackDue = false;
+  // ── reconfiguration ──
+  i32 ourReqSeq;
+  i32 peerReqSeq = 0;
+  bool peerReqSeqKnown = false;
+  Vec<i32> resetWanted = Vec<i32>.create();
+  ResetAsk? resetAsked = null;
+  Vec<ResetWaiting> resetsWaiting = Vec<ResetWaiting>.create();
+  /** The last response we sent, to answer a retransmitted request with the same words. */
+  u8[] lastResponse = u8[]();
+  // ── the handshake ──
+  u8[] cookieToEcho = u8[]();
+  i64 t1At = 0;
+  i32 t1Tries = 0;
+  /** The cookie we hand out; we keep the association in memory, so it needs to mean nothing. */
+  u8[] cookie;
+  // ── output ──
+  Vec<u8[]> control = Vec<u8[]>.create();
+  Vec<u8[]> out = Vec<u8[]>.create();
+  Vec<SctpEvent> happened = Vec<SctpEvent>.create();
+
+  /**
+   * An association for one end. `ourTag` and `initialTsn` should be random (they are the defence against blind
+   * injection); `initiator` says whether `start` sends an INIT or the end waits for one.
+   */
+  Association create(bool initiator, i32 ourTag, i32 initialTsn, i32 window) {
+    return Association { initiator: initiator, ourTag: ourTag, window: window, nextTsn: initialTsn,
+                         peerCumAck: initialTsn - 1, advancedAckPoint: initialTsn - 1, ourReqSeq: initialTsn,
+                         cookie: [0x77 as u8, 0x61 as u8, 0x63 as u8, 0x00 as u8] as u8[] };
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────── the caller's interface ───
+
+  /** For an initiating end: send the INIT. Answering ends need not call it. */
+  void start(this, i64 now) {
+    if (this.state != CLOSED) { return; }
+    this.state = COOKIE_WAIT;
+    this.sendInit(now);
+  }
+
+  /** The packets to send, in order, taken. */
+  u8[][] take(this) {
+    u8[][] a = this.out.toArray();
+    this.out = Vec<u8[]>.create();
+    return a;
+  }
+
+  /** What happened since the last call, taken. */
+  SctpEvent[] events(this) {
+    SctpEvent[] a = this.happened.toArray();
+    this.happened = Vec<SctpEvent>.create();
+    return a;
+  }
+
+  bool established(const this) { return this.state == ESTABLISHED; }
+
+  /**
+   * Send one message on `stream`. Split into chunks as needed, numbered now, and released as the congestion
+   * window and the peer's receive window allow. `maxRetransmits` -1 is reliable; 0 sends once and never again.
+   * False if the association cannot carry data (not established, or closing).
+   */
+  bool send(this, i32 stream, i32 ppid, u8[] payload, bool unordered, i32 maxRetransmits, i64 now) {
+    if (this.state != ESTABLISHED) { return false; }
+    i32 ssn = 0;
+    if (!unordered) {
+      ssn = this.nextSsn.getOr(stream, 0);
+      this.nextSsn.set(stream, (ssn + 1) & 0xFFFF);
+    }
+    i32 pieces = payload.len() == 0 ? 1 : (payload.len() + MAX_CHUNK_DATA - 1) / MAX_CHUNK_DATA;
+    for (i32 i = 0; i < pieces; i++) {
+      i32 from = i * MAX_CHUNK_DATA;
+      i32 n = payload.len() - from < MAX_CHUNK_DATA ? payload.len() - from : MAX_CHUNK_DATA;
+      u8[] part = u8[].filled(n, 0);
+      part.copyFrom(payload, from, 0, n);
+      i32 flags = (unordered ? dataFlagUnordered() : 0) | (i == 0 ? dataFlagBegin() : 0)
+                | (i == pieces - 1 ? dataFlagEnd() : 0);
+      i32 tsn = this.nextTsn;
+      this.nextTsn = tsn + 1;
+      u8[] bytes = chunk(chunkData(), flags, dataValue(tsn, stream, ssn, ppid, part));
+      this.queued.push(Outgoing(tsn, stream, ssn, unordered, maxRetransmits, bytes, 0 as i64, 0, 0, false, false));
+    }
+    this.flush(now);
+    return true;
+  }
+
+  /**
+   * Reset our outgoing `stream` (RFC 6525) — how a data channel is closed. Requests are batched, one in flight at
+   * a time; `ResetDone` reports each performed.
+   */
+  void resetStream(this, i32 stream, i64 now) {
+    for (i32 i = 0; i < this.resetWanted.len(); i++) { if (this.resetWanted.get(i) == stream) { return; } }
+    if (this.resetAsked is not null) {
+      i32[] asked = this.resetAsked!.streams;
+      for (i32 i = 0; i < asked.len(); i++) { if (asked[i] == stream) { return; } }
+    }
+    this.resetWanted.push(stream);
+    this.askReset(now);
+    this.flush(now);
+  }
+
+  /** Whatever the timers say is due at `now`: retransmissions, the handshake, a reset nobody answered. */
+  void tick(this, i64 now) {
+    if (this.state == COOKIE_WAIT || this.state == COOKIE_ECHOED) {
+      if (now - this.t1At >= backoff(this.rto(), this.t1Tries)) {
+        if (this.t1Tries >= 8) {
+          this.down(true);
+          return;
+        }
+        if (this.state == COOKIE_WAIT) { this.sendInit(now); } else { this.sendCookieEcho(now); }
+      }
+      return;
+    }
+    if (this.state < ESTABLISHED) { return; }
+    this.retransmitDue(now);
+    if (this.resetAsked is not null && now - this.resetAsked!.sentAt >= backoff(this.rto(), this.resetAsked!.tries - 1)) {
+      this.resetAsked!.tries = this.resetAsked!.tries + 1;
+      this.resetAsked!.sentAt = now;
+      this.control.push(this.resetAsked!.chunk);
+    }
+    this.flush(now);
+  }
+
+  /**
+   * Every chunk sent and not yet acknowledged, sent again now — for a caller that knows better than the timer that
+   * something was lost (a test that threw a datagram away). Unlike a timeout this leaves the congestion window as
+   * it was: nothing here is evidence about the path.
+   */
+  void retransmitAll(this, i64 now) {
+    for (i32 i = 0; i < this.flight.len(); i++) {
+      Outgoing o = this.flight.get(i);
+      if (o.gapAcked || o.abandoned) { continue; }
+      o.tries++;
+      o.sentAt = now;
+      this.out.push(packet(5000, 5000, this.theirTag, o.bytes));
+    }
+  }
+
+  /** End the association at once. The peer is told with an ABORT; nothing in flight is sent. */
+  void abort(this) {
+    if (this.state == CLOSED && this.theirTag == 0) { return; }
+    this.out.push(packet(5000, 5000, this.theirTag, chunk(chunkAbort(), 0, u8[]())));
+    this.down(true);
+  }
+
+  /** Feed in one received SCTP packet. */
+  void receive(this, u8[] pkt, i64 now) {
+    if (pkt.len() < 12 || !checksumOk(pkt)) { return; }
+    i32 vtag = bigI32(pkt, 4);
+    i32 at = chunksAt();
+    bool first = true;
+    while (chunkSize(pkt, at) > 0) {
+      Chunk c = parseChunk(pkt, at);
+      // **The verification tag is checked**, except where RFC 4960 §8.5.1 says otherwise: an INIT carries zero,
+      // and an ABORT may carry either. Anything else with a tag that is not ours is a packet from some other
+      // association, or forged — dropped whole.
+      if (first && c.kind != chunkInit() && c.kind != chunkAbort() && vtag != this.ourTag) { return; }
+      first = false;
+      this.chunkIn(c, now);
+      at = at + chunkSize(pkt, at);
+    }
+    this.flush(now);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────────────── the chunks ───
+
+  void chunkIn(this, Chunk c, i64 now) {
+    i32 k = c.kind;
+    if (k == chunkInit()) { this.initIn(c.value, now); return; }
+    if (k == chunkInitAck()) { this.initAckIn(c.value, now); return; }
+    if (k == chunkCookieEcho()) {
+      // Accepted in any state but closed-after-down: an answering end receives it in CLOSED, an initiator whose
+      // INIT collided with the peer's receives it in COOKIE-WAIT or COOKIE-ECHOED.
+      this.control.push(chunk(chunkCookieAck(), 0, u8[]()));
+      this.becomeUp();
+      return;
+    }
+    if (k == chunkCookieAck()) {
+      if (this.state == COOKIE_ECHOED || this.state == COOKIE_WAIT) { this.becomeUp(); }
+      return;
+    }
+    if (k == chunkData()) { this.dataIn(c.flags, c.value); return; }
+    if (k == chunkSack()) { this.sackIn(c.value, now); return; }
+    if (k == chunkForwardTsn()) { this.forwardTsnIn(c.value); return; }
+    if (k == CHUNK_RECONFIG) { this.reconfigIn(c.value, now); return; }
+    if (k == chunkHeartbeat()) { this.control.push(chunk(chunkHeartbeatAck(), 0, c.value)); return; }
+    if (k == chunkAbort()) { this.down(true); return; }
+    if (k == chunkShutdown()) {
+      this.control.push(chunk(chunkShutdownAck(), 0, u8[]()));
+      this.state = SHUTTING_DOWN;
+      return;
+    }
+    if (k == chunkShutdownAck()) {
+      this.control.push(chunk(chunkShutdownComplete(), 0, u8[]()));
+      this.down(false);
+      return;
+    }
+    if (k == chunkShutdownComplete()) { this.down(false); return; }
+    // Anything else — ERROR, HEARTBEAT-ACK, a chunk type we do not know — changes nothing. RFC 4960 §3.2's upper
+    // bits say whether an unknown chunk should be reported; reporting is optional and we skip it.
+  }
+
+  void initIn(this, u8[] v, i64 now) {
+    if (v.len() < 16) { return; }
+    this.theirTag = initiateTag(v);
+    this.peerRwnd = initWindow(v);
+    this.learnPeerStart(initTsn(v));
+    // §5.2.1: met in COOKIE-WAIT or COOKIE-ECHOED, the answer still carries our own tag — the collision then
+    // resolves as both ends echo each other's cookie.
+    u8[] value = initValue(this.ourTag, this.window, 65535, 65535, this.nextTsn - this.flightAndQueued(),
+                           withCookie(extensionParams(), this.cookie));
+    this.out.push(packet(5000, 5000, this.theirTag, chunk(chunkInitAck(), 0, value)));
+  }
+
+  void initAckIn(this, u8[] v, i64 now) {
+    if (this.state != COOKIE_WAIT || v.len() < 16) { return; }
+    this.theirTag = initiateTag(v);
+    this.peerRwnd = initWindow(v);
+    this.learnPeerStart(initTsn(v));
+    this.cookieToEcho = stateCookie(v);
+    this.state = COOKIE_ECHOED;
+    this.t1Tries = 0;
+    this.sendCookieEcho(now);
+  }
+
+  /** The peer's initial TSN: our cumulative point starts one below it, and so does its reconfig numbering. */
+  void learnPeerStart(this, i32 tsn) {
+    if (!this.haveCum) {
+      this.cumTsn = tsn - 1;
+      this.haveCum = true;
+    }
+    if (!this.peerReqSeqKnown) {
+      this.peerReqSeq = tsn;
+      this.peerReqSeqKnown = true;
+    }
+  }
+
+  void becomeUp(this) {
+    if (this.state == ESTABLISHED) { return; }
+    this.state = ESTABLISHED;
+    this.happened.push(SctpEvent.Up);
+  }
+
+  void sendInit(this, i64 now) {
+    this.t1At = now;
+    this.t1Tries++;
+    u8[] value = initValue(this.ourTag, this.window, 65535, 65535, this.nextTsn, extensionParams());
+    this.out.push(packet(5000, 5000, 0, chunk(chunkInit(), 0, value)));
+  }
+
+  void sendCookieEcho(this, i64 now) {
+    this.t1At = now;
+    this.t1Tries++;
+    this.out.push(packet(5000, 5000, this.theirTag, chunk(chunkCookieEcho(), 0, this.cookieToEcho)));
+  }
+
+  /** How many TSNs have been taken but not yet acknowledged — never more than zero before the handshake. */
+  i32 flightAndQueued(const this) { return 0; }
+
+  // ─────────────────────────────────────────────────────────────────────────────────────── receiving ───
+
+  void dataIn(this, i32 flags, u8[] v) {
+    if (v.len() < 12 || !this.haveCum) { return; }
+    this.sackDue = true;
+    i32 tsn = bigI32(v, 0);
+    if (!tsnBefore(this.cumTsn, tsn)) { return; }               // at or below the cumulative point: a duplicate
+    if (this.aboveAt(tsn) >= 0) { return; }                     // above it, but already here
+    i32 stream = (v[4] as i32 << 8) | v[5] as i32;
+    i32 ssn = (v[6] as i32 << 8) | v[7] as i32;
+    i32 ppid = bigI32(v, 8);
+    u8[] data = u8[].filled(v.len() - 12, 0);
+    data.copyFrom(v, 12, 0, data.len());
+    this.noteTsn(tsn);
+    Inbound ib = this.inboundOf(stream);
+    ib.frags.push(Fragment(tsn, ssn, flags, ppid, data));
+    this.deliver(stream, ib);
+    this.performWaitingResets();
+  }
+
+  Inbound inboundOf(this, i32 stream) {
+    Inbound? got = this.inbound.get(stream);
+    if (got is not null) { return got!; }
+    Inbound fresh = Inbound(0, Vec<Fragment>.create());
+    this.inbound.set(stream, fresh);
+    return fresh;
+  }
+
+  /** Record a new TSN, folding the run above the cumulative point into it where the hole closes. */
+  void noteTsn(this, i32 tsn) {
+    if (tsn == this.cumTsn + 1) {
+      this.cumTsn = tsn;
+      while (this.above.len() > 0 && this.above.get(0) == this.cumTsn + 1) {
+        this.cumTsn = this.above.remove(0);
+      }
+      return;
+    }
+    i32 i = 0;
+    while (i < this.above.len() && tsnBefore(this.above.get(i), tsn)) { i++; }
+    this.above.insert(i, tsn);
+  }
+
+  i32 aboveAt(const this, i32 tsn) {
+    for (i32 i = 0; i < this.above.len(); i++) { if (this.above.get(i) == tsn) { return i; } }
+    return -1;
+  }
+
+  /**
+   * Hand up every message on `stream` that is now whole and due: an unordered one as soon as its fragments run
+   * from B to E without a gap, an ordered one when it is also the stream's next sequence number.
+   */
+  void deliver(this, i32 stream, Inbound ib) {
+    bool progress = true;
+    while (progress) {
+      progress = false;
+      for (i32 i = 0; i < ib.frags.len() && !progress; i++) {
+        Fragment f = ib.frags.get(i);
+        if ((f.flags & dataFlagBegin()) == 0) { continue; }
+        bool unordered = (f.flags & dataFlagUnordered()) != 0;
+        if (!unordered && f.ssn != ib.nextSsn) { continue; }
+        i32[] run = this.runFrom(ib, f.tsn);
+        if (run.len() == 0) { continue; }
+        u8[] whole = joinRun(ib, run);
+        i32 ppid = f.ppid;
+        removeRun(ib, run);
+        if (!unordered) { ib.nextSsn = (ib.nextSsn + 1) & 0xFFFF; }
+        this.happened.push(SctpEvent.Message(stream, ppid, whole));
+        progress = true;
+      }
+    }
+  }
+
+  /** The indices of the fragments from the one at `tsn` (a B) through an E, TSNs consecutive — or none. */
+  i32[] runFrom(const this, const Inbound ib, i32 tsn) {
+    Vec<i32> idx = Vec<i32>.create();
+    i32 want = tsn;
+    while (true) {
+      i32 at = -1;
+      for (i32 i = 0; i < ib.frags.len(); i++) { if (ib.frags.get(i).tsn == want) { at = i; break; } }
+      if (at < 0) { return i32[](); }
+      if (idx.len() > 0 && (ib.frags.get(at).flags & dataFlagBegin()) != 0) { return i32[](); }
+      idx.push(at);
+      if ((ib.frags.get(at).flags & dataFlagEnd()) != 0) { return idx.toArray(); }
+      want = want + 1;
+    }
+    return i32[]();
+  }
+
+  /** FORWARD-TSN: the peer gave up on everything up to a TSN; stop waiting for it. */
+  void forwardTsnIn(this, u8[] v) {
+    if (v.len() < 4 || !this.haveCum) { return; }
+    this.sackDue = true;
+    i32 newCum = bigI32(v, 0);
+    if (tsnBefore(this.cumTsn, newCum)) {
+      this.cumTsn = newCum;
+      while (this.above.len() > 0 && !tsnBefore(this.cumTsn, this.above.get(0))) { this.above.remove(0); }
+      while (this.above.len() > 0 && this.above.get(0) == this.cumTsn + 1) { this.cumTsn = this.above.remove(0); }
+    }
+    // The ordered streams it names skip past the sequence numbers given up on.
+    for (i32 at = 4; at + 4 <= v.len(); at += 4) {
+      i32 stream = (v[at] as i32 << 8) | v[at + 1] as i32;
+      i32 ssn = (v[at + 2] as i32 << 8) | v[at + 3] as i32;
+      Inbound ib = this.inboundOf(stream);
+      if (ssnBefore(ib.nextSsn, (ssn + 1) & 0xFFFF) || ib.nextSsn == ssn) { ib.nextSsn = (ssn + 1) & 0xFFFF; }
+    }
+    // Fragments at or below the new point can never be completed now.
+    i32[] streams = this.inbound.keys();
+    for (i32 s = 0; s < streams.len(); s++) {
+      Inbound ib = this.inboundOf(streams[s]);
+      i32 i = 0;
+      while (i < ib.frags.len()) {
+        if (!tsnBefore(this.cumTsn, ib.frags.get(i).tsn)) { ib.frags.remove(i); } else { i++; }
+      }
+      this.deliver(streams[s], ib);
+    }
+    this.performWaitingResets();
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────────────────── sending ───
+
+  void sackIn(this, u8[] v, i64 now) {
+    if (v.len() < 12) { return; }
+    i32 cum = bigI32(v, 0);
+    i32 rwnd = bigI32(v, 4);
+    i32 gaps = (v[8] as i32 << 8) | v[9] as i32;
+    if (tsnBefore(cum, this.peerCumAck)) { return; }            // older than one already seen
+    i32 ackedBytes = 0;
+    while (this.flight.len() > 0 && !tsnBefore(cum, this.flight.get(0).tsn)) {
+      Outgoing o = this.flight.remove(0);
+      if (!o.abandoned && !o.gapAcked) {
+        ackedBytes += o.bytes.len();
+        // Karn: a chunk sent more than once gives no sample — either transmission could be the one answered.
+        if (o.tries == 1) { this.sample(now - o.sentAt); }
+      }
+    }
+    this.peerCumAck = cum;
+    if (tsnBefore(this.advancedAckPoint, cum)) { this.advancedAckPoint = cum; }
+    i32 highestGap = cum;
+    for (i32 g = 0; g < gaps && 12 + g * 4 + 4 <= v.len(); g++) {
+      i32 from = cum + ((v[12 + g * 4] as i32 << 8) | v[13 + g * 4] as i32);
+      i32 to = cum + ((v[14 + g * 4] as i32 << 8) | v[15 + g * 4] as i32);
+      for (i32 i = 0; i < this.flight.len(); i++) {
+        Outgoing o = this.flight.get(i);
+        if (!tsnBefore(o.tsn, from) && !tsnBefore(to, o.tsn) && !o.gapAcked) {
+          o.gapAcked = true;
+          if (!o.abandoned) { ackedBytes += o.bytes.len(); }
+        }
+      }
+      if (tsnBefore(highestGap, to)) { highestGap = to; }
+    }
+    this.grow(ackedBytes);
+    this.peerRwnd = rwnd - this.outstanding();
+    // **Missing reports**: below the highest gap-acknowledged TSN and not acknowledged. The third report is a
+    // fast retransmit (§7.2.4) — or, for a chunk past its retransmission allowance, abandonment.
+    bool fastAny = false;
+    for (i32 i = 0; i < this.flight.len(); i++) {
+      Outgoing o = this.flight.get(i);
+      if (o.gapAcked || o.abandoned || !tsnBefore(o.tsn, highestGap)) { continue; }
+      o.missing++;
+      if (o.missing < 3) { continue; }
+      o.missing = 0;
+      if (o.maxRetransmits >= 0 && o.tries > o.maxRetransmits) {
+        this.abandon(o);
+        continue;
+      }
+      if (!fastAny) {
+        i32 half = this.cwnd / 2;
+        this.ssthresh = half > 4 * MAX_PACKET ? half : 4 * MAX_PACKET;
+        this.cwnd = this.ssthresh;
+        this.partialAcked = 0;
+        fastAny = true;
+      }
+      o.tries++;
+      o.sentAt = now;
+      this.out.push(packet(5000, 5000, this.theirTag, o.bytes));
+    }
+    this.advanceAckPoint();
+  }
+
+  /** Give up on a chunk, and on the rest of its message, which can no longer be completed. */
+  void abandon(this, Outgoing o) {
+    for (i32 i = 0; i < this.flight.len(); i++) {
+      Outgoing p = this.flight.get(i);
+      if (p.stream == o.stream && p.ssn == o.ssn && p.unordered == o.unordered && !p.abandoned) { p.abandoned = true; }
+    }
+    i32 i = 0;
+    while (i < this.queued.len()) {
+      Outgoing q = this.queued.get(i);
+      if (q.stream == o.stream && q.ssn == o.ssn && q.unordered == o.unordered && q.tries == 0 && o.tries > 0
+          && isContinuation(q, o)) {
+        q.abandoned = true;
+        q.tries = 1;
+        this.flight.push(this.queued.remove(i));
+        sortFlight(this.flight);
+      } else {
+        i++;
+      }
+    }
+  }
+
+  /**
+   * Move the Advanced.Peer.Ack.Point over every acknowledged-or-abandoned chunk at the front of the flight, and
+   * if that passes what the peer has acknowledged, a FORWARD-TSN is due (RFC 3758 §3.5).
+   */
+  void advanceAckPoint(this) {
+    for (i32 i = 0; i < this.flight.len(); i++) {
+      Outgoing o = this.flight.get(i);
+      if (o.tsn != this.advancedAckPoint + 1) { break; }
+      if (!o.abandoned && !o.gapAcked) { break; }
+      this.advancedAckPoint = o.tsn;
+    }
+    if (tsnBefore(this.peerCumAck, this.advancedAckPoint)) { this.forwardTsnDue = true; }
+  }
+
+  /** The FORWARD-TSN chunk: the new cumulative point, then each ordered stream's last skipped sequence number. */
+  u8[] forwardTsnChunk(const this) {
+    Map<i32, i32> lastSsn = Map<i32, i32>.create(hashI32, i32Eq);
+    for (i32 i = 0; i < this.flight.len(); i++) {
+      const Outgoing o = this.flight.get(i);
+      if (tsnBefore(this.advancedAckPoint, o.tsn)) { break; }
+      if (o.abandoned && !o.unordered) { lastSsn.set(o.stream, o.ssn); }
+    }
+    i32[] streams = lastSsn.keys();
+    u8[] v = u8[].filled(4 + streams.len() * 4, 0);
+    putI32(v, 0, this.advancedAckPoint);
+    for (i32 i = 0; i < streams.len(); i++) {
+      i32 ssn = lastSsn.getOr(streams[i], 0);
+      v[4 + i * 4] = ((streams[i] >> 8) & 0xFF) as@ u8;
+      v[5 + i * 4] = (streams[i] & 0xFF) as@ u8;
+      v[6 + i * 4] = ((ssn >> 8) & 0xFF) as@ u8;
+      v[7 + i * 4] = (ssn & 0xFF) as@ u8;
+    }
+    return chunk(chunkForwardTsn(), 0, v);
+  }
+
+  /** T3: every chunk whose timer ran out is resent — or, past its allowance, abandoned. */
+  void retransmitDue(this, i64 now) {
+    bool timedOut = false;
+    i32 room = MAX_PACKET * 4;
+    for (i32 i = 0; i < this.flight.len(); i++) {
+      Outgoing o = this.flight.get(i);
+      if (o.gapAcked || o.abandoned) { continue; }
+      if (now - o.sentAt < backoff(this.rto(), o.tries - 1)) { continue; }
+      if (!timedOut) {
+        timedOut = true;
+        i32 half = this.cwnd / 2;
+        this.ssthresh = half > 4 * MAX_PACKET ? half : 4 * MAX_PACKET;
+        this.cwnd = MAX_PACKET;
+        this.partialAcked = 0;
+      }
+      if (o.maxRetransmits >= 0 && o.tries > o.maxRetransmits) {
+        this.abandon(o);
+        continue;
+      }
+      if (room < o.bytes.len()) { continue; }
+      room -= o.bytes.len();
+      o.tries++;
+      o.sentAt = now;
+      o.missing = 0;
+      this.out.push(packet(5000, 5000, this.theirTag, o.bytes));
+    }
+    if (timedOut) { this.advanceAckPoint(); }
+  }
+
+  /**
+   * Build packets: control chunks first, a SACK if one is due, a FORWARD-TSN if one is, then as much new DATA as
+   * the congestion window and the peer's window allow — bundled, each packet under MAX_PACKET.
+   */
+  void flush(this, i64 now) {
+    if (this.state == CLOSED && this.theirTag == 0) { return; }
+    Vec<u8[]> chunks = Vec<u8[]>.create();
+    for (i32 i = 0; i < this.control.len(); i++) { chunks.push(this.control.get(i)); }
+    this.control = Vec<u8[]>.create();
+    if (this.sackDue && this.haveCum) {
+      chunks.push(chunk(chunkSack(), 0, this.sackBody()));
+      this.sackDue = false;
+    }
+    if (this.forwardTsnDue && this.state == ESTABLISHED) {
+      chunks.push(this.forwardTsnChunk());
+      this.forwardTsnDue = false;
+    }
+    if (this.state == ESTABLISHED) {
+      while (this.queued.len() > 0) {
+        Outgoing o = this.queued.get(0);
+        i32 inFlight = this.outstanding();
+        bool firstOne = inFlight == 0;
+        if (!firstOne && (inFlight + o.bytes.len() > this.cwnd || o.bytes.len() > this.peerRwnd)) { break; }
+        this.queued.remove(0);
+        o.tries = 1;
+        o.sentAt = now;
+        this.flight.push(o);
+        this.peerRwnd -= o.bytes.len();
+        chunks.push(o.bytes);
+      }
+    }
+    // Bundle into packets.
+    Vec<u8[]> pending = Vec<u8[]>.create();
+    i32 size = 0;
+    for (i32 i = 0; i < chunks.len(); i++) {
+      u8[] c = chunks.get(i);
+      if (pending.len() > 0 && 12 + size + c.len() > MAX_PACKET) {
+        this.out.push(packet(5000, 5000, this.theirTag, concat(pending)));
+        pending = Vec<u8[]>.create();
+        size = 0;
+      }
+      pending.push(c);
+      size += c.len();
+    }
+    if (pending.len() > 0) { this.out.push(packet(5000, 5000, this.theirTag, concat(pending))); }
+  }
+
+  /** Bytes sent and not yet acknowledged or abandoned. */
+  i32 outstanding(const this) {
+    i32 n = 0;
+    for (i32 i = 0; i < this.flight.len(); i++) {
+      const Outgoing o = this.flight.get(i);
+      if (!o.gapAcked && !o.abandoned) { n += o.bytes.len(); }
+    }
+    return n;
+  }
+
+  u8[] sackBody(const this) {
+    Vec<i32> starts = Vec<i32>.create();
+    Vec<i32> ends = Vec<i32>.create();
+    i32 i = 0;
+    while (i < this.above.len() && starts.len() < 64) {
+      i32 from = this.above.get(i);
+      i32 to = from;
+      while (i + 1 < this.above.len() && this.above.get(i + 1) == to + 1) { i++; to = this.above.get(i); }
+      starts.push(from - this.cumTsn);
+      ends.push(to - this.cumTsn);
+      i++;
+    }
+    return sackValueGaps(this.cumTsn, this.window, starts.toArray(), ends.toArray(), starts.len());
+  }
+
+  void grow(this, i32 ackedBytes) {
+    if (ackedBytes <= 0) { return; }
+    if (this.cwnd <= this.ssthresh) {
+      this.cwnd += ackedBytes < MAX_PACKET ? ackedBytes : MAX_PACKET;
+      return;
+    }
+    this.partialAcked += ackedBytes;
+    if (this.partialAcked >= this.cwnd) {
+      this.partialAcked -= this.cwnd;
+      this.cwnd += MAX_PACKET;
+    }
+  }
+
+  void sample(this, i64 r) {
+    if (r < (0 as i64)) { return; }
+    if (this.srtt < (0 as i64)) {
+      this.srtt = r;
+      this.rttvar = r / (2 as i64);
+      return;
+    }
+    i64 diff = this.srtt > r ? this.srtt - r : r - this.srtt;
+    this.rttvar = this.rttvar + (diff - this.rttvar) / (4 as i64);
+    this.srtt = this.srtt + (r - this.srtt) / (8 as i64);
+  }
+
+  /** RFC 4960's RTO: a second before any sample, then srtt + 4·rttvar, between one second and sixty. */
+  i64 rto(const this) {
+    if (this.srtt < (0 as i64)) { return 1000 as i64; }
+    i64 t = this.srtt + (4 as i64) * this.rttvar;
+    if (t < (1000 as i64)) { return 1000 as i64; }
+    return t > (60000 as i64) ? 60000 as i64 : t;
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────────── reconfiguration ───
+
+  void askReset(this, i64 now) {
+    if (this.resetAsked is not null || this.resetWanted.len() == 0 || this.state != ESTABLISHED) { return; }
+    i32[] streams = this.resetWanted.toArray();
+    this.resetWanted = Vec<i32>.create();
+    i32 seq = this.ourReqSeq;
+    this.ourReqSeq = seq + 1;
+    u8[] param = u8[].filled(16 + streams.len() * 2, 0);
+    param[0] = 0;
+    param[1] = PARAM_OUTGOING_RESET as@ u8;
+    param[2] = (((16 + streams.len() * 2) >> 8) & 0xFF) as@ u8;
+    param[3] = ((16 + streams.len() * 2) & 0xFF) as@ u8;
+    putI32(param, 4, seq);
+    putI32(param, 8, this.peerReqSeq - 1);
+    putI32(param, 12, this.nextTsn - 1);           // the last TSN we assigned: the peer waits for all of it
+    for (i32 i = 0; i < streams.len(); i++) {
+      param[16 + i * 2] = ((streams[i] >> 8) & 0xFF) as@ u8;
+      param[17 + i * 2] = (streams[i] & 0xFF) as@ u8;
+    }
+    u8[] c = chunk(CHUNK_RECONFIG, 0, param);
+    this.resetAsked = ResetAsk(seq, streams, c, now, 1);
+    this.control.push(c);
+  }
+
+  void reconfigIn(this, u8[] v, i64 now) {
+    i32 at = 0;
+    while (at + 4 <= v.len()) {
+      i32 kind = (v[at] as i32 << 8) | v[at + 1] as i32;
+      i32 len = (v[at + 2] as i32 << 8) | v[at + 3] as i32;
+      if (len < 4 || at + len > v.len()) { return; }
+      if (kind == PARAM_OUTGOING_RESET && len >= 16) {
+        i32 seq = bigI32(v, at + 4);
+        i32 lastTsn = bigI32(v, at + 12);
+        i32 n = (len - 16) / 2;
+        i32[] streams = i32[].filled(n, 0);
+        for (i32 i = 0; i < n; i++) { streams[i] = (v[at + 16 + i * 2] as i32 << 8) | v[at + 17 + i * 2] as i32; }
+        this.resetRequested(seq, lastTsn, streams);
+      } else if (kind == PARAM_RECONFIG_RESPONSE && len >= 12) {
+        this.resetAnswered(bigI32(v, at + 4), bigI32(v, at + 8), now);
+      }
+      at += (len + 3) & ~3;
+    }
+  }
+
+  /**
+   * A peer's request to reset its outgoing streams. Performed once every TSN up to its last assigned has arrived
+   * — until then the streams still have data on the way, and resetting them would misnumber it.
+   */
+  void resetRequested(this, i32 seq, i32 lastTsn, i32[] streams) {
+    if (seq == this.peerReqSeq - 1 && this.lastResponse.len() > 0) {
+      this.control.push(this.lastResponse);                    // a retransmission: the same answer again
+      return;
+    }
+    if (seq != this.peerReqSeq) { return; }
+    for (i32 i = 0; i < this.resetsWaiting.len(); i++) { if (this.resetsWaiting.get(i).seq == seq) { return; } }
+    this.resetsWaiting.push(ResetWaiting(seq, lastTsn, streams));
+    this.performWaitingResets();
+  }
+
+  void performWaitingResets(this) {
+    while (this.resetsWaiting.len() > 0) {
+      ResetWaiting w = this.resetsWaiting.get(0);
+      if (tsnBefore(this.cumTsn, w.lastTsn)) { return; }
+      this.resetsWaiting.remove(0);
+      for (i32 i = 0; i < w.streams.len(); i++) {
+        Inbound ib = this.inboundOf(w.streams[i]);
+        ib.nextSsn = 0;
+        ib.frags = Vec<Fragment>.create();
+        this.happened.push(SctpEvent.Reset(w.streams[i]));
+      }
+      this.peerReqSeq = w.seq + 1;
+      u8[] param = u8[].filled(12, 0);
+      param[1] = PARAM_RECONFIG_RESPONSE as@ u8;
+      param[3] = 12;
+      putI32(param, 4, w.seq);
+      putI32(param, 8, RECONFIG_PERFORMED);
+      this.lastResponse = chunk(CHUNK_RECONFIG, 0, param);
+      this.control.push(this.lastResponse);
+    }
+  }
+
+  void resetAnswered(this, i32 seq, i32 result, i64 now) {
+    if (this.resetAsked is null || this.resetAsked!.seq != seq) { return; }
+    if (result == RECONFIG_IN_PROGRESS) { return; }            // asked again when the timer runs out
+    i32[] streams = this.resetAsked!.streams;
+    this.resetAsked = null;
+    if (result == RECONFIG_PERFORMED) {
+      for (i32 i = 0; i < streams.len(); i++) {
+        this.nextSsn.set(streams[i], 0);
+        this.happened.push(SctpEvent.ResetDone(streams[i]));
+      }
+    }
+    this.askReset(now);
+  }
+
+  void down(this, bool aborted) {
+    if (this.state == CLOSED && this.happened.len() > 0) {
+      // Already reported as down, or never up: report once.
+    }
+    bool wasUp = this.state != CLOSED;
+    this.state = CLOSED;
+    this.theirTag = this.theirTag;
+    this.queued = Vec<Outgoing>.create();
+    this.flight = Vec<Outgoing>.create();
+    if (wasUp) { this.happened.push(SctpEvent.Down(aborted)); }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────── helpers ───
+
+/**
+ * The parameters an INIT and an INIT-ACK carry so the peer knows what this end speaks: Supported Extensions
+ * (0x8008) naming RE-CONFIG and FORWARD-TSN, and Forward-TSN-Supported (0xC000). A peer that does not see them
+ * assumes the plain RFC 4960 — and a browser then refuses to open an unreliable channel, or never resets one.
+ */
+u8[] extensionParams() {
+  return [0x80 as u8, 0x08 as u8, 0x00 as u8, 0x06 as u8, 0x82 as u8, 0xC0 as u8, 0x00 as u8, 0x00 as u8,
+          0xC0 as u8, 0x00 as u8, 0x00 as u8, 0x04 as u8] as u8[];
+}
+
+/** `params`, then a state cookie parameter (7) holding `cookie`, padded. */
+u8[] withCookie(u8[] params, u8[] cookie) {
+  i32 len = 4 + cookie.len();
+  u8[] out = u8[].filled(params.len() + ((len + 3) & ~3), 0);
+  out.copyFrom(params, 0, 0, params.len());
+  out[params.len()] = 0;
+  out[params.len() + 1] = 7;
+  out[params.len() + 2] = ((len >> 8) & 0xFF) as@ u8;
+  out[params.len() + 3] = (len & 0xFF) as@ u8;
+  out.copyFrom(cookie, 0, params.len() + 4, cookie.len());
+  return out;
+}
+
+i64 backoff(i64 rto, i32 tries) {
+  i64 t = rto;
+  for (i32 i = 0; i < tries && t < (60000 as i64); i++) { t = t * (2 as i64); }
+  return t > (60000 as i64) ? 60000 as i64 : t;
+}
+
+/** Serial comparison on 16-bit stream sequence numbers. */
+bool ssnBefore(i32 a, i32 b) { return ((a - b) & 0xFFFF) > 0x8000; }
+
+bool isContinuation(Outgoing q, Outgoing o) { return tsnBefore(o.tsn, q.tsn); }
+
+void sortFlight(Vec<Outgoing> f) {
+  for (i32 i = 1; i < f.len(); i++) {
+    i32 j = i;
+    while (j > 0 && tsnBefore(f.get(j).tsn, f.get(j - 1).tsn)) {
+      Outgoing t = f.get(j);
+      f.set(j, f.get(j - 1));
+      f.set(j - 1, t);
+      j--;
+    }
+  }
+}
+
+u8[] joinRun(const Inbound ib, i32[] run) {
+  i32 n = 0;
+  for (i32 i = 0; i < run.len(); i++) { n += ib.frags.get(run[i]).data.len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < run.len(); i++) {
+    const u8[] d = ib.frags.get(run[i]).data;
+    out.copyFrom(d, 0, at, d.len());
+    at += d.len();
+  }
+  return out;
+}
+
+void removeRun(Inbound ib, i32[] run) {
+  Vec<Fragment> kept = Vec<Fragment>.create();
+  for (i32 i = 0; i < ib.frags.len(); i++) {
+    bool drop = false;
+    for (i32 k = 0; k < run.len(); k++) { if (run[k] == i) { drop = true; } }
+    if (!drop) { kept.push(ib.frags.get(i)); }
+  }
+  ib.frags = kept;
+}
+
+u8[] concat(Vec<u8[]> parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts.get(i).len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    u8[] p = parts.get(i);
+    out.copyFrom(p, 0, at, p.len());
+    at += p.len();
+  }
+  return out;
+}
+
+i32 bigI32(const u8[] b, i32 at) {
+  return (b[at] as i32 << 24) | (b[at + 1] as i32 << 16) | (b[at + 2] as i32 << 8) | b[at + 3] as i32;
+}
+
+void putI32(u8[] b, i32 at, i32 v) {
+  b[at] = ((v >> 24) & 0xFF) as@ u8;
+  b[at + 1] = ((v >> 16) & 0xFF) as@ u8;
+  b[at + 2] = ((v >> 8) & 0xFF) as@ u8;
+  b[at + 3] = (v & 0xFF) as@ u8;
+}

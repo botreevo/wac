@@ -1,85 +1,118 @@
-// The probe for `Session` — the layer that joins ICE, DTLS and SCTP into a data channel.
+// The probe for `Session` — the layer that joins ICE, DTLS, SCTP and DCEP into data channels.
+//
+// **The browser test reads a session as it read the one-channel version**: messages taken one at a time, the
+// label of the channel the peer opened, whether it opened. `Probed` keeps that shape over the event stream the
+// session now answers with, so `browser.test.ts` measures the protocol and not this file's bookkeeping.
 
-import { Association } from "../../src/sctp.wac";
+import { Association } from "../../src/association.wac";
 import { Consent } from "../../src/ice.wac";
 import { Peer } from "../../src/peer.wac";
-import { Session, chunkBytes, dcepAck, dcepOpen, ppidDcep, ppidString } from "../../src/session.wac";
+import { Session, ChannelEvent } from "../../src/session.wac";
+import { ppidDcep, ppidString, dcepAck, dcepOpen } from "../../src/sctp.wac";
+import { MAX_CHUNK_DATA } from "../../src/association.wac";
 import { hexColons } from "../../src/sdp.wac";
 import { sha256 } from "../../../crypto/src/sha256.wac";
+import { Vec } from "core";
+
+export struct Probed {
+  Session s;
+  Vec<u8[]> inbox;
+  string label;
+  bool opened;
+  bool aborted;
+  /** Whether the association ever came up — the browser test asks after its peer has gone. */
+  bool wasUp;
+}
+
+/** The session's events, folded into the inbox. */
+void fold(Probed p) {
+  ChannelEvent[] evs = p.s.events();
+  for (i32 i = 0; i < evs.len(); i++) {
+    match (evs[i]) {
+      Opened(id, label, ordered, rexmit): { p.opened = true; p.label = label; }
+      Message(id, binary, data): { p.inbox.push(data); }
+      Down(aborted): { p.aborted = aborted; }
+      Up: { p.wasUp = true; }
+      default: { }
+    }
+  }
+}
+
+Probed probed(Session s) { return Probed(s, Vec<u8[]>.create(), "", false, false, false); }
 
 /** A session over a fresh peer and association, so a test can build one in a line. */
-export Session sessionFor(u8[] certDer, u8[] signingKey, u8[] nonce, u8[] scalar, u8[] random,
-                          u8[] cookie, string ourUfrag, string ourPwd, string theirUfrag,
-                          string theirPwd, string expectFingerprint) {
-  return Session.of(Peer.of(certDer, signingKey, nonce, scalar, random, cookie),
-                    Association.of(0x11111111, 1, 65536),
-                    Consent.of(5000 as i64, 30000 as i64, 0 as i64),
-                    ourUfrag, ourPwd, theirUfrag, theirPwd, cookie, expectFingerprint);
+export Probed sessionFor(u8[] certDer, u8[] signingKey, u8[] nonce, u8[] scalar, u8[] random,
+                         u8[] cookie, string ourUfrag, string ourPwd, string theirUfrag,
+                         string theirPwd, string expectFingerprint) {
+  return probed(Session.of(Peer.of(certDer, signingKey, nonce, scalar, random, cookie),
+                           Association.create(false, 0x11111111, 1, 65536),
+                           Consent.of(5000 as i64, 30000 as i64, 0 as i64),
+                           ourUfrag, ourPwd, theirUfrag, theirPwd, expectFingerprint));
 }
 
 /**
- * A session built from bytes rather than from struct handles.
- *
- * **Structs do not cross module instances.** Each `wacBind` is its own wasm instance, so a `Peer`
- * built by the peer probe is a different type from this file's `Peer` and cannot be handed in — the
- * error is `type incompatibility when transforming from/to JS`, which says nothing about why. So a
- * caller that wants a session gives it the material and lets it construct its own.
+ * A session built from bytes rather than from struct handles. **Structs do not cross module instances**: each
+ * `wacBind` is its own wasm instance, so a caller gives the material and lets this construct its own.
  */
-export Session sessionOver(u8[] certDer, u8[] signingKey, u8[] nonce, u8[] scalar, u8[] random,
-                           u8[] dtlsCookie, i32 ourTag, i32 initialTsn, u8[] sctpCookie,
-                           i64 consentInterval, i64 now, string ourUfrag, string ourPwd,
-                           string theirUfrag, string theirPwd, string expectFingerprint) {
-  return Session.of(Peer.of(certDer, signingKey, nonce, scalar, random, dtlsCookie),
-                    Association.of(ourTag, initialTsn, 65536),
-                    Consent.of(consentInterval, 30000 as i64, now),
-                    ourUfrag, ourPwd, theirUfrag, theirPwd, sctpCookie, expectFingerprint);
+export Probed sessionOver(u8[] certDer, u8[] signingKey, u8[] nonce, u8[] scalar, u8[] random,
+                          u8[] dtlsCookie, i32 ourTag, i32 initialTsn, u8[] sctpCookie,
+                          i64 consentInterval, i64 now, string ourUfrag, string ourPwd,
+                          string theirUfrag, string theirPwd, string expectFingerprint) {
+  return probed(Session.of(Peer.of(certDer, signingKey, nonce, scalar, random, dtlsCookie),
+                           Association.create(false, ourTag, initialTsn, 65536),
+                           Consent.of(consentInterval, 30000 as i64, now),
+                           ourUfrag, ourPwd, theirUfrag, theirPwd, expectFingerprint));
 }
 
 // Observation, so the browser test can keep measuring the protocol and not only the composition.
-export u8[] sessionApplication(Session s, u8[] datagram, i32 at) {
-  return s.peer.application(datagram, at);
-}
-export bool sessionPeerEstablished(Session s) { return s.peer.established; }
-export bool sessionAssocEstablished(Session s) { return s.assoc.established; }
-export i32 sessionWaiting(Session s) { return s.assoc.waiting(); }
-export i32 sessionWindow(Session s) { return s.assoc.congestionWindow(); }
-export bool sessionAborted(Session s) { return s.assoc.abortedByPeer(); }
-export u8[] sessionPeerCertificate(Session s) { return s.peer.peerCertificate(); }
-export bool sessionPeerAuthenticated(Session s) { return s.peer.peerAuthenticated(); }
-export bool sessionPeerIsExpected(Session s) { return s.peerIsExpected(); }
+export u8[] sessionApplication(Probed p, u8[] datagram, i32 at) { return p.s.peer.application(datagram, at); }
+export bool sessionPeerEstablished(Probed p) { return p.s.peer.established; }
+/** Whether the association came up at some point: the cookie was echoed and acknowledged. */
+export bool sessionAssocEstablished(Probed p) { fold(p); return p.wasUp; }
+export i32 sessionWaiting(Probed p) { return p.s.assoc.queued.len(); }
+export i32 sessionWindow(Probed p) { return p.s.assoc.cwnd; }
+export bool sessionAborted(Probed p) { fold(p); return p.aborted; }
+export u8[] sessionPeerCertificate(Probed p) { return p.s.peer.peerCertificate(); }
+export bool sessionPeerAuthenticated(Probed p) { return p.s.peer.peerAuthenticated(); }
+export bool sessionPeerIsExpected(Probed p) { return p.s.peerIsExpected(); }
 /** The peer's certificate fingerprint, spelled the way an SDP's `a=fingerprint` line spells it. */
-export string sessionPeerFingerprint(Session s) {
-  u8[] der = s.peer.peerCertificate();
+export string sessionPeerFingerprint(Probed p) {
+  u8[] der = p.s.peer.peerCertificate();
   return der.len() == 0 ? "" : hexColons(sha256(der));
 }
-export bool sessionConsentLive(Session s, i64 now) { return s.consent.live(now); }
-export bool sessionConsentDue(Session s, i64 now) { return s.consent.due(now); }
-export void sessionConsentSent(Session s, u8[] tid, i64 now) { s.consent.sent(tid, now); }
-export bool sessionConsentAnswered(Session s, u8[] msg, u8[] password, i64 now) {
-  return s.consent.answered(msg, password, now);
+export bool sessionConsentLive(Probed p, i64 now) { return p.s.consent.live(now); }
+export bool sessionConsentDue(Probed p, i64 now) { return p.s.consent.due(now); }
+export void sessionConsentSent(Probed p, u8[] tid, i64 now) { p.s.consent.sent(tid, now); }
+export bool sessionConsentAnswered(Probed p, u8[] msg, u8[] password, i64 now) {
+  return p.s.consent.answered(msg, password, now);
 }
 
-export Session newSession(Peer peer, Association assoc, Consent consent, string ourUfrag,
-                          string ourPwd, string theirUfrag, string theirPwd, u8[] cookie,
-                          string expectFingerprint) {
-  return Session.of(peer, assoc, consent, ourUfrag, ourPwd, theirUfrag, theirPwd, cookie,
-                    expectFingerprint);
+export u8[][] sessionReceive(Probed p, u8[] datagram, u8[] fromIp, i32 fromPort, i64 now) {
+  u8[][] out = p.s.receive(datagram, fromIp, fromPort, now);
+  fold(p);
+  return out;
 }
-export u8[][] sessionReceive(Session s, u8[] datagram, u8[] fromIp, i32 fromPort, i64 now) {
-  return s.receive(datagram, fromIp, fromPort, now);
+/** A message on `stream`, as a string — what the browser's channel reads it back as. */
+export u8[][] sessionSend(Probed p, i32 stream, u8[] payload, i64 now) { return p.s.send(stream, payload, false, now); }
+export u8[][] sessionTick(Probed p, i64 now) {
+  u8[][] out = p.s.tick(now);
+  fold(p);
+  return out;
 }
-export u8[][] sessionSend(Session s, i32 stream, u8[] payload, i64 now) {
-  return s.send(stream, payload, now);
+/** Everything unacknowledged, sealed and ready to go again. */
+export u8[][] sessionResend(Probed p, i64 now) {
+  p.s.assoc.retransmitAll(now);
+  Vec<u8[]> out = Vec<u8[]>.create();
+  p.s.drain(out);
+  return out.toArray();
 }
-export u8[][] sessionTick(Session s, i64 now) { return s.tick(now); }
-export i32 sessionPending(Session s) { return s.pending(); }
-export u8[][] sessionResend(Session s, i64 now) { return s.resend(now); }
-export u8[] sessionTake(Session s) { return s.take(); }
-export u8[] sessionMessage(Session s, i32 i) { return s.message(i); }
-export u8[] sessionLabel(Session s) { return s.channelLabel(); }
-export bool sessionOpen(Session s) { return s.open(); }
-export i32 sessionChecks(Session s) { return s.checks(); }
-export i32 kChunkBytes() { return chunkBytes(); }
+export i32 sessionPending(Probed p) { return p.inbox.len(); }
+/** The oldest whole message, taken; empty when there is none. */
+export u8[] sessionTake(Probed p) { return p.inbox.len() == 0 ? u8[]() : p.inbox.remove(0); }
+export u8[] sessionLabel(Probed p) { return p.label.toBytes(); }
+export bool sessionOpen(Probed p) { return p.opened; }
+export i32 sessionChecks(Probed p) { return p.s.checks(); }
+export i32 kChunkBytes() { return MAX_CHUNK_DATA; }
 export i32 kPpidDcep() { return ppidDcep(); }
 export i32 kPpidString() { return ppidString(); }
 export i32 kDcepOpen() { return dcepOpen(); }

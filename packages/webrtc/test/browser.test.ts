@@ -874,13 +874,16 @@ process.exit(0);
       // ── And how a browser closes, which is not how the specification's example does ──────────
       //
       // **Measured rather than assumed.** The design note said it was unclear whether Chromium sent
-      // SCTP's shutdown exchange at all; it does not. Over a whole session it sent exactly one
-      // chunk that was not DATA, SACK, INIT or COOKIE_ECHO, and it was ABORT. No SHUTDOWN, and no
-      // RE-CONFIG for the data channel closing either. So the graceful exchange is one we may
-      // start, and ABORT is the one we will be handed — which is why ignoring it was a real gap
-      // rather than a tidiness one.
+      // SCTP's shutdown exchange at all; it does not. Over a whole session the chunks that were not
+      // DATA, SACK, INIT or COOKIE_ECHO were ABORT and RE-CONFIG: no SHUTDOWN. So the graceful
+      // exchange is one we may start, and ABORT is the one we will be handed.
+      //
+      // **RE-CONFIG appears because our INIT-ACK now says we speak it** (Supported Extensions, for
+      // RFC 6525). Until it did, Chromium closed the channel with no stream reset at all, since a
+      // peer that does not advertise RE-CONFIG cannot be asked; now it resets the channel's stream
+      // before it aborts, which is RFC 8831 §6.7's close.
       const kinds = [...new Set(chunkLog)].sort((x, y) => x - y);
-      assertEquals(kinds.join(","), "0,1,3,6,10",
+      assertEquals(kinds.join(","), "0,1,3,6,10,130",
         `Chromium sent chunk kinds ${kinds.join(",")}. Expected DATA, INIT, SACK, ABORT and ` +
           "COOKIE_ECHO — and in particular no SHUTDOWN (7). If a 7 appears here, a browser has " +
           "started sending the graceful exchange and the design note's account of this is out of date");

@@ -27,7 +27,8 @@ db.execute("INSERT INTO events (id, seq) VALUES (?, ?)", [Value.Text("e1"), Valu
 
 **The file format, both ways.** It opens databases the real SQLite wrote — tables and indexes, interior
 pages, overflow chains, rows shorter than their table after `ALTER TABLE ADD COLUMN`, integral values in
-REAL columns stored as integers — and writes files the real SQLite accepts: `PRAGMA integrity_check` is
+REAL columns stored as integers, `WITHOUT ROWID` tables, auto-vacuum pointer maps, UTF-16 text, and the
+committed transactions in a write-ahead log beside the file — and writes files the real SQLite accepts: `PRAGMA integrity_check` is
 `ok` on every one, and their contents compare equal row by row (`wac task verify`).
 
 **The SQL is checked against SQLite itself.** `test/corpus/*.sql` are scripts; `tools/corpus.py` runs
@@ -38,11 +39,11 @@ data.
 
 | | |
 | --- | --- |
-| Statements | `SELECT` (inner, `LEFT`, `RIGHT`, `FULL` and `NATURAL` joins, `USING`, subqueries anywhere, correlated or not, `GROUP BY`/`HAVING`, `DISTINCT`, `UNION [ALL]`/`INTERSECT`/`EXCEPT`, `VALUES`, `LIMIT`/`OFFSET`), `WITH [RECURSIVE]`, `INSERT` and `UPDATE` (`OR IGNORE`/`REPLACE`/`FAIL`/`ABORT`/`ROLLBACK`, and each constraint's own `ON CONFLICT`; `ON CONFLICT … DO UPDATE`/`DO NOTHING`, `DEFAULT VALUES`, `INSERT … SELECT`), `DELETE`, `RETURNING` on all three, `CREATE TABLE`/`INDEX`/`VIEW`/`TRIGGER`, `DROP`, `ALTER TABLE` (`ADD COLUMN`, `RENAME TO`, `RENAME COLUMN`, `DROP COLUMN`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` |
+| Statements | `SELECT` (row values, `LEFT`, `RIGHT`, `FULL` and `NATURAL` joins, `USING`, subqueries anywhere, correlated or not, `GROUP BY`/`HAVING`, `DISTINCT`, `UNION [ALL]`/`INTERSECT`/`EXCEPT`, `VALUES`, `LIMIT`/`OFFSET`), `WITH [RECURSIVE]`, `INSERT` and `UPDATE` (`OR IGNORE`/`REPLACE`/`FAIL`/`ABORT`/`ROLLBACK`, and each constraint's own `ON CONFLICT`; `ON CONFLICT … DO UPDATE`/`DO NOTHING`, `DEFAULT VALUES`, `INSERT … SELECT`), `UPDATE … FROM`, `DELETE`, `RETURNING` on all three, `CREATE TABLE`/`INDEX`/`VIEW`/`TRIGGER` (and `TEMP` ones), `CREATE TABLE … AS SELECT`, `DROP`, `ALTER TABLE` (`ADD COLUMN`, `RENAME TO`, `RENAME COLUMN`, `DROP COLUMN`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`, `ANALYZE`, `REINDEX`, `VACUUM` |
 | Typing | storage classes, column affinity, comparison affinity, `CAST`, integer overflow to real, SQLite's text for reals (`%!.15g`) |
 | Schema | `INTEGER PRIMARY KEY` as the rowid, `AUTOINCREMENT` with `sqlite_sequence`, `PRIMARY KEY`/`UNIQUE` (with their automatic indexes), `NOT NULL`, `DEFAULT`, `CHECK`, foreign keys (enforced under `PRAGMA foreign_keys`, with `CASCADE`/`SET NULL`/`SET DEFAULT`/`RESTRICT` and `DEFERRABLE`), `COLLATE` (`BINARY`, `NOCASE`, `RTRIM`), generated columns (`VIRTUAL` and `STORED`), `STRICT` tables, `WITHOUT ROWID` tables, partial and expression indexes, views (and `INSTEAD OF` triggers on them), triggers (`BEFORE`/`AFTER`, `UPDATE OF`, `WHEN`, `RAISE`) |
-| Functions | aggregates (`count sum total avg min max group_concat string_agg json_group_array json_group_object`, with `DISTINCT`, `FILTER` and `ORDER BY`), window functions (`row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value` and every aggregate, over `ROWS`/`RANGE`/`GROUPS` frames with `EXCLUDE`, named windows), the core scalar functions, `printf`/`format`, the date and time functions, the math functions, the JSON functions (JSON5 input, JSONB blobs and every `jsonb_` function) and `json_each`/`json_tree`, `->`, `->>`, `LIKE`/`GLOB` (with `ESCAPE`) |
-| Pragmas | `user_version`, `page_size`, `table_info`, `journal_mode` (WAL is kept), `auto_vacuum` (full and incremental files are written with their pointer maps; `VACUUM` applies a change, as in SQLite), and the ones an application sets and does not read back (`journal_mode`, `foreign_keys`, `busy_timeout`, …) |
+| Functions | aggregates (`count sum total avg min max group_concat string_agg json_group_array json_group_object median percentile percentile_cont percentile_disc`, with `DISTINCT`, `FILTER` and `ORDER BY`), window functions (`row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value` and every aggregate, over `ROWS`/`RANGE`/`GROUPS` frames with `EXCLUDE`, named windows), the core scalar functions, `printf`/`format`, the date and time functions, the math functions, the JSON functions (JSON5 input, JSONB blobs and every `jsonb_` function) and `json_each`/`json_tree`, `->`, `->>`, `LIKE`/`GLOB` (with `ESCAPE`) |
+| Pragmas | `user_version`, `application_id`, `schema_version`, `page_size`, `encoding`, `journal_mode` (WAL is kept), `auto_vacuum` (full and incremental files are written with their pointer maps; `VACUUM` applies a change, as in SQLite), `foreign_keys`, `table_info`/`table_xinfo`, `index_list`/`index_info`/`index_xinfo`, `foreign_key_list`, `foreign_key_check`, `collation_list`, `database_list`, all of them as `pragma_…()` tables too, and the connection's settings (`case_sensitive_like`, `ignore_check_constraints`, `defer_foreign_keys` taking effect; `cache_size`, `synchronous` and two dozen more read back as set) |
 | Planning | an index (equality on leading columns, then a range) or the rowid narrows each source of a join; an index that delivers the `ORDER BY` lets a `LIMIT` stop early; a lone `min`/`max` reads one entry |
 
 ## Against SQLite's own wasm build
@@ -74,18 +75,25 @@ since SQLite's image is its pages already and this one is built from rows (an un
 kept, so a commit after a small change costs less than the first). Numbers move a few percent run to run.
 
 **And against SQLite's answers.** Beyond the hand-written corpus, six fuzzers write random SQL and
-record what SQLite 3.53 answers: `tools/fuzz.py` (expressions over mixed types — affinity, casts,
-arithmetic, every scalar function) and `tools/fuzz2.py` (schemas, conflicts, upserts, joins, grouping,
-ordering, subqueries, changes) and `tools/fuzz3.py` (window functions and frames, CTEs, RIGHT/FULL/NATURAL
-joins, row values, compound selects, JSON and `json_each`) and `tools/fuzz4.py` (conflict clauses,
-foreign-key actions, CHECK, generated columns, STRICT, WITHOUT ROWID, partial and expression indexes,
-triggers, savepoints and transactions) and `tools/fuzz5.py` (date and time functions with their
-modifiers, `strftime`, `printf` formats, string functions over non-ASCII text, numbers as text) and
-`tools/fuzz6.py` (views over joins and aggregates, correlated subqueries everywhere, IN and EXISTS with
-NULLs, DISTINCT, collations and NULLS FIRST/LAST in ordering, LIMIT/OFFSET, compound selects). Seeds 1–60 of each (1–90 of the first two) agree statement for statement; seed 1
-of each is in `test/corpus`. `sh tools/fuzzdiff.sh <seed>` shows any disagreement. Reals become text through a port
-of SQLite's own decimal conversion (`src/fp.wac`), so `CAST(1.0/3 AS TEXT)` is `0.33333333333333332`
-here too.
+record what SQLite 3.53 answers:
+
+- `tools/fuzz.py`: expressions over mixed types — affinity, casts, arithmetic, every scalar function;
+- `tools/fuzz2.py`: schemas, conflicts, upserts, joins, grouping, ordering, subqueries, changes;
+- `tools/fuzz3.py`: window functions and frames, CTEs, RIGHT/FULL/NATURAL joins, row values, compound
+  selects, JSON and `json_each`;
+- `tools/fuzz4.py`: conflict clauses, foreign-key actions, CHECK, generated columns, STRICT, WITHOUT
+  ROWID, partial and expression indexes, triggers, savepoints and transactions;
+- `tools/fuzz5.py`: date and time functions with their modifiers, `strftime`, `printf` formats, string
+  functions over non-ASCII text, numbers as text;
+- `tools/fuzz6.py`: views over joins and aggregates, correlated subqueries everywhere, IN and EXISTS with
+  NULLs, DISTINCT, collations and NULLS FIRST/LAST in ordering, LIMIT/OFFSET, compound selects.
+
+At least the first 40 seeds of each agree statement for statement (90 of the first two, 80 of the
+fifth); seed 1 of each is in `test/corpus`, and `sh tools/fuzzdiffN.sh <seed>` shows where a seed
+disagrees. Where SQLite's answer is its planner's choice rather than the SQL's meaning (which row a
+group shows, the order of rows a query does not order), the fuzzers ask only questions with one
+answer. Reals become text through a port of SQLite's own decimal conversion (`src/fp.wac`), so
+`CAST(1.0/3 AS TEXT)` is `0.33333333333333332` here too.
 
 ## How it works, and what that costs
 

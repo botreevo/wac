@@ -2297,15 +2297,19 @@ fn serve(
         OP_OPEN_FILE => {
             let path = text.clone();
             let how = a as i32;
-            let granted = if how == 0 { caller.data().grants.read } else { caller.data().grants.write };
+            // 3 and 4 are `Files.openRandom`: to read anywhere, or to read and write anywhere.
+            let granted = if how == 0 || how == 3 { caller.data().grants.read } else { caller.data().grants.write };
             if !granted {
                 let o = Outcome::Socket(-1, "Not granted to this application".into(), String::new(), 0, FAULT_NOT_GRANTED);
                 return now(Kind::Socket, o);
             }
             let here = resolve(caller, &path);
             let mut o = std::fs::OpenOptions::new();
-            if how == 0 {
+            if how == 0 || how == 3 {
                 o.read(true);
+            } else if how == 4 {
+                // Created if absent, and never emptied: a database's file.
+                o.read(true).write(true).create(true);
             } else {
                 o.write(true).create(true);
                 if how == 2 { o.append(true); } else { o.truncate(true); }
@@ -2318,6 +2322,52 @@ fn serve(
                 Err(e) => Outcome::Socket(-1, e.to_string(), String::new(), 0, fault_of(&e)),
             };
             return now(Kind::Socket, outcome);
+        }
+        // **A file `openRandom` opened**: reads and writes at an offset, its size, cutting it, and `fsync`.
+        // Positioned reads and writes (`pread`, `pwrite`) leave no cursor to share, so two requests in
+        // flight on one handle cannot move each other's. On threads, as the whole-file operations are.
+        OP_READ_AT | OP_WRITE_AT | OP_FILE_SIZE | OP_TRUNCATE_FILE | OP_SYNC_FILE => {
+            let h = a as i32;
+            let file = match caller.data().handles.lock().unwrap().get(h) {
+                Some(Handle::File(f)) => Some(f.clone()),
+                _ => None,
+            };
+            let Some(f) = file else {
+                return now(Kind::Change, Outcome::Change(FAULT_OTHER, "not an open file".into()));
+            };
+            let offset = b as u64;
+            let data = bytes.clone();
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            std::thread::spawn(move || {
+                let outcome = match op {
+                    OP_READ_AT => {
+                        let n = data.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize).unwrap_or(0);
+                        match read_at(&f, n, offset) {
+                            Ok(got) => Outcome::FileResult(true, got, String::new(), FAULT_NONE),
+                            Err(e) => Outcome::FileResult(false, Vec::new(), e.to_string(), fault_of(&e)),
+                        }
+                    }
+                    OP_WRITE_AT => match write_at(&f, &data, offset) {
+                        Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                    OP_FILE_SIZE => match f.metadata() {
+                        Ok(m) => Outcome::I64(m.len() as i64),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                    OP_TRUNCATE_FILE => match f.set_len(offset) {
+                        Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                    _ => match f.sync_all() {
+                        Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                };
+                let _ = table.complete(id, outcome);
+            });
+            return later(Kind::Change, id);
         }
         // The end of a file `openFile` opened. `File` does not buffer, so every `send` already reached the
         // system and dropping it is the whole of closing.
@@ -3011,6 +3061,45 @@ const OP_CALL: i32 = 65;
 const OP_UNLOAD: i32 = 66;
 const OP_VALIDATE: i32 = 67;
 const OP_CAPABILITY: i32 = 68;
+const OP_READ_AT: i32 = 69;
+const OP_WRITE_AT: i32 = 70;
+const OP_FILE_SIZE: i32 = 71;
+const OP_TRUNCATE_FILE: i32 = 72;
+const OP_SYNC_FILE: i32 = 73;
+
+/// Up to `n` bytes of `f` from `offset`, fewer only where it ends — `Files.openRandom`'s `readAt`.
+fn read_at(f: &std::fs::File, n: usize, offset: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    let mut got = 0;
+    while got < n {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[got..], offset + got as u64);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[got..], offset + got as u64);
+        match r {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
+}
+
+/// All of `b` written to `f` from `offset`.
+fn write_at(f: &std::fs::File, b: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::write_all_at(f, b, offset);
+    #[cfg(windows)]
+    {
+        let mut put = 0;
+        while put < b.len() {
+            put += std::os::windows::fs::FileExt::seek_write(f, &b[put..], offset + put as u64)?;
+        }
+        Ok(())
+    }
+}
 
 /// `GRANT_*`, matching `platform.wac`.
 const GRANT_READ: i32 = 1;

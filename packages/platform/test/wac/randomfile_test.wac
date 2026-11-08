@@ -1,0 +1,60 @@
+// std's RandomFile — spec ch44 [§wac-std-file-random-q8v3kxn]: a file read and written at offsets, as a
+// database's pages are, on whichever host runs the test.
+
+import { Sys, Files, RandomFile, HostFault, Unsupported } from "std";
+import { Result, flatten } from "core";
+import { T } from "../../../wactest/src/assert.wac";
+
+string base(Sys sys) {
+  string here = flatten(sys.env().cwd().wait()).unwrap();
+  return here + "/.cache/wac-randomfile";
+}
+
+string text(Result<u8[], HostFault> r) {
+  match (r) {
+    Ok(b): { return string.fromBytes(b); }
+    Err(e): { return "<failed>"; }
+  }
+}
+
+export async string test_a_random_file_is_read_and_written_in_place(Sys sys) {
+  T t = T.create();
+  Files fs = sys.files();
+  string dir = base(sys) + "/rw";
+  await fs.remove(dir, true);
+  t.isTrue((await fs.mkdir(dir, true)).isOk(), "mkdir");
+  RandomFile f = (await fs.openRandom(dir + "/r.bin", true)).unwrap();
+  t.isTrue((await f.writeAt(0 as i64, "hello".toBytes())).isOk(), "writeAt at the start");
+  // A write past the end grows the file, and the gap reads back as zeros.
+  t.isTrue((await f.writeAt(10 as i64, "world".toBytes())).isOk(), "writeAt past the end");
+  t.isTrue((await f.size()).unwrap() == 15 as i64, "size counts the gap");
+  u8[] gap = (await f.readAt(5 as i64, 5)).unwrap();
+  t.eqI32(gap.len(), 5, "the gap is five bytes");
+  t.eqI32(gap[0] as i32 + gap[4] as i32, 0, "and zeros");
+  t.eqStr(text(await f.readAt(10 as i64, 5)), "world", "readAt answers what writeAt wrote");
+  t.eqI32((await f.readAt(12 as i64, 10)).unwrap().len(), 3, "a read across the end answers what there is");
+  t.eqI32((await f.readAt(100 as i64, 4)).unwrap().len(), 0, "and past it, nothing");
+  t.isTrue((await f.writeAt(2 as i64, "LL".toBytes())).isOk(), "a write in the middle");
+  t.isTrue((await f.sync()).isOk(), "sync");
+  t.isTrue((await f.truncate(7 as i64)).isOk(), "truncate");
+  t.eqStr(text(await f.readAt(0 as i64, 100)), "heLLo\0\0", "truncate keeps what is before the cut");
+  t.isTrue((await f.close()).isOk(), "close");
+  t.isTrue((await f.close()).isOk(), "a second close is no fault");
+  t.isTrue((await f.readAt(0 as i64, 1)).isErr(), "a read after close fails");
+
+  // Opening to write again keeps what is there.
+  RandomFile again = (await fs.openRandom(dir + "/r.bin", true)).unwrap();
+  t.isTrue((await again.size()).unwrap() == 7 as i64, "opening to write does not empty the file");
+  await again.close();
+
+  RandomFile ro = (await fs.openRandom(dir + "/r.bin", false)).unwrap();
+  t.eqStr(text(await ro.readAt(0 as i64, 2)), "he", "opened to read, it reads");
+  match (await ro.writeAt(0 as i64, "x".toBytes())) {
+    Ok(v): { t.fail("a file opened to read took a write"); }
+    Err(e): { t.isTrue(e is Unsupported, "a write to a file opened to read is Unsupported"); }
+  }
+  await ro.close();
+  t.isTrue((await fs.openRandom(dir + "/missing", false)).isErr(), "opening a missing file to read fails");
+  await fs.remove(dir, true);
+  return t.report();
+}

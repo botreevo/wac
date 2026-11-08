@@ -22,6 +22,7 @@ import {
   hostCall,
   HostCallError,
   i32le,
+  i64le,
   isDone,
   waitAny as waitOn,
   readI32le,
@@ -169,6 +170,14 @@ function payloadOf(op: number, a: number, b: number, text: string, bytes: Uint8A
       return cat(i32le(a), str(text));
     case OP.SEND:
       return cat(i32le(a), bytes);
+    // A file `openRandom` opened: the handle, then the offset as an i64, then what std put in `bytes` — the length
+    // to read as four bytes, or what to write.
+    case OP.READ_AT: case OP.WRITE_AT:
+      return cat(i32le(a), i64le(BigInt(b)), bytes);
+    case OP.TRUNCATE_FILE:
+      return cat(i32le(a), i64le(BigInt(b)));
+    case OP.FILE_SIZE: case OP.SYNC_FILE:
+      return i32le(a);
     case OP.SEND_TO: {
       const who = str(text);
       return cat(i32le(a), i32le(b), i32le(who.length), who, bytes);
@@ -238,8 +247,12 @@ function answerOf(op: number, out: Uint8Array): Flat {
     case OP.WRITE_FILE: case OP.MKDIR: case OP.REMOVE: case OP.RENAME: case OP.SET_EXECUTABLE: case OP.CHMOD:
       return changeOf(out);
     case OP.WRITE_STDOUT: case OP.WRITE_STDERR: case OP.SEND: case OP.SEND_TO: case OP.CLOSE_FILE:
-    case OP.CLOSE_OUTPUT:
+    case OP.CLOSE_OUTPUT: case OP.WRITE_AT: case OP.TRUNCATE_FILE: case OP.SYNC_FILE:
       return flat({ flags: 1 });
+    case OP.READ_AT:
+      return flat({ bytes: out.slice() });
+    case OP.FILE_SIZE:
+      return flat({ n: readI64le(out) });
     case OP.STAT: case OP.LINK_STAT: {
       // exists, isFile, isDir as bytes, size and mtime as little-endian i64s, isSymlink, the fault,
       // isExecutable, then the mode.
@@ -475,7 +488,8 @@ export function hostFor(b: Bridge, app: Record<string, unknown>, grants?: number
       return;
     }
     let need = NEEDS[op];
-    if (op === OP.OPEN_FILE) need = a === 0 ? GRANT_READ : GRANT_WRITE;
+    // To read, as a stream (0) or anywhere (3), needs the read grant; anything that writes, the write grant.
+    if (op === OP.OPEN_FILE) need = a === 0 || a === 3 ? GRANT_READ : GRANT_WRITE;
     if (need !== undefined && grants !== undefined && (grants & need) === 0) {
       return deliver(id, flat({ fault: FAULT_NOT_GRANTED, text: REFUSED }));
     }

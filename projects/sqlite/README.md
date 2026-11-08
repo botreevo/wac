@@ -102,8 +102,7 @@ So:
 
 ## Not yet
 
-Table-valued functions other than `json_each`/`json_tree`, virtual tables (FTS5, R*Tree), `ATTACH`,
-and `ANALYZE`. UTF-16 databases are read and written (their indexes in SQLite's order), but
+Virtual tables (FTS5, R*Tree), `ATTACH` and `TEMP` objects, JSONB, and `EXPLAIN`. UTF-16 databases are read and written (their indexes in SQLite's order), but
 text compares in code point order in queries, where SQLite compares UTF-16 bytes, so `ORDER BY` and
 ranges over non-ASCII text can differ there. Partial and expression indexes are kept and
 enforced, but the planner does not yet read through them. Each missing feature is refused with an error

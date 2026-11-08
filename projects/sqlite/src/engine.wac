@@ -791,6 +791,17 @@ struct Statement {
       RenameColumnStmt(table, from, to): { try this.alterTable("rename column", table, from, to); return Result.Ok(noRows()); }
       DropColumnStmt(table, col): { try this.alterTable("drop column", table, col, ""); return Result.Ok(noRows()); }
       PragmaStmt(name, value): { return this.pragma(name, value); }
+      AnalyzeStmt(name): { try this.analyze(name); return Result.Ok(noRows()); }
+      ReindexStmt(name): {
+        // Every index here is always in order; what is left is to know the name.
+        if (name is not null) {
+          string n = lower(name!);
+          if (this.conn.db.table(n) is null && this.conn.db.index(n) is null && collationId(n) < 0) {
+            return Result.Err(err("unable to identify the object to be reindexed"));
+          }
+        }
+        return Result.Ok(noRows());
+      }
       VacuumStmt: {
         // Every image this writes is already vacuumed; what VACUUM adds is a pending auto_vacuum change.
         if (this.conn.inTx) { return Result.Err(err("cannot VACUUM from within a transaction")); }
@@ -1433,6 +1444,61 @@ struct Statement {
       Value[] vals = Value[].filled(t.cols.len(), Value.Null);
       for (i32 k = 0; k < vals.len() && k < src.len(); k++) { vals[k] = applyAffinity(src[k], t.cols[k].affinity); }
       this.insertRow(t, Row((i + 1) as i64, vals, null));
+    }
+    return Result.Ok();
+  }
+
+  // ANALYZE: sqlite_stat1's rows for every table (or the one named, or an index's), as SQLite computes
+  // them: per index, its entries, then for each prefix of its columns the average number of entries
+  // sharing a value, rounded up.
+  Result<void, SqlError> analyze(this, string? name) {
+    Database d = this.conn.db;
+    string? onlyTable = null;
+    string? onlyIndex = null;
+    if (name is not null) {
+      if (d.table(name!) is not null) { onlyTable = d.table(name!)!.name; }
+      else if (d.index(name!) is not null) { onlyIndex = d.index(name!)!.name; onlyTable = d.index(name!)!.table; }
+      else { return Result.Err(err("no such table: \{name!}")); }
+    }
+    if (d.table("sqlite_stat1") is null) {
+      match ((try parseOne("CREATE TABLE sqlite_stat1(tbl,idx,stat)")).stmt) {
+        CreateTableStmt(c): {
+          Vec<Index> none;
+          Table st = try tableFrom(c, none);
+          this.saveSchema();
+          d.tables.set("sqlite_stat1", st);
+          d.order.push(SchemaEntry("table", st.name, st.name));
+        }
+        default: {}
+      }
+    }
+    Table stat = d.table("sqlite_stat1")!;
+    for (i32 e = 0; e < d.order.len(); e++) {
+      SchemaEntry se = d.order.get(e);
+      if (se.kind != "table" || lower(se.name).indexOf("sqlite_") == 0) { continue; }
+      if (onlyTable is not null && lower(onlyTable!) != lower(se.name)) { continue; }
+      Table t = d.table(se.name)!;
+      // The table's rows (or the one index's) go, and come again freshly counted.
+      Vec<Row> old;
+      for (i32 i = 0; i < stat.rows.len(); i++) {
+        Row r = stat.rows.get(i);
+        if (lower(textOf(r.vals[0])) != lower(t.name)) { continue; }
+        if (onlyIndex is not null && lower(textOf(r.vals[1])) != lower(onlyIndex!)) { continue; }
+        old.push(r);
+      }
+      for (i32 i = 0; i < old.len(); i++) { this.deleteRow(stat, old.get(i)); }
+      if (t.rows.len() == 0) { continue; }
+      Index[] ixs = d.indexesOf(t.name);
+      if (ixs.len() == 0 && onlyIndex is null) {
+        this.insertRow(stat, Row(stat.maxRowid() + 1, [Value.Text(t.name), Value.Null, Value.Text("\{t.rows.len()}")], null));
+        continue;
+      }
+      for (i32 i = ixs.len() - 1; i >= 0; i--) {
+        Index ix = ixs[i];
+        if (onlyIndex is not null && lower(ix.name) != lower(onlyIndex!)) { continue; }
+        string idxName = t.withoutRowid && lower(ix.name) == lower(t.pkIndex) ? t.name : ix.name;
+        this.insertRow(stat, Row(stat.maxRowid() + 1, [Value.Text(t.name), Value.Text(idxName), Value.Text(indexStat(ix))], null));
+      }
     }
     return Result.Ok();
   }
@@ -2090,4 +2156,32 @@ i64 pragmaInt(Value v, string name) {
     }
     default: { return 0; }
   }
+}
+
+// An index's sqlite_stat1 text: its entries, then for each prefix of its key columns the entries per
+// distinct prefix, rounded up (and 1 rather than 2 for a prefix that is nearly unique), NULLs counting
+// as equal, as SQLite's ANALYZE counts.
+string indexStat(Index ix) {
+  i64 n = ix.entries.len() as i64;
+  i32 cols = ix.cols.len();
+  i64[] distinct = i64[].filled(cols, 0);
+  for (i32 i = 1; i < ix.entries.len(); i++) {
+    Value[] a = ix.entries.get(i - 1).key;
+    Value[] b = ix.entries.get(i).key;
+    // The first column that differs: every prefix that long or longer has a new value here.
+    for (i32 k = 0; k < cols; k++) {
+      if (compareColl(a[k], b[k], ix.colls[k]) != 0) {
+        for (i32 m = k; m < cols; m++) { distinct[m]++; }
+        break;
+      }
+    }
+  }
+  string out = "\{n}";
+  for (i32 k = 0; k < cols; k++) {
+    i64 nd = distinct[k] + 1;
+    i64 v = (n + nd - 1) / nd;
+    if (v == 2 && n * 10 <= nd * 11) { v = 1; }
+    out += " \{v}";
+  }
+  return out;
 }

@@ -24,20 +24,20 @@
 // and on a real path is the first thing that does. The client role is also absent: this answers a
 // handshake, it does not start one. Both are in `design/system/0008`'s list rather than half-built.
 
-import { Record, certificateMessage, certificateRequest, clientPublic, curveX25519, handshake,
-         helloCookie,
+import { Record, certificateMessage, certificateRequest, clientPublic, curveX25519, handshake, helloCookie,
          helloRandom, helloSrtpProfile, helloVerifyRequest, leafCertificate, parseHandshake, parseRecord, record,
-         recordSize,
-         serverEcdhParams, serverHello, serverHelloDone, serverKeyExchange, typeChangeCipherSpec,
-         typeHandshake, versionDtls10, versionDtls12 } from "./dtls.wac";
+         recordSize, serverEcdhParams, serverHello, serverHelloDone, serverKeyExchange, typeChangeCipherSpec,
+         typeHandshake, versionDtls10, versionDtls12, clientKeyExchange, serverCurve, serverKeyExchangeScheme,
+         serverKeyExchangeSignature, serverKeyExchangeSigned, serverPublic, chosenSuite, verifyCookie, curveSecp256r1 } from "./dtls.wac";
 import { keyBlock, masterSecret, open, seal, verifyData } from "./dtlskeys.wac";
-import { p256Sign } from "../../crypto/src/p256.wac";
+import { p256Sign, p256Decodes, p256Ecdh, p256PublicKey } from "../../crypto/src/p256.wac";
 import { x25519, x25519Base, x25519Shared } from "../../crypto/src/x25519.wac";
 import { derInteger, derSequence } from "../../tls/src/derwrite.wac";
 import { Cert, certVerifySignature, parseCert } from "../../tls/src/x509.wac";
+import { Vec } from "core";
 
 /**
- * A DTLS endpoint in either role, as `Session` drives it: `Peer` answers a handshake, `ClientPeer` (`client.wac`)
+ * A DTLS endpoint in either role, as `Session` drives it: `Peer` answers a handshake, `ClientPeer` (below)
  * starts one. Datagrams in, datagrams out; application records opened and sealed; and who the peer proved to be.
  */
 export struct Dtls {
@@ -51,6 +51,8 @@ export struct Dtls {
   virtual bool peerAuthenticated(const this) { trap; }
   /** The peer's certificate, DER, or empty. */
   virtual u8[] peerCertificate(const this) { trap; }
+  /** Whether the handshake has finished — the Finished messages crossed — whoever the peer turned out to be. */
+  virtual bool isEstablished(const this) { trap; }
   /**
    * Whatever a clock says to resend. A server's is empty: the client's retransmission is its timer, which is how
    * `Peer` has always worked against OpenSSL and libwebrtc.
@@ -466,6 +468,8 @@ export struct Peer : Dtls {
   /** Whether the peer proved possession of the key in the certificate it presented. */
   override bool peerAuthenticated(const this) { return this.peerVerified != 0; }
 
+  override bool isEstablished(const this) { return this.established; }
+
   /** The peer's certificate as presented, or empty when it sent none. */
   override u8[] peerCertificate(const this) { return this.peerCertDer; }
 
@@ -492,4 +496,404 @@ export u8[] slice(u8[] b, i32 from, i32 to) {
   u8[] out = u8[].filled(to - from, 0);
   out.copyFrom(b, from, 0, out.len());
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────── the client role ───
+//
+// A DTLS peer in the client role: the half `Peer`, above, leaves out.
+//
+// The server answers; this starts. It sends a ClientHello, echoes the cookie a HelloVerifyRequest hands it, reads
+// the server's flight — ServerHello, Certificate, ServerKeyExchange, an optional CertificateRequest, ServerHelloDone
+// — and answers with its own: Certificate if it was asked, ClientKeyExchange, CertificateVerify if it sent a
+// certificate, ChangeCipherSpec, Finished. The server's ChangeCipherSpec and Finished end it.
+//
+// ## What it checks, and what it leaves to its caller
+//
+// **The ServerKeyExchange's signature, under the server's own certificate.** That is what binds the ephemeral key
+// to the certificate: without it anybody on the path substitutes their own point and reads everything. The server's
+// Finished is checked too, so the server saw the same handshake. **Whose certificate it was is the caller's
+// question** — `peerCertificate` answers the DER, and `Session` compares its hash with the fingerprint it was told
+// to expect, exactly as it does for a server.
+//
+// ## What it offers
+//
+// One suite (ECDHE-ECDSA-AES128-GCM-SHA256), two groups (x25519, and secp256r1 for libdatachannel, whose OpenSSL is
+// configured for nothing else), one signature scheme (ecdsa_secp256r1_sha256) — what every WebRTC stack accepts. And `use_srtp`, though no SRTP will flow: pion refuses a
+// DTLS transport that negotiated no SRTP profile, data channels or not, so a client that wants to reach a pion
+// server has to offer one.
+//
+// ## Loss
+//
+// A flight is resent when its timer runs out (`timers`, RFC 6347's second, doubling) and when the server repeats a
+// message of a flight already answered — its retransmission says ours was lost.
+//
+// (Here rather than in a file of its own because its base, `Dtls`, is declared in this one.)
+
+static i32 SUITE = 0xC02B;
+static i32 SCHEME = 0x0403;
+
+/**
+ * A ClientHello body: DTLS 1.2, one suite, x25519 and secp256r1, ECDSA with SHA-256, and `use_srtp` with the two profiles WebRTC
+ * stacks select from (SRTP_AEAD_AES_128_GCM and SRTP_AES128_CM_HMAC_SHA1_80).
+ *
+ * The same `random` goes in both hellos — the one before the cookie and the one after — since a server may compare
+ * them.
+ */
+export u8[] clientHelloOffer(u8[] random, u8[] cookie) {
+  u8[] ext = [
+    0x00, 0x0A, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1D, 0x00, 0x17,             // supported_groups: x25519, secp256r1
+    0x00, 0x0B, 0x00, 0x02, 0x01, 0x00,                                     // ec_point_formats: uncompressed
+    0x00, 0x0D, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03,                         // signature_algorithms: ecdsa_p256_sha256
+    0x00, 0x0E, 0x00, 0x07, 0x00, 0x04, 0x00, 0x07, 0x00, 0x01, 0x00,       // use_srtp: two profiles, no MKI
+    0xFF, 0x01, 0x00, 0x01, 0x00,                                           // renegotiation_info: empty
+  ];
+  i32 n = 2 + 32 + 1 + 1 + cookie.len() + 2 + 2 + 2 + 2 + ext.len();
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  out[0] = 0xFE; out[1] = 0xFD; at = 2;
+  for (i32 i = 0; i < 32; i++) { out[at + i] = i < random.len() ? random[i] : 0; }
+  at += 32;
+  out[at] = 0; at += 1;                                                     // session_id: empty
+  out[at] = cookie.len() as@ u8; at += 1;
+  out.copyFrom(cookie, 0, at, cookie.len());
+  at += cookie.len();
+  out[at] = 0x00; out[at + 1] = 0x02; at += 2;
+  out[at] = ((SUITE >> 8) & 0xFF) as@ u8; out[at + 1] = (SUITE & 0xFF) as@ u8; at += 2;
+  out[at] = 0x01; out[at + 1] = 0x00; at += 2;                              // compression: null
+  out[at] = ((ext.len() >> 8) & 0xFF) as@ u8; out[at + 1] = (ext.len() & 0xFF) as@ u8; at += 2;
+  out.copyFrom(ext, 0, at, ext.len());
+  return out;
+}
+
+/** A server message, whole, waiting for its turn. */
+struct Arrived {
+  i32 seq;
+  i32 kind;
+  u8[] body;
+  /** Which bytes of `body` have arrived, and how many: a repeated fragment adds nothing. */
+  bool[] got;
+  i32 have;
+}
+
+export struct ClientPeer : Dtls {
+  u8[] certDer;
+  u8[] signingKey;
+  /** The ECDSA nonce for the CertificateVerify. Fresh per handshake: reusing one publishes the key. */
+  u8[] signingNonce;
+  /** Our ephemeral x25519 scalar, and our random. */
+  u8[] scalar;
+  u8[] random;
+
+  u8[] cookie = u8[]();
+  /** The ClientHello the transcript starts with — the last one sent. */
+  u8[] hello = u8[]();
+  i32 helloSeq = 0;
+  u8[] transcript = u8[]();
+  /** The server's messages by sequence, as they complete; processed strictly in order. */
+  Vec<Arrived> arrived = Vec<Arrived>.create();
+  i32 nextServerSeq = 0;
+  /** Our next handshake message_seq. */
+  i32 ourSeq = 0;
+
+  u8[] serverRandom = u8[]();
+  i32 suite = -1;
+  u8[] serverCertDer = u8[]();
+  u8[] serverKeyExchange = u8[]();
+  bool certificateRequested = false;
+  bool serverSigned = false;
+
+  u8[] master = u8[]();
+  u8[] clientWriteKey = u8[]();
+  u8[] serverWriteKey = u8[]();
+  u8[] clientIv = u8[]();
+  u8[] serverIv = u8[]();
+  bool keysReady = false;
+  bool established = false;
+  /** Why the handshake cannot finish, or "" while it can. */
+  string failed = "";
+
+  i64 plainSeq = 0 as i64;
+  i64 cipherSeq = 0 as i64;
+  /** Our last flight as handshake messages; those from `sealedFrom` on go after a ChangeCipherSpec, at epoch 1. */
+  u8[][] lastFlight = u8[][]();
+  i32 sealedFrom = -1;
+  i64 flightSentAt = 0 as i64;
+  i32 flightTries = 0;
+
+  ClientPeer of(u8[] certDer, u8[] signingKey, u8[] signingNonce, u8[] scalar, u8[] random) {
+    return ClientPeer { certDer: certDer, signingKey: signingKey, signingNonce: signingNonce, scalar: scalar,
+                        random: random };
+  }
+
+  /** The first flight: a ClientHello with no cookie. `now` starts its timer. */
+  override u8[][] begin(this, i64 now) {
+    this.sendHello();
+    this.flightSentAt = now;
+    return this.resend(u8[][]());
+  }
+
+  void sendHello(this) {
+    this.hello = clientHelloOffer(this.random, this.cookie);
+    this.helloSeq = this.ourSeq;
+    this.ourSeq += 1;
+    this.lastFlight = [handshake(1, this.helloSeq, this.hello)];
+    this.sealedFrom = -1;
+    this.flightTries = 0;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────── records ───
+
+  u8[] plain(this, i32 kind, u8[] fragment) {
+    u8[] out = record(kind, versionDtls12(), 0, this.plainSeq, fragment);
+    this.plainSeq += 1 as i64;
+    return out;
+  }
+
+  u8[] sealed(this, i32 kind, u8[] plaintext) {
+    u8[] frag = seal(this.clientWriteKey, this.clientIv, 1, this.cipherSeq, kind, versionDtls12(), plaintext);
+    u8[] out = record(kind, versionDtls12(), 1, this.cipherSeq, frag);
+    this.cipherSeq += 1 as i64;
+    return out;
+  }
+
+  override u8[] sealApplication(this, u8[] payload) { return this.sealed(23, payload); }
+
+  override u8[] application(const this, u8[] datagram, i32 at) {
+    if (!this.established) { return u8[](); }
+    Record r = parseRecord(datagram, at);
+    if (!r.ok || r.epoch != 1 || r.kind != 23) { return u8[](); }
+    return open(this.serverWriteKey, this.serverIv, r.epoch, r.sequence, r.kind, r.version, r.fragment);
+  }
+
+  override bool peerAuthenticated(const this) { return this.established && this.serverSigned; }
+  override u8[] peerCertificate(const this) { return this.serverCertDer; }
+  override bool isEstablished(const this) { return this.established; }
+
+  /** Our flight again, in fresh records. */
+  u8[][] resend(this, u8[][] out) {
+    for (i32 i = 0; i < this.lastFlight.len(); i++) {
+      if (i == this.sealedFrom) { out = appendOne(out, this.plain(typeChangeCipherSpec(), [1 as@ u8])); }
+      out = appendOne(out, i >= this.sealedFrom && this.sealedFrom >= 0
+                             ? this.sealed(typeHandshake(), this.lastFlight[i])
+                             : this.plain(typeHandshake(), this.lastFlight[i]));
+    }
+    this.flightTries += 1;
+    return out;
+  }
+
+  /** The flight again if its timer ran out: a second, doubling, to a minute. */
+  override u8[][] timers(this, i64 now) {
+    if (this.established || this.lastFlight.len() == 0 || this.failed != "") { return u8[][](); }
+    i64 wait = 1000 as i64;
+    for (i32 i = 1; i < this.flightTries && wait < 60000 as i64; i++) { wait = wait * (2 as i64); }
+    if (wait > 60000 as i64) { wait = 60000 as i64; }
+    if (now - this.flightSentAt < wait) { return u8[][](); }
+    this.flightSentAt = now;
+    return this.resend(u8[][]());
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────────────────── receiving ───
+
+  override u8[][] receive(this, u8[] datagram) {
+    u8[][] out = u8[][]();
+    i32 at = 0;
+    while (recordSize(datagram, at) > 0) {
+      i32 size = recordSize(datagram, at);
+      Record r = parseRecord(datagram, at);
+      at += size;
+      if (!r.ok || this.failed != "") { continue; }
+      if (r.kind == typeHandshake() && r.epoch == 0) {
+        out = this.fragment(out, r.fragment);
+      } else if (r.kind == typeHandshake() && r.epoch == 1 && this.keysReady && !this.established) {
+        u8[] m = open(this.serverWriteKey, this.serverIv, r.epoch, r.sequence, r.kind, r.version, r.fragment);
+        if (m.len() == 12 + 12 && m[0] == 20) {
+          // The server's Finished: over everything up to it, our Finished included.
+          u8[] want = verifyData(this.master, "server finished", this.transcript);
+          bool same = true;
+          for (i32 i = 0; i < 12; i++) { if (m[12 + i] != want[i]) { same = false; } }
+          if (same && this.serverSigned) { this.established = true; }
+          else if (!same) { this.failed = "the server's Finished does not match the handshake"; }
+        }
+      }
+    }
+    return out;
+  }
+
+  /** One epoch-0 handshake fragment: reassemble, then process whatever is now next in order. */
+  u8[][] fragment(this, u8[][] out, u8[] f) {
+    if (f.len() < 12) { return out; }
+    i32 kind = f[0] as i32;
+    i32 total = (f[1] as i32 << 16) | (f[2] as i32 << 8) | f[3] as i32;
+    i32 seq = (f[4] as i32 << 8) | f[5] as i32;
+    i32 offset = (f[6] as i32 << 16) | (f[7] as i32 << 8) | f[8] as i32;
+    i32 fragLen = (f[9] as i32 << 16) | (f[10] as i32 << 8) | f[11] as i32;
+    if (seq < this.nextServerSeq) {
+      // **A message we have already taken, again: the server did not get our answer to it.** Once per flight of
+      // theirs is enough — answering every repeated fragment would multiply our flight by theirs.
+      if (this.lastFlight.len() > 0 && this.sealedFrom >= 0 && kind == 14) { return this.resend(out); }
+      return out;
+    }
+    if (seq > this.nextServerSeq + 8 || offset < 0 || fragLen < 0 || offset + fragLen > total ||
+        12 + fragLen > f.len()) { return out; }
+    Arrived? a = null;
+    for (i32 i = 0; i < this.arrived.len(); i++) { if (this.arrived.get(i).seq == seq) { a = this.arrived.get(i); } }
+    if (a is null) {
+      a = Arrived(seq, kind, u8[].filled(total, 0), bool[].filled(total, false), 0);
+      this.arrived.push(a!);
+    }
+    if (a!.body.len() != total) { return out; }
+    a!.body.copyFrom(f, 12, offset, fragLen);
+    for (i32 i = offset; i < offset + fragLen; i++) {
+      if (!a!.got[i]) {
+        a!.got[i] = true;
+        a!.have = a!.have + 1;
+      }
+    }
+    while (true) {
+      Arrived? next = null;
+      for (i32 i = 0; i < this.arrived.len(); i++) {
+        Arrived c = this.arrived.get(i);
+        if (c.seq == this.nextServerSeq && c.have >= c.body.len()) { next = c; }
+      }
+      if (next is null) { break; }
+      this.nextServerSeq += 1;
+      out = this.message(out, next!.kind, next!.seq, next!.body);
+      if (this.failed != "") { break; }
+    }
+    return out;
+  }
+
+  void remember(this, i32 kind, i32 seq, u8[] body) {
+    u8[] msg = handshake(kind, seq, body);
+    u8[] t = u8[].filled(this.transcript.len() + msg.len(), 0);
+    t.copyFrom(this.transcript, 0, 0, this.transcript.len());
+    t.copyFrom(msg, 0, this.transcript.len(), msg.len());
+    this.transcript = t;
+  }
+
+  /** One whole server message, in order. */
+  u8[][] message(this, u8[][] out, i32 kind, i32 seq, u8[] body) {
+    if (kind == 3) {                                           // HelloVerifyRequest: the hello again, with the cookie
+      this.cookie = verifyCookie(body);
+      this.sendHello();
+      return this.resend(out);
+    }
+    if (kind == 2) {                                           // ServerHello
+      if (body.len() < 34) { this.failed = "a ServerHello too short to read"; return out; }
+      this.suite = chosenSuite(body);
+      if (this.suite != SUITE) { this.failed = "the server chose suite \{this.suite}, which was not offered"; return out; }
+      this.serverRandom = slice(body, 2, 34);
+      this.transcript = u8[]();
+      this.remember(1, this.helloSeq, this.hello);
+      this.remember(2, seq, body);
+      return out;
+    }
+    if (this.serverRandom.len() == 0) { return out; }          // nothing counts before the ServerHello
+    if (kind == 11) {
+      this.serverCertDer = leafCertificate(body);
+      this.remember(11, seq, body);
+      return out;
+    }
+    if (kind == 12) {
+      this.serverKeyExchange = body;
+      this.remember(12, seq, body);
+      return out;
+    }
+    if (kind == 13) {
+      this.certificateRequested = true;
+      this.remember(13, seq, body);
+      return out;
+    }
+    if (kind == 14) {
+      this.remember(14, seq, body);
+      return this.answer(out);
+    }
+    return out;
+  }
+
+  /** The server's flight is in: check it, derive the keys, and send ours. */
+  u8[][] answer(this, u8[][] out) {
+    if (this.serverCertDer.len() == 0) { this.failed = "the server presented no certificate"; return out; }
+    Cert leaf = parseCert(this.serverCertDer);
+    if (!leaf.wellFormed) { this.failed = "the server's certificate does not parse"; return out; }
+    u8[] ske = this.serverKeyExchange;
+    i32 curve = serverCurve(ske);
+    if (curve != curveX25519() && curve != curveSecp256r1()) {
+      this.failed = "the server chose a group that was not offered";
+      return out;
+    }
+    u8[] signedBytes = serverKeyExchangeSigned(this.random, this.serverRandom, ske);
+    if (signedBytes.len() == 0 ||
+        !certVerifySignature(leaf, serverKeyExchangeScheme(ske), signedBytes, serverKeyExchangeSignature(ske))) {
+      this.failed = "the ServerKeyExchange is not signed by the server's certificate";
+      return out;
+    }
+    this.serverSigned = true;
+    u8[] theirs = serverPublic(ske);
+    u8[] pms = u8[]();
+    u8[] ours = u8[]();
+    if (curve == curveX25519()) {
+      if (theirs.len() != 32) { this.failed = "the server's key share is not an x25519 point"; return out; }
+      u8[]? dh = x25519Shared(this.scalar, theirs);
+      if (dh is null) { this.failed = "the server's key share is a small-order point"; return out; }
+      pms = dh!;
+      ours = x25519Base(this.scalar);
+    } else {
+      // **P-256, which libdatachannel's OpenSSL insists on.** The point is checked before it is used: the ECDH
+      // traps on one off the curve, and a server's bytes are not ours to trap on.
+      if (theirs.len() != 65 || !p256Decodes(theirs)) { this.failed = "the server's key share is not a P-256 point"; return out; }
+      pms = p256Ecdh(this.scalar, theirs);
+      ours = p256PublicKey(this.scalar);
+    }
+    this.master = masterSecret(pms, this.random, this.serverRandom);
+    u8[] block = keyBlock(this.master, this.serverRandom, this.random, 40);
+    this.clientWriteKey = slice(block, 0, 16);
+    this.serverWriteKey = slice(block, 16, 32);
+    this.clientIv = slice(block, 32, 36);
+    this.serverIv = slice(block, 36, 40);
+    this.keysReady = true;
+
+    u8[][] flight = u8[][]();
+    if (this.certificateRequested) {
+      u8[] cert = certificateMessage(this.certDer);
+      flight = appendOne(flight, handshake(11, this.ourSeq, cert));
+      this.remember(11, this.ourSeq, cert);
+      this.ourSeq += 1;
+    }
+    u8[] cke = clientKeyExchange(ours);
+    flight = appendOne(flight, handshake(16, this.ourSeq, cke));
+    this.remember(16, this.ourSeq, cke);
+    this.ourSeq += 1;
+    if (this.certificateRequested) {
+      // **Signed over the transcript so far** — every message up to and including the ClientKeyExchange.
+      u8[] sig = derSignature(p256Sign(this.signingKey, this.transcript, this.signingNonce));
+      if (sig.len() == 0) { this.failed = "the certificate's key could not sign"; return out; }
+      u8[] cv = u8[].filled(4 + sig.len(), 0);
+      cv[0] = ((SCHEME >> 8) & 0xFF) as@ u8; cv[1] = (SCHEME & 0xFF) as@ u8;
+      cv[2] = ((sig.len() >> 8) & 0xFF) as@ u8; cv[3] = (sig.len() & 0xFF) as@ u8;
+      cv.copyFrom(sig, 0, 4, sig.len());
+      flight = appendOne(flight, handshake(15, this.ourSeq, cv));
+      this.remember(15, this.ourSeq, cv);
+      this.ourSeq += 1;
+    }
+    u8[] fin = verifyData(this.master, "client finished", this.transcript);
+    this.sealedFrom = flight.len();
+    flight = appendOne(flight, handshake(20, this.ourSeq, fin));
+    this.remember(20, this.ourSeq, fin);
+    this.ourSeq += 1;
+    this.lastFlight = flight;
+    this.flightTries = 0;
+    return this.resend(out);
+  }
+}
+
+/** A raw sixty-four-byte P-256 signature as TLS carries it: `SEQUENCE { INTEGER r, INTEGER s }`. */
+u8[] derSignature(u8[] raw) {
+  if (raw.len() != 64) { return u8[](); }
+  u8[] rd = derInteger(slice(raw, 0, 32));
+  u8[] sd = derInteger(slice(raw, 32, 64));
+  u8[] both = u8[].filled(rd.len() + sd.len(), 0);
+  both.copyFrom(rd, 0, 0, rd.len());
+  both.copyFrom(sd, 0, rd.len(), sd.len());
+  return derSequence(both);
 }

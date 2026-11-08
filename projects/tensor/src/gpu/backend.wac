@@ -1,0 +1,342 @@
+// The WebGPU backend: each kernel a WGSL program run over GPU buffers, through `wac.gpu`.
+//
+// **Nothing waits but a read.** A kernel makes its output buffer, writes its parameters and runs its program — three
+// operations held in the line and sent with the rest of the step — and answers the output's storage at once. So a
+// training step is built as fast as wac can call methods, and the GPU sees it as one batch.
+//
+// **Programs are compiled once per kind of work**, found by name in a cache: the shader text never holds a size
+// (`wgsl.wac`), so `binary/Add` is one program whatever shapes it adds.
+
+import { Answer, Host } from "std";
+import { Map, Result, Ticket, hashString, stringEq } from "core";
+import { Backend, Binary, Conv, Reduce, Storage, Unary } from "../backend.wac";
+import { Device } from "../tensor.wac";
+import { sizeOf } from "../shape.wac";
+import { GpuLine } from "./line.wac";
+import {
+  PARAMS, argReduceShader, binaryShader, col2imShader, fillShader, gatherShader, im2colShader, matmulShader,
+  padShader, reduceShader, scatterAddShader, selectShader, takeShader, unaryShader,
+} from "./wgsl.wac";
+
+export struct GpuStorage : Storage {
+  i32 handle;
+}
+
+/** The highest number of workgroups a grid may have along one axis. */
+static i32 GRID = 65535;
+
+i32 bitsOf(f32 v) { return f32.toBits(v) as@ i32; }
+
+/** A device on the GPU `host` provides, or why there is none. `warn` hears what the GPU reports going wrong. */
+export async Result<Device, string> gpuDevice(Host host, fn<void(string)> warn) {
+  Result<GpuLine, string> line = await GpuLine.open(host);
+  match (line) {
+    Ok(l): { return Result.Ok(Device.on(GpuBackend.over(l, warn))); }
+    Err(why): { return Result.Err(why); }
+  }
+}
+
+export struct GpuBackend : Backend {
+  GpuLine line;
+  fn<void(string)> warn;
+  Map<string, i32> programs;
+  i32 lastHandle = 0;
+
+  GpuBackend over(GpuLine line, fn<void(string)> warn) {
+    return GpuBackend { line: line, warn: warn, programs: Map.create(hashString, stringEq) };
+  }
+
+  override string name(const this) { return "webgpu"; }
+
+  i32 handle(this) {
+    this.lastHandle++;
+    return this.lastHandle;
+  }
+
+  i32 of(this, Storage s) {
+    if (s.freed) { trap; }
+    return (s as! GpuStorage).handle;
+  }
+
+  /** A buffer for `n` floats. Never empty: WebGPU cannot bind a buffer of no bytes. */
+  GpuStorage alloc(this, i32 n) {
+    i32 h = this.handle();
+    this.line.buffer(h, (n > 0 ? n : 1) * 4);
+    return GpuStorage { size: n, handle: h };
+  }
+
+  /** The program `name`, compiled from `source` the first time it is asked for. */
+  i32 program(this, string name, fn<string()> source) {
+    i32? had = this.programs.get(name);
+    if (had is not null) { return had!; }
+    i32 h = this.handle();
+    this.line.program(h, source());
+    this.programs.set(name, h);
+    return h;
+  }
+
+  /**
+   * Run `program` over `buffers`, the first of which is made here to hold `params`, in a grid of `x` by `y` by `z`
+   * workgroups. The parameter buffer is freed after: the host frees nothing until the runs before it have finished.
+   */
+  void run(this, i32 program, i32[] params, i32[] buffers, i32 x, i32 y, i32 z) {
+    if (params.len() > PARAMS) { trap; }
+    i32 h = this.handle();
+    this.line.buffer(h, PARAMS * 4);
+    u8[] bytes = u8[].filled(params.len() * 4, 0 as u8);
+    for (i32 i = 0; i < params.len(); i++) {
+      for (i32 k = 0; k < 4; k++) { bytes[i * 4 + k] = ((params[i] >> (8 * k)) & 255) as~ u8; }
+    }
+    this.line.write(h, 0, bytes);
+    i32[] all = i32[].filled(buffers.len() + 1, h);
+    all.copyFrom(buffers, 0, 1, buffers.len());
+    this.line.run(program, x, y, z, all);
+    this.line.free(h);
+  }
+
+  /** `run` over one invocation per element of `n`, 64 to a workgroup, the grid folded into two axes when it must be. */
+  void spread(this, i32 program, i32[] params, i32[] buffers, i32 n) {
+    i32 groups = (n + 63) / 64;
+    if (groups == 0) { return; }
+    i32 x = groups < GRID ? groups : GRID;
+    i32 y = (groups + x - 1) / x;
+    this.run(program, params, buffers, x, y, 1);
+  }
+
+  /** `run` with one workgroup per row, for the reductions. */
+  void perRow(this, i32 program, i32[] params, i32[] buffers, i32 rows) {
+    if (rows == 0) { return; }
+    i32 x = rows < GRID ? rows : GRID;
+    i32 y = (rows + x - 1) / x;
+    this.run(program, params, buffers, x, y, 1);
+  }
+
+  override Storage upload(this, f32[] values) {
+    GpuStorage s = this.alloc(values.len());
+    u8[] bytes = u8[].filled(values.len() * 4, 0 as u8);
+    for (i32 i = 0; i < values.len(); i++) {
+      i32 b = bitsOf(values[i]);
+      for (i32 k = 0; k < 4; k++) { bytes[i * 4 + k] = ((b >> (8 * k)) & 255) as~ u8; }
+    }
+    if (bytes.len() > 0) { this.line.write(s.handle, 0, bytes); }
+    return s;
+  }
+
+  override Ticket<f32[]> download(this, Storage s) {
+    if (s.size == 0) {
+      Ticket<f32[]> empty;
+      empty.resolve(f32[]());
+      return empty;
+    }
+    return readFloats(this.line.read(this.of(s), 0, s.size * 4), s.size, this.warn);
+  }
+
+  override void free(this, Storage s) {
+    if (s.freed) { return; }
+    s.freed = true;
+    this.line.free((s as! GpuStorage).handle);
+  }
+
+  override Storage fill(this, i32 n, f32 value) {
+    GpuStorage out = this.alloc(n);
+    i32 prog = this.program("fill", () => fillShader());
+    this.spread(prog, [n, bitsOf(value)], [out.handle], n);
+    return out;
+  }
+
+  override Storage unary(this, Unary op, Storage x) {
+    GpuStorage out = this.alloc(x.size);
+    i32 prog = this.program("unary/\{unaryName(op)}", () => unaryShader(op));
+    this.spread(prog, [x.size], [this.of(x), out.handle], x.size);
+    return out;
+  }
+
+  override Storage binary(this, Binary op, Storage a, Storage b, i32[] out, i32[] sa, i32[] sb) {
+    i32 n = sizeOf(out);
+    GpuStorage o = this.alloc(n);
+    i32 prog = this.program("binary/\{binaryName(op)}", () => binaryShader(op));
+    this.spread(prog, stridedParams(n, out, [sa, sb]), [this.of(a), this.of(b), o.handle], n);
+    return o;
+  }
+
+  override Storage select(this, Storage c, Storage a, Storage b, i32[] out, i32[] sc, i32[] sa, i32[] sb) {
+    i32 n = sizeOf(out);
+    GpuStorage o = this.alloc(n);
+    i32 prog = this.program("select", () => selectShader());
+    this.spread(prog, stridedParams(n, out, [sc, sa, sb]), [this.of(c), this.of(a), this.of(b), o.handle], n);
+    return o;
+  }
+
+  override Storage reduce(this, Reduce op, Storage x, i32 outer, i32 inner) {
+    GpuStorage o = this.alloc(outer);
+    i32 prog = this.program("reduce/\{reduceName(op)}", () => reduceShader(op));
+    this.perRow(prog, [outer, inner], [this.of(x), o.handle], outer);
+    return o;
+  }
+
+  override Storage argReduce(this, bool max, Storage x, i32 outer, i32 inner) {
+    GpuStorage o = this.alloc(outer);
+    i32 prog = this.program(max ? "argmax" : "argmin", () => argReduceShader(max));
+    this.perRow(prog, [outer, inner], [this.of(x), o.handle], outer);
+    return o;
+  }
+
+  override Storage matmul(this, Storage a, Storage b, i32 batch, i32 m, i32 k, i32 n, bool ta, bool tb,
+                          i32 aStride, i32 bStride) {
+    GpuStorage o = this.alloc(batch * m * n);
+    if (batch * m * n == 0) { return o; }
+    i32 prog = this.program("matmul", () => matmulShader());
+    this.run(prog, [batch, m, k, n, ta ? 1 : 0, tb ? 1 : 0, aStride, bStride], [this.of(a), this.of(b), o.handle],
+             (n + 15) / 16, (m + 15) / 16, batch);
+    return o;
+  }
+
+  override Storage gather(this, Storage x, i32[] out, i32[] strides, i32 offset) {
+    i32 n = sizeOf(out);
+    GpuStorage o = this.alloc(n);
+    i32 prog = this.program("gather", () => gatherShader());
+    i32[] p = stridedParams(n, out, [strides]);
+    i32[] withOffset = i32[].filled(p.len() + 1, offset);
+    withOffset.copyFrom(p, 0, 0, p.len());
+    this.spread(prog, withOffset, [this.of(x), o.handle], n);
+    return o;
+  }
+
+  override Storage pad(this, Storage x, i32[] inShape, i32[] out, i32[] begin, f32 value) {
+    i32 n = sizeOf(out);
+    GpuStorage o = this.alloc(n);
+    i32 prog = this.program("pad", () => padShader());
+    i32 r = out.len();
+    i32[] p = i32[].filled(3 + 3 * r, 0);
+    p[0] = n;
+    p[1] = r;
+    for (i32 d = 0; d < r; d++) {
+      p[2 + d] = out[d];
+      p[2 + r + d] = inShape[d];
+      p[2 + 2 * r + d] = begin[d];
+    }
+    p[2 + 3 * r] = bitsOf(value);
+    this.spread(prog, p, [this.of(x), o.handle], n);
+    return o;
+  }
+
+  override Storage im2col(this, Storage x, Conv c, f32 padValue) {
+    i32 n = c.rows() * c.cols();
+    GpuStorage o = this.alloc(n);
+    i32 prog = this.program("im2col", () => im2colShader());
+    i32[] p = convParams(n, c);
+    p[15] = bitsOf(padValue);
+    this.spread(prog, p, [this.of(x), o.handle], n);
+    return o;
+  }
+
+  override Storage col2im(this, Storage cols, Conv c) {
+    i32 n = c.n * c.h * c.w * c.c;
+    GpuStorage o = this.alloc(n);
+    i32 prog = this.program("col2im", () => col2imShader());
+    this.spread(prog, convParams(n, c), [this.of(cols), o.handle], n);
+    return o;
+  }
+
+  override Storage take(this, Storage table, i32 width, Storage indices, i32 n) {
+    GpuStorage o = this.alloc(n * width);
+    i32 prog = this.program("take", () => takeShader());
+    this.spread(prog, [n * width, width, table.size / width], [this.of(table), this.of(indices), o.handle], n * width);
+    return o;
+  }
+
+  override Storage scatterAdd(this, Storage values, i32 width, Storage indices, i32 n, i32 rows) {
+    GpuStorage o = this.alloc(rows * width);
+    i32 prog = this.program("scatteradd", () => scatterAddShader());
+    this.spread(prog, [rows * width, width, n], [this.of(values), this.of(indices), o.handle], rows * width);
+    return o;
+  }
+}
+
+/** [n, rank, shape…, then each operand's strides…] — what `stridedLoop` reads. */
+i32[] stridedParams(i32 n, i32[] out, i32[][] strides) {
+  i32 r = out.len();
+  i32[] p = i32[].filled(2 + r * (strides.len() + 1), 0);
+  p[0] = n;
+  p[1] = r;
+  for (i32 d = 0; d < r; d++) { p[2 + d] = out[d]; }
+  for (i32 k = 0; k < strides.len(); k++) {
+    for (i32 d = 0; d < r; d++) { p[2 + r * (k + 1) + d] = strides[k][d]; }
+  }
+  return p;
+}
+
+i32[] convParams(i32 n, Conv c) {
+  return [n, c.n, c.h, c.w, c.c, c.kh, c.kw, c.sh, c.sw, c.dh, c.dw, c.padTop, c.padLeft, c.oh, c.ow, 0];
+}
+
+async f32[] readFloats(Ticket<Answer> pending, i32 n, fn<void(string)> warn) {
+  Answer a = await pending;
+  if (a.fault != 0) {
+    // The GPU said something went wrong since the last read — a shader that did not compile, a buffer it could not
+    // make. The numbers cannot be trusted, and there is no value to answer with that would not be a lie.
+    warn("wac.gpu: " + a.text);
+    trap;
+  }
+  if (a.bytes.len() < n * 4) { trap; }
+  f32[] out = f32[].filled(n, 0.0);
+  for (i32 i = 0; i < n; i++) {
+    u32 bits = (a.bytes[i * 4] as u32) | ((a.bytes[i * 4 + 1] as u32) << 8) | ((a.bytes[i * 4 + 2] as u32) << 16)
+             | ((a.bytes[i * 4 + 3] as u32) << 24);
+    out[i] = f32.fromBits(bits);
+  }
+  return out;
+}
+
+string unaryName(Unary op) {
+  match (op) {
+    Neg: { return "neg"; }
+    Abs: { return "abs"; }
+    Exp: { return "exp"; }
+    Expm1: { return "expm1"; }
+    Log: { return "log"; }
+    Log1p: { return "log1p"; }
+    Sqrt: { return "sqrt"; }
+    Rsqrt: { return "rsqrt"; }
+    Square: { return "square"; }
+    Reciprocal: { return "reciprocal"; }
+    Sin: { return "sin"; }
+    Cos: { return "cos"; }
+    Tanh: { return "tanh"; }
+    Sigmoid: { return "sigmoid"; }
+    Relu: { return "relu"; }
+    Softplus: { return "softplus"; }
+    Sign: { return "sign"; }
+    Floor: { return "floor"; }
+    Ceil: { return "ceil"; }
+    Round: { return "round"; }
+    Step: { return "step"; }
+  }
+}
+
+string binaryName(Binary op) {
+  match (op) {
+    Add: { return "add"; }
+    Sub: { return "sub"; }
+    Mul: { return "mul"; }
+    Div: { return "div"; }
+    Pow: { return "pow"; }
+    Maximum: { return "maximum"; }
+    Minimum: { return "minimum"; }
+    Equal: { return "equal"; }
+    NotEqual: { return "notequal"; }
+    Less: { return "less"; }
+    LessEqual: { return "lessequal"; }
+    Greater: { return "greater"; }
+    GreaterEqual: { return "greaterequal"; }
+  }
+}
+
+string reduceName(Reduce op) {
+  match (op) {
+    Sum: { return "sum"; }
+    Prod: { return "prod"; }
+    Max: { return "max"; }
+    Min: { return "min"; }
+  }
+}

@@ -8,7 +8,7 @@ import { encodeRecord, toUtf16, fromUtf16, ENC_UTF8, ENC_UTF16BE } from "./recor
 import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
          JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
 import { Table, Row, RowCursor, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, rowsTable, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
-import { Cursor } from "./btree.wac";
+import { Cursor, KeyCmp, whole } from "./btree.wac";
 import { Database, isKeyIndex } from "./database.wac";
 import { jsonEachRows, JSON_EACH_COLS } from "./jsoneach.wac";
 import { pragmaRows } from "./pragma.wac";
@@ -1479,10 +1479,18 @@ struct Scan {
   Cursor? ic;
   bool begun = false;
   bool done = false;
+  KeyCmp? loCmp = null;    // the bounds as comparisons of an entry's bytes
+  KeyCmp? hiCmp = null;
 
   Scan open(Table t, Access a) {
     Cursor? ic = a.ix is null ? null : a.ix!.cursor() as Cursor?;
-    return Scan { t: t, a: a, rc: t.cursor(), ic: ic };
+    Scan sc = Scan { t: t, a: a, rc: t.cursor(), ic: ic };
+    if (a.ix is not null) {
+      Index ix = a.ix!;
+      if (a.lo is not null) { sc.loCmp = a.lo!.after ? ix.prefixTo(a.lo!.key) : ix.cmpTo(a.lo!.key); }
+      if (a.hi is not null) { sc.hiCmp = a.hi!.after ? ix.prefixTo(a.hi!.key) : ix.cmpTo(a.hi!.key); }
+    }
+    return sc;
   }
 
   // The next row, or null at the end. A row an index names that is not in the table is passed over.
@@ -1518,14 +1526,11 @@ struct Scan {
         ok = this.a.reverse ? c.prev() : c.next();
       }
       if (!ok) { this.done = true; return null; }
-      Value[] key = ix.keyOf(c.payload);
-      if (!this.within(ix, key)) { this.done = true; return null; }
-      match (key[key.len() - 1]) {
-        Int(id): {
-          Row? r = this.t.get(id);
-          if (r is not null) { return r; }
-        }
-        default: {}
+      if (!this.within(c.payload)) { this.done = true; return null; }
+      i64? id = ix.rowidOf(c.payload);
+      if (id is not null) {
+        Row? r = this.t.get(id!);
+        if (r is not null) { return r; }
       }
     }
     return null;
@@ -1535,16 +1540,15 @@ struct Scan {
     return b.after ? this.a.ix!.seekAfter(this.ic!, b.key) : this.a.ix!.seekFrom(this.ic!, b.key);
   }
 
-  bool within(this, Index ix, Value[] key) {
-    if (this.a.lo is not null) {
-      Bound lo = this.a.lo!;
-      if (key.len() < lo.key.len()) { return false; }
-      if (lo.after ? ix.comparePrefix(key, lo.key) <= 0 : ix.compare(key, lo.key) < 0) { return false; }
+  // Whether an entry lies between the bounds: from `lo` on, and before `hi`.
+  bool within(this, u8[] rec) {
+    if (this.loCmp is not null) {
+      i32 c = whole(this.loCmp!, rec);
+      if (this.a.lo!.after ? c <= 0 : c < 0) { return false; }
     }
-    if (this.a.hi is not null) {
-      Bound hi = this.a.hi!;
-      if (key.len() < hi.key.len()) { return false; }
-      if (hi.after ? ix.comparePrefix(key, hi.key) > 0 : ix.compare(key, hi.key) >= 0) { return false; }
+    if (this.hiCmp is not null) {
+      i32 c = whole(this.hiCmp!, rec);
+      if (this.a.hi!.after ? c > 0 : c >= 0) { return false; }
     }
     return true;
   }

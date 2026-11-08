@@ -4,7 +4,7 @@
 
 import { Vec, Map, hashI64, i64Eq } from "core";
 import { Value, compareValues, compareColl, classRank, COLL_BINARY } from "./value.wac";
-import { readVarint, Varint, beSigned, sliceBytes } from "./bytes.wac";
+import { readVarint, Varint, beSigned, sliceBytes, varintAt, varintSizeAt } from "./bytes.wac";
 import { Pager } from "./pager.wac";
 import { Cursor, KeyCmp, KeyCmpOf, tableInsert, tableDelete, indexInsert, indexDelete, countEntries } from "./btree.wac";
 import { encodeRecordIn, decodeRecordIn, serialSize, toUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
@@ -150,33 +150,53 @@ export struct Index {
         default: {}
       }
     }
-    return (u8[] s) => this.compareRec(s, target, tb);
+    return (u8[] s, i32 a, i32 b) => this.compareRec(s, a, b, target, tb, false);
+  }
+
+  // The same, comparing only `target`'s length of columns: an entry that begins with it is equal.
+  KeyCmp prefixTo(this, Value[] target) {
+    u8[][] tb = u8[][].defaulted(target.len());
+    for (i32 i = 0; i < target.len(); i++) {
+      match (target[i]) {
+        Text(t): { tb[i] = t.toBytes(); }
+        Blob(b): { tb[i] = b; }
+        default: {}
+      }
+    }
+    return (u8[] s, i32 a, i32 b) => this.compareRec(s, a, b, target, tb, true);
   }
 
   // How a stored record compares with `target`, as compare(keyOf(rec), target) would, reading only the
   // fields it gets to. `tb` holds the target's text and blobs as bytes.
-  i32 compareRec(this, const u8[] rec, Value[] target, u8[][] tb) {
-    if (this.enc != ENC_UTF8 || rec.len() == 0) { return this.compare(this.keyOf(rec), target); }
-    Varint h = readVarint(rec, 0);
-    if (h.value < 1 || h.value > rec.len() as i64) { return this.compare(this.keyOf(rec), target); }
-    i32 hdrEnd = h.value as! i32;
-    i32 at = h.size;
+  i32 compareRec(this, const u8[] rec, i32 start, i32 end, Value[] target, u8[][] tb, bool prefix) {
+    if (this.enc != ENC_UTF8 || end <= start) { return this.slowCompare(rec, start, end, target, prefix); }
+    i64 hv = varintAt(rec, start);
+    if (hv < 1 || hv > (end - start) as i64) { return this.slowCompare(rec, start, end, target, prefix); }
+    i32 hdrEnd = start + hv as! i32;
+    i32 at = start + varintSizeAt(rec, start);
     i32 body = hdrEnd;
     i32 i = 0;
     while (at < hdrEnd) {
       i64 t = 0;
       if ((rec[at] & 0x80) == 0) { t = rec[at] as i64; at++; }
-      else { Varint tv = readVarint(rec, at); t = tv.value; at += tv.size; }
+      else { t = varintAt(rec, at); at += varintSizeAt(rec, at); }
       i32 n = serialSize(t);
-      if (t < 0 || t == 10 || t == 11 || body + n > rec.len()) { return this.compare(this.keyOf(rec), target); }
-      // Every column the target has is equal and the record has more: it comes after.
-      if (i >= target.len()) { return 1; }
+      if (t < 0 || t == 10 || t == 11 || body + n > end) { return this.slowCompare(rec, start, end, target, prefix); }
+      // Every column the target has is equal and the record has more: it comes after, unless only the
+      // target's columns count.
+      if (i >= target.len()) { return prefix ? 0 : 1; }
       i32 c = this.fieldCmp(rec, t, body, n, i, target[i], tb[i]);
       if (c != 0) { return i < this.desc.len() && this.desc[i] ? -c : c; }
       body += n;
       i++;
     }
     return i < target.len() ? -1 : 0;
+  }
+
+  i32 slowCompare(this, const u8[] rec, i32 start, i32 end, Value[] target, bool prefix) {
+    Value[] k = this.keyOf(sliceBytes(rec, start, end));
+    if (prefix) { return k.len() < target.len() ? -1 : this.comparePrefix(k, target); }
+    return this.compare(k, target);
   }
 
   i32 fieldCmp(this, const u8[] rec, i64 t, i32 off, i32 n, i32 col, Value tv, u8[] b) {
@@ -213,12 +233,42 @@ export struct Index {
   }
 
   // The first entry not before `key`, comparing only `key`'s length of columns.
-  bool seekFrom(this, Cursor c, Value[] key) { return c.seek((u8[] s) => this.compare(this.keyOf(s), key) >= 0); }
+  bool seekFrom(this, Cursor c, Value[] key) {
+    KeyCmp cmp = this.cmpTo(key);
+    return c.seek((u8[] s, i32 a, i32 b) => cmp(s, a, b) >= 0);
+  }
 
   // The first entry after every entry that begins with `key`.
-  bool seekAfter(this, Cursor c, Value[] key) { return c.seek((u8[] s) => this.comparePrefix(this.keyOf(s), key) > 0); }
+  bool seekAfter(this, Cursor c, Value[] key) {
+    KeyCmp cmp = this.prefixTo(key);
+    return c.seek((u8[] s, i32 a, i32 b) => cmp(s, a, b) > 0);
+  }
 
   i64 count(this) { return countEntries(this.pg!, this.root); }
+
+  // The rowid an entry ends with, read without decoding the rest; null when it does not end with one.
+  i64? rowidOf(this, const u8[] rec) {
+    if (rec.len() == 0) { return null; }
+    i64 hv = varintAt(rec, 0);
+    if (hv < 1 || hv > rec.len() as i64) { return null; }
+    i32 hdrEnd = hv as! i32;
+    i32 at = varintSizeAt(rec, 0);
+    i32 body = hdrEnd;
+    i64 t = 0;
+    i32 off = 0;
+    while (at < hdrEnd) {
+      t = varintAt(rec, at);
+      at += varintSizeAt(rec, at);
+      if (t < 0 || t == 10 || t == 11) { return null; }
+      off = body;
+      body += serialSize(t);
+    }
+    if (body > rec.len()) { return null; }
+    if (t >= 1 && t <= 6) { return beSigned(rec, off, serialSize(t)); }
+    if (t == 8) { return 0 as i64; }
+    if (t == 9) { return 1 as i64; }
+    return null;
+  }
 
   void add(this, Row r) {
     if (!this.holds(r)) { return; }

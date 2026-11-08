@@ -23,6 +23,10 @@ SqliteFile db = SqliteFile.open(sys.files(), "data/app.db").unwrap();   // creat
 db.execute("INSERT INTO events (id, seq) VALUES (?, ?)", [Value.Text("e1"), Value.Int(1)]).unwrap();
 ```
 
+A database file is read a page at a time and written a page at a time, behind a rollback journal in
+SQLite's format: opening a large file costs what reading its schema costs, and a commit writes the pages
+it changed. This needs a wac whose std has `Files.openRandom` (wac's `random-access-files` branch).
+
 ## Where it stands
 
 **The file format, both ways.** It opens databases the real SQLite wrote — tables and indexes, interior
@@ -55,24 +59,26 @@ same. Times in milliseconds, on 20,000 rows of autonag's events table (`bench/wo
 
 | workload | wac-sqlite | sqlite-wasm | ratio |
 | --- | ---: | ---: | ---: |
-| insert, one transaction | 222 | 225 | 0.99× |
-| point lookup by text key ×10,000 | 76 | 69 | 1.09× |
-| index range, ~50 rows ×1,000 | 65 | 202 | 0.32× |
-| `MAX(seq)` through an index ×10,000 | 53 | 111 | 0.48× |
-| `ORDER BY … DESC LIMIT 10` ×1,000 | 11 | 33 | 0.34× |
-| `json_extract` full scan ×20 | 116 | 137 | 0.85× |
-| `GROUP BY` ×20 | 101 | 143 | 0.71× |
-| join + group ×20 | 73 | 42 | 1.72× |
-| `LIKE '%…%'` full scan ×200 | 957 | 840 | 1.14× |
-| `UPDATE … json_set` ×2,000 | 41 | 15 | 2.73× |
-| `DELETE` 20% | 14 | 7 | 1.96× |
-| serialize the file | 29 | 3 | 10× |
-| deserialize the file | 35 | 2 | 15× |
-| **total** | **1792** | **1829** | **0.98×** |
+| insert, one transaction | 323 | 253 | 1.27× |
+| point lookup by text key ×10,000 | 126 | 79 | 1.59× |
+| index range, ~50 rows ×1,000 | 130 | 248 | 0.52× |
+| `MAX(seq)` through an index ×10,000 | 86 | 117 | 0.74× |
+| `ORDER BY … DESC LIMIT 10` ×1,000 | 16 | 38 | 0.42× |
+| `json_extract` full scan ×20 | 255 | 138 | 1.85× |
+| `GROUP BY` ×20 | 298 | 145 | 2.05× |
+| join + group ×20 | 316 | 44 | 7.2× |
+| `LIKE '%…%'` full scan ×200 | 1551 | 871 | 1.78× |
+| `UPDATE … json_set` ×2,000 | 100 | 17 | 6.0× |
+| `DELETE` 20% | 143 | 7 | 20× |
+| serialize the file | 4 | 3 | 1.08× |
+| deserialize the file and scan it | 44 | 3 | 17× |
+| **total** | **3392** | **1963** | **1.73×** |
 
-Reading through indexes is where this wins; producing and loading a whole file image is where it loses,
-since SQLite's image is its pages already and this one is built from rows (an unchanged row's record is
-kept, so a commit after a small change costs less than the first). Numbers move a few percent run to run.
+Reading through indexes is where this wins. When everything was held decoded in memory the total was
+0.98×; keeping the database on its pages, as SQLite does, costs a record decoded per row read (kept per
+page for a while after) and a b-tree change per row written, and the deletes and the join pay most for
+it. A full scan here decodes every column of every row, where SQLite decodes the ones a query reads; a
+plain `count(*)` still decodes rows. Numbers move several percent run to run.
 
 **And against SQLite's answers.** Beyond the hand-written corpus, seven fuzzers write random SQL and
 record what SQLite 3.53 answers:
@@ -99,22 +105,40 @@ answer. Reals become text through a port of SQLite's own decimal conversion (`sr
 
 ## How it works, and what that costs
 
-The whole database lives in memory: rows in rowid order and every index as a sorted list. Opening a file
-reads it whole; **each commit writes it whole**, every b-tree built bottom-up and packed, to a temporary
-file that is then renamed over the original. That is how wac's std reads and writes files today (whole
-files), it is VACUUM's output every time, and it keeps the writer to one path that is easy to check.
+**The database is its pages.** Every table is a table b-tree and every index an index b-tree, on a pager
+(`src/pager.wac`, `src/btree.wac`), laid out exactly as SQLite lays them out. Statements read rows through
+cursors and change them where they lie: a cell goes into a page's free space or comes out as a free
+block, a page that overflows splits, a page a deletion empties goes and its neighbour takes the
+parent's divider. Opening a database reads its header and `sqlite_schema` and nothing else.
+
+**Every change can be undone.** The first time a transaction (or a statement, or a `SAVEPOINT`) changes a
+page, the page as it was is kept; a rollback puts those back. A commit writes `sqlite_schema` again if the
+schema changed, and the header, onto page 1, and then:
+
+- **A file (`SqliteFile`)** writes a rollback journal holding the old contents of every page the commit
+  changes, syncs it, writes the changed pages over the file, syncs that, and deletes the journal — the
+  commit point, as in SQLite's default journal mode. The journal is SQLite's format, so after a crash
+  SQLite plays it back, and so does this library when it opens the file (`test/paging_test.wac`, and
+  `tools/journal_check.py` with the real SQLite).
+- **A memory database** (`Connection.memory()`, `openBytes`) keeps its pages in memory, and `image()`
+  is those pages.
 
 So:
 
-- **A commit costs time proportional to the database**: about 15–30 ms for 20,000 rows and 3 MB.
-  Batch writes into a transaction where it matters.
-- **One writer.** SQLite's locks are not taken. Readers, the real SQLite included, are safe — they see
-  the old file or the new one.
-- **WAL mode is kept, and a `-wal` beside the file is read**: its committed transactions are laid over
-  the file on opening, and checkpointed into it (then the log and `-shm` removed) before the first
-  write. That assumes no other connection is using the database meanwhile. A hot `-journal` (a crashed
-  rollback-mode writer's) is refused: open the database with SQLite once to recover it.
-- Memory is the whole database, decoded.
+- **Memory** is what is in use, not the database: a bounded cache of pages (2,000 by default) and of
+  decoded rows, plus the pages a transaction has changed until it commits. A 2.4 MB file is read and
+  changed through a 20-page cache in the tests. Large transactions hold their changed pages (and the
+  old contents) until the commit.
+- **Two things are still held in memory whole**: `TEMP` tables, and `WITHOUT ROWID` tables (the engine
+  works with rowids, so such a table is kept as a rowid table in memory, numbered as read, and written
+  back to its b-trees in the file at a commit after it changed).
+- **Some commits write a whole new image**: `VACUUM`, and every commit to an auto-vacuum database, whose
+  pointer map is not kept up page by page. Those build the image in memory and rename it over the file.
+- **One writer.** SQLite's locks are not taken: another program writing the file at the same time would
+  lose one side's changes, and one reading it during a commit could see half of it.
+- **WAL mode is kept, and a `-wal` beside the file is read**: its committed pages are laid over the
+  file's on opening, and checkpointed into it (then the log and `-shm` removed) before the first write.
+  That assumes no other connection is using the database meanwhile.
 
 ## Not yet
 
@@ -148,6 +172,7 @@ rather than half done.
     wac task verify      # files written here, checked by the real SQLite (needs python3)
     wac task fixtures    # regenerate test/data with the real SQLite
     node bench/run.mjs 20000                     # the benchmark (cd bench && npm install, once)
+    wac run --allow-read --allow-write tools/btreefuzz.wac -- 7 5000 && python3 tools/btreecheck.py   # the b-trees alone
     sh tools/fuzzdiff.sh 7; sh tools/fuzzdiff2.sh 7   # a fuzz seed against SQLite
     python3 tools/corpus.py                      # regenerate test/corpus/*.out
     wac run --allow-read --allow-write tools/sql.wac -- my.db script.sql   # a small shell
@@ -155,9 +180,10 @@ rather than half done.
 | | |
 | --- | --- |
 | `src/value.wac`, `record.wac`, `bytes.wac` | values, the record format, varints |
-| `src/reader.wac`, `writer.wac`, `database.wac` | the file: reading b-trees, building them, the schema |
+| `src/pager.wac`, `btree.wac` | pages read when wanted and undone on rollback; b-trees changed in place |
+| `src/database.wac`, `reader.wac`, `writer.wac` | the schema; opening and committing; a whole image for VACUUM |
 | `src/lexer.wac`, `parser.wac`, `ast.wac` | SQL text into statements |
-| `src/schema.wac` | tables, indexes and rows in memory |
+| `src/schema.wac` | tables, indexes and rows over their b-trees |
 | `src/query.wac`, `plan.wac`, `ops.wac`, `functions.wac`, `json.wac` | binding, evaluation, SELECT |
 | `src/engine.wac` | `Connection`: changes, constraints, transactions |
-| `src/file.wac` | `SqliteFile`: a connection backed by a file |
+| `src/file.wac` | `SqliteFile`: pages read from a file and committed behind a rollback journal |

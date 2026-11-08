@@ -19,7 +19,7 @@
 
 import { Vec, Buf } from "core";
 import { Pager } from "./pager.wac";
-import { be16, be32, put16, put32, readVarint, Varint, pushVarint, varintLen } from "./bytes.wac";
+import { be16, be32, put16, put32, readVarint, Varint, pushVarint, varintLen, varintAt, varintSizeAt } from "./bytes.wac";
 import { localSize } from "./reader.wac";
 
 export static i32 INDEX_INTERIOR = 2;
@@ -27,8 +27,9 @@ export static i32 TABLE_INTERIOR = 5;
 export static i32 INDEX_LEAF = 10;
 export static i32 TABLE_LEAF = 13;
 
-// How a stored record compares with what is sought: below zero when it comes first.
-export type KeyCmp = fn<i32(u8[])>;
+// How a stored record compares with what is sought: below zero when it comes first. The record is
+// bytes [start, end) of the array, so one on a page is compared where it lies.
+export type KeyCmp = fn<i32(u8[], i32, i32)>;
 // A record's own comparison, for finding it again.
 export type KeyCmpOf = fn<KeyCmp(u8[])>;
 
@@ -45,12 +46,12 @@ i32 cellSize(const u8[] page, i32 off, i32 kind, i32 usable) {
   if (kind == TABLE_INTERIOR) { return 4 + readVarint(page, off + 4).size; }
   i32 at = off + (kind == INDEX_INTERIOR ? 4 : 0);
   if (at + 9 > page.len() && at >= page.len()) { return -1; }
-  Varint p = readVarint(page, at);
-  at += p.size;
-  if (kind == TABLE_LEAF) { at += readVarint(page, at).size; }
-  i32 local = localSize(usable, kind == TABLE_LEAF, p.value);
-  if (p.value < 0) { return -1; }
-  at += local + ((local as i64) < p.value ? 4 : 0);
+  i64 size = varintAt(page, at);
+  at += varintSizeAt(page, at);
+  if (kind == TABLE_LEAF) { at += varintSizeAt(page, at); }
+  if (size < 0) { return -1; }
+  i32 local = localSize(usable, kind == TABLE_LEAF, size);
+  at += local + ((local as i64) < size ? 4 : 0);
   if (at > page.len()) { return -1; }
   return at - off;
 }
@@ -96,10 +97,10 @@ struct PayloadAt {
 
 PayloadAt payloadOf(const u8[] cell, i32 kind, i32 usable, i32 base) {
   i32 at = base + (kind == INDEX_INTERIOR ? 4 : 0);
-  Varint p = readVarint(cell, at);
-  at += p.size;
-  if (kind == TABLE_LEAF) { at += readVarint(cell, at).size; }
-  return PayloadAt(at, p.value, localSize(usable, kind == TABLE_LEAF, p.value));
+  i64 size = varintAt(cell, at);
+  at += varintSizeAt(cell, at);
+  if (kind == TABLE_LEAF) { at += varintSizeAt(cell, at); }
+  return PayloadAt(at, size, localSize(usable, kind == TABLE_LEAF, size));
 }
 
 // A cell's whole payload, its overflow pages followed.
@@ -547,8 +548,8 @@ i32 cellOff(const u8[] page, i32 h, i32 kind, i32 i) { return be16(page, h + ptr
 
 // A table cell's key, read off the page where it lies.
 i64 rowidAt(const u8[] page, i32 off, i32 kind) {
-  if (kind == TABLE_INTERIOR) { return readVarint(page, off + 4).value; }
-  return readVarint(page, off + readVarint(page, off).size).value;
+  if (kind == TABLE_INTERIOR) { return varintAt(page, off + 4); }
+  return varintAt(page, off + varintSizeAt(page, off));
 }
 
 // The leaf where `rowid` is or would go, and its position there. `path.append` says whether that
@@ -680,7 +681,7 @@ IndexSpot findIndexLeaf(Pager pg, i64 root, KeyCmp cmp) {
     i32 hi = n;
     while (lo < hi) {
       i32 mid = (lo + hi) / 2;
-      i32 c = cmp(payloadAt(pg, page, cellOff(page, h, kind, mid), kind));
+      i32 c = cmpAt(pg, page, cellOff(page, h, kind, mid), kind, cmp);
       if (c == 0) { found = true; }
       if (c < 0) { lo = mid + 1; } else { hi = mid; }
     }
@@ -696,6 +697,24 @@ IndexSpot findIndexLeaf(Pager pg, i64 root, KeyCmp cmp) {
   }
   pg.failed("b-tree too deep");
   return IndexSpot(path, found);
+}
+
+export i32 whole(KeyCmp cmp, u8[] rec) { return cmp(rec, 0, rec.len()); }
+
+// A comparison of the payload of the cell at `off` on a page: where it lies when it is all there, or
+// gathered from its overflow pages.
+i32 cmpAt(Pager pg, u8[] page, i32 off, i32 kind, KeyCmp cmp) {
+  PayloadAt pa = payloadOf(page, kind, pg.pageSize, off);
+  if ((pa.local as i64) == pa.size && pa.start + pa.local <= page.len()) { return cmp(page, pa.start, pa.start + pa.local); }
+  u8[] full = payloadAt(pg, page, off, kind);
+  return cmp(full, 0, full.len());
+}
+
+bool holdsAt(Pager pg, u8[] page, i32 off, i32 kind, fn<bool(u8[], i32, i32)> f) {
+  PayloadAt pa = payloadOf(page, kind, pg.pageSize, off);
+  if ((pa.local as i64) == pa.size && pa.start + pa.local <= page.len()) { return f(page, pa.start, pa.start + pa.local); }
+  u8[] full = payloadAt(pg, page, off, kind);
+  return f(full, 0, full.len());
 }
 
 // The payload of the cell at `off` on a page, its overflow followed.
@@ -731,7 +750,7 @@ export void indexInsert(Pager pg, i64 root, const u8[] rec, KeyCmp cmp) {
 // one before it, which comes up from its leaf. Answers whether there was one.
 export bool indexDelete(Pager pg, i64 root, KeyCmp cmp, KeyCmpOf cmpOf) {
   Cursor c = Cursor.over(pg, root, false);
-  if (!c.seek((u8[] s) => cmp(s) >= 0) || cmp(c.payload) != 0) { return false; }
+  if (!c.seek((u8[] s, i32 a, i32 b) => cmp(s, a, b) >= 0) || whole(cmp, c.payload) != 0) { return false; }
   pg.version++;
   Path path = c.path();
   i32 d = path.pages.len() - 1;
@@ -759,7 +778,7 @@ export bool indexDelete(Pager pg, i64 root, KeyCmp cmp, KeyCmpOf cmpOf) {
   leafRemove(pg, path, false);
   // Taking it off may have moved things about: the entry is found again.
   Cursor again = Cursor.over(pg, root, false);
-  if (!again.seek((u8[] s) => cmp(s) >= 0) || cmp(again.payload) != 0) { pg.failed("index entry lost"); return false; }
+  if (!again.seek((u8[] s, i32 a, i32 b) => cmp(s, a, b) >= 0) || whole(cmp, again.payload) != 0) { pg.failed("index entry lost"); return false; }
   Path p2 = again.path();
   i32 d2 = p2.pages.len() - 1;
   Node nd2 = load(pg, p2.pages.get(d2));
@@ -1035,7 +1054,7 @@ export struct Cursor {
       i32 hi = n;
       while (lo < hi) {
         i32 mid = (lo + hi) / 2;
-        if (cellRowid(this.cellAt(p, mid), kind) < rowid) { lo = mid + 1; } else { hi = mid; }
+        if (rowidAt(page, cellOff(page, h, kind, mid), kind) < rowid) { lo = mid + 1; } else { hi = mid; }
       }
       this.pages.push(p);
       this.slots.push(lo);
@@ -1049,7 +1068,7 @@ export struct Cursor {
   }
 
   // The first entry `after` holds for: it must hold for every entry from some point on.
-  bool seek(this, fn<bool(u8[])> after) {
+  bool seek(this, fn<bool(u8[], i32, i32)> after) {
     this.reset();
     i64 p = this.root;
     while (true) {
@@ -1062,7 +1081,7 @@ export struct Cursor {
       i32 hi = n;
       while (lo < hi) {
         i32 mid = (lo + hi) / 2;
-        if (!after(cellPayload(this.pg, this.cellAt(p, mid), kind))) { lo = mid + 1; } else { hi = mid; }
+        if (!holdsAt(this.pg, page, cellOff(page, h, kind, mid), kind, after)) { lo = mid + 1; } else { hi = mid; }
       }
       this.pages.push(p);
       this.slots.push(lo);
@@ -1083,7 +1102,8 @@ export struct Cursor {
       return this.seekRowid(want) && this.rowid == want;
     }
     KeyCmp cmp = this.cmpOf!(this.payload);
-    return this.seek((u8[] s) => cmp(s) >= 0) && cmp(this.payload) == 0;
+    u8[] mine = this.payload;
+    return this.seek((u8[] s, i32 a, i32 b) => cmp(s, a, b) >= 0) && whole(cmp, mine) == 0;
   }
 
   bool stale(const this) { return this.seen != this.pg.version && (this.table || this.cmpOf is not null); }

@@ -45,6 +45,42 @@ data.
 | Pragmas | `user_version`, `page_size`, `table_info`, and the ones an application sets and does not read back (`journal_mode`, `foreign_keys`, `busy_timeout`, …) |
 | Planning | an index (equality on leading columns, then a range) or the rowid narrows each source of a join; an index that delivers the `ORDER BY` lets a `LIMIT` stop early; a lone `min`/`max` reads one entry |
 
+## Against SQLite's own wasm build
+
+`node bench/run.mjs 20000` runs the same workloads through this library and through
+[`@sqlite.org/sqlite-wasm`](https://www.npmjs.com/package/@sqlite.org/sqlite-wasm) 3.54.1 — SQLite itself,
+compiled to WebAssembly — in the same Node, and checks a digest of every answer. The answers are the
+same. Times in milliseconds, on 20,000 rows of autonag's events table (`bench/workloads.md`):
+
+| workload | wac-sqlite | sqlite-wasm | ratio |
+| --- | ---: | ---: | ---: |
+| insert, one transaction | 222 | 225 | 0.99× |
+| point lookup by text key ×10,000 | 76 | 69 | 1.09× |
+| index range, ~50 rows ×1,000 | 65 | 202 | 0.32× |
+| `MAX(seq)` through an index ×10,000 | 53 | 111 | 0.48× |
+| `ORDER BY … DESC LIMIT 10` ×1,000 | 11 | 33 | 0.34× |
+| `json_extract` full scan ×20 | 116 | 137 | 0.85× |
+| `GROUP BY` ×20 | 101 | 143 | 0.71× |
+| join + group ×20 | 73 | 42 | 1.72× |
+| `LIKE '%…%'` full scan ×200 | 957 | 840 | 1.14× |
+| `UPDATE … json_set` ×2,000 | 41 | 15 | 2.73× |
+| `DELETE` 20% | 14 | 7 | 1.96× |
+| serialize the file | 29 | 3 | 10× |
+| deserialize the file | 35 | 2 | 15× |
+| **total** | **1792** | **1829** | **0.98×** |
+
+Reading through indexes is where this wins; producing and loading a whole file image is where it loses,
+since SQLite's image is its pages already and this one is built from rows (an unchanged row's record is
+kept, so a commit after a small change costs less than the first). Numbers move a few percent run to run.
+
+**And against SQLite's answers.** Beyond the hand-written corpus, two fuzzers write random SQL and
+record what SQLite 3.53 answers: `tools/fuzz.py` (expressions over mixed types — affinity, casts,
+arithmetic, every scalar function) and `tools/fuzz2.py` (schemas, conflicts, upserts, joins, grouping,
+ordering, subqueries, changes). Seeds 1–60 of each agree statement for statement; seed 1 of each is in
+`test/corpus`. `sh tools/fuzzdiff.sh <seed>` shows any disagreement. Reals become text through a port
+of SQLite's own decimal conversion (`src/fp.wac`), so `CAST(1.0/3 AS TEXT)` is `0.33333333333333332`
+here too.
+
 ## How it works, and what that costs
 
 The whole database lives in memory: rows in rowid order and every index as a sorted list. Opening a file
@@ -54,8 +90,8 @@ files), it is VACUUM's output every time, and it keeps the writer to one path th
 
 So:
 
-- **A commit costs time proportional to the database**: about 40 ms for 20,000 rows and 3 MB
-  (`wac run tools/bench.wac -- 20000`). Batch writes into a transaction where it matters.
+- **A commit costs time proportional to the database**: about 15–30 ms for 20,000 rows and 3 MB.
+  Batch writes into a transaction where it matters.
 - **One writer.** SQLite's locks are not taken. Readers, the real SQLite included, are safe — they see
   the old file or the new one.
 - **A database with a `-wal` or hot `-journal` beside it is refused**: those hold changes the main file
@@ -91,6 +127,8 @@ text encodings other than UTF-8. Each is refused with an `unsupported` error rat
     wac task test        # every unit and corpus test (reads test/data and test/corpus)
     wac task verify      # files written here, checked by the real SQLite (needs python3)
     wac task fixtures    # regenerate test/data with the real SQLite
+    node bench/run.mjs 20000                     # the benchmark (cd bench && npm install, once)
+    sh tools/fuzzdiff.sh 7; sh tools/fuzzdiff2.sh 7   # a fuzz seed against SQLite
     python3 tools/corpus.py                      # regenerate test/corpus/*.out
     wac run --allow-read --allow-write tools/sql.wac -- my.db script.sql   # a small shell
 

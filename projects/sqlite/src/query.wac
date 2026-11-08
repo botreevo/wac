@@ -1,11 +1,12 @@
 // Binding and running queries: names resolved against the schema, expressions evaluated, and SELECT
 // executed as nested loops over tables, using an index or the rowid when a condition allows.
 
-import { Result, Vec, Map, hashBytes, bytesEq } from "core";
+import { Result, Vec, Map, hashBytes, bytesEq, hashI64, i64Eq } from "core";
 import { SqlError } from "./error.wac";
 import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY } from "./value.wac";
 import { encodeRecord } from "./record.wac";
-import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
+import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
+         JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
 import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database } from "./database.wac";
 import { Node, BoundSource, AggSpec, WinSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT,
@@ -106,6 +107,8 @@ Result<Node, SqlError> bindColumn(string? table, string name, Scope s0) {
     for (i32 i = 0; i < s!.srcs.len(); i++) {
       const BoundSource b = s!.srcs[i];
       if (table is not null && b.name != lower(table!)) { continue; }
+      // A USING or NATURAL column, named bare, is the left side's.
+      if (table is null && isHidden(b, n)) { continue; }
       i32 c = b.table.colIndex(n);
       if (c < 0) {
         // Not a column; the rowid's names reach the rowid when no column has taken them.
@@ -929,10 +932,10 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
         SelectPlan sp = try planSelect(f.sub!, outer, x);
         Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
         string nm = f.alias ?? "subquery_\{i}";
-        srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true));
+        srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true, string[]()));
       } else {
         Named nt = try resolveTable(f.table!, x);
-        srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived));
+        srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived, string[]()));
       }
     }
     p.srcs = srcs.toArray();
@@ -940,9 +943,23 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
     for (i32 i = 0; i < s.from.len(); i++) {
       const Source f = s.from[i];
       if (f.on is not null) { p.srcs[i].on = try bindExpr(f.on!, sc, x); }
-      if (f.usingCols.len() > 0) {
+      if (f.join == JOIN_RIGHT || f.join == JOIN_FULL) { p.hasRight = true; }
+      string[] usingCols = f.usingCols as string[];
+      if (f.natural) {
+        // NATURAL: every column this source shares with one before it.
+        Vec<string> common;
+        for (i32 c = 0; c < p.srcs[i].table.cols.len(); c++) {
+          string cn = p.srcs[i].table.cols[c].name;
+          for (i32 k = 0; k < i; k++) { if (p.srcs[k].table.colIndex(cn) >= 0) { common.push(cn); break; } }
+        }
+        usingCols = common.toArray();
+      }
+      if (usingCols.len() > 0) {
+        Vec<string> hidden;
+        for (string col in usingCols) { hidden.push(lower(col)); }
+        p.srcs[i].hidden = hidden.toArray();
         Node? on = null;
-        for (string col in f.usingCols) {
+        for (string col in usingCols) {
           i32 left = -1;
           for (i32 k = 0; k < i; k++) { if (p.srcs[k].table.colIndex(col) >= 0) { left = k; break; } }
           i32 rc = p.srcs[i].table.colIndex(col);
@@ -968,6 +985,7 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
           any = true;
           Table t = p.srcs[k].table;
           for (i32 c = 0; c < t.cols.len(); c++) {
+            if (rc.star! == "" && isHidden(p.srcs[k], t.cols[c].name)) { continue; }
             results.push(Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity, t.cols[c].coll));
             names.push(t.cols[c].name);
           }
@@ -1011,6 +1029,12 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
   if (s.limit is not null) { p.limit = try bindExpr(s.limit!, none, x); }
   if (s.offset is not null) { p.offset = try bindExpr(s.offset!, none, x); }
   return Result.Ok(p);
+}
+
+bool isHidden(const BoundSource b, string name) {
+  string n = lower(name);
+  for (string h in b.hidden) { if (h == n) { return true; } }
+  return false;
 }
 
 // The output column an expression names by alias, when it is a bare name that no source has.
@@ -1153,7 +1177,9 @@ ProbeSpec[] probeSpecsFor(const SelectPlan p, i32 k, const Vec<Node> conds) {
 Vec<Node> usableConds(const SelectPlan p, i32 k, const Vec<Node> where) {
   Vec<Node> usable;
   if (p.srcs[k].on is not null) { conjuncts(p.srcs[k].on!, usable); }
-  if (p.srcs[k].join != JOIN_LEFT) { for (i32 i = 0; i < where.len(); i++) { usable.push(where.get(i)); } }
+  if (p.srcs[k].join != JOIN_LEFT && p.srcs[k].join != JOIN_FULL && !p.hasRight) {
+    for (i32 i = 0; i < where.len(); i++) { usable.push(where.get(i)); }
+  }
   return usable;
 }
 
@@ -1420,6 +1446,7 @@ struct Sink {
   Vec<Group> groups;
   Vec<Value[]> groupKeys;
   Vec<Ctx> pend;     // with window functions: each row's context, held until the windows are computed
+  Vec<Map<i64, bool>> hits;   // per source: the rows a RIGHT or FULL JOIN matched
 }
 
 // A key for hashing values that compare equal: integral reals as integers.
@@ -1653,10 +1680,11 @@ Result<bool, SqlError> loop(SelectPlan p, i32 k, Ctx c, Exec x, Sink sink, const
       }
       if (!pass) { continue; }
       matched = true;
+      if (src.join == JOIN_RIGHT || src.join == JOIN_FULL) { sink.hits.get(k).set(r!.rowid, true); }
       if (!(try loop(p, k + 1, c, x, sink, levels, conds))) { c.rows[k] = null; return Result.Ok(false); }
     }
   }
-  if (!matched && src.join == JOIN_LEFT) {
+  if (!matched && (src.join == JOIN_LEFT || src.join == JOIN_FULL)) {
     c.rows[k] = null;
     if (!(try loop(p, k + 1, c, x, sink, levels, conds))) { return Result.Ok(false); }
   }
@@ -1731,7 +1759,7 @@ Result<i64, SqlError> limitValue(Node? n, Ctx c, Exec x, i64 dflt) {
 // One select's rows, before a compound combines them: unordered unless `ordered` is set.
 Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
   Sink sink = Sink(false, false, Vec.create(), Vec.create(), -1, Map.create(hashBytes, bytesEq), Vec.create(), Vec.create(),
-                   Vec.create());
+                   Vec.create(), Vec.create());
   if (p.values is not null) {
     Ctx c = Ctx(Row?[](), outer, null, null, null);
     const Node[][] vs = p.values!;
@@ -1750,7 +1778,12 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
   if (p.where is not null) { conjuncts(p.where!, conds); }
   Vec<Node>[] levels = Vec<Node>[].defaulted(p.srcs.len() + 1);
   i32 leftMask = 0;
-  for (i32 k = 0; k < p.srcs.len(); k++) { if (p.srcs[k].join == JOIN_LEFT) { leftMask = leftMask | (1 << k); } }
+  for (i32 k = 0; k < p.srcs.len(); k++) {
+    if (p.srcs[k].join == JOIN_LEFT || p.srcs[k].join == JOIN_FULL) { leftMask = leftMask | (1 << k); }
+    sink.hits.push(Map<i64, bool>.create(hashI64, i64Eq));
+  }
+  // With a RIGHT or FULL JOIN any source may come out NULL, so every condition waits for the end.
+  if (p.hasRight) { leftMask = -1; }
   for (i32 i = 0; i < conds.len(); i++) {
     i32 m = refs(conds.get(i), 0);
     i32 level = 0;
@@ -1778,6 +1811,18 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
     if (pass) { try emit(p, c, x, sink); }
   } else {
     try loop(p, 0, c, x, sink, levels, conds);
+    // The rows of a RIGHT or FULL JOIN's source that met nothing, with everything before them NULL.
+    for (i32 k = 0; k < p.srcs.len(); k++) {
+      if (p.srcs[k].join != JOIN_RIGHT && p.srcs[k].join != JOIN_FULL) { continue; }
+      Table t = p.srcs[k].table;
+      for (i32 i = 0; i < t.rows.len(); i++) {
+        Row r = t.rows.get(i);
+        if (sink.hits.get(k).has(r.rowid)) { continue; }
+        for (i32 j = 0; j < c.rows.len(); j++) { c.rows[j] = null; }
+        c.rows[k] = r;
+        try loop(p, k + 1, c, x, sink, levels, conds);
+      }
+    }
   }
   if (p.aggregate) {
     if (sink.groups.len() == 0 && p.groupBy.len() == 0) {

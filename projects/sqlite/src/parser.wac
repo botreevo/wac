@@ -95,9 +95,11 @@ export struct Parser {
   i32 maxParam;
   Map<string, i32> named;
   bool[] lastDesc;   // the directions nameList last read, which only a PRIMARY KEY keeps
+  bool lastTemp;     // whether the name qualifiedName last read was qualified by temp
+  i32 lastNameStart; // where that name itself began, after any schema: CREATE text is stored without one
 
   Parser over(Token[] toks, string sql) {
-    return Parser(toks, 0, sql, 0, Map.create(hashString, stringEq), bool[]());
+    return Parser(toks, 0, sql, 0, Map.create(hashString, stringEq), bool[](), false, 0);
   }
 
   Token peek(this) { return this.toks[this.pos]; }
@@ -170,11 +172,19 @@ export struct Parser {
 
   // `schema.name`, keeping only the name: there is one schema, "main".
   Result<string, SqlError> qualifiedName(this) {
+    this.lastNameStart = this.peek().start;
     string n = try this.name();
     if (this.isOp(".")) {
-      if (lower(n) != "main") { return Result.Err(SqlError.unsupported("only the main schema exists")); }
+      string schema = lower(n);
+      if (schema != "main" && schema != "temp") { return Result.Err(SqlError("error", "unknown database \{n}")); }
       this.pos++;
+      this.lastNameStart = this.peek().start;
       n = try this.name();
+      if (schema == "temp") {
+        this.lastTemp = true;
+        // The temporary schema's own table.
+        if (lower(n) == "sqlite_schema" || lower(n) == "sqlite_master") { n = "sqlite_temp_schema"; }
+      }
     }
     return Result.Ok(n);
   }
@@ -1072,7 +1082,15 @@ export struct Parser {
 
   Result<Stmt, SqlError> create(this) {
     i32 begin = this.toks[this.pos - 1].start;
-    if (this.isKw("TEMP") || this.isKw("TEMPORARY")) { return Result.Err(SqlError.unsupported("temporary tables")); }
+    this.lastTemp = false;
+    bool temp = this.eatKw("TEMP") || this.eatKw("TEMPORARY");
+    if (temp && !(this.isKw("TABLE") || this.isKw("VIEW") || this.isKw("TRIGGER"))) { return Result.Err(this.fail("expected TABLE, VIEW or TRIGGER")); }
+    Stmt made = try this.createInner();
+    if (temp || this.lastTemp) { return Result.Ok(Stmt.TempStmt(made)); }
+    return Result.Ok(made);
+  }
+
+  Result<Stmt, SqlError> createInner(this) {
     bool unique = this.eatKw("UNIQUE");
     if (this.eatKw("INDEX")) { return Result.Ok(Stmt.CreateIndexStmt(try this.createIndex(unique))); }
     if (unique) { return Result.Err(this.fail("expected INDEX")); }
@@ -1081,6 +1099,7 @@ export struct Parser {
       bool ine = this.ifNotExists();
       i32 nameStart = this.peek().start;
       string n = try this.qualifiedName();
+      nameStart = this.lastNameStart;
       string[]? cols = null;
       if (this.isOp("(")) { cols = try this.nameList(); }
       try this.expectKw("AS");
@@ -1099,6 +1118,7 @@ export struct Parser {
     bool ine = this.ifNotExists();
     i32 nameStart = this.peek().start;
     string n = try this.qualifiedName();
+    nameStart = this.lastNameStart;
     string timing = "BEFORE";
     if (this.eatKw("BEFORE")) { timing = "BEFORE"; }
     else if (this.eatKw("AFTER")) { timing = "AFTER"; }
@@ -1149,6 +1169,7 @@ export struct Parser {
     bool ine = this.ifNotExists();
     i32 nameStart = this.peek().start;
     string n = try this.qualifiedName();
+    nameStart = this.lastNameStart;
     try this.expectKw("ON");
     string t = try this.qualifiedName();
     try this.expectOp("(");
@@ -1297,6 +1318,7 @@ export struct Parser {
     bool ine = this.ifNotExists();
     i32 nameStart = this.peek().start;
     string n = try this.qualifiedName();
+    nameStart = this.lastNameStart;
     if (this.eatKw("AS")) {
       Select sel = try this.select();
       return Result.Ok(CreateTable(n, ine, ColumnDef[](), TableConstraint[](), false, "", false, sel));

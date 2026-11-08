@@ -1,0 +1,170 @@
+// Tables, columns and indexes as the engine holds them, with their rows, in memory.
+
+import { Vec } from "core";
+import { Value, compareValues } from "./value.wac";
+import { Expr, IndexCol } from "./ast.wac";
+import { lower, upper } from "./lexer.wac";
+
+export static i32 AFF_BLOB = 0;      // "none" in the documentation: values are kept as given
+export static i32 AFF_TEXT = 1;
+export static i32 AFF_NUMERIC = 2;
+export static i32 AFF_INTEGER = 3;
+export static i32 AFF_REAL = 4;
+
+// SQLite's rules for a declared type's affinity, in its order: the first that matches wins.
+export i32 affinityOf(string typeName) {
+  string u = upper(typeName);
+  if (u.indexOf("INT") >= 0) { return AFF_INTEGER; }
+  if (u.indexOf("CHAR") >= 0 || u.indexOf("CLOB") >= 0 || u.indexOf("TEXT") >= 0) { return AFF_TEXT; }
+  if (u.indexOf("BLOB") >= 0 || u == "") { return AFF_BLOB; }
+  if (u.indexOf("REAL") >= 0 || u.indexOf("FLOA") >= 0 || u.indexOf("DOUB") >= 0) { return AFF_REAL; }
+  return AFF_NUMERIC;
+}
+
+export struct Column {
+  string name;
+  string typeName;
+  i32 affinity = 0;
+  bool notNull = false;
+  Expr? dflt;
+}
+
+export struct Row {
+  i64 rowid;
+  // Every column, in order. A column that aliases the rowid holds it here too, though the file stores
+  // NULL in its place.
+  Value[] vals;
+}
+
+export struct Index {
+  string name;
+  string table;
+  string? sql;          // null for an index a constraint made (sqlite_autoindex_…)
+  i32[] cols;           // column positions in the table
+  bool[] desc;
+  bool unique = false;
+  // Every entry, sorted: the indexed values, then the rowid — exactly the record the file stores.
+  Vec<Value[]> entries;
+
+  // Orders two entries as the index does: column by column, each in its direction, then by rowid.
+  i32 compare(this, Value[] a, Value[] b) {
+    for (i32 i = 0; i < a.len() && i < b.len(); i++) {
+      i32 c = compareValues(a[i], b[i]);
+      if (c != 0) { return i < this.desc.len() && this.desc[i] ? -c : c; }
+    }
+    return a.len() < b.len() ? -1 : (a.len() > b.len() ? 1 : 0);
+  }
+
+  Value[] entryFor(this, Row r) {
+    Value[] e = Value[].filled(this.cols.len() + 1, Value.Null);
+    for (i32 i = 0; i < this.cols.len(); i++) { e[i] = r.vals[this.cols[i]]; }
+    e[this.cols.len()] = Value.Int(r.rowid);
+    return e;
+  }
+
+  // The first position whose entry is not before `key`, comparing only `key`'s length of columns.
+  i32 lowerBound(this, Value[] key) {
+    i32 lo = 0;
+    i32 hi = this.entries.len();
+    while (lo < hi) {
+      i32 mid = (lo + hi) / 2;
+      if (this.compare(this.entries.get(mid), key) < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+  }
+
+  // The first position whose entry is after `key` in its first key.len() columns.
+  i32 upperBound(this, Value[] key) {
+    i32 lo = 0;
+    i32 hi = this.entries.len();
+    while (lo < hi) {
+      i32 mid = (lo + hi) / 2;
+      if (this.comparePrefix(this.entries.get(mid), key) <= 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+  }
+
+  i32 comparePrefix(this, Value[] entry, Value[] key) {
+    for (i32 i = 0; i < key.len(); i++) {
+      i32 c = compareValues(entry[i], key[i]);
+      if (c != 0) { return i < this.desc.len() && this.desc[i] ? -c : c; }
+    }
+    return 0;
+  }
+
+  void add(this, Row r) {
+    Value[] e = this.entryFor(r);
+    this.entries.insert(this.lowerBound(e), e);
+  }
+
+  void drop(this, Row r) {
+    Value[] e = this.entryFor(r);
+    i32 at = this.lowerBound(e);
+    if (at < this.entries.len() && this.compare(this.entries.get(at), e) == 0) { this.entries.remove(at); }
+  }
+
+  // The rowid of a row other than `self` holding the same key, when this index is unique. NULLs are
+  // distinct from each other, so a key with one never conflicts.
+  i64? conflict(this, Row r, i64 self) {
+    if (!this.unique) { return null; }
+    Value[] e = this.entryFor(r);
+    Value[] key = Value[].filled(this.cols.len(), Value.Null);
+    for (i32 i = 0; i < key.len(); i++) {
+      match (e[i]) { Null: { return null; } default: {} }
+      key[i] = e[i];
+    }
+    i32 at = this.lowerBound(key);
+    while (at < this.entries.len() && this.comparePrefix(this.entries.get(at), key) == 0) {
+      Value[] hit = this.entries.get(at);
+      match (hit[hit.len() - 1]) {
+        Int(id): { if (id != self) { return id; } }
+        default: {}
+      }
+      at++;
+    }
+    return null;
+  }
+}
+
+export struct Table {
+  string name;
+  string sql;
+  Column[] cols;
+  i32 rowidAlias = -1;   // the INTEGER PRIMARY KEY column, or -1
+  bool autoincrement = false;
+  Vec<Row> rows;         // sorted by rowid
+
+  i32 colIndex(this, string name) {
+    string n = lower(name);
+    for (i32 i = 0; i < this.cols.len(); i++) { if (lower(this.cols[i].name) == n) { return i; } }
+    return -1;
+  }
+
+  i32 find(this, i64 rowid) {
+    i32 lo = 0;
+    i32 hi = this.rows.len();
+    while (lo < hi) {
+      i32 mid = (lo + hi) / 2;
+      if (this.rows.get(mid).rowid < rowid) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+  }
+
+  Row? get(this, i64 rowid) {
+    i32 at = this.find(rowid);
+    if (at < this.rows.len() && this.rows.get(at).rowid == rowid) { return this.rows.get(at); }
+    return null;
+  }
+
+  i64 maxRowid(this) {
+    Row? last = this.rows.last();
+    return last is null ? 0 : last!.rowid;
+  }
+}
+
+// An entry of sqlite_schema, in the order the file lists them, which is the order they are written back.
+export struct SchemaEntry {
+  string kind;      // "table" or "index"
+  string name;
+  string table;
+}

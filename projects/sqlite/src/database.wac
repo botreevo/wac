@@ -1,0 +1,353 @@
+// A database: its schema and rows in memory, loaded from an image and written back as one.
+
+import { Result, Vec, Map, hashString, stringEq } from "core";
+import { SqlError } from "./error.wac";
+import { Value } from "./value.wac";
+import { encodeRecord } from "./record.wac";
+import { put16, put32 } from "./bytes.wac";
+import { openImage, Image, readTable, RawRow, decode, MAGIC } from "./reader.wac";
+import { Pages, buildTable, buildIndex } from "./writer.wac";
+import { parseOne } from "./parser.wac";
+import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef } from "./ast.wac";
+import { lower, upper } from "./lexer.wac";
+import { Column, Row, Index, Table, SchemaEntry, affinityOf, AFF_REAL } from "./schema.wac";
+
+// What version of SQLite the file claims was the last to write it. Readers only print it.
+static i64 SQLITE_VERSION_NUMBER = 3045000;
+
+export struct Database {
+  Vec<SchemaEntry> order;
+  Map<string, Table> tables;      // keyed by lower-case name
+  Map<string, Index> indexes;
+  i32 pageSize;
+  i64 changeCounter;
+  i64 schemaCookie;
+  i64 userVersion;
+  i64 applicationId;
+
+  Database empty() {
+    return Database(Vec.create(), Map.create(hashString, stringEq), Map.create(hashString, stringEq), 4096, 0, 0, 0, 0);
+  }
+
+  Table? table(this, string name) { return this.tables.get(lower(name)); }
+
+  Index? index(this, string name) { return this.indexes.get(lower(name)); }
+
+  // The indexes on a table, in schema order — the order SQLite checks uniqueness in.
+  Index[] indexesOf(this, string table) {
+    Vec<Index> out;
+    string t = lower(table);
+    for (i32 i = 0; i < this.order.len(); i++) {
+      SchemaEntry e = this.order.get(i);
+      if (e.kind == "index" && lower(e.table) == t) { out.push(this.indexes.get(lower(e.name))!); }
+    }
+    return out.toArray();
+  }
+}
+
+// A constant default: a literal, possibly negated. Anything else is refused where a default must be
+// constant, and evaluated per row by the engine where it need not be.
+export Value? constValue(const Expr e) {
+  match (e) {
+    Lit(v): { return v; }
+    Unary(op, x): {
+      Value? v = constValue(x);
+      if (v is null || op == "+") { return v; }
+      if (op != "-") { return null; }
+      match (v!) {
+        Int(i): { return Value.Int(0 - i); }
+        Real(r): { return Value.Real(-r); }
+        default: { return null; }
+      }
+    }
+    default: { return null; }
+  }
+}
+
+bool isIntegerType(string t) { return upper(t) == "INTEGER"; }
+
+// The table a CREATE TABLE describes, and the indexes its constraints imply, in the order SQLite numbers
+// them: column constraints as the columns come, then table constraints.
+export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) {
+  Vec<Column> cols;
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    const ColumnDef d = c.cols[i];
+    cols.push(Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt));
+  }
+  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create());
+  i32 pkCount = 0;
+  for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].primaryKey) { pkCount++; } }
+  for (i32 i = 0; i < c.constraints.len(); i++) {
+    if (c.constraints[i].kind.indexOf("PRIMARY KEY") == 0) { pkCount++; }
+  }
+  if (pkCount > 1) { return Result.Err(SqlError.schema("table \"\{c.name}\" has more than one primary key")); }
+  i32 n = 0;
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    const ColumnDef d = c.cols[i];
+    if (d.primaryKey) {
+      if (isIntegerType(d.typeName) && !d.pkDesc) {
+        t.rowidAlias = i;
+        t.autoincrement = d.autoincrement;
+      } else {
+        if (d.autoincrement) { return Result.Err(SqlError.schema("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")); }
+        n++;
+        autos.push(autoIndex(c.name, n, [i]));
+      }
+    }
+    if (d.unique) {
+      n++;
+      autos.push(autoIndex(c.name, n, [i]));
+    }
+  }
+  for (i32 i = 0; i < c.constraints.len(); i++) {
+    const string[] names = c.constraints[i].cols;
+    i32[] pos = i32[].filled(names.len(), 0);
+    for (i32 k = 0; k < names.len(); k++) {
+      pos[k] = t.colIndex(names[k]);
+      if (pos[k] < 0) { return Result.Err(SqlError.schema("no such column: \{names[k]}")); }
+    }
+    bool pk = c.constraints[i].kind.indexOf("PRIMARY KEY") == 0;
+    if (pk && pos.len() == 1 && isIntegerType(t.cols[pos[0]].typeName)) {
+      t.rowidAlias = pos[0];
+      t.autoincrement = c.constraints[i].kind == "PRIMARY KEY AUTOINCREMENT";
+      continue;
+    }
+    n++;
+    autos.push(autoIndex(c.name, n, pos));
+  }
+  // A primary key's column is NOT NULL in effect only for the rowid alias; elsewhere SQLite allows
+  // NULL there, for compatibility, and so does this.
+  return Result.Ok(t);
+}
+
+Index autoIndex(string table, i32 n, i32[] cols) {
+  return Index("sqlite_autoindex_\{table}_\{n}", table, null, cols, bool[].filled(cols.len(), false), true, Vec.create());
+}
+
+export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
+  i32[] pos = i32[].filled(c.cols.len(), 0);
+  bool[] desc = bool[].filled(c.cols.len(), false);
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    pos[i] = t.colIndex(c.cols[i].name);
+    if (pos[i] < 0) { return Result.Err(SqlError.schema("no such column: \{c.cols[i].name}")); }
+    desc[i] = c.cols[i].desc;
+  }
+  if (c.where is not null) { return Result.Err(SqlError.unsupported("partial indexes")); }
+  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, c.unique, Vec.create()));
+}
+
+// A row as the file has it, widened to the table's columns: a row written before ALTER TABLE ADD COLUMN
+// is shorter, and its missing values are the column's default.
+Row rowFrom(Table t, i64 rowid, const Value[] stored) {
+  Value[] vals = Value[].filled(t.cols.len(), Value.Null);
+  for (i32 i = 0; i < vals.len(); i++) {
+    if (i < stored.len()) {
+      vals[i] = stored[i];
+      // SQLite stores an integral value in a REAL column as an integer, to save space, and reads it
+      // back as a real.
+      if (t.cols[i].affinity == AFF_REAL) {
+        match (stored[i]) { Int(x): { vals[i] = Value.Real(x as~ f64); } default: {} }
+      }
+    }
+    else if (t.cols[i].dflt is not null) {
+      Value? v = constValue(t.cols[i].dflt!);
+      if (v is not null) { vals[i] = v!; }
+    }
+  }
+  if (t.rowidAlias >= 0) { vals[t.rowidAlias] = Value.Int(rowid); }
+  return Row(rowid, vals);
+}
+
+export void rebuildIndex(Index ix, Table t) {
+  ix.entries.clear();
+  Vec<Value[]> all;
+  for (i32 i = 0; i < t.rows.len(); i++) { all.push(ix.entryFor(t.rows.get(i))); }
+  Value[][] arr = all.toArray();
+  sortEntries(ix, arr);
+  ix.entries = Vec.fromArray(arr);
+}
+
+// A merge sort, stable, over index entries.
+void sortEntries(Index ix, Value[][] a) {
+  if (a.len() < 2) { return; }
+  Value[][] tmp = Value[][].defaulted(a.len());
+  i32 width = 1;
+  Value[][] src = a;
+  Value[][] dst = tmp;
+  while (width < a.len()) {
+    for (i32 lo = 0; lo < a.len(); lo += 2 * width) {
+      i32 mid = lo + width < a.len() ? lo + width : a.len();
+      i32 hi = lo + 2 * width < a.len() ? lo + 2 * width : a.len();
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) {
+        if (ix.compare(src[j], src[i]) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        k++;
+      }
+      while (i < mid) { dst[k] = src[i]; i++; k++; }
+      while (j < hi) { dst[k] = src[j]; j++; k++; }
+    }
+    Value[][] s = src;
+    src = dst;
+    dst = s;
+    width *= 2;
+  }
+  if (src is not a) { a.copyFrom(src, 0, 0, a.len()); }
+}
+
+string? textAt(const Value[] v, i32 i) {
+  if (i >= v.len()) { return null; }
+  match (v[i]) { Text(s): { return s; } default: { return null; } }
+}
+
+export Result<Database, SqlError> openBytes(u8[] data) {
+  Image img = try openImage(data);
+  Database db = Database.empty();
+  db.pageSize = img.header.pageSize;
+  db.changeCounter = img.header.changeCounter;
+  db.schemaCookie = img.header.schemaCookie;
+  db.userVersion = img.header.userVersion;
+  db.applicationId = img.header.applicationId;
+  if (img.header.reserved != 0) { return Result.Err(SqlError.unsupported("reserved bytes per page")); }
+  Vec<RawRow> schema = try readTable(img, 1);
+  // Tables first, so an index can find its table whatever order the entries come in.
+  Vec<Index> autos;
+  for (i32 i = 0; i < schema.len(); i++) {
+    Value[] v = try decode(schema.get(i).payload);
+    string? kind = textAt(v, 0);
+    string? name = textAt(v, 1);
+    string? sql = textAt(v, 4);
+    if (kind is null || name is null) { return Result.Err(SqlError.corrupt("malformed schema entry")); }
+    if (kind! != "table") { continue; }
+    if (sql is null) { return Result.Err(SqlError.corrupt("table \{name!} has no sql")); }
+    Stmt st = (try parseOne(sql!)).stmt;
+    match (st) {
+      CreateTableStmt(c): {
+        Table t = try tableFrom(c, autos);
+        i64 root = 0;
+        match (v[3]) { Int(r): { root = r; } default: {} }
+        Vec<RawRow> raw = try readTable(img, root);
+        for (i32 k = 0; k < raw.len(); k++) {
+          t.rows.push(rowFrom(t, raw.get(k).rowid, try decode(raw.get(k).payload)));
+        }
+        db.tables.set(lower(t.name), t);
+      }
+      default: { return Result.Err(SqlError.corrupt("schema entry for \{name!} is not CREATE TABLE")); }
+    }
+  }
+  for (i32 i = 0; i < autos.len(); i++) { db.indexes.set(lower(autos.get(i).name), autos.get(i)); }
+  for (i32 i = 0; i < schema.len(); i++) {
+    Value[] v = try decode(schema.get(i).payload);
+    string kind = textAt(v, 0)!;
+    string name = textAt(v, 1)!;
+    string? tbl = textAt(v, 2);
+    string? sql = textAt(v, 4);
+    if (kind == "index") {
+      if (sql is not null) {
+        match ((try parseOne(sql!)).stmt) {
+          CreateIndexStmt(c): {
+            Table? t = db.table(c.table);
+            if (t is null) { return Result.Err(SqlError.corrupt("index \{name} is on a missing table")); }
+            db.indexes.set(lower(name), try indexFrom(c, t!));
+          }
+          default: { return Result.Err(SqlError.corrupt("schema entry for \{name} is not CREATE INDEX")); }
+        }
+      } else if (db.index(name) is null) {
+        return Result.Err(SqlError.corrupt("\{name} matches no constraint of its table"));
+      }
+    } else if (kind != "table") {
+      return Result.Err(SqlError.unsupported("schema entries of type \{kind}"));
+    }
+    db.order.push(SchemaEntry(kind, name, tbl ?? name));
+  }
+  // An automatic index the schema does not list would be a table this did not understand.
+  for (i32 i = 0; i < autos.len(); i++) {
+    bool listed = false;
+    for (i32 k = 0; k < db.order.len(); k++) { if (db.order.get(k).name == autos.get(i).name) { listed = true; } }
+    if (!listed) { return Result.Err(SqlError.corrupt("\{autos.get(i).name} is missing from the schema")); }
+  }
+  string[] keys = db.indexes.keys();
+  for (string k in keys) {
+    Index ix = db.indexes.get(k)!;
+    rebuildIndex(ix, db.table(ix.table)!);
+  }
+  return Result.Ok(db);
+}
+
+// The record a row is stored as: the alias column, if any, is NULL in the file.
+export u8[] rowRecord(Table t, Row r) {
+  if (t.rowidAlias < 0) { return encodeRecord(r.vals); }
+  Value[] v = Value[].filled(r.vals.len(), Value.Null);
+  v.copyFrom(r.vals, 0, 0, r.vals.len());
+  v[t.rowidAlias] = Value.Null;
+  return encodeRecord(v);
+}
+
+// The whole database as a file image. `changeCounter` and the schema cookie are the caller's to
+// advance; this writes what the database holds.
+export u8[] toBytes(Database db) {
+  Pages ps = Pages(db.pageSize, Vec.create());
+  ps.reserve();
+  // Roots are reserved up front so the schema can name them; contents follow in schema order.
+  i64[] roots = i64[].filled(db.order.len(), 0);
+  for (i32 i = 0; i < db.order.len(); i++) { roots[i] = ps.reserve(); }
+  Vec<i64> schemaIds;
+  Vec<u8[]> schemaRecs;
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (e.kind == "table") {
+      Table t = db.table(e.name)!;
+      i64[] ids = i64[].filled(t.rows.len(), 0);
+      u8[][] recs = u8[][].defaulted(t.rows.len());
+      for (i32 k = 0; k < t.rows.len(); k++) {
+        ids[k] = t.rows.get(k).rowid;
+        recs[k] = rowRecord(t, t.rows.get(k));
+      }
+      buildTable(ps, roots[i], ids, recs);
+      schemaRecs.push(encodeRecord([Value.Text("table"), Value.Text(t.name), Value.Text(t.name),
+                                    Value.Int(roots[i]), Value.Text(t.sql)]));
+    } else {
+      Index ix = db.index(e.name)!;
+      u8[][] recs = u8[][].defaulted(ix.entries.len());
+      for (i32 k = 0; k < recs.len(); k++) { recs[k] = encodeRecord(ix.entries.get(k)); }
+      buildIndex(ps, roots[i], recs);
+      Value sql = ix.sql is null ? Value.Null : Value.Text(ix.sql!);
+      schemaRecs.push(encodeRecord([Value.Text("index"), Value.Text(ix.name), Value.Text(ix.table),
+                                    Value.Int(roots[i]), sql]));
+    }
+    schemaIds.push((i + 1) as i64);
+  }
+  buildTable(ps, 1, schemaIds.toArray(), schemaRecs.toArray());
+  i32 n = ps.pages.len();
+  u8[] out = u8[].filled(n * db.pageSize, 0);
+  for (i32 i = 0; i < n; i++) { out.copyFrom(ps.pages.get(i), 0, i * db.pageSize, db.pageSize); }
+  writeHeader(out, db, n as i64);
+  return out;
+}
+
+void writeHeader(u8[] b, const Database db, i64 pages) {
+  u8[] m = MAGIC.toBytes();
+  b.copyFrom(m, 0, 0, 16);
+  put16(b, 16, db.pageSize == 65536 ? 1 : db.pageSize);
+  b[18] = 1;
+  b[19] = 1;
+  b[20] = 0;
+  b[21] = 64;
+  b[22] = 32;
+  b[23] = 32;
+  put32(b, 24, db.changeCounter);
+  put32(b, 28, pages);
+  put32(b, 32, 0);
+  put32(b, 36, 0);
+  put32(b, 40, db.schemaCookie);
+  put32(b, 44, 4);
+  put32(b, 48, 0);
+  put32(b, 52, 0);
+  put32(b, 56, 1);
+  put32(b, 60, db.userVersion);
+  put32(b, 64, 0);
+  put32(b, 68, db.applicationId);
+  put32(b, 92, db.changeCounter);
+  put32(b, 96, SQLITE_VERSION_NUMBER);
+}

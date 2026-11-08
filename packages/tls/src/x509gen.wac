@@ -202,13 +202,13 @@ u8[] caTrue() {
  * plain integer is the piece most easily got wrong.
  */
 u8[] tbsCertificate(
-  i64 serial, u8[] signatureAlgorithm, string subject, i64 notBefore, i64 notAfter,
+  u8[] serial, u8[] signatureAlgorithm, u8[] name, string dns, i64 notBefore, i64 notAfter,
   u8[] subjectPublicKeyInfo, bool isCa
 ) {
-  u8[] name = nameOf(subject);
+  if (serial.len() == 0) { return u8[](); }
   u8[][] p = u8[][].defaulted(7);
   p[0] = derExplicit(0, derIntegerSmall(2));   // version v3
-  p[1] = derIntegerSmall(serial);
+  p[1] = serial;
   p[2] = signatureAlgorithm;
   p[3] = name;                                  // issuer — self-signed, so the same
   p[4] = validity(notBefore, notAfter);
@@ -217,7 +217,7 @@ u8[] tbsCertificate(
   u8[] body = derConcat(p);
   u8[][] both = u8[][].defaulted(2);
   both[0] = body;
-  both[1] = extensions(isCa, subject);
+  both[1] = extensions(isCa, dns);
   return derSequence(derConcat(both));
 }
 
@@ -243,7 +243,7 @@ export u8[] selfSignedEd25519(string subject, i64 serial, i64 notBefore, i64 not
   if (seed.len() != 32) { return u8[](); }
   if (notAfter <= notBefore) { return u8[](); }
   u8[] alg = algEd25519();
-  u8[] tbs = tbsCertificate(serial, alg, subject, notBefore, notAfter,
+  u8[] tbs = tbsCertificate(derIntegerSmall(serial), alg, nameOf(subject), subject, notBefore, notAfter,
                             spki(alg, ed25519PublicKey(seed)), false);
   if (tbs.len() == 0) { return u8[](); }
   u8[] sig = ed25519Sign(seed, tbs);
@@ -272,13 +272,44 @@ export u8[] selfSignedP256(string subject, i64 serial, i64 notBefore, i64 notAft
   u8[] pub = p256PublicKey(priv);
   if (pub.len() != 65) { return u8[](); }        // uncompressed, 0x04 || X || Y
   u8[] alg = algEcdsaSha256();
-  u8[] tbs = tbsCertificate(serial, alg, subject, notBefore, notAfter,
+  u8[] tbs = tbsCertificate(derIntegerSmall(serial), alg, nameOf(subject), subject, notBefore, notAfter,
                             spki(algEcPublicKey(), pub), false);
   if (tbs.len() == 0) { return u8[](); }
   // **`p256Sign` hashes for you**, like `ed25519Sign` beside it and `rsaSignPkcs1` below. Passing
   // `sha256(tbs)` here signs `sha256(sha256(tbs))`, which is a certificate nothing can verify —
   // and the first version of this did exactly that, undetected, because the oracle was accepting a
   // trusted self-signed certificate without checking its signature at all.
+  u8[] sig = ecdsaSigValue(p256Sign(priv, tbs, nonce));
+  if (sig.len() == 0) { return u8[](); }
+  return wrap(tbs, alg, sig);
+}
+
+/**
+ * A self-signed P-256 certificate that says nothing about whoever holds it, DER.
+ *
+ * **For an identity that is the key and nothing else** — KPS, where a client pins the certificate's
+ * sha-256 and no name is ever checked. The certificate crosses the wire in cleartext in a DTLS 1.2
+ * handshake, so anything distinctive in it is something an observer can match on: a fixed serial of 1, a
+ * common name, a subjectAltName. This one has none. The subject and the issuer are the empty Name
+ * (`SEQUENCE {}`), the serial is the caller's random bytes — 16 is what Go's KPS listener uses — and the only
+ * extension is basicConstraints, which marks it a leaf.
+ *
+ * `serial` is a big-endian magnitude, written as a positive INTEGER (a zero byte goes in front when its top
+ * bit is set). Empty if it is empty or all zero — RFC 5280 asks for a positive serial — if `priv` or `nonce`
+ * is the wrong width, or if the validity window is inverted.
+ */
+export u8[] anonymousP256(u8[] serial, i64 notBefore, i64 notAfter, u8[] priv, u8[] nonce) {
+  if (priv.len() != 32 || nonce.len() != 32) { return u8[](); }
+  if (notAfter <= notBefore) { return u8[](); }
+  bool nonzero = false;
+  for (i32 i = 0; i < serial.len(); i++) { if (serial[i] != 0) { nonzero = true; } }
+  if (!nonzero) { return u8[](); }
+  u8[] pub = p256PublicKey(priv);
+  if (pub.len() != 65) { return u8[](); }
+  u8[] alg = algEcdsaSha256();
+  u8[] tbs = tbsCertificate(derInteger(serial), alg, derSequence(u8[]()), "", notBefore, notAfter,
+                            spki(algEcPublicKey(), pub), false);
+  if (tbs.len() == 0) { return u8[](); }
   u8[] sig = ecdsaSigValue(p256Sign(priv, tbs, nonce));
   if (sig.len() == 0) { return u8[](); }
   return wrap(tbs, alg, sig);
@@ -297,7 +328,7 @@ export u8[] selfSignedRsa(
   if (modulus.len() == 0 || exponent.len() == 0 || privateExponent.len() == 0) { return u8[](); }
   if (notAfter <= notBefore) { return u8[](); }
   u8[] alg = algRsa(oidRsaSha256());
-  u8[] tbs = tbsCertificate(serial, alg, subject, notBefore, notAfter,
+  u8[] tbs = tbsCertificate(derIntegerSmall(serial), alg, nameOf(subject), subject, notBefore, notAfter,
                             spki(algRsa(oidRsaEncryption()),
                                  rsaPublicKeyBits(modulus, exponent)), false);
   if (tbs.len() == 0) { return u8[](); }

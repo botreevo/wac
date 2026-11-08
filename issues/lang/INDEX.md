@@ -141,7 +141,7 @@ has been fixed and why.
 
 ## Closed
 
-353 issues, 278 closed.
+354 issues, 279 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

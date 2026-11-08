@@ -112,7 +112,7 @@ step "7. a node that hides that revocation is caught by the proof"
 node "$here/tools/liar.mjs" 8546 8545 & liar_pid=$!
 sleep 0.5
 sed 's/127.0.0.1:8545/127.0.0.1:8546/' "$work/trust.json5" > "$work/trust-liar.json5"
-expect refused "run hello through the lying node" -- $W run "hello@$pub" --policy "$work/trust-liar.json5" --mirror "$mirror"
+expect refused "run hello by hash through the lying node" -- $W run "$hello" --policy "$work/trust-liar.json5" --mirror "$mirror"
 
 step "8. a deny list you follow names the web app"
 $wallet deny "$keys/denylist" "$registry" "$notes" on

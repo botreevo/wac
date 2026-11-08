@@ -11,13 +11,22 @@
 //                                               rebuild a statement's source and say whether the output matches
 //     wactrust review SUBJECT SCOPE --key F [--out S]   sign a review of a kt1/kb1
 //     wactrust verify S…                        check statements' signatures
+//     wactrust publish MIRROR --blob FILE [--statement S]…   put an app and statements about it in a mirror directory
+//     wactrust check ID --policy P --mirror M… [--purpose app|dependency]   may this be used? and why
+//     wactrust resolve NAME@0xPUBLISHER --policy P            what a name points at, proved
+//     wactrust run NAME@0xPUBLISHER|kb1:… --policy P --mirror M… [--out DIR] [-- ARGS…]
+//                                               resolve, decide, fetch, check the hash, and only then run it
 
 import { Sys } from "std";
 import { treeId, blobId, leafHash } from "../src/tree.wac";
+import { isZero } from "../src/registry.wac";
 import { hashDir, hashCommit } from "../src/walk.wac";
 import { LockEntry, readLock, writeLock, pin, check, fetchInto } from "../src/lock.wac";
 import { Claim, Statement, Verified, signClaim, verify, toJson, fromJson, hex, unhex } from "../src/statement.wac";
 import { runBuild, cleanSource, rebuild } from "../src/build.wac";
+import { Policy, Chain, Decision, readPolicy, decide } from "../src/policy.wac";
+import { blob, statements, chainFor, resolve, Resolved } from "../src/trust.wac";
+import { Authority, Launch, Child } from "std";
 
 string usage() {
   return """
@@ -27,6 +36,10 @@ string usage() {
            wactrust rebuild S --git REPO COMMIT --toolchain kt1:… [--key F] [--out S2]
            wactrust review SUBJECT SCOPE --key F [--out S]
            wactrust verify S…
+           wactrust publish MIRROR --blob FILE [--statement S]…
+           wactrust check ID --policy P --mirror M… [--purpose app|dependency]
+           wactrust resolve NAME@0xPUBLISHER --policy P
+           wactrust run NAME@0xPUBLISHER|kb1:… --policy P --mirror M… [--out DIR] [-- ARGS…]
     """;
 }
 
@@ -57,6 +70,10 @@ export async i32 main(Sys sys) {
   if (cmd == "rebuild" && args.len() >= 2) { return await rebuildCmd(sys, args); }
   if (cmd == "review" && args.len() >= 3) { return await reviewCmd(sys, args); }
   if (cmd == "verify" && args.len() >= 2) { return await verifyCmd(sys, args); }
+  if (cmd == "publish" && args.len() >= 2) { return await publishCmd(sys, args); }
+  if (cmd == "check" && args.len() >= 2) { return await checkCmd(sys, args); }
+  if (cmd == "resolve" && args.len() >= 2) { return await resolveCmd(sys, args); }
+  if (cmd == "run" && args.len() >= 2) { return await runCmd(sys, args); }
   sys.warn(usage());
   return 2;
 }
@@ -240,4 +257,164 @@ async i32 verifyCmd(Sys sys, string[] args) {
     }
   }
   return bad == 0 ? 0 : 1;
+}
+
+/** Every value given for a repeatable flag. */
+string[] flags(string[] args, string name) {
+  string[] out = string[]();
+  for (i32 i = 0; i + 1 < args.len(); i++) {
+    if (args[i] == "--") { break; }
+    if (args[i] == name) {
+      string[] next = string[].defaulted(out.len() + 1);
+      for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+      next[out.len()] = args[i + 1];
+      out = next;
+    }
+  }
+  return out;
+}
+
+async i32 publishCmd(Sys sys, string[] args) {
+  string mirror = args[1];
+  await sys.files().mkdir(mirror + "/blobs", true);
+  await sys.files().mkdir(mirror + "/statements", true);
+  string[] blobs = flags(args, "--blob");
+  for (i32 bi = 0; bi < blobs.len(); bi++) {
+    string b = blobs[bi];
+    match (await sys.readFile(b)) {
+      Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+      Ok(bytes): {
+        string h = hex(leafHash(bytes));
+        await sys.writeFile(mirror + "/blobs/" + h, bytes);
+        sys.log("blob kb1:\{h}");
+      }
+    }
+  }
+  string index = string.fromBytes((await sys.readFile(mirror + "/statements/index")).ok() ?? u8[]());
+  string[] given = flags(args, "--statement");
+  // An index rather than `for (string path in …)`: with the latter wacc's checker passes and its emitter reads
+  // `path` as the string[] it iterates (not reduced further; scratch/wactrust-forin-bug.wac keeps the case).
+  for (i32 gi = 0; gi < given.len(); gi++) {
+    string path = given[gi];
+    Statement? st = await readStatement(sys, path);
+    if (st is null) { return 1; }
+    Verified v;
+    match (verify(st!)) {
+      Err(e): { sys.warn("wactrust: \{path}: \{e} — not published"); return 1; }
+      Ok(x): { v = x; }
+    }
+    string name = hex(v.id).slice(0, 16) + "-" + hex(v.signer).slice(0, 8) + ".json";
+    await sys.writeFile(mirror + "/statements/" + name, (toJson(st!) + "\n").toBytes());
+    if (index.indexOf(name) < 0) { index += name + "\n"; }
+    sys.log("statement \{name}");
+  }
+  await sys.writeFile(mirror + "/statements/index", index.toBytes());
+  return 0;
+}
+
+async Policy? policyFrom(Sys sys, string path) {
+  match (await sys.readFile(path)) {
+    Err(e): { sys.warn("wactrust: cannot read the policy \{path}"); return null; }
+    Ok(b): {
+      match (readPolicy(b)) {
+        Err(e): { sys.warn("wactrust: \{e}"); return null; }
+        Ok(p): { return p; }
+      }
+    }
+  }
+}
+
+async i64 nowSeconds(Sys sys) { return (await sys.clock().nowMillis()).orElse(0 as i64) / (1000 as i64); }
+
+/** Decide about `id`, printing why. */
+async bool allowed(Sys sys, Policy p, string purpose, string id, string[] mirrors) {
+  Verified[] vs = await statements(sys, mirrors, id, string[]());
+  sys.warn("\{vs.len()} verified statement(s) about \{id} or its source");
+  Chain chain;
+  match (chainFor(sys, p, id, vs, await nowSeconds(sys))) {
+    Err(e): {
+      sys.warn("chain: \{e}");
+      chain = Chain.unknown();
+    }
+    Ok(c): { chain = c; }
+  }
+  Decision d = decide(p, purpose, id, vs, chain);
+  for (string r in d.reasons) { sys.warn("  " + r); }
+  return d.allowed;
+}
+
+async i32 checkCmd(Sys sys, string[] args) {
+  Policy? p = await policyFrom(sys, flag(args, "--policy"));
+  if (p is null) { return 1; }
+  string purpose = flag(args, "--purpose") == "" ? "app" : flag(args, "--purpose");
+  return (await allowed(sys, p!, purpose, args[1], flags(args, "--mirror"))) ? 0 : 1;
+}
+
+/** A name's target at this moment, or "" — printing what the chain says, including a change still waiting. */
+async string resolveName(Sys sys, Policy p, string target) {
+  i32 at = target.indexOf("@");
+  u8[]? publisher = at < 0 ? null : unhex(target.slice(at + 1, target.len()));
+  if (publisher is null || publisher!.len() != 20) { sys.warn("wactrust: a name is NAME@0xPUBLISHER"); return ""; }
+  string name = target.slice(0, at);
+  Resolved r;
+  match (resolve(sys.net(), p, publisher!, name)) {
+    Err(e): { sys.warn("wactrust: \{e}"); return ""; }
+    Ok(x): { r = x; }
+  }
+  if (isZero(r.pointer.current)) { sys.warn("wactrust: \{target} is not claimed (proved absent at block \{r.number})"); return ""; }
+  i64 now = await nowSeconds(sys);
+  sys.warn("name \{target} at block \{r.number}: current kb1:\{hex(r.pointer.current)}, delay \{r.pointer.delay}s");
+  if (!isZero(r.pointer.pending)) {
+    i64 left = r.pointer.effectiveAt - r.timestamp;
+    sys.warn(left > (0 as i64)
+      ? "  a change to kb1:\{hex(r.pointer.pending)} is proposed and waits \{left}s more — not followed yet"
+      : "  the change to kb1:\{hex(r.pointer.pending)} has taken effect");
+  }
+  if (r.pointer.delay < p.minDelay) {
+    sys.warn("wactrust: \{target} lets its publisher change it with \{r.pointer.delay}s notice; the policy wants at least \{p.minDelay}s");
+    return "";
+  }
+  // The block's own time decides, not the local clock: the delay is a rule the contract states in its terms.
+  return "kb1:" + hex(r.pointer.at(r.timestamp));
+}
+
+async i32 resolveCmd(Sys sys, string[] args) {
+  Policy? p = await policyFrom(sys, flag(args, "--policy"));
+  if (p is null) { return 1; }
+  string id = await resolveName(sys, p!, args[1]);
+  if (id == "") { return 1; }
+  sys.log(id);
+  return 0;
+}
+
+async i32 runCmd(Sys sys, string[] args) {
+  Policy? p = await policyFrom(sys, flag(args, "--policy"));
+  if (p is null) { return 1; }
+  string id = args[1].indexOf("kb1:") == 0 ? args[1] : await resolveName(sys, p!, args[1]);
+  if (id == "") { return 1; }
+  string[] mirrors = flags(args, "--mirror");
+  if (!(await allowed(sys, p!, "app", id, mirrors))) { sys.warn("wactrust: not running \{id}"); return 1; }
+  u8[] bytes;
+  string[] log = string[]();
+  match (await blob(sys, mirrors, id, log)) {
+    Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+    Ok(b): { bytes = b; }
+  }
+  sys.warn("fetched \{bytes.len()} bytes hashing to \{id}");
+  if (bytes.len() >= 4 && bytes[0] == 0 && bytes[1] == 'a' && bytes[2] == 's' && bytes[3] == 'm') {
+    // The checked bytes themselves are instantiated — no file in between to be swapped — holding nothing.
+    sys.warn("running it with no authority at all: no files, no network, no environment, no processes");
+    Child child;
+    match (await sys.procs().spawn(bytes, afterDashes(args), Authority.none(), Launch("", false, true, false))) {
+      Err(e): { sys.warn("wactrust: cannot start it: \{e}"); return 1; }
+      Ok(c): { child = c; }
+    }
+    return (await child.exit()).orElse(1);
+  }
+  string out = flag(args, "--out") == "" ? "verified-" + id.slice(4, 16) : flag(args, "--out");
+  await sys.files().mkdir(out, true);
+  await sys.writeFile(out + "/index.html", bytes);
+  string cwd = (await sys.env().cwd()).orElse("");
+  sys.log("file://\{out.indexOf("/") == 0 ? out : cwd + "/" + out}/index.html");
+  return 0;
 }

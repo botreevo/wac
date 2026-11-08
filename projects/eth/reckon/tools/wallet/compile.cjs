@@ -1,4 +1,4 @@
-const solc = require('solc'); const fs = require('fs');
+const solc = require('../oracle/node_modules/solc'); const fs = require('fs');
 const [src, out] = process.argv.slice(2);
 const input = { language: 'Solidity', sources: { 'TrustRegistry.sol': { content: fs.readFileSync(src, 'utf8') } },
   settings: { optimizer: { enabled: true, runs: 200 }, evmVersion: 'cancun', outputSelection: { '*': { '*': ['evm.bytecode.object', 'abi', 'storageLayout'] } } } };

@@ -362,6 +362,107 @@ export string programSide() {
               : answer(id, 2, path + ": the site answered " + r.status, NONE, 0n, 0n, 0),
             (e) => answer(id, 5, path + ": " + String(e?.message ?? e), NONE, 0n, 0n, 0));
         };
+        // **`wac.gpu`**: WebGPU's compute half — buffers, WGSL programs, runs and reads — for a program that asks for it
+        // (wac-tensor's `src/gpu/line.wac` is the client, and says what each operation's fields hold). Opened the first
+        // time it is looked up, which answers once the device is ready, so no operation ever arrives before it.
+        //
+        // **Runs are encoded as they come and submitted together**: at the end of each batch, before a write — the
+        // queue's writes land before anything submitted after them, so one that arrived after a run must wait for that
+        // run to be submitted first — and before a read. A buffer freed is destroyed only after the submit that follows,
+        // since a run already encoded may still read it. What the GPU reports going wrong, from an error scope around
+        // each batch, waits to be the fault in the next read's answer: a read is the one place the program listens.
+        const GPU = BASE + 200, GPU_COUNT = 7;
+        const gpuBuffers = new Map(), gpuPrograms = new Map();
+        let gpuOpening = null, gpuDev = null, gpuEncoder = null, gpuDoomed = [], gpuErrors = [], gpuScopes = [];
+        const gpuOpen = () => gpuOpening ??= (async () => {
+          if (!globalThis.navigator?.gpu) throw new Error("this browser has no WebGPU");
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) throw new Error("WebGPU found no adapter here");
+          const L = adapter.limits;
+          gpuDev = await adapter.requestDevice({ requiredLimits: {
+            maxStorageBufferBindingSize: L.maxStorageBufferBindingSize, maxBufferSize: L.maxBufferSize,
+          } });
+          gpuDev.lost.then((info) => gpuErrors.push("the GPU was lost: " + info.message));
+          return gpuDev;
+        })();
+        const gpuSubmit = () => {
+          if (gpuEncoder !== null) { gpuDev.queue.submit([gpuEncoder.finish()]); gpuEncoder = null; }
+          for (const h of gpuDoomed) { gpuBuffers.get(h)?.destroy(); gpuBuffers.delete(h); gpuPrograms.delete(h); }
+          gpuDoomed = [];
+        };
+        const gpuWatch = (f) => {
+          gpuDev.pushErrorScope("validation");
+          gpuDev.pushErrorScope("out-of-memory");
+          f();
+          for (let i = 0; i < 2; i++) gpuScopes.push(gpuDev.popErrorScope().then((e) => { if (e) gpuErrors.push(e.message); }));
+        };
+        const USAGE = () => GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+        const gpuOp = (k, id, a, b, text, bytes) => {
+          const d = gpuDev;
+          switch (k) {
+            case 0: return gpuBuffers.set(lo(a), d.createBuffer({ size: Math.max(4, Math.ceil(Number(b) / 4) * 4), usage: USAGE() }));
+            case 1: {
+              if (gpuEncoder !== null) gpuSubmit();
+              const buf = gpuBuffers.get(lo(a));
+              if (!buf) return gpuErrors.push("a write to buffer " + lo(a) + ", which is not there");
+              return d.queue.writeBuffer(buf, Number(b), bytes);
+            }
+            case 2: return gpuDoomed.push(lo(a));
+            case 3: {
+              const module = d.createShaderModule({ code: text });
+              return gpuPrograms.set(lo(a), d.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } }));
+            }
+            case 4: {
+              const pipe = gpuPrograms.get(lo(a));
+              const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+              const entries = [];
+              for (let i = 0; i * 4 < bytes.length; i++) entries.push({ binding: i, resource: { buffer: gpuBuffers.get(v.getInt32(i * 4, true)) } });
+              if (!pipe || entries.some((e) => !e.resource.buffer)) return gpuErrors.push("a run named a program or buffer that is not there");
+              const group = d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+              gpuEncoder ??= d.createCommandEncoder();
+              const pass = gpuEncoder.beginComputePass();
+              pass.setPipeline(pipe);
+              pass.setBindGroup(0, group);
+              pass.dispatchWorkgroups(quadAt(b, 0), quadAt(b, 1), quadAt(b, 2));
+              return pass.end();
+            }
+            case 5: {
+              const src = gpuBuffers.get(lo(a)), off = hi(b), len = lo(b), size = Math.ceil(len / 4) * 4;
+              if (!src) return answer(id, 9, "a read of buffer " + lo(a) + ", which is not there", NONE, 0n, 0n, 0);
+              const staging = d.createBuffer({ size: Math.max(4, size), usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+              gpuWatch(() => {
+                gpuEncoder ??= d.createCommandEncoder();
+                gpuEncoder.copyBufferToBuffer(src, off, staging, 0, size);
+                gpuSubmit();
+              });
+              const scopes = gpuScopes;
+              gpuScopes = [];
+              return Promise.all([staging.mapAsync(GPUMapMode.READ), ...scopes]).then(() => {
+                const out = new Uint8Array(staging.getMappedRange().slice(0, len));
+                staging.destroy();
+                if (gpuErrors.length) { const why = gpuErrors.join("; "); gpuErrors = []; return answer(id, 5, why, NONE, 0n, 0n, 0); }
+                answer(id, 0, "", out, 0n, 0n, 0);
+              }, (e) => answer(id, 5, String(e?.message ?? e), NONE, 0n, 0n, 0));
+            }
+            // What the program held, in order, as each would have come alone; then submitted, and answered at once.
+            case 6: {
+              const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+              gpuWatch(() => {
+                let at = 0;
+                for (let i = 0; i < Number(a) && at + 21 <= bytes.length; i++) {
+                  const op = bytes[at], ca = v.getBigInt64(at + 1, true), cb = v.getBigInt64(at + 9, true);
+                  const tlen = v.getUint32(at + 17, true);
+                  const ctext = dec.decode(bytes.subarray(at + 21, at + 21 + tlen));
+                  const blen = v.getUint32(at + 21 + tlen, true), from = at + 25 + tlen;
+                  gpuOp(op, 0, ca, cb, ctext, bytes.slice(from, from + blen));
+                  at = from + blen;
+                }
+                gpuSubmit();
+              });
+              return answer(id, 0, "", NONE, 0n, 0n, 0);
+            }
+          }
+        };
         const allows = (versions) => {
           // `^1`, `^1.0`, `^1.1.0` or `1.1.0`: what the 1.1.0 capability here allows — any 1.x at or below it, or it.
           const here = [1, 1, 0], exact = !versions.startsWith("^");
@@ -388,6 +489,16 @@ export string programSide() {
             }
             return answer(id, 0, "1.0.0", NONE, BigInt(BASE), BigInt(COUNT), 0);
           }
+          if (op === 68 && text === "wac.gpu") {
+            // This host speaks 1.0.0, which `^1`, `^1.0`, `^1.0.0` and `1.0.0` allow.
+            const v = dec.decode(bytes);
+            const [major, minor, patch] = (v.startsWith("^") ? v.slice(1) : v).split(".");
+            const allowed = v.startsWith("^") ? major === "1" && (minor ?? "0") === "0" && (patch ?? "0") === "0" : v === "1.0.0";
+            if (!allowed) return answer(id, 9, "wac.gpu here is 1.0.0, which " + v + " does not allow", NONE, 0n, 0n, 0);
+            return gpuOpen().then(() => answer(id, 0, "1.0.0", NONE, BigInt(GPU), BigInt(GPU_COUNT), 0),
+                                  (e) => answer(id, 9, String(e?.message ?? e), NONE, 0n, 0n, 0));
+          }
+          if (op >= GPU && op < GPU + GPU_COUNT && gpuDev !== null) return gpuOp(op - GPU, id, a, b, text, bytes);
           if (op >= BASE && op < BASE + COUNT) return page(op - BASE, id, a, b, text, bytes);
           return next(op, id, a, b, text, bytes);
         };

@@ -5,16 +5,28 @@
 //     wactrust blob FILE                        kb1 of one file
 //     wactrust lock pin|check                   wac.lock pinned by tree, and the cache checked against it
 //     wactrust lock fetch NAME [--from URL]     fetch one entry with git, installed only if it hashes to its pin
+//     wactrust build --dir D --path P --toolchain kt1:… --key F [--out S] -- COMMAND…
+//                                               build from a clean commit and sign what it produced
+//     wactrust rebuild S --git REPO COMMIT --toolchain kt1:… [--key F] [--out S2]
+//                                               rebuild a statement's source and say whether the output matches
+//     wactrust review SUBJECT SCOPE --key F [--out S]   sign a review of a kt1/kb1
+//     wactrust verify S…                        check statements' signatures
 
 import { Sys } from "std";
 import { treeId, blobId, leafHash } from "../src/tree.wac";
 import { hashDir, hashCommit } from "../src/walk.wac";
 import { LockEntry, readLock, writeLock, pin, check, fetchInto } from "../src/lock.wac";
+import { Claim, Statement, Verified, signClaim, verify, toJson, fromJson, hex, unhex } from "../src/statement.wac";
+import { runBuild, cleanSource, rebuild } from "../src/build.wac";
 
 string usage() {
   return """
     usage: wactrust tree DIR | tree --git REPO COMMIT [SUBDIR] | blob FILE
            wactrust lock pin | lock check | lock fetch NAME [--from URL]
+           wactrust build --dir D --path P --toolchain kt1:… --key F [--out S] -- COMMAND…
+           wactrust rebuild S --git REPO COMMIT --toolchain kt1:… [--key F] [--out S2]
+           wactrust review SUBJECT SCOPE --key F [--out S]
+           wactrust verify S…
     """;
 }
 
@@ -41,6 +53,10 @@ export async i32 main(Sys sys) {
     }
   }
   if (cmd == "lock" && args.len() >= 2) { return await lockCmd(sys, args); }
+  if (cmd == "build") { return await buildCmd(sys, args); }
+  if (cmd == "rebuild" && args.len() >= 2) { return await rebuildCmd(sys, args); }
+  if (cmd == "review" && args.len() >= 3) { return await reviewCmd(sys, args); }
+  if (cmd == "verify" && args.len() >= 2) { return await verifyCmd(sys, args); }
   sys.warn(usage());
   return 2;
 }
@@ -94,4 +110,134 @@ async i32 lockCmd(Sys sys, string[] args) {
   }
   sys.warn(usage());
   return 2;
+}
+
+/** The value after `name` (before any `--`), or "". */
+export string flag(string[] args, string name) {
+  for (i32 i = 0; i + 1 < args.len(); i++) {
+    if (args[i] == "--") { return ""; }
+    if (args[i] == name) { return args[i + 1]; }
+  }
+  return "";
+}
+
+/** Everything after `--`. */
+string[] afterDashes(string[] args) {
+  for (i32 i = 0; i < args.len(); i++) {
+    if (args[i] == "--") {
+      string[] out = string[].defaulted(args.len() - i - 1);
+      for (i32 j = i + 1; j < args.len(); j++) { out[j - i - 1] = args[j]; }
+      return out;
+    }
+  }
+  return string[]();
+}
+
+export async u8[]? keyFrom(Sys sys, string path) {
+  if (path == "") { return null; }
+  match (await sys.readFile(path)) {
+    Err(e): { return null; }
+    Ok(b): {
+      string t = string.fromBytes(b);
+      while (t.len() > 0 && (t.slice(t.len() - 1, t.len()) == "\n" || t.slice(t.len() - 1, t.len()) == " ")) { t = t.slice(0, t.len() - 1); }
+      u8[]? k = unhex(t);
+      return k is not null && k!.len() == 32 ? k : null;
+    }
+  }
+}
+
+/** Sign `c` with the key at `keyPath` and write it to `out` (or print it). */
+async i32 emit(Sys sys, Claim c, string keyPath, string out) {
+  u8[]? key = await keyFrom(sys, keyPath);
+  if (key is null) { sys.warn("wactrust: --key names no file holding a 32-byte hex key"); return 1; }
+  match (signClaim(c, key!)) {
+    Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+    Ok(st): {
+      string text = toJson(st) + "\n";
+      if (out == "") { sys.log(toJson(st)); } else { await sys.writeFile(out, text.toBytes()); sys.log("wrote \{out}"); }
+      return 0;
+    }
+  }
+}
+
+async i32 buildCmd(Sys sys, string[] args) {
+  string[] command = afterDashes(args);
+  string dir = flag(args, "--dir");
+  string path = flag(args, "--path");
+  string toolchain = flag(args, "--toolchain");
+  if (command.len() == 0 || path == "" || toolchain == "") { sys.warn(usage()); return 2; }
+  string home = await envOr(sys, "WAC_HOME", (await envOr(sys, "HOME", "")) + "/.wac");
+  string source;
+  match (await cleanSource(sys)) {
+    Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+    Ok(s): { source = s; }
+  }
+  match (await runBuild(sys, home, ".", source, dir == "" ? "." : dir, command, path, toolchain)) {
+    Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+    Ok(c): {
+      sys.warn("source \{source}");
+      match (c) { Built(_, _, _, _, _, output): { sys.warn("output \{output}"); } Reviewed(_, _): { } }
+      return await emit(sys, c, flag(args, "--key"), flag(args, "--out"));
+    }
+  }
+}
+
+async Statement? readStatement(Sys sys, string path) {
+  match (await sys.readFile(path)) {
+    Err(e): { sys.warn("wactrust: cannot read \{path}"); return null; }
+    Ok(b): {
+      match (fromJson(b)) {
+        Err(e): { sys.warn("wactrust: \{path}: \{e}"); return null; }
+        Ok(s): { return s; }
+      }
+    }
+  }
+}
+
+async i32 rebuildCmd(Sys sys, string[] args) {
+  Statement? st = await readStatement(sys, args[1]);
+  if (st is null) { return 1; }
+  match (verify(st!)) {
+    Err(e): { sys.warn("wactrust: \{args[1]}: \{e}"); return 1; }
+    Ok(_): { }
+  }
+  string repo = "";
+  string commit = "";
+  for (i32 i = 0; i + 2 < args.len(); i++) { if (args[i] == "--git") { repo = args[i + 1]; commit = args[i + 2]; } }
+  string toolchain = flag(args, "--toolchain");
+  if (repo == "" || toolchain == "") { sys.warn(usage()); return 2; }
+  string home = await envOr(sys, "WAC_HOME", (await envOr(sys, "HOME", "")) + "/.wac");
+  string scratch = home + "/rebuild-scratch";
+  match (await rebuild(sys, home, repo, commit, scratch, st!.claim, toolchain)) {
+    Err(e): { sys.warn("wactrust: \{e}"); return 1; }
+    Ok(mine): {
+      string theirs = match (st!.claim) { Built(_, _, _, _, _, o): o, Reviewed(_, _): "" };
+      string got = match (mine) { Built(_, _, _, _, _, o): o, Reviewed(_, _): "" };
+      string theirTool = match (st!.claim) { Built(_, _, _, _, t, _): t, Reviewed(_, _): "" };
+      if (got != theirs) {
+        sys.warn("DIFFERS\n  statement \{theirs}\n  rebuilt   \{got}");
+        return 1;
+      }
+      sys.log("same \{got}" + (theirTool != toolchain ? " (with toolchain \{toolchain}, the statement says \{theirTool})" : ""));
+      if (flag(args, "--key") == "") { return 0; }
+      return await emit(sys, mine, flag(args, "--key"), flag(args, "--out"));
+    }
+  }
+}
+
+async i32 reviewCmd(Sys sys, string[] args) {
+  return await emit(sys, Claim.Reviewed(args[1], args[2]), flag(args, "--key"), flag(args, "--out"));
+}
+
+async i32 verifyCmd(Sys sys, string[] args) {
+  i32 bad = 0;
+  for (i32 i = 1; i < args.len(); i++) {
+    Statement? st = await readStatement(sys, args[i]);
+    if (st is null) { bad++; continue; }
+    match (verify(st!)) {
+      Err(e): { sys.warn("\{args[i]}: \{e}"); bad++; }
+      Ok(v): { sys.log("\{args[i]}: signed by 0x\{hex(v.signer)}, id 0x\{hex(v.id)}"); }
+    }
+  }
+  return bad == 0 ? 0 : 1;
 }

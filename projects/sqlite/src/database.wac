@@ -123,7 +123,7 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
       coll = collationId(d.collate!);
       if (coll < 0) { return Result.Err(err0("no such collation sequence: \{d.collate!}")); }
     }
-    Column col = Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt, coll, d.generated, d.stored, "");
+    Column col = Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt, coll, d.generated, d.stored, "", d.notNullConflict);
     if (c.strict) {
       string ty = upper(d.typeName);
       if (ty == "INT") { ty = "INTEGER"; }
@@ -140,7 +140,7 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
     }
     cols.push(col);
   }
-  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create(), c.strict, Expr[](), ForeignKey[](), i32[](), false, "");
+  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create(), c.strict, Expr[](), ForeignKey[](), i32[](), false, "", -1);
   t.withoutRowid = c.withoutRowid;
   i32 pkCount = 0;
   for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].primaryKey) { pkCount++; } }
@@ -159,20 +159,26 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
         n++;
         Index pk = autoIndex(t, n, [i]);
         pk.desc[0] = d.pkDesc;
+        pk.onConflict = d.pkConflict;
         t.pkIndex = pk.name;
         autos.push(pk);
       } else if (isIntegerType(d.typeName) && !d.pkDesc) {
         t.rowidAlias = i;
         t.autoincrement = d.autoincrement;
+        t.rowidConflict = d.pkConflict;
       } else {
         if (d.autoincrement) { return Result.Err(SqlError.schema("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")); }
         n++;
-        autos.push(autoIndex(t, n, [i]));
+        Index pk = autoIndex(t, n, [i]);
+        pk.onConflict = d.pkConflict;
+        autos.push(pk);
       }
     }
     if (d.unique) {
       n++;
-      autos.push(autoIndex(t, n, [i]));
+      Index u = autoIndex(t, n, [i]);
+      u.onConflict = d.uniqueConflict;
+      autos.push(u);
     }
   }
   for (i32 i = 0; i < c.constraints.len(); i++) {
@@ -205,6 +211,7 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
       n++;
       Index ix = autoIndex(t, n, pos);
       ix.desc = descV.toArray();
+      ix.onConflict = c.constraints[i].onConflict;
       t.pkIndex = ix.name;
       autos.push(ix);
       continue;
@@ -212,10 +219,13 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
     if (pk && pos.len() == 1 && isIntegerType(t.cols[pos[0]].typeName)) {
       t.rowidAlias = pos[0];
       t.autoincrement = c.constraints[i].kind == "PRIMARY KEY AUTOINCREMENT";
+      t.rowidConflict = c.constraints[i].onConflict;
       continue;
     }
     n++;
-    autos.push(autoIndex(t, n, pos));
+    Index ix = autoIndex(t, n, pos);
+    ix.onConflict = c.constraints[i].onConflict;
+    autos.push(ix);
   }
   // CHECK constraints, from the columns then the table, and foreign keys likewise.
   Vec<Expr> checks;
@@ -260,7 +270,7 @@ Index autoIndex(Table t, i32 n, i32[] cols) {
   i32[] colls = i32[].filled(cols.len(), 0);
   for (i32 i = 0; i < cols.len(); i++) { colls[i] = t.cols[cols[i]].coll; }
   return Index("sqlite_autoindex_\{t.name}_\{n}", t.name, null, cols, bool[].filled(cols.len(), false), colls, true,
-               null, null, Chunked<Entry>.create());
+               null, null, Chunked<Entry>.create(), -1);
 }
 
 export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
@@ -286,7 +296,7 @@ export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
       if (colls[i] < 0) { return Result.Err(err0("no such collation sequence: \{c.cols[i].collate!}")); }
     }
   }
-  Index ix = Index(c.name, t.name, c.sql, pos, desc, colls, c.unique, null, null, Chunked<Entry>.create());
+  Index ix = Index(c.name, t.name, c.sql, pos, desc, colls, c.unique, null, null, Chunked<Entry>.create(), -1);
   // A partial index's WHERE and an expression index's terms are evaluated against each row.
   Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)], null, null, false);
   Exec x = Exec { db: Database.empty(), params: Value[](), env: FnEnv { nowMillis: 0, changes: 0, totalChanges: 0,
@@ -599,7 +609,7 @@ u8[][] keyedRecords(Index ix, Table t, Index pk) {
     colls[n + k] = t.cols[extra.get(k)].coll;
     desc[n + k] = extraDesc.get(k);
   }
-  Index order = Index(ix.name, ix.table, null, ix.cols, desc, colls, false, null, null, Chunked<Entry>.create());
+  Index order = Index(ix.name, ix.table, null, ix.cols, desc, colls, false, null, null, Chunked<Entry>.create(), -1);
   Entry[] es = Entry[].filled(ix.entries.len(), Entry(Value[](), null));
   for (i32 i = 0; i < es.len(); i++) {
     Value[] key = ix.entries.get(i).key;

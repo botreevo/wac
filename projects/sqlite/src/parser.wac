@@ -927,7 +927,7 @@ export struct Parser {
   }
 
   i32 orAction(this) {
-    if (!this.eatKw("OR")) { return OR_ABORT; }
+    if (!this.eatKw("OR")) { return -1; }
     if (this.eatKw("IGNORE")) { return OR_IGNORE; }
     if (this.eatKw("REPLACE")) { return OR_REPLACE; }
     if (this.eatKw("FAIL")) { return OR_FAIL; }
@@ -1159,17 +1159,17 @@ export struct Parser {
         try this.expectKw("KEY");
         c.primaryKey = true;
         if (this.eatKw("DESC")) { c.pkDesc = true; } else { this.eatKw("ASC"); }
-        try this.conflictClause();
+        c.pkConflict = try this.conflictClause();
         if (this.eatKw("AUTOINCREMENT")) { c.autoincrement = true; }
       } else if (this.isKw("NOT") && this.isKwAt(1, "NULL")) {
         this.pos += 2;
         c.notNull = true;
-        try this.conflictClause();
+        c.notNullConflict = try this.conflictClause();
       } else if (this.eatKw("NULL")) {
         try this.conflictClause();
       } else if (this.eatKw("UNIQUE")) {
         c.unique = true;
-        try this.conflictClause();
+        c.uniqueConflict = try this.conflictClause();
       } else if (this.eatKw("CHECK")) {
         try this.expectOp("(");
         Expr e = try this.expr();
@@ -1205,11 +1205,16 @@ export struct Parser {
     return Result.Ok(c);
   }
 
-  Result<void, SqlError> conflictClause(this) {
-    if (this.isKw("ON") && this.isKwAt(1, "CONFLICT")) {
-      this.pos += 3;
-    }
-    return Result.Ok();
+  // A constraint's ON CONFLICT: its resolution, or -1 when there is none.
+  Result<i32, SqlError> conflictClause(this) {
+    if (!(this.isKw("ON") && this.isKwAt(1, "CONFLICT"))) { return Result.Ok(-1); }
+    this.pos += 2;
+    if (this.eatKw("ROLLBACK")) { return Result.Ok(OR_ROLLBACK); }
+    if (this.eatKw("ABORT")) { return Result.Ok(OR_ABORT); }
+    if (this.eatKw("FAIL")) { return Result.Ok(OR_FAIL); }
+    if (this.eatKw("IGNORE")) { return Result.Ok(OR_IGNORE); }
+    if (this.eatKw("REPLACE")) { return Result.Ok(OR_REPLACE); }
+    return Result.Err(this.fail("expected a conflict resolution"));
   }
 
   Result<void, SqlError> skipParens(this) {
@@ -1269,21 +1274,21 @@ export struct Parser {
         string[] names = try this.nameList();
         bool[] desc = this.lastDesc;
         bool auto = this.eatKw("AUTOINCREMENT");
-        try this.conflictClause();
-        cons.push(TableConstraint(auto ? "PRIMARY KEY AUTOINCREMENT" : "PRIMARY KEY", names, null, null, desc));
+        i32 oc = try this.conflictClause();
+        cons.push(TableConstraint(auto ? "PRIMARY KEY AUTOINCREMENT" : "PRIMARY KEY", names, null, null, desc, oc));
       } else if (this.eatKw("UNIQUE")) {
-        cons.push(TableConstraint("UNIQUE", try this.nameList(), null, null, bool[]()));
-        try this.conflictClause();
+        string[] names = try this.nameList();
+        cons.push(TableConstraint("UNIQUE", names, null, null, bool[](), try this.conflictClause()));
       } else if (this.eatKw("CHECK")) {
         try this.expectOp("(");
         Expr e = try this.expr();
         try this.expectOp(")");
-        cons.push(TableConstraint("CHECK", string[](), e, null, bool[]()));
+        cons.push(TableConstraint("CHECK", string[](), e, null, bool[](), -1));
       } else if (this.eatKw("FOREIGN")) {
         try this.expectKw("KEY");
         string[] fcols = try this.nameList();
         try this.expectKw("REFERENCES");
-        cons.push(TableConstraint("FOREIGN KEY", fcols, null, try this.foreignKeyRest(), bool[]()));
+        cons.push(TableConstraint("FOREIGN KEY", fcols, null, try this.foreignKeyRest(), bool[](), -1));
       } else {
         if (cons.len() > 0) { return Result.Err(this.fail("a column after a table constraint")); }
         cols.push(try this.columnDef());

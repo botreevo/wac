@@ -166,7 +166,7 @@ export struct Connection {
     Vec<Undo> undo;
     Exec x = Exec { db: this.db, params: params, env: this.env, ctes: Vec.create() };
     this.env.changes = this.changes;
-    Statement s = Statement(this, x, undo, 0, false, false, false, Vec.create(), "");
+    Statement s = Statement(this, x, undo, 0, false, false, false, Vec.create(), "", false);
     Result<Rows, SqlError> ran = s.run(st);
     // Immediate foreign keys hold at the end of each statement; deferred ones at COMMIT, or now when
     // there is no transaction to wait for.
@@ -200,6 +200,17 @@ export struct Connection {
         return Result.Ok(rows);
       }
       Err(e): {
+        if (s.failKeep && !s.rollbackTx) {
+          // OR FAIL: what the statement did before failing stays, and counts.
+          if (s.counted) { this.changes = s.count; this.totalChanges += s.count; }
+          if (this.inTx) {
+            for (i32 i = 0; i < undo.len(); i++) { this.txUndo.push(undo.get(i)); }
+            if (undo.len() > 0) { this.txChanged = true; }
+          } else if (undo.len() > 0) {
+            this.dirty = true;
+          }
+          return Result.Err(e);
+        }
         undoAll(this.db, undo);
         if (s.rollbackTx && this.inTx) { this.rollback(); }
         return Result.Err(e);
@@ -216,7 +227,7 @@ export struct Connection {
   // Deferred foreign keys are checked now; a failure leaves the transaction open, as in SQLite.
   Result<void, SqlError> commit(this, Value[] params) {
     Statement chk = Statement(this, Exec { db: this.db, params: params, env: this.env, ctes: Vec.create() },
-                              Vec.create(), 0, false, false, false, Vec.create(), "");
+                              Vec.create(), 0, false, false, false, Vec.create(), "", false);
     for (i32 i = 0; i < this.deferred.len(); i++) {
       if (!(try chk.holds(this.deferred.get(i)))) {
         return Result.Err(SqlError("constraint", "FOREIGN KEY constraint failed"));
@@ -345,8 +356,17 @@ struct Statement {
   bool rollbackTx = false;
   Vec<Pending> pending;
   string activeTriggers = "";
+  // OR FAIL stops the statement but keeps what it changed before the failure.
+  bool failKeep = false;
 
   Database db(this) { return this.conn.db; }
+
+  // A constraint has failed with resolution `action`: what ROLLBACK and FAIL do beyond refusing.
+  SqlError failing(this, i32 action, SqlError e) {
+    if (action == OR_ROLLBACK) { this.rollbackTx = true; }
+    if (action == OR_FAIL) { this.failKeep = true; }
+    return e;
+  }
 
   // ── constraints: CHECK and foreign keys ──────────────────────────────────
 
@@ -358,9 +378,9 @@ struct Statement {
     for (i32 i = 0; i < t.checks.len(); i++) {
       Node n = try bindExpr(t.checks[i], sc, this.x);
       if (truthOf(try eval(n, c, this.x)) == 0) {
-        if (orAction == OR_IGNORE) { return Result.Ok(false); }
-        if (orAction == OR_ROLLBACK) { this.rollbackTx = true; }
-        return Result.Err(constraint("CHECK constraint failed: \{t.name}"));
+        i32 action = actionFor(orAction, -1);
+        if (action == OR_IGNORE) { return Result.Ok(false); }
+        return Result.Err(this.failing(action, constraint("CHECK constraint failed: \{t.name}")));
       }
     }
     return Result.Ok(true);
@@ -674,6 +694,7 @@ struct Statement {
         string code = failed!.code;
         if (code == "raise-ignore") { return Result.Ok(false); }
         if (code == "raise-rollback") { this.rollbackTx = true; }
+        if (code == "raise-fail") { this.failKeep = true; }
         if (code == "raise-abort" || code == "raise-fail" || code == "raise-rollback") {
           return Result.Err(SqlError("constraint", failed!.message));
         }
@@ -827,13 +848,13 @@ struct Statement {
     for (i32 i = 0; i < t.cols.len(); i++) {
       if (i == t.rowidAlias) { continue; }
       if (t.cols[i].notNull && isNull(r.vals[i])) {
-        if (orAction == OR_IGNORE) { return Result.Ok(false); }
-        if (orAction == OR_REPLACE && t.cols[i].dflt is not null) {
+        i32 action = actionFor(orAction, t.cols[i].notNullConflict);
+        if (action == OR_IGNORE) { return Result.Ok(false); }
+        if (action == OR_REPLACE && t.cols[i].dflt is not null) {
           r.vals[i] = applyAffinity(try this.defaultFor(t.cols[i]), t.cols[i].affinity);
           if (!isNull(r.vals[i])) { continue; }
         }
-        if (orAction == OR_ROLLBACK) { this.rollbackTx = true; }
-        return Result.Err(constraint("NOT NULL constraint failed: \{t.name}.\{t.cols[i].name}"));
+        return Result.Err(this.failing(action, constraint("NOT NULL constraint failed: \{t.name}.\{t.cols[i].name}")));
       }
     }
     return this.checksHold(t, r, orAction);
@@ -961,14 +982,13 @@ struct Statement {
           }
           break;
         }
-        i32 action = ins.orAction;
+        i32 action = actionFor(ins.orAction, c!.mode(t));
         if (action == OR_IGNORE) { skip = true; break; }
         if (action == OR_REPLACE) {
           try this.removeUserRow(t, c!.row);
           continue;
         }
-        if (action == OR_ROLLBACK) { this.rollbackTx = true; }
-        return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, c!.cols)));
+        return Result.Err(this.failing(action, constraint("UNIQUE constraint failed: " + this.describeKey(t, c!.cols))));
       }
       if (skip) { continue; }
       this.insertRow(t, r);
@@ -991,7 +1011,7 @@ struct Statement {
   Result<Row?, SqlError> upsertUpdate(this, Table t, Row existing, Row proposed, Upsert u) {
     // `excluded` is a scope outside the table's, so a bare name means the table's column and only
     // `excluded.x` reaches the proposed row, as in SQLite.
-    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "");
+    Table ex = Table("excluded", "", t.cols, t.rowidAlias, false, Vec.create(), false, Expr[](), ForeignKey[](), i32[](), false, "", -1);
     Scope outer = Scope([BoundSource("excluded", ex, JOIN_FIRST, null, false, string[](), null)], null, null, false);
     Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)], outer, null, false);
     Ctx c = Ctx([existing as Row?], Ctx([proposed as Row?], null, null, null, null), null, null, null);
@@ -1061,10 +1081,10 @@ struct Statement {
       while (true) {
         Conflict? cf = this.firstConflict(t, r, old.rowid);
         if (cf is null) { break; }
-        if (orAction == OR_IGNORE) { return Result.Ok(null); }
-        if (orAction == OR_REPLACE) { try this.removeUserRow(t, cf!.row); continue; }
-        if (orAction == OR_ROLLBACK) { this.rollbackTx = true; }
-        return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, cf!.cols)));
+        i32 action = actionFor(orAction, cf!.mode(t));
+        if (action == OR_IGNORE) { return Result.Ok(null); }
+        if (action == OR_REPLACE) { try this.removeUserRow(t, cf!.row); continue; }
+        return Result.Err(this.failing(action, constraint("UNIQUE constraint failed: " + this.describeKey(t, cf!.cols))));
       }
       try this.parentChanging(t, old, r);
       this.childWritten(t, r, old);
@@ -1079,13 +1099,14 @@ struct Statement {
     while (true) {
       Conflict? cf = this.firstConflict(t, r, -9223372036854775807 - 1);
       if (cf is null) { break; }
-      if (orAction == OR_IGNORE) {
+      i32 action = actionFor(orAction, cf!.mode(t));
+      if (action == OR_IGNORE) {
         this.insertRow(t, old);
         return Result.Ok(null);
       }
-      if (orAction == OR_REPLACE) { try this.removeUserRow(t, cf!.row); continue; }
-      if (orAction == OR_ROLLBACK) { this.rollbackTx = true; }
-      return Result.Err(constraint("UNIQUE constraint failed: " + this.describeKey(t, cf!.cols)));
+      if (action == OR_REPLACE) { try this.removeUserRow(t, cf!.row); continue; }
+      if (action == OR_FAIL) { this.insertRow(t, old); }
+      return Result.Err(this.failing(action, constraint("UNIQUE constraint failed: " + this.describeKey(t, cf!.cols))));
     }
     try this.parentChanging(t, old, r);
     this.childWritten(t, r, old);
@@ -1257,8 +1278,8 @@ struct Statement {
     }
     if (t.autoincrement && d.table("sqlite_sequence") is null) {
       Table seq = Table("sqlite_sequence", "CREATE TABLE sqlite_sequence(name,seq)",
-                        [Column("name", "", 0, false, null, 0, null, false, ""), Column("seq", "", 0, false, null, 0, null, false, "")], -1, false, Vec.create(), false,
-                        Expr[](), ForeignKey[](), i32[](), false, "");
+                        [Column("name", "", 0, false, null, 0, null, false, "", -1), Column("seq", "", 0, false, null, 0, null, false, "", -1)], -1, false, Vec.create(), false,
+                        Expr[](), ForeignKey[](), i32[](), false, "", -1);
       d.tables.set("sqlite_sequence", seq);
       d.order.push(SchemaEntry("table", "sqlite_sequence", "sqlite_sequence"));
     }
@@ -1572,7 +1593,7 @@ struct Statement {
     Column[] cols = Column[].defaulted(t.cols.len() + 1);
     cols.copyFrom(t.cols, 0, 0, t.cols.len());
     cols[t.cols.len()] = Column(c.name, c.typeName, affinityOf(c.typeName), c.notNull, c.dflt,
-                                c.collate is null ? 0 : collationId(c.collate!), c.generated, c.stored, "");
+                                c.collate is null ? 0 : collationId(c.collate!), c.generated, c.stored, "", c.notNullConflict);
     Value stored = applyAffinity(dv, cols[t.cols.len()].affinity);
     for (i32 i = 0; i < t.rows.len(); i++) {
       Row r = t.rows.get(i);
@@ -1679,7 +1700,14 @@ struct Conflict {
   Row row;
   i32[] cols;     // the constraint's columns; [-1] for a bare rowid
   Index? ix;
+
+  // The constraint's own ON CONFLICT, or -1.
+  i32 mode(this, Table t) { return this.ix is null ? t.rowidConflict : this.ix!.onConflict; }
 }
+
+// What a failed constraint does: the statement's OR clause when it has one, else the constraint's
+// ON CONFLICT, else ABORT.
+i32 actionFor(i32 stmt, i32 cons) { return stmt >= 0 ? stmt : (cons >= 0 ? cons : OR_ABORT); }
 
 struct BoundSets {
   i32[] cols;

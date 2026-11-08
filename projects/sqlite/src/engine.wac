@@ -7,7 +7,7 @@ import { Value, compareValues, sameValue } from "./value.wac";
 import { Expr, Stmt, Select, Source, ResultCol, Insert, Update, Delete, Upsert, Assign, CreateTable,
          CreateIndex, ColumnDef, JOIN_FIRST, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 import { parseOne, Parsed, isBlank } from "./parser.wac";
-import { Table, Row, Index, Column, SchemaEntry, affinityOf, AFF_INTEGER } from "./schema.wac";
+import { Table, Row, Index, Entry, Column, SchemaEntry, affinityOf, AFF_INTEGER } from "./schema.wac";
 import { Database, openBytes, toBytes, tableFrom, indexFrom, rebuildIndex, constValue } from "./database.wac";
 import { Node, BoundSource, SelectPlan, Rows } from "./plan.wac";
 import { Exec, Scope, Ctx, bindExpr, eval, planSelect, runPlan, query } from "./query.wac";
@@ -229,12 +229,13 @@ void removeRows(Database db, Table t, Map<i64, bool> gone) {
   Index[] ixs = db.indexesOf(t.name);
   for (i32 i = 0; i < ixs.len(); i++) {
     Index ix = ixs[i];
-    Vec<Value[]> ek = Vec.withCapacity(ix.entries.len());
+    Vec<Entry> ek = Vec.withCapacity(ix.entries.len());
     for (i32 k = 0; k < ix.entries.len(); k++) {
-      Value[] e = ix.entries.get(k);
+      Entry en = ix.entries.get(k);
+      Value[] e = en.key;
       match (e[e.len() - 1]) {
-        Int(id): { if (!gone.has(id)) { ek.push(e); } }
-        default: { ek.push(e); }
+        Int(id): { if (!gone.has(id)) { ek.push(en); } }
+        default: { ek.push(en); }
       }
     }
     ix.entries = Chunked.fromArray(ek.toArray());
@@ -356,14 +357,14 @@ struct Statement {
               default: {}
             }
             this.deleteRow(s!, r);
-            this.insertRow(s!, Row(r.rowid, [Value.Text(t.name), Value.Int(rowid)]));
+            this.insertRow(s!, Row(r.rowid, [Value.Text(t.name), Value.Int(rowid)], null));
             return;
           }
         }
         default: {}
       }
     }
-    this.insertRow(s!, Row(s!.maxRowid() + 1, [Value.Text(t.name), Value.Int(rowid)]));
+    this.insertRow(s!, Row(s!.maxRowid() + 1, [Value.Text(t.name), Value.Int(rowid)], null));
   }
 
   // Coerces a row's values to its columns' affinities and checks NOT NULL. Answers false when the row
@@ -470,7 +471,7 @@ struct Statement {
         }
       }
       if (!haveRowid) { rowid = try this.newRowid(t); }
-      Row r = Row(rowid, vals);
+      Row r = Row(rowid, vals, null);
       if (!(try this.prepareRow(t, r, ins.orAction))) { continue; }
       bool skip = false;
       while (true) {
@@ -521,42 +522,49 @@ struct Statement {
         Err(e): { return Result.Err(e); }
       }
     }
-    return this.applySets(t, existing, u.sets, sc, c, OR_ABORT);
+    return this.applySets(t, existing, try this.bindSets(t, u.sets, sc), c, OR_ABORT);
   }
 
   // Computes and stores an updated row. Null when OR IGNORE skipped it.
-  Result<Row?, SqlError> applySets(this, Table t, Row old, Assign[] sets, Scope sc, Ctx c, i32 orAction) {
-    Value[] vals = Value[].filled(old.vals.len(), Value.Null);
-    vals.copyFrom(old.vals, 0, 0, old.vals.len());
-    i64 rowid = old.rowid;
+  // A SET list resolved once per statement: each target column (-1 for the rowid) and its expression.
+  Result<BoundSets, SqlError> bindSets(this, Table t, Assign[] sets, Scope sc) {
+    i32[] cols = i32[].filled(sets.len(), 0);
+    Node[] nodes = Node[].filled(sets.len(), Node.NLit(Value.Null));
     for (i32 i = 0; i < sets.len(); i++) {
       Assign a = sets[i];
       if (a.cols.len() != 1) { return Result.Err(SqlError.unsupported("assigning a row value")); }
       i32 col = t.colIndex(a.cols[0]);
-      Node n = try bindExpr(a.value, sc, this.x);
-      Value v = try eval(n, c, this.x);
       if (col < 0) {
         string nm = lower(a.cols[0]);
-        if (t.rowidAlias < 0 && (nm == "rowid" || nm == "oid" || nm == "_rowid_")) {
-          match (applyAffinity(v, AFF_INTEGER)) {
-            Int(r): { rowid = r; }
-            default: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
-          }
-          continue;
+        if (t.rowidAlias >= 0 || (nm != "rowid" && nm != "oid" && nm != "_rowid_")) {
+          return Result.Err(err("no such column: \{a.cols[0]}"));
         }
-        return Result.Err(err("no such column: \{a.cols[0]}"));
       }
-      if (col == t.rowidAlias) {
+      if (col == t.rowidAlias) { col = -1; }
+      cols[i] = col;
+      nodes[i] = try bindExpr(a.value, sc, this.x);
+    }
+    return Result.Ok(BoundSets(cols, nodes));
+  }
+
+  // Computes and stores an updated row. Null when OR IGNORE skipped it.
+  Result<Row?, SqlError> applySets(this, Table t, Row old, BoundSets bs, Ctx c, i32 orAction) {
+    Value[] vals = Value[].filled(old.vals.len(), Value.Null);
+    vals.copyFrom(old.vals, 0, 0, old.vals.len());
+    i64 rowid = old.rowid;
+    for (i32 i = 0; i < bs.cols.len(); i++) {
+      Value v = try eval(bs.nodes[i], c, this.x);
+      i32 col = bs.cols[i];
+      if (col < 0) {
         match (applyAffinity(v, AFF_INTEGER)) {
           Int(r): { rowid = r; }
-          Null: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
           default: { return Result.Err(SqlError("mismatch", "datatype mismatch")); }
         }
         continue;
       }
       vals[col] = v;
     }
-    Row r = Row(rowid, vals);
+    Row r = Row(rowid, vals, null);
     if (!(try this.prepareRow(t, r, orAction))) { return Result.Ok(null); }
     if (rowid == old.rowid) {
       // The common case: the row keeps its rowid, so it is swapped in place, and only the indexes whose
@@ -614,6 +622,7 @@ struct Statement {
     BoundSource[] srcs = [BoundSource(lower(t.name), t, JOIN_FIRST, null, false)];
     Scope sc = Scope(srcs, null, null, false);
     RetPlan? ret = try this.returning(t, u.returning);
+    BoundSets bs = try this.bindSets(t, u.sets, sc);
     Vec<Value[]> out;
     this.counted = true;
     for (i32 i = 0; i < rows.len(); i++) {
@@ -622,7 +631,7 @@ struct Statement {
       Row want = rows[i];
       if (cur is null || cur! is not want) { continue; }
       Ctx c = Ctx([rows[i] as Row?], null, null, null);
-      Row? changed = try this.applySets(t, rows[i], u.sets, sc, c, u.orAction);
+      Row? changed = try this.applySets(t, rows[i], bs, c, u.orAction);
       if (changed is not null && ret is not null) { out.push(try this.evalReturning(ret!, changed!)); }
     }
     if (ret is not null) { return Result.Ok(Rows(ret!.names, out)); }
@@ -886,6 +895,11 @@ struct Conflict {
   Row row;
   i32[] cols;     // the constraint's columns; [-1] for a bare rowid
   Index? ix;
+}
+
+struct BoundSets {
+  i32[] cols;
+  Node[] nodes;
 }
 
 struct RetPlan {

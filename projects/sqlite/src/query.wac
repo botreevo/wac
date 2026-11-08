@@ -8,7 +8,7 @@ import { encodeRecord } from "./record.wac";
 import { Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
 import { Table, Row, Index, Column, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database } from "./database.wac";
-import { Node, BoundSource, AggSpec, SelectPlan, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT } from "./plan.wac";
+import { Node, BoundSource, AggSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT } from "./plan.wac";
 import { AFF_NONE, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
 import { callScalar, functionId, FID_COALESCE, FID_IFNULL, FID_IIF, knownFunction, returnsJson, FnEnv, likeMatch, likeBytes, globMatch, codepoints } from "./functions.wac";
@@ -23,13 +23,27 @@ export struct Exec {
   string lastPattern = "";
   u8[] lastPatternBytes;
 
+  string? lastNeedle;   // set when the pattern is `%needle%` and the needle has no letters or wildcards
+
   u8[] patternBytes(this, string p) {
     if (p != this.lastPattern || this.lastPatternBytes.len() != p.len()) {
       this.lastPattern = p;
       this.lastPatternBytes = p.toBytes();
+      this.lastNeedle = needleOf(this.lastPatternBytes);
     }
     return this.lastPatternBytes;
   }
+}
+
+string? needleOf(const u8[] b) {
+  if (b.len() < 2 || b[0] != '%' || b[b.len() - 1] != '%') { return null; }
+  for (i32 i = 1; i < b.len() - 1; i++) {
+    u8 c = b[i];
+    if (c == '%' || c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80) { return null; }
+  }
+  u8[] mid = u8[].filled(b.len() - 2, 0);
+  mid.copyFrom(b, 1, 0, b.len() - 2);
+  return string.fromBytes(mid);
 }
 
 // Names visible to an expression: this select's sources, then the enclosing selects'.
@@ -330,7 +344,14 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       Value v = try eval(value, c, x);
       Value p = try eval(pattern, c, x);
       if (isNull(v) || isNull(p)) { return Result.Ok(Value.Null); }
-      if (!glob) { return Result.Ok(boolValue(likeBytes(x.patternBytes(textOf(p)), textOf(v).toBytes(), -1))); }
+      if (!glob) {
+        string pat = textOf(p);
+        x.patternBytes(pat);
+        string text = textOf(v);
+        // `%needle%` with nothing case can change, which is the usual search: a substring test.
+        if (x.lastNeedle is not null) { return Result.Ok(boolValue(text.indexOf(x.lastNeedle!) >= 0)); }
+        return Result.Ok(boolValue(likeBytes(x.lastPatternBytes, text.toBytes(), -1)));
+      }
       i32[] pc = codepoints(textOf(p));
       i32[] vc = codepoints(textOf(v));
       return Result.Ok(boolValue(globMatch(pc, 0, vc, 0)));
@@ -457,7 +478,7 @@ Table tableOfRows(string name, const string[] names, Vec<Value[]> rows) {
   Column[] cols = Column[].defaulted(names.len());
   for (i32 i = 0; i < names.len(); i++) { cols[i] = Column(names[i], "", AFF_BLOB, false, null); }
   Vec<Row> rs;
-  for (i32 i = 0; i < rows.len(); i++) { rs.push(Row((i + 1) as i64, rows.get(i))); }
+  for (i32 i = 0; i < rows.len(); i++) { rs.push(Row((i + 1) as i64, rows.get(i), null)); }
   return Table(name, "", cols, -1, false, rs);
 }
 
@@ -471,7 +492,8 @@ string defaultName(const ResultCol rc) {
 
 export Result<SelectPlan, SqlError> planSelect(const Select s, Scope? outer, Exec x) {
   SelectPlan p = SelectPlan { ast: s as Select, srcs: BoundSource[](), results: Node[](), names: string[](),
-                              groupBy: Node[](), order: Node[](), desc: bool[](), nulls: i32[]() };
+                              groupBy: Node[](), order: Node[](), desc: bool[](), nulls: i32[](),
+                              probeSpecs: ProbeSpec[][](), probeBuilt: bool[]() };
   // VALUES (…), (…): rows of expressions with no sources.
   if (s.values is not null) {
     Scope sc = Scope(BoundSource[](), outer, p, false);
@@ -677,8 +699,8 @@ void conjuncts(const Node n, Vec<Node> out) {
   }
 }
 
-Result<Vec<Probe>, SqlError> probesFor(const SelectPlan p, i32 k, const Vec<Node> conds, Ctx c, Exec x) {
-  Vec<Probe> out;
+ProbeSpec[] probeSpecsFor(const SelectPlan p, i32 k, const Vec<Node> conds) {
+  Vec<ProbeSpec> out;
   i32 earlier = (1 << k) - 1;
   const Table t = p.srcs[k].table;
   for (i32 i = 0; i < conds.len(); i++) {
@@ -692,11 +714,8 @@ Result<Vec<Probe>, SqlError> probesFor(const SelectPlan p, i32 k, const Vec<Node
             NCol(d, s, col, aff): {
               if (d != 0 || s != k) { continue; }
               if ((refs(other, 0) & ~earlier) != 0) { continue; }
-              Value v = try eval(other, c, x);
-              if (isNull(v)) { continue; }
               i32 colAff = col < 0 || col == t.rowidAlias ? AFF_INTEGER : aff;
-              Value pv = probeValue(v, nodeAff(other), colAff);
-              out.push(Probe(col == t.rowidAlias ? -1 : col, side == 0 ? op : flip(op), pv));
+              out.push(ProbeSpec(col == t.rowidAlias ? -1 : col, side == 0 ? op : flip(op), other as Node, colAff));
             }
             default: {}
           }
@@ -704,6 +723,34 @@ Result<Vec<Probe>, SqlError> probesFor(const SelectPlan p, i32 k, const Vec<Node
       }
       default: {}
     }
+  }
+  return out.toArray();
+}
+
+// The conditions that may narrow source k: its ON, and for an inner join the WHERE's too.
+Vec<Node> usableConds(const SelectPlan p, i32 k, const Vec<Node> where) {
+  Vec<Node> usable;
+  if (p.srcs[k].on is not null) { conjuncts(p.srcs[k].on!, usable); }
+  if (p.srcs[k].join != JOIN_LEFT) { for (i32 i = 0; i < where.len(); i++) { usable.push(where.get(i)); } }
+  return usable;
+}
+
+Result<Vec<Probe>, SqlError> probesFor(SelectPlan p, i32 k, const Vec<Node> where, Ctx c, Exec x) {
+  if (p.probeBuilt.len() != p.srcs.len()) {
+    p.probeSpecs = ProbeSpec[][].defaulted(p.srcs.len());
+    p.probeBuilt = bool[].filled(p.srcs.len(), false);
+  }
+  if (!p.probeBuilt[k]) {
+    p.probeSpecs[k] = probeSpecsFor(p, k, usableConds(p, k, where));
+    p.probeBuilt[k] = true;
+  }
+  ProbeSpec[] specs = p.probeSpecs[k];
+  Vec<Probe> out;
+  for (i32 i = 0; i < specs.len(); i++) {
+    ProbeSpec sp = specs[i];
+    Value v = try eval(sp.other, c, x);
+    if (isNull(v)) { continue; }
+    out.push(Probe(sp.col, sp.op, probeValue(v, nodeAff(sp.other), sp.colAff)));
   }
   return Result.Ok(out);
 }
@@ -906,7 +953,7 @@ bool hasRange(const Vec<Probe> probes, i32 col) {
 
 Row? rowAt(Table t, Access a, i32 i) {
   if (a.ix is null) { return t.rows.get(i); }
-  Value[] e = a.ix!.entries.get(i);
+  Value[] e = a.ix!.entries.get(i).key;
   match (e[e.len() - 1]) {
     Int(id): { return t.get(id); }
     default: { return null; }
@@ -1074,10 +1121,7 @@ Result<bool, SqlError> loop(SelectPlan p, i32 k, Ctx c, Exec x, Sink sink, const
   }
   BoundSource src = p.srcs[k];
   // Conditions that may narrow this source: its ON, and for an inner join the WHERE's too.
-  Vec<Node> usable;
-  if (src.on is not null) { conjuncts(src.on!, usable); }
-  if (src.join != JOIN_LEFT) { for (i32 i = 0; i < conds.len(); i++) { usable.push(conds.get(i)); } }
-  Access a = try chooseAccess(p, k, usable, c, x);
+  Access a = try chooseAccess(p, k, conds, c, x);
   bool matched = false;
   if (!a.none) {
     i32 n = a.hi - a.lo;
@@ -1202,13 +1246,13 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
   if (!p.aggregate && !p.distinct && p.compound is null && stopAt >= 0) {
     if (p.order.len() == 0) { sink.stopAt = stopAt as! i32; }
     else if (orderable(p)) {
-      Access a = try chooseAccess(p, 0, levelOneConds(p, conds), c, x);
+      Access a = try chooseAccess(p, 0, conds, c, x);
       if (a.ordered) { sink.stopAt = stopAt as! i32; }
     }
   }
   Wanted? w = wantedOrder(p);
   if (w is not null && w!.minMax) {
-    Access a = try chooseAccess(p, 0, levelOneConds(p, conds), c, x);
+    Access a = try chooseAccess(p, 0, conds, c, x);
     if (a.ordered) { sink.minMaxStop = true; }
   }
   if (p.srcs.len() == 0) {
@@ -1235,13 +1279,6 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
     }
   }
   return Result.Ok(sink);
-}
-
-Vec<Node> levelOneConds(const SelectPlan p, const Vec<Node> conds) {
-  Vec<Node> out;
-  if (p.srcs.len() > 0 && p.srcs[0].on is not null) { conjuncts(p.srcs[0].on!, out); }
-  for (i32 i = 0; i < conds.len(); i++) { out.push(conds.get(i)); }
-  return out;
 }
 
 void dedupe(Vec<Value[]> rows, Vec<Value[]> keys) {

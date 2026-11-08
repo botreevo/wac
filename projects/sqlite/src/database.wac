@@ -3,15 +3,15 @@
 import { Result, Vec, Map, hashString, stringEq } from "core";
 import { SqlError } from "./error.wac";
 import { Value } from "./value.wac";
-import { encodeRecord } from "./record.wac";
+import { encodeRecord, decodeRecord } from "./record.wac";
 import { put16, put32 } from "./bytes.wac";
-import { openImage, Image, readTable, RawRow, decode, MAGIC } from "./reader.wac";
+import { openImage, Image, readTable, readIndex, RawRow, decode, MAGIC } from "./reader.wac";
 import { Pages, buildTable, buildIndex } from "./writer.wac";
 import { Chunked } from "./chunked.wac";
 import { parseOne } from "./parser.wac";
 import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef } from "./ast.wac";
 import { lower, upper } from "./lexer.wac";
-import { Column, Row, Index, Table, SchemaEntry, affinityOf, AFF_REAL } from "./schema.wac";
+import { Column, Row, Index, Entry, Table, SchemaEntry, affinityOf, AFF_REAL } from "./schema.wac";
 
 // What version of SQLite the file claims was the last to write it. Readers only print it.
 static i64 SQLITE_VERSION_NUMBER = 3045000;
@@ -142,7 +142,7 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
 }
 
 Index autoIndex(string table, i32 n, i32[] cols) {
-  return Index("sqlite_autoindex_\{table}_\{n}", table, null, cols, bool[].filled(cols.len(), false), true, Chunked<Value[]>.create());
+  return Index("sqlite_autoindex_\{table}_\{n}", table, null, cols, bool[].filled(cols.len(), false), true, Chunked<Entry>.create());
 }
 
 export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
@@ -154,12 +154,22 @@ export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
     desc[i] = c.cols[i].desc;
   }
   if (c.where is not null) { return Result.Err(SqlError.unsupported("partial indexes")); }
-  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, c.unique, Chunked<Value[]>.create()));
+  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, c.unique, Chunked<Entry>.create()));
 }
 
 // A row as the file has it, widened to the table's columns: a row written before ALTER TABLE ADD COLUMN
 // is shorter, and its missing values are the column's default.
-Row rowFrom(Table t, i64 rowid, const Value[] stored) {
+Row rowFrom(Table t, i64 rowid, Value[] stored) {
+  // Usually the record is exactly the row: take its array rather than copying it.
+  if (stored.len() == t.cols.len()) {
+    for (i32 i = 0; i < stored.len(); i++) {
+      if (t.cols[i].affinity == AFF_REAL) {
+        match (stored[i]) { Int(x): { stored[i] = Value.Real(x as~ f64); } default: {} }
+      }
+    }
+    if (t.rowidAlias >= 0) { stored[t.rowidAlias] = Value.Int(rowid); }
+    return Row(rowid, stored, null);
+  }
   Value[] vals = Value[].filled(t.cols.len(), Value.Null);
   for (i32 i = 0; i < vals.len(); i++) {
     if (i < stored.len()) {
@@ -176,25 +186,44 @@ Row rowFrom(Table t, i64 rowid, const Value[] stored) {
     }
   }
   if (t.rowidAlias >= 0) { vals[t.rowidAlias] = Value.Int(rowid); }
-  return Row(rowid, vals);
+  return Row(rowid, vals, null);
 }
 
 export void rebuildIndex(Index ix, Table t) {
-  ix.entries.clear();
-  Vec<Value[]> all;
-  for (i32 i = 0; i < t.rows.len(); i++) { all.push(ix.entryFor(t.rows.get(i))); }
-  Value[][] arr = all.toArray();
+  Entry[] arr = Entry[].filled(t.rows.len(), Entry(Value[](), null));
+  for (i32 i = 0; i < t.rows.len(); i++) { arr[i] = Entry(ix.entryFor(t.rows.get(i)), null); }
   sortEntries(ix, arr);
   ix.entries = Chunked.fromArray(arr);
 }
 
+// An index as the file holds it, already sorted, with each entry's record kept. Null when the file's
+// entries cannot simply be taken: a count that disagrees with the table, or a REAL column, whose
+// integral values the file may hold as integers.
+Index? indexFromFile(Index ix, Table t, Image img, i64 root) {
+  for (i32 c in ix.cols) { if (t.cols[c].affinity == AFF_REAL) { return null; } }
+  match (readIndex(img, root)) {
+    Ok(raw): {
+      if (raw.len() != t.rows.len()) { return null; }
+      Entry[] arr = Entry[].filled(raw.len(), Entry(Value[](), null));
+      for (i32 i = 0; i < raw.len(); i++) {
+        Value[]? key = decodeRecord(raw.get(i));
+        if (key is null || key!.len() != ix.cols.len() + 1) { return null; }
+        arr[i] = Entry(key!, raw.get(i));
+      }
+      ix.entries = Chunked.fromArray(arr);
+      return ix;
+    }
+    Err(e): { return null; }
+  }
+}
+
 // A merge sort, stable, over index entries.
-void sortEntries(Index ix, Value[][] a) {
+void sortEntries(Index ix, Entry[] a) {
   if (a.len() < 2) { return; }
-  Value[][] tmp = Value[][].defaulted(a.len());
+  Entry[] tmp = Entry[].filled(a.len(), a[0]);
   i32 width = 1;
-  Value[][] src = a;
-  Value[][] dst = tmp;
+  Entry[] src = a;
+  Entry[] dst = tmp;
   while (width < a.len()) {
     for (i32 lo = 0; lo < a.len(); lo += 2 * width) {
       i32 mid = lo + width < a.len() ? lo + width : a.len();
@@ -203,15 +232,15 @@ void sortEntries(Index ix, Value[][] a) {
       i32 j = mid;
       i32 k = lo;
       while (i < mid && j < hi) {
-        if (ix.compare(src[j], src[i]) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        if (ix.compare(src[j].key, src[i].key) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
         k++;
       }
       while (i < mid) { dst[k] = src[i]; i++; k++; }
       while (j < hi) { dst[k] = src[j]; j++; k++; }
     }
-    Value[][] s = src;
+    Entry[] sw = src;
     src = dst;
-    dst = s;
+    dst = sw;
     width *= 2;
   }
   if (src is not a) { a.copyFrom(src, 0, 0, a.len()); }
@@ -250,7 +279,9 @@ export Result<Database, SqlError> openBytes(u8[] data) {
         match (v[3]) { Int(r): { root = r; } default: {} }
         Vec<RawRow> raw = try readTable(img, root);
         for (i32 k = 0; k < raw.len(); k++) {
-          t.rows.push(rowFrom(t, raw.get(k).rowid, try decode(raw.get(k).payload)));
+          Row r = rowFrom(t, raw.get(k).rowid, try decode(raw.get(k).payload));
+          r.rec = raw.get(k).payload;
+          t.rows.push(r);
         }
         db.tables.set(lower(t.name), t);
       }
@@ -288,16 +319,27 @@ export Result<Database, SqlError> openBytes(u8[] data) {
     for (i32 k = 0; k < db.order.len(); k++) { if (db.order.get(k).name == autos.get(i).name) { listed = true; } }
     if (!listed) { return Result.Err(SqlError.corrupt("\{autos.get(i).name} is missing from the schema")); }
   }
-  string[] keys = db.indexes.keys();
-  for (string k in keys) {
-    Index ix = db.indexes.get(k)!;
-    rebuildIndex(ix, db.table(ix.table)!);
+  for (i32 i = 0; i < schema.len(); i++) {
+    Value[] v = try decode(schema.get(i).payload);
+    if (textAt(v, 0)! != "index") { continue; }
+    Index ix = db.index(textAt(v, 1)!)!;
+    Table t = db.table(ix.table)!;
+    i64 root = 0;
+    match (v[3]) { Int(r): { root = r; } default: {} }
+    if (indexFromFile(ix, t, img, root) is null) { rebuildIndex(ix, t); }
   }
   return Result.Ok(db);
 }
 
 // The record a row is stored as: the alias column, if any, is NULL in the file.
 export u8[] rowRecord(Table t, Row r) {
+  if (r.rec is not null) { return r.rec!; }
+  u8[] out = encodeRow(t, r);
+  r.rec = out;
+  return out;
+}
+
+u8[] encodeRow(Table t, Row r) {
   if (t.rowidAlias < 0) { return encodeRecord(r.vals); }
   Value[] v = Value[].filled(r.vals.len(), Value.Null);
   v.copyFrom(r.vals, 0, 0, r.vals.len());
@@ -331,7 +373,11 @@ export u8[] toBytes(Database db) {
     } else {
       Index ix = db.index(e.name)!;
       u8[][] recs = u8[][].defaulted(ix.entries.len());
-      for (i32 k = 0; k < recs.len(); k++) { recs[k] = encodeRecord(ix.entries.get(k)); }
+      for (i32 k = 0; k < recs.len(); k++) {
+        Entry en = ix.entries.get(k);
+        if (en.rec is null) { en.rec = encodeRecord(en.key); }
+        recs[k] = en.rec!;
+      }
       buildIndex(ps, roots[i], recs);
       Value sql = ix.sql is null ? Value.Null : Value.Text(ix.sql!);
       schemaRecs.push(encodeRecord([Value.Text("index"), Value.Text(ix.name), Value.Text(ix.table),

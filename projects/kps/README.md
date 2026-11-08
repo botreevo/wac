@@ -25,6 +25,19 @@ repository is the KPS layer: addresses and pinning, the WebRTC stream framing an
 | the dialer from a page | **done**: a page built with `--grant webrtc` drives the browser's own RTCPeerConnection through wac-web's `wac.webrtc` and runs the same scenarios, 8 of 8, against `@kpstreams/server` and the wac listener (`src/webrtc/page.wac`, `test/page_test.wac`) |
 | the native WebRTC dialer | **done**: wac's own ICE (controlling), DTLS client and SCTP initiator, upstream in wac's `webrtc` package; the same scenarios pass against `@kpstreams/server` (libdatachannel), the wac listener, and Go's `kps-server` (pion) as far as its example server serves them, and a certhash naming another key is not dialled (`src/webrtc/dial.wac`, `test/dial_test.wac`) |
 | QUIC: the dialer, and the listener's QUIC path | **done**, on wac's new QUIC endpoint (`packages/quic/src/endpoint.wac`): the listener takes QUIC on the WebRTC port under the same certhash, and Go's quic-go client echoes, crosses the window, sends a datagram and closes with a code against it; the QUIC dialer passes every scenario against the wac listener, every one quic-go's and quiche's example servers serve, and follows quiche's Retry (`src/quic/`, `test/dial_test.wac`, `test/listener_test.wac`) |
+| hostile traffic | a listener takes 6000 datagrams that are not KPS — random bytes, forged QUIC Initials and short headers, STUN-shaped junk, binding requests that do not know the certhash, DTLS-shaped noise — and still serves both transports, leaking nothing (`test/hostile_test.wac`); nothing is held for a WebRTC client that does not prove the certhash or a QUIC Initial that does not authenticate |
+
+### How fast
+
+Go's client echoing 1.6 MB through a listener on this machine (loopback, five runs each):
+
+| | wac listener | `@kpstreams/server` |
+| --- | --- | --- |
+| WebRTC | 1.6 s | 0.39 s |
+| QUIC | 0.36 s | fails (its QUIC echo stalls at this size) |
+
+The WebRTC gap is mostly wac's software AES-GCM, which is constant-time GHASH and byte-wise AES; the handshake
+costs the same (0.3 s, mostly ICE).
 
 ## Running it
 

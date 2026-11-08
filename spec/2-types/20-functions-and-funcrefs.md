@@ -346,6 +346,28 @@ export i32 bumpedTwice() {
 `[§wacc-lambda-capture]` A lambda captures the locals and parameters it uses by reference. Capture reaches
 through nesting, and two lambdas capturing one local share it.
 
+A `for` loop's variable is one local for the whole loop, so lambdas made in its body and capturing it all see its
+last value; a local declared in the body is a new one each time round, and copying the variable into one gives each
+lambda its own:
+
+```wac
+// expect: lastAndOwn() = 33
+export i32 lastAndOwn() {
+  fn<i32()>[] shared = fn<i32()>[].filled(3, () => 0);
+  fn<i32()>[] own = fn<i32()>[].filled(3, () => 0);
+  for (i32 d = 0; d < 3; d++) {
+    shared[d] = () => d;                   // warning: captures the loop's variable
+    i32 mine = d;
+    own[d] = () => mine;
+  }
+  return shared[0]() * 10 + own[1]() + own[2]();
+}
+```
+
+`[§wac-lambda-loop-capture-warn-q7m2k4x]` A lambda in a `for` loop's body that reads the loop's variable — declared by the
+loop's initialiser, and changed by its update — draws a warning. It is not refused: it is what capture by reference
+means.
+
 ```wac
 // expect: addedThroughReceiver() = 5
 struct Counter {

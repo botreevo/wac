@@ -150,6 +150,17 @@ export function asAppModule(driven: Driven, manifest: Manifest): Record<string, 
       return sig.ret === "" || sig.ret === "void" ? undefined : driven.fromWasm(sig.ret, out);
     };
   }
+  // **What a `trap "…"` said**, read once the trap has unwound (`issues/lang/0147`) — the sentence the worker entries
+  // report in place of the engine's "unreachable". Empty for an engine trap, and for a module asked after it broke.
+  app.__wacTrapSaid = (): string => {
+    try {
+      const read = driven.exports.$trap$message;
+      const s = typeof read === "function" ? (read as CallableFunction)() : null;
+      return s === null || s === undefined ? "" : String(driven.fromWasm("string", s) ?? "");
+    } catch {
+      return "";
+    }
+  };
   return app;
 }
 

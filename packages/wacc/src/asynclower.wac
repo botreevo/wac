@@ -2051,21 +2051,52 @@ export string ticketSigsOf(Program?[] progs, u8[][] srcs, Lexed?[] lexeds) {
     for (i32 d = 0; d < prog.decls.len(); d++) {
       match (prog.decls[d].kind) {
         Func(nameTok, returnType, params, body, exported, typeParams, isAsync): {
-          if (typeParams.len() == 0) { out = out + sigLine("", synthTextAt(src, lx, nameTok), returnType, isAsync, src, lx); }
+          if (typeParams.len() == 0) {
+            string fname = synthTextAt(src, lx, nameTok);
+            out = out + sigLine("", fname, returnType, isAsync, src, lx);
+            for (i32 p = 0; p < params.len(); p++) { out = out + slotLine("@p:" + fname + "#" + slotDecimal(p), params[p].type, src, lx); }
+          }
         }
         StructDecl(snameTok, parentTok, fields, methods, sexported, isConst, stps): {
           if (stps.len() > 0) { continue; }
           string owner = synthTextAt(src, lx, snameTok);
           for (i32 m = 0; m < methods.len(); m++) {
             if (methods[m].typeParams.len() > 0) { continue; }
-            out = out + sigLine(owner, synthTextAt(src, lx, methods[m].nameTok), methods[m].returnType,
-                                methods[m].isAsync, src, lx);
+            string mname = synthTextAt(src, lx, methods[m].nameTok);
+            out = out + sigLine(owner, mname, methods[m].returnType, methods[m].isAsync, src, lx);
+            for (i32 p = 0; p < methods[m].params.len(); p++) {
+              out = out + slotLine("@p:" + owner + "." + mname + "#" + slotDecimal(p), methods[m].params[p].type, src, lx);
+            }
+          }
+          for (i32 f = 0; f < fields.len(); f++) {
+            out = out + slotLine("@f:" + owner + "." + synthTextAt(src, lx, fields[f].nameTok), fields[f].type, src, lx);
+            out = out + slotLine("@c:" + owner + "#" + slotDecimal(f), fields[f].type, src, lx);
           }
         }
         default: { }
       }
     }
   }
+  return out;
+}
+
+/**
+ * A slot an `async` lambda may fill — a parameter, a field, a constructor's argument — when its type is a
+ * `fn<Ticket<R>(…)>`: `key|type`, where the key is `@p:f#i`, `@p:Owner.m#i`, `@f:Owner.field` or `@c:Owner#i`.
+ * What `hoistAsyncLambdas` reads the lambda's `R` from, since a lambda writes no return type of its own.
+ */
+string slotLine(string key, Ty t, u8[] src, Lexed lx) {
+  string st = spellTyL(src, lx, t);
+  if (st.len() < 10 || st.slice(0, 10) != "fn<Ticket<" || st.indexOf("type(") >= 0) { return ""; }
+  return key + "|" + st + "\n";
+}
+
+/** `n` in decimal, for a slot key. */
+string slotDecimal(i32 n) {
+  if (n == 0) { return "0"; }
+  string out = "";
+  i32 v = n;
+  while (v > 0) { out = string.fromCodepoint(48 + v % 10) + out; v = v / 10; }
   return out;
 }
 
@@ -3468,8 +3499,7 @@ Stmt[][] childBodies(Stmt s) {
 /** Whether `body`, at any depth, declares an `async` lambda the lowering can take. */
 bool bodyHasAsyncLambda(u8[] src, Lexed lexed, Stmt[] body) {
   for (i32 i = 0; i < body.len(); i++) {
-    Expr? lam = asyncLambdaOf(src, lexed, body[i]);
-    if (lam is not null) { return true; }
+    if (asyncLambdasIn(body[i]).len() > 0) { return true; }
     Stmt[][] kids = childBodies(body[i]);
     for (i32 k = 0; k < kids.len(); k++) {
       if (bodyHasAsyncLambda(src, lexed, kids[k])) { return true; }
@@ -3482,9 +3512,9 @@ bool bodyHasAsyncLambda(u8[] src, Lexed lexed, Stmt[] body) {
 i32 bodyLambdaArgs(u8[] src, Lexed lexed, Stmt[] body) {
   i32 most = 0;
   for (i32 i = 0; i < body.len(); i++) {
-    Expr? lam = asyncLambdaOf(src, lexed, body[i]);
-    if (lam is not null) {
-      match (lam!.kind) {
+    Expr[] lams = asyncLambdasIn(body[i]);
+    for (i32 q = 0; q < lams.len(); q++) {
+      match (lams[q].kind) {
         Lambda(lps, lbody, la): { if (lps.len() > most) { most = lps.len(); } }
         default: { }
       }
@@ -3502,9 +3532,9 @@ i32 bodyLambdaArgs(u8[] src, Lexed lexed, Stmt[] body) {
 i32 bodyLambdaStates(u8[] src, Lexed lexed, Stmt[] body) {
   i32 most = 0;
   for (i32 i = 0; i < body.len(); i++) {
-    Expr? lam = asyncLambdaOf(src, lexed, body[i]);
-    if (lam is not null) {
-      match (lam!.kind) {
+    Expr[] lams = asyncLambdasIn(body[i]);
+    for (i32 q = 0; q < lams.len(); q++) {
+      match (lams[q].kind) {
         Lambda(lps, lbody, la): {
           i32 w = statesNeeded(lbody);
           if (w > most) { most = w; }
@@ -3659,6 +3689,8 @@ struct Lw {
    * before it has run.
    */
   i32[] statesWanted;
+  /** The return type of the function or method whose body is being walked — what a returned `async` lambda fills. */
+  Ty?[] ret;
 }
 
 void noteWhy(Lw w, string why) { if (w.why[0] == "") { w.why[0] = why; } }
@@ -3716,7 +3748,222 @@ Stmt[]? machineOf(Lw w, Site at, Stmt[] body, Ty ret, string[] extra) {
  * emitter unlowered, which declined a program the checker accepted. A nested body is lowered by the
  * same rule, and its statement rebuilt around it.
  */
-Stmt[] lowerLambdasIn(Lw w, Stmt[] body, i32 selfTok) {
+/**
+ * Every `async` lambda written in `s`'s own expressions — an initialiser, an argument, a field's value, an assigned
+ * value, a returned one — but not in a body nested inside `s`, which `childBodies` hands on. What the sizing walks
+ * count, and the lambdas `hoistAsyncLambdas` may move.
+ */
+Expr[] asyncLambdasIn(Stmt s) {
+  Expr[] found = Expr[]();
+  match (s.kind) {
+    Var(type, nameTok, init, isConst): { if (init is not null) { found = lambdasInE(init!, found); } }
+    ExprStmt(expr): { found = lambdasInE(expr, found); }
+    Assign(target, op, rhs): { found = lambdasInE(rhs, found); }
+    Return(value): { if (value is not null) { found = lambdasInE(value!, found); } }
+    default: { }
+  }
+  return found;
+}
+
+Expr[] withE(Expr[] xs, Expr e) {
+  Expr[] out = Expr[].filled(xs.len() + 1, e);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+Expr[] lambdasInE(Expr e, Expr[] found) {
+  Expr[] f = found;
+  match (e.kind) {
+    Lambda(lps, lbody, la): { if (la) { f = withE(f, e); } }
+    Construct(ctype, args, named): {
+      for (i32 i = 0; i < args.len(); i++) { f = lambdasInE(args[i], f); }
+      for (i32 i = 0; i < named.len(); i++) { f = lambdasInE(named[i].value, f); }
+    }
+    Call(callee, args, targs): {
+      f = lambdasInE(callee, f);
+      for (i32 i = 0; i < args.len(); i++) { f = lambdasInE(args[i], f); }
+    }
+    Member(obj, nameTok): { f = lambdasInE(obj, f); }
+    Unwrap(inner): { f = lambdasInE(inner, f); }
+    Binary(op, left, right): { f = lambdasInE(right, lambdasInE(left, f)); }
+    Unary(op, operand): { f = lambdasInE(operand, f); }
+    Ternary(cond, then, els): { f = lambdasInE(els, lambdasInE(then, lambdasInE(cond, f))); }
+    Index(arr, index): { f = lambdasInE(index, lambdasInE(arr, f)); }
+    default: { }
+  }
+  return f;
+}
+
+/**
+ * **An `async` lambda anywhere a `fn<Ticket<R>(…)>` is expected**, moved into the one form the lowering takes —
+ * `fn<Ticket<R>(P…)> __wacAwK = async (…) => { … };` just before its statement, and the name where it was. A
+ * lambda writes no return type, and this pass has no types, so `R` is read from the slot it fills, as written in
+ * whichever file declares it (`Lw.sigs`): a function's or method's parameter, a struct's field — positional or
+ * named — the field an assignment writes, or the return type of the function a `return` leaves. Making a lambda runs
+ * nothing, and what it captures it reaches by reference, so made one statement earlier it is the same lambda.
+ * wac-kps's `Driver.openChannel` was a `fn<Ticket<Channel?>(…)>` that every implementation filled by resolving a
+ * ticket by hand, because this form was the only one the lowering took (`issues/lang/0437d`).
+ */
+Stmt[] hoistAsyncLambdas(Lw w, Stmt[] body) {
+  i32 extra = 0;
+  for (i32 i = 0; i < body.len(); i++) { extra = extra + asyncLambdasIn(body[i]).len(); }
+  if (extra == 0) { return body; }
+  Stmt[] out = Stmt[].filled(body.len() + extra, body[0]);
+  i32 n = 0;
+  for (i32 i = 0; i < body.len(); i++) {
+    Stmt s = body[i];
+    // The form the lowering already takes stays as it is.
+    if (asyncLambdaOf(w.src, w.lexed, s) is not null) { out[n] = s; n = n + 1; continue; }
+    Stmt[] pre = Stmt[]();
+    Hoist h = Hoist(w, pre, s.line, s.col);
+    Stmt s2 = s;
+    match (s.kind) {
+      Var(type, nameTok, init, isConst): {
+        if (init is not null) { s2 = Stmt(StmtKind.Var(type, nameTok, hoistE(h, init!, null), isConst), s.line, s.col); }
+      }
+      ExprStmt(expr): { s2 = Stmt(StmtKind.ExprStmt(hoistE(h, expr, null)), s.line, s.col); }
+      Assign(target, op, rhs): {
+        Ty? slot = null;
+        match (target.kind) {
+          LField(base, fnameTok): { slot = slotBySuffix(h, "@f:", "." + synthTextAt(w.src, w.lexed, fnameTok) + "|"); }
+          default: { }
+        }
+        s2 = Stmt(StmtKind.Assign(target, op, hoistE(h, rhs, slot)), s.line, s.col);
+      }
+      Return(value): {
+        if (value is not null) { s2 = Stmt(StmtKind.Return(hoistE(h, value!, w.ret[0])), s.line, s.col); }
+      }
+      default: { }
+    }
+    for (i32 k = 0; k < h.pre.len() && n < out.len(); k++) { out[n] = h.pre[k]; n = n + 1; }
+    if (n < out.len()) { out[n] = s2; n = n + 1; }
+  }
+  Stmt[] exact = Stmt[].filled(n, body[0]);
+  for (i32 i = 0; i < n; i++) { exact[i] = out[i]; }
+  return exact;
+}
+
+/** One statement's hoisting: the declarations to put before it. */
+struct Hoist {
+  Lw w;
+  Stmt[] pre;
+  i32 line;
+  i32 col;
+}
+
+/** `e` with each `async` lambda in a slot of known type replaced by a name declared in `h.pre`. `slot` is `e`'s own. */
+Expr hoistE(Hoist h, Expr e, Ty? slot) {
+  Lw w = h.w;
+  match (e.kind) {
+    Lambda(lps, lbody, la): {
+      if (!la || slot is null) { return e; }
+      Ty? tick = slotTicketTy(w.src, w.lexed, slot!);
+      if (tick is null) { return e; }
+      Ctx c = Ctx(w.first, w.ups, w.args, e.line, e.col, string[](), w.src, w.lexed,
+                  i32[].filled(1, e.col), bool[].filled(1, false), i32[].filled(1, 0), Ty?[].defaulted(3), CopyMode.create(w.next), "");
+      i32 k = w.next[0];
+      w.next[0] = k + 1;
+      i32 nm = tAw(c, k);
+      Ty[] pts = Ty[].filled(lps.len(), tick!);
+      for (i32 i = 0; i < lps.len(); i++) { pts[i] = cloneTy(lps[i].type); }
+      Ty ft = lowFnTy(c, lowTicketTy(c, tick!), pts);
+      h.pre = withS(h.pre, Stmt(StmtKind.Var(ft, nm, e, false), h.line, h.col));
+      return Expr(ExprKind.Ident(nm), e.line, e.col);
+    }
+    Construct(ctype, args, named): {
+      string cn = "";
+      match (ctype.kind) {
+        Named(tok, targs): { if (targs.len() == 0) { cn = synthTextAt(w.src, w.lexed, tok); } }
+        default: { }
+      }
+      Expr[] a2 = Expr[].filled(args.len(), e);
+      for (i32 i = 0; i < args.len(); i++) {
+        Ty? st = cn == "" ? null : slotByKey(h, "@p:" + cn + "#" + slotDecimal(i));
+        if (st is null && cn != "") { st = slotByKey(h, "@c:" + cn + "#" + slotDecimal(i)); }
+        a2[i] = hoistE(h, args[i], st);
+      }
+      NamedArg[] n2 = NamedArg[].filled(named.len(), named.len() > 0 ? named[0] : NamedArg(0 - 1, e));
+      for (i32 i = 0; i < named.len(); i++) {
+        Ty? st = cn == "" ? null : slotByKey(h, "@f:" + cn + "." + synthTextAt(w.src, w.lexed, named[i].nameTok));
+        n2[i] = NamedArg(named[i].nameTok, hoistE(h, named[i].value, st));
+      }
+      return Expr(ExprKind.Construct(ctype, a2, n2), e.line, e.col);
+    }
+    Call(callee, args, targs): {
+      string mn = "";
+      match (callee.kind) {
+        Member(obj, mtok): { mn = synthTextAt(w.src, w.lexed, mtok); }
+        default: { }
+      }
+      Expr[] a2 = Expr[].filled(args.len(), e);
+      for (i32 i = 0; i < args.len(); i++) {
+        Ty? st = mn == "" ? null : slotBySuffix(h, "@p:", "." + mn + "#" + slotDecimal(i) + "|");
+        a2[i] = hoistE(h, args[i], st);
+      }
+      return Expr(ExprKind.Call(hoistE(h, callee, null), a2, targs), e.line, e.col);
+    }
+    Member(obj, nameTok): { return Expr(ExprKind.Member(hoistE(h, obj, null), nameTok), e.line, e.col); }
+    Unwrap(inner): { return Expr(ExprKind.Unwrap(hoistE(h, inner, null)), e.line, e.col); }
+    Binary(op, left, right): { return Expr(ExprKind.Binary(op, hoistE(h, left, null), hoistE(h, right, null)), e.line, e.col); }
+    Unary(op, operand): { return Expr(ExprKind.Unary(op, hoistE(h, operand, null)), e.line, e.col); }
+    // A branch's lambda is made before the condition is asked — making one runs nothing, so it is not observed.
+    Ternary(cond, then, els): {
+      return Expr(ExprKind.Ternary(hoistE(h, cond, null), hoistE(h, then, slot), hoistE(h, els, slot)), e.line, e.col);
+    }
+    Index(arr, index): { return Expr(ExprKind.Index(hoistE(h, arr, null), hoistE(h, index, null)), e.line, e.col); }
+    default: { return e; }
+  }
+}
+
+Stmt[] withS(Stmt[] xs, Stmt s) {
+  Stmt[] out = Stmt[].filled(xs.len() + 1, s);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+/** A context enough to rebuild a type `Lw.sigs` records, at `h`'s position. */
+Rz hoistRz(Hoist h) {
+  Lw w = h.w;
+  Ctx c0 = Ctx(w.first, w.ups, w.args, h.line, h.col, string[](), w.src, w.lexed,
+               i32[].filled(1, h.col), bool[].filled(1, false), i32[].filled(1, 0), Ty?[].defaulted(3), CopyMode.create(w.next), "");
+  return Rz(c0, Param[](), Stmt[](), w.prog, 0 - 1, w.next, string[].filled(1, ""), w.sigs, string[]());
+}
+
+/** The slot `key` names, rebuilt here; null when no file declares one of a ticket-answering function type. */
+Ty? slotByKey(Hoist h, string key) {
+  if (h.w.sigs.indexOf(key + "|") < 0) { return null; }
+  return sigTy(hoistRz(h), key);
+}
+
+/**
+ * The slot whose key starts `prefix` and ends `tail` — a method's parameter or a field, named without its owner,
+ * since this pass does not know a receiver's type — when every such slot the program declares is spelled alike.
+ */
+Ty? slotBySuffix(Hoist h, string prefix, string tail) {
+  string sigs = h.w.sigs;
+  string key = "";
+  string text = "";
+  i32 from = 0;
+  while (from < sigs.len()) {
+    i32 nl = sigs.slice(from, sigs.len()).indexOf("\n");
+    i32 end = nl < 0 ? sigs.len() : from + nl;
+    string line = sigs.slice(from, end);
+    from = end + 1;
+    if (line.len() <= prefix.len() || line.slice(0, prefix.len()) != prefix) { continue; }
+    i32 bar = line.indexOf("|");
+    if (bar < 0) { continue; }
+    string head = line.slice(0, bar + 1);
+    if (head.len() < tail.len() || head.slice(head.len() - tail.len(), head.len()) != tail) { continue; }
+    string t = line.slice(bar + 1, line.len());
+    if (key == "") { key = line.slice(0, bar); text = t; }
+    else if (t != text) { return null; }
+  }
+  if (key == "") { return null; }
+  return sigTy(hoistRz(h), key);
+}
+
+Stmt[] lowerLambdasIn(Lw w, Stmt[] body0, i32 selfTok) {
+  Stmt[] body = hoistAsyncLambdas(w, body0);
   if (body.len() == 0) { return body; }
   Stmt[] out = Stmt[].filled(body.len(), body[0]);
   for (i32 i = 0; i < body.len(); i++) {
@@ -3828,6 +4075,7 @@ Method[] loweredMethods(Lw w, Decl at) {
     Method me = ms[m];
     Ctx c = Ctx(w.first, w.ups, w.args, at.line, at.col, string[](), w.src, w.lexed,
                 i32[].filled(1, 0), bool[].filled(1, false), i32[].filled(1, 0), Ty?[].defaulted(3), CopyMode.create(w.next), "");
+    w.ret[0] = me.returnType;
     Stmt[] body2 = coRewrite(c, lowerLambdasIn(w, me.body, self));
     if (!isMachineDecl(w.src, w.lexed, me.returnType, me.isAsync)) {
       out[n] = Method(me.nameTok, me.returnType, me.params, body2, me.isOverride, me.overrideTok,
@@ -3903,7 +4151,8 @@ Lowered lowerSized(Program prog, u8[] src, Lexed lexed, string sigs, i32 ups, i3
   Tail tl = appendWords(srcA, lexedA, "// wac:co-synth ", joinWords(coWords(prog, src, lexed), sigWords(sigs)));
   u8[] src2 = tl.src;
   Lexed lexed2 = tl.lexed;
-  Lw w = Lw(first, ups, args, src2, lexed2, prog, i32[].filled(1, 0), string[].filled(1, ""), sigs, i32[].filled(1, 0));
+  Lw w = Lw(first, ups, args, src2, lexed2, prog, i32[].filled(1, 0), string[].filled(1, ""), sigs, i32[].filled(1, 0),
+            Ty?[].defaulted(1));
 
   // A machine function becomes two: the function calling its coroutine form, where it was, and the
   // form itself after every declaration the file wrote — whose count is how the emitter tells the
@@ -3922,6 +4171,7 @@ Lowered lowerSized(Program prog, u8[] src, Lexed lexed, string sigs, i32 ups, i3
         // **Lambdas first.** An `async` function's own machine substitutes its hoisted names into
         // everything its body contains, lambdas included — so a lambda lowered beforehand is
         // ordinary code by the time that walk reaches it.
+        w.ret[0] = returnType;
         Stmt[] body2 = coRewrite(c, lowerLambdasIn(w, body, 0 - 1));
         if (!isMachineDecl(src2, lexed2, returnType, isAsync)) {
           out[n - 1] = Decl(DeclKind.Func(nameTok, returnType, params, body2, exported, typeParams,

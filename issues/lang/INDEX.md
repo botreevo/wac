@@ -5,8 +5,8 @@ has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0431d](open/0431d-two-private-generics-of-one-name-share-their-instances.md) | Two files each declaring a private `Box<T>` and instantiating it with their own `X`: one `Box<X>` instance is made for both, and the build refuses *a construction of Box<X> with 1 of 2 fields* | bug | emit failure |
-| [0430d](open/0430d-a-program-type-named-as-a-std-fault-breaks-stds-fault-unions.md) | A program type named `Denied`, `NotFound`, `Other` or another of `std`'s faults: the unions `std`'s `type` declarations build from them are spelled two ways and the module cannot be emitted | bug | emit failure |
+| [0438d](open/0438d-a-generic-call-named-only-inside-a-lambda-argument-is-not-instantiated.md) | A generic function called only in the bodies of lambdas handed to a constructor (`std`'s `RandomFile(…)` calling `hostAsk<U>`) is never instantiated: *a call to `hostAsk` … not in the program* | bug | emit failure |
+| [0436d](open/0436d-a-type-reached-only-through-std-has-no-members-to-the-checker.md) | `c.nowMillis().wait()` in a file that never imported `Ticket` has no type: the checker's reach over imported signatures skips `std`, so a `core` type `std` hands on has no members, and a mismatch after it passes the check and stops the build | bug | accepted program |
 | [0421c](open/0421c-a-static-method-through-a-verbatim-import-alias-is-not-found.md) | `import { P as @"$q" }` then `@"$q".make(1)` is *no such static method*, where `import { P as Q }` and `Q.make(1)` check; the verbatim alias resolves as a type but not as a static's receiver | bug | compile error |
 | [0420c](open/0420c-a-for-in-variable-in-an-async-function-collides-with-a-later-local-of-its-name.md) | `for (string g in given) { … await … }` followed by `i32[] g = …` in an `async` function gives a module the engine rejects; the index-loop form with a block-local `g` is fine | bug | invalid wasm |
 | [0419a](open/0419a-an-await-on-the-right-of-and-can-yield-the-wrong-value-under-load.md) | `bool fromOut = reading && (await Ticket.first(parts)) == 0;` in `sh`'s `drain` loop picked an unsettled ticket in 10 of 30 loaded runs; awaiting on its own line, never. No small reproduction yet | bug | wrong answer |
@@ -143,7 +143,7 @@ has been fixed and why.
 
 ## Closed
 
-349 issues, 272 closed.
+355 issues, 278 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

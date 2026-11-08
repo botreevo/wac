@@ -1,6 +1,6 @@
 # 0431d — two files' private generics of one name share their instances
 
-- **Status:** open
+- **Status:** closed 2026-11-08 (cloud) — `emit.wac`'s `genericTypeKey`, `genericTypeKeyFor`; `packages/wacc/test/wac/samegeneric_test.wac`
 - **Reported by:** cloud session, narrowing a report from wac-kps
 - **Date:** 2026-11-08
 - **Kind:** bug
@@ -35,3 +35,11 @@ An instance is named from its template's spelling and its arguments' spelling �
 (`Box@3<X@3>`) is what tells them apart. wac-kps met invalid wasm with two private `struct Outgoing`s in two packages
 (*struct.new expected type (ref null 204), found … (ref null 216)* in a coroutine), which may be this or a relative;
 the plain-struct shapes tried (held directly, in arrays, in a shared generic, across an await) all build.
+
+## Fix
+
+An instance of a generic struct or enum is named from its template's key — its name, or `name@file` when another file
+declares a generic type of that name too — as a generic function's instances already were (`genericFuncKey`). The
+walks that match an instance to its template compare that key, `genericOwner` records it, a template's own body
+reads its bare name as the instance being compiled when the key matches, and `writesNullableLetter` asks about a
+keyed template by its spelling. A program with no such clash is named exactly as before.

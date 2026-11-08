@@ -24,7 +24,7 @@ export type NodeNet = {
 };
 import { serveHostCalls } from "./respond.ts";
 import { nodeWorld } from "./node.ts";
-import { callMain, mainArgs, WacExit } from "./provider.ts";
+import { callMain, failureText, mainArgs, WacExit } from "./provider.ts";
 import type { AppModule, Grants } from "./entry.ts";
 
 /** Node's `worker_threads`, described rather than imported so this checks under Deno. */
@@ -146,7 +146,7 @@ export function runAsWorkerEntryNode(
     } catch (err) {
       if (cov !== undefined && fs !== undefined) dumpCoverageNode(app, cov, fs);
       if (err instanceof WacExit) { port.postMessage({ ok: true, code: err.code } as Result); return; }
-      port.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) } as Result);
+      port.postMessage({ ok: false, error: failureText(app, err) } as Result);
     }
   });
 }
@@ -161,8 +161,12 @@ export async function runLauncherNode(
     rm(p: string, o: { recursive: boolean; force: boolean }): Promise<void>;
     rename(from: string, to: string): Promise<void>;
     open(p: string, flags: string): Promise<{
-      read(b: Uint8Array, off: number, len: number): Promise<{ bytesRead: number }>;
-      write(b: Uint8Array): Promise<unknown>;
+      // `position` is the random-access read and write `openRandom` makes; left out, the file's own offset moves.
+      read(b: Uint8Array, off: number, len: number, position?: number): Promise<{ bytesRead: number }>;
+      write(b: Uint8Array, off?: number, len?: number, position?: number): Promise<{ bytesWritten: number }>;
+      stat(): Promise<{ size: number }>;
+      truncate(n: number): Promise<void>;
+      sync(): Promise<void>;
       close(): Promise<void>;
     }>;
     stat(

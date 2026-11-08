@@ -56,7 +56,7 @@ import {
 } from "./kinds.wac";
 import {
   Arm, Decl, DeclKind, Expr, ExprKind, Field, JsxAttr, Lvalue, LvalueKind, Method, NamedArg, Param, Program,
-  Pattern, Stmt, StmtKind, Ty, TyKind, tyPrim, TupleBinding, safeCallReceiver, safeCallName,
+  Pattern, Stmt, StmtKind, Ty, TyKind, tyPrim, TupleBinding, safeCallReceiver, safeCallName, lvalueExpr,
 } from "./ast.wac";
 
 /** A returned value whose type cannot be the declared one. */
@@ -223,6 +223,7 @@ export i32 errUndefinedType() { return 57; }
 export i32 warnNeverNull() { return 200; }
 export i32 warnNeverThat() { return 201; }
 export i32 warnAlwaysTraps() { return 202; }
+export i32 warnLoopCapture() { return 204; }
 /** A `match` that leaves one of the enum's variants uncovered and has no `else`. */
 export i32 errMatchInexhaustive() { return 58; }
 /** Two arms of one `match` naming the same variant. */
@@ -9932,14 +9933,22 @@ void checkGenericInference(C c, i32 at, string name, Expr[] args, Expr call) {
     // stands in.
     i32 line = call.line;
     i32 col = call.col;
+    string why = "nothing in the call says what " + names[t] + " is";
     for (i32 i = 0; i < args.len() && i < c.funcParamCount[at]; i++) {
-      if (!mentionsTypeParam(c.funcParamTypes[c.funcParamAt[at] + i], names[t])) { continue; }
+      string pt = c.funcParamTypes[c.funcParamAt[at] + i];
+      if (!mentionsTypeParam(pt, names[t])) { continue; }
       line = args[i].line;
       col = args[i].col;
+      // **An argument with a type, of the wrong shape**, is the usual reason, and saying so names the fix:
+      // `flatten(r)` with `r` a plain `Result` is no `Result<Result<A, X>, Y>` (wac-sqlite).
+      string at0 = foundType(c, args[i]);
+      if (at0 != typeNone() && at0 != "" && litKindOf(args[i]) == litNone()) {
+        why = "the argument is " + at0 + ", which is not the " + pt + " this parameter takes, so nothing says what "
+            + names[t] + " is";
+      }
       break;
     }
-    c.reportWith(errInferType(), line, col,
-                 "nothing in the call says what " + names[t] + " is");
+    c.reportWith(errInferType(), line, col, why);
     return;
   }
   // Every letter bound, outside any template: an instantiation whose body is checked again.
@@ -14026,6 +14035,15 @@ void checkStmtOnly(C c, Stmt s, Ty want) {
       c.loopDepth = c.loopDepth - 1;
     }
     For(init, cond, update, body): {
+      // **A lambda capturing the loop's variable** sees it change: capture is by reference, and the variable is one
+      // for the whole loop, so every lambda made here reads its last value — the `place(d)` trap in a markup loop.
+      // Said, not refused: it is what the language means (wac-sudoku).
+      if (init is not null && update is not null) {
+        match (init!.kind) {
+          Var(ltype, lnameTok, linit, lconst): { warnLoopCaptures(c, body, tokenText(c, lnameTok)); }
+          default: { }
+        }
+      }
       // The init and update are statements, and were declared but never checked — a `for` whose
       // initialiser is wrong said nothing. The reachability grid found it: `For` passed on its body
       // and failed on its init, which is exactly the shape of a walk that descends one field and not
@@ -14184,6 +14202,12 @@ void checkStmtOnly(C c, Stmt s, Ty want) {
       c.switchDepth = c.switchDepth - 1;
     }
     Match(subject, arms): {
+      // **The subject is an expression and is checked as one** — the expression form did this and the statement
+      // form did not, so `match (flatten(r)) { … }` over a plain `Result` passed with a call that cannot be typed,
+      // and the emitter declined the module (wac-sqlite). Nothing is expected of it: the arms ask about it.
+      c.expected = typeNone();
+      c.expectedUnknown = false;
+      checkExpr(c, subject);
       checkArmVariants(c, subject, arms, s.line, s.col);
       for (i32 i = 0; i < arms.len(); i++) {
         // **An arm narrows the subject**, exactly as `if (s is Circle)` does — `Circle:` is the
@@ -16181,4 +16205,133 @@ string arrLitType(C c, Expr[] elements) {
 bool primWithoutDefault(string t) {
   return t == "i8" || t == "u8" || t == "i16" || t == "u16" || t == "i32" || t == "u32"
       || t == "i64" || t == "u64" || t == "f32" || t == "f64" || t == "bool";
+}
+
+// ── A lambda that captures a `for` loop's variable (warning 204) ────────────────────────────────────────
+
+/** Warn at each lambda in `body` that reads `name` — the loop variable — and does not bind a `name` of its own. */
+void warnLoopCaptures(C c, Stmt[] body, string name) {
+  for (i32 i = 0; i < body.len(); i++) { lcStmt(c, body[i], name); }
+}
+
+void lcStmt(C c, Stmt s, string name) {
+  match (s.kind) {
+    Var(type, nameTok, init, isConst): { if (init is not null) { lcExpr(c, init!, name); } }
+    ExprStmt(expr): { lcExpr(c, expr, name); }
+    Assign(target, op, rhs): { lcExpr(c, rhs, name); }
+    Return(value): { if (value is not null) { lcExpr(c, value!, name); } }
+    If(cond, then, els): { lcExpr(c, cond, name); warnLoopCaptures(c, then, name); warnLoopCaptures(c, els, name); }
+    While(cond, body): { warnLoopCaptures(c, body, name); }
+    DoWhile(body, cond): { warnLoopCaptures(c, body, name); }
+    Block(body): { warnLoopCaptures(c, body, name); }
+    For(init, cond, update, body): { warnLoopCaptures(c, body, name); }
+    ForIn(type, nameTok, iterable, body): { warnLoopCaptures(c, body, name); }
+    Match(subject, arms): { for (i32 i = 0; i < arms.len(); i++) { warnLoopCaptures(c, arms[i].body, name); } }
+    Switch(subject, cases): { for (i32 i = 0; i < cases.len(); i++) { warnLoopCaptures(c, cases[i].body, name); } }
+    default: { }
+  }
+}
+
+void lcExpr(C c, Expr e, string name) {
+  match (e.kind) {
+    Lambda(params, body, isAsync): {
+      for (i32 i = 0; i < params.len(); i++) { if (tokenText(c, params[i].nameTok) == name) { return; } }
+      if (readsInStmts(c, body, name)) {
+        c.warn(warnLoopCapture(), e.line, e.col);
+        return;
+      }
+      warnLoopCaptures(c, body, name);
+    }
+    Call(callee, args, targs): { lcExpr(c, callee, name); for (i32 i = 0; i < args.len(); i++) { lcExpr(c, args[i], name); } }
+    Construct(ctype, args, named): {
+      for (i32 i = 0; i < args.len(); i++) { lcExpr(c, args[i], name); }
+      for (i32 i = 0; i < named.len(); i++) { lcExpr(c, named[i].value, name); }
+    }
+    Jsx(tagTok, closeTok, attrs, kids): {
+      for (i32 i = 0; i < attrs.len(); i++) { lcExpr(c, attrs[i].value, name); }
+      for (i32 i = 0; i < kids.len(); i++) { lcExpr(c, kids[i], name); }
+    }
+    Binary(op, left, right): { lcExpr(c, left, name); lcExpr(c, right, name); }
+    Ternary(cond, then, els): { lcExpr(c, cond, name); lcExpr(c, then, name); lcExpr(c, els, name); }
+    Member(obj, nameTok): { lcExpr(c, obj, name); }
+    Index(arr, index): { lcExpr(c, arr, name); lcExpr(c, index, name); }
+    Unwrap(inner): { lcExpr(c, inner, name); }
+    ArrLit(elements): { for (i32 i = 0; i < elements.len(); i++) { lcExpr(c, elements[i], name); } }
+    default: { }
+  }
+}
+
+/** Whether `body` reads `name` anywhere a reader would see it — a nested lambda's reads count. */
+bool readsInStmts(C c, Stmt[] body, string name) {
+  for (i32 i = 0; i < body.len(); i++) {
+    match (body[i].kind) {
+      Var(type, nameTok, init, isConst): {
+        if (init is not null && readsIn(c, init!, name)) { return true; }
+        if (tokenText(c, nameTok) == name) { return false; }
+      }
+      ExprStmt(expr): { if (readsIn(c, expr, name)) { return true; } }
+      Assign(target, op, rhs): {
+        if (readsIn(c, rhs, name)) { return true; }
+        if (readsIn(c, lvalueExpr(target), name)) { return true; }
+      }
+      Return(value): { if (value is not null && readsIn(c, value!, name)) { return true; } }
+      If(cond, then, els): { if (readsIn(c, cond, name) || readsInStmts(c, then, name) || readsInStmts(c, els, name)) { return true; } }
+      While(cond, body): { if (readsIn(c, cond, name) || readsInStmts(c, body, name)) { return true; } }
+      Block(body): { if (readsInStmts(c, body, name)) { return true; } }
+      For(init, cond, update, body): { if (readsInStmts(c, body, name)) { return true; } }
+      ForIn(type, nameTok, iterable, body): { if (readsIn(c, iterable, name) || readsInStmts(c, body, name)) { return true; } }
+      Match(subject, arms): {
+        if (readsIn(c, subject, name)) { return true; }
+        for (i32 a = 0; a < arms.len(); a++) { if (readsInStmts(c, arms[a].body, name)) { return true; } }
+      }
+      default: { }
+    }
+  }
+  return false;
+}
+
+bool readsIn(C c, Expr e, string name) {
+  match (e.kind) {
+    Ident(tok): { return tokenText(c, tok) == name; }
+    Lambda(params, body, isAsync): {
+      for (i32 i = 0; i < params.len(); i++) { if (tokenText(c, params[i].nameTok) == name) { return false; } }
+      return readsInStmts(c, body, name);
+    }
+    Call(callee, args, targs): {
+      if (readsIn(c, callee, name)) { return true; }
+      for (i32 i = 0; i < args.len(); i++) { if (readsIn(c, args[i], name)) { return true; } }
+      return false;
+    }
+    Construct(ctype, args, named): {
+      match (ctype.kind) {
+        Named(tok, targs): { if (tokenText(c, tok) == name) { return true; } }
+        default: { }
+      }
+      for (i32 i = 0; i < args.len(); i++) { if (readsIn(c, args[i], name)) { return true; } }
+      for (i32 i = 0; i < named.len(); i++) { if (readsIn(c, named[i].value, name)) { return true; } }
+      return false;
+    }
+    Binary(op, left, right): { return readsIn(c, left, name) || readsIn(c, right, name); }
+    Unary(op, operand): { return readsIn(c, operand, name); }
+    Ternary(cond, then, els): { return readsIn(c, cond, name) || readsIn(c, then, name) || readsIn(c, els, name); }
+    Member(obj, nameTok): { return readsIn(c, obj, name); }
+    SafeMember(obj, nameTok): { return readsIn(c, obj, name); }
+    Index(arr, index): { return readsIn(c, arr, name) || readsIn(c, index, name); }
+    Unwrap(inner): { return readsIn(c, inner, name); }
+    Cast(op, operand, target): { return readsIn(c, operand, name); }
+    ArrLit(elements): {
+      for (i32 i = 0; i < elements.len(); i++) { if (readsIn(c, elements[i], name)) { return true; } }
+      return false;
+    }
+    TupleLit(elements): {
+      for (i32 i = 0; i < elements.len(); i++) { if (readsIn(c, elements[i], name)) { return true; } }
+      return false;
+    }
+    Jsx(tagTok, closeTok, attrs, kids): {
+      for (i32 i = 0; i < attrs.len(); i++) { if (readsIn(c, attrs[i].value, name)) { return true; } }
+      for (i32 i = 0; i < kids.len(); i++) { if (readsIn(c, kids[i], name)) { return true; } }
+      return false;
+    }
+    default: { return false; }
+  }
 }

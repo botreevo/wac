@@ -1,0 +1,297 @@
+// Pages of a database, read when wanted and changed in place, with the old contents kept until the
+// change is committed or undone.
+//
+// A pager holds a database's pages, numbered from 1 as the file numbers them. A memory database keeps
+// every page here; a file's pager reads a page the first time it is wanted, keeps it while there is
+// room, and keeps every page changed since the last commit until the commit writes it.
+//
+// **Every change can be undone.** The first time a transaction changes a page, the page as it was is
+// kept: a rollback puts those back, and a commit writes them to the rollback journal before any page of
+// the file is overwritten. A savepoint (which every statement is, as well as SAVEPOINT) keeps its own
+// copies the same way, so rolling back to it restores exactly the pages changed since it began.
+//
+// **Reads cannot fail here.** A page the file cannot give (a read error, or a page past the end) reads
+// as zeros, and the failure is recorded in `fault` for whoever runs the statement to report; the b-tree
+// code checks what it reads, so zeros come back as an empty page rather than a crash.
+
+import { Vec, Map, hashI64, i64Eq } from "core";
+import { be32, put32 } from "./bytes.wac";
+
+export struct PageSavepoint {
+  i64 count;                  // pages in the database when it began
+  Map<i64, u8[]> saved;       // each page changed since, as it was when it began
+}
+
+export struct Pager {
+  i32 pageSize;
+  Map<i64, u8[]> cache;
+  Map<i64, bool> dirty;
+  Vec<i64> loaded;            // pages in the order they were read, for choosing which to drop
+  i64 count;                  // pages in the database now
+  i64 stored;                 // pages the file (or the bytes opened) holds
+  u8[]? base;                 // a memory database's bytes as they were opened
+  fn<u8[]?(i64)>? source;     // a file's page reader: null when the page cannot be read
+  i32 limit = 2000;           // unchanged pages kept from a file
+  Vec<PageSavepoint> sps;     // sps[0], when present, is the transaction
+  i64 version = 0;            // advanced by every b-tree change, so a cursor knows to find its place again
+  string? fault = null;
+
+  Pager memory(i32 pageSize) {
+    return Pager { pageSize: pageSize, cache: Map.create(hashI64, i64Eq), dirty: Map.create(hashI64, i64Eq),
+                   loaded: Vec.create(), count: 0, stored: 0, sps: Vec.create() };
+  }
+
+  // A memory database over bytes that hold a whole database image.
+  Pager fromBytes(i32 pageSize, u8[] data, i64 pages) {
+    Pager p = Pager.memory(pageSize);
+    p.base = data;
+    p.count = pages;
+    p.stored = pages;
+    return p;
+  }
+
+  // A file's pager: `read` answers a page's bytes, or null when they cannot be had.
+  Pager overFile(i32 pageSize, i64 pages, fn<u8[]?(i64)> read) {
+    Pager p = Pager.memory(pageSize);
+    p.source = read;
+    p.count = pages;
+    p.stored = pages;
+    return p;
+  }
+
+  bool isFile(const this) { return this.source is not null; }
+
+  void failed(this, string why) { if (this.fault is null) { this.fault = why; } }
+
+  // A page to read. Its bytes must not be changed: `write` gives the page to change.
+  u8[] page(this, i64 n) {
+    u8[]? hit = this.cache.get(n);
+    if (hit is not null) { return hit!; }
+    u8[] p = u8[].filled(this.pageSize, 0);
+    if (n < 1 || n > this.count) {
+      this.failed("page \{n} is past the end of the database");
+      return p;
+    }
+    if (n <= this.stored) {
+      if (this.base is not null) {
+        i32 at = ((n - 1) * (this.pageSize as i64)) as! i32;
+        i32 avail = this.base!.len() - at;
+        if (avail > 0) { p.copyFrom(this.base!, at, 0, avail < this.pageSize ? avail : this.pageSize); }
+      } else if (this.source is not null) {
+        u8[]? got = this.source!(n);
+        if (got is null) { this.failed("cannot read page \{n}"); } else { p = got!; }
+      }
+    }
+    this.cache.set(n, p);
+    if (this.source is not null) {
+      this.loaded.push(n);
+      this.trim();
+    }
+    return p;
+  }
+
+  // Drops unchanged pages read longest ago while more than `limit` are kept.
+  void trim(this) {
+    if (this.loaded.len() <= this.limit * 2) { return; }
+    Vec<i64> keep;
+    i32 extra = this.cache.len() - this.limit;
+    for (i32 i = 0; i < this.loaded.len(); i++) {
+      i64 n = this.loaded.get(i);
+      if (extra > 0 && !this.dirty.has(n) && this.cache.has(n) && i < this.loaded.len() - this.limit) {
+        this.cache.remove(n);
+        extra--;
+      } else if (this.cache.has(n) && !this.dirty.has(n)) {
+        keep.push(n);
+      }
+    }
+    this.loaded = keep;
+  }
+
+  // A page to change: its old contents are kept for each open savepoint first.
+  u8[] write(this, i64 n) {
+    u8[] p = this.page(n);
+    if (this.sps.len() == 0) { this.sps.push(PageSavepoint(this.count, Map.create(hashI64, i64Eq))); }
+    u8[]? copy = null;
+    for (i32 i = 0; i < this.sps.len(); i++) {
+      PageSavepoint sp = this.sps.get(i);
+      if (n <= sp.count && !sp.saved.has(n)) {
+        if (copy is null) {
+          u8[] c = u8[].filled(this.pageSize, 0);
+          c.copyFrom(p, 0, 0, this.pageSize);
+          copy = c;
+        }
+        sp.saved.set(n, copy!);
+      }
+    }
+    this.dirty.set(n, true);
+    return p;
+  }
+
+  // ── transactions ──
+
+  bool inTransaction(const this) { return this.sps.len() > 0; }
+
+  // Opens a savepoint, the transaction itself when none is open, and answers its depth.
+  i32 savepoint(this) {
+    this.sps.push(PageSavepoint(this.count, Map.create(hashI64, i64Eq)));
+    return this.sps.len() - 1;
+  }
+
+  // Puts every page back as it was when savepoint `depth` began; it stays open.
+  void rollbackTo(this, i32 depth) {
+    if (depth >= this.sps.len()) { return; }
+    PageSavepoint sp = this.sps.get(depth);
+    i64[] ns = sp.saved.keys();
+    for (i64 n in ns) {
+      u8[] c = u8[].filled(this.pageSize, 0);
+      c.copyFrom(sp.saved.get(n)!, 0, 0, this.pageSize);
+      this.cache.set(n, c);
+    }
+    // Pages added since are gone.
+    i64[] cached = this.cache.keys();
+    for (i64 n in cached) {
+      if (n > sp.count) { this.cache.remove(n); this.dirty.remove(n); }
+    }
+    this.count = sp.count;
+    // The savepoints inside it end; it starts again from here.
+    while (this.sps.len() > depth + 1) { this.sps.pop(); }
+    if (depth == 0) {
+      // The whole transaction undone: what is cached is the file's own content again.
+      for (i64 n in ns) { if (n <= this.stored) { this.dirty.remove(n); } }
+      if (this.base is null && this.source is null) {
+        // A memory database has nowhere else to read a page from: everything it holds stays.
+      }
+    }
+    sp.saved = Map.create(hashI64, i64Eq);
+    this.version++;
+  }
+
+  // Ends savepoint `depth` and those inside it, keeping their changes.
+  void release(this, i32 depth) {
+    if (depth == 0) { this.sps.clear(); return; }
+    while (this.sps.len() > depth) { this.sps.pop(); }
+  }
+
+  // The pages a commit must write, in order.
+  i64[] changed(this) {
+    i64[] ns = this.dirty.keys();
+    sortI64(ns);
+    return ns;
+  }
+
+  // The pages as they were when the transaction began, for the journal: only those the file holds.
+  i64[] originals(this) {
+    if (this.sps.len() == 0) { return i64[](); }
+    i64[] ns = this.sps.get(0).saved.keys();
+    Vec<i64> out;
+    for (i64 n in ns) { if (n <= this.stored) { out.push(n); } }
+    i64[] arr = out.toArray();
+    sortI64(arr);
+    return arr;
+  }
+
+  u8[] original(this, i64 n) { return this.sps.get(0).saved.get(n)!; }
+
+  // The transaction's changes are now the database's own.
+  void committed(this) {
+    this.sps.clear();
+    if (this.source is not null) {
+      i64[] ns = this.dirty.keys();
+      for (i64 n in ns) { this.loaded.push(n); }
+      this.dirty.clear();
+      this.stored = this.count;
+      this.trim();
+    } else {
+      this.dirty.clear();
+    }
+  }
+
+  // ── allocation ──
+
+  // A page for new use: from the freelist when it has one, otherwise one more at the end. Its contents
+  // are whatever they were; the caller writes all of it.
+  i64 allocate(this) {
+    u8[] p1 = this.page(1);
+    i64 trunk = be32(p1, 32);
+    if (trunk != 0 && trunk <= this.count) {
+      u8[] t = this.write(trunk);
+      i64 leaves = be32(t, 4);
+      u8[] h = this.write(1);
+      put32(h, 36, be32(h, 36) - 1);
+      if (leaves > 0 && leaves <= ((this.pageSize / 4) - 2) as i64) {
+        i64 n = be32(t, 8 + 4 * (leaves - 1) as! i32);
+        put32(t, 4, leaves - 1);
+        if (n >= 2 && n <= this.count) {
+          u8[] w = this.write(n);
+          for (i32 i = 0; i < this.pageSize; i++) { w[i] = 0; }
+          return n;
+        }
+        this.failed("freelist names page \{n}");
+      }
+      // The trunk itself is the page.
+      put32(h, 32, be32(t, 0));
+      for (i32 i = 0; i < this.pageSize; i++) { t[i] = 0; }
+      return trunk;
+    }
+    this.count++;
+    i64 n = this.count;
+    u8[] fresh = u8[].filled(this.pageSize, 0);
+    this.cache.set(n, fresh);
+    this.dirty.set(n, true);
+    return n;
+  }
+
+  // Puts a page on the freelist.
+  void free(this, i64 n) {
+    if (n < 2 || n > this.count) { return; }
+    u8[] h = this.write(1);
+    i64 trunk = be32(h, 32);
+    put32(h, 36, be32(h, 36) + 1);
+    // As SQLite does, a trunk takes no more leaves than an old reader can follow.
+    i64 most = ((this.pageSize / 4) - 8) as i64;
+    if (trunk != 0 && trunk <= this.count) {
+      u8[] t = this.write(trunk);
+      i64 leaves = be32(t, 4);
+      if (leaves < most) {
+        put32(t, 8 + 4 * leaves as! i32, n);
+        put32(t, 4, leaves + 1);
+        return;
+      }
+    }
+    u8[] p = this.write(n);
+    for (i32 i = 0; i < this.pageSize; i++) { p[i] = 0; }
+    put32(p, 0, trunk);
+    put32(h, 32, n);
+  }
+
+  i64 freeCount(this) { return be32(this.page(1), 36); }
+}
+
+// Sorts page numbers, ascending.
+export void sortI64(i64[] a) {
+  if (a.len() < 2) { return; }
+  i64[] tmp = i64[].filled(a.len(), 0);
+  i32 width = 1;
+  i64[] src = a;
+  i64[] dst = tmp;
+  while (width < a.len()) {
+    for (i32 lo = 0; lo < a.len(); lo += 2 * width) {
+      i32 mid = lo + width < a.len() ? lo + width : a.len();
+      i32 hi = lo + 2 * width < a.len() ? lo + 2 * width : a.len();
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) {
+        if (src[j] < src[i]) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        k++;
+      }
+      while (i < mid) { dst[k] = src[i]; i++; k++; }
+      while (j < hi) { dst[k] = src[j]; j++; k++; }
+    }
+    i64[] sw = src;
+    src = dst;
+    dst = sw;
+    width *= 2;
+  }
+  if (src is not a) { a.copyFrom(src, 0, 0, a.len()); }
+}

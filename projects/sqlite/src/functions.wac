@@ -9,7 +9,8 @@ import { Value, compareValues } from "./value.wac";
 import { textOf, toNumeric, toInt, toReal, isNull, typeName, exactInt, wholeNumber, intPrefix } from "./ops.wac";
 import { formatReal, hexOf } from "./format.wac";
 import { lower, upper } from "./lexer.wac";
-import { Json, parseJson, jsonText, jsonOf, sqlOf, parsePath, lookup, setPath, removePath, Step, jsonType, escape, extractFast, writeJson } from "./json.wac";
+import { Json, parseJson, jsonText, jsonOf, sqlOf, parsePath, lookup, setPath, removePath, Step, jsonType, escape, extractFast, writeJson,
+         toJsonb, fromJsonb, jsonErrorPosition, mergePatch, jsonValidity } from "./json.wac";
 import { hexDigit } from "./parser.wac";
 
 // Codepoints of UTF-8 text, for the functions that count characters rather than bytes.
@@ -136,6 +137,11 @@ export bool knownFunction(string name, i32 n) {
   if (name == "unistr" || name == "sqlite_compileoption_used" || name == "sqlite_compileoption_get") { return n == 1; }
   if (name == "sqlite_source_id") { return n == 0; }
   if (name == "json_pretty") { return n == 1 || n == 2; }
+  if (name == "jsonb" || name == "json_quote" || name == "json_error_position") { return n == 1; }
+  if (name == "json_patch" || name == "jsonb_patch") { return n == 2; }
+  if (name == "jsonb_array" || name == "jsonb_object") { return true; }
+  if (name == "jsonb_extract" || name == "jsonb_set" || name == "jsonb_insert" || name == "jsonb_replace") { return n >= 2; }
+  if (name == "jsonb_remove") { return n >= 1; }
   if (name == "likelihood") { return n == 2; }
   if (name == "coalesce") { return n >= 2; }
   if (name == "max" || name == "min") { return n >= 1; }
@@ -149,7 +155,7 @@ export bool knownFunction(string name, i32 n) {
   if (name == "round") { return n == 1 || n == 2; }
   if (name == "trim" || name == "ltrim" || name == "rtrim") { return n == 1 || n == 2; }
   if (name == "replace") { return n == 3; }
-  if (name == "json" || name == "json_valid" || name == "json_type" || name == "json_array_length") { return n == 1 || (n == 2 && name != "json" && name != "json_valid"); }
+  if (name == "json" || name == "json_valid" || name == "json_type" || name == "json_array_length") { return n == 1 || (n == 2 && name != "json"); }
   if (name == "length" || name == "lower" || name == "upper" || name == "abs" || name == "typeof" ||
       name == "hex" || name == "unicode" || name == "quote" || name == "zeroblob" || name == "sign" ||
       name == "octet_length" || name == "unhex" || name == "randomblob") { return n == 1; }
@@ -175,7 +181,12 @@ Result<Json, SqlError> parseArg(const Value v) {
     }
     Int: { return Result.Ok(jsonOf(v)); }
     Real: { return Result.Ok(jsonOf(v)); }
-    Blob: { return Result.Err(SqlError("error", "JSON cannot hold BLOB values")); }
+    // A blob is JSONB, SQLite's binary JSON, or no JSON at all.
+    Blob(b): {
+      Json? j = fromJsonb(b);
+      if (j is null) { return Result.Err(malformed()); }
+      return Result.Ok(j!);
+    }
     Null: { return Result.Ok(Json.JNull); }
   }
 }
@@ -192,7 +203,14 @@ Result<Json, SqlError> asMember(const Value v, bool isJson) {
       default: {}
     }
   }
-  match (v) { Blob: { return Result.Err(SqlError("error", "JSON cannot hold BLOB values")); } default: {} }
+  match (v) {
+    Blob(b): {
+      Json? j = fromJsonb(b);
+      if (j is null) { return Result.Err(SqlError("error", "JSON cannot hold BLOB values")); }
+      return Result.Ok(j!);
+    }
+    default: {}
+  }
   return Result.Ok(jsonOf(v));
 }
 
@@ -443,6 +461,9 @@ Result<Value, SqlError> callNamed(string name, const Value[] a, FnEnv env) {
 }
 
 export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a, const bool[] isJson, FnEnv env) {
+  if (fid < 0 && (name.indexOf("jsonb") == 0 || name == "json_patch" || name == "json_quote" || name == "json_error_position")) {
+    return callJsonMore(name, a, isJson, env);
+  }
   if (fid < 0) { return callNamed(name, a, env); }
   if (fid == F_COALESCE || fid == F_IFNULL) {
     for (i32 i = 0; i < a.len(); i++) { if (!isNull(a[i])) { return Result.Ok(a[i] as Value); } }
@@ -689,7 +710,20 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
   // JSON.
   if (fid == F_JSON) { return Result.Ok(Value.Text(jsonText(try parseArg(a[0])))); }
   if (fid == F_JSON_VALID) {
-    match (a[0]) { Text(s): { return Result.Ok(Value.Int(parseJson(s) is null ? 0 : 1)); } default: { return Result.Ok(Value.Int(isNumber(a[0]) ? 1 : 0)); } }
+    // Flags: 1 RFC 8259 text, 2 JSON5 text, 4 JSONB at a glance, 8 JSONB checked through; 1 by default.
+    i64 flags = 1;
+    if (a.len() > 1) {
+      flags = match (a[1]) { Int(i): i, default: 0 as i64 };
+      if (flags < 1 || flags > 15) { return Result.Err(SqlError("error", "FLAGS parameter to json_valid() must be between 1 and 15")); }
+    }
+    match (a[0]) {
+      Text(s): {
+        i32 v = jsonValidity(s);
+        return Result.Ok(Value.Int(((flags & 1) != 0 && v == 1) || ((flags & 2) != 0 && v >= 1) ? 1 : 0));
+      }
+      Blob(b): { return Result.Ok(Value.Int((flags & 12) != 0 && fromJsonb(b) is not null ? 1 : 0)); }
+      default: { return Result.Ok(Value.Int((flags & 3) != 0 && isNumber(a[0]) ? 1 : 0)); }
+    }
   }
   if (fid == F_JSON_EXTRACT && a.len() == 2) {
     match (a[0]) {
@@ -759,7 +793,64 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
 // Calls whose result is JSON text, which json_set and friends insert as JSON rather than as a string.
 export bool returnsJson(string name) {
   return name == "json" || name == "json_object" || name == "json_array" || name == "json_set" ||
-         name == "json_insert" || name == "json_replace" || name == "json_remove" || name == "->";
+         name == "json_insert" || name == "json_replace" || name == "json_remove" || name == "->" ||
+         name == "json_patch" || name == "json_quote" || name == "json_pretty" || name == "json_group_array" ||
+         name == "json_group_object";
+}
+
+// json_patch, json_quote, json_error_position, and the JSONB forms of the JSON functions, which answer
+// a blob: each is its JSON form's answer, encoded.
+Result<Value, SqlError> callJsonMore(string name, const Value[] a, const bool[] isJson, FnEnv env) {
+  if (name == "json_error_position") {
+    match (a[0]) {
+      Null: { return Result.Ok(Value.Null); }
+      Blob(b): { return Result.Ok(Value.Int(fromJsonb(b) is null ? 1 : 0)); }
+      default: { return Result.Ok(Value.Int(jsonErrorPosition(textOf(a[0])))); }
+    }
+  }
+  if (name == "json_quote") {
+    match (a[0]) {
+      Null: { return Result.Ok(Value.Text("null")); }
+      Text(s): {
+        if (isJson[0]) { return Result.Ok(Value.Text(jsonText(try parseArg(a[0])))); }
+        return Result.Ok(Value.Text("\"" + escape(s) + "\""));
+      }
+      default: { return Result.Ok(Value.Text(jsonText(try asMember(a[0], false)))); }
+    }
+  }
+  if (name == "json_patch" || name == "jsonb_patch") {
+    if (isNull(a[0]) || isNull(a[1])) { return Result.Ok(Value.Null); }
+    Json r = mergePatch(try parseArg(a[0]), try parseArg(a[1]));
+    return Result.Ok(name == "json_patch" ? Value.Text(jsonText(r)) : Value.Blob(toJsonb(r)));
+  }
+  if (name == "jsonb") {
+    if (isNull(a[0])) { return Result.Ok(Value.Null); }
+    return Result.Ok(Value.Blob(toJsonb(try parseArg(a[0]))));
+  }
+  if (name == "jsonb_extract") {
+    if (isNull(a[0])) { return Result.Ok(Value.Null); }
+    Json root = try parseArg(a[0]);
+    if (a.len() == 2) {
+      Json? hit = lookup(root, try pathArg(a[1]));
+      if (hit is null) { return Result.Ok(Value.Null); }
+      // Containers come back as JSONB; a scalar as the SQL value it is.
+      return Result.Ok(match (hit!) { JArr: Value.Blob(toJsonb(hit!)), JObj: Value.Blob(toJsonb(hit!)), default: sqlOf(hit!) });
+    }
+    Vec<Json> items;
+    for (i32 i = 1; i < a.len(); i++) { items.push(lookup(root, try pathArg(a[i])) ?? Json.JNull); }
+    return Result.Ok(Value.Blob(toJsonb(Json.JArr(items))));
+  }
+  // jsonb_array, jsonb_object, jsonb_set, jsonb_insert, jsonb_replace, jsonb_remove.
+  string textName = "json" + name.slice(5, name.len());
+  Value r = try callScalar(textName, functionId(textName), a, isJson, env);
+  match (r) {
+    Text(t): {
+      Json? j = parseJson(t);
+      if (j is null) { return Result.Err(malformed()); }
+      return Result.Ok(Value.Blob(toJsonb(j!)));
+    }
+    default: { return Result.Ok(r); }
+  }
 }
 
 i32 hexVal(i32 c) {

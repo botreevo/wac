@@ -16,15 +16,69 @@ export enum Json {
   JObj(Vec<string> keys, Vec<Json> vals), // keys raw, as JStr
 }
 
+// SQLite reads JSON5 as well as JSON, as the JSON it means: comments, trailing commas, single-quoted
+// strings, unquoted keys, and the looser numbers, which become canonical JSON (hex as decimal, .5 as
+// 0.5, Infinity as 9e999). `json5` records that some was seen, which json_valid() distinguishes.
 struct JsonParser {
   u8[] b;
   i32 i;
   bool ok;
+  bool json5 = false;
 
   void ws(this) {
-    while (this.i < this.b.len() && (this.b[this.i] == ' ' || this.b[this.i] == '\t' || this.b[this.i] == '\n' || this.b[this.i] == '\r')) {
+    while (this.i < this.b.len()) {
+      u8 c = this.b[this.i];
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { this.i++; continue; }
+      i32 extra = this.json5Space();
+      if (extra > 0) { this.i += extra; this.json5 = true; continue; }
+      if (c == '/' && this.i + 1 < this.b.len() && this.b[this.i + 1] == '*') {
+        i32 end = this.i + 2;
+        while (end + 1 < this.b.len() && !(this.b[end] == '*' && this.b[end + 1] == '/')) { end++; }
+        if (end + 1 >= this.b.len()) { return; }
+        this.i = end + 2;
+        this.json5 = true;
+        continue;
+      }
+      if (c == '/' && this.i + 1 < this.b.len() && this.b[this.i + 1] == '/') {
+        while (this.i < this.b.len() && this.b[this.i] != '\n') { this.i++; }
+        this.json5 = true;
+        continue;
+      }
+      return;
+    }
+  }
+
+  // The length of JSON5's other whitespace at the cursor (vertical tab, form feed, the Unicode spaces),
+  // or 0.
+  i32 json5Space(this) {
+    u8 c = this.b[this.i];
+    if (c == 0x0b || c == 0x0c) { return 1; }
+    i32 n = this.b.len() - this.i;
+    if (c == 0xc2 && n > 1 && this.b[this.i + 1] == 0xa0) { return 2; }
+    if (n < 3) { return 0; }
+    u8 c1 = this.b[this.i + 1];
+    u8 c2 = this.b[this.i + 2];
+    if (c == 0xef && c1 == 0xbb && c2 == 0xbf) { return 3; }
+    if (c == 0xe1 && c1 == 0x9a && c2 == 0x80) { return 3; }
+    if (c == 0xe2 && c1 == 0x80 && ((c2 >= 0x80 && c2 <= 0x8a) || c2 == 0xa8 || c2 == 0xa9 || c2 == 0xaf)) { return 3; }
+    if (c == 0xe2 && c1 == 0x81 && c2 == 0x9f) { return 3; }
+    if (c == 0xe3 && c1 == 0x80 && c2 == 0x80) { return 3; }
+    return 0;
+  }
+
+  // An unquoted JSON5 key: letters, digits, '_' and '$', and anything beyond ASCII.
+  string? ident(this) {
+    i32 s = this.i;
+    while (this.i < this.b.len()) {
+      u8 c = this.b[this.i];
+      bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' || c >= 0x80 ||
+                (this.i > s && c >= '0' && c <= '9');
+      if (!ok) { break; }
       this.i++;
     }
+    if (this.i == s) { return null; }
+    this.json5 = true;
+    return string.fromBytes(sliceOf(this.b, s, this.i));
   }
 
   bool lit(this, string word) {
@@ -37,17 +91,43 @@ struct JsonParser {
 
   string? str(this) {
     // at the opening quote
+    u8 q = this.b[this.i];
+    if (q == '\'') { this.json5 = true; }
     this.i++;
     i32 s = this.i;
+    // Plain JSON passes through as written; JSON5 forms are rewritten into `out` as JSON.
+    Buf? out = null;
     while (this.i < this.b.len()) {
       u8 c = this.b[this.i];
-      if (c == '"') {
-        string raw = string.fromBytes(sliceOf(this.b, s, this.i));
+      if (c == q) {
+        string raw = out is null ? string.fromBytes(sliceOf(this.b, s, this.i)) : out!.toStr();
         this.i++;
         return raw;
       }
+      if (c == '"' || (c == '\\' && this.i + 1 < this.b.len() && this.json5Escape(this.b[this.i + 1]))) {
+        // From here on the text needs rewriting: a bare double quote inside single quotes, or a JSON5
+        // escape.
+        if (out is null) { out = Buf.create(); out!.pushBytes(this.b, s, this.i - s); }
+        if (c == '"') { out!.pushStr("\\\""); this.i++; continue; }
+        u8 e = this.b[this.i + 1];
+        this.json5 = true;
+        if (e == 'x') {
+          if (this.i + 3 >= this.b.len() || !isHexByte(this.b[this.i + 2]) || !isHexByte(this.b[this.i + 3])) { return null; }
+          out!.pushStr("\\u00");
+          out!.pushBytes(this.b, this.i + 2, 2);
+          this.i += 4;
+        } else if (e == '0') { out!.pushStr("\\u0000"); this.i += 2; }
+        else if (e == 'v') { out!.pushStr("\\u000b"); this.i += 2; }
+        else if (e == '\'') { out!.pushStr("'"); this.i += 2; }
+        else if (e == '\r') { this.i += this.i + 2 < this.b.len() && this.b[this.i + 2] == '\n' ? 3 : 2; }
+        else if (e == '\n') { this.i += 2; }
+        else { this.i += 4; }   // U+2028 or U+2029 after the backslash: a line continuation
+        continue;
+      }
+      if (out is not null && c != '\\') { out!.push(c); this.i++; continue; }
       if (c < 0x20) { return null; }
       if (c == '\\') {
+        i32 from = this.i;
         this.i++;
         if (this.i >= this.b.len()) { return null; }
         u8 e = this.b[this.i];
@@ -59,10 +139,19 @@ struct JsonParser {
         } else if (e != '"' && e != '\\' && e != '/' && e != 'b' && e != 'f' && e != 'n' && e != 'r' && e != 't') {
           return null;
         }
+        if (out is not null) { out!.pushBytes(this.b, from, this.i + 1 - from); }
       }
       this.i++;
     }
     return null;
+  }
+
+  // Whether `\` then `e` is an escape JSON5 has and JSON does not.
+  bool json5Escape(this, u8 e) {
+    if (e == 'x' || e == '0' || e == 'v' || e == '\'' || e == '\r' || e == '\n') { return true; }
+    // A backslash before U+2028 or U+2029 continues the line.
+    return e == 0xe2 && this.i + 3 < this.b.len() && this.b[this.i + 2] == 0x80 &&
+           (this.b[this.i + 3] == 0xa8 || this.b[this.i + 3] == 0xa9);
   }
 
   Json? value(this, i32 depth) {
@@ -78,8 +167,9 @@ struct JsonParser {
       if (this.i < this.b.len() && this.b[this.i] == '}') { this.i++; return Json.JObj(keys, vals); }
       while (true) {
         this.ws();
-        if (this.i >= this.b.len() || this.b[this.i] != '"') { return null; }
-        string? k = this.str();
+        if (this.i >= this.b.len()) { return null; }
+        u8 kc = this.b[this.i];
+        string? k = kc == '"' || kc == '\'' ? this.str() : this.ident();
         if (k is null) { return null; }
         this.ws();
         if (this.i >= this.b.len() || this.b[this.i] != ':') { return null; }
@@ -89,7 +179,13 @@ struct JsonParser {
         keys.push(k!);
         vals.push(v!);
         this.ws();
-        if (this.i < this.b.len() && this.b[this.i] == ',') { this.i++; continue; }
+        if (this.i < this.b.len() && this.b[this.i] == ',') {
+          this.i++;
+          // JSON5: one trailing comma.
+          this.ws();
+          if (this.i < this.b.len() && this.b[this.i] == '}') { this.i++; this.json5 = true; return Json.JObj(keys, vals); }
+          continue;
+        }
         if (this.i < this.b.len() && this.b[this.i] == '}') { this.i++; return Json.JObj(keys, vals); }
         return null;
       }
@@ -104,12 +200,17 @@ struct JsonParser {
         if (v is null) { return null; }
         items.push(v!);
         this.ws();
-        if (this.i < this.b.len() && this.b[this.i] == ',') { this.i++; continue; }
+        if (this.i < this.b.len() && this.b[this.i] == ',') {
+          this.i++;
+          this.ws();
+          if (this.i < this.b.len() && this.b[this.i] == ']') { this.i++; this.json5 = true; return Json.JArr(items); }
+          continue;
+        }
         if (this.i < this.b.len() && this.b[this.i] == ']') { this.i++; return Json.JArr(items); }
         return null;
       }
     }
-    if (c == '"') {
+    if (c == '"' || c == '\'') {
       string? s = this.str();
       return s is null ? null : Json.JStr(s!);
     }
@@ -117,7 +218,43 @@ struct JsonParser {
     if (this.lit("true")) { return Json.JTrue; }
     if (this.lit("false")) { return Json.JFalse; }
     i32 s = this.i;
-    if (this.i < this.b.len() && this.b[this.i] == '-') { this.i++; }
+    bool neg = false;
+    if (this.i < this.b.len() && (this.b[this.i] == '-' || this.b[this.i] == '+')) {
+      neg = this.b[this.i] == '-';
+      if (!neg) { this.json5 = true; }
+      this.i++;
+    }
+    string sign = neg ? "-" : "";
+    // JSON5's other numbers, written back as JSON.
+    if (this.lit("Infinity")) { this.json5 = true; return Json.JNum(sign + "9e999"); }
+    if (this.lit("NaN")) { this.json5 = true; return Json.JNull; }
+    if (this.i + 1 < this.b.len() && this.b[this.i] == '0' && (this.b[this.i + 1] == 'x' || this.b[this.i + 1] == 'X')) {
+      this.i += 2;
+      i32 h0 = this.i;
+      i64 v = 0;
+      bool over = false;
+      while (this.i < this.b.len() && isHexByte(this.b[this.i])) {
+        u8 hc = this.b[this.i];
+        i64 digit = hc <= '9' ? (hc - '0') as i64 : ((hc | 0x20) - 'a') as i64 + 10;
+        if (v > 0x7ffffffffffffff) { over = true; }
+        v = v * 16 + digit;
+        this.i++;
+      }
+      if (this.i == h0) { return null; }
+      this.json5 = true;
+      return Json.JNum(over ? sign + "9.0e999" : sign + "\{v}");
+    }
+    if (this.i < this.b.len() && this.b[this.i] == '.') {
+      // .5
+      i32 f0 = this.i + 1;
+      i32 f = f0;
+      while (f < this.b.len() && this.b[f] >= '0' && this.b[f] <= '9') { f++; }
+      if (f == f0) { return null; }
+      this.json5 = true;
+      this.i = f;
+      string frac = string.fromBytes(sliceOf(this.b, f0 - 1, f));
+      return Json.JNum(sign + "0" + frac + this.exponent());
+    }
     i32 d = this.i;
     while (this.i < this.b.len() && this.b[this.i] >= '0' && this.b[this.i] <= '9') { this.i++; }
     if (this.i == d) { return null; }
@@ -126,16 +263,29 @@ struct JsonParser {
       this.i++;
       i32 f = this.i;
       while (this.i < this.b.len() && this.b[this.i] >= '0' && this.b[this.i] <= '9') { this.i++; }
-      if (this.i == f) { return null; }
+      if (this.i == f) {
+        // 5. is 5.0
+        this.json5 = true;
+        string whole = string.fromBytes(sliceOf(this.b, d, this.i));
+        return Json.JNum(sign + whole + "0" + this.exponent());
+      }
     }
+    string mantissa = string.fromBytes(sliceOf(this.b, d, this.i));
+    return Json.JNum(sign + mantissa + this.exponent());
+  }
+
+  // A number's exponent, as written, or "" (null-free: a malformed one leaves the cursor before it).
+  string exponent(this) {
     if (this.i < this.b.len() && (this.b[this.i] == 'e' || this.b[this.i] == 'E')) {
+      i32 s = this.i;
       this.i++;
       if (this.i < this.b.len() && (this.b[this.i] == '+' || this.b[this.i] == '-')) { this.i++; }
       i32 f = this.i;
       while (this.i < this.b.len() && this.b[this.i] >= '0' && this.b[this.i] <= '9') { this.i++; }
-      if (this.i == f) { return null; }
+      if (this.i == f) { this.i = s; return ""; }
+      return string.fromBytes(sliceOf(this.b, s, this.i));
     }
-    return Json.JNum(string.fromBytes(sliceOf(this.b, s, this.i)));
+    return "";
   }
 }
 
@@ -148,7 +298,7 @@ u8[] sliceOf(const u8[] b, i32 s, i32 e) {
 }
 
 export Json? parseJson(string text) {
-  JsonParser p = JsonParser(text.toBytes(), 0, true);
+  JsonParser p = JsonParser(text.toBytes(), 0, true, false);
   Json? v = p.value(0);
   if (v is null) { return null; }
   p.ws();
@@ -618,4 +768,229 @@ export Value? extractFast(string text, const Step[] path) {
     return j is null ? null : Value.Text(jsonText(j!));
   }
   return numValue(string.fromBytes(sliceOf(b, i, e)));
+}
+
+// ── JSONB, SQLite's binary JSON ─────────────────────────────────────────────
+//
+// Each element is a header and a payload. The header's low four bits are the type; its high four the
+// payload's size when under 12, or (12, 13, 14, 15) that the size follows in 1, 2, 4 or 8 bytes. Numbers
+// and strings keep their JSON text as the payload; arrays hold their elements, objects their labels and
+// values in turn.
+
+static i32 JB_NULL = 0;
+static i32 JB_TRUE = 1;
+static i32 JB_FALSE = 2;
+static i32 JB_INT = 3;
+static i32 JB_INT5 = 4;
+static i32 JB_FLOAT = 5;
+static i32 JB_FLOAT5 = 6;
+static i32 JB_TEXT = 7;
+static i32 JB_TEXTJ = 8;
+static i32 JB_TEXT5 = 9;
+static i32 JB_TEXTRAW = 10;
+static i32 JB_ARRAY = 11;
+static i32 JB_OBJECT = 12;
+
+void jbHeader(Buf out, i32 type, i32 size) {
+  if (size <= 11) { out.push(((size << 4) | type) as@ u8); return; }
+  if (size <= 0xff) { out.push((0xc0 | type) as@ u8); out.push(size as@ u8); return; }
+  if (size <= 0xffff) {
+    out.push((0xd0 | type) as@ u8);
+    out.push((size >> 8) as@ u8);
+    out.push((size & 0xff) as@ u8);
+    return;
+  }
+  out.push((0xe0 | type) as@ u8);
+  out.push((size >> 24) as@ u8);
+  out.push(((size >> 16) & 0xff) as@ u8);
+  out.push(((size >> 8) & 0xff) as@ u8);
+  out.push((size & 0xff) as@ u8);
+}
+
+// A string's JSONB type: TEXT when its text needs no escapes, TEXTJ when it holds some.
+i32 textType(string raw) { return raw.indexOf("\\") >= 0 ? JB_TEXTJ : JB_TEXT; }
+
+export u8[] toJsonb(const Json j) {
+  Buf out = Buf.create();
+  jbWrite(out, j);
+  return out.take();
+}
+
+void jbWrite(Buf out, const Json j) {
+  match (j) {
+    JNull: { out.push(JB_NULL as@ u8); }
+    JTrue: { out.push(JB_TRUE as@ u8); }
+    JFalse: { out.push(JB_FALSE as@ u8); }
+    JNum(raw): {
+      u8[] b = raw.toBytes();
+      bool integral = raw.indexOf(".") < 0 && raw.indexOf("e") < 0 && raw.indexOf("E") < 0;
+      jbHeader(out, integral ? JB_INT : JB_FLOAT, b.len());
+      out.pushAll(b);
+    }
+    JStr(raw): {
+      u8[] b = raw.toBytes();
+      jbHeader(out, textType(raw), b.len());
+      out.pushAll(b);
+    }
+    JArr(items): {
+      Buf inner = Buf.create();
+      for (i32 i = 0; i < items.len(); i++) { jbWrite(inner, items.get(i)); }
+      u8[] body = inner.take();
+      jbHeader(out, JB_ARRAY, body.len());
+      out.pushAll(body);
+    }
+    JObj(keys, vals): {
+      Buf inner = Buf.create();
+      for (i32 i = 0; i < keys.len(); i++) {
+        u8[] k = keys.get(i).toBytes();
+        jbHeader(inner, textType(keys.get(i)), k.len());
+        inner.pushAll(k);
+        jbWrite(inner, vals.get(i));
+      }
+      u8[] body = inner.take();
+      jbHeader(out, JB_OBJECT, body.len());
+      out.pushAll(body);
+    }
+  }
+}
+
+// A JSONB blob as a value, or null when it is not one: every element's header and size must hold, and
+// the elements must fill the blob exactly.
+export Json? fromJsonb(u8[] b) {
+  if (b.len() == 0) { return null; }
+  JbReader r = JbReader(b, 0);
+  Json? v = r.element(b.len(), 0);
+  if (v is null || r.at != b.len()) { return null; }
+  return v;
+}
+
+struct JbReader {
+  u8[] b;
+  i32 at;
+
+  Json? element(this, i32 end, i32 depth) {
+    if (depth > 1000 || this.at >= end) { return null; }
+    i32 h = this.b[this.at] as i32;
+    i32 type = h & 0x0f;
+    i32 sz = h >> 4;
+    i32 p = this.at + 1;
+    if (sz >= 12) {
+      i32 n = sz == 12 ? 1 : (sz == 13 ? 2 : (sz == 14 ? 4 : 8));
+      if (p + n > end || n == 8) { return null; }
+      sz = 0;
+      for (i32 k = 0; k < n; k++) { sz = (sz << 8) | (this.b[p + k] as i32); }
+      p += n;
+    }
+    if (sz < 0 || p + sz > end) { return null; }
+    i32 stop = p + sz;
+    this.at = stop;
+    if (type <= JB_FALSE) {
+      if (sz != 0) { return null; }
+      return type == JB_NULL ? Json.JNull : (type == JB_TRUE ? Json.JTrue : Json.JFalse);
+    }
+    string text = string.fromBytes(sliceOf(this.b, p, stop));
+    if (type == JB_INT || type == JB_FLOAT) { return sz == 0 ? null : Json.JNum(text); }
+    if (type == JB_INT5 || type == JB_FLOAT5) { return json5Number(text); }
+    if (type == JB_TEXT || type == JB_TEXTJ || type == JB_TEXT5) { return Json.JStr(text); }
+    if (type == JB_TEXTRAW) { return Json.JStr(escape(text)); }
+    if (type == JB_ARRAY) {
+      Vec<Json> items;
+      this.at = p;
+      while (this.at < stop) {
+        Json? v = this.element(stop, depth + 1);
+        if (v is null) { return null; }
+        items.push(v!);
+      }
+      return Json.JArr(items);
+    }
+    if (type == JB_OBJECT) {
+      Vec<string> keys;
+      Vec<Json> vals;
+      this.at = p;
+      while (this.at < stop) {
+        Json? k = this.element(stop, depth + 1);
+        if (k is null) { return null; }
+        match (k!) { JStr(raw): { keys.push(raw); } default: { return null; } }
+        Json? v = this.element(stop, depth + 1);
+        if (v is null) { return null; }
+        vals.push(v!);
+      }
+      return Json.JObj(keys, vals);
+    }
+    return null;
+  }
+}
+
+// A JSON5 number (hexadecimal, a leading '+' or '.', a trailing '.', Infinity) as plain JSON.
+Json? json5Number(string text) {
+  string t = text;
+  bool neg = false;
+  if (t.slice(0, 1) == "+") { t = t.slice(1, t.len()); }
+  else if (t.slice(0, 1) == "-") { neg = true; t = t.slice(1, t.len()); }
+  string sign = neg ? "-" : "";
+  string low = t;
+  if (low == "Infinity" || low == "inf") { return Json.JNum(sign + "9.0e999"); }
+  if (low.slice(0, 2) == "0x" || low.slice(0, 2) == "0X") {
+    i64 v = 0;
+    u8[] d = low.slice(2, low.len()).toBytes();
+    for (u8 c in d) {
+      i32 h = c >= '0' && c <= '9' ? (c - '0') as i32 : (c >= 'a' && c <= 'f' ? (c - 'a') as i32 + 10 : (c - 'A') as i32 + 10);
+      v = v * 16 + (h as i64);
+    }
+    return Json.JNum(sign + "\{v}");
+  }
+  if (t.slice(0, 1) == ".") { t = "0" + t; }
+  if (t.slice(t.len() - 1, t.len()) == ".") { t = t + "0"; }
+  return Json.JNum(sign + t);
+}
+
+// 0 when the text is not JSON at all, 1 when it is JSON, 2 when it is only JSON5.
+export i32 jsonValidity(string text) {
+  JsonParser p = JsonParser(text.toBytes(), 0, true, false);
+  Json? v = p.value(0);
+  if (v is null) { return 0; }
+  p.ws();
+  if (p.i != p.b.len()) { return 0; }
+  return p.json5 ? 2 : 1;
+}
+
+// Where JSON text first goes wrong, counted in characters from 1; 0 when it is well-formed.
+export i64 jsonErrorPosition(string text) {
+  JsonParser p = JsonParser(text.toBytes(), 0, true, false);
+  Json? v = p.value(0);
+  if (v is not null) {
+    p.ws();
+    if (p.i == p.b.len()) { return 0; }
+  }
+  i64 chars = 0;
+  for (i32 k = 0; k < p.i && k < p.b.len(); k++) { if ((p.b[k] & 0xc0) != 0x80) { chars++; } }
+  return chars + 1;
+}
+
+// RFC 7396: `patch` merged into `target`. A patch that is not an object replaces the target; a member
+// set to null is removed; other members are merged in turn, new ones added at the end.
+export Json mergePatch(const Json target, const Json patch) {
+  match (patch) {
+    JObj(pk, pv): {
+      Vec<string> keys;
+      Vec<Json> vals;
+      match (target) {
+        JObj(tk, tv): { for (i32 i = 0; i < tk.len(); i++) { keys.push(tk.get(i)); vals.push(tv.get(i)); } }
+        default: {}
+      }
+      for (i32 i = 0; i < pk.len(); i++) {
+        i32 at = -1;
+        for (i32 k = 0; k < keys.len(); k++) { if (keys.get(k) == pk.get(i)) { at = k; break; } }
+        bool isNullMember = match (pv.get(i)) { JNull: true, default: false };
+        if (isNullMember) {
+          if (at >= 0) { keys.remove(at); vals.remove(at); }
+          continue;
+        }
+        if (at >= 0) { vals.set(at, mergePatch(vals.get(at), pv.get(i))); }
+        else { keys.push(pk.get(i)); vals.push(mergePatch(Json.JNull, pv.get(i))); }
+      }
+      return Json.JObj(keys, vals);
+    }
+    default: { return patch as Json; }
+  }
 }

@@ -17,7 +17,7 @@ import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bit
          textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
 import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, F_HEX, F_OCTET_LENGTH, knownFunction, returnsJson, FnEnv, likeMatch, likeMatchCase, likeBytes, globMatch, codepoints } from "./functions.wac";
 import { lower } from "./lexer.wac";
-import { Json, parseJson, jsonText, jsonOf, escape } from "./json.wac";
+import { Json, parseJson, jsonText, jsonOf, escape, toJsonb, fromJsonb } from "./json.wac";
 
 // What a statement runs with: the database, its parameters, and the function environment.
 // A common table expression in scope while a statement runs, and its rows once computed: SQLite
@@ -107,6 +107,7 @@ export struct Ctx {
 
 static string[] AGGREGATES = ["count", "sum", "total", "avg", "group_concat", "string_agg", "json_group_array",
                                "median", "percentile", "percentile_cont", "percentile_disc",
+                               "jsonb_group_array", "jsonb_group_object",
                               "json_group_object"];
 
 bool isAggregate(string name, i32 nargs) {
@@ -335,10 +336,10 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
 Result<AggSpec, SqlError> aggSpec(string name, const Expr[] args, bool star, bool distinct, const Expr? filter,
                                  const OrderTerm[] order, Scope s, Exec x) {
   if (name == "count" && args.len() > 1) { return Result.Err(err("wrong number of arguments to function count()")); }
-  if ((name == "sum" || name == "total" || name == "avg" || name == "json_group_array") && args.len() != 1) {
+  if ((name == "sum" || name == "total" || name == "avg" || name == "json_group_array" || name == "jsonb_group_array") && args.len() != 1) {
     return Result.Err(err("wrong number of arguments to function \{name}()"));
   }
-  if (name == "json_group_object" && args.len() != 2) { return Result.Err(err("wrong number of arguments to function json_group_object()")); }
+  if ((name == "json_group_object" || name == "jsonb_group_object") && args.len() != 2) { return Result.Err(err("wrong number of arguments to function \{name}()")); }
   if ((name == "median" && args.len() != 1) || (name.indexOf("percentile") == 0 && args.len() != 2)) {
     return Result.Err(err("wrong number of arguments to function \{name}()"));
   }
@@ -349,8 +350,8 @@ Result<AggSpec, SqlError> aggSpec(string name, const Expr[] args, bool star, boo
   if (name == "sum" || name == "total" || name == "avg") { kind = AGG_SUM; }
   else if (name == "min" || name == "max") { kind = AGG_MINMAX; }
   else if (name == "group_concat" || name == "string_agg") { kind = AGG_CONCAT; }
-  else if (name == "json_group_array") { kind = AGG_JSON_ARRAY; }
-  else if (name == "json_group_object") { kind = AGG_JSON_OBJECT; }
+  else if (name == "json_group_array" || name == "jsonb_group_array") { kind = AGG_JSON_ARRAY; }
+  else if (name == "json_group_object" || name == "jsonb_group_object") { kind = AGG_JSON_OBJECT; }
   else if (name == "median" || name.indexOf("percentile") == 0) { kind = AGG_PERCENTILE; }
   Node? f = null;
   if (filter is not null) { f = try bindExpr(filter!, inner, x); }
@@ -1755,7 +1756,15 @@ Result<bool, SqlError> stepValues(const AggSpec a, AggState s, const Value[] arg
     }
     Json j = jsonOf(v);
     if (a.jsonArg) { match (v) { Text(t): { Json? pj = parseJson(t); if (pj is not null) { j = pj!; } } default: {} } }
-    match (v) { Blob: { return Result.Err(err("JSON cannot hold BLOB values")); } default: {} }
+    // A blob is JSONB, or cannot be held.
+    match (v) {
+      Blob(b): {
+        Json? pj = fromJsonb(b);
+        if (pj is null) { return Result.Err(err("JSON cannot hold BLOB values")); }
+        j = pj!;
+      }
+      default: {}
+    }
     s.text = s.any ? s.text + "," + member + jsonText(j) : member + jsonText(j);
     s.any = true;
     s.count++;
@@ -1853,8 +1862,11 @@ Result<Value, SqlError> finish(const AggSpec a, AggState s0) {
     }
   }
   string n = a.name;
-  if (a.kind == AGG_JSON_ARRAY) { return Result.Ok(Value.Text("[" + s.text + "]")); }
-  if (a.kind == AGG_JSON_OBJECT) { return Result.Ok(Value.Text("{" + s.text + "}")); }
+  if (a.kind == AGG_JSON_ARRAY || a.kind == AGG_JSON_OBJECT) {
+    string text = a.kind == AGG_JSON_ARRAY ? "[" + s.text + "]" : "{" + s.text + "}";
+    if (n.indexOf("jsonb") == 0) { return Result.Ok(Value.Blob(toJsonb(parseJson(text) ?? Json.JNull))); }
+    return Result.Ok(Value.Text(text));
+  }
   if (n == "count") { return Result.Ok(Value.Int(s.count)); }
   if (n == "sum") {
     if (s.count == 0) { return Result.Ok(Value.Null); }

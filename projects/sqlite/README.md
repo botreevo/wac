@@ -41,7 +41,7 @@ data.
 | Statements | `SELECT` (inner, `LEFT`, `RIGHT`, `FULL` and `NATURAL` joins, `USING`, subqueries anywhere, correlated or not, `GROUP BY`/`HAVING`, `DISTINCT`, `UNION [ALL]`/`INTERSECT`/`EXCEPT`, `VALUES`, `LIMIT`/`OFFSET`), `WITH [RECURSIVE]`, `INSERT` and `UPDATE` (`OR IGNORE`/`REPLACE`/`FAIL`/`ABORT`/`ROLLBACK`, and each constraint's own `ON CONFLICT`; `ON CONFLICT … DO UPDATE`/`DO NOTHING`, `DEFAULT VALUES`, `INSERT … SELECT`), `DELETE`, `RETURNING` on all three, `CREATE TABLE`/`INDEX`/`VIEW`/`TRIGGER`, `DROP`, `ALTER TABLE` (`ADD COLUMN`, `RENAME TO`, `RENAME COLUMN`, `DROP COLUMN`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` |
 | Typing | storage classes, column affinity, comparison affinity, `CAST`, integer overflow to real, SQLite's text for reals (`%!.15g`) |
 | Schema | `INTEGER PRIMARY KEY` as the rowid, `AUTOINCREMENT` with `sqlite_sequence`, `PRIMARY KEY`/`UNIQUE` (with their automatic indexes), `NOT NULL`, `DEFAULT`, `CHECK`, foreign keys (enforced under `PRAGMA foreign_keys`, with `CASCADE`/`SET NULL`/`SET DEFAULT`/`RESTRICT` and `DEFERRABLE`), `COLLATE` (`BINARY`, `NOCASE`, `RTRIM`), generated columns (`VIRTUAL` and `STORED`), `STRICT` tables, `WITHOUT ROWID` tables, partial and expression indexes, views (and `INSTEAD OF` triggers on them), triggers (`BEFORE`/`AFTER`, `UPDATE OF`, `WHEN`, `RAISE`) |
-| Functions | aggregates (`count sum total avg min max group_concat string_agg json_group_array json_group_object`, with `DISTINCT`, `FILTER` and `ORDER BY`), window functions (`row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value` and every aggregate, over `ROWS`/`RANGE`/`GROUPS` frames with `EXCLUDE`, named windows), the core scalar functions, `printf`/`format`, the date and time functions, the math functions, the JSON functions and `json_each`/`json_tree`, `->`, `->>`, `LIKE`/`GLOB` (with `ESCAPE`) |
+| Functions | aggregates (`count sum total avg min max group_concat string_agg json_group_array json_group_object`, with `DISTINCT`, `FILTER` and `ORDER BY`), window functions (`row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value` and every aggregate, over `ROWS`/`RANGE`/`GROUPS` frames with `EXCLUDE`, named windows), the core scalar functions, `printf`/`format`, the date and time functions, the math functions, the JSON functions (JSON5 input, JSONB blobs and every `jsonb_` function) and `json_each`/`json_tree`, `->`, `->>`, `LIKE`/`GLOB` (with `ESCAPE`) |
 | Pragmas | `user_version`, `page_size`, `table_info`, `journal_mode` (WAL is kept), `auto_vacuum` (full and incremental files are written with their pointer maps; `VACUUM` applies a change, as in SQLite), and the ones an application sets and does not read back (`journal_mode`, `foreign_keys`, `busy_timeout`, …) |
 | Planning | an index (equality on leading columns, then a range) or the rowid narrows each source of a join; an index that delivers the `ORDER BY` lets a `LIMIT` stop early; a lone `min`/`max` reads one entry |
 
@@ -102,7 +102,9 @@ So:
 
 ## Not yet
 
-Virtual tables (FTS5, R*Tree), `ATTACH`, JSONB, and `EXPLAIN`. A `TEMP` object may not share a name
+Virtual tables (FTS5, R*Tree), `ATTACH`, and `EXPLAIN`. JSONB that SQLite would write with its JSON5
+or raw-text element types (`jsonb()` of JSON5 text, `jsonb_set()` with a text value) is written with the
+plain ones here: the same JSON, other bytes. A `TEMP` object may not share a name
 with one in the main schema, as SQLite allows. UTF-16 databases are read and written (their indexes in SQLite's order), but
 text compares in code point order in queries, where SQLite compares UTF-16 bytes, so `ORDER BY` and
 ranges over non-ASCII text can differ there. Partial and expression indexes are kept and

@@ -3,7 +3,7 @@
 import { Result, Buf, Vec } from "core";
 import { SqlError } from "./error.wac";
 import { Value, compareValues } from "./value.wac";
-import { textOf, toNumeric, toInt, toReal, isNull, typeName, exactInt, wholeNumber } from "./ops.wac";
+import { textOf, toNumeric, toInt, toReal, isNull, typeName, exactInt, wholeNumber, intPrefix } from "./ops.wac";
 import { formatReal, hexOf } from "./format.wac";
 import { lower, upper } from "./lexer.wac";
 import { Json, parseJson, jsonText, jsonOf, sqlOf, parsePath, lookup, setPath, removePath, Step, jsonType, escape, extractFast } from "./json.wac";
@@ -369,13 +369,18 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
               fid == F_JSON_TYPE || fid == F_JSON_ARRAY_LENGTH;
   for (i32 i = 0; i < (json ? 1 : a.len()); i++) { if (isNull(a[i])) { return Result.Ok(Value.Null); } }
   if (fid == F_LENGTH) {
-    return match (a[0]) {
-      Blob(b): Result.Ok(Value.Int(b.len() as i64)),
-      Int: Result.Ok(Value.Int(codepoints(textOf(a[0])).len() as i64)),
-      Real: Result.Ok(Value.Int(codepoints(textOf(a[0])).len() as i64)),
-      default: Result.Ok(Value.Int(codepoints(textOf(a[0])).len() as i64)),
-    };
+    match (a[0]) {
+      Blob(b): { return Result.Ok(Value.Int(b.len() as i64)); }
+      default: {
+        // Characters before the first NUL, as SQLite counts them.
+        i32[] cps = codepoints(textOf(a[0]));
+        i32 n = 0;
+        while (n < cps.len() && cps[n] != 0) { n++; }
+        return Result.Ok(Value.Int(n as i64));
+      }
+    }
   }
+
   if (fid == F_OCTET_LENGTH) {
     return match (a[0]) { Blob(b): Result.Ok(Value.Int(b.len() as i64)), default: Result.Ok(Value.Int(textOf(a[0]).len() as i64)) };
   }
@@ -417,7 +422,8 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
   }
   if (fid == F_UNICODE) {
     i32[] cps = codepoints(textOf(a[0]));
-    return Result.Ok(cps.len() == 0 ? Value.Null : Value.Int(cps[0] as i64));
+    // SQLite reads the text as a C string, so a leading NUL makes it empty.
+    return Result.Ok(cps.len() == 0 || cps[0] == 0 ? Value.Null : Value.Int(cps[0] as i64));
   }
   if (fid == F_ZEROBLOB) { return Result.Ok(Value.Blob(u8[].filled(toInt(a[0]) as! i32, 0))); }
   if (fid == F_ROUND) {
@@ -434,7 +440,6 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
   if (fid == F_SUBSTR || fid == F_SUBSTRING) {
     if (isNull(a[1]) || (a.len() > 2 && isNull(a[2]))) { return Result.Ok(Value.Null); }
     bool blob = match (a[0]) { Blob: true, default: false };
-    i64 start = toInt(a[1]);
     i32 n = 0;
     i32[] cps = i32[]();
     u8[] bytes = u8[]();
@@ -445,17 +450,36 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
       if (n == 0) { return Result.Ok(Value.Null); }
     }
     else { cps = codepoints(textOf(a[0])); n = cps.len(); }
-    i64 len = a.len() > 2 ? toInt(a[2]) : (n as i64) + 1;
-    // SQLite's arithmetic: 1-based, negative counts from the end, a negative length takes the
-    // characters before the start.
-    i64 s0 = start > 0 ? start - 1 : (start < 0 ? (n as i64) + start : -1);
-    i64 e0 = 0;
-    if (len >= 0) { e0 = s0 + len; if (start == 0) { e0 = len - 1; s0 = 0; } }
-    else { e0 = s0; s0 = s0 + len; }
-    if (s0 < 0) { s0 = 0; }
-    if (s0 > n as i64) { s0 = n as i64; }
-    if (e0 > n as i64) { e0 = n as i64; }
-    if (e0 < s0) { e0 = s0; }
+    // SQLite's substrFunc, step for step (its arithmetic wraps as i64 does here): 1-based, a negative
+    // start counts from the end, a negative length takes the characters before the start.
+    i64 p1 = intPrefix(a[1]);
+    i64 p2 = 1000000000;
+    bool negP2 = false;
+    if (a.len() > 2) {
+      p2 = intPrefix(a[2]);
+      if (p2 < 0) { p2 = 0 - p2; negP2 = true; }
+    }
+    i64 len = n as i64;
+    if (p1 < 0) {
+      p1 = p1 + len;
+      if (p1 < 0) {
+        if (p2 < 0) { p2 = 0; } else { p2 = p2 + p1; }
+        p1 = 0;
+      }
+    } else if (p1 > 0) {
+      p1 = p1 - 1;
+    } else if (p2 > 0) {
+      p2 = p2 - 1;
+    }
+    if (negP2) {
+      p1 = p1 - p2;
+      if (p1 < 0) { p2 = p2 + p1; p1 = 0; }
+    }
+    if (p2 < 0) { p2 = 0; }
+    if (p1 > len) { p1 = len; }
+    if (p2 > len - p1) { p2 = len - p1; }
+    i64 s0 = p1;
+    i64 e0 = p1 + p2;
     if (blob) {
       u8[] out = u8[].filled((e0 - s0) as! i32, 0);
       out.copyFrom(bytes, s0 as! i32, 0, out.len());
@@ -477,6 +501,15 @@ export Result<Value, SqlError> callScalar(string name, i32 fid, const Value[] a,
   if (fid == F_TRIM || fid == F_LTRIM || fid == F_RTRIM) {
     i32[] s = codepoints(textOf(a[0]));
     i32[] set = a.len() > 1 ? codepoints(textOf(a[1])) : [32];
+    // SQLite reads the set of characters as a C string: it ends at a NUL.
+    for (i32 k = 0; k < set.len(); k++) {
+      if (set[k] == 0) {
+        i32[] cut = i32[].filled(k, 0);
+        cut.copyFrom(set, 0, 0, k);
+        set = cut;
+        break;
+      }
+    }
     i32 lo = 0;
     i32 hi = s.len();
     if (fid != F_RTRIM) { while (lo < hi && inSet(set, s[lo])) { lo++; } }

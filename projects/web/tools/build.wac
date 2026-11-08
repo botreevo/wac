@@ -366,14 +366,16 @@ export string programSide() {
         // (wac-tensor's `src/gpu/line.wac` is the client, and says what each operation's fields hold). Opened the first
         // time it is looked up, which answers once the device is ready, so no operation ever arrives before it.
         //
-        // **Runs are encoded as they come and submitted together**: at the end of each batch, before a write — the
-        // queue's writes land before anything submitted after them, so one that arrived after a run must wait for that
-        // run to be submitted first — and before a read. A buffer freed is destroyed only after the submit that follows,
+        // **Runs are encoded as they come and submitted together**: at the end of each batch, before a read, and before
+        // a write to a buffer a run already encoded uses — the queue's writes land before anything submitted after them,
+        // so that write must wait for that run to be submitted first. Every other write goes straight in: a kernel's
+        // parameters are a buffer made for it, which nothing encoded has seen, so a step is a few submits, not one a run. A buffer freed is destroyed only after the submit that follows,
         // since a run already encoded may still read it. What the GPU reports going wrong, from an error scope around
         // each batch, waits to be the fault in the next read's answer: a read is the one place the program listens.
         const GPU = BASE + 200, GPU_COUNT = 7;
         const gpuBuffers = new Map(), gpuPrograms = new Map();
         let gpuOpening = null, gpuDev = null, gpuEncoder = null, gpuDoomed = [], gpuErrors = [], gpuScopes = [];
+        const gpuEncoded = new Set();
         const gpuOpen = () => gpuOpening ??= (async () => {
           if (!globalThis.navigator?.gpu) throw new Error("this browser has no WebGPU");
           const adapter = await navigator.gpu.requestAdapter();
@@ -387,6 +389,7 @@ export string programSide() {
         })();
         const gpuSubmit = () => {
           if (gpuEncoder !== null) { gpuDev.queue.submit([gpuEncoder.finish()]); gpuEncoder = null; }
+          gpuEncoded.clear();
           for (const h of gpuDoomed) { gpuBuffers.get(h)?.destroy(); gpuBuffers.delete(h); gpuPrograms.delete(h); }
           gpuDoomed = [];
         };
@@ -402,7 +405,7 @@ export string programSide() {
           switch (k) {
             case 0: return gpuBuffers.set(lo(a), d.createBuffer({ size: Math.max(4, Math.ceil(Number(b) / 4) * 4), usage: USAGE() }));
             case 1: {
-              if (gpuEncoder !== null) gpuSubmit();
+              if (gpuEncoded.has(lo(a))) gpuSubmit();
               const buf = gpuBuffers.get(lo(a));
               if (!buf) return gpuErrors.push("a write to buffer " + lo(a) + ", which is not there");
               return d.queue.writeBuffer(buf, Number(b), bytes);
@@ -416,7 +419,11 @@ export string programSide() {
               const pipe = gpuPrograms.get(lo(a));
               const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
               const entries = [];
-              for (let i = 0; i * 4 < bytes.length; i++) entries.push({ binding: i, resource: { buffer: gpuBuffers.get(v.getInt32(i * 4, true)) } });
+              for (let i = 0; i * 4 < bytes.length; i++) {
+                const h = v.getInt32(i * 4, true);
+                gpuEncoded.add(h);
+                entries.push({ binding: i, resource: { buffer: gpuBuffers.get(h) } });
+              }
               if (!pipe || entries.some((e) => !e.resource.buffer)) return gpuErrors.push("a run named a program or buffer that is not there");
               const group = d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
               gpuEncoder ??= d.createCommandEncoder();

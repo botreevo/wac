@@ -14,6 +14,7 @@ import { Exec, Scope, Ctx, Named, topCtx, bindExpr, eval, planSelect, runPlan, q
 import { applyAffinity, isNull, textOf } from "./ops.wac";
 import { FnEnv } from "./functions.wac";
 import { lower } from "./lexer.wac";
+import { renameTable, mentionsTable, renameColumnInTable, renameColumnElsewhere, dropColumnText } from "./alter.wac";
 import { Chunked } from "./chunked.wac";
 
 // What undoes one change, newest last.
@@ -735,7 +736,9 @@ struct Statement {
       CreateIndexStmt(c): { try this.createIndex(c); return Result.Ok(noRows()); }
       DropStmt(kind, name, ifExists): { try this.drop(kind, name, ifExists); return Result.Ok(noRows()); }
       AddColumnStmt(table, col, text): { try this.addColumn(table, col, text); return Result.Ok(noRows()); }
-      RenameTableStmt(table, to): { return Result.Err(SqlError.unsupported("ALTER TABLE RENAME")); }
+      RenameTableStmt(table, to): { try this.alterTable("rename", table, to, ""); return Result.Ok(noRows()); }
+      RenameColumnStmt(table, from, to): { try this.alterTable("rename column", table, from, to); return Result.Ok(noRows()); }
+      DropColumnStmt(table, col): { try this.alterTable("drop column", table, col, ""); return Result.Ok(noRows()); }
       PragmaStmt(name, value): { return this.pragma(name, value); }
       default: { return Result.Err(err("unexpected statement")); }
     }
@@ -1335,6 +1338,183 @@ struct Statement {
     }
     d.order = keep;
     d.indexes.remove(lower(name));
+    return Result.Ok();
+  }
+
+  // ALTER TABLE RENAME TO, RENAME COLUMN and DROP COLUMN: every statement in the schema that refers to
+  // what changed is rewritten, and each object whose text changed is made again from it, keeping its rows
+  // and index entries.
+  Result<void, SqlError> alterTable(this, string kind, string table, string a, string b) {
+    Database d = this.conn.db;
+    Table t = try this.table(table);
+    string tn = lower(t.name);
+    i32 dropAt = -1;
+    if (kind == "rename") {
+      if (lower(a).indexOf("sqlite_") == 0) { return Result.Err(err("object name reserved for internal use: \{a}")); }
+      if (this.nameTaken(a)) { return Result.Err(err("there is already another table or index with this name: \{a}")); }
+      if (tn.indexOf("sqlite_") == 0) { return Result.Err(err("table \{t.name} may not be altered")); }
+    } else {
+      i32 ci = t.colIndex(a);
+      if (ci < 0) { return Result.Err(err("no such column: \"\{a}\"")); }
+      if (kind == "rename column") {
+        if (t.colIndex(b) >= 0) { return Result.Err(err("duplicate column name: \{b}")); }
+      } else {
+        if (t.cols.len() == 1) { return Result.Err(err("cannot drop column \"\{a}\": no other columns exist")); }
+        for (i32 k in t.pk) { if (k == ci) { return Result.Err(err("cannot drop PRIMARY KEY column: \"\{a}\"")); } }
+        Index[] ixs = d.indexesOf(t.name);
+        for (i32 i = 0; i < ixs.len(); i++) {
+          for (i32 k in ixs[i].cols) {
+            if (k == ci) {
+              if (ixs[i].sql is null) { return Result.Err(err("cannot drop UNIQUE column: \"\{a}\"")); }
+              return Result.Err(err("error in index \{ixs[i].name} after drop column: no such column: \{a}"));
+            }
+          }
+        }
+        dropAt = ci;
+      }
+    }
+    // The new text of everything in the schema, and the new names.
+    Vec<SchemaEntry> order;
+    Vec<string?> texts;
+    for (i32 i = 0; i < d.order.len(); i++) {
+      SchemaEntry e = d.order.get(i);
+      string? sql = null;
+      if (e.kind == "table") { sql = d.table(e.name)!.sql; }
+      else if (e.kind == "index") { sql = d.index(e.name)!.sql; }
+      else if (e.kind == "view") { sql = d.view(e.name)!.sql; }
+      else { sql = d.trigger(e.name)!.def.sql; }
+      string name = e.name;
+      string owner = e.table;
+      bool own = lower(e.table) == tn;
+      if (sql is not null) {
+        string text = sql!;
+        if (kind == "rename") { text = renameTable(text, t.name, a); }
+        else if (kind == "rename column") {
+          if (e.kind == "table" && own) { text = renameColumnInTable(text, t.name, a, b); }
+          else {
+            bool reads = mentionsTable(text, t.name);
+            text = renameColumnElsewhere(text, t.name, a, b, (e.kind == "view" || e.kind == "trigger" || e.kind == "index") && (own || reads), own);
+          }
+        } else if (e.kind == "table" && own) {
+          text = dropColumnText(text, a);
+        }
+        sql = text;
+      }
+      if (kind == "rename") {
+        if (own) { owner = a; }
+        if (e.kind == "table" && own) { name = a; }
+        if (e.kind == "index" && own && lower(name).indexOf("sqlite_autoindex_") == 0) {
+          name = "sqlite_autoindex_" + a + name.slice(17 + t.name.len(), name.len());
+        }
+      }
+      order.push(SchemaEntry(e.kind, name, owner));
+      texts.push(sql);
+    }
+    // Make again what changed.
+    Map<string, Table> tables = Map.create(hashString, stringEq);
+    Map<string, Index> indexes = Map.create(hashString, stringEq);
+    Map<string, View> views = Map.create(hashString, stringEq);
+    Map<string, Trigger> triggers = Map.create(hashString, stringEq);
+    for (i32 i = 0; i < order.len(); i++) {
+      SchemaEntry e = order.get(i);
+      SchemaEntry was = d.order.get(i);
+      string? text = texts.get(i);
+      if (e.kind == "table") {
+        Table old = d.table(was.name)!;
+        if (text! == old.sql && e.name == was.name) {
+          tables.set(lower(e.name), old);
+          // Its constraint indexes come along unchanged.
+          Index[] keep = d.indexesOf(was.name);
+          for (i32 k = 0; k < keep.len(); k++) { if (keep[k].sql is null) { indexes.set(lower(keep[k].name), keep[k]); } }
+          continue;
+        }
+        match ((try parseOne(text!)).stmt) {
+          CreateTableStmt(ct): {
+            Vec<Index> autos;
+            Table nt = try tableFrom(ct, autos);
+            if (dropAt >= 0 && lower(was.name) == tn) {
+              Vec<Row> rows = Vec.withCapacity(old.rows.len());
+              for (i32 k = 0; k < old.rows.len(); k++) {
+                Row r = old.rows.get(k);
+                Value[] v = Value[].filled(r.vals.len() - 1, Value.Null);
+                for (i32 c = 0; c < r.vals.len(); c++) {
+                  if (c < dropAt) { v[c] = r.vals[c]; } else if (c > dropAt) { v[c - 1] = r.vals[c]; }
+                }
+                rows.push(Row(r.rowid, v, null));
+              }
+              nt.rows = rows;
+            } else {
+              nt.rows = old.rows;
+            }
+            tables.set(lower(nt.name), nt);
+            // The constraint indexes keep their entries, matched by number.
+            Index[] oldIxs = d.indexesOf(was.name);
+            for (i32 k = 0; k < autos.len(); k++) {
+              Index ai = autos.get(k);
+              string suffix = ai.name.slice(17 + nt.name.len(), ai.name.len());
+              for (i32 m = 0; m < oldIxs.len(); m++) {
+                if (oldIxs[m].sql is null && oldIxs[m].name.slice(17 + old.name.len(), oldIxs[m].name.len()) == suffix) {
+                  ai.entries = oldIxs[m].entries;
+                }
+              }
+              indexes.set(lower(ai.name), ai);
+            }
+          }
+          default: { return Result.Err(err("malformed schema after ALTER TABLE")); }
+        }
+      }
+    }
+    for (i32 i = 0; i < order.len(); i++) {
+      SchemaEntry e = order.get(i);
+      SchemaEntry was = d.order.get(i);
+      string? text = texts.get(i);
+      if (e.kind == "index" && text is not null) {
+        Index old = d.index(was.name)!;
+        match ((try parseOne(text!)).stmt) {
+          CreateIndexStmt(ci): {
+            Index ni = try indexFrom(ci, tables.get(lower(e.table))!);
+            ni.entries = old.entries;
+            indexes.set(lower(ni.name), ni);
+          }
+          default: { return Result.Err(err("malformed schema after ALTER TABLE")); }
+        }
+      } else if (e.kind == "view") {
+        match ((try parseOne(text!)).stmt) {
+          CreateViewStmt(vn, ine, cols, sel, sql): { views.set(lower(e.name), View(e.name, text!, cols, sel)); }
+          default: { return Result.Err(err("malformed schema after ALTER TABLE")); }
+        }
+      } else if (e.kind == "trigger") {
+        match ((try parseOne(text!)).stmt) {
+          CreateTriggerStmt(ct): { triggers.set(lower(e.name), Trigger(ct)); }
+          default: { return Result.Err(err("malformed schema after ALTER TABLE")); }
+        }
+      }
+    }
+    // A renamed AUTOINCREMENT table keeps its counter under the new name.
+    this.saveSchema();
+    d.order = order;
+    d.tables = tables;
+    d.indexes = indexes;
+    d.views = views;
+    d.triggers = triggers;
+    if (kind == "rename") {
+      Table? seq = d.table("sqlite_sequence");
+      if (seq is not null) {
+        for (i32 i = 0; i < seq!.rows.len(); i++) {
+          Row r = seq!.rows.get(i);
+          match (r.vals[0]) {
+            Text(n): {
+              if (lower(n) == tn) {
+                Row nr = Row(r.rowid, [Value.Text(a), r.vals[1]], null);
+                replaceRow(d, seq!, r, nr);
+                this.undo.push(Undo.UReplaced(seq!, r, nr));
+              }
+            }
+            default: {}
+          }
+        }
+      }
+    }
     return Result.Ok();
   }
 

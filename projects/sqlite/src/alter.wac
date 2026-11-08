@@ -1,0 +1,180 @@
+// The text side of ALTER TABLE: rewriting the CREATE statements sqlite_schema holds when a table or a
+// column is renamed or a column dropped. SQLite edits the stored text in place rather than regenerating
+// it, so these edit tokens and keep everything else as written. A renamed table is written in double
+// quotes, as SQLite writes it; a renamed column keeps the quoting its old name had.
+
+import { Buf, Vec } from "core";
+import { Token, tokenize, lower, upper, T_IDENT, T_STRING, T_OP, T_EOF } from "./lexer.wac";
+
+string quoted(string name) {
+  Buf b = Buf.create();
+  b.pushStr("\"");
+  u8[] n = name.toBytes();
+  for (i32 i = 0; i < n.len(); i++) {
+    if (n[i] == '"') { b.pushStr("\"\""); } else { b.push(n[i]); }
+  }
+  b.pushStr("\"");
+  return b.toStr();
+}
+
+struct Edit {
+  i32 start;
+  i32 end;
+  string text;
+}
+
+string apply(string sql, Vec<Edit> edits) {
+  Buf out = Buf.create();
+  i32 at = 0;
+  for (i32 i = 0; i < edits.len(); i++) {
+    Edit e = edits.get(i);
+    out.pushStr(sql.slice(at, e.start));
+    out.pushStr(e.text);
+    at = e.end;
+  }
+  out.pushStr(sql.slice(at, sql.len()));
+  return out.toStr();
+}
+
+bool kw(const Token t, string w) { return t.kind == T_IDENT && !t.quoted && upper(t.text) == w; }
+
+bool isName(const Token t) { return t.kind == T_IDENT || t.kind == T_STRING; }
+
+bool isOp(const Token t, string op) { return t.kind == T_OP && t.text == op; }
+
+static string[] FROM_ENDS = ["WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW", "UNION", "EXCEPT", "INTERSECT",
+                             "ON", "USING", "SET", "VALUES", "SELECT", "RETURNING", "BEGIN", "END", "WHEN", "FOR"];
+
+bool endsFrom(const Token t) {
+  if (t.kind != T_IDENT || t.quoted) { return false; }
+  string u = upper(t.text);
+  for (string w in FROM_ENDS) { if (w == u) { return true; } }
+  return false;
+}
+
+// The places a statement names a table: after TABLE, INTO, UPDATE, ON, REFERENCES and TRIGGER … ON, in
+// a FROM or JOIN list, and before a dot.
+export string renameTable(string sql, string from, string to) {
+  Token[] ts = tokenize(sql).orElse(Token[]());
+  Vec<Edit> edits;
+  string f = lower(from);
+  bool inFrom = false;
+  for (i32 i = 0; i < ts.len(); i++) {
+    Token t = ts[i];
+    if (kw(t, "FROM") || kw(t, "JOIN")) { inFrom = true; continue; }
+    if (inFrom && (endsFrom(t) || isOp(t, ")") || isOp(t, ";"))) { inFrom = false; }
+    if (!isName(t) || lower(t.text) != f) { continue; }
+    Token prev = i > 0 ? ts[i - 1] : ts[i];
+    bool hit = i + 1 < ts.len() && isOp(ts[i + 1], ".");
+    if (i > 0 && (kw(prev, "TABLE") || kw(prev, "INTO") || kw(prev, "UPDATE") || kw(prev, "ON") ||
+                  kw(prev, "REFERENCES") || kw(prev, "FROM") || kw(prev, "JOIN"))) { hit = true; }
+    if (inFrom && i > 0 && isOp(prev, ",")) { hit = true; }
+    if (hit) { edits.push(Edit(t.start, t.end, quoted(to))); }
+  }
+  return apply(sql, edits);
+}
+
+// Whether the statement names the table anywhere a table goes.
+export bool mentionsTable(string sql, string table) {
+  return renameTable(sql, table, "\u{1}") != sql;
+}
+
+string newName(const Token t, string to) {
+  // Bare stays bare when the new name can be; quoted stays quoted.
+  return t.quoted ? quoted(to) : to;
+}
+
+// A column renamed in its own table's CREATE TABLE: its definition, and every use in constraints, except
+// in a REFERENCES list naming another table's columns.
+export string renameColumnInTable(string sql, string table, string from, string to) {
+  Token[] ts = tokenize(sql).orElse(Token[]());
+  Vec<Edit> edits;
+  string f = lower(from);
+  i32 skipUntilClose = -1;
+  i32 depth = 0;
+  for (i32 i = 0; i < ts.len(); i++) {
+    Token t = ts[i];
+    if (isOp(t, "(")) { depth++; }
+    if (isOp(t, ")")) {
+      if (depth == skipUntilClose) { skipUntilClose = -1; }
+      depth--;
+    }
+    if (kw(t, "REFERENCES") && i + 2 < ts.len() && lower(ts[i + 1].text) != lower(table) && isOp(ts[i + 2], "(")) {
+      skipUntilClose = depth + 1;
+      continue;
+    }
+    if (skipUntilClose >= 0) { continue; }
+    if (i < 3) { continue; }    // CREATE TABLE name
+    if (isName(t) && lower(t.text) == f) { edits.push(Edit(t.start, t.end, newName(t, to))); }
+  }
+  return apply(sql, edits);
+}
+
+// A column of `table` renamed where another statement refers to it: an index or trigger on the table, a
+// REFERENCES table(cols) list, `table.col`, `new.col` and `old.col` in its triggers, and bare names in a
+// view or trigger that reads the table.
+export string renameColumnElsewhere(string sql, string table, string from, string to, bool bareToo, bool onTable) {
+  Token[] ts = tokenize(sql).orElse(Token[]());
+  Vec<Edit> edits;
+  string f = lower(from);
+  string tb = lower(table);
+  bool inRefList = false;
+  for (i32 i = 0; i < ts.len(); i++) {
+    Token t = ts[i];
+    if (kw(t, "REFERENCES") && i + 2 < ts.len() && lower(ts[i + 1].text) == tb && isOp(ts[i + 2], "(")) {
+      inRefList = true;
+      continue;
+    }
+    if (inRefList && isOp(t, ")")) { inRefList = false; continue; }
+    if (!isName(t) || lower(t.text) != f) { continue; }
+    bool hit = inRefList;
+    if (i >= 2 && isOp(ts[i - 1], ".")) {
+      string q = lower(ts[i - 2].text);
+      if (q == tb || (onTable && (q == "new" || q == "old"))) { hit = true; }
+    } else if (bareToo) {
+      hit = true;
+    }
+    if (hit) { edits.push(Edit(t.start, t.end, newName(t, to))); }
+  }
+  return apply(sql, edits);
+}
+
+// CREATE TABLE without one column's definition, and the comma before it (or after, for the first).
+export string dropColumnText(string sql, string col) {
+  Token[] ts = tokenize(sql).orElse(Token[]());
+  string c = lower(col);
+  i32 depth = 0;
+  i32 itemStart = -1;
+  i32 prevComma = -1;
+  for (i32 i = 0; i < ts.len(); i++) {
+    Token t = ts[i];
+    if (isOp(t, "(")) {
+      depth++;
+      if (depth == 1) { itemStart = i + 1; prevComma = -1; }
+      continue;
+    }
+    if (isOp(t, ")")) { depth--; continue; }
+    if (depth == 1 && isOp(t, ",")) { prevComma = i; itemStart = i + 1; continue; }
+    if (depth == 1 && i == itemStart && isName(t) && lower(t.text) == c) {
+      // Find where the item ends: the next comma or the closing parenthesis at this depth.
+      i32 d = 1;
+      i32 j = i + 1;
+      while (j < ts.len()) {
+        if (isOp(ts[j], "(")) { d++; }
+        if (isOp(ts[j], ")")) { d--; if (d == 0) { break; } }
+        if (d == 1 && isOp(ts[j], ",")) { break; }
+        j++;
+      }
+      Vec<Edit> edits;
+      if (prevComma >= 0) {
+        edits.push(Edit(ts[prevComma].start, ts[j - 1].end, ""));
+      } else if (j < ts.len() && isOp(ts[j], ",")) {
+        edits.push(Edit(t.start, ts[j + 1].start, ""));
+      } else {
+        edits.push(Edit(t.start, ts[j - 1].end, ""));
+      }
+      return apply(sql, edits);
+    }
+  }
+  return sql;
+}

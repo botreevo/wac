@@ -12,6 +12,10 @@ def dump(path):
     for (name, kind, sql) in con.execute("SELECT name, type, sql FROM sqlite_schema ORDER BY rowid"):
         out.append((kind, name, sql))
         if kind == "table":
+            if name == "sqlite_stat1":
+                # Its rows come in the order SQLite's hash table gives the tables; only what they say counts.
+                out.extend(sorted(con.execute('SELECT * FROM sqlite_stat1').fetchall(), key=repr))
+                continue
             try:
                 out.extend(con.execute(f'SELECT rowid, * FROM "{name}" ORDER BY rowid').fetchall())
             except sqlite3.OperationalError:

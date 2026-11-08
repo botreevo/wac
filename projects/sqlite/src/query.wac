@@ -3,10 +3,10 @@
 
 import { Result, Vec, Map, hashBytes, bytesEq } from "core";
 import { SqlError } from "./error.wac";
-import { Value, compareValues } from "./value.wac";
+import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY } from "./value.wac";
 import { encodeRecord } from "./record.wac";
 import { Cte, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS } from "./ast.wac";
-import { Table, Row, Index, Column, View, SchemaEntry, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
+import { Table, Row, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
 import { Database } from "./database.wac";
 import { Node, BoundSource, AggSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT } from "./plan.wac";
 import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
@@ -108,11 +108,13 @@ Result<Node, SqlError> bindColumn(string? table, string name, Scope s0) {
     if (foundSrc >= 0) {
       const BoundSource b = s!.srcs[foundSrc];
       i32 aff = AFF_INTEGER;
+      i32 coll = 0;
       if (foundCol >= 0) {
         aff = b.isSub ? AFF_NONE : b.table.cols[foundCol].affinity;
+        coll = b.table.cols[foundCol].coll;
         if (b.table.rowidAlias == foundCol) { aff = AFF_INTEGER; }
       }
-      return Result.Ok(Node.NCol(depth, foundSrc, foundCol, aff));
+      return Result.Ok(Node.NCol(depth, foundSrc, foundCol, aff, coll));
     }
     if (table is not null) {
       bool known = false;
@@ -216,16 +218,49 @@ export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
     }
     Exists(sub, neg): { return Result.Ok(Node.NExists(try planSelect(sub, s, x), neg)); }
     Collate(a, coll): {
-      if (coll != "binary") { return Result.Err(SqlError.unsupported("collation \{coll}")); }
-      return bindExpr(a, s, x);
+      i32 id = collationId(coll);
+      if (id < 0) { return Result.Err(err("no such collation sequence: \{coll}")); }
+      return Result.Ok(Node.NCollate(try bindExpr(a, s, x), id));
     }
   }
 }
 
 // ── evaluation ─────────────────────────────────────────────────────────────
 
+// The collation a comparison uses, SQLite's way: an explicit COLLATE on the left, then on the right,
+// then the left operand's column's, then the right's; BINARY when none says.
+export i32 explicitColl(const Node n) {
+  return match (n) { NCollate(e, coll): coll, default: -1 };
+}
+
+export i32 columnColl(const Node n) {
+  return match (n) { NCol(d, s, c, aff, coll): coll, NCollate(e, coll): coll, default: -1 };
+}
+
+export i32 cmpColl(const Node l, const Node r) {
+  i32 a = explicitColl(l);
+  if (a >= 0) { return a; }
+  a = explicitColl(r);
+  if (a >= 0) { return a; }
+  a = columnColl(l);
+  if (a >= 0) { return a; }
+  a = columnColl(r);
+  return a >= 0 ? a : COLL_BINARY;
+}
+
+// The collation an expression sorts and groups by on its own.
+export i32 ownColl(const Node n) {
+  i32 c = columnColl(n);
+  return c >= 0 ? c : COLL_BINARY;
+}
+
+Value compareOpColl(string op, const Value a, const Value b, i32 coll) {
+  if (coll == COLL_BINARY) { return compareOp(op, a, b); }
+  return compareOp(op, collated(a, coll), collated(b, coll));
+}
+
 export i32 nodeAff(const Node n) {
-  return match (n) { NCol(d, s, c, aff): aff, NCast(e, aff): aff, default: AFF_NONE };
+  return match (n) { NCol(d, s, c, aff, coll): aff, NCast(e, aff): aff, NCollate(e, coll): nodeAff(e), default: AFF_NONE };
 }
 
 Result<Value, SqlError> colValue(Ctx c, i32 depth, i32 src, i32 col) {
@@ -245,7 +280,8 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
   match (n) {
     NLit(v): { return Result.Ok(v as Value); }
     NParam(i): { return Result.Ok(i >= 1 && i <= x.params.len() ? x.params[i - 1] : Value.Null); }
-    NCol(depth, src, col, aff): { return colValue(c, depth, src, col); }
+    NCol(depth, src, col, aff, coll): { return colValue(c, depth, src, col); }
+    NCollate(e, coll): { return eval(e, c, x); }
     NUnary(op, e): {
       Value v = try eval(e, c, x);
       if (isNull(v)) { return Result.Ok(Value.Null); }
@@ -267,10 +303,10 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       Value[] ab = comparable(a, nodeAff(l), b, nodeAff(r));
       if (op == "IS" || op == "IS NOT") {
         bool same = (isNull(ab[0]) && isNull(ab[1])) ||
-                    (!isNull(ab[0]) && !isNull(ab[1]) && compareValues(ab[0], ab[1]) == 0);
+                    (!isNull(ab[0]) && !isNull(ab[1]) && compareColl(ab[0], ab[1], cmpColl(l, r)) == 0);
         return Result.Ok(boolValue(op == "IS" ? same : !same));
       }
-      return Result.Ok(compareOp(op, ab[0], ab[1]));
+      return Result.Ok(compareOpColl(op, ab[0], ab[1], cmpColl(l, r)));
     }
     NAnd(l, r): {
       i32 a = truth(try eval(l, c, x));
@@ -302,8 +338,8 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
       Value b = try eval(hi, c, x);
       Value[] va = comparable(v, nodeAff(e), a, nodeAff(lo));
       Value[] vb = comparable(v, nodeAff(e), b, nodeAff(hi));
-      Value ge = compareOp(">=", va[0], va[1]);
-      Value le = compareOp("<=", vb[0], vb[1]);
+      Value ge = compareOpColl(">=", va[0], va[1], cmpColl(e, lo));
+      Value le = compareOpColl("<=", vb[0], vb[1], cmpColl(e, hi));
       i32 t1 = truth(ge);
       i32 t2 = truth(le);
       i32 t = (t1 == 0 || t2 == 0) ? 0 : ((t1 < 0 || t2 < 0) ? -1 : 1);
@@ -319,7 +355,7 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
         if (isNull(it)) { sawNull = true; continue; }
         // Only the left side's affinity applies to an IN list, unlike `=`.
         Value[] ab = comparable(v, nodeAff(e), it, AFF_NONE);
-        if (compareValues(ab[0], ab[1]) == 0) { return Result.Ok(boolValue(!neg)); }
+        if (compareColl(ab[0], ab[1], cmpColl(e, items[i])) == 0) { return Result.Ok(boolValue(!neg)); }
       }
       return Result.Ok(sawNull ? Value.Null : boolValue(neg));
     }
@@ -332,7 +368,8 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
         Value it = rows.get(i)[0];
         if (isNull(it)) { sawNull = true; continue; }
         Value[] ab = comparable(v, nodeAff(e), it, AFF_NONE);
-        if (compareValues(ab[0], ab[1]) == 0) { return Result.Ok(boolValue(!neg)); }
+        i32 coll = cmpColl(e, sub.results.len() > 0 ? sub.results[0] : Node.NLit(Value.Null));
+        if (compareColl(ab[0], ab[1], coll) == 0) { return Result.Ok(boolValue(!neg)); }
       }
       return Result.Ok(sawNull ? Value.Null : boolValue(neg));
     }
@@ -381,7 +418,7 @@ export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
         bool hit = false;
         if (b is not null) {
           Value[] ab = comparable(b!, nodeAff(base!), w, nodeAff(whens[i]));
-          hit = !isNull(ab[0]) && !isNull(ab[1]) && compareValues(ab[0], ab[1]) == 0;
+          hit = !isNull(ab[0]) && !isNull(ab[1]) && compareColl(ab[0], ab[1], cmpColl(base!, whens[i])) == 0;
         } else {
           hit = truth(w) == 1;
         }
@@ -421,7 +458,7 @@ Result<Vec<Value[]>, SqlError> subRows(SelectPlan sub, Ctx c, Exec x) {
 // of this select at all. Bit 31 stands for "something this cannot place", which keeps it to the end.
 export i32 refs(const Node n, i32 depth) {
   match (n) {
-    NCol(d, s, c, aff): {
+    NCol(d, s, c, aff, coll): {
       if (d != depth) { return d > depth ? 0 : 0; }
       return s < 30 ? 1 << s : 1 << 30;
     }
@@ -455,6 +492,7 @@ export i32 refs(const Node n, i32 depth) {
       return m;
     }
     NCast(e, aff): { return refs(e, depth); }
+    NCollate(e, coll): { return refs(e, depth); }
     NSub(sub): { return planRefs(sub, depth + 1); }
     NExists(sub, neg): { return planRefs(sub, depth + 1); }
     default: { return 0; }
@@ -489,10 +527,10 @@ bool dependsOnOuter(const SelectPlan p) {
 // A table holding a subquery's rows, so it can be a source like any other.
 Table tableOfRows(string name, const string[] names, Vec<Value[]> rows) {
   Column[] cols = Column[].defaulted(names.len());
-  for (i32 i = 0; i < names.len(); i++) { cols[i] = Column(names[i], "", AFF_BLOB, false, null); }
+  for (i32 i = 0; i < names.len(); i++) { cols[i] = Column(names[i], "", AFF_BLOB, false, null, 0); }
   Vec<Row> rs;
   for (i32 i = 0; i < rows.len(); i++) { rs.push(Row((i + 1) as i64, rows.get(i), null)); }
-  return Table(name, "", cols, -1, false, rs);
+  return Table(name, "", cols, -1, false, rs, Expr[](), ForeignKey[](), i32[]());
 }
 
 string defaultName(const ResultCol rc) {
@@ -771,8 +809,8 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
           i32 rc = p.srcs[i].table.colIndex(col);
           if (left < 0 || rc < 0) { return Result.Err(err("cannot join using column \{col} - column not present in both tables")); }
           i32 lc = p.srcs[left].table.colIndex(col);
-          Node eq = Node.NCompare("=", Node.NCol(0, left, lc, p.srcs[left].table.cols[lc].affinity),
-                                       Node.NCol(0, i, rc, p.srcs[i].table.cols[rc].affinity));
+          Node eq = Node.NCompare("=", Node.NCol(0, left, lc, p.srcs[left].table.cols[lc].affinity, p.srcs[left].table.cols[lc].coll),
+                                       Node.NCol(0, i, rc, p.srcs[i].table.cols[rc].affinity, p.srcs[i].table.cols[rc].coll));
           on = on is null ? eq : Node.NAnd(on!, eq);
         }
         p.srcs[i].on = on;
@@ -791,7 +829,7 @@ Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x
           any = true;
           Table t = p.srcs[k].table;
           for (i32 c = 0; c < t.cols.len(); c++) {
-            results.push(Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity));
+            results.push(Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity, t.cols[c].coll));
             names.push(t.cols[c].name);
           }
         }
@@ -901,6 +939,14 @@ Result<void, SqlError> planOrder(SelectPlan p, const Select s, Scope? outer, Exe
   p.order = order;
   p.desc = desc;
   p.nulls = nulls;
+  i32[] oc = i32[].filled(n, COLL_BINARY);
+  for (i32 i = 0; i < n; i++) {
+    match (order[i]) {
+      NResult(j): { if (j < p.results.len()) { oc[i] = ownColl(p.results[j]); } }
+      default: { oc[i] = ownColl(order[i]); }
+    }
+  }
+  p.orderColl = oc;
   p.aggregate = p.aggregate || p.aggs.len() > 0;
   return Result.Ok();
 }
@@ -912,6 +958,7 @@ struct Probe {
   i32 col;          // -1 for the rowid
   string op;        // = < <= > >=
   Value v;
+  i32 coll;
 }
 
 string flip(string op) {
@@ -946,11 +993,12 @@ ProbeSpec[] probeSpecsFor(const SelectPlan p, i32 k, const Vec<Node> conds) {
           const Node colSide = side == 0 ? l : r;
           const Node other = side == 0 ? r : l;
           match (colSide) {
-            NCol(d, s, col, aff): {
+            NCol(d, s, col, aff, coll): {
               if (d != 0 || s != k) { continue; }
               if ((refs(other, 0) & ~earlier) != 0) { continue; }
               i32 colAff = col < 0 || col == t.rowidAlias ? AFF_INTEGER : aff;
-              out.push(ProbeSpec(col == t.rowidAlias ? -1 : col, side == 0 ? op : flip(op), other as Node, colAff));
+              out.push(ProbeSpec(col == t.rowidAlias ? -1 : col, side == 0 ? op : flip(op), other as Node, colAff,
+                                 cmpColl(side == 0 ? l : r, side == 0 ? r : l)));
             }
             default: {}
           }
@@ -985,7 +1033,7 @@ Result<Vec<Probe>, SqlError> probesFor(SelectPlan p, i32 k, const Vec<Node> wher
     ProbeSpec sp = specs[i];
     Value v = try eval(sp.other, c, x);
     if (isNull(v)) { continue; }
-    out.push(Probe(sp.col, sp.op, probeValue(v, nodeAff(sp.other), sp.colAff)));
+    out.push(Probe(sp.col, sp.op, probeValue(v, nodeAff(sp.other), sp.colAff), sp.coll));
   }
   return Result.Ok(out);
 }
@@ -1011,6 +1059,7 @@ struct Wanted {
   Node[] order;
   bool[] desc;
   i32[] nulls;
+  i32[] colls;
   bool minMax;
 }
 
@@ -1018,16 +1067,16 @@ Wanted? wantedOrder(const SelectPlan p) {
   if (p.srcs.len() != 1 || p.distinct || p.compound is not null) { return null; }
   if (!p.aggregate) {
     if (p.order.len() == 0) { return null; }
-    return Wanted(p.order as Node[], p.desc as bool[], p.nulls as i32[], false);
+    return Wanted(p.order as Node[], p.desc as bool[], p.nulls as i32[], p.orderColl as i32[], false);
   }
   if (p.groupBy.len() != 0 || p.aggs.len() != 1 || p.having is not null) { return null; }
   const AggSpec a = p.aggs.get(0);
   if ((a.name != "min" && a.name != "max") || a.args.len() != 1 || a.distinct) { return null; }
   match (a.args[0]) {
-    NCol(d, src, col, aff): {
+    NCol(d, src, col, aff, coll): {
       if (d != 0 || src != 0) { return null; }
       // Ascending puts NULLs first, which min() skips; descending puts them last.
-      return Wanted([a.args[0] as Node], [a.name == "max"], [0], true);
+      return Wanted([a.args[0] as Node], [a.name == "max"], [0], [ownColl(a.args[0])], true);
     }
     default: { return null; }
   }
@@ -1041,11 +1090,12 @@ i32 orderFromIndex(const Wanted w, const Index ix, i32 from) {
   for (i32 i = 0; i < w.order.len(); i++) {
     if (w.nulls[i] != 0) { return 0; }
     match (w.order[i]) {
-      NCol(d, s, col, aff): {
+      NCol(d, s, col, aff, coll): {
         if (d != 0 || s != 0 || col != ix.cols[from + i]) { return 0; }
       }
       default: { return 0; }
     }
+    if (i < w.colls.len() && w.colls[i] != ix.colls[from + i]) { return 0; }
     i32 want = (w.desc[i] != ix.desc[from + i]) ? 2 : 1;
     if (dir == 0) { dir = want; } else if (dir != want) { return 0; }
   }
@@ -1055,7 +1105,7 @@ i32 orderFromIndex(const Wanted w, const Index ix, i32 from) {
 i32 orderFromRowid(const Wanted w, const Table t) {
   if (w.order.len() != 1 || w.nulls[0] != 0) { return 0; }
   match (w.order[0]) {
-    NCol(d, s, col, aff): {
+    NCol(d, s, col, aff, coll): {
       if (d != 0 || s != 0 || (col != -1 && col != t.rowidAlias)) { return 0; }
       return w.desc[0] ? 2 : 1;
     }
@@ -1093,8 +1143,8 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
   for (i32 j = 0; j < ixs.len(); j++) {
     Index ix = ixs[j];
     i32 eq = 0;
-    while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=") >= 0) { eq++; }
-    bool range = eq < ix.cols.len() && !ix.desc[eq] && hasRange(probes, ix.cols[eq]);
+    while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=", ix.colls[eq]) >= 0) { eq++; }
+    bool range = eq < ix.cols.len() && !ix.desc[eq] && hasRange(probes, ix.cols[eq], ix.colls[eq]);
     i32 score = eq * 4 + (range ? 2 : 0);
     if (wantOrder && orderFromIndex(w!, ix, eq) != 0) { score++; }
     if (score > bestScore) { best = ix; bestScore = score; }
@@ -1107,9 +1157,9 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
   if (best is not null && bestScore >= 2) {
     Index ix = best!;
     i32 eq = 0;
-    while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=") >= 0) { eq++; }
+    while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=", ix.colls[eq]) >= 0) { eq++; }
     Value[] key = Value[].filled(eq, Value.Null);
-    for (i32 i = 0; i < eq; i++) { key[i] = probes.get(findProbe(probes, ix.cols[i], "=")).v; }
+    for (i32 i = 0; i < eq; i++) { key[i] = probes.get(findProbe(probes, ix.cols[i], "=", ix.colls[i])).v; }
     i32 lo = ix.lowerBound(key);
     i32 hi = ix.upperBound(key);
     if (eq < ix.cols.len() && !ix.desc[eq]) {
@@ -1118,7 +1168,7 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
       bool bounded = false;
       for (i32 i = 0; i < probes.len(); i++) {
         Probe pr = probes.get(i);
-        if (pr.col != col || pr.op == "=") { continue; }
+        if (pr.col != col || pr.op == "=" || pr.coll != ix.colls[eq]) { continue; }
         Value[] k2 = Value[].filled(eq + 1, Value.Null);
         k2.copyFrom(key, 0, 0, eq);
         k2[eq] = pr.v;
@@ -1177,16 +1227,16 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
   return Result.Ok(Access(null, lo, hi, dir == 2, dir != 0, false));
 }
 
-i32 findProbe(const Vec<Probe> probes, i32 col, string op) {
+i32 findProbe(const Vec<Probe> probes, i32 col, string op, i32 coll) {
   for (i32 i = 0; i < probes.len(); i++) {
-    if (probes.get(i).col == col && probes.get(i).op == op) { return i; }
+    if (probes.get(i).col == col && probes.get(i).op == op && probes.get(i).coll == coll) { return i; }
   }
   return -1;
 }
 
-bool hasRange(const Vec<Probe> probes, i32 col) {
+bool hasRange(const Vec<Probe> probes, i32 col, i32 coll) {
   for (i32 i = 0; i < probes.len(); i++) {
-    if (probes.get(i).col == col && probes.get(i).op != "=") { return true; }
+    if (probes.get(i).col == col && probes.get(i).op != "=" && probes.get(i).coll == coll) { return true; }
   }
   return false;
 }
@@ -1254,7 +1304,10 @@ Result<void, SqlError> emit(SelectPlan p, Ctx c, Exec x, Sink sink) {
   if (p.aggregate) {
     Value[] gk = Value[].filled(p.groupBy.len(), Value.Null);
     for (i32 i = 0; i < gk.len(); i++) { gk[i] = try eval(p.groupBy[i], c, x); }
-    u8[] kb = keyBytes(gk);
+    // Values equal under the grouping expression's collation fall in one group.
+    Value[] ck = Value[].filled(gk.len(), Value.Null);
+    for (i32 i = 0; i < gk.len(); i++) { ck[i] = collated(gk[i], ownColl(p.groupBy[i])); }
+    u8[] kb = keyBytes(ck);
     i32? gi = sink.groupIndex.get(kb);
     Group g;
     if (gi is null) {
@@ -1271,7 +1324,9 @@ Result<void, SqlError> emit(SelectPlan p, Ctx c, Exec x, Sink sink) {
     for (i32 i = 0; i < p.aggs.len(); i++) {
       if (try step(p.aggs.get(i), g.states[i], c, x)) { improved = true; }
     }
-    if (repFromBest ? improved : true) { g.rep = copyRows(c.rows); }
+    // A bare column takes the group's first row, as SQLite 3.53 does — unless a lone min() or max()
+    // says which row it comes from.
+    if (repFromBest && improved) { g.rep = copyRows(c.rows); }
     if (sink.minMaxStop && g.states[0].best is not null) { sink.done = true; }
     return Result.Ok();
   }
@@ -1331,7 +1386,7 @@ Result<bool, SqlError> step(const AggSpec a, AggState s, Ctx c, Exec x) {
   }
   if (a.kind == AGG_MINMAX) {
     if (s.best is null) { s.best = v; return Result.Ok(true); }
-    i32 cmp = compareValues(v, s.best!);
+    i32 cmp = compareColl(v, s.best!, ownColl(a.args[0]));
     if ((n == "max" && cmp > 0) || (n == "min" && cmp < 0)) { s.best = v; return Result.Ok(true); }
     return Result.Ok(false);
   }
@@ -1410,7 +1465,7 @@ i32 compareKeys(const SelectPlan p, const Value[] a, const Value[] b) {
       c = an ? (nullsFirst ? -1 : 1) : (nullsFirst ? 1 : -1);
       return c;
     }
-    c = compareValues(a[i], b[i]);
+    c = i < p.orderColl.len() ? compareColl(a[i], b[i], p.orderColl[i]) : compareValues(a[i], b[i]);
     if (c != 0) { return p.desc[i] ? -c : c; }
   }
   return 0;
@@ -1575,12 +1630,26 @@ Vec<Value[]> sortedSet(Vec<Value[]> rows) {
   return out;
 }
 
-void dedupe(Vec<Value[]> rows, Vec<Value[]> keys) {
+// Each row with its columns as their collations see them, for finding duplicates.
+u8[] collKey(const Value[] row, const i32[] colls) {
+  if (colls.len() == 0) { return keyBytes(row); }
+  Value[] v = Value[].filled(row.len(), Value.Null);
+  for (i32 i = 0; i < row.len(); i++) { v[i] = i < colls.len() ? collated(row[i], colls[i]) : row[i]; }
+  return keyBytes(v);
+}
+
+i32[] resultColls(const SelectPlan p) {
+  i32[] out = i32[].filled(p.results.len(), COLL_BINARY);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ownColl(p.results[i]); }
+  return out;
+}
+
+void dedupe(Vec<Value[]> rows, Vec<Value[]> keys, const i32[] colls) {
   Map<u8[], bool> seen = Map.create(hashBytes, bytesEq);
   Vec<Value[]> r2;
   Vec<Value[]> k2;
   for (i32 i = 0; i < rows.len(); i++) {
-    u8[] k = keyBytes(rows.get(i));
+    u8[] k = collKey(rows.get(i), colls);
     if (seen.has(k)) { continue; }
     seen.set(k, true);
     r2.push(rows.get(i));
@@ -1601,14 +1670,14 @@ export Result<Vec<Value[]>, SqlError> runPlan(SelectPlan p, Ctx outer, Exec x) {
   Sink first = try runCore(p, outer, x, p.distinct ? -1 : stopAt);
   Vec<Value[]> rows = first.rows;
   Vec<Value[]> keys = first.keys;
-  if (p.distinct) { dedupe(rows, keys); }
+  if (p.distinct) { dedupe(rows, keys, resultColls(p)); }
   // A compound: combine the parts left to right.
   (const SelectPlan)? part = p;
   while (part!.compound is not null) {
     string op = part!.compound!;
     SelectPlan nextPlan = part!.next! as SelectPlan;
     Sink s2 = try runCore(nextPlan, outer, x, -1);
-    if (nextPlan.distinct) { dedupe(s2.rows, s2.keys); }
+    if (nextPlan.distinct) { dedupe(s2.rows, s2.keys, resultColls(nextPlan)); }
     if (op == "UNION ALL") {
       for (i32 i = 0; i < s2.rows.len(); i++) { rows.push(s2.rows.get(i)); keys.push(rekey(p, s2.rows.get(i))); }
     } else if (op == "UNION") {

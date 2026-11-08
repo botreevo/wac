@@ -2,16 +2,16 @@
 
 import { Result, Vec, Map, hashString, stringEq } from "core";
 import { SqlError } from "./error.wac";
-import { Value } from "./value.wac";
+import { Value, collationId } from "./value.wac";
 import { encodeRecord, decodeRecord } from "./record.wac";
 import { put16, put32 } from "./bytes.wac";
 import { openImage, Image, readTable, readIndex, RawRow, decode, MAGIC } from "./reader.wac";
 import { Pages, buildTable, buildIndex } from "./writer.wac";
 import { Chunked } from "./chunked.wac";
 import { parseOne } from "./parser.wac";
-import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef } from "./ast.wac";
+import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef, TableConstraint, ForeignKeyDef } from "./ast.wac";
 import { lower, upper } from "./lexer.wac";
-import { Column, Row, Index, Entry, Table, View, SchemaEntry, affinityOf, AFF_REAL } from "./schema.wac";
+import { Column, Row, Index, Entry, Table, View, SchemaEntry, ForeignKey, affinityOf, AFF_REAL } from "./schema.wac";
 
 // What version of SQLite the file claims was the last to write it. Readers only print it.
 static i64 SQLITE_VERSION_NUMBER = 3045000;
@@ -69,6 +69,8 @@ export struct Database {
   }
 }
 
+SqlError err0(string m) { return SqlError("error", m); }
+
 // A constant default: a literal, possibly negated. Anything else is refused where a default must be
 // constant, and evaluated per row by the engine where it need not be.
 export Value? constValue(const Expr e) {
@@ -96,9 +98,14 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
   Vec<Column> cols;
   for (i32 i = 0; i < c.cols.len(); i++) {
     const ColumnDef d = c.cols[i];
-    cols.push(Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt));
+    i32 coll = 0;
+    if (d.collate is not null) {
+      coll = collationId(d.collate!);
+      if (coll < 0) { return Result.Err(err0("no such collation sequence: \{d.collate!}")); }
+    }
+    cols.push(Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt, coll));
   }
-  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create());
+  Table t = Table(c.name, c.sql, cols.toArray(), -1, false, Vec.create(), Expr[](), ForeignKey[](), i32[]());
   i32 pkCount = 0;
   for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].primaryKey) { pkCount++; } }
   for (i32 i = 0; i < c.constraints.len(); i++) {
@@ -115,15 +122,17 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
       } else {
         if (d.autoincrement) { return Result.Err(SqlError.schema("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")); }
         n++;
-        autos.push(autoIndex(c.name, n, [i]));
+        autos.push(autoIndex(t, n, [i]));
       }
     }
     if (d.unique) {
       n++;
-      autos.push(autoIndex(c.name, n, [i]));
+      autos.push(autoIndex(t, n, [i]));
     }
   }
   for (i32 i = 0; i < c.constraints.len(); i++) {
+    // Only keys make indexes; CHECK and FOREIGN KEY constraints are handled below.
+    if (c.constraints[i].kind != "UNIQUE" && c.constraints[i].kind.indexOf("PRIMARY KEY") != 0) { continue; }
     const string[] names = c.constraints[i].cols;
     i32[] pos = i32[].filled(names.len(), 0);
     for (i32 k = 0; k < names.len(); k++) {
@@ -137,27 +146,64 @@ export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) 
       continue;
     }
     n++;
-    autos.push(autoIndex(c.name, n, pos));
+    autos.push(autoIndex(t, n, pos));
   }
+  // CHECK constraints, from the columns then the table, and foreign keys likewise.
+  Vec<Expr> checks;
+  Vec<ForeignKey> fks;
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    const ColumnDef d = c.cols[i];
+    for (i32 k = 0; k < d.checks.len(); k++) { checks.push(d.checks[k] as Expr); }
+    if (d.fk is not null) { fks.push(fkFrom([i], d.fk!)); }
+    if (d.primaryKey) { t.pk = [i]; }
+  }
+  for (i32 i = 0; i < c.constraints.len(); i++) {
+    const TableConstraint tc = c.constraints[i];
+    if (tc.check is not null) { checks.push(tc.check! as Expr); }
+    if (tc.kind.indexOf("PRIMARY KEY") == 0 || tc.kind == "FOREIGN KEY") {
+      i32[] pos = i32[].filled(tc.cols.len(), 0);
+      for (i32 k = 0; k < tc.cols.len(); k++) {
+        pos[k] = t.colIndex(tc.cols[k]);
+        if (pos[k] < 0) { return Result.Err(SqlError.schema("unknown column \"\{tc.cols[k]}\" in foreign key definition")); }
+      }
+      if (tc.kind == "FOREIGN KEY") { fks.push(fkFrom(pos, tc.fk!)); } else { t.pk = pos; }
+    }
+  }
+  t.checks = checks.toArray();
+  t.fks = fks.toArray();
   // A primary key's column is NOT NULL in effect only for the rowid alias; elsewhere SQLite allows
   // NULL there, for compatibility, and so does this.
   return Result.Ok(t);
 }
 
-Index autoIndex(string table, i32 n, i32[] cols) {
-  return Index("sqlite_autoindex_\{table}_\{n}", table, null, cols, bool[].filled(cols.len(), false), true, Chunked<Entry>.create());
+// A constraint's index compares each column by the column's own collation.
+ForeignKey fkFrom(i32[] cols, const ForeignKeyDef d) {
+  return ForeignKey(cols, d.parent, d.parentCols as string[], d.onDelete, d.onUpdate, d.deferred);
+}
+
+Index autoIndex(Table t, i32 n, i32[] cols) {
+  i32[] colls = i32[].filled(cols.len(), 0);
+  for (i32 i = 0; i < cols.len(); i++) { colls[i] = t.cols[cols[i]].coll; }
+  return Index("sqlite_autoindex_\{t.name}_\{n}", t.name, null, cols, bool[].filled(cols.len(), false), colls, true,
+               Chunked<Entry>.create());
 }
 
 export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
   i32[] pos = i32[].filled(c.cols.len(), 0);
   bool[] desc = bool[].filled(c.cols.len(), false);
+  i32[] colls = i32[].filled(c.cols.len(), 0);
   for (i32 i = 0; i < c.cols.len(); i++) {
     pos[i] = t.colIndex(c.cols[i].name);
     if (pos[i] < 0) { return Result.Err(SqlError.schema("no such column: \{c.cols[i].name}")); }
     desc[i] = c.cols[i].desc;
+    colls[i] = t.cols[pos[i]].coll;
+    if (c.cols[i].collate is not null) {
+      colls[i] = collationId(c.cols[i].collate!);
+      if (colls[i] < 0) { return Result.Err(err0("no such collation sequence: \{c.cols[i].collate!}")); }
+    }
   }
   if (c.where is not null) { return Result.Err(SqlError.unsupported("partial indexes")); }
-  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, c.unique, Chunked<Entry>.create()));
+  return Result.Ok(Index(c.name, t.name, c.sql, pos, desc, colls, c.unique, Chunked<Entry>.create()));
 }
 
 // A row as the file has it, widened to the table's columns: a row written before ALTER TABLE ADD COLUMN

@@ -4,7 +4,7 @@ import { Result, Vec, Map, hashString, stringEq, NumberLiteral, numberLiteralToF
 import { SqlError } from "./error.wac";
 import { Value } from "./value.wac";
 import { Token, tokenize, upper, lower, T_IDENT, T_STRING, T_INTEGER, T_FLOAT, T_BLOB, T_PARAM, T_OP, T_EOF } from "./lexer.wac";
-import { Cte, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
+import { Cte, ForeignKeyDef, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
          CreateIndex, Assign, Upsert, Insert, Update, Delete, Stmt, JOIN_FIRST, JOIN_INNER, JOIN_LEFT,
          JOIN_CROSS, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
 
@@ -917,13 +917,11 @@ export struct Parser {
       if (c.kind != T_IDENT && c.kind != T_STRING) { return Result.Err(SqlError.unsupported("indexes on expressions")); }
       this.pos++;
       if (this.isOp("(") || this.isOp(".")) { return Result.Err(SqlError.unsupported("indexes on expressions")); }
-      if (this.eatKw("COLLATE")) {
-        string coll = lower(try this.name());
-        if (coll != "binary") { return Result.Err(SqlError.unsupported("collation \{coll}")); }
-      }
+      string? coll = null;
+      if (this.eatKw("COLLATE")) { coll = lower(try this.name()); }
       bool desc = false;
       if (this.eatKw("DESC")) { desc = true; } else { this.eatKw("ASC"); }
-      cols.push(IndexCol(c.text, desc));
+      cols.push(IndexCol(c.text, desc, coll));
       if (!this.eatOp(",")) { break; }
     }
     try this.expectOp(")");
@@ -954,7 +952,12 @@ export struct Parser {
         c.unique = true;
         try this.conflictClause();
       } else if (this.eatKw("CHECK")) {
-        try this.skipParens();
+        try this.expectOp("(");
+        Expr e = try this.expr();
+        try this.expectOp(")");
+        Vec<Expr> cs = Vec.fromArray(c.checks);
+        cs.push(e);
+        c.checks = cs.toArray();
       } else if (this.eatKw("DEFAULT")) {
         if (this.isOp("(")) {
           this.pos++;
@@ -967,9 +970,8 @@ export struct Parser {
         }
       } else if (this.eatKw("COLLATE")) {
         c.collate = lower(try this.name());
-        if (c.collate! != "binary") { return Result.Err(SqlError.unsupported("collation \{c.collate!}")); }
       } else if (this.eatKw("REFERENCES")) {
-        try this.foreignKeyRest();
+        c.fk = try this.foreignKeyRest();
       } else if (this.isKw("GENERATED") || this.isKw("AS")) {
         return Result.Err(SqlError.unsupported("generated columns"));
       } else {
@@ -998,25 +1000,32 @@ export struct Parser {
     return Result.Ok();
   }
 
-  // Foreign keys are parsed and kept in the schema text, and neg enforced, which is SQLite's default too
-  // (`PRAGMA foreign_keys` is off unless a connection turns it on).
-  Result<void, SqlError> foreignKeyRest(this) {
-    try this.name();
-    if (this.isOp("(")) { try this.nameList(); }
+  // What follows REFERENCES. The keys are enforced only while PRAGMA foreign_keys is on, which is
+  // SQLite's default too.
+  Result<ForeignKeyDef, SqlError> foreignKeyRest(this) {
+    ForeignKeyDef fk = ForeignKeyDef { parent: try this.name(), parentCols: string[]() };
+    if (this.isOp("(")) { fk.parentCols = try this.nameList(); }
     while (true) {
       if (this.eatKw("ON")) {
-        this.advance();
-        if (this.eatKw("SET")) { this.advance(); }
-        else if (this.eatKw("NO")) { try this.expectKw("ACTION"); }
-        else { this.advance(); }
+        bool del = this.eatKw("DELETE");
+        if (!del) { try this.expectKw("UPDATE"); }
+        string action = "NO ACTION";
+        if (this.eatKw("SET")) {
+          if (this.eatKw("NULL")) { action = "SET NULL"; } else { try this.expectKw("DEFAULT"); action = "SET DEFAULT"; }
+        } else if (this.eatKw("CASCADE")) { action = "CASCADE"; }
+        else if (this.eatKw("RESTRICT")) { action = "RESTRICT"; }
+        else { try this.expectKw("NO"); try this.expectKw("ACTION"); }
+        if (del) { fk.onDelete = action; } else { fk.onUpdate = action; }
       } else if (this.eatKw("MATCH")) {
         try this.name();
       } else if (this.isKw("DEFERRABLE") || (this.isKw("NOT") && this.isKwAt(1, "DEFERRABLE"))) {
-        this.eatKw("NOT");
+        bool never = this.eatKw("NOT");
         this.pos++;
-        if (this.eatKw("INITIALLY")) { this.advance(); }
+        bool deferred = false;
+        if (this.eatKw("INITIALLY")) { deferred = this.eatKw("DEFERRED"); if (!deferred) { this.eatKw("IMMEDIATE"); } }
+        fk.deferred = deferred && !never;
       } else {
-        return Result.Ok();
+        return Result.Ok(fk);
       }
     }
   }
@@ -1036,17 +1045,20 @@ export struct Parser {
         string[] names = try this.nameList();
         bool auto = this.eatKw("AUTOINCREMENT");
         try this.conflictClause();
-        cons.push(TableConstraint(auto ? "PRIMARY KEY AUTOINCREMENT" : "PRIMARY KEY", names));
+        cons.push(TableConstraint(auto ? "PRIMARY KEY AUTOINCREMENT" : "PRIMARY KEY", names, null, null));
       } else if (this.eatKw("UNIQUE")) {
-        cons.push(TableConstraint("UNIQUE", try this.nameList()));
+        cons.push(TableConstraint("UNIQUE", try this.nameList(), null, null));
         try this.conflictClause();
       } else if (this.eatKw("CHECK")) {
-        try this.skipParens();
+        try this.expectOp("(");
+        Expr e = try this.expr();
+        try this.expectOp(")");
+        cons.push(TableConstraint("CHECK", string[](), e, null));
       } else if (this.eatKw("FOREIGN")) {
         try this.expectKw("KEY");
-        try this.nameList();
+        string[] fcols = try this.nameList();
         try this.expectKw("REFERENCES");
-        try this.foreignKeyRest();
+        cons.push(TableConstraint("FOREIGN KEY", fcols, null, try this.foreignKeyRest()));
       } else {
         if (cons.len() > 0) { return Result.Err(this.fail("a column after a table constraint")); }
         cols.push(try this.columnDef());

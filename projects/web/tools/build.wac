@@ -106,6 +106,11 @@ Asked askedOf(string[] argv) {
       for (string g in names) {
         if (g == "read") { a.grants = a.grants | 1; }
         else if (g == "write") { a.grants = a.grants | 2; }
+        // **WebRTC data channels** (`wac.webrtc`, `src/webrtc.wac`): peer connections the program makes and the
+        // document holds. Not a socket and not a fetch — the peer is reached through ICE and DTLS, so the content
+        // security policy, which governs neither, is unchanged; what the grant decides is whether the program is
+        // offered the capability at all.
+        else if (g == "webrtc") { a.grants = a.grants | 4; }
         else { a.title = "unknown grant: " + g; a.entry = ""; }
       }
       i += 2;
@@ -233,7 +238,7 @@ export string base64(u8[] bytes) {
  * on the page — and touches nothing of the document itself; a frame is the document's to give, and the clock and
  * timers are the system's.
  *
- * `wacPageServer(next, answer, post, where, site)` answers the lookup and the capability's range, passes every
+ * `wacPageServer(next, answer, post, where, site, rtc)` answers the lookup and the capability's range, passes every
  * other request to `next`, sends the document what `post` takes, and starts at location `where`; it answers
  * `request`, and `receive` for what the document sends back. `site` is the page's own URL, or null for a page opened
  * from a file: what `wac.site` (`src/site.wac`) fetches from, relative to it and never outside its folder. A buffer is handed over rather than copied when it is the whole
@@ -241,7 +246,7 @@ export string base64(u8[] bytes) {
  */
 export string programSide() {
   return """
-      const wacPageServer = (next, answer, post, where, site) => {
+      const wacPageServer = (next, answer, post, where, site, rtc) => {
         // **Where `wac.page`'s numbers start here** — above every request std numbers, below the 2^20 a parent
         // numbers the capabilities it provides from.
         const BASE = 4096, COUNT = 23;
@@ -370,7 +375,49 @@ export string programSide() {
           if (exact) return want.join(".") === here.join(".");
           return want[0] === here[0] && (want[1] < here[1] || (want[1] === here[1] && want[2] <= here[2]));
         };
+        // **`wac.webrtc`** (`src/webrtc.wac`): peer connections and data channels, held by the document — a worker has
+        // no RTCPeerConnection — and named by numbers the program side gives out, so making one answers at once. What
+        // takes the browser a while (an offer, a description set) is answered when the document says so, and every
+        // event of a connection waits in its own queue until the program asks for the next one.
+        const RTC = BASE + 200, RTC_COUNT = 9;
+        const rtcAsks = new Map(), rtcEvents = new Map(), rtcNext = new Map();
+        let rtcIds = 0, rtcReq = 0;
+        const rtcFlush = (pc) => {
+          const q = rtcEvents.get(pc) ?? [], w = rtcNext.get(pc) ?? [];
+          while (q.length && w.length) {
+            const [kind, dc, data, buffered] = q.shift();
+            answer(w.shift(), 0, kind, data, BigInt(dc), BigInt(buffered), 0);
+          }
+        };
+        const rtcAsk = (id, m) => { const req = ++rtcReq; rtcAsks.set(req, id); send([...m, req]); };
+        const rtcOp = (k, id, a, b, text, bytes) => {
+          switch (k) {
+            case 0: { const pc = ++rtcIds; rtcEvents.set(pc, []); rtcNext.set(pc, []);
+                      send(["rtcNew", pc, text]); return answer(id, 0, "", NONE, BigInt(pc), 0n, 0); }
+            case 1: { const dc = ++rtcIds; send(["rtcChannel", lo(a), dc, text, dec.decode(bytes)]);
+                      return answer(id, 0, "", NONE, BigInt(dc), 0n, 0); }
+            case 2: return rtcAsk(id, ["rtcOffer", lo(a)]);
+            case 3: return rtcAsk(id, ["rtcLocal", lo(a), text, dec.decode(bytes)]);
+            case 4: return rtcAsk(id, ["rtcRemote", lo(a), text, dec.decode(bytes)]);
+            // Told, not asked: a send, a close and an end answer nothing (their id is 0).
+            case 5: return send(["rtcSend", lo(a), bytes], wacOwn(bytes));
+            case 6: return send(["rtcClose", lo(a)]);
+            case 7: return send(["rtcEnd", lo(a)]);
+            case 8: { const pc = lo(a); (rtcNext.get(pc) ?? []).push(id); return queueMicrotask(() => rtcFlush(pc)); }
+          }
+        };
         const request = (op, id, a, b, text, bytes) => {
+          if (op === 68 && text === "wac.webrtc") {
+            if (!rtc) return answer(id, 9, "this page was not built with --grant webrtc", NONE, 0n, 0n, 0);
+            if (typeof RTCPeerConnection === "undefined" && typeof window !== "undefined") {
+              return answer(id, 9, "this browser has no RTCPeerConnection", NONE, 0n, 0n, 0);
+            }
+            const v = dec.decode(bytes);
+            const want = (v.startsWith("^") ? v.slice(1) : v).split(".");
+            if (want[0] !== "1") return answer(id, 9, "wac.webrtc here is 1.0.0, which " + v + " does not allow", NONE, 0n, 0n, 0);
+            return answer(id, 0, "1.0.0", NONE, BigInt(RTC), BigInt(RTC_COUNT), 0);
+          }
+          if (op >= RTC && op < RTC + RTC_COUNT) return rtcOp(op - RTC, id, a, b, text, bytes);
           if (op === 68 && text === "wac.site") {
             if (siteDir === null) return answer(id, 9, "a page opened from a file has no site", NONE, 0n, 0n, 0);
             if (!allows(dec.decode(bytes))) return answer(id, 9, "wac.site here is 1.1.0, which " + dec.decode(bytes) + " does not allow", NONE, 0n, 0n, 0);
@@ -393,6 +440,11 @@ export string programSide() {
         };
         const receive = (m) => {
           switch (m[0]) {
+            case "rtcEvent": { const [, pc, kind, dc, data, buffered] = m;
+                               (rtcEvents.get(pc) ?? []).push([kind, dc, data, buffered]); return rtcFlush(pc); }
+            case "rtcAnswer": { const [, req, ok, text] = m; const id = rtcAsks.get(req); rtcAsks.delete(req);
+                                if (id !== undefined) answer(id, ok ? 0 : 5, ok ? "" : text, ok ? enc.encode(text) : NONE, 0n, 0n, 0);
+                                return; }
             case "el": events.push(m.slice(1)); return flush();
             case "file": files.push(m.slice(1)); return flush();
             case "where": at = m[1]; return located();
@@ -1116,7 +1168,7 @@ export string moduleSide() {
       // location `where`, and answers `receive` for what the document sends back.
       const wacPage = (wasm, grants, post, where, site) => {
         const me = { child: false, args: [], cwd: "/", post: null };
-        const top = wacRun(wasm, me, grants, (next, answer) => wacPageServer(next, answer, post, where, site), (text) => console.error(text));
+        const top = wacRun(wasm, me, grants, (next, answer) => wacPageServer(next, answer, post, where, site, (grants & 4) !== 0), (text) => console.error(text));
         return top === null ? () => {} : top.receive;
       };
       """;
@@ -1192,7 +1244,67 @@ export string documentSide() {
         // What an element filling the window, where there is no full screen, is styled with: above everything, edge to edge.
         const WAC_FILL = [["position", "fixed"], ["inset", "0"], ["z-index", "2147483647"], ["width", "auto"],
                           ["height", "auto"], ["margin", "0"], ["max-width", "none"], ["max-height", "none"]];
+        // **`wac.webrtc`'s other half**: the peer connections and channels themselves, which only a document has. Each
+        // is named by the number the program side gave it; a channel the peer opens is given one from a range of the
+        // document's own (2^20 up), so the two never collide. Every event goes back as `rtcEvent`, every answer to an
+        // offer or a description as `rtcAnswer`.
+        const pcs = new Map(), dcs = new Map(), rtcReporting = new Set();
+        let rtcTheirs = 1 << 20;
+        const rtcBytes = (d) => typeof d === "string" ? new TextEncoder().encode(d) : new Uint8Array(d);
+        const rtcWire = (pc, dc, ch) => {
+          dcs.set(dc, ch);
+          ch.__wacPc = pc;
+          ch.binaryType = "arraybuffer";
+          // Half of the megabyte a writer stops at: one stopped there has a queue above this, so its fall below it is a
+          // crossing the browser announces.
+          ch.bufferedAmountLowThreshold = 524288;
+          const ev = (kind, data) => emit(["rtcEvent", pc, kind, dc, data ?? new Uint8Array(0), ch.bufferedAmount]);
+          ch.onopen = () => ev("open");
+          ch.onmessage = (e) => ev("message", rtcBytes(e.data));
+          ch.onclose = () => ev("close");
+          ch.onerror = (e) => ev("error", new TextEncoder().encode(String(e?.error?.message ?? "data channel error")));
+          ch.onbufferedamountlow = () => ev("low");
+          if (ch.readyState === "open") ev("open");
+        };
+        const rtcDone = (req, p) => p.then((v) => emit(["rtcAnswer", req, true, v ?? ""]),
+                                           (e) => emit(["rtcAnswer", req, false, String(e?.message ?? e)]));
         const ops = {
+          rtcNew: (pc, config) => {
+            // A document with no RTCPeerConnection (WebKitGTK's has none) says so as the connection's state.
+            if (typeof RTCPeerConnection === "undefined") {
+              return emit(["rtcEvent", pc, "state", 0, new TextEncoder().encode("unsupported"), 0]);
+            }
+            const c = new RTCPeerConnection(config ? JSON.parse(config) : {});
+            pcs.set(pc, c);
+            c.onconnectionstatechange = () => emit(["rtcEvent", pc, "state", 0, new TextEncoder().encode(c.connectionState), 0]);
+            c.ondatachannel = (e) => {
+              const dc = ++rtcTheirs;
+              rtcWire(pc, dc, e.channel);
+              emit(["rtcEvent", pc, "channel", dc, new TextEncoder().encode(e.channel.label), 0]);
+            };
+          },
+          rtcChannel: (pc, dc, label, opts) => {
+            const c = pcs.get(pc);
+            if (c) rtcWire(pc, dc, c.createDataChannel(label, opts ? JSON.parse(opts) : {}));
+          },
+          rtcOffer: (pc, req) => rtcDone(req, pcs.get(pc).createOffer().then((o) => o.sdp)),
+          rtcLocal: (pc, type, sdp, req) => rtcDone(req, pcs.get(pc).setLocalDescription({ type, sdp }).then(() => "")),
+          rtcRemote: (pc, type, sdp, req) => rtcDone(req, pcs.get(pc).setRemoteDescription({ type, sdp }).then(() => "")),
+          // **And what is queued, once a turn after sending.** `bufferedamountlow` fires only on a crossing, and a
+          // channel the browser drains as fast as it is filled never crosses — so a program counting what it sent,
+          // corrected only by that event, would count up to its bound and wait for ever.
+          rtcSend: (dc, bytes) => {
+            const ch = dcs.get(dc);
+            try { ch?.send(bytes); } catch {}
+            if (!ch || rtcReporting.has(dc)) return;
+            rtcReporting.add(dc);
+            queueMicrotask(() => {
+              rtcReporting.delete(dc);
+              emit(["rtcEvent", ch.__wacPc, "low", dc, new Uint8Array(0), ch.bufferedAmount]);
+            });
+          },
+          rtcClose: (dc) => { try { dcs.get(dc)?.close(); } catch {} },
+          rtcEnd: (pc) => { try { pcs.get(pc)?.close(); } catch {} pcs.delete(pc); },
           make: (id, parent, tag, before) => {
             // `#shadow` is the parent's shadow root, opened — a page of its own inside it (`Element.shadow`).
             if (tag === "#shadow") {

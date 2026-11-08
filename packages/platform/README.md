@@ -88,7 +88,7 @@ JavaScript hosts; `native/` holds the two Rust ones. They serve this table, whic
 | 57 | `CLOSE_SEND` | `Socket.closeSend` | — |
 | 59 | `EXEC` | `Procs.exec` — a **host program**, which `spawn` is not; a page has no form of it | `--allow-run` |
 | 60 | `CHMOD` | `Files.chmod` | `--allow-write` |
-| 61 | `OPEN_FILE` | `Files.openRead`, `openWrite`, `openAppend` | `--allow-read` to read, `--allow-write` to write |
+| 61 | `OPEN_FILE` | `Files.openRead`, `openWrite`, `openAppend`, `openRandom` | `--allow-read` to read, `--allow-write` to write |
 | 62 | `CLOSE_FILE` | `close` on a file's `Input` or `Output` | — |
 | 63 | `CLOSE_OUTPUT` | `close` on `sys.stdout()` or `sys.stderr()` | — |
 | 64 | `LOAD` | `Modules.load` | — (a module runs in this program, with what you hand it) |
@@ -96,6 +96,11 @@ JavaScript hosts; `native/` holds the two Rust ones. They serve this table, whic
 | 66 | `UNLOAD` | `Module.unload` | — |
 | 67 | `VALIDATE` | `Modules.validate` | — (compiles, and nothing more) |
 | 68 | `CAPABILITY` | `capability(host, name, versions)` | — (no host provides one yet; a parent serving a child may) |
+| 69 | `READ_AT` | `RandomFile.readAt` — bytes at an offset, fewer at the end | — (the file was granted when opened) |
+| 70 | `WRITE_AT` | `RandomFile.writeAt` — bytes at an offset, the file growing to hold them | — |
+| 71 | `FILE_SIZE` | `RandomFile.size` | — |
+| 72 | `TRUNCATE_FILE` | `RandomFile.truncate` | — |
+| 73 | `SYNC_FILE` | `RandomFile.sync` — returns once the file's bytes are on the disk | — |
 
 What each request carries in `a`, `b`, `text` and `bytes`, and what each answer puts in which field, is
 the pair of tables in design/system/0013 — the contract a new host implements.

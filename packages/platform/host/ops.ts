@@ -109,6 +109,19 @@ export const OP = {
   VALIDATE: 67,
   // A capability by name: none yet on this host; a parent serving a child answers its lookups itself.
   CAPABILITY: 68,
+  /**
+   * A file opened with `OPEN_FILE` how 3 (read anywhere) or 4 (read and write anywhere, created if absent and never
+   * emptied) — `Files.openRandom`. Each names its handle first. `READ_AT`: offset, length → the bytes there.
+   */
+  READ_AT: 69,
+  /** Offset, bytes: written there, the file growing as it needs to. */
+  WRITE_AT: 70,
+  /** → the file's size. */
+  FILE_SIZE: 71,
+  /** The size to cut or grow it to. */
+  TRUNCATE_FILE: 72,
+  /** What was written is on the disk before this answers: `fsync`. */
+  SYNC_FILE: 73,
 } as const;
 
 /**

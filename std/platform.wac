@@ -568,6 +568,10 @@ static i32 OPEN_READ = 0;
 static i32 OPEN_WRITE = 1;
 /** `OP_OPEN_FILE`'s `a`: write after what is there, created if absent. */
 static i32 OPEN_APPEND = 2;
+/** `OP_OPEN_FILE`'s `a`: read it anywhere — `Files.openRandom(p, false)`. */
+static i32 OPEN_RANDOM_READ = 3;
+/** `OP_OPEN_FILE`'s `a`: read and write it anywhere, created if absent and never emptied — `openRandom(p, true)`. */
+static i32 OPEN_RANDOM_WRITE = 4;
 /**
  * The child reads this program's own standard input instead of the queue `send` fills.
  *
@@ -1083,6 +1087,26 @@ export struct Input {
 }
 
 /**
+ * A file open to read, and perhaps write, at any offset (`Files.openRandom`). Each call is one request to whoever
+ * opened it, and answers once it is done: a write is in the file — as far as the system is concerned — when
+ * `writeAt` answers, and on the disk itself only once `sync` has.
+ */
+export struct RandomFile {
+  /** Up to `n` bytes from `offset`: fewer only where the file ends, none past its end. */
+  fn<Ticket<Result<u8[], HostFault>>(i64, i32)> readAt;
+  /** `bytes` written from `offset`, the file growing as it needs to (any gap reads as zeros). */
+  fn<Ticket<Result<void, OutputFault>>(i64, u8[])> writeAt;
+  /** How many bytes the file holds. */
+  fn<Ticket<Result<i64, HostFault>>()> size;
+  /** The file cut (or grown with zeros) to `n` bytes. */
+  fn<Ticket<Result<void, OutputFault>>(i64)> truncate;
+  /** What was written is on the disk itself — `fsync` — before this answers. */
+  fn<Ticket<Result<void, OutputFault>>()> sync;
+  /** Done: the handle goes back. Closing twice is not an error (`§wac-std-close-r4v8ndq`). */
+  fn<Ticket<Result<void, HostFault>>()> close;
+}
+
+/**
  * A write to one of this program's two streams. **The host answers it before `request` returns** — the reason a
  * write failed comes back in the same call (design/system/0013, settled before step 5) — so the ticket is
  * settled when this returns, which is what lets a program ignore a write to stderr.
@@ -1335,6 +1359,20 @@ export struct Files {
   Ticket<Result<Output, WriteFault>> openAppend(this, string p) {
     Host h = this.via;
     return hostAsk(h, OP_OPEN_FILE(), OPEN_APPEND as i64, 0 as i64, p, u8[](), (Answer o) => openedToWrite(h, p, o));
+  }
+
+  /**
+   * The file to read — and with `write`, to change — at any offset, a piece at a time: what a database does with
+   * its file. With `write` it is created if absent and never emptied, and needs the grant a write does; without, the
+   * grant a read does. `close` it when done.
+   *
+   * The host's files answer it, and the layers over them that rename or refuse (`relativeTo`, `readOnly`, `mounted`
+   * over the host's); files a parent serves or `Files.of` answers do not, and say `Unsupported`.
+   */
+  Ticket<Result<RandomFile, WriteFault>> openRandom(this, string p, bool write) {
+    Host h = this.via;
+    i64 how = (write ? OPEN_RANDOM_WRITE : OPEN_RANDOM_READ) as i64;
+    return hostAsk(h, OP_OPEN_FILE(), how, 0 as i64, p, u8[](), (Answer o) => openedRandom(h, p, write, o));
   }
 
   Ticket<Result<Stat, LookFault>> stat(this, string p) {
@@ -2039,6 +2077,58 @@ Result<void, OutputFault> fileClosedOf(Answer o, string p) {
   return Result.Ok();
 }
 
+/** A file the host opened to read (and write) anywhere: each call a request on its handle. */
+Result<RandomFile, WriteFault> openedRandom(Host host, string p, bool write, Answer o) {
+  if (o.fault != FAULT_NONE()) { return Result.Err(writeFault(o.fault, o.text)); }
+  i64 h = o.n;
+  bool[] shut = bool[].filled(1, false);
+  return Result.Ok(RandomFile(
+    (i64 offset, i32 n) => {
+      if (shut[0]) { return readAfterClose(p); }
+      return hostAsk(host, OP_READ_AT(), h, offset, "", lengthBytes(n), (Answer x) => randomReadOf(x, p));
+    },
+    (i64 offset, u8[] bytes) => {
+      if (shut[0]) { return writeAfterClose(p); }
+      if (!write) { return writeReadOnly(p); }
+      return hostAsk(host, OP_WRITE_AT(), h, offset, "", bytes, (Answer x) => fileWrittenOf(x, p));
+    },
+    () => {
+      if (shut[0]) { return sizeAfterClose(p); }
+      return hostAsk(host, OP_FILE_SIZE(), h, 0 as i64, "", u8[](), (Answer x) => randomSizeOf(x, p));
+    },
+    (i64 n) => {
+      if (shut[0]) { return writeAfterClose(p); }
+      if (!write) { return writeReadOnly(p); }
+      return hostAsk(host, OP_TRUNCATE_FILE(), h, n, "", u8[](), (Answer x) => fileWrittenOf(x, p));
+    },
+    () => {
+      if (shut[0]) { return writeAfterClose(p); }
+      return hostAsk(host, OP_SYNC_FILE(), h, 0 as i64, "", u8[](), (Answer x) => fileWrittenOf(x, p));
+    },
+    () => closeReadOnce(host, h as~ i32, p, shut)));
+}
+
+/** `OP_READ_AT`'s length, which goes in `bytes`: four bytes, little-endian. */
+u8[] lengthBytes(i32 n) {
+  u8[] b = u8[].filled(4, 0);
+  for (i32 i = 0; i < 4; i++) { b[i] = ((n >> (8 * i)) & 0xff) as@ u8; }
+  return b;
+}
+
+Result<u8[], HostFault> randomReadOf(Answer a, string p) {
+  if (a.fault != FAULT_NONE()) { return Result.Err(hostFaultOf(a.fault, a.text == "" ? p + ": the read failed" : a.text)); }
+  return Result.Ok(a.bytes);
+}
+
+Result<i64, HostFault> randomSizeOf(Answer a, string p) {
+  if (a.fault != FAULT_NONE()) { return Result.Err(hostFaultOf(a.fault, a.text == "" ? p + ": its size is not known" : a.text)); }
+  return Result.Ok(a.n);
+}
+
+async Result<u8[], HostFault> readAfterClose(string p) { return Result.Err(Other(p + ": closed")); }
+async Result<i64, HostFault> sizeAfterClose(string p) { return Result.Err(Other(p + ": closed")); }
+async Result<void, OutputFault> writeReadOnly(string p) { return Result.Err(Unsupported(p + ": opened only to read")); }
+
 Result<void, WriteFault> writtenOf(Answer a) {
   if (a.fault != FAULT_NONE()) { return Result.Err(writeFault(a.fault, a.text)); }
   return Result.Ok();
@@ -2606,17 +2696,26 @@ bool pathRequest(i32 op) {
 }
 
 /** Whether request `op` acts on a stream's handle, in `a`. */
-bool streamRequest(i32 op) { return op == OP_RECV() || op == OP_SEND() || op == OP_CLOSE_FILE() || op == SERVED_READ_ALL; }
+bool streamRequest(i32 op) {
+  return op == OP_RECV() || op == OP_SEND() || op == OP_CLOSE_FILE() || op == SERVED_READ_ALL || randomRequest(op);
+}
+
+/** Whether request `op` is one on a file `openRandom` opened, by its handle in `a`. */
+bool randomRequest(i32 op) {
+  return op == OP_READ_AT() || op == OP_WRITE_AT() || op == OP_FILE_SIZE() || op == OP_TRUNCATE_FILE() || op == OP_SYNC_FILE();
+}
 
 /** Whether request `op` changes what is there, which a read-only view refuses. */
 bool changeRequest(i32 op, i64 a) {
-  return op == OP_WRITE_FILE() || (op == OP_OPEN_FILE() && a != OPEN_READ as i64) || op == OP_MKDIR() || op == OP_REMOVE()
+  return op == OP_WRITE_FILE() || (op == OP_OPEN_FILE() && a != OPEN_READ as i64 && a != OPEN_RANDOM_READ as i64)
+      || op == OP_MKDIR() || op == OP_REMOVE()
       || op == OP_RENAME() || op == OP_CHMOD() || op == OP_SET_EXECUTABLE() || op == SERVED_CHOWN;
 }
 
 /** Whether request `op` looks at what is there, which a write-only view refuses. */
 bool lookRequest(i32 op, i64 a) {
-  return op == OP_READ_FILE() || (op == OP_OPEN_FILE() && a == OPEN_READ as i64) || op == OP_STAT()
+  return op == OP_READ_FILE() || (op == OP_OPEN_FILE() && (a == OPEN_READ as i64 || a == OPEN_RANDOM_READ as i64
+      || a == OPEN_RANDOM_WRITE as i64)) || op == OP_STAT()
       || op == OP_LINK_STAT() || op == OP_READ_DIR();
 }
 
@@ -3170,6 +3269,11 @@ async Answer answerRequest(FileOps files, ServedStreams open, i32 op, i64 a, i64
   if (op == OP_SET_EXECUTABLE()) { return answerDone((await files.setExecutable(text, a == 1 as i64)).err()); }
   if (op == SERVED_CHOWN) { return answerDone((await files.chown(text, string.fromBytes(bytes))).err()); }
   if (op == OP_OPEN_FILE()) {
+    // A file to read and write anywhere is the host's to give; streams are all that is served here — and opening
+    // it as a stream to write would empty it.
+    if (a == OPEN_RANDOM_READ as i64 || a == OPEN_RANDOM_WRITE as i64) {
+      return Answer(FAULT_UNSUPPORTED(), text + ": files served here open as streams only", u8[](), 0 as i64, 0 as i64, 0);
+    }
     if (a == OPEN_READ as i64) {
       match (await files.openRead(text)) {
         Ok(in): {
@@ -4234,6 +4338,16 @@ export i32 OP_CHMOD() { return 60; }
 export i32 OP_OPEN_FILE() { return 61; }
 /** `a` handle. */
 export i32 OP_CLOSE_FILE() { return 62; }
+/** `a` handle of a file `openRandom` opened, `b` offset, `bytes` the length as four little-endian bytes → `bytes`. */
+export i32 OP_READ_AT() { return 69; }
+/** `a` handle, `b` offset, `bytes` what to write there. */
+export i32 OP_WRITE_AT() { return 70; }
+/** `a` handle → `n` the file's size. */
+export i32 OP_FILE_SIZE() { return 71; }
+/** `a` handle, `b` the size to cut or grow it to. */
+export i32 OP_TRUNCATE_FILE() { return 72; }
+/** `a` handle: what was written is on the disk before this answers. */
+export i32 OP_SYNC_FILE() { return 73; }
 /** `a` 1 for standard error: that stream ends while the program runs on. */
 export i32 OP_CLOSE_OUTPUT() { return 63; }
 /** `bytes` a module, `a` grants → `n` its handle. Answered at once. */

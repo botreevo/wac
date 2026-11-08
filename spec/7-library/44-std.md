@@ -299,6 +299,7 @@ struct Files {
   fn<Ticket<Result<Input, ReadFault>>(string)> openRead;         // to read a piece at a time
   fn<Ticket<Result<Output, WriteFault>>(string)> openWrite;      // created or emptied, to write a piece at a time
   fn<Ticket<Result<Output, WriteFault>>(string)> openAppend;     // created or added to
+  Ticket<Result<RandomFile, WriteFault>> openRandom(this, string p, bool write); // read and written at offsets
   fn<Ticket<Result<Stat, LookFault>>(string)> stat;
   fn<Ticket<Result<Stat, LookFault>>(string)> linkStat;          // a symbolic link itself
   fn<Ticket<Result<string[], LookFault>>(string)> readDir;
@@ -386,6 +387,30 @@ async Result<void> copyStreaming(Files fs, string from, string to) {
   }
   try await in.close();
   try await out.close();
+  return Result.Ok();
+}
+```
+
+`[§wac-std-file-random-q8v3kxn]` `openRandom` opens a file to be read, and with `write` written, at any offset, which is
+what a database or an index needs: it touches the pages it uses and leaves the rest of the file on the disk. Opening to
+write creates a file that does not exist and keeps one that does; opening only to read fails as `openRead` does, and a
+`RandomFile` opened that way refuses every change as `Unsupported`. `readAt(offset, n)` answers fewer than `n` bytes
+where the file ends, and none past it. `writeAt` grows the file to hold what it writes, and a gap it leaves reads back
+as zeros. `size`, `truncate` and `sync` answer the file's length, cut it, and return once its bytes are on the disk.
+Nothing is granted per call: the grant is asked for when the file is opened. A file a page or a parent serves opens as a
+stream only, and `openRandom` on it is `Unsupported`.
+
+```wac
+// fragment — one page of a larger file, read and written in place
+async Result<void> bumpPage(Files fs, string path, i64 page) {
+  RandomFile f = try await fs.openRandom(path, true);
+  u8[] bytes = try await f.readAt(page * 4096, 4096);
+  if (bytes.len() == 4096) {
+    bytes[0] = bytes[0] + 1;
+    try await f.writeAt(page * 4096, bytes);
+    try await f.sync();
+  }
+  try await f.close();
   return Result.Ok();
 }
 ```

@@ -1,0 +1,22 @@
+# Notes for whoever works on this next
+
+README.md says what this is and where it stands; read it first.
+
+- **Two oracles, and no expectations typed from memory where one applies.** A backward rule is checked against
+  finite differences (`Check.gradient` in `test/check.wac`); a GPU kernel against the CPU backend
+  (`example/gpucheck.wac`). Adding an operation means adding it to both. Where a test does compare with typed numbers,
+  work them out with NumPy or by hand first — three of the first expected values here were wrong, not the code.
+- **A new operation should almost never need a new kernel.** Write it in `tensor.wac` from existing operations and it
+  gets its gradient and its GPU version free. A kernel is for something no composition can do efficiently.
+- **The GPU check needs Chromium with WebGPU**: `NODE_PATH=$(npm root -g) node tools/gpucheck.js dist/gpucheck`
+  after `wac task gpucheck:build`. Headless Chromium gets WebGPU from `--enable-unsafe-webgpu --use-angle=swiftshader`
+  on a page served from localhost (not `about:blank`, which is not a secure context). `wac task shaders` prints every
+  WGSL program, for compiling them without running a model.
+- **The pin on wac-web is to its `gpu` branch**, which adds `wac.gpu` to the browser host. Until that commit is on
+  GitHub, `wac update` cannot fetch it: put it in the cache by hand — `git archive <commit> | tar -x -C
+  ~/.wac/cache/git/https%3A%2F%2Fgithub.com%2Fvoltrevo%2Fwac-web.git/<commit>` and `touch pack.pack` there, which is
+  what wac's `tools/fill-cache.sh` does.
+- **wac is pinned by the `wac` you build**: this was written against wac `701028301`. When wac gets in the way, write it
+  down in `docs/wac-asks.md` with a reproduction and work around it here.
+- Comments explain *why*, in full sentences, as wac's own do. There are no users and no legacy: when nothing needs a
+  thing, delete it.

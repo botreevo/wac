@@ -29,18 +29,19 @@ def statements(text):
     if buf.strip():
         yield buf.strip()
 
-for path in sorted(glob.glob("test/corpus/*.sql")):
-    con = sqlite3.connect(":memory:", isolation_level=None)
-    out = []
-    for st in statements(open(path).read()):
-        out.append("> " + st.splitlines()[0])
-        try:
-            cur = con.execute(st)
-            for row in cur.fetchall():
-                out.append("|".join(render(con, v) for v in row))
-        except sqlite3.Error as e:
-            out.append("error")
-    con.close()
-    with open(path[:-4] + ".out", "w") as f:
-        f.write("\n".join(out) + "\n")
-    print("wrote", path[:-4] + ".out")
+if __name__ == "__main__":
+    for path in sorted(glob.glob("test/corpus/*.sql")):
+        con = sqlite3.connect(":memory:", isolation_level=None)
+        out = []
+        for st in statements(open(path).read()):
+            out.append("> " + st.splitlines()[0])
+            try:
+                cur = con.execute(st)
+                for row in cur.fetchall():
+                    out.append("|".join(render(con, v) for v in row))
+            except sqlite3.Error as e:
+                out.append("error")
+        con.close()
+        with open(path[:-4] + ".out", "w") as f:
+            f.write("\n".join(out) + "\n")
+        print("wrote", path[:-4] + ".out")

@@ -1,0 +1,72 @@
+// A database in a file. The file is read whole when opened and written whole at every commit: to a
+// temporary file beside it, then renamed over it, so a reader never sees half a write and a crash
+// leaves the old file or the new one.
+//
+// The calls block until the file operations finish (`Ticket.wait`), which keeps the interface the same
+// as the in-memory Connection's.
+//
+// One writer at a time. SQLite's locks are not taken, so another program writing the same file at the
+// same time would lose one side's changes; readers (the real SQLite included) are safe.
+
+import { Result, flatten } from "core";
+import { Files, NotFound } from "std";
+import { SqlError } from "./error.wac";
+import { Value } from "./value.wac";
+import { Connection } from "./engine.wac";
+import { Rows } from "./plan.wac";
+
+export struct SqliteFile {
+  Files fs;
+  string path;
+  Connection conn;
+
+  // Opens a database file, or starts an empty one that is created at the first commit.
+  Result<SqliteFile, SqlError> open(Files fs, string path) {
+    // A database with a write-ahead log or a hot journal beside it holds changes the file itself does
+    // not; checkpoint it with SQLite first (`PRAGMA wal_checkpoint(TRUNCATE)`, `journal_mode=DELETE`).
+    for (string side in ["-wal", "-journal"]) {
+      match (flatten(fs.stat(path + side).wait())) {
+        Ok(st): {
+          if (st.exists && st.size > 0) {
+            return Result.Err(SqlError.unsupported("\{path}\{side} exists: checkpoint the database with SQLite first"));
+          }
+        }
+        Err(e): {}
+      }
+    }
+    match (flatten(fs.readFile(path).wait())) {
+      Ok(bytes): { return Result.Ok(SqliteFile(fs, path, try Connection.openImage(bytes))); }
+      Err(e): {
+        if (e is NotFound) { return Result.Ok(SqliteFile(fs, path, Connection.memory())); }
+        return Result.Err(SqlError("io", "cannot read \{path}"));
+      }
+    }
+  }
+
+  // Runs one statement, and writes the file if it committed a change.
+  Result<Rows, SqlError> execute(this, string sql, Value[] params) {
+    Rows r = try this.conn.execute(sql, params);
+    try this.saveIfChanged();
+    return Result.Ok(r);
+  }
+
+  // Runs every statement in the text, writing the file after each that committed a change.
+  Result<Rows, SqlError> exec(this, string sql) {
+    Rows r = try this.conn.exec(sql);
+    try this.saveIfChanged();
+    return Result.Ok(r);
+  }
+
+  Result<void, SqlError> saveIfChanged(this) {
+    if (!this.conn.dirty || this.conn.inTx) { return Result.Ok(); }
+    string tmp = this.path + "-wac-tmp";
+    match (flatten(this.fs.writeFile(tmp, this.conn.image()).wait())) {
+      Ok: {}
+      Err(e): { return Result.Err(SqlError("io", "cannot write \{tmp}")); }
+    }
+    match (flatten(this.fs.rename(tmp, this.path).wait())) {
+      Ok: { return Result.Ok(); }
+      Err(e): { return Result.Err(SqlError("io", "cannot replace \{this.path}")); }
+    }
+  }
+}

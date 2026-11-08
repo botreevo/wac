@@ -706,31 +706,60 @@ bool isInt(const Value v) { return match (v) { Int: true, default: false }; }
 
 i64 intOf(const Value v) { return match (v) { Int(i): i, default: 0 as i64 }; }
 
-// Whether reading `ix` from column `from` on gives the plan's ORDER BY, and in which direction.
+// The order the first source's rows are wanted in, when an access path might deliver it: the ORDER BY of
+// a plain select, or for a lone min()/max() over a column, that column — read in order, the first row
+// with a value is the answer.
+struct Wanted {
+  Node[] order;
+  bool[] desc;
+  i32[] nulls;
+  bool minMax;
+}
+
+Wanted? wantedOrder(const SelectPlan p) {
+  if (p.srcs.len() != 1 || p.distinct || p.compound is not null) { return null; }
+  if (!p.aggregate) {
+    if (p.order.len() == 0) { return null; }
+    return Wanted(p.order as Node[], p.desc as bool[], p.nulls as i32[], false);
+  }
+  if (p.groupBy.len() != 0 || p.aggs.len() != 1 || p.having is not null) { return null; }
+  const AggSpec a = p.aggs.get(0);
+  if ((a.name != "min" && a.name != "max") || a.args.len() != 1 || a.distinct) { return null; }
+  match (a.args[0]) {
+    NCol(d, src, col, aff): {
+      if (d != 0 || src != 0) { return null; }
+      // Ascending puts NULLs first, which min() skips; descending puts them last.
+      return Wanted([a.args[0] as Node], [a.name == "max"], [0], true);
+    }
+    default: { return null; }
+  }
+}
+
+// Whether reading `ix` from column `from` on gives the wanted order, and in which direction.
 // 0: no; 1: forwards; 2: backwards.
-i32 orderFromIndex(const SelectPlan p, const Index ix, i32 from) {
-  if (p.order.len() == 0 || p.order.len() > ix.cols.len() - from) { return 0; }
+i32 orderFromIndex(const Wanted w, const Index ix, i32 from) {
+  if (w.order.len() == 0 || w.order.len() > ix.cols.len() - from) { return 0; }
   i32 dir = 0;
-  for (i32 i = 0; i < p.order.len(); i++) {
-    if (p.nulls[i] != 0) { return 0; }
-    match (p.order[i]) {
+  for (i32 i = 0; i < w.order.len(); i++) {
+    if (w.nulls[i] != 0) { return 0; }
+    match (w.order[i]) {
       NCol(d, s, col, aff): {
         if (d != 0 || s != 0 || col != ix.cols[from + i]) { return 0; }
       }
       default: { return 0; }
     }
-    i32 want = (p.desc[i] != ix.desc[from + i]) ? 2 : 1;
+    i32 want = (w.desc[i] != ix.desc[from + i]) ? 2 : 1;
     if (dir == 0) { dir = want; } else if (dir != want) { return 0; }
   }
   return dir;
 }
 
-i32 orderFromRowid(const SelectPlan p, const Table t) {
-  if (p.order.len() != 1 || p.nulls[0] != 0) { return 0; }
-  match (p.order[0]) {
+i32 orderFromRowid(const Wanted w, const Table t) {
+  if (w.order.len() != 1 || w.nulls[0] != 0) { return 0; }
+  match (w.order[0]) {
     NCol(d, s, col, aff): {
       if (d != 0 || s != 0 || (col != -1 && col != t.rowidAlias)) { return 0; }
-      return p.desc[0] ? 2 : 1;
+      return w.desc[0] ? 2 : 1;
     }
     default: { return 0; }
   }
@@ -744,7 +773,8 @@ bool orderable(const SelectPlan p) {
 Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds, Ctx c, Exec x) {
   Table t = p.srcs[k].table;
   Vec<Probe> probes = try probesFor(p, k, conds, c, x);
-  bool wantOrder = k == 0 && orderable(p);
+  Wanted? w = k == 0 ? wantedOrder(p) : null;
+  bool wantOrder = w is not null;
   // The rowid, exactly.
   for (i32 i = 0; i < probes.len(); i++) {
     Probe pr = probes.get(i);
@@ -768,7 +798,7 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
     while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=") >= 0) { eq++; }
     bool range = eq < ix.cols.len() && !ix.desc[eq] && hasRange(probes, ix.cols[eq]);
     i32 score = eq * 4 + (range ? 2 : 0);
-    if (wantOrder && orderFromIndex(p, ix, eq) != 0) { score++; }
+    if (wantOrder && orderFromIndex(w!, ix, eq) != 0) { score++; }
     if (score > bestScore) { best = ix; bestScore = score; }
   }
   if (best is not null && bestScore >= 2) {
@@ -806,7 +836,7 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
       }
     }
     if (hi < lo) { hi = lo; }
-    i32 dir = wantOrder ? orderFromIndex(p, ix, eq) : 0;
+    i32 dir = wantOrder ? orderFromIndex(w!, ix, eq) : 0;
     return Result.Ok(Access(ix, lo, hi, dir == 2, dir != 0, false));
   }
   // A range of rowids.
@@ -833,11 +863,11 @@ Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds
     }
   }
   if (hi < lo) { hi = lo; }
-  i32 dir = wantOrder ? orderFromRowid(p, t) : 0;
+  i32 dir = wantOrder ? orderFromRowid(w!, t) : 0;
   // An index can still deliver the order when nothing narrows the rows.
   if (dir == 0 && wantOrder && lo == 0 && hi == t.rows.len()) {
     for (i32 j = 0; j < ixs.len(); j++) {
-      i32 d2 = orderFromIndex(p, ixs[j], 0);
+      i32 d2 = orderFromIndex(w!, ixs[j], 0);
       if (d2 != 0) { return Result.Ok(Access(ixs[j], 0, ixs[j].entries.len(), d2 == 2, true, false)); }
     }
   }
@@ -888,6 +918,8 @@ struct Group {
 
 // Gathers what the loops produce: output rows with their sort keys, or groups.
 struct Sink {
+  bool minMaxStop;   // a lone min()/max() read in order: the first value found is the answer
+  bool done;
   Vec<Value[]> rows;
   Vec<Value[]> keys;
   i32 stopAt;        // -1: keep going
@@ -937,6 +969,7 @@ Result<void, SqlError> emit(SelectPlan p, Ctx c, Exec x, Sink sink) {
       if (try step(p.aggs.get(i), g.states[i], c, x)) { improved = true; }
     }
     if (repFromBest ? improved : true) { g.rep = copyRows(c.rows); }
+    if (sink.minMaxStop && g.states[0].best is not null) { sink.done = true; }
     return Result.Ok();
   }
   Value[] out = Value[].filled(p.results.len(), Value.Null);
@@ -1021,7 +1054,7 @@ Result<bool, SqlError> loop(SelectPlan p, i32 k, Ctx c, Exec x, Sink sink, const
     const Vec<Node> fin = levels[k];
     for (i32 i = 0; i < fin.len(); i++) { if (truth(try eval(fin.get(i), c, x)) != 1) { return Result.Ok(true); } }
     try emit(p, c, x, sink);
-    return Result.Ok(sink.stopAt < 0 || sink.rows.len() < sink.stopAt);
+    return Result.Ok(!sink.done && (sink.stopAt < 0 || sink.rows.len() < sink.stopAt));
   }
   BoundSource src = p.srcs[k];
   // Conditions that may narrow this source: its ON, and for an inner join the WHERE's too.
@@ -1122,7 +1155,7 @@ Result<i64, SqlError> limitValue(Node? n, Ctx c, Exec x, i64 dflt) {
 
 // One select's rows, before a compound combines them: unordered unless `ordered` is set.
 Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
-  Sink sink = Sink(Vec.create(), Vec.create(), -1, Map.create(hashBytes, bytesEq), Vec.create(), Vec.create());
+  Sink sink = Sink(false, false, Vec.create(), Vec.create(), -1, Map.create(hashBytes, bytesEq), Vec.create(), Vec.create());
   if (p.values is not null) {
     Ctx c = Ctx(Row?[](), outer, null, null);
     const Node[][] vs = p.values!;
@@ -1156,6 +1189,11 @@ Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
       Access a = try chooseAccess(p, 0, levelOneConds(p, conds), c, x);
       if (a.ordered) { sink.stopAt = stopAt as! i32; }
     }
+  }
+  Wanted? w = wantedOrder(p);
+  if (w is not null && w!.minMax) {
+    Access a = try chooseAccess(p, 0, levelOneConds(p, conds), c, x);
+    if (a.ordered) { sink.minMaxStop = true; }
   }
   if (p.srcs.len() == 0) {
     bool pass = true;

@@ -31,5 +31,4 @@ Some package tests ask an oracle written in TypeScript (`packages/mpt/test/oracl
 ## Moving the wac pin
 
 `ref` in `wac.json5` names the branch, `commit` in `wac.lock` the commit; move the commit, run `sh tools/deps.sh`
-and `wac task test`. The pin is a branch of wac today only because `bytes`, `http` and `wactest` reached wac's
-`lib.wac` there first; once they are on wac's master, point `ref` at master.
+and `wac task test`.

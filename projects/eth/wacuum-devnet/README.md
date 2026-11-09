@@ -28,7 +28,6 @@ in wac; the same process serves JSON-RPC and the site. Meant for **wacuum.voltre
     src/chain.wac      the genesis, addresses, and signing the faucet's transfers
     src/format.wac     ether, gwei, ages, short hashes
     src/style.wac      the stylesheet and the icon, as block strings
-    tools/deps.wac     the locked dependencies into wac's cache, with git
     tools/e2e.wac      a visitor and a wallet against a running devnet, over HTTP
     deploy/            a Caddyfile and a systemd unit
 
@@ -77,22 +76,13 @@ from before the snapshot, from its block, and says that its status, fee and logs
 
 ## Building
 
-You need the `wac` command, built from the commit `wac.lock` pins for `wac` (the one wacuum pins):
+The devnet is part of [wac-eth](../README.md), with one wac pin for the whole repository: build the `wac` command
+and fill the package cache as the root README says. Then, from `wacuum-devnet/`:
 
-    git clone https://git.voltrevo.com/wac.git ~/src/wac
-    cd ~/src/wac && git checkout d267592b8 && ./bootstrap.sh --host nodejs
+    wac test test      # the unit tests, in a second: pages, RPC, the faucet and its limits, against a real engine
+    mkdir -p dist && wac app --allow-read --allow-write --allow-net cmd/devnet.wac -o dist/devnet
 
-One built from `96e5a0cfe`, which this was first deployed with, builds and runs it too, as fast: the
-end-to-end test passes on either.
-
-Node is the fastest of wac's hosts for wacuum, by two to four times. Then clone this with `-b master`: the
-server's default branch is `main` and empty, as for the other repositories there.
-
-    git clone -b master https://git.voltrevo.com/wacuum-devnet.git && cd wacuum-devnet
-
-    wac task deps      # the three locked dependencies into wac's cache, with git (`wac update` gets a 401 from git.voltrevo.com)
-    wac task test      # the unit tests, in a second: pages, RPC, the faucet and its limits, against a real engine
-    wac task build     # dist/devnet, one executable file (it runs on the `wac` it finds on PATH)
+(`wac task devnet:test` and `wac task devnet:build` from the root do the same.)
 
 and to see it working end to end, the way a visitor and a wallet use it:
 
@@ -133,10 +123,6 @@ match; a follower that does it by itself is still to be written. Both are wacuum
 
 ## Dependencies
 
-`wac.json5` imports three packages by git, each pinned in `wac.lock`:
-
-- **wacuum**, from `master`, through the `src/lib.wac` its manifest names as `exports`: wac lets a project reach
-  another project only that way.
-- **wac**, at the commit wacuum pins, so that values crossing between the two (JSON from the engine, above all)
-  are one type.
-- **web**, for components and `documentOf`.
+wacuum is beside this in wac-eth, imported by path (`@/wacuum/src/lib.wac`), so the devnet always runs the
+wacuum in the same commit. wac and **web** (components and `documentOf`) are pinned once, in wac-eth's root
+`wac.lock`; one pin means the JSON the engine answers with and the JSON this code reads are one type.

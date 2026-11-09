@@ -8,7 +8,7 @@
 - **Symptom:** not implemented
 
 Fourth slice of [design/0003](../../../design/system/0003-an-ethereum-centric-reference-distribution.md). Needs
-[0083](0083-keccak256-for-ethereum-not-just-sha3.md) and
+0083 (wac's `issues/system/closed/0083`) and
 [0084](0084-rlp-encoding-and-decoding.md).
 
 **This is the piece the whole claim rests on.** `packages/lightclient` follows the chain and gives a

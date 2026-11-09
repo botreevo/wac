@@ -9,7 +9,7 @@ sync-committee period rules, which are what stop a client being walked onto a fo
 This package is those rules in wac. `src/store.wac` is the store and the update logic, function for
 function as the spec has them; `src/domain.wac` is the signing-domain arithmetic they rest on. The
 layouts and the Merkle proofs come from [`ssz`](../ssz/README.md), the signature verification from
-[`bls`](../bls/README.md).
+wac's `bls` (`packages/bls` in wac).
 
 ```sh
 deno test -A packages/lightclient/test/sync_wac.test.ts   # Ethereum's four sync cases, step by step

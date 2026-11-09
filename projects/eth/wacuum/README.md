@@ -44,24 +44,11 @@ in about twenty minutes on the Node host (an hour and a half on wasmtime).
 
 ## Running it
 
-You need the `wac` command, built from the commit `wac.lock` pins:
+wacuum is part of [wac-eth](../README.md), with one wac pin for the whole repository: build the `wac` command
+and fill the package cache as the root README says. Then, from `wacuum/`:
 
 ```bash
-git clone https://git.voltrevo.com/wac.git ~/src/wac
-```
-
-```bash
-cd ~/src/wac && git checkout d267592b88c3a269019924735e00d5ef52598aea && ./bootstrap.sh --host nodejs
-```
-
-Then, in this repository:
-
-```bash
-wac update            # or, without network access: sh tools/use-local-wac.sh ~/src/wac
-```
-
-```bash
-wac task test         # the unit tests, in about a second
+wac test test         # the unit tests, in about a second (or `wac task wacuum:test` from the root)
 ```
 
 ```bash

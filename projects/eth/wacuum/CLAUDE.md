@@ -11,8 +11,9 @@ README's table, top to bottom, and each row is "done" when the matching `ethereu
 
 ## Working agreements
 
-- **wac is pinned to one commit**, in `wac.lock`, and the `wac` command should be built from it. Change both
-  together. Today it is `d267592b8`.
+- **wacuum is one member of wac-eth** (since 2026-11-09), beside the Ethereum packages it uses and the devnet that
+  serves it. wac is pinned once, in the root `wac.lock`, and the `wac` command should be built from it. `rlp`,
+  `mpt` and the rest are this repository's own now: `import { rlp.encode } from "@/lib.wac"`, not from `"wac"`.
 - **Bugs and tasks are files in `issues/`**, as in wac's tracker: `issues/README.md` says when to file and how.
 - **When wac gets in the way, write it down in `docs/wac-asks.md`** with a reproduction, and work around it
   here. Fixing the compiler is ordinary work in the wac repository, but it is a different repository with
@@ -36,15 +37,15 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
 
 ## Building and testing here
 
-    wac task deps        # the wac wac.lock pins, into the package cache with git — once, and after the pin moves
-    wac task test        # the unit tests, in about a second
+    sh ../tools/deps.sh  # the wac the root wac.lock pins, into the package cache with git — once, and after it moves
+    wac test test        # the unit tests, in about a second
     wac task vectors     # regenerate the U256 cases (needs node)
     wac task fixtures    # execution-spec-tests v5.4.0 into fixtures/
     wac task statetests  # every Cancun state test, about a minute
     wac task blocktests  # every Cancun blockchain test, about a minute; add Prague as an argument to the scripts
 
-- `wac update` could not reach the network in the container this was started in. `sh tools/use-local-wac.sh
-  <wac clone>` fills the package cache from a clone instead.
+- `wac update` could not reach the network in the container this was started in. `sh ../tools/use-local-wac.sh
+  <wac clone>` fills the package cache from a clone instead. The tasks below still run from `wacuum/`.
 - `wac check src` checks the sources; it also walks into the parts of wac they reach.
 
 ## Against other clients

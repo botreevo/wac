@@ -8,7 +8,7 @@
 - **Symptom:** not implemented
 
 Third slice of [design/0003](../../../design/system/0003-an-ethereum-centric-reference-distribution.md). Needs
-[0083](0083-keccak256-for-ethereum-not-just-sha3.md) for selectors.
+0083 (wac's `issues/system/closed/0083`) for selectors.
 
 The contract ABI: how a call's arguments become calldata and how the returned bytes become values. Every
 contract interaction in 0003 goes through it — ENS resolution, reading state, decoding an event's topics

@@ -5,11 +5,12 @@ README does not say.
 
 ## Working agreements
 
-- **wacuum is a dependency, not a place to work around.** If the explorer needs something the engine's `eth_`
-  methods do not answer, add it to wacuum (and to its `src/lib.wac`), then move the pin here. Do not reach into
+- **wacuum is a dependency, not a place to work around**, even now it is in the same repository (wac-eth, since
+  2026-11-09). If the explorer needs something the engine's `eth_` methods do not answer, add it to wacuum (and to
+  its `src/lib.wac`) in the same change. Do not reach into
   the engine's fields from here beyond what `cmd/devnet.wac` already does (`mempool`, `head`, `produce`).
-- **The `wac` pin follows wacuum's.** Moving it alone gives two copies of `json`, and an engine answer stops
-  being the `JsonValue` this code imports.
+- **There is one `wac` pin, at the root**, so `json` has one copy and an engine answer is the `JsonValue` this code
+  imports. That was a rule to remember when this was its own repository; it is now true by construction.
 - **Every page goes through `documentOf`/`htmlOf`.** Nothing writes HTML by string concatenation; that is what
   keeps every value from the chain (token names, input data, anything a stranger can put in a transaction)
   escaped. A new attribute that `web`'s tags do not list uses a quoted tag: `<"input" aria-label="…"/>`.
@@ -20,10 +21,9 @@ README does not say.
 
 ## Things that have bitten
 
-- `wac update` gets a 401 from git.voltrevo.com; `wac task deps` (tools/deps.wac) fills the cache with
-  `git`. It imports only `std`, since what it fetches is what any other import needs first.
-- A project cannot import a file inside another project, even a git submodule: wac says to import its
-  directory, which means its `exports`. That is why wacuum names `src/lib.wac` as its own.
+- `wac update` gets a 401 from git.voltrevo.com; `sh tools/deps.sh` at wac-eth's root fills the cache with `git`.
+- A project cannot import a file inside another project: wac says to import its directory, which means its
+  `exports`. Inside wac-eth there is one project, so wacuum is imported by path.
 - **wac's JavaScript hosts allow 128 host calls in flight; the 129th waits for ever and the program stops.**
   Every connection reading, every sleep, every peer holds one. `src/server.wac` caps connections and reaps slow
   ones for that reason; anything new that waits on the host (a timer per request, more peers) spends from the

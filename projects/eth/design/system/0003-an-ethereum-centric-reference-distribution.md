@@ -82,8 +82,8 @@ Ordered by dependency, not by intent.
 | ENS resolution — `packages/ens` | **the name half is done** — namehash, DNS wire encoding, selectors and the two calls' calldata, all against `npm:ethers`. ENSIP-15 normalisation is not implemented and says so; making the calls needs an endpoint, which is the same gap 0086 has |
 | secp256k1 signing | not started — see the section below, which is the reason it is last |
 | content-addressed retrieval (IPFS or otherwise) | not started — needs a decision about what is being promised |
-| notifications, update channels, atomic activation with rollback | not started — these are Wacland's, see [0001](0001-a-self-contained-system.md) |
-| hosting the whole thing as a Wacland image | [0001](0001-a-self-contained-system.md), and **not a prerequisite** — E1 |
+| notifications, update channels, atomic activation with rollback | not started — these are Wacland's, see 0001 (wac's `design/system/0001`) |
+| hosting the whole thing as a Wacland image | 0001 (wac's `design/system/0001`), and **not a prerequisite** — E1 |
 
 ## Signing is a different risk class, and gets a different gate
 
@@ -129,7 +129,7 @@ required.
 
 Issues reference this document rather than restating it. Unblocked today, in dependency order:
 
-- [0083](../../issues/system/closed/0083-keccak256-for-ethereum-not-just-sha3.md) — keccak256 — **closed**
+- 0083 (wac's `issues/system/closed/0083`) — keccak256 — **closed**
 - [0084](../../issues/system/closed/0084-rlp-encoding-and-decoding.md) — RLP — **closed**
 - [0085](../../issues/system/closed/0085-abi-encoding-and-decoding.md) — ABI — **closed**
 - [0086](../../issues/system/closed/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) — state proofs

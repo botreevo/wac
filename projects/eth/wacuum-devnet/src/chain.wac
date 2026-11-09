@@ -1,0 +1,92 @@
+// The devnet's chain: its genesis, the faucet's account in it, and the transfers the faucet signs.
+//
+// wacuum's own `--dev` chain funds an account whose key is 0x11…11, which is right for a devnet on one
+// machine and wrong for one on the internet: anybody could empty it. So this chain funds an account whose key
+// is made on first start and kept in the data directory, and the faucet is the only thing that spends it.
+
+import { rlp.Item, rlp.encode } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256, hexToBytes, bytesToHex, systemContracts, u256Bytes, addressBytes, publicKey, sign } from "wacuum";
+
+/** What the genesis says beyond the system contracts: the chain id, and who holds how much. */
+export struct ChainSpec {
+  u64 chainId;
+  /** The faucet's address, as 0x-hex. */
+  string faucet;
+  /** Its balance at genesis, in wei, as 0x-hex. */
+  string faucetBalance;
+}
+
+/** The address of the account `key` controls: the last 20 bytes of the keccak of its public key. */
+export U256 addressOf(u8[] key) {
+  return U256.fromBytes(keccak256(publicKey(key)), 12, 20);
+}
+
+/** An address as 0x-hex with EIP-55's mixed-case checksum, as wallets show it. */
+export string checksummed(U256 a) {
+  string plain = bytesToHex(addressBytes(a)).slice(2, 42);
+  u8[] hash = keccak256(plain.toBytes());
+  u8[] out = plain.toBytes();
+  for (i32 i = 0; i < out.len(); i++) {
+    i32 nibble = i % 2 == 0 ? ((hash[i / 2] >> 4) as i32) : ((hash[i / 2] & 15) as i32);
+    if (out[i] >= 97 && nibble >= 8) { out[i] = out[i] - 32; }
+  }
+  return "0x" + string.fromBytes(out);
+}
+
+/**
+ * The genesis, as the JSON a geth-format genesis file holds: Osaka from block 0 (so every fork's rules are
+ * on from the start), the system contracts Prague's blocks call, and the faucet's balance.
+ */
+export string genesisJson(ChainSpec spec) {
+  return "{\"config\": {\"chainId\": \{spec.chainId}, \"homesteadBlock\": 0, \"eip150Block\": 0, \"eip155Block\": 0, " +
+         "\"eip158Block\": 0, \"byzantiumBlock\": 0, \"constantinopleBlock\": 0, \"petersburgBlock\": 0, " +
+         "\"istanbulBlock\": 0, \"berlinBlock\": 0, \"londonBlock\": 0, \"mergeNetsplitBlock\": 0, " +
+         "\"terminalTotalDifficulty\": 0, \"shanghaiTime\": 0, \"cancunTime\": 0, \"pragueTime\": 0, \"osakaTime\": 0}, " +
+         "\"gasLimit\": \"0x2aea540\", \"baseFeePerGas\": \"0x3b9aca00\", \"difficulty\": \"0x0\", \"timestamp\": \"0x0\", " +
+         "\"alloc\": {" + systemContracts() + ", \"" + spec.faucet + "\": {\"balance\": \"" + spec.faucetBalance + "\"}}}";
+}
+
+/** One ether, in wei. */
+export U256 ether() { return U256.ofU64(1000000000000000000); }
+
+/**
+ * An EIP-1559 transfer of `value` wei to `to`, signed by `key` for `chainId`, in the form
+ * `eth_sendRawTransaction` takes: the type byte, then the RLP.
+ */
+export u8[] signedTransfer(u8[] key, u64 chainId, u64 nonce, U256 tip, U256 maxFee, U256 to, U256 value) {
+  return signedTx(key, chainId, nonce, tip, maxFee, 21000, addressBytes(to), value, u8[]());
+}
+
+/**
+ * Any EIP-1559 transaction, signed: `to` is the recipient's 20 bytes, or none at all for a contract's
+ * creation, whose `data` is then its initcode.
+ */
+export u8[] signedTx(u8[] key, u64 chainId, u64 nonce, U256 tip, U256 maxFee, u64 gas, u8[] to, U256 value, u8[] data) {
+  Item[] fields = [Item.Bytes(u256Bytes(U256.ofU64(chainId))), Item.Bytes(u256Bytes(U256.ofU64(nonce))),
+                   Item.Bytes(u256Bytes(tip)), Item.Bytes(u256Bytes(maxFee)), Item.Bytes(u256Bytes(U256.ofU64(gas))),
+                   Item.Bytes(to), Item.Bytes(u256Bytes(value)), Item.Bytes(data),
+                   Item.List(Item[]())];
+  u8[] sig = sign(keccak256(typed(encode(Item.List(fields)))), key);
+  Item[] all = Item[].filled(fields.len() + 3, Item.Bytes(u8[]()));
+  for (i32 i = 0; i < fields.len(); i++) { all[i] = fields[i]; }
+  all[fields.len()] = Item.Bytes(u256Bytes(U256.ofU64(sig[64] as u64)));
+  all[fields.len() + 1] = Item.Bytes(u256Bytes(U256.fromBytes(sig, 0, 32)));
+  all[fields.len() + 2] = Item.Bytes(u256Bytes(U256.fromBytes(sig, 32, 32)));
+  return typed(encode(Item.List(all)));
+}
+
+/** A type-2 transaction's bytes: its type, then its RLP. */
+u8[] typed(u8[] body) {
+  u8[] out = u8[].filled(body.len() + 1, 2);
+  for (i32 i = 0; i < body.len(); i++) { out[i + 1] = body[i]; }
+  return out;
+}
+
+/** `s` as an address, if it is 0x and forty hex digits (in any case: the checksum is a wallet's concern). */
+export U256? parseAddress(string s) {
+  if (s.len() != 42 || s.indexOf("0x") != 0) { return null; }
+  u8[]? b = hexToBytes(s);
+  if (b is null || b!.len() != 20) { return null; }
+  return U256.fromBytes(b!, 0, 20);
+}

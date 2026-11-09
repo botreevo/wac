@@ -1,0 +1,118 @@
+// The node's own state, apart from the engine: the genesis it was started from, and the chain log and
+// snapshots it keeps, as wacuum's `cmd/wacuum.wac` keeps them, so a restart goes on from where it stopped.
+
+import { Sys, Output } from "std";
+import { Vec } from "core";
+import { json.parse } from "wac";
+import { rlp.encode } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256, Engine, Genesis, Header, genesisFrom, headerItem } from "wacuum";
+
+/** An engine at the start of the chain `genesisText` describes, or why there is none. */
+export struct Started {
+  Engine? engine;
+  Genesis? genesis;
+  string error;
+}
+
+export Started engineFor(u8[] genesisText) {
+  match (parse(genesisText)) {
+    Err(e): { return Started(null, null, "the genesis is not JSON"); }
+    Ok(doc): {
+      string[] why = [""];
+      Genesis? g = genesisFrom(doc, why);
+      if (g is null) { return Started(null, null, why[0]); }
+      Genesis gen = g!;
+      gen.header.hash = U256.fromBytes(keccak256(encode(headerItem(gen.spec, gen.header))), 0, 32);
+      return Started(Engine.create(gen.config, gen.header, gen.world), gen, "");
+    }
+  }
+}
+
+/** Where the node keeps things: the chain log, the directory, and how often a snapshot is taken. */
+export struct Disk {
+  Output? log;
+  string dir;
+  u64 snapshotEvery;
+}
+
+/**
+ * Append what the engine has recorded since last time to the chain log; and when finality has moved far
+ * enough since the last snapshot, write a new one — to a temporary name first, then renamed over the old,
+ * so that a snapshot on disk is always a whole one.
+ */
+export async void flush(Sys sys, Engine e, Disk disk) {
+  if (disk.log is not null) {
+    for (i32 i = 0; i < e.records.len(); i++) {
+      match (await disk.log!.write(e.records.get(i))) {
+        Err(err): { sys.warn("devnet: the chain log cannot be written: \{err}"); }
+        Ok(_): {}
+      }
+    }
+  }
+  e.records = Vec.create();
+  if (disk.dir == "" || disk.snapshotEvery == 0) { return; }
+  Header? f = e.headerByHash(e.finalized);
+  if (f is null || f!.number.lt(e.snapshotNumber.add(U256.ofU64(disk.snapshotEvery)))) { return; }
+  u8[]? snap = e.snapshot();
+  if (snap is null) { return; }
+  string tmp = disk.dir + "/snapshot.tmp";
+  match (await sys.writeFile(tmp, snap!)) {
+    Err(err): { sys.warn("devnet: the snapshot cannot be written: \{err}"); }
+    Ok(_): {
+      await sys.files().rename(tmp, disk.dir + "/snapshot");
+      sys.log("devnet: snapshot at block \{f!.number.toDecimal()}");
+    }
+  }
+}
+
+/**
+ * Bring `e` up to where the data directory says it was: the snapshot, then the log after it. Opens the log
+ * for appending, and answers the disk to keep writing to, or null after saying what went wrong.
+ */
+export async Disk? restore(Sys sys, Engine e, string dir, u64 snapshotEvery) {
+  string path = dir + "/chain.log";
+  bool exists = false;
+  match (await sys.files().stat(path)) {
+    Ok(st): { exists = st.exists; }
+    Err(err): {}
+  }
+  match (await sys.readFile(dir + "/snapshot")) {
+    Ok(snap): {
+      string why = e.restore(snap);
+      if (why != "") {
+        sys.warn("devnet: \{dir}/snapshot: \{why}");
+        return null;
+      }
+      sys.log("devnet: starting from the snapshot at block \{e.restoredNumber.toDecimal()}");
+    }
+    Err(err): {}
+  }
+  if (exists) {
+    match (await sys.readFile(path)) {
+      Err(err): { sys.warn("devnet: \{path}: \{err}"); return null; }
+      Ok(bytes): {
+        auto r = e.replay(bytes);
+        if (r.error != "") {
+          sys.warn("devnet: \{path} does not replay on this genesis: \{r.error}");
+          return null;
+        }
+        if (r.good < bytes.len()) {
+          // The last record was cut short when the process stopped; the log goes on from before it.
+          u8[] keep = u8[].filled(r.good, 0);
+          for (i32 i = 0; i < keep.len(); i++) { keep[i] = bytes[i]; }
+          match (await sys.writeFile(path, keep)) {
+            Err(err): { sys.warn("devnet: \{path}: \{err}"); return null; }
+            Ok(_): {}
+          }
+          sys.warn("devnet: dropped \{bytes.len() - r.good} bytes of a record cut short at the end of \{path}");
+        }
+        sys.log("devnet: replayed \{r.blocks} blocks from \{path}; head \{e.head.toHex()}");
+      }
+    }
+  }
+  match (await sys.files().openAppend(path)) {
+    Err(err): { sys.warn("devnet: \{path}: \{err}"); return null; }
+    Ok(out): { return Disk(out, dir, snapshotEvery); }
+  }
+}

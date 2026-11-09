@@ -1,0 +1,277 @@
+// The one HTTP port: JSON-RPC for wallets and libraries, the explorer's pages, the faucet, and the two files
+// the pages load. Everything is answered from the engine in this process, between blocks.
+
+import { Sys, Socket } from "std";
+import { Vec } from "core";
+import { U256, Engine, hexToBytes, bytesToHex, addressBytes } from "wacuum";
+import { Request, Response, header, headersEnd, parseHead, responseBytes, formValue, clientAddress, trim, digits } from "./http.wac";
+import { Site, home, block, transaction, findTransaction, address, faucetAnswer, notFound } from "./explorer.wac";
+import { Index, lowerHex } from "./index.wac";
+import { Faucet, Drip, drip } from "./faucet.wac";
+import { parseAddress, checksummed } from "./chain.wac";
+import { Disk, flush } from "./node.wac";
+import { about } from "./about.wac";
+import { answerCapped } from "./gascap.wac";
+import { STYLE } from "./style.wac";
+import { WORDMARK, STACKED, FAVICON } from "./images.wac";
+
+/** Everything a request can reach. */
+export struct Served {
+  Site site;
+  Engine engine;
+  Index index;
+  Faucet faucet;
+  /** The genesis, as served at /genesis.json for anyone who wants to run a node of their own. */
+  string genesis;
+  /** The logos, decoded once. */
+  Images images;
+  /** The most gas one `eth_call` or `eth_estimateGas` may run with (`src/gascap.wac`). */
+  i64 rpcGasCap;
+  /** Where the chain log goes: written after every request, before its answer, as wacuum does. */
+  Disk disk;
+}
+
+/** The images the pages show: AVIF, from `src/images.wac`, which `wac task embed` writes from assets/. */
+export struct Images {
+  u8[] wordmark;
+  u8[] stacked;
+  u8[] favicon;
+
+  Images decode() { return Images(hexToBytes(WORDMARK)!, hexToBytes(STACKED)!, hexToBytes(FAVICON)!); }
+}
+
+/** The answer to one request, at `nowMillis`, from `client`. */
+export Response route(Served s, Request r, string client, i64 nowMillis) {
+  u64 now = ((nowMillis / 1000) as@ u64);
+  string p = r.path;
+  // JSON-RPC: at /rpc, and at / for clients that are given the bare origin. A browser dapp on another origin
+  // asks first with OPTIONS.
+  if (r.method == "OPTIONS") { return cors(Response(204, "text/plain", string[](), u8[]())); }
+  if (r.method == "POST" && (p == "/rpc" || p == "/")) {
+    u8[] answer = answerCapped(s.engine, r.body, s.rpcGasCap);
+    return cors(Response.json(answer));
+  }
+  if (r.method == "POST" && p == "/faucet") {
+    string to = trim(formValue(string.fromBytes(r.body), "address"));
+    U256? a = parseAddress(to);
+    if (a is null) {
+      return Response(400, "text/html; charset=utf-8", string[](),
+                      notFound(s.site, "That is not an address: an address is 0x and forty hexadecimal digits.").toBytes());
+    }
+    Drip d = drip(s.faucet, s.engine, client, a!, nowMillis);
+    Response out = Response.html(faucetAnswer(s.site, d, checksummed(a!)));
+    if (d.refused != "") { out.status = d.waitSeconds > 0 ? 429 : 400; }
+    return out;
+  }
+  if (r.method != "GET" && r.method != "HEAD") { return Response.text(405, "GET, POST or OPTIONS\n"); }
+
+  if (p == "/") { return Response.html(home(s.site, s.engine, s.index, now)); }
+  if (p == "/about") { return Response.html(about(s.site)); }
+  if (p == "/style.css") { return cached(Response(200, "text/css; charset=utf-8", string[](), STYLE.toBytes())); }
+  if (p == "/favicon.avif" || p == "/favicon.ico") { return cached(image(s.images.favicon)); }
+  if (p == "/wordmark.avif") { return cached(image(s.images.wordmark)); }
+  if (p == "/logo.avif") { return cached(image(s.images.stacked)); }
+  if (p == "/genesis.json") { return cors(Response(200, "application/json", string[](), s.genesis.toBytes())); }
+  if (p == "/healthz") { return Response.text(200, "ok\n"); }
+  if (p == "/rpc") { return Response.text(405, "JSON-RPC is POSTed here: point a wallet or a library at this URL.\n"); }
+  if (p == "/search") { return search(s, formValue(r.query, "q")); }
+  if (p.indexOf("/block/") == 0) {
+    string id = p.slice(7, p.len());
+    string? html = block(s.site, s.engine, s.index, id, now);
+    if (html is not null) { return Response.html(html!); }
+    i64? n = digits(id);
+    if (n is not null && n! > 0 && (n! as@ u64) < s.engine.keptFrom) {
+      return missing(s, "Block \{id} is older than the \{s.engine.history} blocks this node keeps.");
+    }
+    return missing(s, "There is no block \{id} on this chain yet.");
+  }
+  if (p.indexOf("/tx/") == 0) {
+    string hash = lowerHex(p.slice(4, p.len()));
+    string? html = hash.len() == 66 ? transaction(s.site, s.engine, s.index, hash, now) : null;
+    if (html is not null) { return Response.html(html!); }
+    return missing(s, s.engine.keptFrom > 1 ? "This chain has no transaction \{hash}, or none in the last \{s.engine.history} blocks, which are what this node keeps."
+                                             : "This chain has no transaction \{hash}.");
+  }
+  if (p.indexOf("/address/") == 0) {
+    string a = p.slice(9, p.len());
+    if (parseAddress(a) is null) { return missing(s, "That is not an address: an address is 0x and forty hexadecimal digits."); }
+    return Response.html(address(s.site, s.engine, s.index, a, now));
+  }
+  return missing(s, "There is no page at this address.");
+}
+
+/**
+ * Where a search for `q` goes: a block by number, a block or transaction by hash, or an address. Only a target
+ * built from what was recognised goes into the `Location` header — never the query itself, which could carry a
+ * CR LF and with it headers of the searcher's choosing.
+ */
+Response search(Served s, string q) {
+  string t = lowerHex(trim(q));
+  if (t == "") { return Response.seeOther("/"); }
+  U256? a = parseAddress(t);
+  if (a is not null) { return Response.seeOther("/address/" + bytesToHex(addressBytes(a!))); }
+  u8[]? hash = t.len() == 66 && t.indexOf("0x") == 0 ? hexToBytes(t) : null;
+  if (hash is not null) {
+    string h = bytesToHex(hash!);
+    // A hash is a transaction's or a block's; the transaction is the likelier.
+    if (findTransaction(s.engine, s.index, h) is not null) { return Response.seeOther("/tx/" + h); }
+    return Response.seeOther("/block/" + h);
+  }
+  string digits = "";
+  for (u8 c in t.toBytes()) {
+    if (c >= '0' && c <= '9') { digits += string.fromBytes([c]); }
+    else if (c != ',' && c != '_' && c != ' ') { return missing(s, "Nothing on this chain is called \"\{q}\": search for a block number, a block or transaction hash, or an address."); }
+  }
+  return digits == "" ? Response.seeOther("/") : Response.seeOther("/block/" + digits);
+}
+
+Response missing(Served s, string what) {
+  return Response(404, "text/html; charset=utf-8", string[](), notFound(s.site, what).toBytes());
+}
+
+Response cors(Response r) {
+  r.headers = ["Access-Control-Allow-Origin: *", "Access-Control-Allow-Methods: GET, POST, OPTIONS",
+               "Access-Control-Allow-Headers: Content-Type"];
+  return r;
+}
+
+Response image(u8[] avif) { return Response(200, "image/avif", string[](), avif); }
+
+Response cached(Response r) {
+  r.headers = ["Cache-Control: public, max-age=3600"];
+  return r;
+}
+
+// ── Connections ────────────────────────────────────────────────────────────────
+//
+// **Few at a time, and none for long.** On wac's JavaScript hosts a program has 128 host calls in flight at
+// most, and every connection waiting for its request holds one; past that, the next call waits for a slot
+// for ever and the whole program stops, blocks and all (wac's `packages/platform/host/layout.ts`, `SLOTS`).
+// 130 idle connections did it. So the node takes at most `MAX_CONNECTIONS` at once, leaving the rest to wait
+// in the kernel's queue, and a connection that has not been answered within `DEADLINE_MILLIS` is closed,
+// which ends its read. Behind Caddy a slow client is Caddy's to wait for, so the deadline is never met by a
+// real one.
+
+static i32 MAX_CONNECTIONS = 48;
+static i64 DEADLINE_MILLIS = 10000;
+
+/** A connection being answered, and when it was accepted. */
+struct Open {
+  Socket sock;
+  i64 since;
+  bool closed;
+}
+
+struct Conns {
+  Vec<Open> open;
+  i32 active;
+}
+
+/**
+ * Accept connections on `addr`:`port` for as long as the program runs. With `trustProxy`, a connection from
+ * loopback is a reverse proxy's, and the client is the one its `X-Forwarded-For` names.
+ */
+export async void serve(Sys sys, Served s, string addr, i32 port, bool trustProxy) {
+  match (await sys.net().listen(addr, port)) {
+    Err(err): { sys.warn("devnet: cannot listen on \{addr}:\{port}: \{err}"); }
+    Ok(listener): {
+      sys.log("devnet: site and JSON-RPC on http://\{listener.addr}");
+      Conns c = Conns(Vec.create(), 0);
+      reap(sys, c);
+      while (true) {
+        while (c.active >= MAX_CONNECTIONS) { await sys.sleepMillis(25); }
+        match (await listener.accept()) {
+          Err(err): { sys.warn("devnet: accept: \{err}"); }
+          Ok(sock): {
+            Open o = Open(sock, (await sys.clock().nowMillis()).orElse(0 as i64), false);
+            c.open.push(o);
+            c.active++;
+            answer(sys, s, c, o, trustProxy);
+          }
+        }
+      }
+    }
+  }
+}
+
+/** Once a second, close every connection older than the deadline, and forget the ones that are done. */
+async void reap(Sys sys, Conns c) {
+  while (true) {
+    await sys.sleepMillis(1000);
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64);
+    Vec<Open> keep = Vec.create();
+    for (i32 i = 0; i < c.open.len(); i++) {
+      Open o = c.open.get(i);
+      if (!o.closed && now - o.since > DEADLINE_MILLIS) { close(o); }
+      if (!o.closed) { keep.push(o); }
+    }
+    c.open = keep;
+  }
+}
+
+/** Close a connection once: its handle's number may be another socket's after that. */
+void close(Open o) {
+  if (o.closed) { return; }
+  o.closed = true;
+  o.sock.close();
+}
+
+/** One request on its own connection: read it whole, answer it, close. */
+async void answer(Sys sys, Served s, Conns c, Open o, bool trustProxy) {
+  Socket sock = o.sock;
+  u8[] buf = u8[].filled(4096, 0);
+  i32 len = 0;
+  i32 end = -1;
+  Request? req = null;
+  bool done = false;
+  bool tooBig = false;
+  while (!done) {
+    match (await sock.recv()) {
+      Err(err): { done = true; }
+      Ok(r): {
+        match (r) {
+          End: { done = true; }
+          Data(bytes): {
+            if (len + bytes.len() > 16777216 + 65536) { tooBig = true; done = true; break; }
+            if (len + bytes.len() > buf.len()) {
+              i32 cap = buf.len() * 2;
+              while (cap < len + bytes.len()) { cap = cap * 2; }
+              u8[] grown = u8[].filled(cap, 0);
+              for (i32 i = 0; i < len; i++) { grown[i] = buf[i]; }
+              buf = grown;
+            }
+            for (i32 i = 0; i < bytes.len(); i++) { buf[len + i] = bytes[i]; }
+            len += bytes.len();
+            if (end < 0) {
+              end = headersEnd(buf, len);
+              if (end < 0 && len > 65536) { tooBig = true; done = true; }
+              if (end >= 0) {
+                req = parseHead(buf, end);
+                if (req is null) { done = true; }
+              }
+            }
+            if (req is not null && len - end >= req!.contentLength) { done = true; }
+          }
+        }
+      }
+    }
+  }
+  if (tooBig) {
+    await sock.send(responseBytes(Response.text(413, "too large\n")));
+  } else if (req is not null && len - end >= req!.contentLength) {
+    Request rq = req!;
+    u8[] body = u8[].filled(rq.contentLength, 0);
+    for (i32 i = 0; i < body.len(); i++) { body[i] = buf[end + i]; }
+    rq.body = body;
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64);
+    Response out = route(s, rq, clientAddress(rq, sock.peer, trustProxy && sock.fromLoopback()), now);
+    // A transaction the request put in the mempool is not in the log until a block has it; what is, goes first.
+    await flush(sys, s.engine, s.disk);
+    if (rq.method == "HEAD") { out.body = u8[](); }
+    await sock.send(responseBytes(out));
+  } else if (end >= 0) {
+    await sock.send(responseBytes(Response.text(400, "bad request\n")));
+  }
+  close(o);
+  c.active--;
+}

@@ -62,6 +62,14 @@ them from git.voltrevo.com, which has them first, through one git setting (`sh t
 machine — `wac update`'s own fetcher does not follow it). So `sh tools/fill-cache.sh` puts the locked commit in the
 cache with `git` — the gate runs it, and a fresh checkout runs it once after `./bootstrap.sh`. A page is built from here with `tools/wac/buildpage.wac`.
 
+**Ethereum is not here either: since 2026-11-09 it is wac-eth, `https://git.voltrevo.com/wac-eth.git`.**
+`ssz`, `lightclient`, `rlp`, `abi`, `ens`, `mpt` and `ethrpc` moved there with their history, with design 0003 and
+the issues about them (0063, 0064, 0066, 0084–0086, 0119), beside wacuum and wacuum-devnet, which joined it from
+their own repositories. wac-eth pins this repository once and imports what is not Ethereum's through `lib.wac` —
+`crypto`, `bls`, `json`, `codec`, `bytes`, `http`, `wactest` — so **a name it needs that `lib.wac` does not
+export is a change here**, and removing one it uses breaks it. `bls` stayed on purpose: BLS12-381 is not only
+Ethereum's, and `packages/bls/src/fp.wac` is the compiler's heaviest program.
+
 ## Running things
 
     wac task test                                    the suite

@@ -25,8 +25,8 @@ Read README.md first. This is what it does not say.
     wac task wacuum:fixtures             execution-spec-tests, once (250 MB), then wacuum:statetests and friends
     wac task devnet:build                wacuum-devnet/dist/devnet
 
-Some package tests ask an oracle written in TypeScript (`packages/mpt/test/oracle.ts`, run with `deno`); with
-no `deno` on PATH they say so.
+Some package tests ask an oracle written in TypeScript (`packages/mpt/test/oracle.ts`), which wactest runs with
+`deno`: have it on PATH.
 
 ## Moving the wac pin
 

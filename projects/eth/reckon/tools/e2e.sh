@@ -2,13 +2,13 @@
 # The whole of design/system/0016, end to end, on a wacuum devnet: build, rebuild, sign, publish, name, run —
 # and then every attack the design says it stops, each checked to be stopped for the reason it claims.
 #
-#     sh tools/e2e.sh WORKDIR        (wacuum's dist/wacuum.wasm from its claude/… branch, which serves eth_getProof)
+#     sh tools/e2e.sh WORKDIR        (WACUUM: a wacuum.wasm built from wac-eth, which serves eth_getProof)
 #
 # Needs: wac on PATH, node with tools/oracle's packages installed, git, curl, python3.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 work=$1; mkdir -p "$work"; work=$(cd "$work" && pwd)
-wacuum=${WACUUM:-$here/../g/wacuum/dist/wacuum.wasm}
+wacuum=${WACUUM:?set WACUUM to a wacuum.wasm built from wac-eth}
 W="wac $here/dist/wactrust.wasm"
 wallet="node $here/tools/wallet/wallet.mjs"
 keys=$work/keys; stmts=$work/stmts; mirror=$work/mirror; evil=$work/mirror-evil

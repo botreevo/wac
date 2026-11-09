@@ -119,11 +119,11 @@ wac test test                    # 23 unit tests
 wac build --allow-read --allow-write --allow-run --allow-net --allow-env cmd/wactrust.wac -o dist/wactrust
 sh tools/agree.sh ../wac         # one tree, three ways
 (cd tools/oracle && npm install) # ethers, js-sha3, solc: the oracles and the wallet
-sh tools/e2e.sh /tmp/e2e         # needs wacuum's dist/wacuum.wasm from its experiment branch (WACUUM=…)
+sh tools/e2e.sh /tmp/e2e         # needs a wacuum.wasm built from wac-eth (WACUUM=…)
 ```
 
-Dependencies are pinned to experiment branches named `claude/ethereum-wac-package-trust-subwyf`, in wac (adds the `mpt`
-and `ethrpc` namespaces) and in wacuum (exports `recover`, pins the same wac, serves `eth_getProof`).
+Dependencies: [wac-eth](https://git.voltrevo.com/wac-eth.git) for `mpt`, `ethrpc` and wacuum's secp256k1 (and wacuum
+itself, which serves `eth_getProof` there), and wac at the commit wac-eth pins, so there is one copy of it.
 
 | | |
 | --- | --- |

@@ -1,0 +1,168 @@
+// Run execution-spec-tests' state tests: every case for one fork, checked against the state root and the
+// logs hash the fixture expects.
+//
+//     wac build --allow-read tools/statetest.wac -o statetest
+//     find fixtures/state_tests -name '*.json' | xargs ./statetest --fork Cancun
+//
+// A case is one entry in a test's `post[fork]`: the pre-state, the transaction built from that entry's
+// `indexes`, and the root it must produce. A case expecting an exception passes when the transaction is
+// refused as invalid and the state is untouched — the root is still checked, since it is the pre-state's.
+//
+// Prints each failure with the test's name and why, then one line of totals. `--verbose` also prints, for
+// a failure, which accounts differ from the fixture's `state`, which is what makes a wrong root findable.
+
+import { Map } from "core";
+import { Sys } from "std";
+import { json.parse, json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { U256 } from "../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../src/hex.wac";
+import { num, bytes, worldFrom, diffState } from "./fixture.wac";
+import { World, Account, Log, hashU256, eqU256 } from "../src/state/world.wac";
+import { stateRoot, logsHash } from "../src/state/root.wac";
+import { BlockEnv } from "../src/evm/evm.wac";
+import { Spec } from "../src/evm/spec.wac";
+import { Transaction, AccessEntry, Authorization, Processed, processTransaction, blobGasPrice } from "../src/tx/process.wac";
+
+struct Tally {
+  i32 passed;
+  i32 failed;
+  i32 skipped;
+  bool verbose;
+  bool trace;
+  string fork;
+  string filter;
+}
+
+JsonValue? at(JsonValue? v, i32 i) {
+  if (v is null) { return null; }
+  return v!.item(i);
+}
+
+BlockEnv blockFrom(Spec spec, JsonValue env, U256 chainId) {
+  JsonValue? excess = env.member("currentExcessBlobGas");
+  return BlockEnv(num(env.member("currentCoinbase")), num(env.member("currentNumber")), num(env.member("currentTimestamp")),
+                  num(env.member("currentGasLimit")), num(env.member("currentRandom")), num(env.member("currentBaseFee")),
+                  blobGasPrice(spec, num(excess)), chainId, Map.create(hashU256, eqU256));
+}
+
+Transaction txFrom(JsonValue t, JsonValue indexes) {
+  i32 d = num(indexes.member("data")).low() as! i32;
+  i32 g = num(indexes.member("gas")).low() as! i32;
+  i32 v = num(indexes.member("value")).low() as! i32;
+  JsonValue? hashes = t.member("blobVersionedHashes");
+  JsonValue? maxFee = t.member("maxFeePerGas");
+  JsonValue? lists = t.member("accessLists");
+  JsonValue? list = at(lists, d);
+  i32 txType = hashes is not null ? 3 : maxFee is not null ? 2 : (list is not null && !list!.isNull()) ? 1 : 0;
+  if (t.member("authorizationList") is not null) { txType = 4; }
+
+  AccessEntry[] entries = AccessEntry[].filled(0, AccessEntry(U256.zero(), U256[].filled(0, U256.zero())));
+  if (list is not null && !list!.isNull()) {
+    JsonArray arr = list!.array()!;
+    entries = AccessEntry[].filled(arr.len(), AccessEntry(U256.zero(), U256[].filled(0, U256.zero())));
+    for (i32 i = 0; i < arr.len(); i++) {
+      JsonArray keys = arr.get(i).member("storageKeys")!.array()!;
+      U256[] ks = U256[].filled(keys.len(), U256.zero());
+      for (i32 k = 0; k < keys.len(); k++) { ks[k] = num(keys.get(k)); }
+      entries[i] = AccessEntry(num(arr.get(i).member("address")), ks);
+    }
+  }
+  U256[] blobs = U256[].filled(0, U256.zero());
+  if (hashes is not null) {
+    JsonArray arr = hashes!.array()!;
+    blobs = U256[].filled(arr.len(), U256.zero());
+    for (i32 i = 0; i < arr.len(); i++) { blobs[i] = num(arr.get(i)); }
+  }
+  Authorization[] auths = Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(),
+                                                                  U256.zero(), U256.zero()));
+  JsonValue? authList = t.member("authorizationList");
+  if (authList is not null) {
+    JsonArray arr = authList!.array()!;
+    auths = Authorization[].filled(arr.len(), auths.len() == 0 ? Authorization(U256.zero(), U256.zero(), U256.zero(),
+                                                                               U256.zero(), U256.zero(), U256.zero()) : auths[0]);
+    for (i32 i = 0; i < arr.len(); i++) {
+      JsonValue e = arr.get(i);
+      // The fixture also names each `signer`; it is ignored, and the signer recovered, as a client must.
+      auths[i] = Authorization(num(e.member("chainId")), num(e.member("address")), num(e.member("nonce")),
+                               num(e.member("yParity")), num(e.member("r")), num(e.member("s")));
+    }
+  }
+  string toText = t.member("to")!.text() ?? "";
+  U256? to = toText == "" ? null : U256.fromHex(toText);
+  return Transaction(txType, num(t.member("nonce")), num(t.member("gasPrice")), num(maxFee), num(t.member("maxPriorityFeePerGas")),
+                     num(at(t.member("gasLimit"), g)), to, num(at(t.member("value"), v)), bytes(at(t.member("data"), d)),
+                     entries, num(t.member("maxFeePerBlobGas")), blobs, auths, num(t.member("sender")));
+}
+
+/** One case: true when it matches the fixture. */
+bool runCase(Sys sys, Tally tally, string name, JsonValue test, JsonValue post, i32 idx) {
+  World w = worldFrom(test.member("pre")!);
+  JsonValue? config = test.member("config");
+  U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
+  if (chainId.isZero()) { chainId = U256.one(); }
+  Spec spec = Spec.byName(tally.fork)!;
+  BlockEnv block = blockFrom(spec, test.member("env")!, chainId);
+  Transaction tx = txFrom(test.member("transaction")!, post.member("indexes")!);
+  bool expectInvalid = post.member("expectException") is not null;
+  i64 gl = block.gasLimit.fitsU64() ? block.gasLimit.low() as@ i64 : 0x7FFFFFFFFFFFFFFF;
+  fn<void(string)>? tracer = null;
+  if (tally.trace) { tracer = (string line) => { sys.log(line); }; }
+  Processed p = processTransaction(spec, w, block, tx, gl, spec.maxBlobGasPerBlock, tracer);
+  string why = "";
+  if (expectInvalid && p.invalid == "") { why = "accepted a transaction the fixture expects to be refused"; }
+  if (!expectInvalid && p.invalid != "") { why = "refused it: \{p.invalid}"; }
+  string root = bytesToHex(stateRoot(w));
+  string wantRoot = post.member("hash")!.text()!;
+  if (why == "" && root != wantRoot) { why = "state root \{root}, want \{wantRoot}"; }
+  string logs = bytesToHex(logsHash(p.logs));
+  string wantLogs = post.member("logs")!.text()!;
+  if (why == "" && logs != wantLogs) { why = "logs hash \{logs}, want \{wantLogs}"; }
+  if (why == "") { return true; }
+  sys.log("FAIL \{name} [\{idx}]: \{why} (gas used \{p.gasUsed})");
+  if (tally.verbose) { diffState(sys, w, post.member("state")); }
+  return false;
+}
+
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  Tally tally = Tally(0, 0, 0, false, false, "Cancun", "");
+  for (i32 a = 0; a < args.len(); a++) {
+    string arg = args[a];
+    if (arg == "--verbose") { tally.verbose = true; continue; }
+    if (arg == "--trace") { tally.trace = true; continue; }
+    if (arg == "--fork") {
+      a++;
+      tally.fork = args[a];
+      if (Spec.byName(tally.fork) is null) { sys.log("unknown fork \{tally.fork}: Cancun and Prague are what this runs"); return 2; }
+      continue;
+    }
+    if (arg == "--filter") { a++; tally.filter = args[a]; continue; }
+    match (await sys.readFile(arg)) {
+      Err(e): { sys.log("FAIL \{arg}: \{e}"); tally.failed++; }
+      Ok(src): {
+        match (parse(src)) {
+          Err(e): { sys.log("FAIL \{arg}: not JSON"); tally.failed++; }
+          Ok(doc): { runFile(sys, tally, doc); }
+        }
+      }
+    }
+  }
+  sys.log("\{tally.passed} passed, \{tally.failed} failed");
+  return tally.failed == 0 ? 0 : 1;
+}
+
+void runFile(Sys sys, Tally tally, JsonValue doc) {
+  JsonObject tests = doc.object()!;
+  for (i32 i = 0; i < tests.len(); i++) {
+    string name = tests.at(i).keyStr();
+    if (tally.filter != "" && name.indexOf(tally.filter) < 0) { continue; }
+    JsonValue test = tests.at(i).value;
+    JsonValue? posts = test.member("post")!.member(tally.fork);
+    if (posts is null) { continue; }
+    JsonArray cases = posts!.array()!;
+    for (i32 c = 0; c < cases.len(); c++) {
+      if (runCase(sys, tally, name, test, cases.get(c), c)) { tally.passed++; } else { tally.failed++; }
+    }
+  }
+}

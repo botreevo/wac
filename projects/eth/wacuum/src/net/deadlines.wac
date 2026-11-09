@@ -1,0 +1,58 @@
+// Deadlines for connections that must not be waited on for ever.
+//
+// A socket waiting on a peer that never speaks holds a host call for as long as it waits, and wac's
+// JavaScript hosts give a program a bounded number of those (128, wac `issues/system/0373d`): enough silent
+// connections and nothing else the program asks of its host is answered again. Closing a socket ends its
+// wait. So a connection is given a deadline when it is accepted and closed if it is still on it then, by
+// one task for all of them — a timer per connection would itself be a host call per connection.
+
+import { Sys, Socket } from "std";
+import { Vec } from "core";
+
+/** One connection with a deadline: closed at `due` (milliseconds) unless `done` first. */
+export struct Watched {
+  Socket sock;
+  i64 due;
+  bool done;
+}
+
+export struct Deadlines {
+  Vec<Watched> watched;
+  /** Whether a task is enforcing these already: whoever needs them starts `enforce`, and one runs. */
+  bool enforced;
+
+  Deadlines create() { return Deadlines(Vec.create(), false); }
+
+  /** Close `sock` `millis` from `now` unless the answer is `done` by then. */
+  Watched watch(this, Socket sock, i64 now, i64 millis) {
+    Watched w = Watched(sock, now + millis, false);
+    this.watched.push(w);
+    return w;
+  }
+
+  /** Close what is overdue, and forget what is done or closed. */
+  void sweep(this, i64 now) {
+    Vec<Watched> keep = Vec.create();
+    for (i32 i = 0; i < this.watched.len(); i++) {
+      Watched w = this.watched.get(i);
+      if (w.done) { continue; }
+      if (now >= w.due) {
+        w.done = true;
+        w.sock.close();
+        continue;
+      }
+      keep.push(w);
+    }
+    this.watched = keep;
+  }
+}
+
+/** The one task that enforces every deadline in `d`, a sweep a second, for as long as the program runs. */
+export async void enforce(Sys sys, Deadlines d) {
+  if (d.enforced) { return; }
+  d.enforced = true;
+  while (true) {
+    await sys.sleepMillis(1000);
+    d.sweep((await sys.clock().nowMillis()).orElse(0 as i64));
+  }
+}

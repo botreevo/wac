@@ -1,0 +1,148 @@
+// `--dev`'s chain: the engine making its own blocks from the built-in genesis, with no consensus client.
+
+import { json.parse, json.JsonValue, json.JsonArray } from "wac";
+import { rlp.Item, rlp.encode } from "wac";
+import { keccak256 } from "../src/crypto/keccak.wac";
+import { U256 } from "../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../src/hex.wac";
+import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
+import { Engine, Answer, Replayed } from "../src/engine/engine.wac";
+import { devGenesis, DEV_KEY, DEV_ADDRESS } from "../src/chain/dev.wac";
+import { u256Bytes } from "../src/state/root.wac";
+import { addressBytes } from "../src/evm/evm.wac";
+import { sign } from "../src/p2p/secp.wac";
+import { str, one } from "./chainkit.wac";
+import { Check } from "./check.wac";
+
+static string TO = "0x2222222222222222222222222222222222222222";
+
+Engine devEngine() {
+  string[] why = [""];
+  Genesis gen = genesisFrom(parse(devGenesis(DEV_ADDRESS).toBytes()).ok()!, why)!;
+  return Engine.create(gen.config, gen.header, gen.world);
+}
+
+/** An EIP-1559 transfer of `value` wei to 0x22…22 from the dev account, signed for chain 1337. */
+string transfer(u64 nonce, u64 value) {
+  Item[] fields = [Item.Bytes(u256Bytes(U256.ofU64(1337))), Item.Bytes(u256Bytes(U256.ofU64(nonce))), Item.Bytes(u256Bytes(U256.one())),
+                   Item.Bytes(u256Bytes(U256.ofU64(10000000000))), Item.Bytes(u256Bytes(U256.ofU64(21000))),
+                   Item.Bytes(hexToBytes(TO)!), Item.Bytes(u256Bytes(U256.ofU64(value))), Item.Bytes(u8[].filled(0, 0)),
+                   Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0))))];
+  u8[] sig = sign(keccak256(typed(encode(Item.List(fields)))), hexToBytes(DEV_KEY)!);
+  Item[] all = Item[].filled(fields.len() + 3, Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < fields.len(); i++) { all[i] = fields[i]; }
+  all[fields.len()] = Item.Bytes(u256Bytes(U256.ofU64(sig[64] as u64)));
+  all[fields.len() + 1] = Item.Bytes(u256Bytes(U256.fromBytes(sig, 0, 32)));
+  all[fields.len() + 2] = Item.Bytes(u256Bytes(U256.fromBytes(sig, 32, 32)));
+  return bytesToHex(typed(encode(Item.List(all))));
+}
+
+/** A type-2 transaction's bytes: its type, then its RLP. */
+u8[] typed(u8[] body) {
+  u8[] out = u8[].filled(body.len() + 1, 2);
+  for (i32 i = 0; i < body.len(); i++) { out[i + 1] = body[i]; }
+  return out;
+}
+
+U256 balance(Engine e, string addr) { return U256.fromHex(e.call("eth_getBalance", one(str(addr))).result!.text()!)!; }
+
+export string test_dev_mode_makes_its_own_blocks() {
+  Check t = Check.create();
+  Engine e = devEngine();
+  t.ok(balance(e, DEV_ADDRESS).gt(U256.zero()), "the dev account is funded");
+
+  // An empty block, then one with two transfers, then another empty one.
+  t.eqStr(e.produce(U256.ofU64(1000), U256.zero()), "", "the first block is made");
+  Answer a = e.call("eth_sendRawTransaction", one(str(transfer(0, 5))));
+  t.eqStr(a.message, "", "the first transfer is taken");
+  e.call("eth_sendRawTransaction", one(str(transfer(1, 7))));
+  // A timestamp that has not moved on is taken as the parent's and one more.
+  t.eqStr(e.produce(U256.ofU64(1000), U256.zero()), "", "the second block is made");
+  t.eqStr(e.produce(U256.ofU64(1010), U256.zero()), "", "the third block is made");
+
+  t.eqU256(e.headerByHash(e.head)!.number, U256.ofU64(3), "three blocks");
+  t.eqU256(e.headerByNumber(2)!.timestamp, U256.ofU64(1001), "the second a second after the first");
+  t.eqU256(e.finalized, e.head, "each final as soon as it is made");
+  t.eqU256(balance(e, TO), U256.ofU64(12), "both transfers are in");
+  t.ok(e.mempool.len() == 0, "and out of the mempool");
+  string block = e.call("eth_getTransactionReceipt", one(str(bytesToHex(keccak256(hexToBytes(transfer(1, 7))!))))).result?.member("blockNumber")?.text() ?? "";
+  t.eqStr(block, "0x2", "the second transfer's receipt is in block 2");
+
+  // The records a restart replays end in the same place.
+  i32 total = 0;
+  for (i32 i = 0; i < e.records.len(); i++) { total += e.records.get(i).len(); }
+  u8[] log = u8[].filled(total, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < e.records.len(); i++) {
+    u8[] r = e.records.get(i);
+    for (i32 k = 0; k < r.len(); k++) { log[at + k] = r[k]; }
+    at += r.len();
+  }
+  Engine again = devEngine();
+  Replayed rp = again.replay(log);
+  t.eqStr(rp.error, "", "the log replays");
+  t.ok(rp.blocks == 3, "all three blocks");
+  t.eqU256(again.head, e.head, "to the same head");
+  t.eqU256(balance(again, TO), U256.ofU64(12), "and the same state");
+  return t.report();
+}
+
+export string test_a_bounded_history_forgets_old_blocks() {
+  Check t = Check.create();
+  Engine e = devEngine();
+  e.history = 3;
+  e.call("eth_sendRawTransaction", one(str(transfer(0, 5))));
+  for (u64 i = 1; i <= 8; i++) { t.eqStr(e.produce(U256.ofU64(i * 10), U256.zero()), "", "block \{i} is made"); }
+
+  // Finalized at 8, keeping 3 below it: 5, 6, 7 and 8 are kept, 1 to 4 are not, and the genesis is.
+  t.ok(e.headerByNumber(4) is null && e.headerByNumber(5) is not null, "blocks below 5 are gone");
+  t.ok(e.headerByNumber(0) is not null, "the genesis is kept");
+  string hash = bytesToHex(keccak256(hexToBytes(transfer(0, 5))!));
+  t.ok(e.call("eth_getTransactionReceipt", one(str(hash))).result!.isNull(), "block 1's transfer is forgotten");
+  t.ok(e.call("eth_getBlockByNumber", JsonValue.Array(pair(str("0x1"), JsonValue.Bool(false)))).result!.isNull(), "and block 1");
+  t.eqU256(balance(e, TO), U256.ofU64(5), "but not its effect");
+  Answer f = e.call("eth_feeHistory", JsonValue.Array(pair(str("0x10"), str("latest"))));
+  t.ok(f.result is not null && f.result!.member("oldestBlock")!.text()! == "0x5", "fee history starts at what is kept");
+  return t.report();
+}
+
+export string test_a_transaction_from_before_the_snapshot_is_found_by_its_hash() {
+  Check t = Check.create();
+  Engine e = devEngine();
+  e.call("eth_sendRawTransaction", one(str(transfer(0, 5))));
+  for (u64 i = 1; i <= 3; i++) { e.produce(U256.ofU64(i * 10), U256.zero()); }
+  u8[]? snap = e.snapshot();
+  t.ok(snap is not null, "a snapshot at block 3");
+  u8[] log = logOf(e);
+
+  // Restarted: the snapshot is block 3's state, and blocks 1 to 3 are recorded from the log, not run.
+  Engine again = devEngine();
+  t.eqStr(again.restore(snap!), "", "the snapshot restores");
+  t.eqStr(again.replay(log).error, "", "the log replays onto it");
+  string hash = bytesToHex(keccak256(hexToBytes(transfer(0, 5))!));
+  JsonValue? tx = again.call("eth_getTransactionByHash", one(str(hash))).result;
+  t.ok(tx is not null && !tx!.isNull() && tx!.member("blockNumber")!.text()! == "0x1", "the transfer is found, in block 1");
+  t.ok(again.call("eth_getTransactionReceipt", one(str(hash))).result!.isNull(), "with no receipt: its block did not run here");
+  return t.report();
+}
+
+/** Everything the engine has recorded, as its log on disk would hold it. */
+u8[] logOf(Engine e) {
+  i32 total = 0;
+  for (i32 i = 0; i < e.records.len(); i++) { total += e.records.get(i).len(); }
+  u8[] log = u8[].filled(total, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < e.records.len(); i++) {
+    u8[] r = e.records.get(i);
+    for (i32 k = 0; k < r.len(); k++) { log[at + k] = r[k]; }
+    at += r.len();
+  }
+  return log;
+}
+
+JsonArray pair(JsonValue a, JsonValue b) {
+  JsonArray ps = JsonArray.create();
+  ps.push(a);
+  ps.push(b);
+  return ps;
+}

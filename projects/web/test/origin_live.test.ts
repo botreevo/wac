@@ -3,23 +3,16 @@
 // served by a server that also answers `/echo`, `/gone` and a WebSocket at `/ws` — where the page's POST arrives with
 // its fields and body, its DELETE with no body, and its socket's message is echoed, followed by two of the server's
 // own and a close — and opened from a file, where there is no origin.
-import { buildPage, waitInPage } from "./harness.ts";
+import { buildPage, waitInPage, findChromium } from "./harness.ts";
 
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   const a = JSON.stringify(got), b = JSON.stringify(want);
   if (a !== b) throw new Error(`assertEquals failed${msg === undefined ? "" : ` — ${msg}`}\n  got:  ${a}\n  want: ${b}`);
 }
 
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") return "no `sys` permission";
-  const home = Deno.env.get("HOME") ?? "";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)].some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    return found ? "" : `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright`;
-  }
-})();
+// Found by `harness.ts` `findChromium`, which launches it by executable (wac `issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") console.warn(`SKIPPING the origin live test: ${cannotBecause}.`);
 
 Deno.test({
@@ -62,7 +55,7 @@ Deno.test({
     });
     try {
       await buildPage("example/originpage.wac", dir);
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
       const said = async (url: string) => {
         const page = await browser!.newPage();
         await page.goto(url, { waitUntil: "load" });

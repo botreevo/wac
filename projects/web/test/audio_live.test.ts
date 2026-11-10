@@ -8,7 +8,7 @@
 //
 // **Skipped loudly** when there is no browser, as `view_live.test.ts` is.
 
-import { buildPage, serve, waitInPage } from "./harness.ts";
+import { buildPage, serve, waitInPage, findChromium } from "./harness.ts";
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   const a = JSON.stringify(got), b = JSON.stringify(want);
   if (a !== b) {
@@ -16,20 +16,9 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
   }
 }
 
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return "no `sys` permission: run this file with `deno test -A`";
-  }
-  const home = Deno.env.get("HOME") ?? "";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
-      .some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright — run: ./node_modules/.bin/playwright install chromium`;
-  }
-  return "";
-})();
+// Found by `harness.ts` `findChromium`, which launches it by executable (wac `issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") {
   console.warn(
     `SKIPPING the audio live test: ${cannotBecause}.\n` +
@@ -69,7 +58,7 @@ Deno.test({
     try {
       await buildPage("example/beep.wac", dir);
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server", "--autoplay-policy=no-user-gesture-required"] });
+      browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server", "--autoplay-policy=no-user-gesture-required"] });
       const page = await browser.newPage();
       await page.addInitScript(WATCH);
       const failures: string[] = [];

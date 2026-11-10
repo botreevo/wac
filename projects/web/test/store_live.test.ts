@@ -3,23 +3,16 @@
 // reads a value plain JavaScript stored before it ran, and what it stores and removes is what JavaScript then sees. It
 // also names the reader's zone (`PAGE_ZONE_NAME`, set here by Playwright) and goes Back (`PAGE_BACK`) without adding to
 // the history.
-import { buildPage, serve, waitInPage } from "./harness.ts";
+import { buildPage, serve, waitInPage, findChromium } from "./harness.ts";
 
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   const a = JSON.stringify(got), b = JSON.stringify(want);
   if (a !== b) throw new Error(`assertEquals failed${msg === undefined ? "" : ` — ${msg}`}\n  got:  ${a}\n  want: ${b}`);
 }
 
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") return "no `sys` permission";
-  const home = Deno.env.get("HOME") ?? "";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)].some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    return found ? "" : `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright`;
-  }
-})();
+// Found by `harness.ts` `findChromium`, which launches it by executable (wac `issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") console.warn(`SKIPPING the store live test: ${cannotBecause}.`);
 
 Deno.test({
@@ -35,7 +28,7 @@ Deno.test({
     try {
       await buildPage("example/storepage.wac", dir);
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
       const context = await browser.newContext({ timezoneId: "America/New_York" });
       const page = await context.newPage();
       await page.addInitScript(() => { localStorage.setItem("token", "abc"); localStorage.setItem("gone", "x"); });

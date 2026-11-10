@@ -8,7 +8,7 @@
 //
 // **Skipped loudly** when there is no browser, in the words `view_live.test.ts` uses.
 
-import { buildModule, buildPage, serve, waitInPage } from "./harness.ts";
+import { buildModule, buildPage, serve, waitInPage, findChromium } from "./harness.ts";
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   const a = JSON.stringify(got), b = JSON.stringify(want);
   if (a !== b) {
@@ -16,20 +16,9 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
   }
 }
 
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return "no `sys` permission: run this file with `deno test -A`";
-  }
-  const home = Deno.env.get("HOME") ?? "";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
-      .some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright — run: ./node_modules/.bin/playwright install chromium`;
-  }
-  return "";
-})();
+// Found by `harness.ts` `findChromium`, which launches it by executable (wac `issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") {
   console.warn(
     `SKIPPING the page spawn live test: ${cannotBecause}.\n` +
@@ -58,7 +47,7 @@ Deno.test({
       const plain = await Deno.readFile(`${dir}/plain.wasm`);
       const load = await Deno.readFile(`${dir}/load.wasm`);
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
       const page = await browser.newPage();
       const failures: string[] = [];
       page.on("pageerror", (e: Error) => failures.push(String(e)));
@@ -116,7 +105,9 @@ Deno.test({
         .catch(async (e: Error) => {
           throw new Error(`${e.message}\nthe page shows: ${JSON.stringify(await shown())}\nerrors: ${localFailures.join(" | ")}`);
         });
-      assertEquals(await shown(), "from a file\nstopped: 143", "a copy started and stopped from a file");
+      // A child its parent stopped did not exit: `exit()` says so, as on every host since `Child.ended()` (wac 71bc06729).
+      assertEquals(await shown(), "from a file\nstopped: the child was stopped: stopped by its parent",
+        "a copy started and stopped from a file");
       assertEquals(localFailures, [], "the page from a file reported an error");
     } finally {
       await browser?.close();

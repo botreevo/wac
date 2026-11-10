@@ -2,23 +2,16 @@
 // A page reads the site it was served from (`wac.site`, `src/site.wac`): `example/sitepage.wac` built, a `data`
 // folder put beside it, `tools/index.wac` run over the lot, and the page served over http — where it lists the folder
 // from the index and reads the note by a GET, and cannot write — and opened from a file, where there is no site.
-import { ROOT, WAC, buildPage, serve, waitInPage } from "./harness.ts";
+import { ROOT, WAC, buildPage, serve, waitInPage, findChromium } from "./harness.ts";
 
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   const a = JSON.stringify(got), b = JSON.stringify(want);
   if (a !== b) throw new Error(`assertEquals failed${msg === undefined ? "" : ` — ${msg}`}\n  got:  ${a}\n  want: ${b}`);
 }
 
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") return "no `sys` permission";
-  const home = Deno.env.get("HOME") ?? "";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)].some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    return found ? "" : `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright`;
-  }
-})();
+// Found by `harness.ts` `findChromium`, which launches it by executable (wac `issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") console.warn(`SKIPPING the site live test: ${cannotBecause}.`);
 
 Deno.test({
@@ -41,7 +34,7 @@ Deno.test({
       }).output();
       if (!indexed.success) throw new Error(new TextDecoder().decode(indexed.stderr));
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
       const said = async (url: string) => {
         const page = await browser!.newPage();
         await page.goto(url, { waitUntil: "load" });

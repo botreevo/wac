@@ -100,3 +100,51 @@ export async function waitInPage(
     await new Promise((r) => setTimeout(r, 50));
   }
 }
+
+/** The executable a live test launches, or why there is none. Exactly one of the two is not `""`. */
+export type Chromium = { executablePath: string; cannot: string };
+
+/**
+ * **Where this machine's Chromium is** — wac's `harness/chromium.ts`, for the same reason (wac `issues/system/0452e`).
+ *
+ * Each live test looked in `$HOME/.cache/ms-playwright` and nowhere else, then launched whatever browser the newest
+ * `npm:playwright@1` expected. A machine whose Chromium is elsewhere — a cloud container keeps it at
+ * `$PLAYWRIGHT_BROWSERS_PATH` — skipped every one, and the gate read that as a pass: which is how a page stopped being
+ * able to wait for a child without this repository noticing (wac `issues/system/0460e`). So the browser is found:
+ * `WAC_CHROMIUM`, or the newest `chromium-*` under `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`, and
+ * launched by its executable, which makes the Playwright version irrelevant.
+ */
+export function findChromium(): Chromium {
+  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
+    return { executablePath: "", cannot: "no `sys` permission: run this file with `deno test -A`" };
+  }
+  const isFile = (path: string): boolean => {
+    try {
+      return Deno.statSync(path).isFile;
+    } catch {
+      return false;
+    }
+  };
+  const named = Deno.env.get("WAC_CHROMIUM") ?? "";
+  if (named !== "") {
+    return isFile(named)
+      ? { executablePath: named, cannot: "" }
+      : { executablePath: "", cannot: `WAC_CHROMIUM names ${named}, which is not a file` };
+  }
+  const dir = Deno.env.get("PLAYWRIGHT_BROWSERS_PATH") || `${Deno.env.get("HOME") ?? ""}/.cache/ms-playwright`;
+  let revisions: string[];
+  try {
+    revisions = [...Deno.readDirSync(dir)]
+      .filter((e) => e.isDirectory && /^chromium-\d+$/.test(e.name))
+      .map((e) => e.name)
+      .sort((a, b) => Number(b.slice(9)) - Number(a.slice(9)));
+  } catch {
+    return { executablePath: "", cannot: `no ${dir} — run: ./node_modules/.bin/playwright install chromium` };
+  }
+  for (const r of revisions) {
+    for (const sub of ["chrome-linux64/chrome", "chrome-linux/chrome", "chrome-mac/Chromium.app/Contents/MacOS/Chromium"]) {
+      if (isFile(`${dir}/${r}/${sub}`)) return { executablePath: `${dir}/${r}/${sub}`, cannot: "" };
+    }
+  }
+  return { executablePath: "", cannot: `no chromium executable under ${dir}` };
+}

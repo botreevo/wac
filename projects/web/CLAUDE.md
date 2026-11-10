@@ -29,8 +29,9 @@ directory of wac, and they are still the reasons.
     deno test -A --unstable-net --no-check test/     the template outside the repository, and pages in Chromium
     tools/push.sh                                    all of it, then push
 
-`$WAC` names the `wac` the Deno tests and the gate run; the one on `PATH` otherwise. The browser tests skip,
-loudly, without Chromium under `~/.cache/ms-playwright`.
+`$WAC` names the `wac` the Deno tests and the gate run; the one on `PATH` otherwise. The browser tests find Chromium
+at `$WAC_CHROMIUM`, or under `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright` (`test/harness.ts`
+`findChromium`), and skip, loudly, where there is none.
 
 ## Working agreements
 

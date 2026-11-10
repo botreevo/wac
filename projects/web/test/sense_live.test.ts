@@ -8,22 +8,11 @@
 //
 // **Skipped loudly** when there is no browser, as `view_live.test.ts` is.
 
-import { buildPage, serve, waitInPage } from "./harness.ts";
+import { buildPage, serve, waitInPage, findChromium } from "./harness.ts";
 
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return "no `sys` permission: run this file with `deno test -A`";
-  }
-  const home = Deno.env.get("HOME") ?? "";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
-      .some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright — run: ./node_modules/.bin/playwright install chromium`;
-  }
-  return "";
-})();
+// Found by `harness.ts` `findChromium`, which launches it by executable (wac `issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") {
   console.warn(`SKIPPING the sense live test: ${cannotBecause}.`);
 }
@@ -52,7 +41,7 @@ for (const mode of [[], ["--in-page"]]) {
         const index = await Deno.readTextFile(`${dir}/index.html`);
         if (!index.includes("interactive-widget=resizes-content, viewport-fit=cover")) throw new Error("the viewport of an --edge page");
         const port = (http = serve(dir)).port;
-        browser = await chromium.launch({ args: ["--no-proxy-server"] });
+        browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
         const page = await browser.newPage({ viewport: { width: 800, height: 600 }, deviceScaleFactor: 2, hasTouch: true });
         await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
         const text = (id: string) => `(document.getElementById(${JSON.stringify(id)})?.textContent ?? "")`;

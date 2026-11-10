@@ -1,0 +1,62 @@
+// web — admission in a browser (docs/browser-extension.md, R2): src/admission.wac behind a `main(Sys)` that wac's
+// `--target browser` builds into a page whose program runs in a worker.
+//
+//     web SUBJECT ROLE --policy-text JSON5 [the settings `claim admit` takes: --checkpoint, --beacon-url, --now,
+//         --anchor, --rpc, --registry, --code-hash, --ens-registry…] [--store DIR] [--mirror URL]…
+//
+// The same decision as `claim admit`, printed the same way, with the policy given as text: a page starts with an
+// empty disk (the browser's Origin Private File System), so there is no file to name. In a page the arguments come
+// from the query string, `?a=ens:vitalik.eth&a=app&a=--policy-text&a=…`. Beacon data comes from a node by URL, and
+// claims and blocks from mirrors by URL: everything outside the page arrives over HTTP, checked.
+
+import { Sys } from "std";
+import { fetch.Caps } from "wac";
+import { ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.mirrorAt } from "@/lib.wac";
+import { Loaded, loadIndexes } from "../src/graph.wac";
+import { AdmitRequest, Admitted, admitSubject } from "../src/admission.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+i64 decimal(string s) {
+  i64 v = 0 as i64;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] < 48 || b[i] > 57) { return -1 as i64; } v = v * (10 as i64) + ((b[i] as i64) - (48 as i64)); }
+  return v;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 2 || flag(a, "--policy-text", "") == "") {
+    sys.warn("usage: web SUBJECT ROLE --policy-text JSON5 [settings] [--mirror URL]… (see the source)");
+    return 2;
+  }
+  Store store = Store.dir(sys.files(), flag(a, "--store", "store"));
+  Store[] mirrors = Store[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != "--mirror") { continue; }
+    if (!isHttp(a[i + 1])) { sys.warn("web: a mirror is a URL here: \{a[i + 1]}"); return 2; }
+    match (mirrorAt(Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files()), a[i + 1])) {
+      Err(e): { sys.warn("web: \{e}"); return 2; }
+      Ok(m): {
+        Store[] next = Store[].filled(mirrors.len() + 1, m);
+        for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
+        mirrors = next;
+      }
+    }
+  }
+  Resolver r = Resolver(store, mirrors);
+  Loaded loaded = loadIndexes(store, mirrors);
+  for (i32 i = 0; i < loaded.refused.len(); i++) { sys.warn("web: left out: \{loaded.refused[i]}"); }
+  sys.log("web: \{loaded.index.signed.len()} statement(s) from \{mirrors.len()} mirror(s)");
+  AdmitRequest q = AdmitRequest(a[0], a[1], flag(a, "--policy-text", "").toBytes(), flag(a, "--checkpoint", ""), "",
+                                flag(a, "--beacon-url", ""), flag(a, "--fork", ""),
+                                flag(a, "--now", "") != "" ? decimal(flag(a, "--now", "")) : (-1 as i64),
+                                flag(a, "--anchor", ""), flag(a, "--rpc", ""), flag(a, "--registry", ""), flag(a, "--code-hash", ""),
+                                flag(a, "--ens-registry", ""), flag(a, "--ens-registry-code", ""), flag(a, "--resolver-code", ""));
+  Admitted d = await admitSubject(sys, q, loaded.index, r);
+  for (i32 i = 0; i < d.lines.len(); i++) { if (d.lines[i].warn) { sys.log("web: " + d.lines[i].text); } else { sys.log(d.lines[i].text); } }
+  return d.code;
+}

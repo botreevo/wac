@@ -55,8 +55,8 @@ sandboxed frame  ◄── extension service worker: answers /app/<root-cid>/<pa
 | | Change | Where |
 | --- | --- | --- |
 | W1 | **An HTTP capability in the browser host.** A host-provided request/response, e.g. `wac.http ^1`: method, URL, headers, body in; status, headers, body out. Answered in `platform/host/browser.ts` (and an extension host) by `fetch`. Then wac's `fetch` package and `http` client use it when the host offers it, and sockets otherwise, so programs don't change. Without W1 nothing in the browser can reach a beacon node, an RPC or a mirror. **Blocks milestone 1** | **[wac]** |
-| W2 | **`--target browser` for an extension.** Today it emits one self-contained HTML page. An extension needs the worker and the wasm as files, not inline strings, because MV3's CSP forbids inline script, plus a launcher that is a module script and a way to pass arguments other than the query string | **[wac]** packages/platform/build.ts |
-| W3 | **Building in this container.** `app:build` is a deno task, and deno isn't installed here, so 20 of wac-eth's oracle tests also fail. Install deno, or give `wac` itself a `--target browser` | **[wac]** or environment |
+| W2 | **`--target browser` for a project with dependencies, and for an extension.** Found by trying: `build.ts` reads the import graph itself (`harness/wacFiles.ts`), resolving relative, `@/`, core and std imports, and **not the packages a project's `wac.lock` pins**. Every program in wac-eth imports `"wac"`, so `cmd/web.wac` fails with 54 imports unresolved. That **blocks milestone 1 as much as W1**. A `--target browser` in `wac build` itself, which already resolves packages, would fix this and W3 at once. Also: today it emits one self-contained HTML page. An extension needs the worker and the wasm as files, not inline strings, because MV3's CSP forbids inline script, plus a module launcher and a way to pass arguments other than the query string | **[wac]** packages/platform/build.ts, or `wac build` |
+| W3 | **Building in this container.** `app:build` is a deno task, and deno isn't installed here. Measured: deno installs from npm (`npm install deno`), and with it a program with no package imports (`corpus/probe.wac`) builds and runs in headless Chromium, its clock, random bytes and arguments as expected. `build.ts` must be run from a wac checkout at a path with no `%`: from the package cache's path, deno's file URLs mangle `%3A` | environment (solved locally) |
 | R1 | **Admission as a library.** Move `claim admit`'s flow (anchor, name, chain, claims, decision) out of `cmd/claim.wac` into `src/admission.wac`: `admitSubject(sys, Request) → Admitted{ ok, why[], cid, log[] }`. Then `claim` and the browser entry are thin over it | **[reckon]** |
 | R2 | **A browser entry,** `cmd/web.wac`: `main(Sys)` taking the subject, role and settings, running R1, then fetching the tree, so the worker hands verified blocks to the service worker | **[reckon]** |
 | R3 | **CORS on the replays.** `tools/replay.mjs` and `tools/beacon-replay.mjs` answer `OPTIONS` and send `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Eth-Consensus-Version`, so a page served from another port can use them | **[reckon]** |
@@ -84,9 +84,10 @@ what the user installed, and its build can itself be a derivation, so it can be 
    loads a page built with `--target browser` from the browser entry (R2, over R1). Against `replay.mjs` and
    `beacon-replay.mjs` (R3) on recorded mainnet data, it admits `ens:vitalik.eth` under a reviewer's endorsement,
    with the claims from a mirror served over HTTP. A tampered beacon update and a tampered proof are refused, as
-   `admit-by-name.sh` checks on the command line. This needs W1 (and W3 to build here). Without W1, I can do R1,
-   R2 and R3, and a Playwright harness that shows the run reaching its first network request and being refused with
-   "network access".
+   `admit-by-name.sh` checks on the command line. It needs W1 and W2. **Status:** R1, R2 and R3 are done, and
+   `tools/browser-admit.sh` is the harness. It admits `ens:vitalik.eth` through `cmd/web.wac` on the command line
+   (2 of 2), then builds the page and runs it in Chromium. The browser half reports BLOCKED, naming W2 (and then W1),
+   and counts nothing until they land.
 2. **The extension shell.** MV3 manifest, a UI page, the worker running milestone 1's module from packaged files
    (W2), and settings. It admits a name and shows the account. No app is served yet.
 3. **Serving the admitted app.** The service worker serves `/app/<cid>/…` from verified blocks, in the sandboxed

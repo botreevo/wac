@@ -1,6 +1,6 @@
 // derive — a runner for the deterministic WebAssembly machine (`src/machine.wac`).
 //
-//     derive recipe --program F [--args F] [--in DIR]   an input tree and a recipe over it, into the store;
+//     derive recipe --program F [--args F] [--in DIR] [--slot NAME DIR]…   an input tree and a recipe over it, into the store;
 //                                                        prints the recipe's CID
 //     derive canon IN OUT [--scan F]                    a module with canonical NaNs, as `run` runs it
 //     derive run RECIPE [--timeout MS] [--key F --runner NAME]
@@ -33,7 +33,7 @@ string flag(string[] a, string name, string fallback) {
 export async i32 main(Sys sys) {
   string[] a = sys.args();
   if (a.len() < 1) {
-    sys.warn("usage: derive recipe --program F [--args F] [--in DIR] | derive run RECIPE [--timeout MS] [--key F --runner NAME]  [--store DIR] [--mirror DIR]…");
+    sys.warn("usage: derive recipe --program F [--args F] [--in DIR] [--slot NAME DIR]… | derive run RECIPE [--timeout MS] [--key F --runner NAME]  [--store DIR] [--mirror DIR]…");
     return 2;
   }
   Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
@@ -55,29 +55,23 @@ export async i32 main(Sys sys) {
 async i32 recipeCmd(Sys sys, Store store, string[] a) {
   string programPath = flag(a, "--program", "");
   if (programPath == "") { sys.warn("derive recipe: --program is required"); return 2; }
-  FileIn[] files = FileIn[]();
-  string[] dirs = string[]();
+  Tree t = Tree(FileIn[](), string[]());
+  // `--in DIR` is the slot `in`; `--slot NAME DIR`, repeatable, any other: a recipe's input is its named slots, and a
+  // policy says which role each must be admitted in (src/slots.wac).
   string inDir = flag(a, "--in", "");
   if (inDir != "") {
-    // The directory through the importer, so `in/` is read exactly as `obj add` would read it, then read back.
-    Cid sub;
-    match (await importDir(store, sys.files(), inDir, PROFILE())) {
-      Err(e): { sys.warn("derive: \{inDir}: \{e}"); return 1; }
-      Ok(c): { sub = c; }
-    }
-    match (readTree(Resolver(store, Store[]()), sub)) {
-      Err(e): { sys.warn("derive: \{e}"); return 1; }
-      Ok(fs): {
-        FileIn[] only = filesOnly(fs);
-        string[] empty = emptyDirsOf(fs);
-        files = FileIn[].filled(only.len(), FileIn("", u8[]()));
-        for (i32 i = 0; i < only.len(); i++) { files[i] = FileIn("in/" + only[i].path, only[i].content); }
-        dirs = string[].defaulted(empty.len() + 1);
-        dirs[0] = "in";
-        for (i32 i = 0; i < empty.len(); i++) { dirs[i + 1] = "in/" + empty[i]; }
-      }
-    }
+    match (await addSlot(sys, store, t, "in", inDir)) { Err(e): { sys.warn("derive: \{e}"); return 1; } Ok(_): { } }
   }
+  for (i32 i = 0; i + 2 < a.len(); i++) {
+    if (a[i] != "--slot") { continue; }
+    string name = a[i + 1];
+    if (name == "program" || name == "args" || name == "in" || name.indexOf("/") >= 0 || name == "") {
+      sys.warn("derive: --slot \{name}: a slot of its own, not program, args or in, and no /"); return 2;
+    }
+    match (await addSlot(sys, store, t, name, a[i + 2])) { Err(e): { sys.warn("derive: \{e}"); return 1; } Ok(_): { } }
+  }
+  FileIn[] files = t.files;
+  string[] dirs = t.dirs;
   match (await sys.readFile(programPath)) {
     Err(e): { sys.warn("derive: \{programPath}: \{e}"); return 1; }
     Ok(b): { files = plus(files, FileIn("program", b)); }
@@ -103,6 +97,36 @@ async i32 recipeCmd(Sys sys, Store store, string[] a) {
   sys.warn("input \{input.text()}");
   sys.log(id.text());
   return 0;
+}
+
+/** A recipe's input as it is put together: files and empty directories, by path. */
+struct Tree {
+  FileIn[] files;
+  string[] dirs;
+}
+
+/** The directory `dir` as the slot `name`: through the importer, so it is read exactly as `obj add` reads it. */
+async Result<bool, string> addSlot(Sys sys, Store store, Tree t, string name, string dir) {
+  Cid sub;
+  match (await importDir(store, sys.files(), dir, PROFILE())) {
+    Err(e): { return Result.Err("\{dir}: \{e}"); }
+    Ok(c): { sub = c; }
+  }
+  FileIn[] fs;
+  match (readTree(Resolver(store, Store[]()), sub)) { Err(e): { return Result.Err(e); } Ok(x): { fs = x; } }
+  FileIn[] only = filesOnly(fs);
+  string[] empty = emptyDirsOf(fs);
+  for (i32 i = 0; i < only.len(); i++) { t.files = plus(t.files, FileIn(name + "/" + only[i].path, only[i].content)); }
+  t.dirs = plusS(t.dirs, name);
+  for (i32 i = 0; i < empty.len(); i++) { t.dirs = plusS(t.dirs, name + "/" + empty[i]); }
+  return Result.Ok(true);
+}
+
+string[] plusS(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
 }
 
 FileIn[] plus(FileIn[] xs, FileIn x) {

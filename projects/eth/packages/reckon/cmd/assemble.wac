@@ -1,0 +1,104 @@
+// assemble — the extension, put together inside the machine (docs/browser-extension.md, milestone 5), from a recipe
+// whose input has three slots:
+//
+//     /in/pages/…           the extension's own files (manifest, page, loader, scripts): source
+//     /in/glue/…            the browser glue wac's --target browser --layout files writes (index.html, launcher.js,
+//                           worker.js), without its module
+//     /in/module/out/web.wasm   cmd/web.wac as the compiler built it, inside the machine: a derived output
+//
+// and writes /out/: the pages at the top, the glue under admit/, and admit/app.wasm, which is web.wasm with its
+// `wac.manifest` custom section left out, the only thing the browser build changes in the module. So the extension a
+// person loads is a derived output: the program and every slot named by CID in the recipe, each admitted in its own
+// role by a policy (site/downloads/policy.json5), and two runners on two engines witnessing the same tree.
+
+import { Sys, Files } from "std";
+import { Result } from "core";
+
+/** The module with its `wac.manifest` custom section left out; every other byte as it was. */
+export Result<u8[], string> withoutManifest(u8[] b) {
+  if (b.len() < 8 || b[0] != (0 as u8) || b[1] != (0x61 as u8) || b[2] != (0x73 as u8) || b[3] != (0x6d as u8)) {
+    return Result.Err("not a wasm module");
+  }
+  u8[] out = u8[].filled(b.len(), 0);
+  out.copyFrom(b, 0, 0, 8);
+  i32 n = 8;
+  i32 i = 8;
+  while (i < b.len()) {
+    i32 start = i;
+    i32 id = b[i] as i32;
+    i++;
+    i32 size = 0;
+    i32 shift = 0;
+    while (true) {
+      if (i >= b.len()) { return Result.Err("a section's size runs past the end"); }
+      i32 x = b[i] as i32;
+      i++;
+      size = size | ((x & 127) << shift);
+      shift += 7;
+      if (x < 128) { break; }
+    }
+    i32 body = i;
+    i = i + size;
+    if (i > b.len()) { return Result.Err("a section runs past the end"); }
+    bool manifest = false;
+    if (id == 0) {
+      i32 len = 0;
+      i32 sh = 0;
+      i32 j = body;
+      while (true) {
+        i32 x = b[j] as i32;
+        j++;
+        len = len | ((x & 127) << sh);
+        sh += 7;
+        if (x < 128) { break; }
+      }
+      manifest = len == 12 && string.fromBytes(cut(b, j, j + len)) == "wac.manifest";
+    }
+    if (!manifest) { out.copyFrom(b, start, n, i - start); n = n + (i - start); }
+  }
+  return Result.Ok(cut(out, 0, n));
+}
+
+u8[] cut(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+/** Every file below `from`, copied to the same path below `to`, directories made as needed. */
+async Result<i32, string> copyTree(Files fs, string from, string to) {
+  string[] names;
+  match (await fs.readDir(from)) { Err(e): { return Result.Err("\{from}: \{e}"); } Ok(n): { names = n; } }
+  match (await fs.mkdir(to, true)) { Err(e): { return Result.Err("\{to}: \{e}"); } Ok(_): { } }
+  i32 count = 0;
+  for (i32 i = 0; i < names.len(); i++) {
+    string src = from + "/" + names[i];
+    string dst = to + "/" + names[i];
+    bool dir = false;
+    match (await fs.stat(src)) { Err(e): { return Result.Err("\{src}: \{e}"); } Ok(s): { dir = s.isDir; } }
+    if (dir) { count += try await copyTree(fs, src, dst); continue; }
+    match (await fs.readFile(src)) {
+      Err(e): { return Result.Err("\{src}: \{e}"); }
+      Ok(bytes): { match (await fs.writeFile(dst, bytes)) { Err(e): { return Result.Err("\{dst}: \{e}"); } Ok(_): { count++; } } }
+    }
+  }
+  return Result.Ok(count);
+}
+
+async Result<string, string> assemble(Sys sys) {
+  Files fs = sys.files();
+  i32 pages = try await copyTree(fs, "/in/pages", "/out");
+  i32 glue = try await copyTree(fs, "/in/glue", "/out/admit");
+  u8[] module;
+  match (await fs.readFile("/in/module/out/web.wasm")) { Err(e): { return Result.Err("/in/module/out/web.wasm: \{e}"); } Ok(b): { module = b; } }
+  u8[] app = try withoutManifest(module);
+  match (await fs.writeFile("/out/admit/app.wasm", app)) { Err(e): { return Result.Err("/out/admit/app.wasm: \{e}"); } Ok(_): { } }
+  return Result.Ok("assembled: \{pages} page file(s), \{glue} glue file(s), admit/app.wasm (\{app.len()} bytes, from \{module.len()})");
+}
+
+export async i32 main(Sys sys) {
+  match (await assemble(sys)) {
+    Err(e): { sys.warn("assemble: \{e}"); return 1; }
+    Ok(said): { sys.log(said); return 0; }
+  }
+}

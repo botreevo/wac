@@ -1,4 +1,5 @@
-// The NaN rewrite on a module small enough to read by hand: one function, (f64, f64) -> f64, `a + b`.
+// The NaN rewrite on modules small enough to read by hand: one function, (f64, f64) -> f64, and where the inline
+// check goes, and where it is rightly left out.
 
 import { canonicalize } from "../src/canon.wac";
 import { Check } from "./check.wac";
@@ -26,7 +27,26 @@ bool contains(u8[] hay, u8[] needle) {
   return false;
 }
 
-export string testAnAddIsFollowedByTheCanonicalizer() {
+i32 count(u8[] hay, u8 x) {
+  i32 n = 0;
+  for (i32 i = 0; i < hay.len(); i++) { if (hay[i] == x) { n++; } }
+  return n;
+}
+
+/** The inline check on an f64 through local `t`: tee, the canonical NaN, get, get, f64.eq, select. */
+u8[] check64(u8 t) {
+  return [0x22 as u8, t, 0x44 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0xF8 as u8, 0x7F as u8,
+          0x20 as u8, t, 0x20 as u8, t, 0x61 as u8, 0x1B as u8];
+}
+
+u8[] cat(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+export string testAnAddThatIsReturnedIsChecked() {
   Check c = Check.create();
   // no locals; local.get 0; local.get 1; f64.add; end
   u8[] m = module([0x00 as u8, 0x20 as u8, 0x00 as u8, 0x20 as u8, 0x01 as u8, 0xA0 as u8, 0x0B as u8]);
@@ -34,13 +54,64 @@ export string testAnAddIsFollowedByTheCanonicalizer() {
     Err(e): { c.fail(e); }
     Ok(r): {
       c.eq(r.scan, "4 5\n", "four operators, the add at byte 5");
-      // f64.add then `call 1` (the first appended function: no imports, one defined).
-      c.ok(contains(r.module, [0xA0 as u8, 0x10 as u8, 0x01 as u8, 0x0B as u8]), "the add is followed by a call");
-      // Two types appended: the type section now declares three.
-      c.ok(contains(r.module, [0x01 as u8, 0x11 as u8, 0x03 as u8, 0x60 as u8]), "two types appended");
-      // Three functions: the original and the two canonicalizers, of types 1 and 2.
-      c.ok(contains(r.module, [0x03 as u8, 0x04 as u8, 0x03 as u8, 0x00 as u8, 0x01 as u8, 0x02 as u8]), "two functions appended");
+      // Two scratch locals declared after the two parameters, so the f64 one is local 2.
+      c.ok(contains(r.module, [0x02 as u8, 0x01 as u8, 0x7C as u8, 0x01 as u8, 0x7D as u8, 0x20 as u8]), "an f64 and an f32 local appended");
+      c.ok(contains(r.module, cat([0xA0 as u8], cat(check64(2 as u8), [0x0B as u8]))), "the add, then the check through local 2, then end");
+      // Nothing appended elsewhere: one type, one function, as before.
+      c.ok(contains(r.module, [0x01 as u8, 0x07 as u8, 0x01 as u8, 0x60 as u8]), "the type section is untouched");
+      c.ok(contains(r.module, [0x03 as u8, 0x02 as u8, 0x01 as u8, 0x00 as u8]), "the function section is untouched");
     }
+  }
+  return c.report();
+}
+
+export string testAResultConsumedByArithmeticIsNotCheckedTwice() {
+  Check c = Check.create();
+  // (a * b) + a: the product only feeds the add, so only the add's result is checked.
+  u8[] m = module([0x00 as u8, 0x20 as u8, 0x00 as u8, 0x20 as u8, 0x01 as u8, 0xA2 as u8, 0x20 as u8, 0x00 as u8,
+                   0xA0 as u8, 0x0B as u8]);
+  match (canonicalize(m)) {
+    Err(e): { c.fail(e); }
+    Ok(r): {
+      c.eq(r.scan, "6 5,8\n", "two producers seen");
+      c.ok(count(r.module, 0x1B as u8) == 1, "one check, not two: \{count(r.module, 0x1B as u8)}");
+      c.ok(contains(r.module, [0xA2 as u8, 0x20 as u8, 0x00 as u8, 0xA0 as u8, 0x22 as u8]), "the product goes straight on; the sum is checked");
+    }
+  }
+  return c.report();
+}
+
+export string testASignCopiedFromANaNIsChecked() {
+  Check c = Check.create();
+  // copysign(a, a / b): the quotient's sign shows, so it is checked even though no arithmetic follows it.
+  u8[] m = module([0x00 as u8, 0x20 as u8, 0x00 as u8, 0x20 as u8, 0x00 as u8, 0x20 as u8, 0x01 as u8, 0xA3 as u8,
+                   0xA6 as u8, 0x0B as u8]);
+  match (canonicalize(m)) {
+    Err(e): { c.fail(e); }
+    Ok(r): { c.ok(contains(r.module, cat([0xA3 as u8], cat(check64(2 as u8), [0xA6 as u8]))), "the division is checked before copysign"); }
+  }
+  return c.report();
+}
+
+export string testALocalReadOnlyByArithmeticHidesItsValue() {
+  Check c = Check.create();
+  // one f64 local (2): local.set 2 (a / b); local.get 2; local.get 0; f64.mul; end — the quotient never shows itself.
+  u8[] m = module([0x01 as u8, 0x01 as u8, 0x7C as u8, 0x20 as u8, 0x00 as u8, 0x20 as u8, 0x01 as u8, 0xA3 as u8,
+                   0x21 as u8, 0x02 as u8, 0x20 as u8, 0x02 as u8, 0x20 as u8, 0x00 as u8, 0xA2 as u8, 0x0B as u8]);
+  match (canonicalize(m)) {
+    Err(e): { c.fail(e); }
+    Ok(r): {
+      c.ok(count(r.module, 0x1B as u8) == 1, "only the product is checked: \{count(r.module, 0x1B as u8)} checks");
+      c.ok(contains(r.module, [0xA3 as u8, 0x21 as u8, 0x02 as u8]), "the quotient is set unchecked");
+      c.ok(contains(r.module, cat([0xA2 as u8], check64(3 as u8))), "the product is checked through local 3, after the declared one");
+    }
+  }
+  // The same, but the local is then also returned: now it shows, and so the quotient is checked where it is made.
+  u8[] m2 = module([0x01 as u8, 0x01 as u8, 0x7C as u8, 0x20 as u8, 0x00 as u8, 0x20 as u8, 0x01 as u8, 0xA3 as u8,
+                    0x21 as u8, 0x02 as u8, 0x20 as u8, 0x02 as u8, 0x0B as u8]);
+  match (canonicalize(m2)) {
+    Err(e): { c.fail(e); }
+    Ok(r): { c.ok(contains(r.module, cat([0xA3 as u8], check64(3 as u8))), "a local that is returned does not hide"); }
   }
   return c.report();
 }
@@ -51,7 +122,10 @@ export string testWhatMovesBitsIsLeftAlone() {
   u8[] m = module([0x00 as u8, 0x20 as u8, 0x00 as u8, 0x9A as u8, 0x20 as u8, 0x01 as u8, 0xA6 as u8, 0x0B as u8]);
   match (canonicalize(m)) {
     Err(e): { c.fail(e); }
-    Ok(r): { c.eq(r.scan, "5 \n", "neg and copysign move bits exactly"); }
+    Ok(r): {
+      c.eq(r.scan, "5 \n", "neg and copysign move bits exactly");
+      c.ok(r.module.len() == m.len() && contains(r.module, m), "and a module with nothing to check comes back as it was");
+    }
   }
   return c.report();
 }

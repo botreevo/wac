@@ -90,6 +90,28 @@ expect refused "admit app3 on a followed rejection list" "is on a rejection list
 expect ok "the list takes it off again" -- $wallet unreject "$keys/list" "$registry" "$app3"
 expect ok "admit app3 once more" "0 rejection(s) set" -- $R admit "$work/app3.bin" --statement "$work/e3" $A
 
+step "3b. rejections by signature, relayed: on, off by a signed revocation, and no replay"
+long30=$(printf 'r%.0s' $(seq 30)); long300=$(printf 'r%.0s' $(seq 300))
+for reason in "signed rejection" "$long30" "$long300"; do
+  set -- $($wallet rejection-id "$keys/dev" "$registry" "$app3" "$reason"); js=$1; onchain=$2
+  same "the Rejection's id for a ${#reason}-byte reason: the contract = @ipld/dag-cbor" "$onchain" "$js"
+  same "…= wac's statementId" "$($R rejection-id "$app3" "$reason")" "$js"
+done
+expect ok "the list signs a rejection of app3; a relayer sends it" -- $wallet reject-signed "$keys/list" "$keys/relayer" "$registry" "$app3" "signed rejection"
+expect refused "admit app3: on the followed list, by the list's own signature" "is on a rejection list you follow (on the chain)" -- $R admit "$work/app3.bin" --statement "$work/e3" $A
+reason=$(node -e "const s = BigInt(process.argv[1]) + 1n; console.log('0x' + s.toString(16).padStart(64, '0'))" "$($R slot rejected "$addr_list" "$app3")")
+same "its reason is keccak256 of the statement's" "$($wallet storage "$keys/dev" "$registry" "$reason")" "$(node -e "import('$here/tools/oracle/node_modules/ethers/lib.esm/index.js').then(e=>console.log(e.keccak256(e.toUtf8Bytes('signed rejection'))))")"
+expect ok "the list signs a revocation of that rejection; a relayer sends it" -- $wallet unreject-signed "$keys/list" "$keys/relayer" "$registry" "$app3" "signed rejection"
+expect ok "admit app3 again" "0 rejection(s) set" -- $R admit "$work/app3.bin" --statement "$work/e3" $A
+expect refused "the old signed rejection cannot be relayed again" "that rejection was revoked by its signer" -- $wallet reject-signed "$keys/list" "$keys/relayer" "$registry" "$app3" "signed rejection"
+expect refused "nor its revocation twice" "already revoked" -- $wallet unreject-signed "$keys/list" "$keys/relayer" "$registry" "$app3" "signed rejection"
+expect ok "a new rejection, with another reason, is another statement" -- $wallet reject-signed "$keys/list" "$keys/relayer" "$registry" "$app3" "second look"
+expect ok "revoking a rejection the list never made on chain is recorded" -- $wallet unreject-signed "$keys/list" "$keys/relayer" "$registry" "$app3" "never sent"
+expect refused "but does not take off the rejection that is there" "is on a rejection list you follow (on the chain)" -- $R admit "$work/app3.bin" --statement "$work/e3" $A
+expect ok "a stranger's signed rejection lands on the stranger's list" -- $wallet reject-signed "$keys/stranger" "$keys/relayer" "$registry" "$app3" "not mine to say"
+expect ok "the list unrejects directly" -- $wallet unreject "$keys/list" "$registry" "$app3"
+expect ok "and app3 is admitted: the stranger's list is not followed" "0 rejection(s) set" -- $R admit "$work/app3.bin" --statement "$work/e3" $A
+
 step "4. delayed names"
 nameA=$($R cid "$work/app1.bin"); nameB=$($R cid "$work/app4.bin")
 P=$addr_publisher

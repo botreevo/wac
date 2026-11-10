@@ -12,7 +12,7 @@ them, so any IPFS node or gateway can serve them. Reckon's objects are these.
 | `src/unixfs.wac`, `src/tree.wac` | files and directory trees under the profile, and reading nodes back |
 | `src/dagcbor.wac` | DAG-CBOR for records: deterministic, strict, no floats |
 | `src/car.wac` | CAR v1, every block checked on reading |
-| `src/store.wac` | blocks kept under their CIDs (at `ipfs/<cid>`, the path a trustless gateway serves), resolving through mirrors, importing directories, git commits and CARs, exporting files and trees |
+| `src/store.wac` | blocks kept under their CIDs (at `ipfs/<cid>`, the path a trustless gateway serves), resolving through mirrors, importing directories, git commits and CARs, exporting files and trees. `Store.http(net, host, port)` reads a trustless gateway (`GET /ipfs/<cid>?format=raw`), or any web server in front of a store directory, every block re-hashed; `obj … --mirror http://HOST:PORT` uses it, and `tools/http-mirror.sh` checks it against a real server, a tampered block included |
 | `cmd/obj.wac` | `obj add`, `add-git`, `cat`, `ls`, `car`, `import-car` |
 
 **Checked against the reference implementations**, not against itself: `tools/oracle/vectors.mjs` writes

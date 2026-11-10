@@ -25,7 +25,15 @@ a name's CID is in storage whole and the reader needs nothing else.
   revocation. The relayed signature in the run is made by ethers, so it also checks the contract's EIP-712 hash
   independently of wac.
 - `rejections[list][k(cid)]`: `{since, reason}`. The list is `msg.sender`. `reject(cid, reasonHash)` and
-  `unreject(cid)`.
+  `unreject(cid)`. Or by signature, relayed by anyone: `rejectSigned(cid, reason, v, r, s)` takes claims.wac's
+  EIP-712 Rejection and puts the subject on the *signer's* list with `keccak256(reason)` as the reason.
+  `unrejectSigned(cid, reason, v, r, s)` takes a signed Revocation of that Rejection statement. It records the
+  revocation, which is permanent as every revocation is, and clears the entry if that rejection is still the one
+  there. So a relayed rejection cannot be replayed once its signer has withdrawn it, and withdrawing an older
+  rejection does not clear a newer one. To reject again, a keeper signs a new rejection: another reason is another
+  statement. The contract computes the statement's id itself (`rejectionId`: DAG-CBOR, sha2-256, the sha256
+  precompile), and the run checks it against wac's `statementId` and `@ipld/dag-cbor` for reasons of 16, 30 and 300
+  bytes, one for each length encoding of a CBOR string.
 - `names[publisher][k(name)]`: eight words: current CID, pending CID, effectiveAt, delay, pending delay and its time.
   `claim` takes effect at once and sets the delay. `propose` waits for the delay in force. `proposeDelay` waits for the
   *old* delay, so a stolen key cannot shorten the window and then use it. `cancel` withdraws a proposal. A name at
@@ -38,7 +46,7 @@ reach (the target, every subject and output, and each recipe's input slots). `ch
 and `chainOf` turns the answers into admit's `Chain`. Asking for a superset means anything admit isn't told about has
 been proved absent, not skipped.
 
-## The end-to-end run: 47 of 47
+## The end-to-end run: 66 of 66
 
 On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row passed):
 
@@ -49,6 +57,11 @@ On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row p
    signed by the endorser and sent by a relayer refuses a second object.
 3. A list the policy doesn't follow changes nothing. The followed list's rejection refuses, with its reason hash at
    `since + 1`. Unrejecting admits the object again.
+   By signature (3b): a rejection signed by the list and sent by a relayer refuses, with `keccak256(reason)` at
+   `since + 1`. A relayed signed revocation of it admits again. The old signed rejection cannot be relayed again
+   ("that rejection was revoked by its signer"), and its revocation cannot be sent twice. A new rejection with
+   another reason can be. Revoking a rejection that was never sent is recorded, but leaves the rejection that is
+   there. A stranger's signed rejection lands on the stranger's list, which the policy doesn't follow.
 4. An unclaimed name is refused. A claim resolves at once. A stranger cannot move it, and the publisher cannot claim
    it twice. During the 8 s delay the old CID holds and the proposal and the shorter delay show as pending. After the
    delay the new CID and delay are in effect with no write in between.
@@ -87,7 +100,7 @@ On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row p
 
 ## Not done
 
-- Rejections and endorsements are not relayed by signature, only revocations.
+- Endorsements are not recorded on chain at all: they live in the claim index, as signed objects.
 - Statements written as signed objects but never revoked on chain are still decided by `graph.wac`'s `revokedHere`. The
   chain is a second source, not a replacement.
 - There is still no anchor on a devnet. On a real chain the anchor comes from `packages/lightclient` (item 8).

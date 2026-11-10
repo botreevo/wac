@@ -7,6 +7,10 @@
 //   node wallet.mjs revoke        KEYFILE REGISTRY CID
 //   node wallet.mjs revoke-signed SIGNERKEY RELAYERKEY REGISTRY CID   EIP-712 Revocation signed by SIGNER, sent by RELAYER
 //   node wallet.mjs reject        KEYFILE REGISTRY CID REASON        (REASON is hashed)
+//   node wallet.mjs reject-signed SIGNERKEY RELAYERKEY REGISTRY CID REASON   EIP-712 Rejection, relayed
+//   node wallet.mjs unreject-signed SIGNERKEY RELAYERKEY REGISTRY CID REASON a signed Revocation of that Rejection
+//   node wallet.mjs rejection-id  KEYFILE REGISTRY CID REASON        the Rejection's id, by @ipld/dag-cbor and by the
+//                                                                    contract's rejectionId (eth_call): "JS CONTRACT"
 //   node wallet.mjs unreject      KEYFILE REGISTRY CID
 //   node wallet.mjs claim         KEYFILE REGISTRY NAME CID DELAY
 //   node wallet.mjs propose       KEYFILE REGISTRY NAME CID
@@ -16,6 +20,8 @@
 // RPC is $RPC, default http://127.0.0.1:8545. A refused transaction exits 1 with the contract's reason.
 import { Wallet, JsonRpcProvider, ContractFactory, Contract, keccak256, toUtf8Bytes, parseEther, Signature } from '../oracle/node_modules/ethers/lib.esm/index.js';
 import { CID } from '../oracle/node_modules/multiformats/dist/src/cid.js';
+import { sha256 } from '../oracle/node_modules/multiformats/dist/src/hashes/sha2.js';
+import * as dagCbor from '../oracle/node_modules/@ipld/dag-cbor/src/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +30,14 @@ const abi = [
   'function revoke(bytes)', 'function revokeSigned(bytes,uint8,bytes32,bytes32)', 'function reject(bytes,bytes32)',
   'function unreject(bytes)', 'function claim(string,bytes,uint256)', 'function propose(string,bytes)',
   'function proposeDelay(string,uint256)', 'function cancel(string)',
+  'function rejectSigned(bytes,string,uint8,bytes32,bytes32)', 'function unrejectSigned(bytes,string,uint8,bytes32,bytes32)',
+  'function rejectionId(bytes,string) view returns (bytes)',
 ];
+// claims.wac's typed data: domain { name "reckon", version "2" }.
+const domain = { name: 'reckon', version: '2' };
+// claims.wac's Rejection statement's id, from @ipld/dag-cbor: not from wac, and not from the contract.
+const rejectionId = async (subject, reason) =>
+  CID.create(1, 0x71, await sha256.digest(dagCbor.encode({ kind: 'rejection', subject: CID.parse(subject), reason }))).bytes;
 const provider = new JsonRpcProvider(process.env.RPC || 'http://127.0.0.1:8545', undefined, { staticNetwork: true, polling: true, pollingInterval: 500 });
 const wallet = (f) => new Wallet('0x' + fs.readFileSync(f, 'utf8').trim().replace(/^0x/, ''), provider);
 const cid = (text) => CID.parse(text).bytes;
@@ -47,7 +60,19 @@ else if (cmd === 'deploy') {
   console.log(addr, keccak256(await provider.getCode(addr)));
 } else if (cmd === 'fund') await done(() => w.sendTransaction({ to: rest[0], value: parseEther(rest[1]) }));
 else if (cmd === 'storage') console.log(await provider.getStorage(rest[0], rest[1]));
-else if (cmd === 'revoke-signed') {
+else if (cmd === 'reject-signed' || cmd === 'unreject-signed') {
+  const [relayer, registry, subject, reason] = rest;
+  const sig = Signature.from(cmd === 'reject-signed'
+    ? await w.signTypedData(domain, { Rejection: [{ name: 'subject', type: 'bytes' }, { name: 'reason', type: 'string' }] }, { subject: cid(subject), reason })
+    : await w.signTypedData(domain, { Revocation: [{ name: 'statement', type: 'bytes' }] }, { statement: await rejectionId(subject, reason) }));
+  const c = new Contract(registry, abi, wallet(relayer));
+  await call(c, cmd === 'reject-signed' ? 'rejectSigned' : 'unrejectSigned', cid(subject), reason, sig.v, sig.r, sig.s);
+} else if (cmd === 'rejection-id') {
+  const [registry, subject, reason] = rest;
+  const js = CID.decode(await rejectionId(subject, reason)).toString();
+  const onchain = CID.decode(Buffer.from((await new Contract(registry, abi, provider).rejectionId(cid(subject), reason)).slice(2), 'hex')).toString();
+  console.log(js, onchain);
+} else if (cmd === 'revoke-signed') {
   // claims.wac's typed data: domain { name "reckon", version "2" }, Revocation(bytes statement).
   const sig = Signature.from(await w.signTypedData({ name: 'reckon', version: '2' }, { Revocation: [{ name: 'statement', type: 'bytes' }] },
                                                    { statement: cid(rest[2]) }));

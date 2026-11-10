@@ -1,7 +1,6 @@
 # 0410a — a method call on a nullable array is not checked
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — the same rule as `issues/lang/0305b`; `spec/cases/0907`
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
 - **Kind:** diagnostic
@@ -29,3 +28,7 @@ Found when a local `u8[]? out` shadowed an `Output out` parameter in `packages/b
 (design/system/0013 step 5): the whole of `packages/box` checked clean and would not build. Likely a sibling of
 0406a (a method call on a union value is not checked) — the receiver's type is not a plain array or struct, and
 the method lookup gives up without a diagnostic.
+
+## Fix
+
+`out.write()` on a `u8[]?` is refused as a call on a nullable, as every method call on one is now.

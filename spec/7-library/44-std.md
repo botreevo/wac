@@ -541,8 +541,8 @@ struct Child {
 }
 
 enum Ended { Exited(i32 code), Trapped(TrapKind kind, string message), HostLimit(string why) }
-enum TrapKind { Explicit, Unreachable, MemoryBounds, TableBounds, DivideByZero, IntegerOverflow, BadConversion,
-                NullReference, BadCast, StackExhausted, Other }
+enum TrapKind { Explicit, UnreachableCode, MemoryBounds, TableBounds, DivideByZero, IntegerOverflow, BadConversion,
+                NullReference, BadCast, StackExhausted, Unclassified }
 ```
 
 `[§wac-std-spawn-grants-ykmq5tw]` A spawned child holds exactly the handles in its `Authority`, so it never holds more than
@@ -550,7 +550,7 @@ its parent. Spawning needs the program's own `procs` authority — another insta
 
 `[§wac-std-child-ended-q2v8mtf]` `ended()` says how a child ended, the same on every host: `Exited` with the code its
 `main` returned, `Trapped` with what stopped it — `Explicit` and the message for its own `trap "…"`, otherwise the
-engine's reason, classified, and `Other` for one none of the kinds names — or `HostLimit` when the host stopped it,
+engine's reason, classified, and `Unclassified` for one none of the kinds names — or `HostLimit` when the host stopped it,
 by its parent's `stop` or for want of memory. `exit()` answers the code for an exit and `Err` saying why for the other
 two, so a trap is never a status a program could have returned.
 

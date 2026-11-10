@@ -309,7 +309,7 @@ struct Complex {
 void example(bool runtimeCond) {
   Complex x = 3;
   Complex y = runtimeCond ? 2 : 3;
-  // Conceptually select between two statically converted Complex values.
+  // Select between two converted Complex values, each its own.
 }
 ```
 
@@ -377,16 +377,19 @@ compile-time error, reported at the literal.
 The target is selected before conversion. A conversion error does not retry inference, select another
 union alternative, or try another implementation.
 
-Conversion of a source literal is evaluated statically. It follows ordinary static evaluation
+Conversion of a source literal is checked statically: it follows ordinary static evaluation
 ([28](../4-static/28-static-evaluation.md)), including diagnostics for failed evaluation and resource
-limits. The conversion may allocate; materialisation preserves identity and aliasing under the
-existing static-value rules ([27](../4-static/27-static-declarations.md)). It does not allocate afresh
-on every runtime evaluation of that literal occurrence. Distinct occurrences are separate conversions,
-per generic instantiation; cached evaluation must preserve observable identity. Existing const and
-static-value access rules still apply.
+limits, once per occurrence and generic instantiation — which is how an `Err` is a compile error at the
+literal. What the literal *is* at run time depends on whether its value can be written through. Where it
+can — a struct or an array, in a slot that is not `const` — **each evaluation converts again and is a value
+of its own**, so a write through one is not seen by the next: `Box b = 3;` in a loop binds a new `Box`
+every pass. Where it cannot — a `const` slot, or a value with nothing to write through — the statically
+converted value is used every time, since no program can tell it from a fresh one. `NumberLiteral` carries
+nothing that depends on the run, so a conversion that succeeded statically succeeds again at run time.
 
-`[§wac-fromnumber-static-ah2ihmk]` A literal's `fromNumber` conversion runs at compile time, once per
-occurrence and generic instantiation, and its result is that occurrence's value at every run.
+`[§wac-fromnumber-evaluation-5k2r8vq]` A literal's `fromNumber` conversion is checked at compile time, once per
+occurrence and generic instantiation; a literal whose value can be written through, in a slot that is not
+`const`, is a fresh conversion at every evaluation, and any other is the statically converted value.
 
 `NumberLiteral` carries no runtime-dependent numeric input. An unresolved expression is a
 type-checking state, not a runtime `NumberLiteral` value:
@@ -394,7 +397,7 @@ type-checking state, not a runtime `NumberLiteral` value:
 ```wac
 // fragment
 Complex x = runtimeCond ? 2 : 3;
-// Convert 2 and 3 separately, statically; select at runtime.
+// Convert 2 and 3 separately; select at runtime.
 // Do not pass the runtime conditional to fromNumber.
 ```
 

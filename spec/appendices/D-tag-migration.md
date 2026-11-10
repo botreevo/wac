@@ -38,6 +38,7 @@ not have.
 | `§jsx-text-is-a-child` | `§wac-markup-text-child-m5c9qtw` | text is the child type's `[markup.text]`, not `Node.Text` |
 | `§jsx-fragment-is-a-node` | `§wac-markup-fragment-built-p8j3zrk` | a fragment is the child type's `[markup.fragment]`, not `Node.Fragment` |
 | `§wac-markup-child-tonode-vp842rw` | `§wac-markup-child-converts-w8d4ntc` | a `{e}` child is the child type, a fragment of an array of it, or text through `toString`; `toNode` is gone |
+| `§wac-fromnumber-static-ah2ihmk` | `§wac-fromnumber-evaluation-5k2r8vq` | a converted literal whose value can be written through, in a slot that is not `const`, converts afresh at each evaluation; it was one shared static ([09](../2-types/09-numeric-literals.md), `issues/lang/0360a`) |
 | `§wac-tostring-builtin-4t3buvz` | `§wac-tostring-builtin-only-k9w4hcz` | the built-in conversions are `toString` alone |
 | `§wac-conversion-none-for-compound-urda9vz` | `§wac-conversion-none-compound-r6tn2hx` | as above |
 | `§enum-methods-6vkq2wn` | `§wac-enum-methods-receiver-d7xk2nv` | an enum method with no receiver is refused only when a word names it; a symbol may ([13](../2-types/13-enums.md)) |

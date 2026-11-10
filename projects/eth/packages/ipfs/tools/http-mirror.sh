@@ -50,6 +50,30 @@ a=$(basename "$(grep -lx hello served/ipfs/* | head -1)")
 out=$($O cat bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku --store fresh2 $M 2>&1) && got=ok || got=refused
 [ "$got" = refused ] && ok "a block the server does not have: not here ($(printf '%s' "$out" | grep -o 'mirror 0: [^;]*' | head -1))" || bad "a missing block: $out"
 
+# A mirror that fails (PORT+2): it answers 503, after 2 s, as a gateway whose origin is down does. Listed first, it is
+# asked once, marked down, and asked nothing more, so the good mirror after it serves the tree without waiting on it
+# for every block.
+dport=$((port + 2))
+printf 'second file\n' > "served/ipfs/$leaf"                          # the honest block back
+cat > dead.mjs <<'JS'
+import http from 'node:http'; import fs from 'node:fs';
+let n = 0;
+http.createServer((q, s) => { fs.writeFileSync('dead.hits', String(++n)); setTimeout(() => { s.statusCode = 503; s.end('down'); }, 2000); })
+  .listen(Number(process.argv[2]), '127.0.0.1');
+JS
+node dead.mjs "$dport" & dsrv=$!
+trap 'kill $srv $dsrv 2>/dev/null || true' EXIT
+until curl -s -m3 -o /dev/null "http://127.0.0.1:$dport/"; do sleep 0.2; done
+before=$(cat dead.hits)
+t0=$(date +%s)
+got=$($O ls "$tree" --store fresh6 --mirror "http://127.0.0.1:$dport" $M 2>&1 | wc -l)
+t1=$(date +%s)
+asked=$(( $(cat dead.hits) - before ))
+[ "$got" -eq 3 ] && [ "$asked" -eq 1 ] && [ $((t1 - t0)) -lt 6 ] \
+  && ok "a mirror answering 503 is asked once and then left out: the tree from the next, in $((t1 - t0)) s" \
+  || bad "a failing mirror: $got files, it was asked $asked times, $((t1 - t0)) s"
+kill $dsrv 2>/dev/null || true
+
 # HTTPS: the same store behind a TLS server (PORT+1), as a trustless gateway is reached.
 sport=$((port + 1))
 printf 'second file\n' > "served/ipfs/$leaf"                          # the honest block back

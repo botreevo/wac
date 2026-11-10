@@ -1143,7 +1143,7 @@ fn run_child(
     cwd: Vec<u8>,
     streams: AsChild,
     stop: Arc<AtomicBool>,
-) -> i32 {
+) -> (i32, i32, i32, Vec<u8>) {
     let m = world.manifest.clone();
     let mut host = Host::new(m.callbacks.len(), argv, grants);
     host.world = Some(world.clone());
@@ -1157,15 +1157,15 @@ fn run_child(
     host.cwd = cwd;
     let mut store = Store::new(&world.engine, host);
     run_until_stopped(&mut store, Some(stop.clone()));
-    let code = match wire(&world.engine, &world.module, &m)
+    let (code, how, kind, said) = match wire(&world.engine, &world.module, &m)
         .and_then(|linker| enter(&mut store, &world.module, &linker, &m))
     {
-        Ok(code) => code,
+        Ok(code) => (code, 0, code, Vec::new()),
         // **A child its parent stopped is not a child that failed.** The trap is one this runtime
         // asked for, so it says nothing on the error stream and answers -1 — which is what a
         // terminated worker answers on the JavaScript hosts, and what `packages/sh` reads as "this
         // one has no status of its own to report".
-        Err(_) if stop.load(Ordering::Relaxed) => -1,
+        Err(_) if stop.load(Ordering::Relaxed) => (-1, 2, 0, b"stopped by its parent".to_vec()),
         Err(e) => {
             // **Said as the other hosts say it** — `wac: prog trapped: why` — with the engine's own reason
             // (`wasm trap: call stack exhausted`) rather than a page of backtrace, and the program's message
@@ -1185,7 +1185,14 @@ fn run_child(
             } else {
                 let _ = stderr.write(line.as_bytes());
             }
-            1
+            // **How, as a value** (`Child.ended()`): a `trap "…"` is the one `enter` worded with the program's own message;
+            // anything else is the engine's, and wasmtime names which.
+            let (kind, said) = if let Some(at) = shown.find(" trapped: ") {
+                (0, shown[at + " trapped: ".len()..].to_string())
+            } else {
+                (trap_kind(&e), format!("{}", e.root_cause()))
+            };
+            (1, 1, kind, said.into_bytes())
         }
     };
     stdout.finish();
@@ -1194,7 +1201,24 @@ fn run_child(
     // from a program that has exited; without this it waits for ever, which is the shape a shell
     // serving its children would meet on every command that ends.
     fsreq.finish();
-    code
+    (code, how, kind, said)
+}
+
+/// std's `TrapKind`, in order, for an engine trap: `Explicit` is 0 and is `enter`'s to say; `Other` is 10.
+fn trap_kind(e: &wasmtime::Error) -> i32 {
+    use wasmtime::Trap;
+    match e.downcast_ref::<Trap>() {
+        Some(Trap::UnreachableCodeReached) => 1,
+        Some(Trap::MemoryOutOfBounds) | Some(Trap::HeapMisaligned) | Some(Trap::ArrayOutOfBounds) => 2,
+        Some(Trap::TableOutOfBounds) => 3,
+        Some(Trap::IntegerDivisionByZero) => 4,
+        Some(Trap::IntegerOverflow) => 5,
+        Some(Trap::BadConversionToInteger) => 6,
+        Some(Trap::IndirectCallToNull) | Some(Trap::NullReference) => 7,
+        Some(Trap::BadSignature) | Some(Trap::CastFailure) => 8,
+        Some(Trap::StackOverflow) => 9,
+        _ => 10,
+    }
 }
 
 /// Whether two capabilities are the same behaviour, and so may share a slot.
@@ -1376,6 +1400,7 @@ fn flatten(kind: Kind, outcome: Outcome) -> Flat {
             _ => Flat::default(),
         },
         (_, Outcome::Change(code, words)) => Flat { fault: code, text: words.into_bytes(), ..Flat::default() },
+        (_, Outcome::Ended(how, m, text)) => Flat { n: how as i64, m: m as i64, text, ..Flat::default() },
         (_, Outcome::FileResult(true, b, _, _)) => Flat { bytes: b, ..Flat::default() },
         (_, Outcome::FileResult(false, _, words, code)) => failed(code, words),
         (_, Outcome::Stat(exists, file, dir, size, modified, link, exec, code, mode)) => {
@@ -1677,6 +1702,18 @@ fn serve(
         OP_RANDOM_BYTES => {
             let n = (a as i32).max(0) as usize;
             return now(Kind::Bytes, Outcome::Bytes(random_bytes(n)?));
+        }
+        // **How a child ended** (`Child.ended()`, spec ch44): exited with a code, trapped and how, or stopped by a limit.
+        OP_CHILD_ENDED => {
+            let Some(c) = child_of(caller, a as i32) else { return Ok(fault(FAULT_OTHER, "not a child")) };
+            let exit = c.exit.clone();
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            std::thread::spawn(move || {
+                let (how, m, text) = exit.ended();
+                table.complete(id, Outcome::Ended(how, m, text))
+            });
+            return later(Kind::Change, id);
         }
         OP_EXIT_CODE => {
             // Two meanings on one capability, and the handle says which: a child's handle asks for
@@ -3012,8 +3049,8 @@ fn spawn_instance(
 
     let streams = AsChild { stdin, stdout, stderr, fsreq, fsrep, inherits: inherit_input, inherit_out };
     std::thread::spawn(move || {
-        let code = run_child(world, argv, grants, cwd, streams, stop);
-        exit.set(code);
+        let (code, how, m, text) = run_child(world, argv, grants, cwd, streams, stop);
+        exit.end(code, how, m, text);
     });
 
     now(Kind::Child, Outcome::Child(handle, err_handle, fs_handle, String::new()))
@@ -3024,6 +3061,8 @@ const OP_DROP: i32 = 0;
 /// `Launch.detached`, in a spawn's `b`: dropping the child's ticket does not stop it.
 const DETACHED: i64 = 4;
 const OP_NOW_MILLIS: i32 = 1;
+/// `Child.ended()`: how a child ended — `Outcome::Ended`.
+const OP_CHILD_ENDED: i32 = 74;
 const OP_MONOTONIC_NANOS: i32 = 2;
 const OP_RANDOM_BYTES: i32 = 3;
 const OP_ARG_COUNT: i32 = 6;

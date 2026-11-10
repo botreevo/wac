@@ -1072,6 +1072,17 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       return EMPTY;
     },
 
+    [OP.CHILD_ENDED]: async (p) => {
+      const c = children.get(readI32le(p));
+      if (c === undefined) throw new Error("not a spawned worker");
+      const e = await c.ended;
+      const said = new TextEncoder().encode(e.text);
+      const out = new Uint8Array(8 + said.length);
+      new DataView(out.buffer).setInt32(0, e.how, true);
+      new DataView(out.buffer).setInt32(4, e.m, true);
+      out.set(said, 8);
+      return out;
+    },
     [OP.EXIT_CODE]: async (p) => {
       const c = children.get(readI32le(p));
       if (c === undefined) throw new Error("not a spawned worker");

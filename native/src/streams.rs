@@ -197,10 +197,12 @@ impl Stream {
     }
 }
 
-/// What a child's exit status is, once it has one.
+/// What a child's exit status is, once it has one — and how it ended (`Child.ended()`): `(how, m, text)`, `how` 0 for an
+/// exit with code `m`, 1 for a trap of kind `m` (std's `TrapKind`, in order) saying `text`, 2 for a limit the host imposed.
 #[derive(Default)]
 pub struct Exit {
     code: Mutex<Option<i32>>,
+    ending: Mutex<Option<(i32, i32, Vec<u8>)>>,
     over: Condvar,
 }
 
@@ -208,6 +210,18 @@ impl Exit {
     pub fn set(&self, code: i32) {
         *self.code.lock().unwrap() = Some(code);
         self.over.notify_all();
+    }
+
+    /// The status and how it came about, at once — a waiter on either sees both.
+    pub fn end(&self, code: i32, how: i32, m: i32, text: Vec<u8>) {
+        *self.ending.lock().unwrap() = Some((how, m, text));
+        self.set(code);
+    }
+
+    /// How it ended, once it has: an exit with its code when nothing said otherwise.
+    pub fn ended(&self) -> (i32, i32, Vec<u8>) {
+        let code = self.wait();
+        self.ending.lock().unwrap().clone().unwrap_or((0, code, Vec::new()))
     }
 
     pub fn wait(&self) -> i32 {

@@ -101,6 +101,7 @@ JavaScript hosts; `native/` holds the two Rust ones. They serve this table, whic
 | 71 | `FILE_SIZE` | `RandomFile.size` | — |
 | 72 | `TRUNCATE_FILE` | `RandomFile.truncate` | — |
 | 73 | `SYNC_FILE` | `RandomFile.sync` — returns once the file's bytes are on the disk | — |
+| 74 | `CHILD_ENDED` | `Child.ended` — exited with a code, trapped and how, or stopped by the host; `exit` is answered from it | — |
 
 What each request carries in `a`, `b`, `text` and `bytes`, and what each answer puts in which field, is
 the pair of tables in design/system/0013 — the contract a new host implements.

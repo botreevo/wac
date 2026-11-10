@@ -18,7 +18,8 @@ pragma solidity ^0.8.28;
 ///               = the block time of the revocation; 0 if not revoked
 ///     slot 1  rejections[list][k(subject cid)]                     base = k(k(cid) ‖ k(p(list) ‖ w(1)))
 ///               base+0  since    the block time it was put on the list; 0 if not on it
-///               base+1  reason   a hash of the reason, whatever the list keeper chose; 0 if none
+///               base+1  reason   a hash of the reason: the keeper's choice for reject(), keccak256 of the
+///                                statement's reason for rejectSigned(); 0 if none
 ///     slot 2  names[publisher][k(name as UTF-8)]                   base = k(k(name) ‖ k(p(publisher) ‖ w(2)))
 ///               base+0  codec          the current CID's codec; 0 if the name was never claimed
 ///               base+1  digest         the current CID's digest
@@ -75,15 +76,19 @@ contract Registry {
         record(msg.sender, keccak256(statement));
     }
 
+    /// The address that signed a claims.wac statement whose EIP-712 struct hash is `hash`.
+    function signerOf(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address signer) {
+        bytes32 domain = keccak256(abi.encode(keccak256("EIP712Domain(string name,string version)"), keccak256("reckon"), keccak256("2")));
+        signer = ecrecover(keccak256(abi.encodePacked(hex"1901", domain, hash)), v, r, s);
+        require(signer != address(0), "the signature recovers to no address");
+    }
+
     /// The same from a signed Revocation statement (claims.wac's EIP-712), so anyone can relay it: a signer without
     /// gas, or a watcher holding a revocation its signer published off chain.
     function revokeSigned(bytes calldata statement, uint8 v, bytes32 r, bytes32 s) external {
         split(statement);
-        bytes32 domain = keccak256(abi.encode(keccak256("EIP712Domain(string name,string version)"), keccak256("reckon"), keccak256("2")));
         bytes32 hash = keccak256(abi.encode(keccak256("Revocation(bytes statement)"), keccak256(statement)));
-        address signer = ecrecover(keccak256(abi.encodePacked(hex"1901", domain, hash)), v, r, s);
-        require(signer != address(0), "the signature recovers to no address");
-        record(signer, keccak256(statement));
+        record(signerOf(hash, v, r, s), keccak256(statement));
     }
 
     function record(address signer, bytes32 key) internal {
@@ -108,6 +113,47 @@ contract Registry {
         bytes32 key = keccak256(subject);
         delete rejections[msg.sender][key];
         emit Rejected(msg.sender, key, false, 0);
+    }
+
+    /// The CID of claims.wac's Rejection statement `{kind: "rejection", subject, reason}`: its DAG-CBOR encoding
+    /// (keys in DAG-CBOR's order: kind, reason, subject; the subject a tag-42 link), hashed with sha2-256.
+    function rejectionId(bytes calldata subject, string calldata reason) public pure returns (bytes memory) {
+        split(subject);
+        uint256 n = bytes(reason).length;
+        bytes memory head;
+        if (n < 24) head = abi.encodePacked(uint8(0x60 + n));
+        else if (n < 256) head = abi.encodePacked(uint8(0x78), uint8(n));
+        else if (n < 65536) head = abi.encodePacked(uint8(0x79), uint16(n));
+        else { require(n < 2 ** 32, "reason too long"); head = abi.encodePacked(uint8(0x7a), uint32(n)); }
+        bytes memory block_ = abi.encodePacked(hex"a3646b696e646972656a656374696f6e66726561736f6e", head, reason,
+                                               hex"677375626a656374d82a582500", subject);
+        return abi.encodePacked(hex"01711220", sha256(block_));
+    }
+
+    /// A Rejection statement signed by a list's keeper, relayed by anyone: the subject goes on the signer's list, with
+    /// the reason's keccak256 as its reason. A rejection its signer has revoked cannot be relayed again; to reject
+    /// again after withdrawing, a keeper signs a new rejection (another reason is another statement).
+    function rejectSigned(bytes calldata subject, string calldata reason, uint8 v, bytes32 r, bytes32 s) external {
+        split(subject);
+        bytes32 hash = keccak256(abi.encode(keccak256("Rejection(bytes subject,string reason)"), keccak256(subject), keccak256(bytes(reason))));
+        address signer = signerOf(hash, v, r, s);
+        require(revokedAt[signer][keccak256(rejectionId(subject, reason))] == 0, "that rejection was revoked by its signer");
+        bytes32 key = keccak256(subject);
+        rejections[signer][key] = Rejection(block.timestamp, keccak256(bytes(reason)));
+        emit Rejected(signer, key, true, keccak256(bytes(reason)));
+    }
+
+    /// A signed Revocation of a Rejection statement, relayed by anyone: the revocation is recorded (permanently, as any
+    /// revocation), and the subject comes off the signer's list if that rejection is still the entry there.
+    function unrejectSigned(bytes calldata subject, string calldata reason, uint8 v, bytes32 r, bytes32 s) external {
+        bytes memory id = rejectionId(subject, reason);
+        address signer = signerOf(keccak256(abi.encode(keccak256("Revocation(bytes statement)"), keccak256(id))), v, r, s);
+        record(signer, keccak256(id));
+        bytes32 key = keccak256(subject);
+        if (rejections[signer][key].reason == keccak256(bytes(reason))) {
+            delete rejections[signer][key];
+            emit Rejected(signer, key, false, 0);
+        }
     }
 
     // ------------------------------------------------------------------ delayed names

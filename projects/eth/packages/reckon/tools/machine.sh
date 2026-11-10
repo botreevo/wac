@@ -7,8 +7,9 @@
 #   - the same output CID on both engines, where the machine promises one;
 #   - the same output CID twice on one engine.
 #
-# Two programs are expected to break that promise, and are reported rather than failed: floats.wac, where V8 and
-# wasmtime choose different NaNs, and probe.wac, which reads a clock and random bytes no runner here can take away.
+# One program is expected to break that promise, and is reported rather than failed: probe.wac, which reads a clock and
+# random bytes no runner here can take away. floats.wac used to be the other (V8 and wasmtime choose different NaNs)
+# until the runner made NaNs canonical (src/canon.wac); it must now agree.
 #
 #     sh tools/machine.sh [WORKDIR]
 set -eu
@@ -73,7 +74,7 @@ check unwrap "trap unreachable"
 check deep abort
 check big abort
 check loop abort
-check floats "exit 0" differs
+check floats "exit 0"
 check probe "exit 0" differs
 
 # What the program could and could not reach, from its own log.
@@ -89,6 +90,22 @@ wac obj.wasm cat "$f" log $store > files.log
 grep -q "refused /in/x" files.log && ok "files: the input is read-only" || bad "files: wrote to its input"
 grep -q "refused climbing out" files.log && ok "files: cannot climb out of the root" || bad "files: climbed out"
 [ "$(wac obj.wasm cat "$f" out/streamed $store)" = "one two" ] && ok "files: a streamed write lands" || bad "files: streamed write"
+
+# The NaN rewrite against wasmparser (tools/wasmscan, built offline when cargo is here): the same operators at the same
+# offsets in every function, and every rewritten module valid.
+if command -v cargo >/dev/null 2>&1 && (cd "$here/tools/wasmscan" && cargo build --offline --release -q 2>/dev/null); then
+  scan="$here/tools/wasmscan/target/release/wasmscan"
+  for m in derive obj floats files probe; do
+    wac derive.wasm canon "$m.wasm" "$m.canon.wasm" --scan "$m.mine" 2>/dev/null
+    "$scan" scan "$m.wasm" | awk '{print $2" "$3}' | sed 's/ $//' > "$m.oracle"
+    sed 's/ $//' "$m.mine" > "$m.mine2"
+    cmp -s "$m.mine2" "$m.oracle" && ok "canon: $m's $(wc -l < "$m.oracle") functions read as wasmparser reads them" \
+      || bad "canon: $m read differently from wasmparser"
+    [ "$("$scan" validate "$m.canon.wasm")" = valid ] && ok "canon: $m rewritten is valid" || bad "canon: $m rewritten is invalid"
+  done
+else
+  known "canon: no cargo here, so the rewrite was not checked against wasmparser"
+fi
 
 # A derivation signed over the recipe and the output.
 printf '%s\n' 4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 > key

@@ -1,0 +1,66 @@
+// The NaN rewrite on a module small enough to read by hand: one function, (f64, f64) -> f64, `a + b`.
+
+import { canonicalize } from "../src/canon.wac";
+import { Check } from "./check.wac";
+
+u8[] module(u8[] code) {
+  u8[] head = [0x00 as u8, 0x61 as u8, 0x73 as u8, 0x6D as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+               // type section: one func type (f64 f64) -> f64
+               0x01 as u8, 0x07 as u8, 0x01 as u8, 0x60 as u8, 0x02 as u8, 0x7C as u8, 0x7C as u8, 0x01 as u8, 0x7C as u8,
+               // function section: one function of type 0
+               0x03 as u8, 0x02 as u8, 0x01 as u8, 0x00 as u8,
+               // code section
+               0x0A as u8, (code.len() + 2) as@ u8, 0x01 as u8, code.len() as@ u8];
+  u8[] out = u8[].filled(head.len() + code.len(), 0);
+  out.copyFrom(head, 0, 0, head.len());
+  out.copyFrom(code, 0, head.len(), code.len());
+  return out;
+}
+
+bool contains(u8[] hay, u8[] needle) {
+  for (i32 i = 0; i + needle.len() <= hay.len(); i++) {
+    bool all = true;
+    for (i32 j = 0; j < needle.len(); j++) { if (hay[i + j] != needle[j]) { all = false; break; } }
+    if (all) { return true; }
+  }
+  return false;
+}
+
+export string testAnAddIsFollowedByTheCanonicalizer() {
+  Check c = Check.create();
+  // no locals; local.get 0; local.get 1; f64.add; end
+  u8[] m = module([0x00 as u8, 0x20 as u8, 0x00 as u8, 0x20 as u8, 0x01 as u8, 0xA0 as u8, 0x0B as u8]);
+  match (canonicalize(m)) {
+    Err(e): { c.fail(e); }
+    Ok(r): {
+      c.eq(r.scan, "4 5\n", "four operators, the add at byte 5");
+      // f64.add then `call 1` (the first appended function: no imports, one defined).
+      c.ok(contains(r.module, [0xA0 as u8, 0x10 as u8, 0x01 as u8, 0x0B as u8]), "the add is followed by a call");
+      // Two types appended: the type section now declares three.
+      c.ok(contains(r.module, [0x01 as u8, 0x11 as u8, 0x03 as u8, 0x60 as u8]), "two types appended");
+      // Three functions: the original and the two canonicalizers, of types 1 and 2.
+      c.ok(contains(r.module, [0x03 as u8, 0x04 as u8, 0x03 as u8, 0x00 as u8, 0x01 as u8, 0x02 as u8]), "two functions appended");
+    }
+  }
+  return c.report();
+}
+
+export string testWhatMovesBitsIsLeftAlone() {
+  Check c = Check.create();
+  // local.get 0; f64.neg; local.get 1; f64.copysign; end — no NaN is produced, so nothing is inserted
+  u8[] m = module([0x00 as u8, 0x20 as u8, 0x00 as u8, 0x9A as u8, 0x20 as u8, 0x01 as u8, 0xA6 as u8, 0x0B as u8]);
+  match (canonicalize(m)) {
+    Err(e): { c.fail(e); }
+    Ok(r): { c.eq(r.scan, "5 \n", "neg and copysign move bits exactly"); }
+  }
+  return c.report();
+}
+
+export string testWhatItCannotReadItRefuses() {
+  Check c = Check.create();
+  // a SIMD instruction (0xFD prefix)
+  u8[] m = module([0x00 as u8, 0xFD as u8, 0x0C as u8, 0x0B as u8]);
+  c.ok(canonicalize(m).isErr(), "SIMD is refused, not skipped");
+  c.ok(canonicalize([0x01 as u8, 0x02 as u8]).isErr(), "not a module");
+  return c.report();
+}

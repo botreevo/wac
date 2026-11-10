@@ -2,6 +2,7 @@
 //
 //     derive recipe --program F [--args F] [--in DIR]   an input tree and a recipe over it, into the store;
 //                                                        prints the recipe's CID
+//     derive canon IN OUT [--scan F]                    a module with canonical NaNs, as `run` runs it
 //     derive run RECIPE [--timeout MS] [--key F --runner NAME]
 //                                                        run it: prints the output tree's CID, or nothing on an abort;
 //                                                        with --key, signs a derivation, adds it to the store's
@@ -22,6 +23,7 @@ import { Index, loadIndex, saveIndex } from "../src/graph.wac";
 import { Written, worldFiles } from "../src/world.wac";
 import { MACHINE, FORMAT, Ending, endingOf, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
 import { unhex } from "../src/statement.wac";
+import { canonicalize } from "../src/canon.wac";
 
 string flag(string[] a, string name, string fallback) {
   for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
@@ -44,6 +46,7 @@ export async i32 main(Sys sys) {
   }
   Resolver r = Resolver(store, mirrors);
   if (a[0] == "recipe") { return await recipeCmd(sys, store, a); }
+  if (a[0] == "canon" && a.len() >= 3) { return await canonCmd(sys, a); }
   if (a[0] == "run" && a.len() >= 2) { return await runCmd(sys, store, r, a); }
   sys.warn("derive: unknown command \{a[0]}");
   return 2;
@@ -140,10 +143,18 @@ async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
   }
   if (program is null) { sys.warn("derive: the input tree has no file `program`"); return 1; }
 
+  // The machine's floats: every produced NaN canonical, by rewriting the module (src/canon.wac). A module the
+  // rewrite cannot read is refused, never run without the profile.
+  u8[] runnable;
+  match (canonicalize(program!)) {
+    Err(e): { sys.warn("derive: abort: the program cannot be given canonical NaNs: \{e}"); return 3; }
+    Ok(c): { runnable = c.module; }
+  }
+
   Written written = Written.create();
   Files world = worldFiles(input, emptyDirsOf(tree), written);
   Child kid;
-  match (await sys.procs().spawn(program!, argsOf(argsFile), Authority(world, null, null, null),
+  match (await sys.procs().spawn(runnable, argsOf(argsFile), Authority(world, null, null, null),
                                  Launch("/", false, false, false))) {
     Err(e): { sys.warn("derive: abort: the program did not start: \{e}"); return 3; }
     Ok(c): { kid = c; }
@@ -240,4 +251,22 @@ string withoutSpace(u8[] b) {
   u8[] out = u8[].filled(to - from, 0);
   out.copyFrom(b, from, 0, to - from);
   return string.fromBytes(out);
+}
+
+/** `derive canon IN OUT [--scan FILE]`: the module with canonical NaNs, as the runner will run it; the scan is for the oracle. */
+async i32 canonCmd(Sys sys, string[] a) {
+  match (await sys.readFile(a[1])) {
+    Err(e): { sys.warn("derive: \{a[1]}: \{e}"); return 1; }
+    Ok(b): {
+      match (canonicalize(b)) {
+        Err(e): { sys.warn("derive: \{e}"); return 1; }
+        Ok(c): {
+          await sys.writeFile(a[2], c.module);
+          string scan = flag(a, "--scan", "");
+          if (scan != "") { await sys.writeFile(scan, c.scan.toBytes()); }
+          return 0;
+        }
+      }
+    }
+  }
 }

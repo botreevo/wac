@@ -1,9 +1,10 @@
 # A runner for the deterministic WebAssembly machine
 
-`cmd/derive.wac` runs recipes for the machine `wasm-gc/wac-host/0`, defined in `src/machine.wac`. `tools/machine.sh`
+`cmd/derive.wac` runs recipes for the machine `wasm-gc/wac-host/1`, defined in `src/machine.wac`. `tools/machine.sh`
 runs a corpus of programs (`corpus/`) through it on V8 (the Node host's `wac`) and on wasmtime (the native host's),
-and checks what the machine promises. This page records what that showed. The machine is version 0 because two of
-those promises do not hold yet, and both are below.
+and checks what the machine promises. This page records what that showed. Version 0 broke two of those promises.
+Version 1 keeps one of them (finding 2, NaNs) by rewriting the module, and the other (finding 1, clock and
+randomness) still needs a change in wac.
 
 ## The machine
 
@@ -79,6 +80,23 @@ variable is readable, the working directory is `/`, and a streamed write lands w
    `wac-host`. A machine for other languages would define its imports (WASI preview 1, restricted to a read-only
    `/in` and a writable `/out`, is the obvious candidate), and the same world, output tree and endings would carry
    over unchanged.
+
+## Version 1: canonical NaNs (2026-11-10)
+
+Finding 2 is settled the way it recommends. Before running a program, the runner rewrites it (`src/canon.wac`):
+after every float operation that can produce a NaN (arithmetic, `min`/`max`, `sqrt`, the four roundings,
+`promote`, `demote`), it inserts a call to one of two appended functions, which replace a NaN with the canonical
+positive one. This is WebAssembly 3.0's deterministic profile: `neg`, `abs`, `copysign` and the reinterprets still
+move bits exactly, so a payload written with `fromBits` survives until an operation produces a new NaN.
+
+- `floats.wac` now gives one CID on V8 and wasmtime. `0/0` is `7ff8…` on both (x86 had given `fff8…`), and so is
+  `max(1, payload)`. `-(0/0)` is `fff8…`, because `neg` is a bit operation.
+- The decoder reads every instruction a wac-built module uses and refuses anything else (SIMD and threads included),
+  so a module it cannot read is never run without the profile. `tools/wasmscan`, built on wasmparser (the decoder
+  wasmtime uses), is its oracle: across 4,418 functions in six modules, both find the same operators at the same
+  offsets, and every rewritten module validates. `tools/machine.sh` repeats that check when cargo is available.
+- The cost is a call after each float operation. That is nothing for the corpus here, but measurable in float-heavy
+  code; inlining the check would remove the call.
 
 ## Running it
 

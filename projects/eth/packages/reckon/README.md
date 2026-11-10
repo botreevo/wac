@@ -128,6 +128,15 @@ In the order I would act on them.
    tree hash of the entry must skip a top-level `pack.pack`. A repository containing a real top-level `pack.pack`
    would be misread. 0016's `cache/tree/<hash>/` layout removes the ambiguity.
 
+## Registry v2
+
+`contracts/Registry.sol` and `src/registry2.wac` are the registry rebuilt for this design. Objects are named by CID.
+Revocations are keyed by (signer, statement CID) and can also be relayed as signed EIP-712 Revocations. Rejection
+lists hold a reason hash. Names point at a CID, and changes to the CID or to the delay itself both wait out the
+delay. The reader proves every question admission could ask and turns the answers into admit's `Chain`. Its
+end-to-end run on a devnet passes 32 of 32 checks, including a lying node and a wrong code hash. What was built, the
+layout, and the findings (wacuum drops revert data, among others) are in [docs/registry2.md](docs/registry2.md).
+
 ## What it does not do
 
 - **The light client is not wired in** (finding 2).
@@ -149,6 +158,7 @@ sh packages/reckon/tools/agree.sh ../wac              # one tree hashed three wa
 (cd packages/reckon/tools/oracle && npm install)      # ethers, js-sha3, solc: the oracles and the wallet
 (cd packages/wacuum && wac build --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum)
 TOOLCHAIN=kt1:… sh packages/reckon/tools/e2e.sh /tmp/e2e   # the whole run on a devnet; needs a clean commit
+sh packages/reckon/tools/registry2.sh /tmp/r2             # the registry v2 on a devnet: 32 checks
 ```
 
 `mpt`, `ethrpc` and wacuum's secp256k1 come from `@/lib.wac`, and the devnet the end-to-end run uses is the wacuum beside

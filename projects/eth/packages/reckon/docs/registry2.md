@@ -79,8 +79,8 @@ On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 
   trie, mpt says either "the proof ends where a node hashing to … was expected" or "node N hashes to …, but its parent
   named …". v1's e2e matched the first phrase only. That held there by the luck of its trie shapes, and would have
   failed here.
-- **`tools/oracle/package-lock.json` is out of sync** with its `package.json`: it lacks `multiformats` and
-  `@ipld/dag-cbor`, so `npm ci` refuses. `npm install` works. It is not changed here because it belongs to v1's tools.
+- **`tools/oracle/package-lock.json` was out of sync** with its `package.json` (fixed): it lacked `multiformats`,
+  `@ipld/dag-cbor` and `cborg`, so `npm ci` refused. Regenerated; every version it already pinned is unchanged.
 - **No wac blockers.** The only compiler friction was casts (`as!`, `as~`), where the diagnostics say what to write.
 - **`now` belongs to the caller.** A name's meaning at a time does not depend on which block proved it, because the
   pending value and its time are in storage. A follower can therefore see a change coming for the whole delay,

@@ -67,11 +67,13 @@ check() {   # check PROGRAM EXPECTED [agrees|differs]
 
 check files "exit 0"
 check fail "exit 7"
-check oob "trap array-out-of-bounds"
+check oob "trap memory-bounds"
 check div "trap divide-by-zero"
 check ovf "trap integer-overflow"
-check nul "trap null"
-check unwrap "trap unreachable"
+check nul "trap null-reference"
+check unwrap "trap unreachable-code"
+check conv "trap bad-conversion"
+check explicit "trap explicit"
 check deep abort
 check big abort
 check loop abort
@@ -100,6 +102,19 @@ if [ -n "$WT" ]; then
   limit heap 1024 completes "$WT" wasmtime
   limit depth 1000000 aborts "$WT" wasmtime
 fi
+
+# Version 3 keeps an explicit trap's message, and version 2 still gives its own names for the same programs.
+x=$(run "$V8" "$(recipe explicit)")
+[ "$(wac obj.wasm cat "$x" message $store)" = "explicit: n is 2" ] && ok "explicit: its message is in the output" \
+  || bad "explicit: message '$(wac obj.wasm cat "$x" message $store 2>&1)'"
+recipe2() { wac derive.wasm recipe --machine wasm-gc/wac-host/2 --program "$1.wasm" --args args --in in $store 2>/dev/null; }
+for pair in "oob:trap array-out-of-bounds" "nul:trap null" "unwrap:trap unreachable" "conv:trap float-to-integer" "explicit:trap unreachable"; do
+  p=${pair%%:*}; want=${pair#*:}
+  for host in "$V8" ${WT:+"$WT"}; do
+    got=$(status "$(run "$host" "$(recipe2 "$p")")")
+    [ "$got" = "$want" ] && ok "$p under /2 on $(basename "$host"): $want, as /2 always said" || bad "$p under /2: '$got', want '$want'"
+  done
+done
 
 # What the program could and could not reach, from its own log.
 p=$(run "$V8" "$(recipe probe)")

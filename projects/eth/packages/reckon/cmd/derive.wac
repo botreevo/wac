@@ -1,7 +1,8 @@
-// derive — a runner for the deterministic WebAssembly machine (`src/machine.wac`).
+// derive — a runner for the deterministic WebAssembly machine, versions 3 and 2 (`src/machine.wac`).
 //
 //     derive recipe --program F [--args F] [--in DIR] [--slot NAME DIR]…   an input tree and a recipe over it, into the store;
-//                                                        prints the recipe's CID
+//                                                        prints the recipe's CID. --machine M: wasm-gc/wac-host/3
+//                                                        (the default) or wasm-gc/wac-host/2, both of which `run` carries
 //     derive canon IN OUT [--scan F]                    a module with canonical NaNs, as `run` runs it
 //     derive run RECIPE [--timeout MS] [--key F --runner NAME]
 //                                                        run it: prints the output tree's CID, or nothing on an abort;
@@ -14,14 +15,14 @@
 // memory, from the verified input tree (`src/world.wac`). Its diagnostic output is not part of the output tree; this
 // runner reads it only to learn how the run ended, and passes it on to its own.
 
-import { Sys, Authority, Launch, Child, Files, Input, TimedOut } from "std";
+import { Sys, Authority, Launch, Child, Files, Input, TimedOut, Ended } from "std";
 import { Read, Result, Ticket, flatten } from "core";
 import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.FileIn, ipfs.PROFILE, ipfs.encode, ipfs.readTree,
          ipfs.importFiles, ipfs.importDir, ipfs.emptyDirsOf, ipfs.filesOnly, ipfs.Block, ipfs.DAG_CBOR } from "@/lib.wac";
 import { Recipe, recipeFrom, recipeId, recipeValue, Statement, Signed, signStatement, signedBlock, statementId } from "../src/claims.wac";
 import { Index, loadIndex, saveIndex } from "../src/graph.wac";
 import { Written, worldFiles } from "../src/world.wac";
-import { MACHINE, FORMAT, Ending, endingOf, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
+import { MACHINE, MACHINE_2, isMachine, FORMAT, Ending, endingOfEnded, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
 import { unhex } from "../src/hex.wac";
 import { canonicalize } from "../src/canon.wac";
 
@@ -88,7 +89,9 @@ async i32 recipeCmd(Sys sys, Store store, string[] a) {
     Err(e): { sys.warn("derive: \{e}"); return 1; }
     Ok(c): { input = c; }
   }
-  Recipe recipe = Recipe(MACHINE(), FORMAT(), input);
+  string machine = flag(a, "--machine", MACHINE());
+  if (!isMachine(machine)) { sys.warn("derive recipe: --machine is \{MACHINE()} or \{MACHINE_2()}, not \{machine}"); return 2; }
+  Recipe recipe = Recipe(machine, FORMAT(), input);
   Cid id = recipeId(recipe);
   match (store.put(Block(id, encode(recipeValue(recipe))))) {
     Err(e): { sys.warn("derive: \{e}"); return 1; }
@@ -151,7 +154,7 @@ async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
       }
     }
   }
-  if (recipe.machine != MACHINE()) { sys.warn("derive: this runner is for \{MACHINE()}, not \{recipe.machine}"); return 1; }
+  if (!isMachine(recipe.machine)) { sys.warn("derive: this runner is for \{MACHINE()} and \{MACHINE_2()}, not \{recipe.machine}"); return 1; }
   if (recipe.format != FORMAT()) { sys.warn("derive: this runner reads \{FORMAT()}, not \{recipe.format}"); return 1; }
   FileIn[] tree;
   match (readTree(r, recipe.input)) {
@@ -178,7 +181,7 @@ async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
   Written written = Written.create();
   Files world = worldFiles(input, emptyDirsOf(tree), written);
   Child kid;
-  // Sealed (machine version 2): the program, and anything it spawns, has no clock and no random bytes, on every host.
+  // Sealed (since machine version 2): the program, and anything it spawns, has no clock and no random bytes, on every host.
   // Version 1 could not take them away (docs/runner.md, finding 1).
   match (await sys.procs().spawn(runnable, argsOf(argsFile), Authority(world, null, null, null),
                                  Launch("/", false, false, false, false).sealed())) {
@@ -189,26 +192,24 @@ async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
   Ticket<Result<u8[], string>> log = drained(kid.output());
   Ticket<Result<u8[], string>> err = drained(kid.errors());
   i32 timeout = number(flag(a, "--timeout", "-1"));
-  bool ran = true;
-  i32 code = 0;
-  match (await sys.clock().within(kid.exit(), timeout)) {
-    Ok(c): { code = c; }
+  // How it ended, as the host reports it (`Child.ended()`): the same on every host, not read from what it printed.
+  Ended how;
+  match (await sys.clock().within(kid.ended(), timeout)) {
+    Ok(e): { how = e; }
     Err(e): {
-      if (e is TimedOut) {
-        kid.stop();
-        await log;
-        await err;
-        sys.warn("derive: abort: out of time after \{timeout}ms; no claim");
-        return 3;
-      }
-      ran = false;
+      kid.stop();
+      await log;
+      await err;
+      if (e is TimedOut) { sys.warn("derive: abort: out of time after \{timeout}ms; no claim"); }
+      else { sys.warn("derive: abort: the host could not say how it ended: \{e}; no claim"); }
+      return 3;
     }
   }
   Result<u8[], string> logged = await log;
   Result<u8[], string> said = await err;
   if (logged.isErr() || said.isErr()) { sys.warn("derive: abort: its output was not read to the end"); return 3; }
   if (said.unwrap().len() > 0) { await sys.stderr().write(said.unwrap()); }
-  Ending ending = endingOf(ran, code, said.unwrap());
+  Ending ending = endingOfEnded(recipe.machine, how);
   if (ending.kind == "abort") { sys.warn("derive: abort: \{ending.why}; no claim"); return 3; }
 
   Cid output;

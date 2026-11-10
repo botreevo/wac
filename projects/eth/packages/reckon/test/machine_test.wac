@@ -1,39 +1,50 @@
 // The deterministic machine's pure parts: how a run's ending is read, and the world a program is given.
 
 import { ipfs.FileIn } from "@/lib.wac";
-import { Ending, endingOf, trapName, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
+import { Ended, TrapKind } from "std";
+import { MACHINE, MACHINE_2, Ending, endingOfEnded, trapName, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
 import { Written, clean } from "../src/world.wac";
 import { Check } from "./check.wac";
 
 string ends(Ending e) { return e.kind == "abort" ? "abort" : e.status(); }
 
-export string testEndings() {
+export string testEndingsVersion3() {
   Check c = Check.create();
-  c.eq(ends(endingOf(true, 0, u8[]())), "exit 0\n", "a clean exit");
-  c.eq(ends(endingOf(true, 7, "anything\n".toBytes())), "exit 7\n", "a status");
-  // Node: no status, the trap in V8's words. wasmtime: status 1 and its own words.
-  c.eq(ends(endingOf(false, 0, "wac: array element access out of bounds\n".toBytes())), "trap array-out-of-bounds\n", "V8 bounds");
-  c.eq(ends(endingOf(true, 1, "wac: x.wac trapped: wasm trap: out of bounds array access\n".toBytes())),
-       "trap array-out-of-bounds\n", "wasmtime bounds");
-  c.eq(ends(endingOf(false, 0, "wac: divide by zero".toBytes())), "trap divide-by-zero\n", "V8 division");
-  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: integer divide by zero".toBytes())), "trap divide-by-zero\n", "wasmtime division");
-  c.eq(ends(endingOf(false, 0, "wac: divide result unrepresentable".toBytes())), "trap integer-overflow\n", "V8 overflow");
-  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: integer overflow".toBytes())), "trap integer-overflow\n", "wasmtime overflow");
-  c.eq(ends(endingOf(false, 0, "wac: dereferencing a null pointer".toBytes())), "trap null\n", "V8 null");
-  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: null reference".toBytes())), "trap null\n", "wasmtime null");
-  c.eq(ends(endingOf(false, 0, "wac: unreachable".toBytes())), "trap unreachable\n", "V8 unreachable");
-  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: wasm `unreachable` instruction executed".toBytes())), "trap unreachable\n",
-       "wasmtime unreachable");
-  // Limits, and what nobody named, yield nothing.
-  c.eq(ends(endingOf(false, 0, "wac: Maximum call stack size exceeded".toBytes())), "abort", "V8 stack");
-  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: call stack exhausted".toBytes())), "abort", "wasmtime stack");
-  c.eq(ends(endingOf(false, 0, "wac: requested new array is too large".toBytes())), "abort", "V8 memory");
-  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: allocation size too large".toBytes())), "abort", "wasmtime memory");
-  c.eq(ends(endingOf(false, 0, u8[]())), "abort", "a stop with nothing said");
-  c.eq(ends(endingOf(false, 0, "wac: something new".toBytes())), "abort", "a stop nobody named");
-  // A status 1 is a status unless the host's trap words are on the last line.
-  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: integer divide by zero\nthen more\n".toBytes())), "exit 1\n",
-       "words not on the last line");
+  string m = MACHINE();
+  c.eq(ends(endingOfEnded(m, Ended.Exited(0))), "exit 0\n", "a clean exit");
+  c.eq(ends(endingOfEnded(m, Ended.Exited(7))), "exit 7\n", "a status");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "whatever an engine says"))), "trap memory-bounds\n", "bounds, by kind");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.DivideByZero, ""))), "trap divide-by-zero\n", "division, with nothing said");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.NullReference, "x"))), "trap null-reference\n", "null");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.UnreachableCode, "x"))), "trap unreachable-code\n", "unreachable");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.BadConversion, "x"))), "trap bad-conversion\n", "conversion");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.BadCast, "x"))), "trap bad-cast\n", "cast");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.TableBounds, "x"))), "trap table-bounds\n", "table");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.IntegerOverflow, "x"))), "trap integer-overflow\n", "overflow");
+  Ending own = endingOfEnded(m, Ended.Trapped(TrapKind.Explicit, "half needs an even number"));
+  c.ok(ends(own) == "trap explicit\n" && own.message! == "half needs an even number", "the program's own trap, and its message");
+  FileIn[] files = outputFiles(own, u8[](), Written.create());
+  c.ok(files.len() == 3 && files[2].path == "message", "the message is in the output tree");
+  // Limits, and what no host classifies, yield nothing.
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.StackExhausted, "x"))), "abort", "out of stack");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.Unclassified, "x"))), "abort", "unclassified");
+  c.eq(ends(endingOfEnded(m, Ended.HostLimit("out of memory"))), "abort", "a host limit");
+  return c.report();
+}
+
+export string testEndingsVersion2AsBefore() {
+  Check c = Check.create();
+  string m = MACHINE_2();
+  // /2 reads its names from what the engine said, as it always did: an array's bounds and memory's are different names.
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "array element access out of bounds"))), "trap array-out-of-bounds\n", "V8 bounds");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "wasm trap: out of bounds array access"))), "trap array-out-of-bounds\n", "wasmtime bounds");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "memory access out of bounds"))), "trap memory-out-of-bounds\n", "memory");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, ""))), "abort", "bounds with nothing said: /2 cannot tell which");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.UnreachableCode, ""))), "trap unreachable\n", "unreachable by kind");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.NullReference, "dereferencing a null pointer"))), "trap null\n", "null");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.Explicit, "the program's words"))), "trap unreachable\n", "an explicit trap, as /2 saw it");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.Unclassified, "requested new array is too large"))), "abort", "memory");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.StackExhausted, "x"))), "abort", "stack");
   c.eq(trapName("illegal cast"), "cast", "V8 cast");
   c.eq(trapName("wasm trap: cast failure"), "cast", "wasmtime cast");
   return c.report();

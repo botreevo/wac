@@ -87,6 +87,19 @@ else
   replay header;    in_page refused "in the browser, an execution node that answers the anchor with another header" "re-encodes to a different hash"
   replay proof;     in_page refused "in the browser, an execution node that changes a storage proof" "the name:"
   replay honest
+  # R4 in the page: the light client's state kept in the browser's storage, then resumed by the next page.
+  qs() { python3 -c 'import sys, urllib.parse; print("&".join("a=" + urllib.parse.quote(x, safe="") for x in sys.argv[1:]))' \
+    ens:vitalik.eth app --policy-text "$policy" --mirror "http://127.0.0.1:$mport" --beacon-url "http://127.0.0.1:$bport" \
+    --now 15630000 --rpc 127.0.0.1:$eport --state lc.state "$@"; }
+  two=$(node "$here/tools/browser/open.cjs" "http://127.0.0.1:$port/web.html?$(qs --checkpoint $checkpoint)" 180000 \
+    THEN "http://127.0.0.1:$port/web.html?$(qs)" 2>&1)
+  printf '%s\n' "$two" | grep -E '^== page|state kept|resumed|^ADMITTED|^REFUSED|bootstrap' | sed 's/^/   | /'
+  first=$(printf '%s' "$two" | sed -n '/^== page 1/,/^== page 2/p'); second=$(printf '%s' "$two" | sed -n '/^== page 2/,$p')
+  printf '%s' "$first" | grep -q "state kept at lc.state" && printf '%s' "$first" | grep -q "^ADMITTED" \
+    && ok "in the browser, the first page starts from the checkpoint and keeps the state in the browser's storage" || bad "the first page"
+  printf '%s' "$second" | grep -q "resumed from its kept state" && printf '%s' "$second" | grep -q "^ADMITTED" \
+    && ! printf '%s' "$second" | grep -q "bootstrap" \
+    && ok "the next page, given no checkpoint, resumes from it and admits, with no bootstrap" || bad "the second page"
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

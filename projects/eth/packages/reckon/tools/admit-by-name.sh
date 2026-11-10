@@ -121,5 +121,30 @@ C="--policy policy.json5 --checkpoint $checkpoint --beacon-url http://127.0.0.1:
 expect refused "a clock slot before the finality update was signed ($((sig - 1)))" "the finality update did not verify" -- $CL admit ens:vitalik.eth app $C --now $((sig - 1))
 expect ok "at the slot it was signed in ($sig)" "ADMITTED" -- $CL admit ens:vitalik.eth app $C --now $sig
 
+step "the light client's state, kept between runs (R4): resumed, not bootstrapped again"
+beacon honest
+K="--policy policy.json5 --beacon-url http://127.0.0.1:$bport --now 15630000 --rpc 127.0.0.1:$port --store local"
+rm -f lc.state
+expect refused "no kept state yet, and no checkpoint to start one" "give --checkpoint to start it" -- $CL admit ens:vitalik.eth app $K --state lc.state
+expect ok "the first run starts from the checkpoint, and keeps the state" "state kept at lc.state" -- $CL admit ens:vitalik.eth app $K --checkpoint $checkpoint --state lc.state
+expect ok "the next needs no checkpoint: resumed from the kept state" "resumed from its kept state" -- $CL admit ens:vitalik.eth app $K --state lc.state
+out=$($CL admit ens:vitalik.eth app $K --state lc.state 2>&1 || true)
+printf '%s' "$out" | grep -qF "finalized execution block 0xe6343fc3" && printf '%s' "$out" | grep -q "^ADMITTED" \
+  && { pass=$((pass+1)); echo "   PASS (…to the same anchor, and admitted)"; } || { fail=$((fail+1)); echo "   FAIL (the resumed anchor)"; }
+printf '%s' "$out" | grep -q "bootstrap" && { fail=$((fail+1)); echo "   FAIL (a resumed run asked for a bootstrap)"; } \
+  || { pass=$((pass+1)); echo "   PASS (…without asking for a bootstrap)"; }
+expect ok "the same, from beacon data in a directory" "resumed from its kept state" -- $CL admit ens:vitalik.eth app --policy policy.json5 --beacon "$beacon" --now 15630000 --rpc 127.0.0.1:$port --store local --state lc.state
+expect refused "a kept state from another checkpoint than the one given" "descends from checkpoint" -- $CL admit ens:vitalik.eth app $K --state lc.state --checkpoint 0x$(printf 'ab%.0s' $(seq 32))
+expect refused "a kept state older than the bound: 20 periods on" "sync-committee periods old" -- $CL admit ens:vitalik.eth app --policy policy.json5 --beacon-url http://127.0.0.1:$bport --now $((15630000 + 8192 * 20)) --rpc 127.0.0.1:$port --store local --state lc.state
+expect refused "…or a tighter bound given: 0 periods" "sync-committee periods old" -- $CL admit ens:vitalik.eth app $K --state lc.state --state-max-periods 0
+cp lc.state lc.state.before
+beacon fork
+expect refused "a node whose answers cannot continue it" "the kept state is" -- $CL admit ens:vitalik.eth app $K --state lc.state
+cmp -s lc.state lc.state.before && { pass=$((pass+1)); echo "   PASS (…and the kept state is left as it was)"; } || { fail=$((fail+1)); echo "   FAIL (a refused run changed the kept state)"; }
+beacon honest
+printf 'something else\n' > lc.bad
+expect refused "a kept state that is not one" "not a light-client state" -- $CL admit ens:vitalik.eth app $K --state lc.bad
+expect refused "--state and --anchor at once" "not both" -- $CL admit ens:vitalik.eth app $K --state lc.state --anchor 0x$(printf '12%.0s' $(seq 32))
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

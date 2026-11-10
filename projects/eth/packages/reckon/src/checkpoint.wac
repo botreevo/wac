@@ -32,10 +32,12 @@
 import { Sys } from "std";
 import { Result } from "core";
 import { codec.hexEncode, codec.hexDecoded, fetch.fetch, fetch.Caps, fetch.Fetched } from "wac";
-import { forkNamed } from "../../ssz/src/forks.wac";
-import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, headerSlot }
-  from "../../lightclient/src/store.wac";
+import { forkNamed, forkName } from "../../ssz/src/forks.wac";
+import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, headerSlot, isNextSyncCommitteeKnown,
+         updateFinalizedHeaderAt } from "../../lightclient/src/store.wac";
 import { Schedule } from "../../lightclient/src/schedule.wac";
+import { fieldsOfN } from "../../lightclient/src/upgrade.wac";
+import { TY_LIGHT_CLIENT_FINALITY_UPDATE } from "../../ssz/src/beacon.wac";
 import { executionBlockHash, executionStateRoot } from "../../lightclient/src/header.wac";
 
 /** What the light client ends up believing: the finalized execution block, and how it got there. */
@@ -44,6 +46,8 @@ export struct Anchored {
   u8[] stateRoot;
   i64 beaconSlot;
   string[] log;
+  /** The light client's store as it ended, to resume from next time (`stateText`). */
+  string state;
 }
 
 /** Mainnet's genesis validators root: part of every signing domain, so a signature from another chain fails. */
@@ -81,6 +85,10 @@ string[] more(string[] xs, string x) {
 struct Run {
   Store store;
   string[] log;
+  /** The checkpoint this store descends from, kept with it. */
+  string checkpoint;
+  /** Whether it was resumed from a kept state, where updates it already has are skipped (`known`). */
+  bool resumed;
 }
 
 Result<u8[], string> rootOf(string checkpoint) {
@@ -94,15 +102,31 @@ Result<u8[], string> rootOf(string checkpoint) {
 Result<Run, string> start(u8[] root, i32 fork, u8[] boot, string from) {
   Store? s = initializeStoreWith(Schedule.mainnet(), fork, root, boot);
   if (s is null) { return Result.Err("the light client: the bootstrap \{from} is not the checkpoint's, or its committee is not proven by it"); }
-  return Result.Ok(Run(s!, ["light client: bootstrap \{from} proven against checkpoint \{hx(root)}, slot \{headerSlot(s!.finalizedHeader)}"]));
+  return Result.Ok(Run(s!, ["light client: bootstrap \{from} proven against checkpoint \{hx(root)}, slot \{headerSlot(s!.finalizedHeader)}"], hx(root), false));
 }
 
 /** Updates in the beacon API's chunked list form: each an 8-byte length, a 4-byte fork digest, the SSZ. */
+/**
+ * Whether `update` tells this store nothing: its finalized header no later than the store's, and no committee the
+ * store lacks. A resumed store is handed updates it already has (they come by period), and the spec's relevance
+ * check refuses those; they are skipped instead, unapplied, and anything newer must still verify.
+ */
+bool known(Store s, u8[] update) {
+  // An update that does not even parse has slot -1: it is not "known", it goes on to be refused.
+  i64 f = headerSlot(updateFinalizedHeaderAt(s.fork, s.schedule.size, update));
+  return isNextSyncCommitteeKnown(s) && f >= (0 as i64) && f <= headerSlot(s.finalizedHeader);
+}
+
 Result<bool, string> updates(Run r, u8[] d, i64 now) {
   i32 at = 0;
   while (at + 12 <= d.len()) {
     i32 n = le64(cut(d, at, at + 8)) as~ i32;
     if (n < 4 || at + 8 + n > d.len()) { return Result.Err("the light client: the updates are not a chunked list"); }
+    if (r.resumed && known(r.store, cut(d, at + 12, at + 8 + n))) {
+      at = at + 8 + n;
+      r.log = more(r.log, "light client: update already known, finalized slot \{headerSlot(r.store.finalizedHeader)}");
+      continue;
+    }
     if (!processUpdate(r.store, cut(d, at + 12, at + 8 + n), now, MAINNET_GVR())) { return Result.Err("the light client: an update did not verify"); }
     at = at + 8 + n;
     r.log = more(r.log, "light client: update accepted, finalized slot \{headerSlot(r.store.finalizedHeader)}");
@@ -111,6 +135,10 @@ Result<bool, string> updates(Run r, u8[] d, i64 now) {
 }
 
 Result<bool, string> finality(Run r, u8[] d, i64 now) {
+  if (r.resumed && finalityKnown(r.store, d)) {
+    r.log = more(r.log, "light client: finality update already known, finalized slot \{headerSlot(r.store.finalizedHeader)}");
+    return Result.Ok(true);
+  }
   if (!processFinalityUpdate(r.store, d, now, MAINNET_GVR())) { return Result.Err("the light client: the finality update did not verify"); }
   r.log = more(r.log, "light client: finality update accepted, finalized slot \{headerSlot(r.store.finalizedHeader)}");
   return Result.Ok(true);
@@ -121,7 +149,7 @@ Result<Anchored, string> finish(Run r) {
   u8[]? state = executionStateRoot(r.store.fork, r.store.finalizedHeader);
   if (hash is null || state is null) { return Result.Err("the light client: the finalized header names no execution block"); }
   string[] log = more(r.log, "light client: finalized execution block \{hx(hash!)}: the anchor");
-  return Result.Ok(Anchored(hash!, state!, headerSlot(r.store.finalizedHeader), log));
+  return Result.Ok(Anchored(hash!, state!, headerSlot(r.store.finalizedHeader), log, stateText(r)));
 }
 
 /** The slot an update is checked against: `fixed` when it is one (>= 0), else mainnet's clock slot at this moment,
@@ -223,5 +251,126 @@ export async Result<Anchored, string> anchorFromNode(Sys sys, string checkpoint,
   Got fin = try get(caps, base, "/eth/v1/beacon/light_client/finality_update");
   if (fin.fork != want) { return Result.Err("the beacon node answered the finality update as \{fin.fork}, and the bootstrap as \{want}"); }
   try finality(r, fin.body, await slotNow(sys, now));
+  return finish(r);
+}
+
+// ---------------------------------------------------------------- the store, kept between runs (R4)
+
+/**
+ * The light client's store as text, to resume from: what it believes and nothing else, so a later run fetches only
+ * the updates after it, not a bootstrap. It is as trusted as the checkpoint it descends from, which it names: it is
+ * this client's own verified state, kept where the client keeps its checkpoint (a file natively, the browser's storage
+ * in a page). Lines of `key value`, the byte strings in hex.
+ */
+string stateText(Run r) {
+  Store s = r.store;
+  return "reckon-light-client-state 1\n" + "checkpoint \{r.checkpoint}\n" + "fork \{forkName(s.fork)}\n"
+    + "finalized \{hx(s.finalizedHeader)}\n" + "current \{hx(s.currentSyncCommittee)}\n" + "next \{hx(s.nextSyncCommittee)}\n"
+    + "best \{hx(s.bestValidUpdate)}\n" + "optimistic \{hx(s.optimisticHeader)}\n"
+    + "participants \{s.previousMaxActiveParticipants} \{s.currentMaxActiveParticipants}\n";
+}
+
+/** A kept state read back: the store, and the checkpoint it descends from. */
+export struct Kept {
+  string checkpoint;
+  string fork;
+  i64 finalizedSlot;
+}
+
+Result<string, string> line(string text, string key) {
+  string rest = text;
+  while (rest.len() > 0) {
+    i32 nl = rest.indexOf("\n");
+    string one = nl < 0 ? rest : rest.slice(0, nl);
+    if (one.indexOf(key + " ") == 0) { return Result.Ok(one.slice(key.len() + 1, one.len())); }
+    if (nl < 0) { break; }
+    rest = rest.slice(nl + 1, rest.len());
+  }
+  return Result.Err("the light client's kept state has no \{key}");
+}
+
+Result<u8[], string> bytesOf(string text, string key) {
+  string h = try line(text, key);
+  string body = h.len() >= 2 && h.slice(0, 2) == "0x" ? h.slice(2, h.len()) : h;
+  if (body == "") { return Result.Ok(u8[]()); }
+  u8[]? b = hexDecoded(body);
+  if (b is null) { return Result.Err("the light client's kept state: \{key} is not hex"); }
+  return Result.Ok(b!);
+}
+
+Result<Run, string> runOf(u8[] state) {
+  string text = string.fromBytes(state);
+  if (text.indexOf("reckon-light-client-state 1\n") != 0) { return Result.Err("not a light-client state this reads"); }
+  i32 fork = forkNamed(try line(text, "fork"));
+  if (fork < 0) { return Result.Err("the light client's kept state names a fork it does not read"); }
+  string parts = try line(text, "participants");
+  i32 sp = parts.indexOf(" ");
+  if (sp < 0) { return Result.Err("the light client's kept state: participants"); }
+  Store s = Store(try bytesOf(text, "finalized"), try bytesOf(text, "current"), try bytesOf(text, "next"),
+                  try bytesOf(text, "best"), try bytesOf(text, "optimistic"),
+                  number(parts.slice(0, sp)), number(parts.slice(sp + 1, parts.len())), fork, Schedule.mainnet());
+  if (headerSlot(s.finalizedHeader) < (0 as i64) || s.currentSyncCommittee.len() == 0) { return Result.Err("the light client's kept state is incomplete"); }
+  return Result.Ok(Run(s, string[](), try line(text, "checkpoint"), true));
+}
+
+i32 number(string s) {
+  i32 v = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { v = v * 10 + ((b[i] - 48) as i32); }
+  return v;
+}
+
+/** What a kept state says about itself, without resuming it. */
+export Result<Kept, string> keptOf(u8[] state) {
+  Run r = try runOf(state);
+  return Result.Ok(Kept(r.checkpoint, forkName(r.store.fork), headerSlot(r.store.finalizedHeader)));
+}
+
+/** Whether a finality update tells this store nothing new (its finalized header no later than the store's). */
+bool finalityKnown(Store s, u8[] fu) {
+  i64 f = finalizedOfFinality(s, fu);
+  return isNextSyncCommitteeKnown(s) && f >= (0 as i64) && f <= headerSlot(s.finalizedHeader);
+}
+
+i64 finalizedOfFinality(Store s, u8[] fu) {
+  // A finality update's fields: attested header, finalized header, finality branch, sync aggregate, signature slot.
+  u8[][] p = fieldsOfN(s.fork, s.schedule.size, TY_LIGHT_CLIENT_FINALITY_UPDATE(), fu);
+  return p.len() == 5 ? headerSlot(p[1]) : (-1 as i64);
+}
+
+/**
+ * The finalized execution block, resumed from a kept `state` instead of a checkpoint: the updates since its period and
+ * the latest finality update, from a beacon node at `url` or the directory `dir`, as `anchorFromNode` and `anchorFrom`
+ * read them. Refused when the state is older than `maxPeriods` sync-committee periods at the clock (a committee that
+ * old is no longer one to trust, however it is reached: the weak subjectivity bound), or when it cannot be continued.
+ */
+export async Result<Anchored, string> anchorResume(Sys sys, u8[] state, string url, string dir, i64 now, i64 maxPeriods) {
+  Run r = try runOf(state);
+  i64 stored = headerSlot(r.store.finalizedHeader);
+  i64 clock = await slotNow(sys, now);
+  i64 age = clock / PERIOD() - stored / PERIOD();
+  if (age > maxPeriods) {
+    return Result.Err("the light client's kept state is \{age} sync-committee periods old (finalized slot \{stored}, the clock at \{clock}), more than the \{maxPeriods} allowed: start again from a checkpoint you trust");
+  }
+  r.log = ["light client: resumed from its kept state, finalized slot \{stored}, descended from checkpoint \{r.checkpoint}"];
+  if (url != "") {
+    string base = url.len() > 0 && url.slice(url.len() - 1, url.len()) == "/" ? url.slice(0, url.len() - 1) : url;
+    Caps caps = Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files());
+    string want = forkName(r.store.fork);
+    i64 from = stored / PERIOD();
+    if (clock / PERIOD() >= from) {
+      Got ups = try get(caps, base, "/eth/v1/beacon/light_client/updates?start_period=\{from}&count=\{clock / PERIOD() - from + 1}");
+      if (ups.body.len() > 0 && !allAre(ups.fork, want)) { return Result.Err("the beacon node answered the updates as \{ups.fork}, and the kept state is \{want}"); }
+      try updates(r, ups.body, await slotNow(sys, now));
+    }
+    Got fin = try get(caps, base, "/eth/v1/beacon/light_client/finality_update");
+    if (fin.fork != want) { return Result.Err("the beacon node answered the finality update as \{fin.fork}, and the kept state is \{want}"); }
+    try finality(r, fin.body, await slotNow(sys, now));
+  } else {
+    u8[]? ups = await optional(sys, dir + "/updates.ssz");
+    if (ups is not null) { try updates(r, ups!, await slotNow(sys, now)); }
+    u8[]? fin = await optional(sys, dir + "/finality.ssz");
+    if (fin is not null) { try finality(r, fin!, await slotNow(sys, now)); }
+  }
   return finish(r);
 }

@@ -1,7 +1,6 @@
 # 0405a — an `await` in the `Ok` arm of a match on a `Result<void, E>` emits a module the engine refuses
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `asynclower.wac`'s `splitMatch` makes a binding the arm never reads `_`; `spec/cases/0889`
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
 - **Kind:** bug
@@ -36,3 +35,7 @@ local first and matching that fails the same way.
 Found with `std`'s `Output.write`, which answers `Result<void, OutputFault>`: matching a write and then awaiting a line
 on the diagnostic output is the obvious way to report what happened, and every `Files` change answers a `Result<void, …>`
 too.
+
+## Fix
+
+A suspending `match` copies each arm binding into a local of its own name, so it is hoisted like any local; for `Ok(v)` on a `Result<void, E>` that local was a cell of `void`, which the engine refused. A binding the arm never reads (`mentions`, which counts what a rename of it would touch) is now `_` — a synthetic token added for it — and binds nothing. Leaving it under its own name was tried first and trapped at run time: a binding is a local of the state that dispatches, which the flattening does not keep.

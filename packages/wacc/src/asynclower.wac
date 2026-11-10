@@ -65,7 +65,7 @@ import {
   synthSource, synthTokens, synthTok, synthTextAt,
   synthTicket, synthValue, synthStep, synthWaiting, synthYielded, synthDone, synthCoroutine,
   synthTicketBase, synthNever, synthState, synthRes, synthMachine, synthStartName, synthOrReady,
-  synthTargetSet, synthTargetGet, synthHypothetical, synthLt, synthPlus, synthLen, synthIsArray, synthElement, synthGet, synthStepped, synthNextName, synthCurrentName, synthStepCall, synthIsDoneName, synthYieldedName,
+  synthTargetSet, synthTargetGet, synthHypothetical, synthLt, synthPlus, synthLen, synthIsArray, synthElement, synthGet, synthStepped, synthUnderscore, synthNextName, synthCurrentName, synthStepCall, synthIsDoneName, synthYieldedName,
   synthAssign, synthI32, synthBool, synthVoid, synthStepFn,
   synthOk, synthErr, synthResult, synthTryV, synthTryE, synthGenerator, synthAsyncGenerator,
   synthSlot, synthAw, synthNum, synthZero, synthOne, synthArg,
@@ -183,10 +183,12 @@ struct CopyMode {
   i32[] declToks;
   Ty[] declTys;
   i32 declN;
+  /** How many times a rename under `renFrom` fired — so `mentions` can ask whether a body names something. */
+  i32 renHits;
 
   CopyMode create(i32[] next) {
     return CopyMode(false, "", 0 - 1, 0 - 1, 0 - 1, string[].filled(16, ""), 0, next, Stmt[](), 0, false, false,
-                    0, false, string[](), i32[](), 0, Stmt[](), "", Stmt[](), i32[](), Ty[](), 0);
+                    0, false, string[](), i32[](), 0, Stmt[](), "", Stmt[](), i32[](), Ty[](), 0, 0);
   }
 
   /** The local a lambda reads hoisted `name` through, or -1 before its first read. */
@@ -895,7 +897,16 @@ string shadowStartAny(Ctx c, i32[] toks) {
 
 /** Whether `tok` spells the name the copy is renaming. */
 bool renamesTok(Ctx c, i32 tok) {
-  return c.copy.renFrom != "" && synthTextAt(c.src, c.lexed, tok) == c.copy.renFrom;
+  bool hit = c.copy.renFrom != "" && synthTextAt(c.src, c.lexed, tok) == c.copy.renFrom;
+  if (hit) { c.copy.renHits = c.copy.renHits + 1; }
+  return hit;
+}
+
+/** Whether `body` reads `name` anywhere — a rename of it that fires, and is thrown away. */
+bool mentions(Rz z, Stmt[] body, string name, i32 any) {
+  i32 before = z.c.copy.renHits;
+  renameIn(z, body, name, any);
+  return z.c.copy.renHits != before;
 }
 
 /** Whether `s` declares a local called `name` — the end of an outer one's reach in this block. */
@@ -2879,6 +2890,11 @@ Stmt[] uniqueLocals(Rz z, Stmt[] body, Seen seen) {
       While(cond, b): { cur[i] = Stmt(StmtKind.While(cond, uniqueLocals(z, b, seen)), s.line, s.col); }
       DoWhile(b, cond): { cur[i] = Stmt(StmtKind.DoWhile(uniqueLocals(z, b, seen), cond), s.line, s.col); }
       Block(b): { cur[i] = Stmt(StmtKind.Block(uniqueLocals(z, b, seen)), s.line, s.col); }
+      // **Both branches**: a `for … in` the split has written as a `static_if` declares its variable in each, and a
+      // later local of the same name was one cell with it — of the loop's type (`issues/lang/0420c`).
+      StaticIf(cond, then, els): {
+        cur[i] = Stmt(StmtKind.StaticIf(cond, uniqueLocals(z, then, seen), uniqueLocals(z, els, seen)), s.line, s.col);
+      }
       For(init, cond, update, b): {
         Stmt? i2 = init;
         Expr? c2 = cond;
@@ -3325,6 +3341,13 @@ Stmt splitMatch(Rz z, Stmt s, Expr subject, Arm[] arms, Ty? st) {
     i32 kept = 0;
     for (i32 k = 0; k < nb; k++) {
       if (rzText(z, arm.bindingToks[k]) == "_") { fresh[k] = arm.bindingToks[k]; continue; }
+      // **A binding the arm never reads is not copied, and is `_`.** `Ok(v)` on a `Result<void, E>` binds a `void`, and
+      // its copy was a cell of `void` — a module the engine refused (`issues/lang/0405a`). Left under its own name it
+      // was a local of the dispatching state that the flattening does not keep; `_` binds nothing.
+      if (!mentions(z, body, rzText(z, arm.bindingToks[k]), arm.bindingToks[k])) {
+        fresh[k] = synthTok(c.first, synthUnderscore());
+        continue;
+      }
       i32 f = freshTmp(z);
       fresh[k] = f;
       Ty bt = typeofTy(c, bindingShape(z, subject, arm.variantTok, arm.bindingToks, k));
@@ -3810,7 +3833,11 @@ Stmt[]? machineOf(Lw w, Site at, Stmt[] body, Ty ret, string[] extra) {
                i32[].filled(1, at.colBase), bool[].filled(1, false), i32[].filled(1, 0), Ty?[].defaulted(3), CopyMode.create(w.next), "");
   Rz z = Rz(c0, at.params, body, w.prog, at.selfTok, w.next, string[].filled(1, ""), w.sigs,
            localsOf(c0, at.params, body));
-  Stmt[] split = uniqueLocals(z, splitBody(z, body), Seen.create());
+  // **The parameters are names already**: a block-local that shadows one is a cell of its own, or the cell — named
+  // after the local, declared for the whole function — shadows the parameter after the block too (`issues/lang/0412a`).
+  Seen seen = Seen.create();
+  for (i32 i = 0; i < at.params.len(); i++) { seen.add(synthTextAt(w.src, w.lexed, at.params[i].nameTok)); }
+  Stmt[] split = uniqueLocals(z, splitBody(z, body), seen);
   i32 wantStates = statesNeeded(split) + 10;   // `buildArms` numbers up to `statesNeeded + 8`
   if (wantStates > w.statesWanted[0]) { w.statesWanted[0] = wantStates; }
   AsyncPlan plan = planBody(split);

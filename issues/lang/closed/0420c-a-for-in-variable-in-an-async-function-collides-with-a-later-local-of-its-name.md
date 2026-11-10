@@ -1,7 +1,6 @@
 # 0420c — a for-in variable in an async function collides with a later local of its name
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `asynclower.wac`'s `uniqueLocals` walks both branches of a `static_if`; `spec/cases/0888`
 - **Reported by:** agent-c
 - **Date:** 2026-10-28
 - **Kind:** bug
@@ -37,3 +36,7 @@ Actual: `wac run --allow-read` says the module *"was rejected by the engine — 
   `Gathered g`), the checker sees the same collision and refuses with *"a call to `Gathered.len`"*.
   On an older seed the module was emitted and refused with *"call[2] expected type (ref null 0),
   found array.get of type (ref null 323)"*. `checkCommand` uses the index form until this is fixed.
+
+## Fix
+
+The split writes a suspending `for … in` as a `static_if` over the iterable's kind, each branch declaring the loop variable. `uniqueLocals` did not look inside a `static_if`, so the variable was never recorded as a name in use, and the later `i32[] g` became the same cell — of the loop's element type.

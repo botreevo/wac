@@ -1,7 +1,6 @@
 # 0412a — a block-local shadowing a parameter in an async function emits invalid wasm
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `asynclower.wac`'s `machineOf` seeds `uniqueLocals` with the parameters; `spec/cases/0887`
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
 - **Kind:** bug
@@ -36,3 +35,7 @@ of type (ref null M)* — the state machine keeps both `out`s in one frame slot,
 Found as `$lambda$3/29:1024` in `packages/box/src/applets/gets.wac`, where a `ClientStep out` inside the request
 block shadowed the `Output out` parameter (design/system/0013 step 5 gave applets an `Output out`). Renamed there.
 A synchronous function with the same shape is fine; the frame of an `async` one is keyed by name.
+
+## Fix
+
+A machine keeps each local in a cell named after it, declared for the whole function, and `uniqueLocals` renames a local whose name an earlier one used — but it started knowing no names, so a block-local named like a parameter kept the name, and its cell shadowed the parameter after the block as well. The parameters are seeded as names already used.

@@ -75,5 +75,5 @@ Said plainly, because the point is to know exactly what an answer rests on.
   replayed by local servers. The live path (`--beacon-url` against a public node) is shown in docs/admit.md.
 - **Keys and the policy are the user's.** The three signers and the policy file are what the client trusts by
   choice, which is the design.
-- **What the machine does not yet bound.** `docs/runner.md` lists the floor (stack, heap) and what remains, such as
-  `--env-from-runner` for builds with dependencies, which steps outside the machine and is never signed.
+- **What the machine does not yet bound.** `docs/runner.md` lists the floor (stack and heap) and what remains. Builds
+  with dependencies are now wholly inside it and signed (`--wac-home`, since wac fade22039).

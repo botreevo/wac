@@ -3,11 +3,17 @@
 import { admit } from './admission.js';
 import { openTree } from './tree.js';
 import { buildDocument, typeOf } from './build-doc.js';
+import { renderAccount } from './account.js';
 
 const $ = (id) => document.getElementById(id);
 const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'mirrorsFrom', 'policy', 'now', 'recheck'];
 // No mirror by default: a public gateway is a choice to make, and one that is down slows every admission until it is
 // left out. The settings suggest one.
+/**
+ * The reckon pages site's own mirror manifest (docs/discovery.md): offered in the settings, never used unless added. What
+ * its mirrors serve is checked like any mirror's; the preset only says where else to look.
+ */
+export const SITE_MANIFEST = 'https://pages.voltrevo.com/wac-eth/reckon-mirrors.json';
 const DEFAULTS = { mirrors: '', mirrorsFrom: '', policy: '{ signers: {}, roles: {} }', recheck: '600' };
 
 async function loadSettings() {
@@ -42,7 +48,7 @@ const fenced = (async () => {
 
 let shown = null;   // { tree, page }: what the frame shows, and the only tree its requests are answered from
 
-function account(lines) { $('account').textContent = lines.join('\n'); }
+function account(lines) { renderAccount($('account'), lines); }
 
 const STALE_S = 3600;   // a decision older than this is marked: the chain may have moved since (a revocation, a name)
 
@@ -168,6 +174,10 @@ async function open(subject, role) {
   const s = await loadSettings();
   for (const f of FIELDS) $(f).value = s[f] ?? '';
   $('save').addEventListener('click', saveSettings);
+  $('preset-mirrors').addEventListener('click', () => {
+    const have = $('mirrorsFrom').value.split(/\s+/).filter(Boolean);
+    if (!have.includes(SITE_MANIFEST)) $('mirrorsFrom').value = [...have, SITE_MANIFEST].join('\n');
+  });
   setInterval(() => { if (banner.asOf) showAsOf(banner.asOf, banner.ok); }, 10000);   // the age, kept live
   $('open').addEventListener('submit', (e) => { e.preventDefault(); open($('subject').value.trim(), $('role').value.trim() || 'app'); });
   const q = new URLSearchParams(location.search).get('open');

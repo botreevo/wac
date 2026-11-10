@@ -183,6 +183,26 @@ what the user installed, and its build can itself be a derivation, so it can be 
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
 
+## The account, read for a person (2026-11-10)
+
+The page used to show admission's account as the lines `web` printed. Now (`extension/src/account.js`):
+
+- **A verdict line leads.** "Admitted as app: CID — 5 derivation(s), 9 endorsement(s), 3 trust root(s) checked", or
+  "Refused: CID… as build: recipe …: witnessed by v8 on 1 runner(s) (need 2 on 2)".
+  - A refusal is summarized by the rule that failed at the bottom of the tree: the deepest refused node with nothing
+    refused below it, and its first reason. Other refusals at the bottom are counted ("and 6 more refused").
+  - When admission stopped before deciding anything (a light client that did not verify, a name the policy does not
+    follow), the verdict is the line that stopped it.
+  - While admission runs, there is no verdict.
+- **The decision is a tree to open.** Refused branches are open, so the reason is in view. Admitted branches below the
+  top are folded.
+- **The text is unchanged.** The account's text is still every line, so it copies as it was printed.
+- **A mirror-manifest preset.** In the settings, "add the reckon site's manifest" adds
+  `https://pages.voltrevo.com/wac-eth/reckon-mirrors.json` to the mirror manifests. Nothing is used unless it is added.
+
+`extension/test/account.cjs` checks the summaries against the 53 accounts in the site's recorded runs, and the
+rendering in the extension's page (13 of 13).
+
 ## A hostile app (2026-11-10)
 
 `extension/test/hostile.cjs` shows an admitted tree whose pages try every way out we know of. Each way out is aimed at

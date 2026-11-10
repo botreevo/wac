@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `wac task map` after adding a package or an entry point; `wac task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-34 packages, 182,190 lines of wac, 2859 tests,
+34 packages, 182,232 lines of wac, 2862 tests,
 79 command-line programs and 13 browser pages.
 
 ## Packages
@@ -42,8 +42,8 @@ In dependency order: nothing here imports anything below it.
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 4,212 | 58 | `box` `bytes` `codec` `crypto` `fs` `sh` `tty` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 4,541 | 204 | `bytes` `codec` `crypto` |
 | [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 17,801 | 326 | `bytes` `codec` `crypto` `datetime` `http` `json` `tls` `wactest` |
-| [`wac`](packages/wac/) | The command. | 5,975 | 93 | `box` `fmt` `fs` `json` `sh` `wacc` `wacpkg` |
-| [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 77,364 | 517 | `codec` `crypto` `fmt` `json` `sh` `wactest` |
+| [`wac`](packages/wac/) | The command. | 5,995 | 94 | `box` `fmt` `fs` `json` `sh` `wacc` `wacpkg` |
+| [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 77,386 | 519 | `codec` `crypto` `fmt` `json` `sh` `wactest` |
 | [`wacpkg`](packages/wacpkg/) | Where a wac project says its dependencies come from: `wac.json5`, read and checked. | 1,832 | 55 | `codec` `git` `json` `tls` `wacc` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 2,789 | 41 | `crypto` `fmt` `json` `wacpkg` |
 | [`webrtc`](packages/webrtc/) | WebRTC in wac — the data channel half, following `design/system/0008`. | 4,578 | 86 | `crypto` `gzip` `tls` |

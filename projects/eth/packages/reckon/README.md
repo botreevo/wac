@@ -47,6 +47,7 @@ not wired into wac's own fetch and build: that waits until the design settles.
 | `cmd/claim.wac`, `src/policyfile.wac`, `tools/demo.sh` | sign endorsements, rejections and revocations; query origins and dependents; admit under a JSON5 policy. The demo (8 checks): one recipe run on V8 and on wasmtime gives one output, both runners sign, a reviewer endorses the inputs, and the output is admitted only with both witnesses and every endorsement, and refused again when either is revoked |
 | `tools/selfbuild.sh` | builds as derivations: wac's compiler, run by the machine, builds an app that runs as the next derivation, admitted only through that chain (the `within` rule takes a file out of a build's output), and the compiler rebuilds itself from source inside the machine, byte for byte, on both engines: a fixed point |
 | registry v2 | revocations by (signer, statement CID), rejection lists and delayed names, read by proof; `claim admit --rpc` — [done](docs/registry2.md): 66 of 66 on a devnet |
+| `cmd/name.wac`, `contracts/DevENS.sol`, `tools/byname.sh` | a name to a decision: an ENS name resolved by proof to a CID, the tree fetched from a mirror (a directory, or HTTP as a trustless gateway) with every block re-hashed, and admitted under a policy. Mainnet half from recorded light-client data (vitalik.eth, from a trusted beacon root); devnet half on contracts with ENS's storage layout, read by the same `packages/ens` code, and anchored only by code hashes since a devnet has no beacon chain. 23 checks |
 
 ## The first round: what was built, and what it showed
 
@@ -161,6 +162,7 @@ sh packages/reckon/tools/agree.sh ../wac              # one tree hashed three wa
 (cd packages/wacuum && wac build --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum)
 TOOLCHAIN=kt1:… sh packages/reckon/tools/e2e.sh /tmp/e2e   # the whole run on a devnet; needs a clean commit
 sh packages/reckon/tools/registry2.sh /tmp/r2             # the registry v2 on a devnet: 66 checks
+sh packages/reckon/tools/byname.sh /tmp/bn                 # ENS name → proven CID → fetched tree → admission: 23 checks
 ```
 
 `mpt`, `ethrpc` and wacuum's secp256k1 come from `@/lib.wac`, and the devnet the end-to-end run uses is the wacuum beside

@@ -126,6 +126,27 @@ it passes on both engines, and so does `floats.wac`, whose output is the same bi
 `tools/machine.sh`: 75 of 75 with wasmtime, and wasmscan finds the same operators at the same offsets in all seven
 modules, every one valid after the rewrite. `test/canon_test.wac` covers the cases one at a time.
 
+## Minimum resources (machine /1)
+
+A run that exceeds what its runner allows aborts and yields no claim, which is safe but means two runners can disagree
+about whether there is an answer at all. So the machine names a floor, and every conforming runner provides at least
+this much. Programs that stay within it get an answer from every runner. Frame size depends on the code, so the floor
+is defined by two reference programs in `corpus/`, not in bytes:
+
+| resource | every runner of `/1` must complete | measured on this machine (V8 / wasmtime) |
+| --- | --- | --- |
+| stack | `depth.wac 10000`: 10,000 nested calls of a two-argument `i64` function | ~50,000–60,000 / ~10,000–12,000 |
+| heap | `heap.wac 1024`: 1 GiB live at once, in 1 MiB `u8[]` arrays | 1–2 GiB / at least 4 GiB |
+| time | none: a recipe states none, and a runner's time limit is its own | |
+
+The floor is the lower of the two engines in each row: wasmtime's default stack (about 10,000 of these frames) and
+V8's heap (between 1 and 2 GiB). `tools/machine.sh` checks it on both engines, and checks that a million frames
+aborts. A runner may provide more; a program that relies on more may get an answer from some runners and none from
+others, never a wrong one. Raising the floor (wasmtime's `max_wasm_stack`, V8's `--max-old-space-size`) would be a
+new machine version, because what a recipe can count on changes.
+
+The wac compiler building itself (below) stays well inside the floor on both engines.
+
 ## Builds as derivations (2026-11-10)
 
 The machine's first real program is wac's compiler: the `wac` command at the commit wac-eth pins, built to a plain
@@ -154,11 +175,18 @@ the compiler's lock resolves them; that is the next step toward building wac-eth
 
 ### With dependencies (2026-11-10)
 
-`tools/builddeps.sh` builds wac-eth's own `obj` command, which imports wac's library, the same way. The input tree is
+`tools/builddeps.sh` builds four of wac-eth's own commands, `obj`, `claim`, `derive` and `lc`, which import wac's
+library and wac-eth's packages, the same way, from one input tree (16 checks; the run is kept in
+`docs/builds-run.txt`). The input tree is
 wac-eth's source plus every dependency `wac.lock` pins, laid out as wac's package cache (`home/cache/git/<repo>/<commit>/`).
-V8 and wasmtime derive the same output, and the program is byte-identical to the same compiler run natively, although
-the cache sits at a different absolute path in the two. The cache location is not in the output. The derived `obj`
-works.
+For each command, V8 and wasmtime derive the same output, and the program is the same module the same compiler makes
+natively, although the cache sits at a different absolute path in the two (the cache location is not in the output).
+It differs only in the manifest's record of the entry path, which the build is given as `/in/…` (`tools/wasmdiff.py`
+compares the rest). Each derived program runs.
+
+The entry is given absolute because of a wac issue, now reported: given a relative entry inside the machine, the
+compiler refuses an `@/` import as "leaving its project", although the same tree builds natively. `obj` and `lc` use
+only relative imports, so they built either way; `claim` and `derive` use `@/lib.wac`.
 
 **One thing stands outside the machine.** The compiler finds its cache through `$WAC_HOME`, and the machine gives a
 program no environment. For now the runner hands the program its own (`derive --env-from-runner`), started under

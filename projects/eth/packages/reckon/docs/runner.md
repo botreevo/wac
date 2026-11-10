@@ -126,6 +126,32 @@ it passes on both engines, and so does `floats.wac`, whose output is the same bi
 `tools/machine.sh`: 75 of 75 with wasmtime, and wasmscan finds the same operators at the same offsets in all seven
 modules, every one valid after the rewrite. `test/canon_test.wac` covers the cases one at a time.
 
+## Builds as derivations (2026-11-10)
+
+The machine's first real program is wac's compiler: the `wac` command at the commit wac-eth pins, built to a plain
+module. It needs nothing the machine withholds. It reads its sources from `/in`, writes the program to `/out`, and its
+standard library is built in. `tools/selfbuild.sh` (`wac task reckon:selfbuild`) checks 10 things:
+
+- **A build is a derivation.** The recipe is the compiler, the arguments `build in/in/hello.wac -o /out/hello`, and the
+  source; the output tree holds `out/hello.wasm`. V8 and wasmtime derive the same CID, and the app is byte-identical
+  to what the same compiler produces run natively. Run natively on another path, the bytes differ only in the
+  manifest, which records the entry path as given and the output's name.
+- **Its product runs as the next derivation.** The app, taken out of the build's output, is the program of a second
+  recipe, and both engines agree on its run.
+- **Admission follows the chain.** The run's result is admitted only because its program is the file at
+  `out/hello.wasm` in a build output (the new `within` rule). That build is admitted because two runners on two
+  engines witnessed it, its compiler is a trust root, and its source is endorsed. Before the reviewer endorses the
+  source, it is refused.
+- **The compiler reproduces itself.** With `SELF=1`, the compiler (A, built natively) compiles its own 4,050-file
+  source inside the machine, in 1 m 46 s against 1 m 11 s natively. The result (B) is byte-identical to A run
+  natively on the same entry path, and wasmtime derives the same CID. B then compiles the same source again inside
+  the machine, and the result is B, byte for byte: a fixed point, witnessed on two engines.
+
+Still open: the compiler is the trust root here. Making it derived (B, from endorsed source by A) is one more rule in
+the policy, `compiler: [{ derived: { … program: "compiler" … } }]` with A as the root, and it is how a toolchain's
+history would be told. Programs that import packages beyond std need those packages in the input tree, laid out where
+the compiler's lock resolves them; that is the next step toward building wac-eth itself this way.
+
 ## Running it
 
 ```sh

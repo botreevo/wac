@@ -9,6 +9,8 @@
 //                                  runners, an allowed machine and format, and every input slot admitted in the role the
 //                                  rule gives that slot's name (or `otherSlots` for the rest)
 //     Analysis(analyser, …)        a derivation of `analyser` run on the object, witnessed enough, wrote `expect` at `path`
+//     Within(role, path)           the object is the file at `path` inside an output admitted in `role`: what a build
+//                                  produced (`out/app.wasm` in a compiler's output), taken out to be run
 //
 // and refused, whatever else holds, if a followed rejection list names it. A statement revoked by its own signer —
 // on the chain, or by a signed revocation in the index — counts for nothing.
@@ -35,6 +37,7 @@ export enum Rule {
   Endorsed(string[] by, i32 atLeast),
   Derived(string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots),
   Analysis(Cid analyser, string slot, string path, string expect, string[] by, i32 atLeast),
+  Within(string role, string path),
 }
 
 export struct RoleRules {
@@ -165,6 +168,7 @@ Decision alternative(Ctx c, Cid cid, string role, Rule rule) {
     }
     Derived(by, atLeast, runners, slots, otherSlots): { return derived(c, cid, by, atLeast, runners, slots, otherSlots); }
     Analysis(analyser, slot, path, expect, by, atLeast): { return analysis(c, cid, analyser, slot, path, expect, by, atLeast); }
+    Within(role2, path): { return within(c, cid, role2, path); }
   }
 }
 
@@ -294,4 +298,44 @@ u8[]? fileAt(Resolver r, Cid tree, string path) {
     if (!found) { return null; }
   }
   return readFile(r, at).ok();
+}
+
+/**
+ * Whether `cid` is the file at `path` in some derivation's output, and that output is admitted in `role`. The outputs
+ * tried are those the index has derivations for; an output that has the file but is not admitted does not count.
+ */
+Decision within(Ctx c, Cid cid, string role, string path) {
+  Cid[] seen = Cid[]();
+  string[] why = string[]();
+  for (i32 i = 0; i < c.ix.held.len(); i++) {
+    Cid? out = match (c.ix.held[i].statement) {
+      Derivation(_, o, _): o, Endorsement(_, _): null, Rejection(_, _): null, Revocation(_): null
+    };
+    if (out is null || contains(seen, out!)) { continue; }
+    seen = pushCid(seen, out!);
+    Cid? at = cidAt(c.r, out!, path);
+    if (at is null || !at!.eq(cid)) { continue; }
+    Decision d = admitIn(c, out!, role);
+    if (d.ok) { return Decision(true, plusAll(["  the file at \{path} in \{short(out!)}, which is admitted as \{role}:"], indent(d.why))); }
+    why = plusAll(plus(why, "  the file at \{path} in \{short(out!)}, which is not admitted as \{role}:"), indent(d.why));
+  }
+  if (seen.len() == 0 || why.len() == 0) { return Decision(false, plus(why, "  no derived output has it at \{path}")); }
+  return Decision(false, why);
+}
+
+/** The CID of the entry at a `/`-separated path in a tree. */
+Cid? cidAt(Resolver r, Cid tree, string path) {
+  Cid at = tree;
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 s = rest.indexOf("/");
+    string part = s < 0 ? rest : rest.slice(0, s);
+    rest = s < 0 ? "" : rest.slice(s + 1, rest.len());
+    Slot[]? ss = slotsOf(r, at).ok();
+    if (ss is null) { return null; }
+    bool found = false;
+    for (i32 i = 0; i < ss!.len(); i++) { if (ss![i].name == part) { at = ss![i].cid; found = true; } }
+    if (!found) { return null; }
+  }
+  return at;
 }

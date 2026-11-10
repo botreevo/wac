@@ -113,6 +113,13 @@ export type WaccApi = {
   diagnoseFilesIn: (paths: string[], sources: string[], res: WaccRes, entry: string) => string;
   /** The two `harness/wacBind.ts` had and this did not, which is what `issues/system/0231a` cost. */
   blockedFilesIn: (paths: string[], sources: string[], res: WaccRes, entry: string) => string;
+  /** The graph a program build of `entry` compiles: `main` adapted, then unreached declarations blanked — ch07, ch05. */
+  pruneProgramForBuild: (
+    paths: string[],
+    sources: string[],
+    res: WaccRes,
+    entry: string,
+  ) => { readonly paths: string[]; readonly sources: string[]; readonly res: WaccRes };
   emitFilesIn: (paths: string[], sources: string[], res: WaccRes, entry: string) => Uint8Array;
   buildFilesIn: (
     paths: string[],
@@ -144,9 +151,17 @@ export function waccRes(
   paths: string[],
   roots: Map<string, string>,
   base: string,
+  /** Package imports as the command mapped them — `wacFilesFromCommand`. */
+  maps: { from: string; spec: string; to: string }[] = [],
 ): WaccRes {
-  if (roots.size === 0) return api.Res.empty();
-  return api.Res.whole(paths.map((p) => roots.get(p) ?? ""), [], [], [], base);
+  if (roots.size === 0 && maps.length === 0) return api.Res.empty();
+  return api.Res.whole(
+    paths.map((p) => roots.get(p) ?? ""),
+    maps.map((m) => m.from),
+    maps.map((m) => m.spec),
+    maps.map((m) => m.to),
+    base,
+  );
 }
 
 let cached: WaccApi | null = null;
@@ -270,6 +285,8 @@ export async function waccArtifacts(
     /** See `compileArtifacts`. `wacFilesWithRoots` is what produces both of these. */
     roots?: Map<string, string>;
     base?: string;
+    /** Package imports as the command mapped them; see `waccRes`. */
+    maps?: { from: string; spec: string; to: string }[];
   } = {},
 ): Promise<WaccArtifacts> {
   const cacheKey = await compileKey(
@@ -279,6 +296,7 @@ export async function waccArtifacts(
     opts.optimize !== undefined,
     opts.roots,
     opts.base,
+    opts.maps,
   );
   if (cacheKey !== null) {
     const hit = await readCompiled(cacheKey);
@@ -297,6 +315,7 @@ async function compileKey(
   optimize: boolean,
   roots: Map<string, string> | undefined,
   base: string | undefined,
+  maps: { from: string; spec: string; to: string }[] = [],
 ): Promise<string | null> {
   // **The harness, because it drives the build**, and wacc's own sources, because wacc is what
   // compiles this — `coretext.wac` under there is the embedding of `std/platform.wac`, so a
@@ -322,6 +341,8 @@ async function compileKey(
     ...[...(roots ?? new Map<string, string>())]
       .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
       .map(([p, r]) => `root ${p} ${r}`),
+    // The mappings decide which file an import names, so two graphs with one set of files can differ in them.
+    ...maps.map((m) => `map ${m.from} ${m.spec} ${m.to}`),
     `base ${base ?? ""}`,
     ...harness,
     ...wacc,
@@ -405,12 +426,23 @@ async function compileArtifacts(
     roots?: Map<string, string>;
     /** The directory relative keys are measured from — `Deno.cwd()` for a caller that walked from it. */
     base?: string;
+    maps?: { from: string; spec: string; to: string }[];
   } = {},
 ): Promise<WaccArtifacts> {
   const api = await waccApi();
-  const paths = [...files.keys()];
-  const sources = paths.map((p) => files.get(p)!);
-  const res = waccRes(api, paths, opts.roots ?? new Map(), opts.base ?? "");
+  let paths = [...files.keys()];
+  let sources = paths.map((p) => files.get(p)!);
+  let res = waccRes(api, paths, opts.roots ?? new Map(), opts.base ?? "", opts.maps ?? []);
+  // **A graph the `wac` command walked is built as the command builds it** — the entry adapted and the graph
+  // pruned to what it reaches (`pruneProgramForBuild`), then checked and emitted (`packages/wac/src/wac.wac`). Without the prune a package's
+  // unreached declarations were checked and emitted too: a wac-eth entry importing `"wac"` met constants in
+  // files it never uses that the emitter declines, where `wac build` of the same entry succeeds.
+  if ((opts.maps ?? []).length > 0) {
+    const pruned = api.pruneProgramForBuild(paths, sources, res, entry);
+    paths = pruned.paths;
+    sources = pruned.sources;
+    res = pruned.res;
+  }
 
   // **The checker first.** This asked only what the *emitter* declined, so a program with type
   // errors was built and run as long as the emitter could guess its way through: an example here

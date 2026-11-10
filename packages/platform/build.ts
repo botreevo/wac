@@ -30,7 +30,8 @@
 // unless it is run with `--allow-read`.
 
 import { waccArtifacts } from "../../harness/waccBuild.ts";
-import { wacFilesWithRoots } from "../../harness/wacFiles.ts";
+import { type WacMap, wacFilesWithRoots } from "../../harness/wacFiles.ts";
+import { externalizeWasm } from "../wacc/tools/waccBindgen.ts";
 // Imported for its side effect as much as for `COV_DUMP_DIR`'s twin: under `WAC_PROFILE` it wraps
 // `Deno.test` so that what a *built* program executes is attributed to whichever test ran it. Every
 // subprocess-based test file reaches this module — that is how it builds the binary it runs — and none
@@ -237,6 +238,12 @@ const PAGE_CLI = `<!doctype html>
 </script>
 `;
 
+/** `PAGE_CLI` with its launcher a file beside it rather than inline — `--layout files`, for a CSP with no inline script. */
+const PAGE_FILES = PAGE_CLI
+  .replace("Arguments come from the query string: <code>?a=first&amp;a=second</code>.",
+           "Arguments come from <code>args.json</code> beside this page, or the query string: <code>?a=first&amp;a=second</code>.")
+  .replace("<script type=\"module\">\n%LAUNCHER%\n</script>", "<script type=\"module\" src=\"launcher.js\"></script>");
+
 /**
  * The cache key for a built application, or null when it cannot be computed.
  *
@@ -331,8 +338,20 @@ export async function buildApp(
   grants: Grants = {},
   target: Target = "deno",
   workerOnly = false,
-  opts: { coverage?: boolean; optimize?: boolean } = {},
+  opts: {
+    coverage?: boolean;
+    optimize?: boolean;
+    /**
+     * **`files`: a directory rather than one page** — `--target browser` only. `index.html` with no inline script,
+     * `launcher.js` (a module), `worker.js` and `app.wasm` beside it, each loaded by URL, which is what a Manifest V3
+     * extension's CSP allows and a single self-contained page is not: it refuses inline script and a `blob:`
+     * worker. Arguments come from an `args.json` beside the page when there is one. `out` names the directory.
+     */
+    layout?: "page" | "files";
+  } = {},
 ): Promise<void> {
+  const layout = opts.layout ?? "page";
+  if (layout === "files" && target !== "browser") throw new Error("--layout files is a --target browser layout");
   // Instrumented when this process is profiling, which is how every existing subprocess test becomes
   // attributable without being edited — `differential.test.ts` builds its shell through here. Callers
   // that assert on what an ordinary build looks like pass `coverage: false`.
@@ -349,27 +368,54 @@ export async function buildApp(
   const optimize = opts.optimize ?? false;
   // **With the roots** — see `buildNative`. Both compilers below need to be told which project each
   // file sits in, or a `@/` import resolves to a key nothing supplied. GitHub issue 22 finding 4.
-  const { files, roots } = await wacFilesWithRoots(entry);
-  const base = Deno.cwd();
+  const { files, roots, maps, base: walkedFrom } = await wacFilesWithRoots(entry);
+  const base = walkedFrom ?? Deno.cwd();
   // A page and a worker bundle are not runnable by themselves, so neither gets the execute bit.
   const executable = !workerOnly && target !== "browser";
 
-  const key = await appKey(entry, files, grants, target, workerOnly, coverage, optimize);
+  // **The mappings are part of what is built**: a project's lock decides which file `"wac"` names, so two graphs
+  // of the same texts can be two programs. Keyed as one more input, under a name no file can have.
+  const keyed = maps.length === 0 && layout === "page" ? files : new Map([
+    ...files,
+    ["\u0000maps", maps.map((m) => `${m.from}\t${m.spec}\t${m.to}`).join("\n")],
+    // And the layout, which is a different artefact from the same sources.
+    ["\u0000layout", layout],
+  ]);
+  const key = await appKey(entry, keyed, grants, target, workerOnly, coverage, optimize);
   if (key !== null) {
     const artifact = await cached("app", key, "", async (tmp) => {
       await Deno.writeTextFile(
         tmp,
-        await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize, key),
+        await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize, key, maps, layout),
       );
     });
-    await place(await Deno.readTextFile(artifact), out, executable);
+    const text = await Deno.readTextFile(artifact);
+    if (layout === "files") await placeFiles(text, out);
+    else await place(text, out, executable);
     return;
   }
-  await place(
-    await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize),
-    out,
-    executable,
-  );
+  const text = await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize, null, maps, layout);
+  if (layout === "files") await placeFiles(text, out);
+  else await place(text, out, executable);
+}
+
+/**
+ * A `--layout files` build's files, written into `dir`: the artefact is their names and contents as JSON, with the
+ * module in base64, so the cache holds it as one text like every other build.
+ */
+async function placeFiles(json: string, dir: string): Promise<void> {
+  const files = JSON.parse(json) as Record<string, string>;
+  await Deno.mkdir(dir, { recursive: true });
+  for (const [name, content] of Object.entries(files)) {
+    if (name.endsWith(".wasm")) {
+      const raw = atob(content);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      await Deno.writeFile(`${dir}/${name}`, bytes);
+    } else {
+      await Deno.writeTextFile(`${dir}/${name}`, content);
+    }
+  }
 }
 
 /**
@@ -505,7 +551,11 @@ async function produceApp(
   coverage: boolean,
   optimize = false,
   stageKey: string | null = null,
+  /** Package imports as the `wac` command mapped them — `wacFilesWithRoots`. */
+  maps: WacMap[] = [],
+  layout: "page" | "files" = "page",
 ): Promise<string> {
+  const split = layout === "files";
   // **Which compiler builds an application: wacc.** All 55 programs here emit through it; box's
   // `wc`, `grep`, `sha256sum` and `cp` produce output identical to the reference-built ones, with
   // `sha256sum` agreeing with GNU's; `packages/box/example/boxsh.wac` runs the website's own
@@ -532,6 +582,7 @@ async function produceApp(
       optimize: optimize ? optimized : undefined,
       roots,
       base,
+      maps,
     });
     ({ wasm, glue, covLines } = a);
   }
@@ -548,7 +599,8 @@ async function produceApp(
     // **Written through a rename**, because two runs that miss the same key stage into the same
     // directory at once. The bytes are identical by construction — the path is a hash of them — so
     // the only hazard is a reader seeing half a file, and a rename has no half.
-    await writeAtomic(modPath, glue);
+    // **Split, the glue reads its module from the page** (`externalizeWasm`): `app.wasm` is a file beside it.
+    await writeAtomic(modPath, split ? externalizeWasm(glue) : glue);
     const runtime = import.meta.resolve("./host/entry.ts");
 
     const bundle = async (name: string, source: string): Promise<string> => {
@@ -614,7 +666,19 @@ async function produceApp(
     // however it is started: `--worker` writes this string to a file, and the launcher holds the same
     // one for `spawnSelf`. Marking only the file would have left a program's own self-spawn as the one
     // case `spawnChild` could not recognise, which is the opposite of the point — see `children.ts`.
-    const workerSource = WORKER_MARKER + "\n" + (target === "browser"
+    const workerSource = WORKER_MARKER + "\n" + (split
+      // The module is fetched first and left where the glue reads it, so the glue need not `await` at its top.
+      ? await bundle(
+        "worker",
+        `import { runAsWorkerBrowser } from "${browserRuntime}";\n` +
+          `runAsWorkerBrowser(async () => {\n` +
+          `  const res = await fetch(new URL("app.wasm", import.meta.url));\n` +
+          `  if (!res.ok) throw new Error("app.wasm: " + res.status);\n` +
+          `  (globalThis as unknown as { __wacWasm: Uint8Array }).__wacWasm = new Uint8Array(await res.arrayBuffer());\n` +
+          `  return await import("${modPath}") as unknown as Parameters<Parameters<typeof runAsWorkerBrowser>[0]>[0];\n` +
+          `});\n`,
+      )
+      : target === "browser"
       ? await bundle(
         "worker",
         `import { runAsWorkerBrowser } from "${browserRuntime}";\n` +
@@ -682,7 +746,7 @@ async function produceApp(
     const launcher = target === "browser"
       ? await bundle(
         "launcher",
-        `import { argsFromLocation, runInPage } from "${browserRuntime}";\n` +
+        `import { argsFromLocation, argsFromPage, runInPage } from "${browserRuntime}";\n` +
           `const out = document.getElementById("out");\n` +
           `const line = (t, cls) => {\n` +
           `  const s = document.createElement("span");\n` +
@@ -702,12 +766,17 @@ async function produceApp(
             ? `  const root = await navigator.storage.getDirectory();\n`
             : `  const root = undefined;\n`) +
           `  const code = await runInPage({\n` +
-          `    workerSource: ${JSON.stringify(workerSource)},\n` +
-          `    args: argsFromLocation(location.search),\n` +
+          (split
+            ? `    workerUrl: new URL("worker.js", import.meta.url),\n` +
+              `    args: await argsFromPage(location.search, import.meta.url),\n`
+            : `    workerSource: ${JSON.stringify(workerSource)},\n` +
+              `    args: argsFromLocation(location.search),\n`) +
           `    warn: (l) => line(l, "warn"),\n` +
           `    write: raw,\n` +
           `    root,\n` +
           `    writable: ${grants.write === true},\n` +
+          // **`--allow-net` is `wac.http`** in a page, which has no sockets: the capability is network access.
+          `    http: ${grants.net === true},\n` +
           `  });\n` +
           `  line("[exit " + code + "]", "meta");\n` +
           `} catch (e) {\n` +
@@ -753,6 +822,16 @@ async function produceApp(
       // A program with a `Sys`, run in a page that shows its output. An interactive page is
       // `web`'s `main(Page)`, built by `tools/wac/buildpage.wac`.
       const title = entry.split("/").pop() ?? "wac";
+      if (split) {
+        let b64 = "";
+        for (let i = 0; i < wasm.length; i += 0x8000) b64 += String.fromCharCode(...wasm.subarray(i, i + 0x8000));
+        return JSON.stringify({
+          "index.html": PAGE_FILES.replaceAll("%TITLE%", title),
+          "launcher.js": launcher,
+          "worker.js": workerSource,
+          "app.wasm": btoa(b64),
+        });
+      }
       return PAGE_CLI.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher);
     }
     return shebangFor(grants, target, coverage) + launcher;
@@ -779,7 +858,9 @@ if (import.meta.main) {
     console.error(
       "usage: wac task app:build <entry.wac> [-o output] " +
         "[--allow-read] [--allow-write] [--allow-env] [--allow-net] [--allow-run]\n" +
-      "                        [--target deno|node|browser] [--worker] [--optimize]\n\n" +
+      "                        [--target deno|node|browser] [--layout page|files] [--worker] [--optimize]\n\n" +
+        "--layout files (browser): a directory of index.html, launcher.js, worker.js and app.wasm, for a\n" +
+        "page under a CSP with no inline script or blob: worker — a Manifest V3 extension.\n\n" +
         "--optimize runs wasm-opt over the module: 36-41% smaller, a second or so per megabyte,\n" +
         "and the artifact stops being exactly what the compiler emitted — see wac-mono 0094.\n\n" +
         "The grants are baked in: the built program takes no permission flags of its own,\n" +
@@ -807,8 +888,14 @@ if (import.meta.main) {
   }
   const dest = out ?? entry.replace(/.*\//, "").replace(/\.wac$/, "");
   const optimize = argv.includes("--optimize");
-  await buildApp(entry, dest, grants, target, workerOnly, { optimize });
-  const size = (await Deno.stat(dest)).size;
+  const li = argv.indexOf("--layout");
+  const layout = (li >= 0 ? argv[li + 1] : "page") as "page" | "files";
+  if (layout !== "page" && layout !== "files") {
+    console.error(`unknown layout '${layout}' — page or files`);
+    Deno.exit(2);
+  }
+  await buildApp(entry, dest, grants, target, workerOnly, { optimize, layout });
+  const size = layout === "files" ? (await Deno.stat(`${dest}/app.wasm`)).size : (await Deno.stat(dest)).size;
   const granted = Object.entries(grants).filter(([, v]) => v).map(([k]) => k);
   console.log(
     `${dest}  ${(size / 1024).toFixed(0)}K  ${target}  ` +

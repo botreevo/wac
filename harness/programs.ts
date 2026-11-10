@@ -27,7 +27,7 @@ export type Program = {
 };
 
 /** The repo root, from this file's location, so a caller's working directory does not matter. */
-export const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+export const ROOT = decodeURIComponent(new URL("..", import.meta.url).pathname).replace(/\/$/, "");
 
 async function* walk(dir: string): AsyncGenerator<string> {
   for await (const e of Deno.readDir(dir)) {

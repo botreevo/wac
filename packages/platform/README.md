@@ -513,6 +513,23 @@ WebSocket, so `connect` is absent rather than approximated — an application ge
 it can report instead of one protocol that works by accident. `box get`, `box gets` and
 `box serve` do not run here, and no amount of shimming would change that.
 
+**HTTP is a capability the page provides by name instead: `wac.http ^1`** (`host/hosthttp.ts`). Built with
+`--allow-net`, a page answers `capability(host, "wac.http", "^1")` with three requests — open, read, close — that it
+serves with its own `fetch`, and `packages/http`'s client and `packages/fetch` ask for it before they reach for a
+socket (`packages/http/src/hosthttp.wac`), so a program that does HTTP runs in a page unchanged. Every other host
+answers that it provides no such thing, and the same program speaks HTTP over its sockets there. What a page gets is
+what the browser exposes: redirects followed, only the headers a page may read, the request headers it may not set
+dropped, and a request the browser will not complete — CORS included, which a page is not told apart — refused as
+`network error or CORS refusal`. `example/hostget.wac` and `test/hostget_live.test.ts` run it in Chromium.
+
+**`--layout files` is the same page as a directory, for a Manifest V3 extension**: `index.html` with no inline
+script, `launcher.js` (a module), `worker.js` and `app.wasm` beside it, each loaded by URL — the single page inlines
+its launcher and starts its worker from a `blob:`, and an extension's CSP refuses both. Arguments come from an
+`args.json` beside the page when there is one, since an extension's own page has no query string worth the name. The
+extension's manifest still has to give the page `cross_origin_embedder_policy` and `cross_origin_opener_policy` (for
+`SharedArrayBuffer`) and `'wasm-unsafe-eval'`. `test/csp_live.test.ts` runs it under that policy in Chromium, with the
+single page refused under the same policy as the control.
+
 ### Interactive pages
 
 **A page is built with [`web`](https://github.com/voltrevo/wac-web.git)**: `export async i32 main(Page page)`, run in a
@@ -625,10 +642,9 @@ have a seam rather than a mode, but the seam is in rather than retrofitted.
   defines it and drives it from its own host, and folding that into the launcher is the next
   step. Note what 0076 established about it: repeated calls did not need this, so the case
   for it is state that outlives a call rather than the cost of starting one.
-- **A page has no network at all.** No TCP, which is structural — `fetch` is not a socket, so
-  `connect` is refused rather than approximated — but no `fetch` capability either, which is
-  merely unwritten. It would be request/response rather than a stream, so it revives none of
-  `http`, `tls`, `tor` or `ssh` in a page; the browser does that layer itself.
+- **A page has no TCP.** That is structural — `fetch` is not a socket, so `connect` is refused rather
+  than approximated. HTTP is `wac.http` instead (above), request and response rather than a stream, so it
+  revives `http`'s client and `fetch` and none of `tls`, `tor` or `ssh`; the browser does that layer itself.
 - **An element's event carries no pointer button.** Its modifiers are there, so Shift and `^C` can be
   read, but a left-drag and a right-click look alike. The first thing anyone drawing on a canvas with
   `pixels` will want next.

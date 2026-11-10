@@ -580,6 +580,26 @@ function classFor(t: BindType): string[] {
 }
 
 /**
+ * **The same glue reading its module from the page instead of from itself** — for a `--target browser --layout files`
+ * build (`packages/platform/build.ts`), whose `app.wasm` is a file beside the page: an extension's CSP refuses
+ * inline script, and a megabyte of base64 inside the worker is a megabyte parsed as JavaScript before it is decoded.
+ * The worker fetches the file before it imports this module and leaves the bytes at `globalThis.__wacWasm`, so the
+ * glue stays synchronous — no top-level `await` for a bundler to mishandle. Kept here, beside `generate`, because it
+ * edits what `generate` writes: a change to how the bytes are spelled there has to change this too, and throws here
+ * when it did not.
+ */
+export function externalizeWasm(glue: string): string {
+  const from = glue.indexOf('const WASM = "');
+  const to = glue.indexOf("const $mod = new WebAssembly.Module(bytes");
+  if (from < 0 || to < from) {
+    throw new Error("externalizeWasm: the glue no longer spells its module as `const WASM` then `$mod` — update this beside generate");
+  }
+  return glue.slice(0, from) +
+    "const bytes = (globalThis as unknown as { __wacWasm: Uint8Array }).__wacWasm;\n" +
+    glue.slice(to);
+}
+
+/**
  * The generated module: one exported function per wac export, plus the conversions they need.
  *
  * `bytes` is the wasm as a base64 string so the result is a single self-contained file — the same

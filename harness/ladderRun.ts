@@ -38,7 +38,7 @@ import { boot, files as ladderFiles } from "../bootstrap/hosts/deno.js";
 import { assemble } from "../bootstrap/js/assemble.js";
 import { wacc as driveWacc } from "../bootstrap/js/wacc.js";
 
-Deno.chdir(new URL("..", import.meta.url).pathname);
+Deno.chdir(decodeURIComponent(new URL("..", import.meta.url).pathname));
 
 const WACC = "packages/wacc/src/api.wac";
 

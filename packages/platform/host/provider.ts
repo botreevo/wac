@@ -33,6 +33,7 @@ import {
   unstr,
 } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_RUN, GRANT_WRITE, OP } from "./ops.ts";
+import { type HostCapability, HOST_HTTP, capRequest, notProvided, readCapAnswer, versionMatches } from "./hosthttp.ts";
 import { asAppModule, drive, manifestIn } from "./driver.ts";
 import type { Driven } from "./driver.ts";
 import {
@@ -230,6 +231,11 @@ const readOf = (out: Uint8Array): Flat => {
 
 /** The launcher's reply to `op`, flattened as design 0013's answer table says. */
 function answerOf(op: number, out: Uint8Array): Flat {
+  // A provided capability's answer carries every field itself (`hosthttp.ts`'s `capAnswer`).
+  if (op >= HOST_HTTP.base && op < HOST_HTTP.base + HOST_HTTP.count) {
+    const x = readCapAnswer(out);
+    return flat({ n: x.n, m: x.m, flags: x.flags, text: x.text, bytes: x.bytes });
+  }
   switch (op) {
     case OP.NOW_MILLIS: case OP.MONOTONIC_NANOS: case OP.SLEEP_MILLIS:
       return flat({ n: readI64le(out) });
@@ -425,7 +431,16 @@ function validate(module: Uint8Array): Flat {
  * `grants` narrows a *loaded* module (`issues/system/0242c`); a program's own grants are the
  * launcher's, which refuses what the build did not ask for.
  */
-export function hostFor(b: Bridge, app: Record<string, unknown>, grants?: number): unknown {
+export function hostFor(
+  b: Bridge,
+  app: Record<string, unknown>,
+  grants?: number,
+  /**
+   * Capabilities this host provides by name — `wac.http` in a page (`hosthttp.ts`), nothing elsewhere. A lookup
+   * answers the range; a request in it goes to the launcher as it was asked, for the launcher's handler.
+   */
+  provides: HostCapability[] = [],
+): unknown {
   const make = app.__wacHost;
   const answered = app.__wacAnswered;
   if (typeof make !== "function" || typeof answered !== "function") return undefined;
@@ -501,9 +516,18 @@ export function hostFor(b: Bridge, app: Record<string, unknown>, grants?: number
       case OP.CALL: return deliver(id, call(a, text, bb));
       case OP.UNLOAD: loadedModules.delete(a); return deliver(id, flat({}));
       case OP.VALIDATE: return deliver(id, validate(bytes));
-      case OP.CAPABILITY: return deliver(id, flat({ fault: FAULT_UNSUPPORTED, text: `no capability ${text} on this host` }));
+      case OP.CAPABILITY: {
+        const cap = provides.find((c) => c.name === text);
+        const versions = new TextDecoder().decode(bytes);
+        if (cap === undefined) return deliver(id, flat(notProvided(text)));
+        if (!versionMatches(cap, versions)) {
+          return deliver(id, flat({ fault: FAULT_UNSUPPORTED, text: `${text} ${cap.version} does not satisfy ${versions}` }));
+        }
+        return deliver(id, flat({ n: BigInt(cap.base), m: BigInt(cap.count), text: cap.version }));
+      }
     }
-    const payload = payloadOf(op, a, bb, text, bytes);
+    const provided = provides.some((c) => op >= c.base && op < c.base + c.count);
+    const payload = provided ? capRequest(a64, b64, text, bytes) : payloadOf(op, a, bb, text, bytes);
     if (payload === null) {
       return deliver(id, flat({ fault: FAULT_UNSUPPORTED, text: `this host serves no request ${op}` }));
     }
@@ -556,8 +580,8 @@ export function hostFor(b: Bridge, app: Record<string, unknown>, grants?: number
 }
 
 /** `main`'s arguments: the host value when it takes one, nothing when it declared nothing. */
-export function mainArgs(b: Bridge, app: Record<string, unknown>): unknown[] {
-  const h = hostFor(b, app);
+export function mainArgs(b: Bridge, app: Record<string, unknown>, provides: HostCapability[] = []): unknown[] {
+  const h = hostFor(b, app, undefined, provides);
   return h === undefined ? [] : [h];
 }
 

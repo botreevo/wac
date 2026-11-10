@@ -173,10 +173,10 @@ export async function buildNative(entry: string, out: string, grants: Grants = {
   // GitHub issue 22 finding 4 read that as two loaders diverging. It is one loader, asked the smaller
   // of its two questions by every caller that does not want the roots — which was everything except
   // the two reference runners, and both of those are deleted.
-  const { files, roots } = await wacFilesWithRoots(entry);
+  const { files, roots, maps, base: walkedFrom } = await wacFilesWithRoots(entry);
   // The directory relative keys are measured from. The walk resolved `@/` against `Deno.cwd()`, so a
   // compiler handed a different base would file the same file under a second key.
-  const base = Deno.cwd();
+  const base = walkedFrom ?? Deno.cwd();
   // **wacc, and only wacc, since 2026-08-28.** `WAC_APP_FROM=reference` built this with the
   // TypeScript compiler instead — the switch `build.ts` had, for the same reason and with the same
   // default. That compiler is deleted; `bootstrap/` builds wacc from source through the ladder, so
@@ -185,7 +185,7 @@ export async function buildNative(entry: string, out: string, grants: Grants = {
   // A hundred lines went with it: a second manifest writer, assembled from the reference's own
   // export list rather than from wacc's description of what it emitted. `issues/lang/0105` is why
   // it mattered that this was the last bundler on the reference.
-  return await buildNativeWithWacc(entry, out, grants, files, roots, base);
+  return await buildNativeWithWacc(entry, out, grants, files, roots, base, maps);
 }
 
 /**
@@ -209,7 +209,8 @@ export async function buildNative(entry: string, out: string, grants: Grants = {
 /** What `waccApi` builds, and therefore part of the wire cache's key. */
 // **Absolute, from this file's own location.** It is the *compiler's* source, not the caller's, so a
 // bare relative path only worked with the wac checkout as the working directory — GitHub issue 21.
-const WACC_API = new URL("../wacc/src/api.wac", import.meta.url).pathname;
+// Decoded: a checkout under a path with `%` in it — the package cache is one, `https%3A%2F%2F…` — spells it `%25`.
+const WACC_API = decodeURIComponent(new URL("../wacc/src/api.wac", import.meta.url).pathname);
 
 async function buildNativeWithWacc(
   entry: string,
@@ -218,12 +219,13 @@ async function buildNativeWithWacc(
   files: Map<string, string>,
   roots: Map<string, string>,
   base: string,
+  maps: { from: string; spec: string; to: string }[] = [],
 ): Promise<Manifest> {
   const { waccApi, waccArtifacts, waccRes } = await import("../../harness/waccBuild.ts");
   const { parseAliases, parseBindTypes, parseCallbacks, parseSigs } = await import(
     "../wacc/tools/waccBindgen.ts"
   );
-  const art = await waccArtifacts(files, entry, { roots, base });
+  const art = await waccArtifacts(files, entry, { roots, base, maps });
   const api = await waccApi();
   const paths = [...files.keys()];
   const sources = paths.map((p) => files.get(p)!);

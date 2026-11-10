@@ -97,9 +97,19 @@ what the user installed, and its build can itself be a derivation, so it can be 
    The whole admission takes about two seconds in the page.
 2. **The extension shell.** MV3 manifest, a UI page, the worker running milestone 1's module from packaged files
    (W2), and settings. It admits a name and shows the account. No app is served yet.
-3. **Serving the admitted app,** through the sandbox loader (R5). Test it with the capstone's app, a static site
-   (vitalik.eth's, from the gateway), and a hostile app that tries every way out (the spike's `main.js` is the
-   start of one).
+3. **Serving the admitted app. Done (2026-11-10, wac 64e87365, with W2b's `--layout files`).** The extension's
+   admission is `cmd/web.wac`, built into `admit/` (`extension/build.sh`) and run in a hidden frame of the
+   extension's own origin. So its program runs in a worker that may block, its files are the extension's OPFS, and
+   its HTTP is the browser's fetch. It keeps the blocks in `store/` and the light client's state in `lc.state`
+   (resumed after the first run), and writes an admitted tree to `trees/<cid>/` (`web --out-root`), which the page
+   then shows through the sandbox loader. Opening a subject first takes down what was shown, so a refusal never
+   leaves the last app beside it. `extension/test/admit.sh` passes 11 of 11:
+   - with the light client from the checkpoint on recorded mainnet data, it admits a reviewed app from a mirror,
+     writes it into OPFS from checked blocks, and shows it (origin `null`, its style and its `fetch` from its tree);
+   - it refuses an unreviewed tree, saying why, and shows nothing;
+   - that second admission resumed the kept state, with no bootstrap;
+   - it admits `ens:vitalik.eth` by proof, says its content is on no mirror here, and shows nothing.
+   Still to do: a static site from the gateway, when it answers, and a hostile app that tries every way out.
 4. **State and freshness.** Light-client state persisted (R4), revocations proved on chain each time an app is
    opened, and a visible "as of block N" on the page.
 5. **Hardening.** Size and start-up time, the extension built as a derivation, and an admission of the extension by
@@ -117,6 +127,9 @@ what the user installed, and its build can itself be a derivation, so it can be 
 - **Size.** `claim.wasm` is about 540 KB today. With the light client and BLS it is still fine for an extension;
   start-up is measured in milestone 1.
 - **CPU.** The light client's BLS checks run in V8 as they do on the Node host. Milestone 1 will time them.
+- **A mirror that does not answer delays admission.** Each mirror is asked for its claim index, and a public gateway
+  that is down (as trustless-gateway.link was on 2026-11-10) holds an admission for about 90 s before it is left
+  out. Timeouts per mirror, or asking mirrors in parallel, would fix it.
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
 

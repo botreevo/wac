@@ -369,6 +369,11 @@ the default 76 instead of being refused, and six sibling applets that read the s
 `hasNum ? num : default` all refuse it. `issues/system/0292b`. What moved the other five between the
 two runs is not established.
 
+**Re-measured on 2026-11-10 it is 0 ignored against 1 refused** (`grep -f`), over the same 375 flags and 43
+applets: `base64` and `base32` refuse a width that will not parse, as their siblings do (`issues/system/0292b`,
+closed). The refused count fell from 4 to 1 between the two runs, and what moved it is not established here — the
+same caution as above: the number is the sweep's, read on the day, and the line records it rather than a direction.
+
 The distinction is the whole point. Calling `-k` invalid says the *command* is wrong when only this
 program is unfinished, and it sends a caller to re-read a manual that was right. Both tables are measured
 rather than remembered — `test/flags.test.ts` reads the installed tools' `--help` and the applets' own

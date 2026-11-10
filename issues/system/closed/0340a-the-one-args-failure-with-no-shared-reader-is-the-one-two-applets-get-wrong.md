@@ -1,6 +1,7 @@
 # 0340a — the one `Args` failure with no shared reader is the one two applets get wrong
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — with `0292b`; `applets_test.wac`
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-09-05
 - **Kind:** bug
@@ -143,3 +144,11 @@ remembered what it checks.
 `badNum`/`missingValue`/`longOpt` stop being fields, and `hasNum`/`num`/`numSign` become one
 `Count?`. That is a redesign of a file 63 applets import, so it is a decision rather than work, which
 is why it is in `vision/` and this is an issue.
+
+## Why
+
+Of the eight applets whose flag takes a value, two never read `a.badNum` — `base64` and `base32` — so a value the parser refused fell back to the default silently.
+
+## Fix
+
+Both applets ask `a.badNum` after `refuseFlags`, as their six siblings do, and `badNumberMessage` has GNU's sentence for them: `base64 -w x` is *"base64: invalid wrap size: 'x'"*, exit 1, and so is `base32`. `-w 4` still wraps. `packages/box/test/wac/applets_test.wac`'s `test_an_unparseable_wrap_width_is_refused` holds the status and the exact message for both, with `x` and `f.txt` (the sweep's spelling), and the valid width beside them. See `0292b`.

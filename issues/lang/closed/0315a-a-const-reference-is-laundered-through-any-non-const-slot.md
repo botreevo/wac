@@ -1,7 +1,7 @@
 # 0315a — a const reference is laundered through any non-const slot, and the write lands
 
-- **Status:** open — narrowed 2026-11-10 (cloud) to the type-argument row; the other four are refused
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — the last row, a written type argument; `spec/cases/0915`
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-09-01
 - **Kind:** bug
@@ -164,3 +164,11 @@ spelled `const Inner`, found none and returned in silence. It strips the qualifi
 function to `checkGenericInference` and checks no argument types, and the explicit type arguments that make the slot
 a plain `Inner` are not in reach there. Inferred, `hop(this.inner)` binds `T` to `const Inner`, which is right — so the
 rule is only about a written type argument that drops the qualifier.
+
+## Why
+
+A const-tainted reference could flow into a non-const slot. Four of the five slots were closed before (the argument, the array element, the struct field) and on 2026-11-10 (`o.get().mutate()` through a `const T` result); the fifth was `hop<Inner>(this.inner)` for `void hop<T>(T x)`, because `checkCall` hands a generic function to `checkGenericInference`, which checked no argument against a slot its written type arguments decide.
+
+## Fix
+
+`checkGenericInference` reads the written type arguments' types, and an argument filling a parameter declared as a bare letter whose written type is a writable, non-`const` type is refused when the argument is const: *"a const Inner passed to parameter 1 of `hop`, which `hop<Inner>` makes a plain Inner"*, with *write `hop<const Inner>`, or leave the type argument to be inferred* as the help. Inferred, `hop(this.inner)` binds `T` to `const Inner` and stands, as does `hop<const Inner>(…)`, and a plain receiver passing to `hop<Inner>` is unaffected. `spec/cases/0915` holds the refusal; `cases_test`, `corpuscheck_test` and `matrixfuzz_test` raised nothing new.

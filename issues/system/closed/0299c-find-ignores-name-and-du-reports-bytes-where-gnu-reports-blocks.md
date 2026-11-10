@@ -1,7 +1,7 @@
 # 0299 — `find` accepts `-name` and ignores it
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `find` reads its expression; `applets_test.wac`
+- **Claimed by:** wac2
 - **Reported by:** agent-c
 - **Date:** 2026-08-31
 - **Kind:** bug
@@ -63,3 +63,11 @@ points here.
 `find .` and `du m1.txt` cannot be plain vector cases either, but for a different and duller reason:
 the vectors compare against the tool named in the script, and these two need `find . | sort` and
 `du -sb` to be the thing asked. That is a case-list question, not a defect.
+
+## Why
+
+`find` read no expression at all: `-name` takes a value, so the shared parser left it among the operands, `refuseFlags` does not cover `find`, and `find . -name m1.txt` printed the whole walk — a filter matching nothing and one matching everything were one command.
+
+## Fix
+
+`packages/box/src/applets/find.wac` reads the expression after its roots: `-name PATTERN`, a shell glob (`*`, `?`, `[…]`, `[!…]`) against the last component, and `-type f` or `-type d`, every one of them required, the root included. Any other predicate is refused as GNU refuses it — *"find: unknown predicate `-newer'"* — and `-name` with nothing after it is *"find: missing argument to `-name'"*. `test_find_reads_its_expression` holds a plain name, a set, a star through a subdirectory, `-type d`, both together, a root other than `.`, the bare walk unchanged, and both refusals. The other two findings in this issue were corrected as not defects when it was filed.

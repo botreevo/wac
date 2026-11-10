@@ -1,7 +1,7 @@
 # 0292b — `base64` and `base32` accept an unparseable `-w` and quietly use the default width
 
-- **Status:** open
-- **Claimed by:** unclaimed
+- **Status:** closed 2026-11-10 (cloud) — `base64.wac`, `base32.wac` and `args.wac`'s `badNumberMessage`; `applets_test.wac`
+- **Claimed by:** wac2
 - **Reported by:** agent-b
 - **Date:** 2026-08-30
 - **Kind:** bug — an invalid argument accepted, which is the worst of the three answers this repo ranks
@@ -94,3 +94,11 @@ check belongs in each applet or in `args.wac`, given that six of them chose the 
 
 The wider question is the second bullet above: a differential harness whose file and stream carry the
 same bytes cannot see an applet reading the wrong one. That is `packages/sh`'s corpus fixture too.
+
+## Why
+
+`width = a.hasNum ? a.num : 76` cannot tell an unparseable width from no width, and the parser had recorded the bad value in `a.badNum` for an applet that never read it.
+
+## Fix
+
+Both applets ask `a.badNum` after `refuseFlags`, as their six siblings do, and `badNumberMessage` has GNU's sentence for them: `base64 -w x` is *"base64: invalid wrap size: 'x'"*, exit 1, and so is `base32`. `-w 4` still wraps. `packages/box/test/wac/applets_test.wac`'s `test_an_unparseable_wrap_width_is_refused` holds the status and the exact message for both, with `x` and `f.txt` (the sweep's spelling), and the valid width beside them. Fixed together with `0340a`, which is the same defect found from the other side.

@@ -1016,9 +1016,26 @@ fn run_as_with(m: &Manifest, wasm: &[u8], manifest_text: &str, as_child: AsChild
     let context = v8::Context::new(handle_scope, Default::default());
     let scope = &mut v8::ContextScope::new(handle_scope, context);
 
-    let module = match v8::WasmModuleObject::compile(scope, wasm) {
-        Some(mo) => mo,
-        None => {
+    // **Inside a `TryCatch`, for the engine's own reason** — *"Compiling function #1696 failed: call[31] expected type
+    // …"* is the whole diagnosis, and the message below printed none of it. It is read before the scope is reset.
+    // Handed out of the `TryCatch` as a `Global`, because a `Local` made inside it borrows it for as long as it lives.
+    let compiled: Result<v8::Global<v8::WasmModuleObject>, String> = {
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let mut tc = tc.init();
+        let got = match v8::WasmModuleObject::compile(&mut tc, wasm) {
+            Some(mo) => Ok(v8::Global::new(&mut tc, mo)),
+            None => Err(tc
+                .exception()
+                .and_then(|e| e.to_string(&mut tc))
+                .map(|s| s.to_rust_string_lossy(&mut tc))
+                .unwrap_or_default()),
+        };
+        tc.reset();
+        got
+    };
+    let module = match compiled {
+        Ok(g) => v8::Local::new(scope, &g),
+        Err(why) => {
             // **The engine rejected the module we emitted, which is our fault and not the
             // program's.** This said "did not compile", which reads as a diagnostic about the source
             // — and the source has already been checked by then, so the reader goes looking for a
@@ -1026,11 +1043,25 @@ fn run_as_with(m: &Manifest, wasm: &[u8], manifest_text: &str, as_child: AsChild
             // "`build` skips a check `run` does", because `run` printed this and `build` printed a
             // byte count for the same module. Neither was checking anything; the checker had a hole,
             // and this message pointed away from it.
-            eprintln!(
-                "wac: the module compiled from {} was rejected by the engine — this is a compiler \
-                 bug rather than a fault in the program. `wac build … -o out` keeps the module.",
-                m.entry
-            );
+            //
+            // **And when the module is this binary's own seed, it says so** (`issues/system/0365a`). A bootstrap
+            // round whose seed is invalid reached here before any build began, and was told the program it was
+            // asked to build had failed and that `-o out` would keep it — a flag that cannot help, since nothing
+            // was compiled. That advice was false for a program too (`issues/lang/0394a`), so it is gone.
+            let seed = SEED.is_some_and(|s| std::ptr::eq(s.as_ptr(), wasm.as_ptr()) && s.len() == wasm.len());
+            if seed {
+                eprintln!(
+                    "wac: this binary's own compiler — the seed it was built with, native/v8/seed/wacc.wasm — was \
+                     rejected by the engine, before anything was compiled: {why}\n\
+                     wac: the seed is out of step with the sources it was built from; ./bootstrap.sh rebuilds it from the ladder."
+                );
+            } else {
+                eprintln!(
+                    "wac: the module compiled from {} was rejected by the engine — this is a compiler \
+                     bug rather than a fault in the program: {why}",
+                    m.entry
+                );
+            }
             return 1;
         }
     };
@@ -1400,15 +1431,25 @@ fn call_named(
 ) -> i32 {
     let callable: Vec<&ExportSig> =
         m.exports.iter().filter(|e| !e.name.starts_with("$bind$")).collect();
+    // **What to type, not a signature** (`issues/system/0366a`): this listed `f(i32)`, and `f(i32)` — or `f()` — was
+    // then refused as no such export, by a message that listed it again. The name is what the command takes, and the
+    // parameters follow it as arguments, so that is how each is shown.
     let listing = || {
         let mut names: Vec<String> = callable
             .iter()
-            .map(|e| format!("{}({})", e.name, e.params.join(", ")))
+            .map(|e| {
+                if e.params.is_empty() { e.name.clone() } else { format!("{} <{}>", e.name, e.params.join("> <")) }
+            })
             .collect();
         names.sort();
         names.join("\n  ")
     };
-    let Some(name) = args.first() else {
+    // And a name written as a call is that name: `f()` is `f`, which is what someone copying a signature types.
+    let named: Option<String> = args.first().map(|a| match a.find('(') {
+        Some(at) if a.ends_with(')') => a[..at].to_string(),
+        _ => a.clone(),
+    });
+    let Some(name) = named.as_ref() else {
         eprintln!("wac: {} exports no main, so name the function to run:", m.entry);
         eprintln!("  {}", listing());
         return 2;

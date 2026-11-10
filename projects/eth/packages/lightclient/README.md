@@ -33,7 +33,7 @@ wac-mono **0064**, now closed.
 | post-Altair headers: Capella–Fulu execution branches, Gloas's block-hash header | **done** — `src/header.wac`, below |
 | mainnet fork schedule and versions | **done** — `ssz/src/forks.wac` (Gloas unscheduled upstream) |
 | a fork-aware store (layout, gindices and fork version by fork) | **done** — `light_client_sync` for Capella, Deneb, Electra and Fulu: 40 steps |
-| a store crossing a fork (`upgrade_lc_store_to_*`, the `*_store_with_legacy_data` vectors) | **not started** |
+| a store crossing forks: a fork schedule, `upgrade_lc_*_to_*`, checks by each header's own epoch | **done** — 15 transition and legacy-data cases, Bellatrix to Electra |
 | a live beacon API | **not started** — 0066 |
 
 ## What the vectors cannot check, and what stands in for it
@@ -152,7 +152,14 @@ follow the chain across the fork.
   bytes", because the default header serializes with two non-zero SSZ offsets in it. Testing for zeros refused every
   update without finality. `isEmptyHeader` is the real test.
 
-**Still to do, in order:** a store that crosses forks (`upgrade_lc_store_to_*`, and the `*_store_with_legacy_data`
-vectors); wiring a header's block hash into `ethrpc.headerOf(block, hash)`, which already re-encodes an execution header
+- **Across forks** (`src/schedule.wac`, `src/upgrade.wac`): a store holds a fork schedule. It reads what a peer's
+  bytes are only from their fork digest, upgrades older updates as they arrive, and is itself upgraded at a fork.
+  Header validity, branch gindices and the signing version go by each header's or signature's own epoch: a
+  Capella-era header in a Deneb store hashes as Capella's 15-field payload header, and a Bellatrix-era signature
+  verifies under Bellatrix's version with Altair's types. All 15 of Ethereum's transition and legacy-data cases agree
+  at every step (Bellatrix→Capella, Capella→Deneb, Deneb→Electra, two- and three-fork spans, and stores fed older
+  data). Removing the Electra branch normalization fails them.
+
+**Still to do, in order:** wiring a header's block hash into `ethrpc.headerOf(block, hash)`, which already re-encodes an execution header
 and checks it against a given hash, so a Gloas block hash reaches a state root; mainnet's committee size and period length
 in the store, which is minimal-only today; and a beacon API client (0066).

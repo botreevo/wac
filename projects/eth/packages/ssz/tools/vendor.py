@@ -509,7 +509,46 @@ def do_sync_forks() -> dict:
             "cases": out}
 
 
+# Following the chain across a fork: the transition cases (data from one fork, then the next, with an
+# `upgrade_store` step between) and the legacy-data cases (a store already on a later fork, fed an older fork's
+# bootstrap and update). Each case runs under its own fork schedule, read from its `config.yaml`. Gloas cases are
+# left out: this release's Gloas light client predates EIP-7732.
+TRANSITION_CASES = [
+    ("bellatrix", "capella_fork"), ("bellatrix", "capella_deneb_fork"), ("bellatrix", "capella_electra_fork"),
+    ("capella", "deneb_fork"), ("capella", "deneb_electra_fork"),
+    ("deneb", "electra_fork"),
+    ("altair", "capella_store_with_legacy_data"), ("altair", "deneb_store_with_legacy_data"),
+    ("altair", "electra_store_with_legacy_data"),
+    ("bellatrix", "capella_store_with_legacy_data"), ("bellatrix", "deneb_store_with_legacy_data"),
+    ("bellatrix", "electra_store_with_legacy_data"),
+    ("capella", "deneb_store_with_legacy_data"), ("capella", "electra_store_with_legacy_data"),
+    ("deneb", "electra_store_with_legacy_data"),
+]
+SCHEDULE = ["ALTAIR", "BELLATRIX", "CAPELLA", "DENEB", "ELECTRA", "FULU"]
+
+
+def do_transitions() -> dict:
+    global SYNC_FORK
+    out = []
+    for phase, name in TRANSITION_CASES:
+        SYNC_FORK = phase
+        c = do_sync_cases([name])[0]
+        cfg = fetch(f"{RAW}/tests/minimal/{phase}/light_client/sync/pyspec_tests/{name}/config.yaml").decode()
+        epochs = {}
+        for line in cfg.splitlines():
+            k, _, v = line.partition(":")
+            if k.endswith("_FORK_EPOCH"):
+                epochs[k[: -len("_FORK_EPOCH")]] = v.strip()
+        c["phase"] = phase
+        c["fork_epochs"] = [epochs.get(f, "18446744073709551615") for f in SCHEDULE]
+        out.append(c)
+    SYNC_FORK = "altair"
+    return {"source": f"{REPO} @ {COMMIT[:12]}, minimal/*/light_client/sync: fork transitions and legacy data",
+            "schedule": SCHEDULE, "cases": out}
+
+
 BUILDERS = {
+    "light_client_sync_transitions_minimal": lambda: do_transitions(),
     "ssz_static_light_client_forks_mainnet": lambda: do_fork_static(),
     "light_client_sync_forks_minimal": lambda: do_sync_forks(),
     "light_client_sync_altair_minimal": lambda: do_sync(),

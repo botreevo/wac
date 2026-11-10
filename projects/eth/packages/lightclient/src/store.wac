@@ -30,7 +30,9 @@ import { TY_LIGHT_CLIENT_UPDATE, TY_LIGHT_CLIENT_BOOTSTRAP, TY_SYNC_COMMITTEE, T
 import { lightClientTypes, lightClientFields, ALTAIR, CAPELLA, DENEB, ELECTRA, FULU, GLOAS, finalizedRootGindex,
          currentSyncCommitteeGindex, nextSyncCommitteeGindex, FT_BEACON_BLOCK_HEADER } from "../../ssz/src/forks.wac";
 import { fieldBytes, fieldRoot, hashTreeRoot } from "../../ssz/src/container.wac";
-import { isValidHeader, isEmptyHeader } from "./header.wac";
+import { isEmptyHeader } from "./header.wac";
+import { Schedule, SLOTS_PER_EPOCH } from "./schedule.wac";
+import { isValidHeaderAt, upgradeHeader, upgradeUpdate, upgradeBootstrap } from "./upgrade.wac";
 import { isValidNormalizedMerkleBranch } from "../../ssz/src/merkle.wac";
 import { bls.fastAggregateVerify } from "wac";
 import { syncCommitteeSigningRoot } from "./domain.wac";
@@ -85,6 +87,8 @@ export struct Store {
    * vectors are not run.
    */
   i32 fork;
+  /** When each fork begins: what a header's own epoch, a branch's gindex and a signature's version go by. */
+  Schedule schedule;
 }
 
 u8[] field(i32 fork, i32 ty, u8[] data, i32 f) {
@@ -225,9 +229,17 @@ export Store? initializeStore(u8[] trustedBlockRoot, u8[] bootstrap) { return in
 
 /** `initialize_light_client_store` for a bootstrap of `fork`, whose header must also be valid for it. */
 export Store? initializeStoreAt(i32 fork, u8[] trustedBlockRoot, u8[] bootstrap) {
+  return initializeStoreWith(Schedule.genesisTo(fork), fork, trustedBlockRoot, bootstrap);
+}
+
+/**
+ * A store from a bootstrap in `layout`, under a chain's `schedule`. Upgrade it with `upgradeStore` to follow the chain
+ * into a later fork.
+ */
+export Store? initializeStoreWith(Schedule schedule, i32 fork, u8[] trustedBlockRoot, u8[] bootstrap) {
   u8[] header = field(fork, TY_LIGHT_CLIENT_BOOTSTRAP(), bootstrap, BOOTSTRAP_HEADER);
   if (header.len() == 0) { return null; }
-  if (!isValidHeader(fork, header)) { return null; }
+  if (!isValidHeaderAt(schedule, fork, header)) { return null; }
   u8[] beaconRoot = headerBeaconRoot(header);
   if (beaconRoot.len() != 32 || trustedBlockRoot.len() != 32) { return null; }
   for (i32 i = 0; i < 32; i++) {
@@ -237,10 +249,32 @@ export Store? initializeStoreAt(i32 fork, u8[] trustedBlockRoot, u8[] bootstrap)
   u8[] branch = field(fork, TY_LIGHT_CLIENT_BOOTSTRAP(), bootstrap, BOOTSTRAP_CURRENT_SYNC_COMMITTEE_BRANCH);
   u8[] leaf = rootOf(fork, TY_LIGHT_CLIENT_BOOTSTRAP(), bootstrap, BOOTSTRAP_CURRENT_SYNC_COMMITTEE);
   if (leaf.len() != 32) { return null; }
-  if (!isValidNormalizedMerkleBranch(leaf, branch, currentSyncCommitteeGindex(fork), headerStateRoot(header))) {
+  i32 at = schedule.layoutAtSlot(headerSlot(header));
+  if (!isValidNormalizedMerkleBranch(leaf, branch, currentSyncCommitteeGindex(at), headerStateRoot(header))) {
     return null;
   }
-  return Store(header, committee, u8[](), u8[](), header, 0, 0, fork);
+  return Store(header, committee, u8[](), u8[](), header, 0, 0, fork, schedule);
+}
+
+/**
+ * `upgrade_lc_store_to_*`, as far as `to`: the headers and the best update rewritten in the later layout. A store must
+ * be upgraded before it can take the later fork's data; it may be upgraded early, and still takes older data, which
+ * `processUpdateFrom` upgrades as it arrives.
+ */
+export void upgradeStore(Store store, i32 to) {
+  if (to <= store.fork) { return; }
+  store.finalizedHeader = upgradeHeader(store.fork, to, store.finalizedHeader);
+  store.optimisticHeader = upgradeHeader(store.fork, to, store.optimisticHeader);
+  if (store.bestValidUpdate.len() > 0) { store.bestValidUpdate = upgradeUpdate(store.fork, to, store.bestValidUpdate); }
+  store.fork = to;
+}
+
+/** `process_light_client_update` for an update in `layout`: refused if newer than the store, upgraded if older. */
+export bool processUpdateFrom(Store store, u8[] update, i32 layout, i64 currentSlot, u8[] genesisValidatorsRoot) {
+  if (layout < 0 || layout > store.fork) { return false; }
+  u8[] u = upgradeUpdate(layout, store.fork, update);
+  if (u.len() == 0) { return false; }
+  return processUpdate(store, u, currentSlot, genesisValidatorsRoot);
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -279,7 +313,7 @@ export bool validateUpdate(Store store, u8[] update, i64 currentSlot, u8[] genes
   u8[] attested = updateAttestedHeaderAt(k, update);
   u8[] finalized = updateFinalizedHeaderAt(k, update);
   if (attested.len() == 0 || finalized.len() == 0) { return false; }
-  if (!isValidHeader(k, attested)) { return false; }
+  if (!isValidHeaderAt(store.schedule, k, attested)) { return false; }
   i64 attestedSlot = headerSlot(attested);
   i64 finalizedSlot = headerSlot(finalized);
   i64 signatureSlot = updateSignatureSlotAt(k, update);
@@ -312,14 +346,15 @@ export bool validateUpdate(Store store, u8[] update, i64 currentSlot, u8[] genes
   } else {
     u8[] finalizedRoot = u8[].filled(32, 0);          // the genesis checkpoint root is the zero hash
     if (finalizedSlot != 0) {
-      if (!isValidHeader(k, finalized)) { return false; }
+      if (!isValidHeaderAt(store.schedule, k, finalized)) { return false; }
       finalizedRoot = headerBeaconRoot(finalized);
       if (finalizedRoot.len() != 32) { return false; }
     } else {
       if (!isEmptyHeader(k, finalized)) { return false; }
     }
     if (!isValidNormalizedMerkleBranch(finalizedRoot, updateFinalityBranchAt(k, update),
-                                       finalizedRootGindex(k), headerStateRoot(attested))) {
+                                       finalizedRootGindex(store.schedule.layoutAtSlot(attestedSlot)),
+                                       headerStateRoot(attested))) {
       return false;
     }
   }
@@ -338,7 +373,8 @@ export bool validateUpdate(Store store, u8[] update, i64 currentSlot, u8[] genes
     u8[] leaf = rootOf(k, TY_LIGHT_CLIENT_UPDATE(), update, UPDATE_NEXT_SYNC_COMMITTEE);
     if (leaf.len() != 32) { return false; }
     if (!isValidNormalizedMerkleBranch(leaf, updateNextSyncCommitteeBranchAt(k, update),
-                                       nextSyncCommitteeGindex(k), headerStateRoot(attested))) {
+                                       nextSyncCommitteeGindex(store.schedule.layoutAtSlot(attestedSlot)),
+                                       headerStateRoot(attested))) {
       return false;
     }
   }
@@ -362,23 +398,16 @@ export bool validateUpdate(Store store, u8[] update, i64 currentSlot, u8[] genes
     }
   }
   u8[]? signingRoot = syncCommitteeSigningRoot(headerBeaconRoot(attested),
-                                               minimalForkVersion(k), genesisValidatorsRoot);
+                                               signatureVersion(store, signatureSlot), genesisValidatorsRoot);
   if (signingRoot is null) { return false; }
   return fastAggregateVerify(participants, signingRoot!,
                              field(k, TY_SYNC_AGGREGATE(), aggregate, AGGREGATE_SIGNATURE));
 }
 
-/**
- * The fork version under the minimal config: `0x0N000001`, N counting from phase 0 (Bellatrix, 2, has no
- * index here). Every fork of a store's own data is the one it signs under — the vectors schedule each fork
- * from genesis — so this is `compute_fork_version` of the signature slot's epoch for them; a store crossing
- * forks would need the schedule.
- */
-u8[] minimalForkVersion(i32 fork) {
-  u8[] v = u8[].filled(4, 0);
-  v[0] = (fork == ALTAIR() ? 1 : fork + 2) as@ u8;
-  v[3] = 0x01;
-  return v;
+/** `compute_fork_version(compute_epoch_at_slot(max(signature_slot, 1) - 1))`: the fork the signed block's parent is in. */
+u8[] signatureVersion(Store store, i64 signatureSlot) {
+  i64 slot = signatureSlot > (1 as i64) ? signatureSlot - (1 as i64) : 0 as i64;
+  return store.schedule.versionAt(slot / SLOTS_PER_EPOCH);
 }
 
 // ── Choosing between updates ──────────────────────────────────────────────────

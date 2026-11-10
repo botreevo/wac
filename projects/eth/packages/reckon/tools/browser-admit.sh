@@ -10,11 +10,8 @@
 # Needs: wac, node, Playwright's Chromium (preinstalled), deno (for wac's browser build: WAC_SRC is a checkout of
 # wac at the pinned commit, at a path with no `%` in it, which deno's file URLs mangle).
 #
-# **The browser half is blocked on wac, twice, and says which**, counting nothing:
-#   - W2: wac's browser build (packages/platform/build.ts) resolves relative, `@/`, core and std imports, and not
-#     the packages a project's wac.lock pins, so a program importing "wac" (all of wac-eth) does not build for it;
-#   - W1: in a page, wac's browser host refuses sockets (a page has no TCP), and there is no HTTP capability yet, so
-#     admission would be refused "network access" at its first request.
+# The browser half needs wac at 78c748c1 or later: its browser build resolves wac.lock packages (W2a), and a page's
+# HTTP goes through the browser's fetch (W1), so the servers it reads send CORS headers.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -42,11 +39,13 @@ printf '%s\n' c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3 >
 policy="{ signers: { reviewer: \"$($CL address --key reviewer.key)\" }, roles: { app: [{ endorsed: { by: [\"reviewer\"], at_least: 1 } }] } }"
 $CL endorse "$content" "reviewed the site" --key reviewer.key --store local >/dev/null 2>&1
 $CL publish mirror --store local >/dev/null 2>&1
-node "$here/tools/replay.mjs" $eport honest & pids="$pids $!"
-node "$here/tools/beacon-replay.mjs" $bport honest & pids="$pids $!"
+epid=""; bpid=""
+replay() { [ -n "$epid" ] && kill $epid 2>/dev/null; sleep 0.2; node "$here/tools/replay.mjs" $eport "$1" & epid=$!; pids="$pids $epid"
+  until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "http://127.0.0.1:$eport/" >/dev/null; do sleep 0.2; done; }
+beacon() { [ -n "$bpid" ] && kill $bpid 2>/dev/null; sleep 0.2; node "$here/tools/beacon-replay.mjs" $bport "$1" & bpid=$!; pids="$pids $bpid"; up $bport; }
+replay honest; beacon honest
 node "$here/tools/browser/serve.mjs" $mport mirror & pids="$pids $!"
-up $bport; up $mport
-until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "http://127.0.0.1:$eport/" >/dev/null; do sleep 0.2; done
+up $mport
 
 step "the entry point on the command line: web, over src/admission.wac"
 out=$(wac web.wasm ens:vitalik.eth app --policy-text "$policy" --store cli --mirror "http://127.0.0.1:$mport" \
@@ -55,38 +54,39 @@ printf '%s\n' "$out" | sed 's/^/   | /'
 [ $code -eq 0 ] && printf '%s' "$out" | grep -q "^ADMITTED" && ok "admitted, as claim admit admits it" || bad "exit $code"
 printf '%s' "$out" | grep -qF "name: vitalik.eth → ipfs://$content" && ok "the name proved to the recorded CID" || bad "the name"
 
-step "the same in headless Chromium: wac's --target browser, the program in a worker"
-deno=$(command -v deno || true)
+step "the same in headless Chromium: wac's --target browser, the program in a worker, its HTTP the browser's fetch"
 src=${WAC_SRC:-}
-if [ -z "$deno" ] || [ -z "$src" ] || [ ! -f "$src/packages/platform/build.ts" ]; then
-  echo "   SKIP (needs deno on PATH and WAC_SRC, a wac checkout at the pinned commit: see the header)"
+if ! command -v deno >/dev/null || [ -z "$src" ] || [ ! -f "$src/packages/platform/build.ts" ]; then
+  bad "the browser half needs deno on PATH and WAC_SRC, a wac checkout at the pinned commit: see the header"
 else
   mkdir -p page
   (cd "$root" && deno run -A "$src/packages/platform/build.ts" "$here/cmd/web.wac" --target browser \
      --allow-read --allow-write --allow-net --allow-env -o "$work/page/web.html" > "$work/build.log" 2>&1) || true
-fi
-if [ -n "$deno" ] && [ -n "$src" ] && [ ! -s page/web.html ]; then
-  if grep -q "no file was supplied at that path" build.log; then
-    echo "   BLOCKED (W2: wac's browser build does not resolve wac.lock packages: $(grep -c 'no file was supplied' build.log) imports unresolved, e.g. $(grep -o '[^ /]*/src/[a-z0-9]*\.wac:[0-9]*' build.log | head -1))"
-  else
-    bad "the browser build failed: $(tail -3 build.log)"
-  fi
-elif [ -n "$deno" ] && [ -n "$src" ]; then
-  ok "built: page/web.html, $(wc -c < page/web.html) bytes"
+  [ -s page/web.html ] && ok "built: page/web.html, $(wc -c < page/web.html) bytes" || bad "the browser build: $(tail -3 build.log)"
   node "$here/tools/browser/serve.mjs" $port page & pids="$pids $!"; up $port
-  q=$(python3 -c 'import sys, urllib.parse; print("&".join("a=" + urllib.parse.quote(x, safe="") for x in sys.argv[1:]))' \
-    ens:vitalik.eth app --policy-text "$policy" --mirror "http://127.0.0.1:$mport" --checkpoint $checkpoint \
-    --beacon-url "http://127.0.0.1:$bport" --now 15630000 --rpc 127.0.0.1:$eport)
-  page=$(node "$here/tools/browser/open.cjs" "http://127.0.0.1:$port/web.html?$q" 180000 2>&1)
-  printf '%s\n' "$page" | sed 's/^/   | /'
-  if printf '%s' "$page" | grep -q "^ADMITTED"; then
-    ok "admitted in the browser"
-    printf '%s' "$page" | grep -qF "name: vitalik.eth → ipfs://$content" && ok "the name proved to the recorded CID, in the browser" || bad "the name, in the browser"
-  elif printf '%s' "$page" | grep -q "network access"; then
-    echo "   BLOCKED (the page reached its first request and was refused \"network access\": wac's browser host has no HTTP yet, W1)"
-  else
-    bad "neither admitted nor refused for network access"
-  fi
+  # in_page EXPECT WHAT BECAUSE [CHECKPOINT]: run the page with the usual settings, and check how it ends.
+  in_page() {
+    want=$1; what=$2; because=$3; cp=${4:-$checkpoint}
+    q=$(python3 -c 'import sys, urllib.parse; print("&".join("a=" + urllib.parse.quote(x, safe="") for x in sys.argv[1:]))' \
+      ens:vitalik.eth app --policy-text "$policy" --mirror "http://127.0.0.1:$mport" --checkpoint "$cp" \
+      --beacon-url "http://127.0.0.1:$bport" --now 15630000 --rpc 127.0.0.1:$eport)
+    got=$(node "$here/tools/browser/open.cjs" "http://127.0.0.1:$port/web.html?$q" 180000 2>&1)
+    printf '%s\n' "$got" | grep -v '^$\|^web.wac$\|^Arguments come' | sed 's/^/   | /'
+    if printf '%s' "$got" | grep -q '^\[exit 0\]'; then g=admitted; else g=refused; fi
+    if [ "$g" != "$want" ]; then bad "$what: wanted $want, got $g"
+    elif ! printf '%s' "$got" | grep -qF -- "$because"; then bad "$what: $g, but not because \"$because\""
+    else ok "$what: $g, because \"$because\""; fi
+  }
+  in_page admitted "ens:vitalik.eth, in the browser: checkpoint → light client → anchored name → mirror's claims → policy" \
+    "name: vitalik.eth → ipfs://$content"
+  in_page refused "in the browser, a checkpoint the bootstrap is not for" "HTTP 404" 0x$(printf 'cd%.0s' $(seq 32))
+  beacon bootstrap; in_page refused "in the browser, a beacon node that changes a byte of the bootstrap" "not the checkpoint's"
+  beacon update;    in_page refused "in the browser, …of an update" "an update did not verify"
+  beacon finality;  in_page refused "in the browser, …of the finality update" "the finality update did not verify"
+  beacon honest
+  replay header;    in_page refused "in the browser, an execution node that answers the anchor with another header" "re-encodes to a different hash"
+  replay proof;     in_page refused "in the browser, an execution node that changes a storage proof" "the name:"
+  replay honest
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

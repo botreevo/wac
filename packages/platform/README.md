@@ -521,6 +521,14 @@ what the browser exposes: redirects followed, only the headers a page may read, 
 dropped, and a request the browser will not complete — CORS included, which a page is not told apart — refused as
 `network error or CORS refusal`. `example/hostget.wac` and `test/hostget_live.test.ts` run it in Chromium.
 
+**`--layout files` is the same page as a directory, for a Manifest V3 extension**: `index.html` with no inline
+script, `launcher.js` (a module), `worker.js` and `app.wasm` beside it, each loaded by URL — the single page inlines
+its launcher and starts its worker from a `blob:`, and an extension's CSP refuses both. Arguments come from an
+`args.json` beside the page when there is one, since an extension's own page has no query string worth the name. The
+extension's manifest still has to give the page `cross_origin_embedder_policy` and `cross_origin_opener_policy` (for
+`SharedArrayBuffer`) and `'wasm-unsafe-eval'`. `test/csp_live.test.ts` runs it under that policy in Chromium, with the
+single page refused under the same policy as the control.
+
 ### Interactive pages
 
 **A page is built with [`web`](https://github.com/voltrevo/wac-web.git)**: `export async i32 main(Page page)`, run in a

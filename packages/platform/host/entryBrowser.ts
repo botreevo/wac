@@ -64,7 +64,13 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
 /** What a page needs to say about the environment it is offering. */
 export type PageOptions = BrowserWorldOptions & {
   /** The worker's source. The build inlines the whole program here. */
-  workerSource: string;
+  workerSource?: string;
+  /**
+   * **Or where the worker is**, a file beside the page — `--layout files`, for a page under a CSP that refuses a
+   * `blob:` worker, as a Manifest V3 extension's does. One of the two; the source wins when both are given. A page
+   * started this way has no source to hand `spawnSelf`, which is refused in it.
+   */
+  workerUrl?: string | URL;
 };
 
 /**
@@ -91,7 +97,12 @@ export async function runInPage(opts: PageOptions): Promise<number> {
   // this is the program. `opts` already carries the bundle — it is what the launcher starts.
   const responder = serveHostCalls(bridge, browserWorld({ ...opts, selfSource: opts.workerSource }));
 
-  const url = URL.createObjectURL(new Blob([opts.workerSource], { type: "text/javascript" }));
+  if (opts.workerSource === undefined && opts.workerUrl === undefined) {
+    throw new Error("runInPage: neither a worker's source nor where it is");
+  }
+  const url = opts.workerSource !== undefined
+    ? URL.createObjectURL(new Blob([opts.workerSource], { type: "text/javascript" }))
+    : String(opts.workerUrl);
   const worker = new Worker(url, { type: "module" });
   try {
     const code = await new Promise<number>((resolve, reject) => {
@@ -113,8 +124,26 @@ export async function runInPage(opts: PageOptions): Promise<number> {
   } finally {
     responder.stop();
     worker.terminate();
-    URL.revokeObjectURL(url);
+    if (opts.workerSource !== undefined) URL.revokeObjectURL(url);
   }
+}
+
+/**
+ * **Arguments from `args.json` beside the page**, an array of strings, when there is one — for a page whose URL is
+ * not the place for them (an extension's own page) — and from the query string otherwise.
+ */
+export async function argsFromPage(search: string, base: string | URL): Promise<string[]> {
+  try {
+    const res = await fetch(new URL("args.json", base));
+    if (res.ok) {
+      const got = await res.json();
+      if (Array.isArray(got) && got.every((a) => typeof a === "string")) return got;
+      throw new Error("args.json must be an array of strings");
+    }
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("args.json")) throw e;
+  }
+  return argsFromLocation(search);
 }
 
 /** Arguments from the query string: `?a=one&a=two` becomes `["one", "two"]`. */

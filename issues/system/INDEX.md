@@ -5,6 +5,8 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0453e](open/0453e-the-ts-stripper-erases-satisfies-used-as-an-identifier.md) | `packages/ts`'s stripper erases `satisfies` wherever it appears, as if the operator — so `export function satisfies(…)` and a call to it become `export function {` and `if (!)`, which do not parse; `design/system/0009` D4 says a construct it cannot read is an error, never a rewrite. Found by `./bootstrap.sh --host nodejs` | bug | a bundle that does not parse |
+| [0452e](open/0452e-live-browser-tests-assume-a-playwright-cache-and-version-a-cloud-container-lacks.md) | the live browser tests look for Chromium only under `~/.cache/ms-playwright` and import a floating `npm:playwright@1`, so in a cloud container (Chromium at `/opt/pw-browsers`) they skip — and the gate reads green — or, pointed at it, fail on the browser revision; launched with `executablePath` they pass | bug — in the test harness | a browser lane that passes having driven no browser |
 | [0451e](open/0451e-wac-update-reads-http-proxy-only-and-goes-direct-where-https-proxy-is-set.md) | `packages/git/src/transport.wac` asks for `HTTP_PROXY` and nothing else, so where only `HTTPS_PROXY` is set — every Claude cloud container — `wac update` connects to `git.voltrevo.com:443` directly, past the proxy that authenticates it, and the server answers 401 where `git` succeeds. `packages/fetch` already takes `HTTPS_PROXY` for an `https` URL and honours `NO_PROXY` | bug | `wac update` fails where `git` succeeds |
 | [0377w](open/0377w-keccak256-absorbs-a-byte-at-a-time.md) | `keccak256`'s `absorb` takes a byte at a time with a division, a remainder and a variable shift each, and costs as much as the permutation: lane-wide reads (wacuum's `keccak.wac`) make 32 bytes 498 ns against 942 | performance | 942 ns for 32 bytes |
 | [0376w](open/0376w-p256-verification-pays-for-constant-time-it-does-not-need.md) | `p256VerifyDigest` runs the constant-time `jacMul` twice — 512 doublings and 512 masked additions — for a verification whose inputs are all public; a variable-time joint wNAF (wacuum's `p256.wac`) is 0.44 ms against 7 | performance | 7 ms a verification |
@@ -138,7 +140,7 @@ own roadmap lives in its README. This tracker is for what crosses those lines.
 
 ## Closed
 
-354 issues, 254 closed.
+356 issues, 254 closed.
 
 The count is checked against the directory by `tools/wac/issuecounts_test.wac`, which reads both
 trackers. It was `compiler/wacSpec.test.ts` until that file went with the TypeScript compiler on

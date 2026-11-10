@@ -59,7 +59,7 @@ case_() {
 }
 n=0
 for c in "files:exit 0" "fail:exit 7" "oob:trap memory-bounds" "div:trap divide-by-zero" "ovf:trap integer-overflow" \
-         "nul:trap null-reference" "unwrap:trap unreachable-code" "explicit:trap explicit" \
+         "nul:trap null-reference" "unwrap:trap unreachable-code" "conv:trap bad-conversion" "explicit:trap explicit" \
          "floats:exit 0" "nanpaths:exit 0" "nbody:exit 0" "probe:exit 0" "deep:abort" "big:abort" "loop:abort"; do
   case_ "${c%%:*}" args "${c#*:}" 3000 in
 done
@@ -69,7 +69,7 @@ case_ heap heap.args "exit 0" 300000
 case_ depth deeper.args abort 300000
 suite=$(wac obj.wasm add suite $st 2>/dev/null | tail -1)
 nones=$(grep -c ' none$' suite/cases || true)
-[ "$n" -eq 18 ] && ok "the suite: $n cases ($nones that give nothing), one object: $suite" || bad "the suite has $n cases"
+[ "$n" -eq 19 ] && ok "the suite: $n cases ($nones that give nothing), one object: $suite" || bad "the suite has $n cases"
 sed -n '3,$p' suite/cases | sed 's/^/   | /' | cut -c1-120
 
 # witness KEY NAME HOST: a runner witnessing the suite: every case with an output, run and signed. A case that gives
@@ -115,7 +115,7 @@ sed 's/^/   | /' admit.log
 echo; echo "## runners that do not count"
 wac derive.wasm run "$app" $st --key fresh.key --runner "reckon-derive/1 v8, another host" >/dev/null 2>&1
 policy v8 fresh
-[ "$(admit)" = no ] && grep -q "fresh on .*: it has witnessed 0 of the suite's 14 cases with an output" admit.log \
+[ "$(admit)" = no ] && grep -q "fresh on .*: it has witnessed 0 of the suite's 15 cases with an output" admit.log \
   && ok "a runner that never witnessed the suite is not counted, though its claim about the app is true" || bad "fresh: $(cat admit.log)"
 grep -o "not counted: .*" admit.log | sort -u | sed 's/^not counted: /   | /'
 
@@ -145,7 +145,7 @@ first=$(awk '$1 == "files" { print $2 }' names)
 s=$(wac derive.wasm run "$first" $st --key wt.key --runner "$WT_NAME" 2>/dev/null | sed -n 2p)
 claim revoke "$s" --key wt.key >/dev/null
 policy v8 wt
-[ "$(admit)" = no ] && grep -q "wt on .*: it has witnessed 13 of the suite's 14 cases with an output" admit.log \
+[ "$(admit)" = no ] && grep -q "wt on .*: it has witnessed 14 of the suite's 15 cases with an output" admit.log \
   && ok "wasmtime's runner revokes one suite case: it no longer counts" || bad "after a revocation: $(cat admit.log)"
 
 echo

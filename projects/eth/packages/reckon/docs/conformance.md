@@ -16,12 +16,11 @@ A conformance suite is an object: a tree whose `cases` file has one case per lin
     RECIPE OUTPUT       the recipe must give this output tree
     RECIPE none         the recipe must give no output: the machine aborts it (past its floor, out of time)
 
-The suite for `wasm-gc/wac-host/3` is built from `corpus/`, the programs `tools/machine.sh` checks. It has 18 cases:
+The suite for `wasm-gc/wac-host/3` is built from `corpus/`, the programs `tools/machine.sh` checks. It has 19 cases:
 
-- every ending the corpus reaches and both engines agree on: exit 0, exit 7, and six kinds of trap (memory-bounds,
-  divide-by-zero, integer-overflow, null-reference, unreachable-code, and explicit, whose message is part of the
-  output). The suite for `/2` had 17, with `/2`'s names. A float-to-integer conversion's kind still differs between
-  the engines' hosts (reported to wac; docs/runner.md), so it waits outside the suite;
+- every ending the corpus reaches: exit 0, exit 7, and seven kinds of trap (memory-bounds, divide-by-zero,
+  integer-overflow, null-reference, unreachable-code, bad-conversion, and explicit, whose message is part of the
+  output). The suite for `/2` had 17, with `/2`'s names;
 - the float programs, whose NaNs must come out canonical (floats, nanpaths, nbody);
 - the probe, which must be refused the host's files, environment, clock and random bytes;
 - the resource floor: depth.wac at 10,000 frames and heap.wac at 1 GiB must complete;

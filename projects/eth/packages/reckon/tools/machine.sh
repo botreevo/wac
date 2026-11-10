@@ -72,16 +72,7 @@ check div "trap divide-by-zero"
 check ovf "trap integer-overflow"
 check nul "trap null-reference"
 check unwrap "trap unreachable-code"
-# A float out of an integer's range, converted with `as!`: V8's host says bad-conversion, wasmtime's integer-overflow
-# (wasmtime reports that trap as it does a division's overflow). Reported to wac; until it is fixed the engines differ
-# here, so no two-engine quorum forms for such a program, and it is not in the conformance suite.
-r=$(recipe conv); a=$(run "$V8" "$r")
-[ "$(status "$a")" = "trap bad-conversion" ] && ok "conv: trap bad-conversion on V8" || bad "conv: V8 gave '$(status "$a")'"
-if [ -n "$WT" ]; then
-  b=$(run "$WT" "$r")
-  if [ "$a" = "$b" ]; then ok "conv: the engines agree now ($(status "$b")): take it out of this exception"
-  else known "conv: wasmtime says '$(status "$b")', V8 'trap bad-conversion': wac's classification differs (reported)"; fi
-fi
+check conv "trap bad-conversion"
 check explicit "trap explicit"
 check deep abort
 check big abort
@@ -124,6 +115,13 @@ for pair in "oob:trap array-out-of-bounds" "nul:trap null" "unwrap:trap unreacha
     [ "$got" = "$want" ] && ok "$p under /2 on $(basename "$host"): $want, as /2 always said" || bad "$p under /2: '$got', want '$want'"
   done
 done
+
+# /2 names a trap from the engine's words, and for an out-of-range float-to-int conversion wasmtime's words are an
+# integer overflow's: under /2 the engines differ on such a program, as they always did. /3 takes the host's kind
+# instead, and agrees (above). /2 is kept as it was defined, so this stays a known property of /2.
+c2=$(status "$(run "$V8" "$(recipe2 conv)")")
+[ "$c2" = "trap float-to-integer" ] && ok "conv under /2 on V8: trap float-to-integer" || bad "conv under /2 on V8: '$c2'"
+[ -n "$WT" ] && known "conv under /2 on wasmtime: '$(status "$(run "$WT" "$(recipe2 conv)")")', from wasmtime's words: /2's own disagreement, which /3 removes"
 
 # What the program could and could not reach, from its own log.
 p=$(run "$V8" "$(recipe probe)")

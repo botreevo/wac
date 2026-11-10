@@ -182,10 +182,13 @@ The `/2` conformance suite (17 cases) gives every recorded output unchanged thro
 - V8 and wasmtime agree on every trap kind the corpus reaches: explicit (with its message), unreachable-code (an
   `unwrap` of an Err), memory-bounds, divide-by-zero, integer-overflow (from division) and null-reference. `/2`'s
   names come out as before on both.
-- **One disagreement, reported to wac.** A float outside an integer's range, converted with `as!`, is
-  `bad-conversion` on V8 and `integer-overflow` on wasmtime, because wasmtime reports that trap as it does a
-  division's overflow. Until wac's classification is fixed, the engines give such a program different outputs. No
-  two-engine quorum forms, which is safe, and the program (`corpus/conv.wac`) is kept out of the conformance suite.
+- **One disagreement, found and fixed.** A float outside an integer's range, converted with `as!`, was
+  `bad-conversion` on V8 and `integer-overflow` on wasmtime, which reports that trap as it does a division's overflow.
+  Reported to wac, fixed at `cfd985372` (0459d): the wasmtime host reads the faulting opcode. From the pin at
+  `7f559349c`, both engines say `bad-conversion`, and `corpus/conv.wac` is in the conformance suite.
+  Under `/2`, which names a trap from the engine's words, wasmtime still says integer overflow for that program, so `/2`
+  gives the engines different outputs there, as it always did. That is a property of `/2` that `/3` removes, and
+  `/2` keeps it, since a definition does not change.
   `table-bounds` and `bad-cast` are named but nothing in the corpus reaches them.
 
 ## Minimum resources (machine /2, unchanged from /1)

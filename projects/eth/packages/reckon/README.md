@@ -20,10 +20,9 @@ proofs.
 Everything here is wac except three things: the registry contract (Solidity), the wallet that writes to it (ethers,
 because publishers and signers use ordinary wallets), and the JavaScript oracles the tests are checked against.
 
-**The first round is quarantined under [`v1/`](v1/README.md)** (decision J, docs/decisions/J-v1-code.md): the
-`reckon` command, its kt1/kb1 trees, build statements and `TrustRegistry`, with its tests, end-to-end run and records.
-It still builds and is tested (`reckon:build`, `reckon:test`, `reckon:e2e`), and is to be deleted now that `claim run`
-and `deps` do what only it did.
+**The first round is deleted** (decision J, docs/decisions/J-v1-code.md), now that `claim run` and `deps` do the
+two things only it did. Its code, its measured results and its findings are in the history: `packages/reckon/v1/`
+and `v1/README.md` at commit 2a2241d, or `packages/reckon/` before it.
 
 ## The second round: attested derivations (2026-11-10)
 

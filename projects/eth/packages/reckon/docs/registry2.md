@@ -1,7 +1,7 @@
 # Registry v2
 
 Build list item 9, a prototype: the on-chain half of attested derivations, for objects named by IPFS CIDs, read only by
-proof. v1 (`v1/contracts/TrustRegistry.sol`, `v1/src/registry.wac`, `v1/src/trust.wac`) is quarantined under `v1/`, for reference.
+proof. v1 (`TrustRegistry.sol`, `src/registry.wac`, `src/trust.wac`) is deleted; it is in the history at 2a2241d.
 
 ## What was built
 

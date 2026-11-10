@@ -123,8 +123,26 @@ what the user installed, and its build can itself be a derivation, so it can be 
      takes the app down, as of block 6. On recorded mainnet (`admit.sh`, 12 of 12) the banner says beacon slot
      15621760 and marks it 10 hours old.
    - **Not yet:** a decision does not expire while an app stays open; it is checked again at the next open.
-5. **Hardening.** Size and start-up time, the extension built as a derivation, and an admission of the extension by
-   its own policy.
+5. **Hardening. Done (2026-11-10), but for the JavaScript.**
+   - **The extension is a derived output, admitted by its own policy.** `cmd/assemble.wac` puts it together inside
+     the machine, from three slots: `pages` (its own files), `glue` (wac's browser glue) and `module` (`web.wac`'s
+     derived build), writing `admit/app.wasm` as the module less its `wac.manifest` section. `derive recipe --slot`
+     names the slots.
+   - **`release.sh`:**
+     - builds `web.wac` and `assemble.wac` with `builddeps`;
+     - runs the assembly on V8 and wasmtime;
+     - holds its `out/` to the extension `build.sh` makes, file for file;
+     - has a reviewer endorse what is reviewed rather than derived (the build's source and arguments, the pages,
+       the glue);
+     - ships `policy.json5`.
+     From an empty store, `claim admit EXTENSION extension --policy policy.json5 --mirror claims/` says ADMITTED,
+     through: assembly (two runners), assembler and module (each built by two runners from reviewed source by the
+     root compiler), and pages and glue (reviewed). A copy with one byte changed is refused.
+   - **Size and start-up:** a 194 KB zip, 608 KB unpacked, of which the admission module is 422 KB. In the
+     extension an admission decides in 0.9 s from a checkpoint and 0.2 s resumed (`test/admit.sh`, which bounds it
+     at 30 s), on recorded mainnet with local servers.
+   - **Not yet:** the JavaScript is reviewed, not derived (the pages are source; the glue is deno's bundle, which
+     wac's 0454e will make reproducible, dropping the release's rewrite of its temporary name).
 6. **Published. Done (2026-11-10).** `extension/release.sh` makes `site/downloads/`, which the pages site serves:
    - the zip, named by the unpacked extension's CID (unzip it, `obj add` the folder: the same CID; three builds gave
      the same one);

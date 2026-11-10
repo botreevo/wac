@@ -1,0 +1,297 @@
+// Admission: whether an object may be used in a role, decided recursively over the derivation graph. A pure function of
+// the policy, the index, the objects the resolver can reach, and what the chain said (revocations, rejections).
+//
+// A policy gives each role a list of alternatives; an object is admitted in a role if any alternative holds:
+//
+//     Root                         the object is one of the policy's trust roots
+//     Endorsed(by, n)              n distinct endorsers from `by` endorsed it
+//     Derived(by, n, runners, …)   some recipe producing it has n distinct witnesses from `by` on `runners` distinct
+//                                  runners, an allowed machine and format, and every input slot admitted in the role the
+//                                  rule gives that slot's name (or `otherSlots` for the rest)
+//     Analysis(analyser, …)        a derivation of `analyser` run on the object, witnessed enough, wrote `expect` at `path`
+//
+// and refused, whatever else holds, if a followed rejection list names it. A statement revoked by its own signer —
+// on the chain, or by a signed revocation in the index — counts for nothing.
+
+import { ipfs.Cid, ipfs.Resolver, ipfs.readFile, ipfs.readNode, ipfs.Node } from "@/lib.wac";
+import { Result } from "core";
+import { Recipe, recipeFrom, Statement } from "./claims.wac";
+import { Index, Held, same, contains, pushCid } from "./graph.wac";
+import { Slot, slotsOf } from "./slots.wac";
+import { codec.hexEncode } from "wac";
+
+export struct Named {
+  string name;
+  u8[] address;
+}
+
+export struct SlotRole {
+  string slot;
+  string role;
+}
+
+export enum Rule {
+  Root,
+  Endorsed(string[] by, i32 atLeast),
+  Derived(string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots),
+  Analysis(Cid analyser, string slot, string path, string expect, string[] by, i32 atLeast),
+}
+
+export struct RoleRules {
+  string role;
+  Rule[] anyOf;
+}
+
+export struct Policy {
+  Named[] signers;
+  Cid[] roots;
+  string[] machines;
+  string[] formats;
+  u8[][] rejectLists;
+  RoleRules[] roles;
+}
+
+/** What the chain said: revocations as (signer, statement id), rejections as (list, subject). */
+export struct Chain {
+  u8[][] revokedBy;
+  Cid[] revokedId;
+  u8[][] rejectedBy;
+  Cid[] rejected;
+
+  Chain none() { return Chain(u8[][](), Cid[](), u8[][](), Cid[]()); }
+}
+
+export struct Decision {
+  bool ok;
+  string[] why;
+}
+
+struct Ctx {
+  Policy p;
+  Index ix;
+  Resolver r;
+  Chain chain;
+  string[] stack;
+}
+
+string short(Cid c) { string t = c.text(); return t.slice(0, 14) + "…"; }
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+string nameOf(Policy p, u8[] address) {
+  for (i32 i = 0; i < p.signers.len(); i++) { if (same(p.signers[i].address, address)) { return p.signers[i].name; } }
+  return "";
+}
+
+bool has(string[] xs, string x) {
+  for (i32 i = 0; i < xs.len(); i++) { if (xs[i] == x) { return true; } }
+  return false;
+}
+
+string[] plus(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+string[] plusAll(string[] xs, string[] ys) {
+  string[] out = xs;
+  for (i32 i = 0; i < ys.len(); i++) { out = plus(out, ys[i]); }
+  return out;
+}
+
+bool revoked(Ctx c, Held h) {
+  if (c.ix.revokedHere(h.signer, h.id)) { return true; }
+  for (i32 i = 0; i < c.chain.revokedId.len(); i++) {
+    if (c.chain.revokedId[i].eq(h.id) && same(c.chain.revokedBy[i], h.signer)) { return true; }
+  }
+  return false;
+}
+
+/** A followed list's rejection of `cid`, from the chain or a signed rejection in the index; "" when none. */
+string rejection(Ctx c, Cid cid) {
+  for (i32 l = 0; l < c.p.rejectLists.len(); l++) {
+    for (i32 i = 0; i < c.chain.rejected.len(); i++) {
+      if (c.chain.rejected[i].eq(cid) && same(c.chain.rejectedBy[i], c.p.rejectLists[l])) { return "on the chain"; }
+    }
+    Held[] about = c.ix.about(cid);
+    for (i32 i = 0; i < about.len(); i++) {
+      bool isRejection = match (about[i].statement) { Rejection(_, _): true, Endorsement(_, _): false, Derivation(_, _, _): false, Revocation(_): false };
+      if (isRejection && same(about[i].signer, c.p.rejectLists[l]) && !revoked(c, about[i])) { return "by a signed rejection"; }
+    }
+  }
+  return "";
+}
+
+/** Whether `cid` may be used as `role`, and why. */
+export Decision admit(Policy p, Index ix, Resolver r, Chain chain, Cid cid, string role) {
+  return admitIn(Ctx(p, ix, r, chain, string[]()), cid, role);
+}
+
+Decision admitIn(Ctx c, Cid cid, string role) {
+  string key = cid.text() + " as " + role;
+  if (has(c.stack, key)) { return Decision(false, ["\{short(cid)} as \{role} depends on itself"]); }
+  if (c.stack.len() > 64) { return Decision(false, ["deeper than 64 derivations"]); }
+  string rej = rejection(c, cid);
+  if (rej != "") { return Decision(false, ["\{short(cid)} is on a rejection list you follow (\{rej})"]); }
+  Rule[]? rules = null;
+  for (i32 i = 0; i < c.p.roles.len(); i++) { if (c.p.roles[i].role == role) { rules = c.p.roles[i].anyOf; } }
+  if (rules is null) { return Decision(false, ["the policy has no rule for the role \{role}"]); }
+  Ctx inner = Ctx(c.p, c.ix, c.r, c.chain, plus(c.stack, key));
+  string[] why = string[]();
+  for (i32 i = 0; i < rules!.len(); i++) {
+    Decision d = alternative(inner, cid, role, rules![i]);
+    if (d.ok) { return Decision(true, plusAll(["\{short(cid)} admitted as \{role}"], d.why)); }
+    why = plusAll(why, d.why);
+  }
+  return Decision(false, plusAll(["\{short(cid)} refused as \{role}"], why));
+}
+
+Decision alternative(Ctx c, Cid cid, string role, Rule rule) {
+  match (rule) {
+    Root: {
+      return contains(c.p.roots, cid) ? Decision(true, ["  a trust root"]) : Decision(false, ["  not a trust root"]);
+    }
+    Endorsed(by, atLeast): {
+      string[] who = string[]();
+      Held[] about = c.ix.about(cid);
+      for (i32 i = 0; i < about.len(); i++) {
+        bool isEndorsement = match (about[i].statement) { Endorsement(_, _): true, Rejection(_, _): false, Derivation(_, _, _): false, Revocation(_): false };
+        string n = nameOf(c.p, about[i].signer);
+        if (isEndorsement && has(by, n) && !has(who, n) && !revoked(c, about[i])) { who = plus(who, n); }
+      }
+      bool ok = who.len() >= atLeast;
+      return Decision(ok, ["  endorsed by \{list(who)} (need \{atLeast})"]);
+    }
+    Derived(by, atLeast, runners, slots, otherSlots): { return derived(c, cid, by, atLeast, runners, slots, otherSlots); }
+    Analysis(analyser, slot, path, expect, by, atLeast): { return analysis(c, cid, analyser, slot, path, expect, by, atLeast); }
+  }
+}
+
+string list(string[] xs) {
+  if (xs.len() == 0) { return "nobody"; }
+  string out = "";
+  for (i32 i = 0; i < xs.len(); i++) { out += (i > 0 ? ", " : "") + xs[i]; }
+  return out;
+}
+
+/** The recipe named `id`, from the index or else from its block. */
+Recipe? recipeOf(Ctx c, Cid id) {
+  Recipe? r = c.ix.recipe(id);
+  if (r is not null) { return r; }
+  u8[]? b = c.r.block(id).ok();
+  return b is null ? null : recipeFrom(b!).ok();
+}
+
+/** Witnesses from `by`, unrevoked, claiming recipe `rid` produces `output`: their names and their runners. */
+struct Witnessed {
+  string[] names;
+  string[] runners;
+}
+
+Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by) {
+  Witnessed w = Witnessed(string[](), string[]());
+  Held[] origins = c.ix.origins(output);
+  for (i32 i = 0; i < origins.len(); i++) {
+    match (origins[i].statement) {
+      Derivation(r, _, runner): {
+        string n = nameOf(c.p, origins[i].signer);
+        if (r.eq(rid) && has(by, n) && !has(w.names, n) && !revoked(c, origins[i])) {
+          w.names = plus(w.names, n);
+          if (!has(w.runners, runner)) { w.runners = plus(w.runners, runner); }
+        }
+      }
+      Endorsement(_, _): { }
+      Rejection(_, _): { }
+      Revocation(_): { }
+    }
+  }
+  return w;
+}
+
+Decision derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots) {
+  string[] why = string[]();
+  Cid[] seen = Cid[]();
+  Held[] origins = c.ix.origins(cid);
+  if (origins.len() == 0) { return Decision(false, ["  no known recipe produces it"]); }
+  for (i32 i = 0; i < origins.len(); i++) {
+    Cid rid = match (origins[i].statement) { Derivation(r, _, _): r, Endorsement(s, _): s, Rejection(s, _): s, Revocation(s): s };
+    if (contains(seen, rid)) { continue; }
+    seen = pushCid(seen, rid);
+    Recipe? rec = recipeOf(c, rid);
+    if (rec is null) { why = plus(why, "  recipe \{short(rid)}: not found"); continue; }
+    if (!has(c.p.machines, rec!.machine)) { why = plus(why, "  recipe \{short(rid)}: machine \{rec!.machine} is not one the policy accepts"); continue; }
+    if (!has(c.p.formats, rec!.format)) { why = plus(why, "  recipe \{short(rid)}: format \{rec!.format} is not one the policy accepts"); continue; }
+    Witnessed w = witnesses(c, rid, cid, by);
+    string count = "witnessed by \{list(w.names)} on \{w.runners.len()} runner(s) (need \{atLeast} on \{runners})";
+    if (w.names.len() < atLeast || w.runners.len() < runners) { why = plus(why, "  recipe \{short(rid)}: \{count}"); continue; }
+    Slot[] ss;
+    match (slotsOf(c.r, rec!.input)) {
+      Err(e): { why = plus(why, "  recipe \{short(rid)}: \{e}"); continue; }
+      Ok(x): { ss = x; }
+    }
+    bool all = true;
+    string[] sub = string[]();
+    for (i32 j = 0; j < ss.len(); j++) {
+      string want = otherSlots;
+      for (i32 k = 0; k < slots.len(); k++) { if (slots[k].slot == ss[j].name) { want = slots[k].role; } }
+      if (want == "") { all = false; sub = plus(sub, "    slot \{ss[j].name}: the rule takes no such input"); continue; }
+      Decision d = admitIn(c, ss[j].cid, want);
+      sub = plusAll(sub, indent(d.why));
+      if (!d.ok) { all = false; }
+    }
+    if (all) { return Decision(true, plusAll(["  recipe \{short(rid)}: \{count}"], sub)); }
+    why = plusAll(plus(why, "  recipe \{short(rid)}: \{count}, but an input is refused"), sub);
+  }
+  return Decision(false, why);
+}
+
+string[] indent(string[] xs) {
+  string[] out = string[].defaulted(xs.len());
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = "    " + xs[i]; }
+  return out;
+}
+
+Decision analysis(Ctx c, Cid cid, Cid analyser, string slot, string path, string expect, string[] by, i32 atLeast) {
+  for (i32 i = 0; i < c.ix.recipeIds.len(); i++) {
+    Recipe rec = c.ix.recipes[i];
+    Slot[]? ss = slotsOf(c.r, rec.input).ok();
+    if (ss is null) { continue; }
+    bool onIt = false;
+    bool byIt = false;
+    for (i32 j = 0; j < ss!.len(); j++) {
+      if (ss![j].name == slot && ss![j].cid.eq(cid)) { onIt = true; }
+      if (ss![j].name == "program" && ss![j].cid.eq(analyser)) { byIt = true; }
+    }
+    if (!onIt || !byIt || !has(c.p.machines, rec.machine)) { continue; }
+    Cid rid = c.ix.recipeIds[i];
+    for (i32 h = 0; h < c.ix.held.len(); h++) {
+      Cid? out = match (c.ix.held[h].statement) { Derivation(r, o, _): r.eq(rid) ? o : null, Endorsement(_, _): null, Rejection(_, _): null, Revocation(_): null };
+      if (out is null) { continue; }
+      Witnessed w = witnesses(c, rid, out!, by);
+      if (w.names.len() < atLeast) { continue; }
+      u8[]? got = fileAt(c.r, out!, path);
+      string text = got is null ? "(nothing)" : string.fromBytes(got!);
+      if (text == expect) { return Decision(true, ["  the analyser \{short(analyser)} says \"\{expect}\" at \{path}, witnessed by \{list(w.names)}"]); }
+      return Decision(false, ["  the analyser \{short(analyser)} says \"\{text}\" at \{path}, not \"\{expect}\""]);
+    }
+  }
+  return Decision(false, ["  no witnessed run of the analyser \{short(analyser)} on it"]);
+}
+
+/** The file at a `/`-separated path in a tree, if there is one. */
+u8[]? fileAt(Resolver r, Cid tree, string path) {
+  Cid at = tree;
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 s = rest.indexOf("/");
+    string part = s < 0 ? rest : rest.slice(0, s);
+    rest = s < 0 ? "" : rest.slice(s + 1, rest.len());
+    Slot[]? ss = slotsOf(r, at).ok();
+    if (ss is null) { return null; }
+    bool found = false;
+    for (i32 i = 0; i < ss!.len(); i++) { if (ss![i].name == part) { at = ss![i].cid; found = true; } }
+    if (!found) { return null; }
+  }
+  return readFile(r, at).ok();
+}

@@ -1,0 +1,203 @@
+// The claim index: signed statements and the recipes they name, held so that the two questions trust needs are cheap —
+// origins (which recipes produce this object?) and dependents (what consumed this object, and what did that produce?).
+//
+// Untrusted like a resolver: only statements whose signatures verify are added, so the worst an index can do is leave
+// one out. Which of them count is the policy's business, not the index's.
+
+import { ipfs.Cid, ipfs.Resolver, ipfs.Store, ipfs.Block, ipfs.DAG_CBOR, ipfs.encode, ipfs.parseCid } from "@/lib.wac";
+import { Result } from "core";
+import { Recipe, recipeId, recipeFrom, recipeValue, Statement, statementId, Signed, verifySigned, signedFrom, signedBlock } from "./claims.wac";
+import { slotsOf, Slot } from "./slots.wac";
+
+/** A statement whose signature has been checked, with the signer it recovered to and its id. */
+export struct Held {
+  Statement statement;
+  u8[] signer;
+  Cid id;
+}
+
+export struct Index {
+  Held[] held;
+  Recipe[] recipes;
+  Cid[] recipeIds;
+  /** The signed records themselves, as published: what `save` writes and `load` reads back. */
+  Signed[] signed;
+
+  Index create() { return Index(Held[](), Recipe[](), Cid[](), Signed[]()); }
+
+  /** Add a signed statement, if its signature verifies; answers why not otherwise. */
+  Result<Cid, string> add(this, Signed s) {
+    u8[] who = try verifySigned(s);
+    Cid id = statementId(s.statement);
+    for (i32 i = 0; i < this.held.len(); i++) {
+      if (this.held[i].id.eq(id) && same(this.held[i].signer, who)) { return Result.Ok(id); }
+    }
+    Held[] next = Held[].filled(this.held.len() + 1, Held(s.statement, who, id));
+    for (i32 i = 0; i < this.held.len(); i++) { next[i] = this.held[i]; }
+    this.held = next;
+    Signed[] ss = Signed[].filled(this.signed.len() + 1, s);
+    for (i32 i = 0; i < this.signed.len(); i++) { ss[i] = this.signed[i]; }
+    this.signed = ss;
+    return Result.Ok(id);
+  }
+
+  Result<Cid, string> addBlock(this, u8[] block) {
+    Signed s = try signedFrom(block);
+    return this.add(s);
+  }
+
+  Cid addRecipe(this, Recipe r) {
+    Cid id = recipeId(r);
+    if (this.recipe(id) is not null) { return id; }
+    Recipe[] rs = Recipe[].filled(this.recipes.len() + 1, r);
+    Cid[] ids = Cid[].filled(this.recipeIds.len() + 1, id);
+    for (i32 i = 0; i < this.recipes.len(); i++) { rs[i] = this.recipes[i]; ids[i] = this.recipeIds[i]; }
+    this.recipes = rs;
+    this.recipeIds = ids;
+    return id;
+  }
+
+  Recipe? recipe(this, Cid id) {
+    for (i32 i = 0; i < this.recipeIds.len(); i++) { if (this.recipeIds[i].eq(id)) { return this.recipes[i]; } }
+    return null;
+  }
+
+  /** Every derivation claimed to produce `output`. */
+  Held[] origins(this, Cid output) {
+    Held[] out = Held[]();
+    for (i32 i = 0; i < this.held.len(); i++) {
+      bool hit = match (this.held[i].statement) { Derivation(_, o, _): o.eq(output), Endorsement(_, _): false, Rejection(_, _): false, Revocation(_): false };
+      if (hit) { out = pushHeld(out, this.held[i]); }
+    }
+    return out;
+  }
+
+  /** Endorsements and rejections whose subject is `subject`. */
+  Held[] about(this, Cid subject) {
+    Held[] out = Held[]();
+    for (i32 i = 0; i < this.held.len(); i++) {
+      bool hit = match (this.held[i].statement) {
+        Endorsement(s, _): s.eq(subject), Rejection(s, _): s.eq(subject), Derivation(_, _, _): false, Revocation(_): false };
+      if (hit) { out = pushHeld(out, this.held[i]); }
+    }
+    return out;
+  }
+
+  /** Revocations signed by `signer` of statement `id`, as statements (the chain's record is the other source). */
+  bool revokedHere(this, u8[] signer, Cid id) {
+    for (i32 i = 0; i < this.held.len(); i++) {
+      bool hit = match (this.held[i].statement) { Revocation(s): s.eq(id), Derivation(_, _, _): false, Endorsement(_, _): false, Rejection(_, _): false };
+      if (hit && same(this.held[i].signer, signer)) { return true; }
+    }
+    return false;
+  }
+
+  /**
+   * The recipes that consumed `object` as one of their input slots, and what each was claimed to produce: the answer
+   * to "what is affected?". `r` lists each recipe's slots.
+   */
+  Cid[] dependents(this, Resolver r, Cid object) {
+    Cid[] outs = Cid[]();
+    for (i32 i = 0; i < this.recipeIds.len(); i++) {
+      Slot[]? slots = slotsOf(r, this.recipes[i].input).ok();
+      if (slots is null) { continue; }
+      bool uses = false;
+      for (i32 j = 0; j < slots!.len(); j++) { if (slots![j].cid.eq(object)) { uses = true; } }
+      if (!uses) { continue; }
+      for (i32 h = 0; h < this.held.len(); h++) {
+        Cid? o = match (this.held[h].statement) {
+          Derivation(rid, out, _): rid.eq(this.recipeIds[i]) ? out : null, Endorsement(_, _): null, Rejection(_, _): null, Revocation(_): null };
+        if (o is not null && !contains(outs, o!)) { outs = pushCid(outs, o!); }
+      }
+    }
+    return outs;
+  }
+}
+
+/**
+ * The index as objects: each signed record and each recipe kept in `store` under its CID, and a list of them at
+ * `claims/index`, one `signed <cid>` or `recipe <cid>` per line. Served as a mirror, that directory is a claim index
+ * anyone can load; loading re-verifies every signature and every hash, so a mirror can only leave things out.
+ */
+export Result<bool, string> saveIndex(Index ix, Store store) {
+  string list = "";
+  for (i32 i = 0; i < ix.signed.len(); i++) {
+    u8[] b = signedBlock(ix.signed[i]);
+    Cid c = Cid.of(DAG_CBOR, b);
+    try store.put(Block(c, b));
+    list += "signed " + c.text() + "\n";
+  }
+  for (i32 i = 0; i < ix.recipes.len(); i++) {
+    u8[] b = encode(recipeValue(ix.recipes[i]));
+    Cid c = Cid.of(DAG_CBOR, b);
+    try store.put(Block(c, b));
+    list += "recipe " + c.text() + "\n";
+  }
+  if (!store.write("claims/index", list.toBytes())) { return Result.Err("cannot write claims/index"); }
+  return Result.Ok(true);
+}
+
+/** An index loaded from a store laid out by `saveIndex`; anything that does not verify is reported and left out. */
+export struct Loaded {
+  Index index;
+  string[] refused;
+}
+
+export Loaded loadIndex(Store store) {
+  Index ix = Index.create();
+  string[] refused = string[]();
+  u8[]? list = store.read("claims/index");
+  if (list is null) { return Loaded(ix, ["no claims/index"]); }
+  string rest = string.fromBytes(list!);
+  while (rest.len() > 0) {
+    i32 nl = rest.indexOf("\n");
+    string line = nl < 0 ? rest : rest.slice(0, nl);
+    rest = nl < 0 ? "" : rest.slice(nl + 1, rest.len());
+    i32 sp = line.indexOf(" ");
+    if (sp < 0) { continue; }
+    string kind = line.slice(0, sp);
+    Cid? c = parseCid(line.slice(sp + 1, line.len())).ok();
+    if (c is null) { refused = pushS(refused, "\{line}: not a CID"); continue; }
+    match (store.get(c!)) {
+      Err(e): { refused = pushS(refused, e); }
+      Ok(b): {
+        if (kind == "signed") {
+          match (ix.addBlock(b)) { Err(e): { refused = pushS(refused, "\{c!.text()}: \{e}"); } Ok(_): { } }
+        } else if (kind == "recipe") {
+          match (recipeFrom(b)) { Err(e): { refused = pushS(refused, "\{c!.text()}: \{e}"); } Ok(r): { ix.addRecipe(r); } }
+        }
+      }
+    }
+  }
+  return Loaded(ix, refused);
+}
+
+string[] pushS(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+export bool same(const u8[] a, const u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+Held[] pushHeld(Held[] xs, Held x) {
+  Held[] out = Held[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+export Cid[] pushCid(Cid[] xs, Cid x) {
+  Cid[] out = Cid[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+export bool contains(Cid[] xs, Cid x) {
+  for (i32 i = 0; i < xs.len(); i++) { if (xs[i].eq(x)) { return true; } }
+  return false;
+}

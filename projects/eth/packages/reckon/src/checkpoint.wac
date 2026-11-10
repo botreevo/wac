@@ -1,0 +1,101 @@
+// From a beacon checkpoint to an execution block hash: the light client (packages/lightclient), run as `lc` runs it,
+// over beacon data kept in a directory, as `packages/lightclient/tools/mainnet.sh` fetches it. The hash is the anchor
+// every chain read is then checked against (docs/anchoring.md), so the checkpoint is the one thing trusted.
+//
+//     DIR/bootstrap.ssz    the light-client bootstrap for the checkpoint (required)
+//     DIR/updates.ssz      updates by period, in the beacon API's chunked list form (optional)
+//     DIR/finality.ssz     the latest finality update (optional)
+//     DIR/optimistic.ssz   the latest optimistic update (optional)
+//
+// Mainnet only: its fork schedule and genesis validators root are what signatures are checked under.
+
+import { Sys } from "std";
+import { Result } from "core";
+import { codec.hexEncode, codec.hexDecoded } from "wac";
+import { forkNamed } from "../../ssz/src/forks.wac";
+import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, processOptimisticUpdate, headerSlot }
+  from "../../lightclient/src/store.wac";
+import { Schedule } from "../../lightclient/src/schedule.wac";
+import { executionBlockHash, executionStateRoot } from "../../lightclient/src/header.wac";
+
+/** What the light client ends up believing: the finalized execution block, and how it got there. */
+export struct Anchored {
+  u8[] blockHash;
+  u8[] stateRoot;
+  i64 beaconSlot;
+  string[] log;
+}
+
+/** Mainnet's genesis validators root: part of every signing domain, so a signature from another chain fails. */
+u8[] MAINNET_GVR() { return hexDecoded("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"); }
+
+/** Mainnet's genesis time: the clock slot, when none is given, is counted from it. */
+export i64 MAINNET_GENESIS() { return 1606824023 as i64; }
+
+string hx(u8[] b) { return "0x" + string.fromBytes(hexEncode(b)); }
+
+u8[] cut(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+i64 le64(u8[] b) {
+  i64 v = 0 as i64;
+  for (i32 i = 7; i >= 0; i--) { v = (v << (8 as i64)) | (b[i] as i64); }
+  return v;
+}
+
+string[] more(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+async u8[]? optional(Sys sys, string path) { return (await sys.readFile(path)).ok(); }
+
+/**
+ * The finalized execution block, from the beacon block root `checkpoint`, the beacon data in `dir`, read as fork
+ * `forkName`, at clock slot `now`. Refused when the bootstrap is not the checkpoint's, or an update does not verify.
+ */
+export async Result<Anchored, string> anchorFrom(Sys sys, string checkpoint, string dir, string forkName, i64 now) {
+  i32 fork = forkNamed(forkName);
+  if (fork < 0) { return Result.Err("the light client: \{forkName} is not a fork it reads"); }
+  string body = checkpoint.len() >= 2 && checkpoint.slice(0, 2) == "0x" ? checkpoint.slice(2, checkpoint.len()) : checkpoint;
+  u8[]? root = body.len() == 64 ? hexDecoded(body) : null;
+  if (root is null) { return Result.Err("the light client: a checkpoint is a 32-byte beacon block root"); }
+  u8[]? boot = await optional(sys, dir + "/bootstrap.ssz");
+  if (boot is null) { return Result.Err("the light client: no \{dir}/bootstrap.ssz"); }
+  Schedule net = Schedule.mainnet();
+  Store? s = initializeStoreWith(net, fork, root!, boot!);
+  if (s is null) { return Result.Err("the light client: the bootstrap is not the checkpoint's, or its committee is not proven by it"); }
+  Store store = s!;
+  string[] log = ["light client: bootstrap proven against checkpoint \{hx(root!)}, slot \{headerSlot(store.finalizedHeader)}"];
+  u8[]? ups = await optional(sys, dir + "/updates.ssz");
+  if (ups is not null) {
+    u8[] d = ups!;
+    i32 at = 0;
+    while (at + 12 <= d.len()) {
+      i32 n = le64(cut(d, at, at + 8)) as~ i32;
+      if (n < 4 || at + 8 + n > d.len()) { return Result.Err("the light client: updates.ssz is not a chunked list"); }
+      if (!processUpdate(store, cut(d, at + 12, at + 8 + n), now, MAINNET_GVR())) { return Result.Err("the light client: an update did not verify"); }
+      at = at + 8 + n;
+      log = more(log, "light client: update accepted, finalized slot \{headerSlot(store.finalizedHeader)}");
+    }
+  }
+  u8[]? fin = await optional(sys, dir + "/finality.ssz");
+  if (fin is not null) {
+    if (!processFinalityUpdate(store, fin!, now, MAINNET_GVR())) { return Result.Err("the light client: the finality update did not verify"); }
+    log = more(log, "light client: finality update accepted, finalized slot \{headerSlot(store.finalizedHeader)}");
+  }
+  u8[]? opt = await optional(sys, dir + "/optimistic.ssz");
+  if (opt is not null) {
+    if (!processOptimisticUpdate(store, opt!, now, MAINNET_GVR())) { return Result.Err("the light client: the optimistic update did not verify"); }
+  }
+  u8[]? hash = executionBlockHash(store.fork, store.finalizedHeader);
+  u8[]? state = executionStateRoot(store.fork, store.finalizedHeader);
+  if (hash is null || state is null) { return Result.Err("the light client: the finalized header names no execution block"); }
+  log = more(log, "light client: finalized execution block \{hx(hash!)}: the anchor");
+  return Result.Ok(Anchored(hash!, state!, headerSlot(store.finalizedHeader), log));
+}

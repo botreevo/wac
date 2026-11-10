@@ -13,108 +13,15 @@
 // `--resolver-code`, the keccak256 of their runtime code. Without an anchor that proves the node is consistent with
 // itself and with those contracts, not that its chain is anyone else's; it says so when it answers.
 
-import { Sys, Net } from "std";
-import { Result } from "core";
-import { json.JsonValue, codec.hexEncode, codec.hexDecoded } from "wac";
-import { ethrpc.call, ethrpc.headerOf, ethrpc.Header, ethrpc.proofOfSlots, ethrpc.Proof, ethrpc.memberQuantity,
-         mpt.accountAt, mpt.storageAt, mpt.AccountProof, mpt.StorageProof,
-         ens.namehash, ens.ownerSlot, ens.resolverSlot, ens.recordOf, ens.Record, ens.versionSlot, ens.contenthashSlot,
-         ens.slotsFor, ens.contenthashOf, ipfs.Cid, ipfs.cidFromBytes } from "@/lib.wac";
-import { transient } from "../src/registry2.wac";
+import { Sys } from "std";
+import { codec.hexDecoded } from "wac";
+import { ensContent, NameAnswer } from "../src/names.wac";
 
-string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
 u8[] unhex(string s) { return hexDecoded(s.len() >= 2 && s.slice(0, 2) == "0x" ? s.slice(2, s.len()) : s); }
 
 string flag(string[] a, string name) {
   for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
   return "";
-}
-
-u8[] padded(u8[] v) {
-  u8[] w = u8[].filled(32, 0);
-  for (i32 i = 0; i < v.len() && i < 32; i++) { w[32 - v.len() + i] = v[i]; }
-  return w;
-}
-
-i64 toI64(u8[] w) {
-  i64 n = 0 as i64;
-  for (i32 i = 24; i < 32; i++) { n = (n << 8) | (w[i] as i64); }
-  return n;
-}
-
-struct Chain {
-  Net net;
-  string host;
-  i32 port;
-  Header h;
-  i64 number;
-}
-
-string[] keys(u8[][] slots) {
-  string[] out = string[].defaulted(slots.len());
-  for (i32 i = 0; i < slots.len(); i++) { out[i] = "0x" + hex(slots[i]); }
-  return out;
-}
-
-/** Proofs of `slots` of `account` at the chain's block, the account's code checked against `code`. */
-Result<Proof, string> proofs(Chain c, u8[] account, u8[] code, string what, u8[][] slots) {
-  Proof p = try proofOfSlots(c.net, c.host, c.port, "0x" + hex(account), keys(slots), c.h.hash);
-  AccountProof a = accountAt(c.h.stateRoot, account, p.accountNodes);
-  if (!a.ok) { return Result.Err("the \{what}'s account proof: \{a.error}"); }
-  if (!a.present) { return Result.Err("there is no account at the \{what}'s address in this block"); }
-  if (hex(a.account.codeHash) != hex(code)) { return Result.Err("the account at the \{what}'s address runs other code (0x\{hex(a.account.codeHash)})"); }
-  return Result.Ok(p);
-}
-
-/** One slot of `account`, proved: a word, zero where absent. */
-Result<u8[], string> word(Chain c, u8[] account, u8[] code, string what, u8[] slot) {
-  Proof p = try proofs(c, account, code, what, [slot]);
-  AccountProof a = accountAt(c.h.stateRoot, account, p.accountNodes);
-  StorageProof s = storageAt(a.account.storageRoot, slot, p.slots[0]);
-  if (!s.ok) { return Result.Err("the \{what}'s slot 0x\{hex(slot)}: \{s.error}"); }
-  return Result.Ok(padded(s.value));
-}
-
-struct Answer {
-  i32 code;
-  string out;
-}
-
-Result<Answer, string> resolve(Net net, string name, string host, i32 port, u8[] registry, u8[] registryCode,
-                               u8[] resolverCode, u8[] anchor) {
-  bool anchored = anchor.len() == 32;
-  string where = anchored ? "[\"0x\{hex(anchor)}\",false]" : "[\"latest\",false]";
-  JsonValue block = try call(net, host, port, anchored ? "eth_getBlockByHash" : "eth_getBlockByNumber", where);
-  if (block.isNull()) { return Result.Err("the node does not have the anchored block"); }
-  Header h = try headerOf(block, anchor);
-  Chain c = Chain(net, host, port, h, toI64(padded(memberQuantity(block, "number"))));
-  u8[] node = namehash(name.toBytes());
-  string at = "block \{c.number} 0x\{hex(h.hash).slice(0, 16)}…" + (anchored ? "" : ", the node's latest (no anchor)");
-
-  Proof rp = try proofs(c, registry, registryCode, "registry", [ownerSlot(node), resolverSlot(node)]);
-  Record r = recordOf(h.stateRoot, registry, name.toBytes(), rp.accountNodes, rp.slots[0], rp.slots[1]);
-  if (!r.ok) { return Result.Err("the registry's proof: \{r.error}"); }
-  if (!r.present) { return Result.Ok(Answer(1, "\{name} has no owner, proved absent at \{at}")); }
-  if (r.resolver.len() == 0) { return Result.Ok(Answer(1, "\{name} has no resolver, proved at \{at}")); }
-
-  // The version decides where the contenthash is, and its head how long it is: two reads, then the whole of it
-  // proved at once by contenthashOf, which checks the version and the head again against the same root.
-  i64 version = toI64(try word(c, r.resolver, resolverCode, "resolver", versionSlot(node)));
-  u8[] head = try word(c, r.resolver, resolverCode, "resolver", contenthashSlot(node, version));
-  i32 length = (head[31] & (1 as u8)) == 0 ? (head[31] as i32) / 2 : ((toI64(head) - (1 as i64)) / (2 as i64)) as~ i32;
-  if (length > 4096) { return Result.Err("a contenthash of \{length} bytes"); }
-  u8[][] slots = slotsFor(node, version, length);
-  Proof cp = try proofs(c, r.resolver, resolverCode, "resolver", slots);
-  u8[] bytes = try contenthashOf(h.stateRoot, r.resolver, node, version, cp.accountNodes, cp.slots);
-  if (bytes.len() == 0) { return Result.Ok(Answer(1, "\{name} has no contenthash, proved at \{at}")); }
-  // EIP-1577: the ipfs namespace 0xe3 as a varint (0xe3 0x01), then a CID.
-  if (bytes.len() < 3 || bytes[0] != (0xe3 as u8) || bytes[1] != (0x01 as u8)) {
-    return Result.Err("\{name}'s contenthash is not an ipfs one: 0x\{hex(bytes)}");
-  }
-  u8[] cidBytes = u8[].filled(bytes.len() - 2, 0);
-  for (i32 i = 2; i < bytes.len(); i++) { cidBytes[i - 2] = bytes[i]; }
-  Cid cid = try cidFromBytes(cidBytes);
-  return Result.Ok(Answer(0, "ipfs://\{cid.text()}\nproved at \{at}; owner 0x\{hex(r.owner)}, resolver 0x\{hex(r.resolver)}, record version \{version}"));
 }
 
 export i32 main(Sys sys) {
@@ -136,18 +43,8 @@ export i32 main(Sys sys) {
   i32 port = 0;
   u8[] ps = rpc.slice(colon + 1, rpc.len()).toBytes();
   for (i32 i = 0; i < ps.len(); i++) { port = port * 10 + (ps[i] as i32) - 48; }
-  // A block can land between the header and a proof, and a node proves recent blocks only: try again then, and only
-  // then. A proof that fails fails the same way every time (registry2.wac's `transient`).
-  string last = "";
-  for (i32 i = 0; i < 8; i++) {
-    match (resolve(sys.net(), a[1], rpc.slice(0, colon), port, registry, rc, vc, anchor)) {
-      Ok(ans): { sys.log(ans.out); return ans.code; }
-      Err(e): {
-        last = e;
-        if (!transient(e)) { break; }
-      }
-    }
+  match (ensContent(sys.net(), a[1], rpc.slice(0, colon), port, registry, rc, vc, anchor)) {
+    Ok(ans): { sys.log(ans.out); return ans.code; }
+    Err(e): { sys.warn("name: \{e}"); return 3; }
   }
-  sys.warn("name: \{last}");
-  return 3;
 }

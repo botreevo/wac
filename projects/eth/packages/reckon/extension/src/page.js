@@ -21,6 +21,25 @@ async function saveSettings() {
   await chrome.storage.local.set({ settings: s });
 }
 
+/**
+ * The fence: no request leaves this tab unless the extension itself makes it. The app's frame is sandboxed under a CSP
+ * that refuses every fetch, but a CSP cannot stop a document navigating itself (Chrome has no navigate-to), and that
+ * navigation's request reaches the network before anything refuses its answer. So a session rule for this tab blocks
+ * every request whose initiator is not this extension: the app's, whose origin is opaque, and its navigations among
+ * them. Admission's own requests (mirrors, RPC, beacon node) are the extension's and pass. Nothing is shown until the
+ * fence is up, and none is shown if it cannot be put up. The service worker takes the rule down with the tab.
+ */
+const fenced = (async () => {
+  const tab = await chrome.tabs.getCurrent();
+  if (!tab || typeof tab.id !== 'number') throw new Error('reckon: not in a tab of its own, so no fence for the app');
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [tab.id],
+    addRules: [{ id: tab.id, priority: 1, action: { type: 'block' },
+                 condition: { tabIds: [tab.id], excludedInitiatorDomains: [chrome.runtime.id] } }],
+  });
+  return tab.id;
+})();
+
 let shown = null;   // { tree, page }: what the frame shows, and the only tree its requests are answered from
 
 function account(lines) { $('account').textContent = lines.join('\n'); }
@@ -48,6 +67,7 @@ function showAsOf(asOf, ok) {
 
 /** Show `page` of `tree` in a fresh sandbox loader. Exported for the tests, which put a tree in OPFS themselves. */
 export async function show(tree, page = 'index.html') {
+  await fenced;   // throws, and shows nothing, when the fence could not be put up
   const { html, report } = buildDocument(tree, page);
   shown = { tree, page };
   const frame = $('app');

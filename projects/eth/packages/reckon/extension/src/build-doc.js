@@ -119,6 +119,31 @@ function workerModule(tree, path, report, memo = new Map(), stack = []) {
 /** The shim, run first in the page: fetch, XHR and links within the tree go to the extension page. */
 function shim(pagePath, workers) {
   return `<script>(() => {
+// WebRTC is not covered by the CSP: a peer connection sends UDP (STUN, then ICE checks) to whatever address it is given,
+// and the tab's fence (page.js) sees only HTTP. So its constructors are taken away here. A child frame has an opaque
+// origin of its own, so the page cannot reach one's; but a frame with its own document (srcdoc) runs its own script,
+// with its own RTCPeerConnection. Such a frame is made to load without scripts: it loads after the task that inserted
+// it, so the observer, a microtask, always comes first (test/hostile.cjs, webrtc-srcdoc).
+const RTC = ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'RTCSessionDescription', 'RTCIceCandidate',
+  'RTCRtpSender', 'RTCRtpReceiver', 'RTCRtpTransceiver', 'RTCDtlsTransport', 'RTCIceTransport', 'RTCSctpTransport', 'RTCCertificate'];
+const noRtc = (w) => { for (const k of RTC) { try { Object.defineProperty(w, k, { value: undefined, writable: false, configurable: false }); } catch {} } };
+noRtc(window);
+const scriptless = (f) => {
+  if (!(f instanceof HTMLIFrameElement) || f.getAttribute('sandbox') === '') return;
+  f.setAttribute('sandbox', '');   // every restriction, scripts included
+  if (f.hasAttribute('srcdoc')) f.setAttribute('srcdoc', f.getAttribute('srcdoc'));   // load again, under it
+  else if (f.hasAttribute('src')) f.setAttribute('src', f.getAttribute('src'));
+};
+new MutationObserver((records) => {
+  for (const r of records) {
+    // A frame whose sandbox is already '' loads whatever it is given without scripts; any other is made so, and reloaded.
+    if (r.type === 'attributes') { scriptless(r.target); continue; }
+    for (const n of r.addedNodes) {
+      if (n instanceof HTMLIFrameElement) scriptless(n);
+      if (n.querySelectorAll) for (const f of n.querySelectorAll('iframe')) scriptless(f);
+    }
+  }
+}).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['srcdoc', 'src', 'sandbox'] });
 const PAGE = ${JSON.stringify(pagePath)}, ORIGIN = ${JSON.stringify(ORIGIN)};
 // The document's own address is the loader's, so a URL beside it (a page that resolves names against location.href,
 // as a wac-web page's site does) means the same name beside the page in the tree.

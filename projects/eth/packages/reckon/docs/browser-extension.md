@@ -109,7 +109,7 @@ what the user installed, and its build can itself be a derivation, so it can be 
    - it refuses an unreviewed tree, saying why, and shows nothing;
    - that second admission resumed the kept state, with no bootstrap;
    - it admits `ens:vitalik.eth` by proof, says its content is on no mirror here, and shows nothing.
-   Still to do: a static site from the gateway, when it answers, and a hostile app that tries every way out.
+   Still to do: a static site from the gateway, when it answers. The hostile app is done: see "A hostile app" below.
 4. **State and freshness. Done (2026-11-10).**
    - **Light-client state:** kept and resumed (R4, `--state`).
    - **Revocations at each open:** every open is a fresh admission, so with a registry set, revocations and rejections
@@ -182,6 +182,43 @@ what the user installed, and its build can itself be a derivation, so it can be 
   The extension no longer defaults to a gateway.
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
+
+## A hostile app (2026-11-10)
+
+`extension/test/hostile.cjs` shows an admitted tree whose pages try every way out we know of. Each way out is aimed at
+its own path on a listener at 127.0.0.1 (TCP, and UDP for WebRTC's STUN). For each one, the test records what the app
+saw, the CSP violation the browser reported, and whether anything reached the listener. It passes 53 of 53. What stops
+each way out is printed beside it:
+
+- **The sandbox CSP** stops subresources and connections, each with its directive reported: style, script (including
+  a dynamic `import()`), font, image (including CSS `url()`), media, object and embed, frame, prefetch and preload,
+  WebSocket, EventSource, `sendBeacon` (which says it queued), and a form's action.
+- **The loader's shim** answers `fetch`, XHR and workers with names in the tree only, and CSP stands behind it.
+  A blob worker's own `fetch` is refused under the CSP it inherits.
+- **The opaque origin** leaves no service worker, storage, IndexedDB or cookies, and no reach into the parent, the top
+  or a child frame.
+- **The sandbox flags** stop popups (including `target=_blank`), top navigation, downloads, and a meta refresh.
+- **The page** answers only names in the shown tree and shows only a page in it. A path out of the tree, another
+  tree's name, or a URL is a 404, or nothing.
+
+Two ways out got past all of that. Both are closed now:
+
+1. **A frame navigating itself** (`location.href = …`). CSP cannot stop a document's own navigation, since Chrome has
+   no `navigate-to`. The request reached the listener even though COEP then refused the answer. **The fence** closes
+   it: when the extension page opens, it adds a `declarativeNetRequest` session rule for its own tab that blocks every
+   request not initiated by the extension (`page.js`). That covers the app's requests, whose initiator is opaque, and
+   its navigations. Admission's own requests to mirrors, RPC and the beacon node are the extension's, and they pass
+   (`admit.sh` still passes 13 of 13 through the fence). Nothing is shown until the fence is up. The service worker
+   removes the rule when the tab closes. This adds the `declarativeNetRequest` permission.
+2. **WebRTC.** CSP does not cover it, and the fence sees only HTTP. A peer connection sent STUN packets (UDP) to the
+   listener. The shim now removes the WebRTC constructors before the app runs. A child frame has an opaque origin of
+   its own, so the app cannot borrow one from it. But a frame with its own document (`srcdoc`) runs its own script, and
+   that sent STUN too. So every frame the app makes is sandboxed with no scripts (`sandbox=""`), and reloaded under it
+   if the app loosens that. The frame loads after the task that inserted it, so the shim's observer always acts first.
+   The sandbox CSP also says `webrtc 'block'`, which this Chromium ignores; it will close the route where it is
+   implemented.
+
+A frame of the app's runs no script, then. No admitted app has needed one.
 
 ## A real app (2026-11-10)
 

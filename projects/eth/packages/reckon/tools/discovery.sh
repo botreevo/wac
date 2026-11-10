@@ -8,6 +8,7 @@
 #   - admission with the mirrors found admits, where either mirror alone does not;
 #   - a manifest that leads to a lying mirror costs nothing: its forged statement is left out and reported;
 #   - a long chain of manifests stops at the limit, and says so;
+#   - `--mirrors-from URL` walks inside the command: the mirrors found join those given with --mirror;
 #   - mirrors given by hand work as before.
 #
 #     sh packages/reckon/tools/discovery.sh WORKDIR     (PORT defaults to 8860; the second site is PORT+1, the third PORT+2)
@@ -96,6 +97,16 @@ mkdir -p site3/chain
 i=0; while [ $i -lt 20 ]; do $CL manifest "site3/chain/$i.json" --follow "$((i + 1)).json" >/dev/null; i=$((i + 1)); done
 $CL mirrors "$u3/chain/0.json" > /dev/null 2> chain.log || true
 grep -q "past the limit of 16 manifests" chain.log && ok "a chain of 20 manifests stops at 16, and says so" || bad "chain: $(cat chain.log)"
+
+step "--mirrors-from: the walk inside the command"
+[ "$(admit --store client6 --mirrors-from "$u1/reckon-mirrors.json")" = yes ] && grep -q "not JSON\|404\|Not Found" admit.log \
+  && ok "admit --mirrors-from the first manifest: admitted, what it could not read reported" || bad "--mirrors-from: $(cat admit.log)"
+[ "$(admit --store client7 --mirrors-from "$u3/reckon-mirrors.json")" = yes ] && grep -q "left out: mirror 0" admit.log \
+  && ok "…and from the third: its liar's forged statement left out, the honest mirrors decide" || bad "--mirrors-from the third: $(cat admit.log)"
+[ "$(admit --store client8 --mirror "$u1/a/mirror" --mirrors-from "$u3/chain/0.json")" = no ] && grep -q "no mirror found" admit.log \
+  && ok "a walk that finds no mirror adds none, and says so; one mirror by hand is not enough" || bad "an empty walk: $(cat admit.log)"
+[ "$(admit --store client9 --mirror "$u1/a/mirror" --mirrors-from "$u2/reckon-mirrors.json")" = yes ] \
+  && ok "by hand and found together: admitted" || bad "by hand and found: $(cat admit.log)"
 
 step "mirrors given by hand, as before"
 [ "$(admit --store client5 --mirror "$u1/a/mirror" --mirror "$u2/deep/b")" = yes ] && ok "mirrors given by hand still work" || bad "by hand: $(cat admit.log)"

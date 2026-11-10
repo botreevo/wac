@@ -5,10 +5,10 @@ import { openTree } from './tree.js';
 import { buildDocument, typeOf } from './build-doc.js';
 
 const $ = (id) => document.getElementById(id);
-const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'policy', 'now', 'recheck'];
+const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'mirrorsFrom', 'policy', 'now', 'recheck'];
 // No mirror by default: a public gateway is a choice to make, and one that is down slows every admission until it is
 // left out. The settings suggest one.
-const DEFAULTS = { mirrors: '', policy: '{ signers: {}, roles: {} }', recheck: '600' };
+const DEFAULTS = { mirrors: '', mirrorsFrom: '', policy: '{ signers: {}, roles: {} }', recheck: '600' };
 
 async function loadSettings() {
   const got = await chrome.storage.local.get('settings');

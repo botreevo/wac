@@ -54,9 +54,14 @@ Nothing fails the walk. The answer is the list of mirrors and the list of proble
 
     claim mirrors URL                          the mirrors URL leads to, one per line (to pass as --mirror); problems to stderr
     claim manifest OUT [--lists URL]… [--follow URL]…     write a manifest
+    claim admit|run|origins|… --mirrors-from URL…         the walk inside the command: what it finds joins --mirror
+    web SUBJECT ROLE … --mirrors-from URL…                the same in a browser; the extension's setting "mirror manifests"
 
 `src/discovery.wac` holds `readManifest`, `writeManifest`, `resolveUrl` and `discover(caps, url, maxManifests,
-maxMirrors)`, for `--mirrors-from URL` in `claim`, in `web` and in the extension.
+maxMirrors)`, and `mirrorsAsked(caps, args)`: the `--mirror`s as given, then what each `--mirrors-from` walk finds (16
+manifests and 32 mirrors a walk), each mirror once, with the walks' problems to report. A walk that finds no mirror is
+one of them. `claim` and `web` both take their mirrors from it; the extension passes each line of its setting as
+`--mirrors-from`. `tools/discovery.sh` checks it in `claim admit` (15 of 15, with the four checks below).
 
 ## What was run (2026-11-10)
 

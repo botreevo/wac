@@ -86,14 +86,37 @@ export struct Replayed {
   string error;
 }
 
-/** A JSON-RPC answer: a result, or an error with its code. */
+/** A JSON-RPC answer: a result, or an error with its code, and the error's `data` when it has one ("" when not). */
 export struct Answer {
   JsonValue? result;
   i32 code;
   string message;
+  string data;
 
-  Answer ok(JsonValue v) { return Answer(v, 0, ""); }
-  Answer error(i32 code, string message) { return Answer(null, code, message); }
+  Answer ok(JsonValue v) { return Answer(v, 0, "", ""); }
+  Answer error(i32 code, string message) { return Answer(null, code, message, ""); }
+
+  /**
+   * A call that reverted, as geth answers it: code 3, "execution reverted" (with the reason when the data is a
+   * Solidity `Error(string)`), and the revert data itself as the error's `data`, which is where wallets look for it.
+   */
+  Answer reverted(u8[] output) {
+    string? why = revertReason(output);
+    return Answer(null, 3, why is null ? "execution reverted" : "execution reverted: " + why!, bytesToHex(output));
+  }
+}
+
+/** The reason in revert data that is `Error(string)`: selector 0x08c379a0, an offset of 32, a length, the bytes. */
+export string? revertReason(u8[] d) {
+  if (d.len() < 68 || d[0] != 0x08 || d[1] != 0xc3 || d[2] != 0x79 || d[3] != 0xa0) { return null; }
+  for (i32 i = 4; i < 35; i++) { if (d[i] != 0) { return null; } }
+  if (d[35] != 32) { return null; }
+  for (i32 i = 36; i < 64; i++) { if (d[i] != 0) { return null; } }
+  i64 n = ((d[64] as i64) << 24) | ((d[65] as i64) << 16) | ((d[66] as i64) << 8) | (d[67] as i64);
+  if (n > ((d.len() - 68) as i64)) { return null; }
+  u8[] text = u8[].filled(n as@ i32, 0);
+  for (i32 i = 0; i < text.len(); i++) { text[i] = d[68 + i]; }
+  return string.fromBytes(text);
 }
 
 export struct Engine {
@@ -792,7 +815,12 @@ export struct Engine {
     w.record();
     Outcome o = processMessage(evm, m);
     w.undo(w.seal());
-    if (!o.succeeded()) { return Answer.error(3, "execution reverted: " + bytesToHex(o.output())); }
+    match (o.halt) {
+      Revert(d): { return Answer.reverted(d); }
+      Failure(why): { return Answer.error(-32000, why); }
+      Stop: { }
+      Return(_): { }
+    }
     return Answer.ok(str(bytesToHex(o.output())));
   }
 
@@ -993,8 +1021,9 @@ export struct Engine {
     i64 hi = h.gasLimit.low() as@ i64;
     Spec spec = this.config.specAt(h.timestamp.add(U256.ofU64(12)));
     if (spec.isOsaka && hi > 16777216) { hi = 16777216; }
-    string why = this.tryGas(spec, h, tx, hi);
-    if (why != "") { return Answer.error(3, why); }
+    Processed first = this.tryRun(spec, h, tx, hi);
+    if (first.invalid != "") { return Answer.error(-32000, first.invalid); }
+    if (!first.success) { return Answer.reverted(first.output); }
     while (hi - lo > 1) {
       i64 mid = lo + (hi - lo) / 2;
       if (this.tryGas(spec, h, tx, mid) == "") { hi = mid; } else { lo = mid; }
@@ -1004,14 +1033,20 @@ export struct Engine {
 
   /** "" when `tx` with gas limit `gas` succeeds as the next block's first transaction; otherwise why not. */
   string tryGas(this, Spec spec, Header h, Transaction tx, i64 gas) {
+    Processed p = this.tryRun(spec, h, tx, gas);
+    if (p.invalid != "") { return p.invalid; }
+    return p.success ? "" : "execution reverted";
+  }
+
+  /** `tx` with gas limit `gas` run as the next block's first transaction, and undone. */
+  Processed tryRun(this, Spec spec, Header h, Transaction tx, i64 gas) {
     tx.gasLimit = U256.ofU64(gas as@ u64);
     BlockEnv env = BlockEnv(h.coinbase, h.number.add(U256.one()), h.timestamp.add(U256.ofU64(12)), h.gasLimit,
                             h.prevRandao, U256.zero(), U256.zero(), this.chainId, this.ancestorHashes(h));
     this.world.record();
     Processed p = processTransaction(spec, this.world, env, tx, h.gasLimit.low() as@ i64, spec.maxBlobGasPerBlock, null);
     this.world.undo(this.world.seal());
-    if (p.invalid != "") { return p.invalid; }
-    return p.success ? "" : "execution reverted";
+    return p;
   }
 
   /**

@@ -65,12 +65,10 @@ On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 
 
 ## Findings
 
-- **wacuum drops revert data.** A reverting `eth_estimateGas` answers a bare `execution reverted`, and a reverting
-  `eth_call` puts the revert data in the message (`execution reverted: 0x08c379a0…`) rather than in `error.data`. ethers
-  therefore reports "missing revert data" for every refused transaction. The wallet works around it by replaying the
-  call with a raw `eth_call` and decoding `Error(string)` from the message. The fix belongs in
-  `packages/wacuum/src/engine/engine.wac` (`call` and `estimateGas`): put the output in `data`, and have
-  `estimateGas` return the reverting run's output too.
+- **wacuum dropped revert data** (fixed). A reverting `eth_estimateGas` answered a bare `execution reverted`, and a
+  reverting `eth_call` put the data in the message rather than in `error.data`, so ethers reported "missing revert
+  data" for every refused transaction. wacuum now answers as geth does: code 3, `execution reverted: <reason>`, and
+  the data in `error.data` (`packages/wacuum/test/revert_test.wac`). The wallet's workaround is gone.
 - **A wacuum devnet proves only its head.** `--dev` finalizes every block as it makes it, and the world keeps the
   finalized block's state and nothing older. A proof requested for the header just fetched is therefore refused
   ("the state of that block is not available") whenever a block lands in between. Through the liar, which adds a hop

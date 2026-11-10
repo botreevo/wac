@@ -81,6 +81,25 @@ check nanpaths "exit 0"
 check nbody "exit 0"
 check probe "exit 0" differs
 
+# The minimums every runner of this machine must provide (docs/runner.md): 10,000 frames of depth.wac's recursion and
+# 1 GiB of heap held live by heap.wac. Within them a run must complete on both engines; past what an engine allows it
+# aborts and yields nothing, which is correct.
+limit() {   # limit PROGRAM ARG WANT HOST
+  printf '%s\n' "$2" > limit.args
+  r=$(wac derive.wasm recipe --program "$1.wasm" --args limit.args $store 2>/dev/null)
+  out=$($4 derive.wasm run "$r" $store --timeout 300000 2>/dev/null) || true
+  got=$([ -n "$out" ] && echo "completes" || echo "aborts")
+  [ "$got" = "$3" ] && ok "$1 $2: $3 on $5" || bad "$1 $2: $got on $5, want $3"
+}
+limit depth 10000 completes "$V8" V8
+limit heap 1024 completes "$V8" V8
+limit depth 1000000 aborts "$V8" V8
+if [ -n "$WT" ]; then
+  limit depth 10000 completes "$WT" wasmtime
+  limit heap 1024 completes "$WT" wasmtime
+  limit depth 1000000 aborts "$WT" wasmtime
+fi
+
 # What the program could and could not reach, from its own log.
 p=$(run "$V8" "$(recipe probe)")
 wac obj.wasm cat "$p" log $store > probe.log

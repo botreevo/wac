@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `wac task map` after adding a package or an entry point; `wac task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-34 packages, 182,510 lines of wac, 2873 tests,
+34 packages, 182,510 lines of wac, 2876 tests,
 80 command-line programs and 13 browser pages.
 
 ## Packages
@@ -36,7 +36,7 @@ In dependency order: nothing here imports anything below it.
 | [`fetch`](packages/fetch/) | One HTTP request to a URL — `http://` or `https://` — and the whole response back. | 367 | 2 | `bytes` `http` `tls` |
 | [`fs`](packages/fs/) | What a system needs around a filesystem that is its own: the trees that exist only when read (`/dev`, `/proc`, `/bin`), an image to keep a… | 1,269 | 14 | `gzip` `platform` |
 | [`git`](packages/git/) | git in wac: the object database, a working tree, and a client that clones a real repository over its own TLS. | 5,778 | 60 | `bytes` `codec` `crypto` `gzip` `http` `tls` |
-| [`platform`](packages/platform/) | The hosts a wac program runs on, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell the time… | 3,784 | 281 | `fs` `http` `json` `wacc` |
+| [`platform`](packages/platform/) | The hosts a wac program runs on, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell the time… | 3,784 | 284 | `fs` `http` `json` `wacc` |
 | [`quic`](packages/quic/) | QUIC version 1 — RFC 9000 and RFC 9001 — in wac. | 5,726 | 104 | `crypto` `tls` |
 | [`sh`](packages/sh/) | A shell, in wac, whose definition of *correct* is GNU bash: a corpus of scripts runs through both and the two must agree on standard output… | 7,400 | 43 | `codec` `fmt` `fs` `platform` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 4,212 | 58 | `box` `bytes` `codec` `crypto` `fs` `sh` `tty` |

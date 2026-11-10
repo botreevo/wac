@@ -1,0 +1,174 @@
+// A LightClientHeader after Altair: is it valid, and what does it say about the execution chain?
+//
+// This is the step from "the sync committee signed this beacon block" to "this is the execution block, and its
+// state root", which is what anything reading Ethereum state by storage proof needs from a light client.
+//
+//   Capella–Fulu   the header carries the whole ExecutionPayloadHeader and a depth-4 branch proving its root at
+//                  gindex 25 of the beacon block body. The execution state root is a field of it, so a storage proof
+//                  can start right there.
+//   Gloas          the payload is no longer in the block (EIP-7732). The header carries only an execution block
+//                  hash, proved at gindex 2856: the bid's `parent_block_hash`, so it names the *previous* slot's
+//                  execution block. The state root then has to come from that block's RLP header, fetched from
+//                  anyone and checked by `keccak256(rlp) == block_hash`.
+//
+// So the block hash is the one anchor every fork can give, and `blockHashProof` builds the Gloas-style proof of it
+// for earlier headers too: the payload header's own branch to `block_hash` (gindex 412 in Capella, 812 from Deneb)
+// joined to the execution branch. That lets one code path follow the chain across the fork, and it lets the Gloas
+// construction be checked against real pre-Gloas data now, before any Gloas vectors exist.
+
+import { lightClientTypes, lightClientFields, CAPELLA, DENEB, GLOAS, FT_LIGHT_CLIENT_HEADER, FT_EXECUTION_PAYLOAD_HEADER,
+         FT_BEACON_BLOCK_HEADER, executionPayloadGindex, executionBlockHashGindex } from "../../ssz/src/forks.wac";
+import { containerSpans, fieldRoot, hashTreeRoot } from "../../ssz/src/container.wac";
+import { isValidMerkleBranch, isValidNormalizedMerkleBranch, hashPair, zeroHash, subtreeIndex } from "../../ssz/src/merkle.wac";
+
+/** A header taken apart: the beacon block header, and the execution part as this fork has it. */
+export struct Parts {
+  u8[] beacon;
+  /** The ExecutionPayloadHeader (Capella–Fulu), or the 32-byte block hash (Gloas), or nothing (Altair). */
+  u8[] execution;
+  u8[] branch;
+}
+
+u8[] cut(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+/** The parts of `header` as `fork` lays it out, or null when it is not one. Sync committee size does not matter here. */
+export Parts? partsOf(i32 fork, u8[] header) {
+  i32[] t = lightClientTypes(fork, 32);
+  i32[] f = lightClientFields(fork);
+  i32[]? s = containerSpans(t, f, FT_LIGHT_CLIENT_HEADER(), header, 0, header.len());
+  if (s is null) { return null; }
+  if (fork < CAPELLA()) { return Parts(cut(header, s![0], s![1]), u8[](), u8[]()); }
+  return Parts(cut(header, s![0], s![1]), cut(header, s![2], s![3]), cut(header, s![4], s![5]));
+}
+
+/** The beacon block header's `body_root`: its fifth field, at byte 80. */
+u8[] bodyRoot(u8[] beacon) { return cut(beacon, 80, 112); }
+
+/** `hash_tree_root` of the beacon block header: what a sync committee signs, and what a block root is. */
+export u8[]? beaconRoot(i32 fork, u8[] header) {
+  Parts? p = partsOf(fork, header);
+  if (p is null) { return null; }
+  return hashTreeRoot(lightClientTypes(fork, 32), lightClientFields(fork), FT_BEACON_BLOCK_HEADER(), p!.beacon);
+}
+
+/** `get_lc_execution_root` for this fork's own headers: the payload header's root, or the block hash itself in Gloas. */
+export u8[]? executionRoot(i32 fork, u8[] header) {
+  Parts? p = partsOf(fork, header);
+  if (p is null || fork < CAPELLA()) { return null; }
+  if (fork >= GLOAS()) { return p!.execution; }
+  return hashTreeRoot(lightClientTypes(fork, 32), lightClientFields(fork), FT_EXECUTION_PAYLOAD_HEADER(), p!.execution);
+}
+
+/** `is_valid_light_client_header`, for a header of `fork` (one in its own fork's layout). */
+export bool isValidHeader(i32 fork, u8[] header) {
+  Parts? p = partsOf(fork, header);
+  if (p is null) { return false; }
+  if (fork < CAPELLA()) { return true; }
+  u8[]? leaf = executionRoot(fork, header);
+  if (leaf is null) { return false; }
+  if (fork >= GLOAS()) { return isValidNormalizedMerkleBranch(leaf!, p!.branch, executionBlockHashGindex(fork), bodyRoot(p!.beacon)); }
+  u64 g = executionPayloadGindex();
+  return isValidMerkleBranch(leaf!, p!.branch, 4, subtreeIndex(g), bodyRoot(p!.beacon));
+}
+
+/** The ExecutionPayloadHeader field at `index`: 32 bytes for the hash- and root-valued fields used here. */
+u8[]? payloadField(i32 fork, u8[] payload, i32 index) {
+  i32[] t = lightClientTypes(fork, 32);
+  i32[] f = lightClientFields(fork);
+  i32[]? s = containerSpans(t, f, FT_EXECUTION_PAYLOAD_HEADER(), payload, 0, payload.len());
+  if (s is null) { return null; }
+  return cut(payload, s![index * 2], s![index * 2 + 1]);
+}
+
+/** The execution block hash a header names. Check the header with `isValidHeader` first. */
+export u8[]? executionBlockHash(i32 fork, u8[] header) {
+  Parts? p = partsOf(fork, header);
+  if (p is null || fork < CAPELLA()) { return null; }
+  if (fork >= GLOAS()) { return p!.execution; }
+  return payloadField(fork, p!.execution, 12);
+}
+
+/**
+ * The execution state root, where the header carries it (Capella–Fulu): field 2 of the payload header. Null in
+ * Gloas, where it has to come from the RLP block header the block hash names.
+ */
+export u8[]? executionStateRoot(i32 fork, u8[] header) {
+  Parts? p = partsOf(fork, header);
+  if (p is null || fork < CAPELLA() || fork >= GLOAS()) { return null; }
+  return payloadField(fork, p!.execution, 2);
+}
+
+/**
+ * A proof of the execution block hash against the beacon block's `body_root`, in the shape Gloas uses: for a
+ * Capella–Fulu header, the payload header's branch to `block_hash` (bottom first) followed by the execution branch.
+ * Verify it with `isValidNormalizedMerkleBranch(hash, proof, executionBlockHashGindex(fork), body_root)`.
+ */
+export u8[]? blockHashProof(i32 fork, u8[] header) {
+  Parts? p = partsOf(fork, header);
+  if (p is null || fork < CAPELLA()) { return null; }
+  if (fork >= GLOAS()) { return p!.branch; }
+  i32[] t = lightClientTypes(fork, 32);
+  i32[] f = lightClientFields(fork);
+  i32 n = fork >= DENEB() ? 17 : 15;
+  i32 width = n > 16 ? 32 : 16;
+  u8[][] level = u8[][].filled(width, zeroHash(0));
+  for (i32 i = 0; i < n; i++) {
+    u8[]? r = fieldRoot(t, f, FT_EXECUTION_PAYLOAD_HEADER(), p!.execution, i);
+    if (r is null) { return null; }
+    level[i] = r!;
+  }
+  u8[] out = u8[]();
+  i32 at = 12;                                            // block_hash
+  while (level.len() > 1) {
+    out = joined(out, level[at ^ 1]);
+    u8[][] up = u8[][].filled(level.len() / 2, zeroHash(0));
+    for (i32 i = 0; i < up.len(); i++) { up[i] = hashPair(level[2 * i], level[2 * i + 1]); }
+    level = up;
+    at = at / 2;
+  }
+  return joined(out, p!.branch);
+}
+
+u8[] joined(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+/** The beacon block body root a header commits to, for checking a `blockHashProof`. */
+export u8[]? headerBodyRoot(i32 fork, u8[] header) {
+  Parts? p = partsOf(fork, header);
+  if (p is null) { return null; }
+  return bodyRoot(p!.beacon);
+}
+
+/**
+ * `header == LightClientHeader()`: the default header, which is how an update says it carries no finalized header.
+ *
+ * **Not all zero bytes from Capella on.** The header holds the payload header behind an offset, and the payload
+ * header holds `extra_data` behind another, so the default serializes with two non-zero offsets in it. A client
+ * testing "all zeros" refuses every update without finality: found by Capella's sync vectors.
+ */
+export bool isEmptyHeader(i32 fork, u8[] header) {
+  if (fork < CAPELLA() || fork >= GLOAS()) { return allZero(header, 0, header.len()); }
+  Parts? p = partsOf(fork, header);
+  if (p is null) { return false; }
+  if (!allZero(p!.beacon, 0, p!.beacon.len()) || !allZero(p!.branch, 0, p!.branch.len())) { return false; }
+  i32[] t = lightClientTypes(fork, 32);
+  i32[] f = lightClientFields(fork);
+  i32[]? s = containerSpans(t, f, FT_EXECUTION_PAYLOAD_HEADER(), p!.execution, 0, p!.execution.len());
+  if (s is null) { return false; }
+  i32 extraAt = 436;                                      // the offset of `extra_data`, after ten fixed fields
+  if (s![20] != s![21]) { return false; }                 // `extra_data` is empty
+  return allZero(p!.execution, 0, extraAt) && allZero(p!.execution, extraAt + 4, p!.execution.len());
+}
+
+bool allZero(u8[] b, i32 from, i32 to) {
+  for (i32 i = from; i < to; i++) { if (b[i] != 0) { return false; } }
+  return true;
+}

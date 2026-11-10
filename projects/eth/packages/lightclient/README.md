@@ -30,7 +30,11 @@ wac-mono **0064**, now closed.
 | `apply_light_client_update`, `process_light_client_update` | **done** |
 | `is_better_update`, `process_light_client_store_force_update` | **done** |
 | the sync-committee period rules | **done** |
-| mainnet config, the fork schedule, a live beacon API | **not started** — 0066 |
+| post-Altair headers: Capella–Fulu execution branches, Gloas's block-hash header | **done** — `src/header.wac`, below |
+| mainnet fork schedule and versions | **done** — `ssz/src/forks.wac` (Gloas unscheduled upstream) |
+| a fork-aware store (layout, gindices and fork version by fork) | **done** — `light_client_sync` for Capella, Deneb, Electra and Fulu: 40 steps |
+| a store crossing a fork (`upgrade_lc_store_to_*`, the `*_store_with_legacy_data` vectors) | **not started** |
+| a live beacon API | **not started** — 0066 |
 
 ## What the vectors cannot check, and what stands in for it
 
@@ -105,3 +109,49 @@ Minimal, because Ethereum's sync-protocol vectors exist only for it: `SYNC_COMMI
 rather than 512, and Altair's fork version is `0x01000001` rather than `0x01000000`. Both mainnet and
 minimal versions are exported; `packages/ssz`'s descriptor table takes the committee size as a
 parameter for the same reason.
+
+## After Altair (2026-11-10)
+
+Read from `consensus-specs` at `0393013` (2026-11-09). What changes for a light client, fork by fork:
+
+| fork | header | state branches | execution |
+| --- | --- | --- | --- |
+| Capella | gains `execution` (ExecutionPayloadHeader, 15 fields) and `execution_branch` | unchanged (105, 54/55) | payload root at body gindex 25, depth 4 |
+| Deneb | payload header gains two blob-gas fields (17) | unchanged | unchanged |
+| Electra | unchanged | BeaconState grew: 169, 86/87 (depths 7, 6) | unchanged |
+| Fulu | **no light-client change** (there is no `specs/fulu/light-client`) | — | — |
+| Gloas | `execution` removed; `execution_block_hash` only (EIP-7732) | EIP-7688: 735, 2945/2946 (depths 9, 11) | block hash at gindex 2856, the bid's `parent_block_hash` |
+| Heze | no light-client change | — | — |
+
+**The consequence that matters for anything reading state by proof:** from Gloas on, a header does not contain an
+execution state root at all. It proves a block hash, and that hash is the *parent* execution block's (in Gloas the
+payload arrives after its beacon block). So the state root comes from that block's RLP header, fetched from anyone and
+checked by `keccak256(rlp) == block_hash`, and it is one slot older than the beacon header proving it. Since the block
+hash is the one anchor every fork can give, `blockHashProof` gives it in Gloas's shape for Capella–Fulu headers as well
+(the payload header's own branch to `block_hash`, gindex 412 or 812, joined to the execution branch), so one path can
+follow the chain across the fork.
+
+**What is checked, against what:**
+
+- `ssz/src/forks.wac` is one descriptor table per fork. All 90 `ssz_static` cases (ExecutionPayloadHeader and the five
+  light-client containers, mainnet, Capella to Gloas) merkleize to Ethereum's roots. This is the first real use of
+  `container.wac`'s offsets: from Capella on, a header carries `extra_data`, a list.
+- `src/header.wac` validates headers and reads the block hash and state root. Against `light_client_sync` for Capella,
+  Deneb, Electra and Fulu (minimal): 60 real headers are valid, their Gloas-shaped block-hash proofs hold, 80 stated
+  `execution_root`s match, and one byte changed in a payload's state root or in a branch is refused.
+- **There are no Gloas vectors for this.** The release pinned here (`v1.6.0-beta.0`, the last before the
+  consensus-spec-tests repository was archived) predates EIP-7732's light-client change: its Gloas containers are still
+  Electra's, and `forks_test.wac` asserts exactly that. The Gloas path is written from the spec and is checked only
+  through the shared block-hash construction above.
+
+- `store.wac` takes its fork's layout, gindices and fork version (a `fork` field on the store; Altair's functions keep
+  their names). Each fork's `light_client_sync` case runs through it step by step: 40 steps across Capella, Deneb,
+  Electra and Fulu, the finalized and optimistic headers' beacon and execution roots agreeing at every step, and Altair's
+  four cases unchanged. An Electra bootstrap read as Deneb's does not initialize.
+- **One bug the vectors found:** from Capella on, the spec's `finalized_header == LightClientHeader()` is not "all zero
+  bytes", because the default header serializes with two non-zero SSZ offsets in it. Testing for zeros refused every
+  update without finality. `isEmptyHeader` is the real test.
+
+**Still to do, in order:** a store that crosses forks (`upgrade_lc_store_to_*`, and the `*_store_with_legacy_data`
+vectors); the RLP header check that takes a Gloas block hash to a state root; mainnet's committee size and period length
+in the store, which is minimal-only today; and a beacon API client (0066).

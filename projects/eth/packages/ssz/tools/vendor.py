@@ -430,8 +430,15 @@ def parse_steps(text: str) -> list:
 
 
 def do_sync() -> dict:
+    return {
+        "source": f"{REPO} @ {COMMIT[:12]}, minimal/{SYNC_FORK}/light_client/sync",
+        "cases": do_sync_cases(SYNC_CASES),
+    }
+
+
+def do_sync_cases(names: list) -> list:
     cases = []
-    for name in SYNC_CASES:
+    for name in names:
         base = f"tests/minimal/{SYNC_FORK}/light_client/sync/pyspec_tests/{name}"
         meta_text = fetch(f"{RAW}/{base}/meta.yaml").decode()
         meta = {}
@@ -452,13 +459,59 @@ def do_sync() -> dict:
               f"bootstrap {len(bootstrap)//2} bytes", file=sys.stderr)
         cases.append({"case": name, "meta": meta, "steps": steps,
                       "bootstrap": bootstrap, "updates": updates})
-    return {
-        "source": f"{REPO} @ {COMMIT[:12]}, minimal/{SYNC_FORK}/light_client/sync",
-        "cases": cases,
-    }
+    return cases
+
+
+# Past Altair: the light-client containers of every later fork in the pinned release, for the per-fork tables in
+# `src/forks.wac`. Three cases a container is enough to catch a wrong descriptor (one wrong field type gives a wrong
+# root in every case) and keeps a cold rebuild to a few hundred small fetches.
+#
+# **gloas here is not the gloas of the current spec.** The release predates EIP-7732's light-client change: its
+# Gloas LightClientHeader is still Deneb's shape (830 bytes). It is vendored anyway, under its own name, so a test can
+# say so rather than a reader having to find out.
+FORK_STATIC_FORKS = ["capella", "deneb", "electra", "fulu", "gloas"]
+FORK_STATIC_CONTAINERS = [
+    "ExecutionPayloadHeader",
+    "LightClientHeader",
+    "LightClientBootstrap",
+    "LightClientUpdate",
+    "LightClientFinalityUpdate",
+    "LightClientOptimisticUpdate",
+]
+
+
+def do_fork_static() -> dict:
+    cases = []
+    for fork in FORK_STATIC_FORKS:
+        for container in FORK_STATIC_CONTAINERS:
+            for case in CASES[:3]:
+                d = f"tests/{CONFIG}/{fork}/ssz_static/{container}/{SUITE}/{case}"
+                ssz = snappy_block(fetch(f"{RAW}/{d}/serialized.ssz_snappy"))
+                root = root_of(fetch(f"{RAW}/{d}/roots.yaml"))
+                cases.append({"fork": fork, "container": container, "case": f"{SUITE}/{case}",
+                              "ssz": ssz.hex(), "root": root[2:]})
+                print(f"  {fork}/{container}/{case}: {len(ssz)} bytes", file=sys.stderr)
+    return {"source": f"{REPO} @ {COMMIT[:12]}, {CONFIG}/{{capella..gloas}}/ssz_static", "cases": cases}
+
+
+def do_sync_forks() -> dict:
+    """`light_client_sync` for each fork with an execution header: real headers with real execution branches, and
+    checks that state each header's `execution_root`."""
+    global SYNC_FORK
+    out = []
+    for fork in ["capella", "deneb", "electra", "fulu"]:
+        SYNC_FORK = fork
+        for c in do_sync_cases(["light_client_sync"]):
+            c["fork"] = fork
+            out.append(c)
+    SYNC_FORK = "altair"
+    return {"source": f"{REPO} @ {COMMIT[:12]}, minimal/{{capella..fulu}}/light_client/sync/light_client_sync",
+            "cases": out}
 
 
 BUILDERS = {
+    "ssz_static_light_client_forks_mainnet": lambda: do_fork_static(),
+    "light_client_sync_forks_minimal": lambda: do_sync_forks(),
     "light_client_sync_altair_minimal": lambda: do_sync(),
     "light_client_proofs": lambda: do_proofs(),
     "ssz_static_altair_mainnet": lambda: do_static(),

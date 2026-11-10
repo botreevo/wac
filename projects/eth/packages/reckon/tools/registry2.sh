@@ -138,7 +138,7 @@ echo "recipe $recipe → output $output (derivation $deriv); program $program"
 cat > "$work/dpolicy.json5" <<POLICY
 {
   signers: { runner: "$addr_runner", reviewer: "$addr_reviewer" },
-  machines: ["wasm-gc/wac-host/0"],
+  machines: ["wasm-gc/wac-host/1"],
   formats: ["unixfs-v1-2025+hidden"],
   reject_lists: ["$addr_list"],
   roles: {

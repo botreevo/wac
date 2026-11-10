@@ -1,7 +1,7 @@
 # Bootstrap derivations: rooting trust at reviewed sources (decision D)
 
-**Status, 2026-11-10: milestone 1 done (`tools/ladder.sh`, task `reckon:ladder`). Milestones 2–5 are a plan, waiting on
-the choice below.**
+**Status, 2026-11-10: milestones 1 (`tools/ladder.sh`) and 2 (`wac-l0/1`, docs/l0-machine.md, `tools/l0.sh`) done.
+Milestones 3–5 are a plan, waiting on the choice below. Milestone 2 is needed under either choice.**
 
 Today every compiler in reckon's chains is derived from one *seed*: wac's compiler at the pinned commit, built natively
 and named in the policy's `roots`. selfbuild.sh and the capstone show the seed is consistent with its source. A
@@ -96,7 +96,7 @@ the ones wac already argues for. Every step is a function of bytes to bytes, so 
 
    So the ladder already reaches the same compiler as the seed. What milestones 2–5 add is that each step is signed and
    checked, and that the seed can leave `roots`.
-2. **L0 as a machine.** `wac-l0/1`, its definition (pointing at bootstrap/spec/l0.md at a pinned commit), and two
+2. **L0 as a machine. Done:** docs/l0-machine.md, 20 of 20 (21 with wacc's L0). `wac-l0/1`, its definition (pointing at bootstrap/spec/l0.md at a pinned commit), and two
    runners that sign: the TS and Rust assemblers wrapped by a reckon command. A recipe is `{program: none, in: x.l0}`
    (the machine is the assembler, so there is no program slot). Checked: both runners give one CID for every rung's L0
    in the ladder.

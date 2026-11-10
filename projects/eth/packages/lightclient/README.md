@@ -126,7 +126,7 @@ Read from `consensus-specs` at `0393013` (2026-11-09). What changes for a light 
 **The consequence that matters for anything reading state by proof:** from Gloas on, a header does not contain an
 execution state root at all. It proves a block hash, and that hash is the *parent* execution block's (in Gloas the
 payload arrives after its beacon block). So the state root comes from that block's RLP header, fetched from anyone and
-checked by `keccak256(rlp) == block_hash`, and it is one slot older than the beacon header proving it. Since the block
+checked by `keccak256(rlp) == block_hash` (`ethrpc`'s `headerOf` does exactly this), and it is one slot older than the beacon header proving it. Since the block
 hash is the one anchor every fork can give, `blockHashProof` gives it in Gloas's shape for Capella–Fulu headers as well
 (the payload header's own branch to `block_hash`, gindex 412 or 812, joined to the execution branch), so one path can
 follow the chain across the fork.
@@ -153,5 +153,6 @@ follow the chain across the fork.
   update without finality. `isEmptyHeader` is the real test.
 
 **Still to do, in order:** a store that crosses forks (`upgrade_lc_store_to_*`, and the `*_store_with_legacy_data`
-vectors); the RLP header check that takes a Gloas block hash to a state root; mainnet's committee size and period length
+vectors); wiring a header's block hash into `ethrpc.headerOf(block, hash)`, which already re-encodes an execution header
+and checks it against a given hash, so a Gloas block hash reaches a state root; mainnet's committee size and period length
 in the store, which is minimal-only today; and a beacon API client (0066).

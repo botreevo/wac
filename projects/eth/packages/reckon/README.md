@@ -31,7 +31,22 @@ reckon resolve NAME@0xPUBLISHER --policy P                         what a name p
 reckon run NAME@0xPUBLISHER|kb1:… --policy P --mirror M… [-- ARGS] resolve → decide → fetch → hash → run
 ```
 
-## What was built, and what it showed
+## The second round: attested derivations (2026-11-10)
+
+The model in the explainer is built in parts, beside the first experiment (which is left as it was measured). It is
+not wired into wac's own fetch and build: that waits until the design settles.
+
+| | |
+| --- | --- |
+| `packages/ipfs` | CIDv1, base32, DAG-PB, DAG-CBOR, CAR; UnixFS under `unixfs-v1-2025` (hidden files kept, no symlinks, no modes); a store and resolvers that re-hash every block. Agrees with the JavaScript IPFS implementation, and on the whole wac repository |
+| `src/claims.wac` | recipes `{machine, format, input}` and the four statements (Derivation, Endorsement, Rejection, Revocation) as DAG-CBOR objects, signed as EIP-712; byte-identical to ethers and `@ipld/dag-cbor` |
+| `src/graph.wac` | the claim index: origins (what derived this?) and dependents (what was derived from it?), saved in a store |
+| `src/admit.wac` | admission: a policy of trust roots and per-role rules, applied recursively over the derivation graph, with revocations and rejection lists |
+| `src/machine.wac`, `src/world.wac`, `cmd/derive.wac` | the deterministic WebAssembly machine and a runner for it; `docs/runner.md` has what V8 and wasmtime agree on, and the two places they do not |
+| `packages/lightclient`, `packages/ssz` | the light client past Altair, to Fulu and Gloas: per-fork types, execution headers, a fork-aware store, checked against Ethereum's vectors (see its README) |
+| registry v2 | revocations by (signer, statement CID), rejection lists and delayed names, read by proof — in progress |
+
+## The first round: what was built, and what it showed
 
 **The end-to-end run passes 19 of 19 checks** (`tools/e2e.sh`, on a wacuum devnet). The happy path:
 

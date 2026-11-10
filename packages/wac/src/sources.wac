@@ -444,20 +444,61 @@ export struct ReadCache {
    * it keeps itself: the wac IDE keeps the `web` it was built with in one, so a page program in it can import `web`.
    */
   string wacHome;
+  /**
+   * **The directory every key is measured from, when it is not the working directory**: `""` reads the
+   * environment's. `gatherFrom` sets it to the entry's project root, so a key is the same whichever
+   * directory the command ran in (`issues/lang/0270a`); `fs` is then that directory's, too.
+   */
+  string base;
 
   ReadCache create() {
     return ReadCache(Map.create(hashString, stringEq), Map.create(hashString, stringEq),
-                     Map.create(hashString, stringEq), RootCache.create(), 0, "");
+                     Map.create(hashString, stringEq), RootCache.create(), 0, "", "");
   }
 }
 
 export async Sources gather(Files fs, Env env, string entry, bool lazy) { return await gatherFrom(fs, env, entry, lazy, ""); }
 
-/** `gather`, with the package cache at `wacHome` rather than `$WAC_HOME`'s when it is not `""` — `wac … --wac-home`. */
+/**
+ * `gather`, with the package cache at `wacHome` rather than `$WAC_HOME`'s when it is not `""` — `wac … --wac-home`.
+ *
+ * **Keyed from the entry's project root, not from the working directory** (`issues/lang/0270a`). A key is
+ * what a build's bytes are spelled from — the manifest's `entry`, and the name of every generic instantiated
+ * over a type the project declares — so a key measured from wherever the command happened to run made one
+ * source several artefacts: an entry at packages/a/m.wac was keyed so from the project, as in/in/proj/packages/a/m.wac
+ * from two levels up, and as /tmp/…/m.wac when spelled absolutely. Measured from the root, all three agree. A file with
+ * no `wac.json5` above it is its own project, rooted at its directory. `Sources.base` is that root, and a
+ * caller showing a key to a person puts it back in the working directory's terms (`shownFrom`).
+ */
 export async Sources gatherFrom(Files fs, Env env, string entry, bool lazy, string wacHome) {
   ReadCache cache = ReadCache.create();
   cache.wacHome = wacHome;
-  return lazy ? await gatherNeeded(fs, env, entry, cache) : await gatherWith(fs, env, entry, false, cache);
+  string cwd = normalisePath(flatten(env.cwd().wait()).unwrap());
+  string abs = entry.len() > 0 && entry.slice(0, 1) == "/" ? normalisePath(entry) : normalisePath("\{cwd}/\{entry}");
+  string root = await projectRootOf(fs, abs);
+  if (root == "") { root = dirOf(abs); }
+  if (root == "") { root = "/"; }
+  cache.base = root;
+  Files at = root == cwd ? fs : fs.relativeTo(root);
+  string key = relativeTo(root, abs);
+  return lazy ? await gatherNeeded(at, env, key, cache) : await gatherWith(at, env, key, false, cache);
+}
+
+/**
+ * `key` as the person who ran the command would spell it: from `cwd` rather than from `base`, where
+ * `gatherFrom` measured it. A built-in or an absolute key is the same from anywhere and is left alone.
+ */
+export string shownFrom(string cwd, string base, string key) {
+  if (base == "" || base == cwd || key == "" || key.slice(0, 1) == "/" || key.slice(0, 1) == " " || isBuiltinSpec(key)) {
+    return key;
+  }
+  return relativeTo(cwd, normalisePath("\{base}/\{key}"));
+}
+
+/** `key` as an absolute path, for a caller whose entry was spelled absolutely and keys its graph that way. */
+export string absoluteFrom(string base, string key) {
+  if (base == "" || key == "" || key.slice(0, 1) == "/" || key.slice(0, 1) == " " || isBuiltinSpec(key)) { return key; }
+  return normalisePath("\{base}/\{key}");
 }
 
 /**
@@ -608,7 +649,7 @@ async Sources gatherIn(Files fs, Env env, string entry, bool lazy, ReadCache cac
   // `candidateRoots` walks the components of the path it is given, so a relative entry could climb
   // only as far as it was spelled — `wac run main.wac` from a subdirectory reported *no wac.json5
   // above main.wac* with the manifest one level up. `issues/lang/0168a`.
-  string base = normalisePath(flatten(env.cwd().wait()).unwrap());
+  string base = cache.base != "" ? cache.base : normalisePath(flatten(env.cwd().wait()).unwrap());
   i32 mapN = 0;
   i32 n = 0;
   // **The entry in the same spelling its imports will be in.** `resolveFrom` collapses `.` and

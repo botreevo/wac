@@ -56,7 +56,7 @@ import { renderDiagnostics } from "../../wacc/src/render.wac";
 import { importSpecs } from "../../wacc/src/files.wac";
 import { Res, normalisePath, resolveFrom, resolveFromAt, resolveFromIn } from "../../wacc/src/path.wac";
 import { MANIFEST_NAME, candidateRoots, dirOf, isProjectSpecifier } from "../../wacpkg/src/root.wac";
-import { Gathered, ReadCache, Sources, exactly, gather, gatherFrom, gatherRoots, gatherRootsFrom, gatherWith, projectRootAbs, resOf, wacHomeOf } from "./sources.wac";
+import { Gathered, ReadCache, Sources, exactly, gather, gatherFrom, gatherRoots, gatherRootsFrom, gatherWith, projectRootAbs, resOf, shownFrom, wacHomeOf } from "./sources.wac";
 import { Manifest, Match, Located, readManifest, manifestWhy, matchSpecifier, locate,
          M_OK } from "../../wacpkg/src/manifest.wac";
 import { Lock, LockEntry, readLock } from "../../wacpkg/src/lock.wac";
@@ -314,6 +314,25 @@ string buildCachePath(string[] argv, Env env, i32 argc, string cmd, string entry
     h.eat(texts[i]);
   }
   return "\{home}/cache/build/\{h.hex()}.wasm";
+}
+
+/**
+ * Diagnostics in the working directory's terms. `gatherFrom` keys files from the project root
+ * (`issues/lang/0270a`), so a build from a subdirectory or from above the project has keys that do not open
+ * from where the person is; each line's file, and the paths its sources are found under, are put back.
+ */
+string renderShown(string wire, string[] paths, string[] sources, string cwd, string base) {
+  if (base == "" || base == cwd) { return renderDiagnostics(wire, paths, sources); }
+  string[] shown = string[].filled(paths.len(), "");
+  for (i32 i = 0; i < paths.len(); i++) { shown[i] = shownFrom(cwd, base, paths[i]); }
+  string out = "";
+  string[] lines = linesOf(wire);
+  for (i32 i = 0; i < lines.len(); i++) {
+    if (lines[i] == "") { continue; }
+    i32 tab = lines[i].indexOf("\t");
+    out = out + (tab < 0 ? lines[i] : shownFrom(cwd, base, lines[i].slice(0, tab)) + lines[i].slice(tab, lines[i].len())) + "\n";
+  }
+  return renderDiagnostics(out, shown, sources);
 }
 
 /**
@@ -1471,8 +1490,13 @@ export async i32 main(Sys sys) {
   if (generated != "" && keepAggregate(env)) {
     err.line("wac: kept the generated aggregate at \{generated} (WAC_KEEP_AGGREGATE)");
   }
+  // **Keys are the project's, names are the person's** (`issues/lang/0270a`): `key` is the entry as the
+  // build spells it — the manifest, every name a generic is instantiated under — and `entry` stays what was
+  // typed, for every message and for the command line it is looked for in.
+  string cwd = normalisePath((await env.cwd()).orElse("."));
+  string key = src.n > 0 ? src.paths[0] : entry;
   if (src.missing != "" || src.why != "") {
-    err.line(src.why != "" ? "wacc: \{src.why}" : "wacc: cannot read \{src.missing}");
+    err.line(src.why != "" ? "wacc: \{src.why}" : "wacc: cannot read \{shownFrom(cwd, src.base, src.missing)}");
     return 1;
   }
   string[] paths = exactly(src.paths, src.n);
@@ -1510,7 +1534,7 @@ export async i32 main(Sys sys) {
   // after this one see what they always did. `tools/wac/libentry_test.wac`.
   bool program = cmd == "build" || cmd == "run" || cmd == "app";
   if (program || cmd == "compile" || cmd == "bindgen") {
-    ProgramGraph pg = programGraph(paths, lowerSources(paths, texts, res), entry);
+    ProgramGraph pg = programGraph(paths, lowerSources(paths, texts, res), key);
     if (pg.why != "" && program) {
       err.line("wacc: cannot build \{entry} as a program — \{pg.why}");
       return 1;
@@ -1635,13 +1659,13 @@ export async i32 main(Sys sys) {
   // needs is not compiled at all, so a missing one is an error exactly when something needs it.
   // `check` and `audit` are questions about the whole source and keep every file (ch06).
   if (cmd != "check" && cmd != "audit") {
-    Pruned pruned = pruneForBuild(paths, texts, res, entry);
+    Pruned pruned = pruneForBuild(paths, texts, res, key);
     paths = pruned.paths;
     texts = pruned.sources;
     res = pruned.res;
   }
-  string wire = diagnoseGraphIn(paths, texts, res, entry);
-  string diags = wire == "" ? "" : renderDiagnostics(wire, paths, asWritten(paths, texts, readPaths, readTexts));
+  string wire = diagnoseGraphIn(paths, texts, res, key);
+  string diags = wire == "" ? "" : renderShown(wire, paths, asWritten(paths, texts, readPaths, readTexts), cwd, src.base);
   if (diags != "") { err.line(diags); }
   if (wireHasErrors(wire)) { return 1; }
 
@@ -1650,7 +1674,7 @@ export async i32 main(Sys sys) {
   // It runs *after* the diagnostics above on purpose — an audit of a graph that does not type-check is
   // an audit of something nobody can build, and the reader should be told which problem they have.
   if (cmd == "audit") {
-    return auditReport(err, out, src, entry, hasFlag(argv, argc, "--verbose"));
+    return auditReport(err, out, src, key, hasFlag(argv, argc, "--verbose"));
   }
 
   // **One front end for the whole build**, which is what `buildFiles` exists for — `issues/lang/0129`
@@ -1698,15 +1722,15 @@ export async i32 main(Sys sys) {
     // `@/` or a mapped import resolves the same way it did when the graph was gathered — that is
     // `design/lang/0009` D7. The traced emitters have no `In` variant yet and build a `Res.empty()`
     // of their own, so a traced build of a program using either feature resolves from nothing.
-    blocked = blockedFilesIn(paths, texts, res, entry);
+    blocked = blockedFilesIn(paths, texts, res, key);
     i32 slots = traceSlots(argv, argc);
-    wasm = covered ? emitFilesCoveredIn(paths, texts, res, entry)
-                   : (slots > 0 ? emitFilesTracedSlots(paths, texts, entry, slots)
-                                : emitFilesTraced(paths, texts, entry));
-    sigs = exportSigsFilesIn(paths, texts, res, entry);
-    types = bindTypesFilesIn(paths, texts, res, entry);
+    wasm = covered ? emitFilesCoveredIn(paths, texts, res, key)
+                   : (slots > 0 ? emitFilesTracedSlots(paths, texts, key, slots)
+                                : emitFilesTraced(paths, texts, key));
+    sigs = exportSigsFilesIn(paths, texts, res, key);
+    types = bindTypesFilesIn(paths, texts, res, key);
   } else {
-    Built built = buildFilesIn(paths, texts, res, entry);
+    Built built = buildFilesIn(paths, texts, res, key);
     Described parts = describedParts(built.described);
     blocked = parts.blocked;
     sigs = parts.sigs;
@@ -1722,7 +1746,7 @@ export async i32 main(Sys sys) {
     // locate: it knows the key, the file that asked and the specifier as written — and the specifier is
     // what makes a position findable *by comparison*, without resolving anything, which is the step
     // that cannot be redone soundly inside a mapped checkout. `issues/lang/0157`.
-    string parts = missingImportFilesIn(paths, texts, res, entry);
+    string parts = missingImportFilesIn(paths, texts, res, key);
     if (parts != "") {
       string shown = positionedMissingImport(parts, paths, texts);
       if (shown != "") { err.line(shown); return 1; }
@@ -1769,7 +1793,7 @@ export async i32 main(Sys sys) {
     // page's own text, which may not be a module.
     bool script = hasFlag(argv, argc, "--script");
     bool js = script || hasFlag(argv, argc, "--js");
-    string declined = bindgenDeclinedFilesIn(paths, texts, res, entry);
+    string declined = bindgenDeclinedFilesIn(paths, texts, res, key);
     if (declined != "") {
       err.line("wacc bindgen: not bound yet — \{oneLine(declined)}");
     }
@@ -1843,7 +1867,7 @@ export async i32 main(Sys sys) {
     // the table is written beside it, so one aggregate would report the first file's positions for all
     // of them. That path needs a build per file, which this command does not do yet.
     i32 grants = grantsIn(argv, argc);
-    string manifest = manifestWire(wasm, types, sigsWithCounters(sigs, covered || traced), entry,
+    string manifest = manifestWire(wasm, types, sigsWithCounters(sigs, covered || traced), key,
                                   "\{baseName(stem(entry))}.wasm", grants);
     u8[] wholeTest = withManifestSection(wasm, manifest);
     // **Remembered before the tests run, not after.** What is cached is the *build*, and whether the
@@ -1852,7 +1876,7 @@ export async i32 main(Sys sys) {
     // line, and for a warned program the diagnostics pass above has returned.
     rememberBuild(env, fs, cachePath, wholeTest, entry);
     if (hasFlag(argv, argc, "--compile-only")) { out.line("compiled \{target}"); return 0; }
-    i32 code = runTests(err, out, clock, fs, mods, entry, wholeTest, manifest, within(held, askedOfBits(grants)), flagValue(argv, argc, "--filter"), walked, ignoredCount, target, covered ? covTableFilesIn(paths, texts, res, entry) : "", !hasFlag(argv, argc, "--quiet"), profileDir, onlyList(flagValue(argv, argc, "--only")));
+    i32 code = runTests(err, out, clock, fs, mods, entry, wholeTest, manifest, within(held, askedOfBits(grants)), flagValue(argv, argc, "--filter"), walked, ignoredCount, target, covered ? covTableFilesIn(paths, texts, res, key) : "", !hasFlag(argv, argc, "--quiet"), profileDir, onlyList(flagValue(argv, argc, "--only")));
     // The aggregate is already gone — removed below `gather`, which is the one place that covers
     // every way out of this function rather than only this one. GitHub wac#27.
     return code;
@@ -1892,7 +1916,7 @@ export async i32 main(Sys sys) {
     // The name inside it is the entry's own stem: nothing is written to disk, so there is no file for
     // it to be wrong about, and a program that reports its own name should not report a temporary one.
     u8[] whole = withManifestSection(
-      wasm, manifestWire(wasm, types, sigsWithCounters(sigs, covered || traced), entry,
+      wasm, manifestWire(wasm, types, sigsWithCounters(sigs, covered || traced), key,
                          "\{baseName(stem(entry))}.wasm", grants));
 
     // `true` for the input, so the program reads the terminal or the pipe this command was given —
@@ -1957,7 +1981,7 @@ export async i32 main(Sys sys) {
     // behind two shell lines, so a hit rebuilds the artefact with `writeApp` exactly as a miss does.
     // Storing the finished file instead would put the preamble in the cache, and the preamble is the
     // one part that costs nothing. `issues/system/0283c`.
-    u8[] sealed = withManifestSection(wasm, manifestWire(wasm, types, sigs, entry,
+    u8[] sealed = withManifestSection(wasm, manifestWire(wasm, types, sigs, key,
                                                         "\{baseName(stem(entry))}.wasm",
                                                         appGrants));
     rememberBuild(env, fs, cachePath, sealed, dest);
@@ -1994,7 +2018,7 @@ export async i32 main(Sys sys) {
     //
     // `traced` as well as `covered`: the two are one counter array meaning different things, and both
     // inject the same three exports.
-    string manifest = manifestWire(wasm, types, sigsWithCounters(sigs, covered || traced), entry,
+    string manifest = manifestWire(wasm, types, sigsWithCounters(sigs, covered || traced), key,
                                   wasmName, grantsIn(argv, argc));
     u8[] whole = withManifestSection(wasm, manifest);
     // **A build that emitted no code used to report success** — `issues/lang/0155`. The artefact had
@@ -2043,7 +2067,7 @@ export async i32 main(Sys sys) {
     // `index\tline\tcol\tkind\tfile` per counter, in counter order — what turns a count into a
     // position. Beside the module because whoever runs it is who needs it.
     if (covered) {
-      auto wroteCov = await fs.writeFile("\{stem}.cov", covTableFilesIn(paths, texts, res, entry).toBytes());
+      auto wroteCov = await fs.writeFile("\{stem}.cov", covTableFilesIn(paths, texts, res, key).toBytes());
       if (wroteCov.isErr()) {
         err.line("wacc: cannot write \{stem}.cov — \{"\{wroteCov.isErr() ? "\{wroteCov.err()!}" : ""}"}");
         return 1;
@@ -2053,7 +2077,7 @@ export async i32 main(Sys sys) {
     // a table without the module it describes names positions in a program that was not built.
     if (traced) {
       auto wroteTrace = await fs.writeFile("\{stem}.trace",
-                                       traceTableFiles(paths, texts, entry).toBytes());
+                                       traceTableFiles(paths, texts, key).toBytes());
       if (wroteTrace.isErr()) {
         err.line("wacc: cannot write \{stem}.trace — \{"\{wroteTrace.isErr() ? "\{wroteTrace.err()!}" : ""}"}");
         return 1;

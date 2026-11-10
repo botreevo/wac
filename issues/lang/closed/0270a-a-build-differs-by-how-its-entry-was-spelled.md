@@ -1,6 +1,6 @@
 # 0270a — a build differs by how its entry was spelled, so byte-identity is conditional on the command line
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (wac2) — `packages/wac/src/sources.wac` `gatherFrom` keys from the project root; `packages/wac/test/wac/entrykey_test.wac`
 - **Reported by:** agent-a
 - **Date:** 2026-08-26
 - **Kind:** bug
@@ -151,3 +151,34 @@ since a field recording *what was built* has a claim to being the path that was 
 decision about the manifest's contract before either is touched, and that decision is not made by
 whoever happens to be reproducing it. Recorded here so the next person starts from a confirmed
 reproduction rather than a three-day-old one.
+
+
+## Fixed — keys are measured from the project root, wac2, 2026-11-10
+
+**It was location too, not only spelling.** "What this is not" above says two relative builds from different
+directories agree. They do not when the directories sit differently against the project: reckon's machine
+builds `in/in/in/packages/…` where a native build says `packages/…`, and the manifests differed by exactly that
+prefix (reckon checked around it in `tools/samepage.py`). Measured here with one project built from its root,
+from two levels above it and from the entry's own directory: `"entry"` was `packages/a/m.wac`,
+`in/in/proj/packages/a/m.wac` and `m.wac`.
+
+**The fix is the one proposed above, at the point keys are chosen.** `gatherFrom` finds the entry's project root
+(its directory, for a file with no `wac.json5` above it), reads through `fs.relativeTo(root)` and walks with that
+root as `Res.base`, so every key — the entry's, and so the manifest's `entry` and every symbol a generic is
+instantiated under — is relative to the project, whatever the working directory and however the entry was
+spelled. The command hands the compiler `paths[0]` rather than the entry as typed.
+
+**Diagnostics stay in the person's terms.** `renderShown` puts each diagnostic's file back relative to the working
+directory (`shownFrom`), so `wac build in/in/proj/packages/a/bad.wac` still says `--> in/in/proj/packages/a/bad.wac`.
+`tools/wac/sources.wac`, which `harness/wacFiles.ts` reads, prints keys the same way, so the TypeScript side is
+unchanged.
+
+**The manifest's contract**, which was the open question: `entry` is the entry relative to its project's root.
+The coordinator decided it, reckon being the manifest's main reader and wanting exactly that.
+
+`packages/wac/test/wac/entrykey_test.wac` builds one project four ways — from the root, from above, from the
+entry's directory, and absolutely — and compares the bytes, with a generic from another file instantiated over
+a type of the entry's so the symbol half is in play.
+
+**Not covered: a package's files, under `$WAC_HOME`.** Their keys are absolute cache paths, so a generic from a
+package instantiated over a project's type is named after where that machine keeps its cache. `0458e`.

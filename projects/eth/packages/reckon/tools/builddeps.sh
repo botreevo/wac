@@ -61,8 +61,12 @@ WAC_HOME="$work/tree/home" wac deps.wasm check --lock "$root/wac.lock" > deps.ch
   && ok "the dependencies in the input are the CIDs wac.lock pins: $(grep -c '^ok' deps.check)" \
   || { bad "the dependencies are not what wac.lock pins: $(grep -v '^ok' deps.check | head -3)"; echo "$pass passed, $fail failed"; exit 1; }
 st="--store $work/store"
+# The runners' keys: the test keys everyone has, or with RUNNER_KEYS=DIR, the v8.key and wt.key in DIR, for a build
+# whose claims are published (extension/release.sh).
+if [ -n "${RUNNER_KEYS:-}" ]; then cp "$RUNNER_KEYS/v8.key" "$RUNNER_KEYS/wt.key" .; else
 printf '%s\n' 4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 > v8.key
 printf '%s\n' 646f1ce2fdad0e6deeeb5c7e8e5543bdde65e86029e2fd9fc169899c440a7913 > wt.key
+fi
 for spec in $entries; do
   entry=${spec%%:*}
   grants=$([ "$spec" = "$entry" ] && echo "" || echo "${spec#*:}" | tr ',' ' ')

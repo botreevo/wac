@@ -30,16 +30,20 @@ with an entry that has no `cid`, so a dropped pin is noticed, not silently lost.
 A new `cmd/deps.wac`. The v2 code is not mixed into v1's `lock`, and the name doesn't collide with `src/lock.wac`.
 
 - `deps pin [--lock F]`: for each entry without a `cid`, hash its cache directory (less the marker) and write the
-  CID in. It never changes a `cid` that is there. `--from-git REPO` hashes the commit instead, and refuses if the
-  cache disagrees.
+  CID in. It never changes a `cid` that is there. It refuses a lock holding a field it doesn't know, rather than
+  drop it on rewriting.
 - `deps check`: hash every entry's cache directory and refuse any that differs from its `cid`, or has none. This is
   what a build should run first. v1 found that wac compiles from a tampered cache without noticing (README,
   finding 1), and this is the check for that.
-- `deps fetch [--mirror DIR|URL]…`: for an entry not in the cache, get it by CID from the store or a mirror, with
-  every block checked. Failing that, get it from git into a scratch directory and hash that. Either way, install it
+- `deps fetch [--mirror DIR|URL]… [--git]`: for an entry not in the cache, get it by CID from the store or a mirror,
+  with every block checked. Failing that, and with `--git`, clone the repository into a scratch directory and hash
+  the commit there. Either way, install it
   into the cache, with the marker, only if it matches. A remote serving other bytes is refused before the cache
   holds them.
-- `deps admit ROLE --policy P [admit flags]`: `claim admit CID ROLE` for every locked CID, under one policy. For
+- `deps cids`: one `NAME CID` per entry.
+- `deps admit ROLE --policy P [--mirror …]`: `claim admit CID ROLE` for every locked CID, under one policy. It reads
+  the claims here and in the mirrors, but has no chain flags: for revocations proved on chain, run `claim admit` with
+  them on each of `deps cids`. For
   example, `dependency: [{ endorsed: { by: ["reviewer"] } }]` requires that each dependency was reviewed. v1 had no
   equivalent: there, a pinned dependency was only the same bytes as before, never an admitted one.
 
@@ -52,13 +56,19 @@ admitted as `dependency`, so a build is admitted only if what it was built from 
 compiler sees in the cache, so the tree builds lay out has it. That changes the layout's CID but not the
 dependency's, and a recipe names both.
 
-## Size
+## Built
 
-About 200 lines: lock reading and writing (`src/lock.wac`'s, kept field-compatible and adding `cid`), hashing a
-directory less one file (`importDir` over a filtered listing), and fetch-and-install. Tests are a script in the shape
-of `run.sh`:
-- pin;
-- check, clean and with one byte changed;
-- fetch from a mirror, honest and lying;
-- fetch from git;
-- admit with and without the reviewer's endorsement.
+The code is about 330 lines:
+- `src/deplock.wac`: the lock, read and written with `cid`, v1's fields carried through;
+- `cmd/deps.wac`;
+- `importDirExcept` in `packages/ipfs`: `importDir` leaving out named top-level entries.
+
+`tools/deps-lock.sh` (task `reckon:deps`) runs on wac-web, as wac.lock pins it, in a cache of its own, and passes 14
+of 14:
+- pin gives the CID that `obj add-git` gives for the commit, and a second pin changes nothing;
+- check passes the cache, and refuses one byte added or an entry without a `cid`;
+- fetch from a mirror into an empty cache gives the same files and checks;
+- a mirror with one block changed is refused, and nothing is marked complete;
+- fetch from git checks, and a pin the commit isn't is refused with nothing kept;
+- admit refuses the dependency unreviewed (4) and admits it once the reviewer endorses its CID;
+- a lock with an unknown field isn't rewritten.

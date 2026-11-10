@@ -1,6 +1,6 @@
 # 0315a — a const reference is laundered through any non-const slot, and the write lands
 
-- **Status:** open
+- **Status:** open — narrowed 2026-11-10 (cloud) to the type-argument row; the other four are refused
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-01
@@ -150,3 +150,17 @@ longer returned as a plain result, and a field declared `const` is const through
 `const Box shared()` is now carried — the parser used to read the `const` and drop it — so its callers
 receive a `const Box`. What is left of this issue is its own list above; the sweep found nothing else in the
 repository once the fixes landed.
+
+## Narrowed 2026-11-10 — one row left
+
+On master after `64f942d76` and this change, four of the five rows are refused with *a non-const reference cannot be
+taken from a const one*: the argument (`poke(this.inner)`), the array element, the struct field — fixed by
+`57bd93563` and `6ebae0d1e` — and now `o.get().mutate()` through a `const Inner get(this)`. That last one was not the
+qualifier being ignored: the call's result *is* typed `const Inner`, and `checkMethodCall` looked for methods of a type
+spelled `const Inner`, found none and returned in silence. It strips the qualifier and keeps it as `recvConst` now
+(`spec/cases/0913`).
+
+**Left: `hop<Inner>(this.inner)` for `void hop<T>(T x)`**, which still checks clean. `checkCall` hands a generic
+function to `checkGenericInference` and checks no argument types, and the explicit type arguments that make the slot
+a plain `Inner` are not in reach there. Inferred, `hop(this.inner)` binds `T` to `const Inner`, which is right — so the
+rule is only about a written type argument that drops the qualifier.

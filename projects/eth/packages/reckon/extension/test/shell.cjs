@@ -1,7 +1,8 @@
 // Milestone 2's shell under Playwright's Chromium (docs/browser-extension.md): the extension loads; its page is
-// cross-origin isolated (SharedArrayBuffer, for the admission worker to come); admission, still a stub, refuses and
+// cross-origin isolated (SharedArrayBuffer, for the admission worker); with no settings, admission does not admit and
 // nothing is shown; and an app tree put in OPFS is shown through the sandbox loader, with every reference into the
-// tree working and every way out failing. A listener on 127.0.0.1:PORT counts what reached the network.
+// tree working and every way out failing. A listener on 127.0.0.1:PORT counts what reached the network. Needs the
+// admission build (extension/build.sh); admit.sh is the test of admission itself.
 //
 //     node packages/reckon/extension/test/shell.cjs [PORT]
 const { chromium } = require('playwright');
@@ -61,12 +62,16 @@ r('done', 'index');
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
+  // No mirrors (the default, a public gateway, is not what this checks), and nothing else set.
+  await page.goto(`chrome-extension://${id}/page.html`);
+  await page.evaluate(() => chrome.storage.local.set({ settings: { mirrors: '' } }));
   await page.goto(`chrome-extension://${id}/page.html?open=${encodeURIComponent('ens:vitalik.eth')}`);
   await page.waitForTimeout(500);
   ok(await page.evaluate(() => crossOriginIsolated && typeof SharedArrayBuffer === 'function'),
      'the page is cross-origin isolated: SharedArrayBuffer, for the admission worker');
+  await page.waitForFunction(() => !/^admitting/.test(document.getElementById('account').textContent), null, { timeout: 120000 });
   const acct = await page.evaluate(() => document.getElementById('account').textContent);
-  ok(/REFUSED/.test(acct) && /not built into the extension yet/.test(acct), 'admission (a stub until wac W1/W2) refuses, saying why');
+  ok(!/^ADMITTED$/m.test(acct) && /give --checkpoint to start it/.test(acct), 'with no settings, admission admits nothing, and says what it lacks (a checkpoint)');
   ok(!(await page.evaluate(() => document.getElementById('app').classList.contains('shown'))), '…and nothing is shown');
 
   // A tree as admission will leave it in OPFS, and shown as an admitted one is.

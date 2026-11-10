@@ -5,8 +5,10 @@ import { openTree } from './tree.js';
 import { buildDocument, typeOf } from './build-doc.js';
 
 const $ = (id) => document.getElementById(id);
-const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'policy'];
-const DEFAULTS = { mirrors: 'https://trustless-gateway.link', policy: '{ signers: {}, roles: {} }' };
+const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'policy', 'now'];
+// No mirror by default: a public gateway is a choice to make, and one that is down slows every admission until it is
+// left out. The settings suggest one.
+const DEFAULTS = { mirrors: '', policy: '{ signers: {}, roles: {} }' };
 
 async function loadSettings() {
   const got = await chrome.storage.local.get('settings');
@@ -58,7 +60,18 @@ addEventListener('message', async (e) => {
   }
 });
 
+/** Take down whatever was shown: a new subject is not shown until it is admitted, and the last one must not linger
+ *  beside its account as if it were the new one. */
+function clear() {
+  shown = null;
+  const frame = $('app');
+  const blank = frame.cloneNode(false);
+  blank.classList.remove('shown');
+  frame.replaceWith(blank);
+}
+
 async function open(subject, role) {
+  clear();
   const settings = await loadSettings();
   account([`admitting ${subject} as ${role}…`]);
   const d = await admit(settings, subject, role);
@@ -66,6 +79,7 @@ async function open(subject, role) {
   if (d.code !== 0 || !d.cid) return;
   const tree = await openTree(d.cid);
   if (!tree) { account([...d.lines, `admitted, but its tree is not in storage: ${d.cid}`]); return; }
+  window.__reckon.last = { subject, cid: d.cid, paths: tree.paths };
   const { notes } = await show(tree);
   if (notes.length) account([...d.lines, ...notes]);
 }

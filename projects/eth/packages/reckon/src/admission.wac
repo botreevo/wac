@@ -15,13 +15,36 @@
 
 import { Sys } from "std";
 import { Result } from "core";
-import { ipfs.Cid, ipfs.parseCid, ipfs.Resolver } from "@/lib.wac";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Resolver, ipfs.FileIn, ipfs.Node, ipfs.readNode, ipfs.readFile, ipfs.readTree, ipfs.filesOnly,
+         ipfs.emptyDirsOf } from "@/lib.wac";
 import { Index } from "./graph.wac";
 import { Chain, Decision, admit } from "./admit.wac";
 import { readPolicyFile, NameRule, readNameRule, ensRefusal, delayRefusal } from "./policyfile.wac";
 import { Endpoint, Snapshot, NameAt, endpointOf, asksFor, chainFor, read, nameAt, nameSlot, plus } from "./registry2.wac";
 import { unhex, hex } from "./hex.wac";
-import { Anchored, anchorFrom, anchorFromNode } from "./checkpoint.wac";
+import { Anchored, Kept, anchorFrom, anchorFromNode, anchorResume, keptOf } from "./checkpoint.wac";
+
+/**
+ * The default bound on a kept state's age, in sync-committee periods (about 27 hours each): 12, about two weeks,
+ * inside mainnet's weak subjectivity period. A committee older than that may have been sold or stolen since, and a
+ * history signed by it proves nothing; a client that old starts again from a checkpoint.
+ */
+export i64 STATE_MAX_PERIODS() { return 12 as i64; }
+
+string normalRoot(string h) {
+  string body = h.len() >= 2 && h.slice(0, 2) == "0x" ? h.slice(2, h.len()) : h;
+  u8[] b = body.toBytes();
+  u8[] o = u8[].filled(b.len(), 0);
+  for (i32 i = 0; i < b.len(); i++) { o[i] = b[i] >= 65 && b[i] <= 90 ? b[i] + 32 : b[i]; }
+  return "0x" + string.fromBytes(o);
+}
+
+/** Write `text` to `path` whole or not at all: to a file beside it, then moved over it. */
+async Result<void, string> keep(Sys sys, string path, string text) {
+  match (await sys.writeFile(path + ".new", text.toBytes())) { Err(e): { return Result.Err(e); } Ok(_): { } }
+  match (await sys.files().rename(path + ".new", path)) { Err(e): { return Result.Err("\{e}"); } Ok(_): { } }
+  return Result.Ok();
+}
 import { NameAnswer, ensContent, ENS_REGISTRY, ENS_REGISTRY_CODE, PUBLIC_RESOLVER_CODE } from "./names.wac";
 
 /** What to admit, in which role, under which policy, and where to look. Empty strings are "not given". */
@@ -46,10 +69,18 @@ export struct AdmitRequest {
   string ensRegistry;
   string ensRegistryCode;
   string resolverCode;
+  /**
+   * Where the light client's state is kept between runs (R4), or "": a file natively, the browser's storage in a page.
+   * With a kept state, the light client resumes from it, and no checkpoint is needed; without one yet, the checkpoint
+   * starts it. Either way it is written back after a run that verified.
+   */
+  string statePath;
+  /** How many sync-committee periods old a kept state may be (the weak subjectivity bound); negative for the default. */
+  i64 stateMaxPeriods;
 
   /** Nothing but the subject, the role and the policy. */
   AdmitRequest of(string subject, string role, u8[] policy) {
-    return AdmitRequest(subject, role, policy, "", "", "", "", -1 as i64, "", "", "", "", "", "", "");
+    return AdmitRequest(subject, role, policy, "", "", "", "", -1 as i64, "", "", "", "", "", "", "", "", -1 as i64);
   }
 }
 
@@ -93,9 +124,35 @@ i64 decimal(string s) {
 export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r) {
   Say s = Say(Line[]());
   Cid? none = null;
-  // 1. The anchor (docs/admit.md): from the light client with a checkpoint, or given.
+  // 1. The anchor (docs/admit.md): from the light client, resumed from its kept state or started from a checkpoint, or
+  // given.
   string anchorHex = q.anchor;
-  if (q.checkpoint != "") {
+  bool resumed = false;
+  if (q.statePath != "") {
+    if (anchorHex != "") { s.warn("--state or --anchor, not both: one anchor"); return ended(s, 2, none, ""); }
+    u8[]? kept = (await sys.readFile(q.statePath)).ok();
+    if (kept is null && q.checkpoint == "") { s.warn("there is no kept light-client state at \{q.statePath} yet: give --checkpoint to start it"); return ended(s, 2, none, ""); }
+    if (kept is not null) {
+      Kept k;
+      match (keptOf(kept!)) { Err(e): { s.warn("\{q.statePath}: \{e}"); s.out("REFUSED"); return ended(s, 3, none, ""); } Ok(x): { k = x; } }
+      if (q.checkpoint != "" && normalRoot(q.checkpoint) != normalRoot(k.checkpoint)) {
+        s.warn("the light-client state at \{q.statePath} descends from checkpoint \{k.checkpoint}, not \{q.checkpoint}: remove it to start again from \{q.checkpoint}");
+        return ended(s, 2, none, "");
+      }
+      i64 bound = q.stateMaxPeriods >= (0 as i64) ? q.stateMaxPeriods : STATE_MAX_PERIODS();
+      match (await anchorResume(sys, kept!, q.beaconUrl, q.beaconDir == "" ? "." : q.beaconDir, q.now, bound)) {
+        // The kept state is left as it was: a run that could not continue it changes nothing.
+        Err(e): { s.warn(e); s.out("REFUSED"); return ended(s, 3, none, ""); }
+        Ok(an): {
+          for (i32 i = 0; i < an.log.len(); i++) { s.out(an.log[i]); }
+          anchorHex = "0x" + hex(an.blockHash);
+          match (await keep(sys, q.statePath, an.state)) { Err(e): { s.warn("\{q.statePath}: the state was not kept: \{e}"); } Ok(_): { s.out("light client: state kept at \{q.statePath}, finalized slot \{an.beaconSlot}"); } }
+          resumed = true;
+        }
+      }
+    }
+  }
+  if (!resumed && q.checkpoint != "") {
     if (anchorHex != "") { s.warn("--checkpoint or --anchor, not both: one anchor"); return ended(s, 2, none, ""); }
     if (q.beaconUrl != "" && q.beaconDir != "") { s.warn("--beacon DIR or --beacon-url URL, not both"); return ended(s, 2, none, ""); }
     Result<Anchored, string> got = q.beaconUrl != ""
@@ -103,7 +160,13 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
       : await anchorFrom(sys, q.checkpoint, q.beaconDir == "" ? "." : q.beaconDir, q.fork == "" ? "fulu" : q.fork, q.now);
     match (got) {
       Err(e): { s.warn(e); s.out("REFUSED"); return ended(s, 3, none, ""); }
-      Ok(an): { for (i32 i = 0; i < an.log.len(); i++) { s.out(an.log[i]); } anchorHex = "0x" + hex(an.blockHash); }
+      Ok(an): {
+        for (i32 i = 0; i < an.log.len(); i++) { s.out(an.log[i]); }
+        anchorHex = "0x" + hex(an.blockHash);
+        if (q.statePath != "") {
+          match (await keep(sys, q.statePath, an.state)) { Err(e): { s.warn("\{q.statePath}: the state was not kept: \{e}"); } Ok(_): { s.out("light client: state kept at \{q.statePath}, finalized slot \{an.beaconSlot}"); } }
+        }
+      }
     }
   }
 
@@ -202,4 +265,33 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
       return ended(s, d.ok ? 0 : 4, c, anchorHex);
     }
   }
+}
+
+/**
+ * The admitted object written out at `out` from its blocks, every one checked against its CID as `r` reads it: a file's
+ * bytes to the file `out`, or a tree's files below the directory `out`. What was written, or why nothing could be.
+ * `claim run --out` uses it, and so does the browser entry, whose files are the browser's own storage.
+ */
+export async Result<string, string> writeOut(Sys sys, Resolver r, Cid c, string out) {
+  u8[] b = try r.block(c);
+  Node n = try readNode(c, b);
+  bool isDir = match (n) { Dir(_): true, Shard(_, _): true, File(_, _, _): false };
+  if (!isDir) {
+    u8[] bytes = try readFile(r, c);
+    match (await sys.writeFile(out, bytes)) { Err(e): { return Result.Err("\{out}: \{e}"); } Ok(_): { } }
+    return Result.Ok("\{c.text()}: \{bytes.len()} bytes, written to \{out}");
+  }
+  FileIn[] tree = try readTree(r, c);
+  FileIn[] files = filesOnly(tree);
+  string[] dirs = emptyDirsOf(tree);
+  for (i32 i = 0; i < dirs.len(); i++) { await sys.files().mkdir(out + "/" + dirs[i], true); }
+  await sys.files().mkdir(out, true);
+  for (i32 i = 0; i < files.len(); i++) {
+    string path = out + "/" + files[i].path;
+    i32 slash = path.len() - 1;
+    while (path.slice(slash, slash + 1) != "/") { slash--; }
+    await sys.files().mkdir(path.slice(0, slash), true);
+    match (await sys.writeFile(path, files[i].content)) { Err(e): { return Result.Err("\{path}: \{e}"); } Ok(_): { } }
+  }
+  return Result.Ok("\{c.text()}: \{files.len()} file(s), written below \{out}");
 }

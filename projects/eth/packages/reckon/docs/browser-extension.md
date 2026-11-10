@@ -57,13 +57,13 @@ sandbox loader (packaged, opaque origin, CSP: no network) ◄── the page pos
 
 | | Change | Where |
 | --- | --- | --- |
-| W1 | **An HTTP capability in the browser host.** A host-provided request/response, e.g. `wac.http ^1`: method, URL, headers, body in; status, headers, body out. Answered in `platform/host/browser.ts` (and an extension host) by `fetch`. Then wac's `fetch` package and `http` client use it when the host offers it, and sockets otherwise, so programs don't change. Without W1 nothing in the browser can reach a beacon node, an RPC or a mirror. **Blocks milestone 1** | **[wac]** |
-| W2 | **`--target browser` for a project with dependencies, and for an extension.** Found by trying: `build.ts` reads the import graph itself (`harness/wacFiles.ts`), resolving relative, `@/`, core and std imports, and **not the packages a project's `wac.lock` pins**. Every program in wac-eth imports `"wac"`, so `cmd/web.wac` fails with 54 imports unresolved. That **blocks milestone 1 as much as W1**. A `--target browser` in `wac build` itself, which already resolves packages, would fix this and W3 at once. Also: today it emits one self-contained HTML page. An extension needs the worker and the wasm as files, not inline strings, because MV3's CSP forbids inline script, plus a module launcher and a way to pass arguments other than the query string | **[wac]** packages/platform/build.ts, or `wac build` |
+| W1 | **An HTTP capability in the browser host** (landed in wac 78c748c1: `wac.http`, the page's fetch). A host-provided request/response, e.g. `wac.http ^1`: method, URL, headers, body in; status, headers, body out. Answered in `platform/host/browser.ts` (and an extension host) by `fetch`. Then wac's `fetch` package and `http` client use it when the host offers it, and sockets otherwise, so programs don't change. Without W1 nothing in the browser can reach a beacon node, an RPC or a mirror. **Blocks milestone 1** | **[wac]** |
+| W2 | **`--target browser` for a project with dependencies, and for an extension.** (W2a, the packages, landed in wac 78c748c1; W2b, `--layout files` for MV3, is next.) Found by trying: `build.ts` reads the import graph itself (`harness/wacFiles.ts`), resolving relative, `@/`, core and std imports, and **not the packages a project's `wac.lock` pins**. Every program in wac-eth imports `"wac"`, so `cmd/web.wac` fails with 54 imports unresolved. That **blocks milestone 1 as much as W1**. A `--target browser` in `wac build` itself, which already resolves packages, would fix this and W3 at once. Also: today it emits one self-contained HTML page. An extension needs the worker and the wasm as files, not inline strings, because MV3's CSP forbids inline script, plus a module launcher and a way to pass arguments other than the query string | **[wac]** packages/platform/build.ts, or `wac build` |
 | W3 | **Building in this container.** `app:build` is a deno task, and deno isn't installed here. Measured: deno installs from npm (`npm install deno`), and with it a program with no package imports (`corpus/probe.wac`) builds and runs in headless Chromium, its clock, random bytes and arguments as expected. `build.ts` must be run from a wac checkout at a path with no `%`: from the package cache's path, deno's file URLs mangle `%3A` | environment (solved locally) |
 | R1 | **Admission as a library.** Move `claim admit`'s flow (anchor, name, chain, claims, decision) out of `cmd/claim.wac` into `src/admission.wac`: `admitSubject(sys, Request) → Admitted{ ok, why[], cid, log[] }`. Then `claim` and the browser entry are thin over it | **[reckon]** |
 | R2 | **A browser entry,** `cmd/web.wac`: `main(Sys)` taking the subject, role and settings, running R1, then fetching the tree, so the worker hands verified blocks to the service worker | **[reckon]** |
 | R3 | **CORS on the replays.** `tools/replay.mjs` and `tools/beacon-replay.mjs` answer `OPTIONS` and send `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Eth-Consensus-Version`, so a page served from another port can use them | **[reckon]** |
-| R4 | **Light-client state kept between runs.** `src/checkpoint.wac` writes the store it ends with (finalized header, committees) and starts from it next time. A check is then a few requests, not a bootstrap | **[reckon]** (lightclient's store type is serialized here, not changed) |
+| R4 | **Light-client state kept between runs** (done: `--state`, docs/admit.md). `src/checkpoint.wac` writes the store it ends with (finalized header, committees) and starts from it next time. A check is then a few requests, not a bootstrap | **[reckon]** (lightclient's store type is serialized here, not changed) |
 | R5 | **The extension.** Manifest, UI page, settings, the sandbox loader, and the document builder: an admitted tree's HTML with its scripts, styles, images and fonts inlined as `data:` URLs (CSS `url()` too), a `fetch`/XHR shim answered from the tree, and links within the tree re-rendered in place | **[reckon]**, `packages/reckon/extension/` |
 
 ## Trust roots and settings
@@ -74,8 +74,8 @@ decision:
   the light client's own state as it advances (R4).
 - **Policy:** the JSON5 file `claim admit` reads, pasted or picked.
 - **Beacon node(s) and execution RPC(s):** trusted for availability only.
-- **Mirrors and gateways:** trusted for availability only. The default gateway is https://trustless-gateway.link
-  (decision G).
+- **Mirrors and gateways:** trusted for availability only. None by default; the settings suggest
+  https://trustless-gateway.link (decision G).
 - **Registry address and code hash,** for revocations, rejections and `name:` subjects (K1).
 
 Nothing else is trusted. In particular, the extension never loads code from the network for itself. Its own code is
@@ -87,22 +87,47 @@ what the user installed, and its build can itself be a derivation, so it can be 
    loads a page built with `--target browser` from the browser entry (R2, over R1). Against `replay.mjs` and
    `beacon-replay.mjs` (R3) on recorded mainnet data, it admits `ens:vitalik.eth` under a reviewer's endorsement,
    with the claims from a mirror served over HTTP. A tampered beacon update and a tampered proof are refused, as
-   `admit-by-name.sh` checks on the command line. It needs W1 and W2. **Status:** R1, R2 and R3 are done, and
-   `tools/browser-admit.sh` is the harness. It admits `ens:vitalik.eth` through `cmd/web.wac` on the command line
-   (2 of 2), then builds the page and runs it in Chromium. The browser half reports BLOCKED, naming W2 (and then W1),
-   and counts nothing until they land.
+   `admit-by-name.sh` checks on the command line. **Done (2026-11-10, wac 78c748c1, which has W1 and W2a).**
+   `tools/browser-admit.sh` passes 10 of 10:
+   - `cmd/web.wac` (R2, over R1) admits ens:vitalik.eth on the command line;
+   - it is built with `--target browser`, 667 KB, and in headless Chromium admits ens:vitalik.eth on recorded mainnet
+     data, all of its HTTP the browser's own fetch, against the replays (R3, with CORS);
+   - in the browser it refuses a wrong checkpoint, a changed bootstrap, update and finality update, a header that is
+     not the anchor's, and a changed storage proof, each for its own reason.
+   The whole admission takes about two seconds in the page.
 2. **The extension shell.** MV3 manifest, a UI page, the worker running milestone 1's module from packaged files
    (W2), and settings. It admits a name and shows the account. No app is served yet.
-3. **Serving the admitted app,** through the sandbox loader (R5). Test it with the capstone's app, a static site
-   (vitalik.eth's, from the gateway), and a hostile app that tries every way out (the spike's `main.js` is the
-   start of one).
+3. **Serving the admitted app. Done (2026-11-10, wac 64e87365, with W2b's `--layout files`).** The extension's
+   admission is `cmd/web.wac`, built into `admit/` (`extension/build.sh`) and run in a hidden frame of the
+   extension's own origin. So its program runs in a worker that may block, its files are the extension's OPFS, and
+   its HTTP is the browser's fetch. It keeps the blocks in `store/` and the light client's state in `lc.state`
+   (resumed after the first run), and writes an admitted tree to `trees/<cid>/` (`web --out-root`), which the page
+   then shows through the sandbox loader. Opening a subject first takes down what was shown, so a refusal never
+   leaves the last app beside it. `extension/test/admit.sh` passes 11 of 11:
+   - with the light client from the checkpoint on recorded mainnet data, it admits a reviewed app from a mirror,
+     writes it into OPFS from checked blocks, and shows it (origin `null`, its style and its `fetch` from its tree);
+   - it refuses an unreviewed tree, saying why, and shows nothing;
+   - that second admission resumed the kept state, with no bootstrap;
+   - it admits `ens:vitalik.eth` by proof, says its content is on no mirror here, and shows nothing.
+   Still to do: a static site from the gateway, when it answers, and a hostile app that tries every way out.
 4. **State and freshness.** Light-client state persisted (R4), revocations proved on chain each time an app is
    opened, and a visible "as of block N" on the page.
 5. **Hardening.** Size and start-up time, the extension built as a derivation, and an admission of the extension by
    its own policy.
-6. **Published.** A zip (and a `.crx` if signing is settled) with install instructions as a download on the reckon
-   pages site reckon1 is building, and live in-browser demos there if feasible. The download is named by its CID,
-   with the claims that admit it.
+6. **Published. Done (2026-11-10).** `extension/release.sh` makes `site/downloads/`, which the pages site serves:
+   - the zip, named by the unpacked extension's CID (unzip it, `obj add` the folder: the same CID; three builds gave
+     the same one);
+   - a manifest;
+   - a claims mirror with the derivation.
+
+   The admission module is derived: `cmd/web.wac` compiled inside the sealed machine on V8 and on wasmtime (by
+   `builddeps`, from HEAD and the dependencies wac.lock pins by CID), each runner signing it with keys made for the
+   release and not published. The shipped `admit/app.wasm` must be that output, byte for byte, less its
+   `wac.manifest` section (all wac's browser build changes), or there is no release.
+
+   Not derived: the JavaScript (the extension's own, in git; wac's browser glue, bundled by deno). Two deno builds
+   differ only in a random temporary directory name, which the release replaces with a fixed one (a wac issue,
+   reported). The site's card says what it does not verify yet.
 
 ## Risks and open questions
 
@@ -113,6 +138,12 @@ what the user installed, and its build can itself be a derivation, so it can be 
 - **Size.** `claim.wasm` is about 540 KB today. With the light client and BLS it is still fine for an extension;
   start-up is measured in milestone 1.
 - **CPU.** The light client's BLS checks run in V8 as they do on the Node host. Milestone 1 will time them.
+- **A mirror that does not answer delays admission, once.** A mirror that fails (no answer, or a 5xx such as a down
+  gateway's 522) is now marked down and asked nothing more in that run (`packages/ipfs`'s `Store.http` and
+  `Store.gateway`), so a tree no longer waits on it for every block. But its first request still waits as long as
+  the server takes to fail: wac's `fetch` and HTTP client have no timeout, and a store's reads are synchronous, so
+  neither a deadline nor asking mirrors in parallel can be done in reckon. That is asked of wac (a request timeout).
+  The extension no longer defaults to a gateway.
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
 

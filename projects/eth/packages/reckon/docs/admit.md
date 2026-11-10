@@ -101,3 +101,34 @@ are followed, by who can move them and how fast:
 Tested in `tools/registry2.sh` (5a and 6: a followed name, a delay under the minimum, an unclaimed name, another
 publisher's, a lying node) and `tools/admit-by-name.sh` (`ens: "refuse"`, `min_delay` with ens unset and with
 "allow"), and unit-tested in `test/policyfile_test.wac`.
+
+## The light client's state, kept (R4)
+
+`--state FILE` keeps the light client's store between runs: the finalized header it reached, its sync committees,
+and the checkpoint it descends from. In a page, `FILE` is in the browser's storage.
+
+    claim admit ens:NAME app --policy P --checkpoint ROOT --beacon-url URL --state lc.state …   # starts it
+    claim admit ens:NAME app --policy P --beacon-url URL --state lc.state …                     # resumes it
+
+- **Resuming** asks the beacon node (or a directory) only for the updates since the kept finalized header's period,
+  then the finality update. There is no bootstrap, and no checkpoint is needed: the kept state is the client's own
+  verified state, trusted as the checkpoint it descends from was. Updates it already has are skipped, unapplied.
+  Anything newer must verify, as it would from a checkpoint.
+- **It is written back** after every run that verified, whole or not at all (to a file beside it, then moved over it).
+  A run that is refused leaves it as it was.
+- **Refused:**
+  - a kept state older than `--state-max-periods N` sync-committee periods at the clock (default 12, about two
+    weeks, inside mainnet's weak subjectivity period). A committee that old may have been sold or stolen since,
+    and a history signed by it proves nothing, so start again from a checkpoint;
+  - a state that the node's answers cannot continue (another fork, an update that does not verify);
+  - a state that descends from another checkpoint than one given;
+  - a file that is not a kept state;
+  - `--state` with `--anchor`;
+  - and, with no kept state yet, no `--checkpoint` to start one.
+
+It lives in `src/admission.wac` (and `src/checkpoint.wac`'s `anchorResume`), so `claim` and the browser entry share
+it. Tested:
+- `tools/admit-by-name.sh`: start, resume to the same anchor with no bootstrap, resume from a directory, and each
+  refusal, the kept state unchanged after one;
+- `tools/browser-admit.sh`: a page keeps the state in the browser's storage, and the next page resumes from it with
+  no checkpoint.

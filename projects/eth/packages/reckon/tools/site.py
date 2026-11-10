@@ -5,7 +5,7 @@
 
 Writes OUT/index.html (the landing page with the demos' counts, the commit it is built from, and the docs list filled
 in), OUT/style.css, OUT/demos/NAME.html for each site/demos/NAME.txt, and OUT/docs/*.md.txt (the README and
-docs/*.md as plain text, since the site has no markdown renderer).
+docs/*.md as plain text, since the site has no markdown renderer), and OUT/downloads/ from site/downloads/.
 """
 import html
 import os
@@ -149,5 +149,8 @@ if left:
     sys.exit(f"site: unfilled in index.html: {left}")
 write(os.path.join(out, "index.html"), index)
 shutil.copyfile(os.path.join(site, "style.css"), os.path.join(out, "style.css"))
+# Downloads (the extension, extension/release.sh): copied as they are, the zip, its manifest and its claims mirror.
+if os.path.isdir(os.path.join(site, "downloads")):
+    shutil.copytree(os.path.join(site, "downloads"), os.path.join(out, "downloads"))
 write(os.path.join(out, ".nojekyll"), "")
 print(f"site: {out}")

@@ -45,6 +45,10 @@ struct Grants {
     /// refusing both. `issues/system/0165`.
     #[serde(default)]
     run: bool,
+    /// **The opposite of a grant**: no clock and no random bytes (`GRANT_SEALED`, `Launch.sealed()`). Joined, not
+    /// narrowed — a child of a sealed program is sealed whatever it asks — so nothing it starts has them back.
+    #[serde(default)]
+    sealed: bool,
 }
 
 #[derive(Deserialize)]
@@ -322,6 +326,8 @@ const GRANT_NET: i32 = 4;
 const GRANT_ENV: i32 = 8;
 /// Running a host program — `procs.exec`. See `GRANT_RUN` in `std/platform.wac`.
 const GRANT_RUN: i32 = 16;
+/// `GRANT_SEALED` in `platform.wac`: the child has no clock and no random bytes.
+const GRANT_SEALED: i32 = 32;
 
 const FAULT_NONE: i32 = 0;
 const FAULT_NOT_FOUND: i32 = 1;
@@ -2413,6 +2419,7 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 // child gets `run` if it asked for it *and* its parent had it. The confinement
                 // argument the old note made is intact, because that is what the `&&` is.
                 run: parent_grants.run && grant_bits & GRANT_RUN != 0,
+                sealed: parent_grants.sealed || grant_bits & GRANT_SEALED != 0,
             };
 
             let handle = keep_socket(Sock::Queue(out.clone()));
@@ -2557,6 +2564,7 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 // child gets `run` if it asked for it *and* its parent had it. The confinement
                 // argument the old note made is intact, because that is what the `&&` is.
                 run: parent_grants.run && grant_bits & GRANT_RUN != 0,
+                sealed: parent_grants.sealed || grant_bits & GRANT_SEALED != 0,
             };
 
             let handle = keep_socket(Sock::Queue(out.clone()));
@@ -3611,6 +3619,12 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
             };
             return Reply::Now(Answer::Text(here));
         }
+        Cap::SleepMillis | Cap::RandomBytes | Cap::NowMillis | Cap::MonotonicNanos
+            if HOST.with(|h| h.borrow().as_ref().is_some_and(|s| s.grants.sealed)) =>
+        {
+            // **Sealed: no clock and no random bytes** (`Launch.sealed()`, spec ch44 `§wac-std-sealed-child-w4kq9ve`).
+            return Reply::Now(Answer::Change(FAULT_UNSUPPORTED, "this program was started sealed: it has no clock and no random bytes".into()));
+        }
         Cap::SleepMillis => {
             let millis = r.a.clamp(0, i32::MAX as i64);
             let Some(t) = table() else { return no_table() };
@@ -3843,6 +3857,8 @@ fn load_module(scope: &mut v8::PinScope, wasm: &[u8], asked: i32) -> Result<i32,
                 // spawn, which is what kept a whole test implementation in this host.
                 // `issues/system/0264c`.
                 run: mine.run && (asked & GRANT_RUN) != 0,
+                // A module a sealed program loads is sealed too, or loading one would be the way back to a clock.
+                sealed: mine.sealed || (asked & GRANT_SEALED) != 0,
             },
         },
         exports: m.exports.clone(),

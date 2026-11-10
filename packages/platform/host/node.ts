@@ -12,7 +12,7 @@
 
 import { type Handlers } from "./respond.ts";
 import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, readI64le, str, unstr } from "./call.ts";
-import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_RUN, GRANT_WRITE, OP } from "./ops.ts";
+import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_RUN, GRANT_SEALED, GRANT_WRITE, OP } from "./ops.ts";
 import { randomBytes } from "./entropy.ts";
 import { envRecord, joinPath, unpackExec } from "./child.ts";
 import { ByteQueue } from "./queue.ts";
@@ -222,6 +222,8 @@ export type NodeWorldOptions = {
   net?: boolean;
   /** Running a host *program* — `exec`. Left out means every call is refused. */
   run?: boolean;
+  /** No clock and no random bytes: each answers `Unsupported` (`Launch.sealed()`, spec ch44). */
+  sealed?: boolean;
   env?(name: string): string | undefined;
   /** The channel to this program's parent's filesystem, when it is a spawned child — see `deno.ts`. */
   parentFs?: { req: ByteQueue; rep: ByteQueue };
@@ -364,6 +366,8 @@ export function nodeWorld(
       // `exec` with *Not granted to this application* — `packages/web`'s builder, which runs
       // `wac bindgen`, on the one host CI has. The native hosts always passed it on.
       run: (wanted & GRANT_RUN) !== 0 && opts.run === true,
+      // Joined, not narrowed: a sealed parent's children are sealed whatever they ask.
+      sealed: opts.sealed === true || (wanted & GRANT_SEALED) !== 0,
     };
     const h = nextHandle++;
     const child = spawnChild(source, childArgs, (sab, cargs, out, input, cerr, parentFs, childSelf) => {
@@ -394,6 +398,7 @@ export function nodeWorld(
         ...(give.net ? { net: true } : {}),
         ...(give.env ? { env: opts.env } : {}),
         ...(give.run ? { run: true } : {}),
+        ...(give.sealed ? { sealed: true } : {}),
         makeWorker,
         // Its parent's filesystem, on a handle of its own — wac-mono 0116, and see `deno.ts` for
         // why this is passed unconditionally rather than as a grant.
@@ -449,10 +454,18 @@ export function nodeWorld(
     if (outClosed[toErr ? 1 : 0]) throw new Error("");
   };
   const P = (path: string) => joinPath(opts.cwd ?? "", path);
+  // **Sealed: no clock and no random bytes** (`Launch.sealed()`, spec ch44 `§wac-std-sealed-child-w4kq9ve`). Each of the
+  // four asks this first, so a sealed world refuses them all with one sentence.
+  const unsealed = (): undefined => {
+    if (opts.sealed === true) {
+      throw new Faulted(FAULT_UNSUPPORTED, "this program was started sealed: it has no clock and no random bytes");
+    }
+    return undefined;
+  };
 
   return {
-    [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
-    [OP.MONOTONIC_NANOS]: () => i64le(BigInt(Math.round(performance.now() * 1e6))),
+    [OP.NOW_MILLIS]: () => unsealed() ?? i64le(BigInt(Date.now())),
+    [OP.MONOTONIC_NANOS]: () => unsealed() ?? i64le(BigInt(Math.round(performance.now() * 1e6))),
     // A timer, which is what makes a timeout expressible: waited on beside another ticket,
     // whichever lands first decides. Resolves to the monotonic nanoseconds at which it fired
     // rather than to nothing, so a caller can see the overshoot.
@@ -461,10 +474,10 @@ export function nodeWorld(
     // is what keeps a worker parked on it from waiting forever.
     [OP.CWD]: () => str(opts.cwd !== undefined && opts.cwd !== "" ? opts.cwd : process.cwd()),
     [OP.SLEEP_MILLIS]: (p) =>
-      new Promise<Uint8Array>((ok) =>
+      unsealed() ?? new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
       ),
-    [OP.RANDOM_BYTES]: (p) => randomBytes(readI32le(p)),
+    [OP.RANDOM_BYTES]: (p) => unsealed() ?? randomBytes(readI32le(p)),
     /**
      * Nobody can ask this host to interrupt, so the answer is no — the answer, not a stub.
      *

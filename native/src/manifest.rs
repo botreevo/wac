@@ -33,6 +33,10 @@ pub struct Grants {
     /// `issues/system/0165`.
     #[serde(default)]
     pub run: bool,
+    /// **The opposite of a grant**: no clock and no random bytes (`GRANT_SEALED`, `Launch.sealed()`). Joined, not
+    /// narrowed, so nothing a sealed program starts has them back.
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 /// One funcref signature the module takes, and how to hand it a function.

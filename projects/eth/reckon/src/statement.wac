@@ -1,0 +1,223 @@
+// Statements about hashes, signed as EIP-712 typed data by an ordinary Ethereum key: design/system/0016 H4.
+//
+//     domain    EIP712Domain(string name,string version)            name "wac-trust", version "1"
+//     built     Built(bytes32 source,string dir,string[] command,string path,bytes32 toolchain,bytes32 output)
+//               "in source tree `source`, in its directory `dir`, running `command` with toolchain `toolchain`
+//               writes `path`, whose hash is `output`"
+//     reviewed  Reviewed(bytes32 subject,string scope)
+//
+// The domain carries no chain id and no contract: a statement is about bytes, which are the same on every
+// chain, and it is valid in a file beside a release before any contract exists. Its **id** is the EIP-712
+// digest, which is what its signer revokes on chain (`TrustRegistry.revoke`) — so revocation is keyed by
+// (signer, id), and nobody can revoke a statement they did not sign.
+//
+// **wac verifies; it signs only because the tests and the demo need statements to exist.** Signing here uses
+// wacuum's secp256k1, which says of itself that it is not constant-time. A real signer uses a wallet.
+
+import { crypto.keccak256, codec.hexEncode, codec.hexDecode, json.parse, json.JsonValue } from "wac";
+import { wacuum.sign, wacuum.recover, wacuum.publicKey } from "eth";
+import { Result } from "core";
+import { parseId, Id } from "./tree.wac";
+
+export enum Claim {
+  Built(string source, string dir, string[] command, string path, string toolchain, string output),
+  Reviewed(string subject, string scope),
+}
+
+/** A statement and who says they signed it. `signature` is 65 bytes, r ‖ s ‖ v with v 27 or 28. */
+export struct Statement {
+  Claim claim;
+  u8[] signer;
+  u8[] signature;
+}
+
+/** A statement whose signature has been checked: `id` is its digest, `signer` the address that signed it. */
+export struct Verified {
+  Claim claim;
+  u8[] id;
+  u8[] signer;
+}
+
+u8[] k(string s) { return keccak256(s.toBytes()); }
+
+u8[] cat(u8[][] parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts[i].len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    for (i32 j = 0; j < parts[i].len(); j++) { out[at + j] = parts[i][j]; }
+    at += parts[i].len();
+  }
+  return out;
+}
+
+export u8[] domainSeparator() {
+  return keccak256(cat([k("EIP712Domain(string name,string version)"), k("wac-trust"), k("1")]));
+}
+
+/** The 32 bytes of a `kt1:`/`kb1:` id, or null. */
+u8[]? bytes32(string id) {
+  Id? p = parseId(id);
+  return p is null ? null : p!.hash;
+}
+
+/** The EIP-712 struct hash, or why the claim cannot have one. */
+export Result<u8[], string> structHash(Claim c) {
+  match (c) {
+    Built(source, dir, command, path, toolchain, output): {
+      u8[]? s = bytes32(source);
+      u8[]? t = bytes32(toolchain);
+      u8[]? o = bytes32(output);
+      if (s is null || t is null || o is null) { return Result.Err("a built statement names a hash that is not kt1/kb1"); }
+      u8[][] argHashes = u8[][].filled(command.len(), u8[]());
+      for (i32 i = 0; i < command.len(); i++) { argHashes[i] = k(command[i]); }
+      return Result.Ok(keccak256(cat([
+        k("Built(bytes32 source,string dir,string[] command,string path,bytes32 toolchain,bytes32 output)"),
+        s!, k(dir), keccak256(cat(argHashes)), k(path), t!, o!,
+      ])));
+    }
+    Reviewed(subject, scope): {
+      u8[]? s = bytes32(subject);
+      if (s is null) { return Result.Err("a reviewed statement names a hash that is not kt1/kb1"); }
+      return Result.Ok(keccak256(cat([k("Reviewed(bytes32 subject,string scope)"), s!, k(scope)])));
+    }
+  }
+}
+
+/** The digest a signer signs, which is also the statement's id. */
+export Result<u8[], string> digest(Claim c) {
+  match (structHash(c)) {
+    Err(e): { return Result.Err(e); }
+    Ok(h): { return Result.Ok(keccak256(cat([[0x19, 0x01] as u8[], domainSeparator(), h]))); }
+  }
+}
+
+/** The address of a 64-byte public key: the last 20 bytes of its keccak256. */
+export u8[] addressOf(u8[] pub) {
+  u8[] h = keccak256(pub);
+  u8[] out = u8[].filled(20, 0);
+  for (i32 i = 0; i < 20; i++) { out[i] = h[12 + i]; }
+  return out;
+}
+
+/** Sign a claim with a 32-byte private key. Not constant-time: for tests and the demo, not for keys that matter. */
+export Result<Statement, string> signClaim(Claim c, u8[] priv) {
+  match (digest(c)) {
+    Err(e): { return Result.Err(e); }
+    Ok(d): {
+      u8[] sig = sign(d, priv);
+      sig[64] = sig[64] + 27;
+      return Result.Ok(Statement(c, addressOf(publicKey(priv)), sig));
+    }
+  }
+}
+
+/** Check a statement's signature: it verifies only if it recovers to the address it names. */
+export Result<Verified, string> verify(Statement s) {
+  if (s.signature.len() != 65 || (s.signature[64] != 27 && s.signature[64] != 28)) {
+    return Result.Err("a signature is 65 bytes ending in 27 or 28");
+  }
+  match (digest(s.claim)) {
+    Err(e): { return Result.Err(e); }
+    Ok(d): {
+      u8[] sig = u8[].filled(65, 0);
+      for (i32 i = 0; i < 65; i++) { sig[i] = s.signature[i]; }
+      sig[64] = sig[64] - 27;
+      u8[]? pub = recover(d, sig);
+      if (pub is null) { return Result.Err("the signature recovers to no key"); }
+      u8[] who = addressOf(pub!);
+      if (!same(who, s.signer)) {
+        return Result.Err("signed by 0x\{hex(who)}, not by 0x\{hex(s.signer)} as it claims");
+      }
+      return Result.Ok(Verified(s.claim, d, who));
+    }
+  }
+}
+
+export bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+/** `0x`-prefixed hex to bytes, or null. */
+export u8[]? unhex(string s) {
+  string body = s.len() >= 2 && s.slice(0, 2) == "0x" ? s.slice(2, s.len()) : s;
+  return hexDecode(body.toBytes());
+}
+
+// ---------------------------------------------------------------- the file form
+
+string q(string s) { return "\"" + s + "\""; }
+
+/** One statement as a JSON object on one line, fields in a fixed order. */
+export string toJson(Statement s) {
+  string body = match (s.claim) {
+    Built(source, dir, command, path, toolchain, output): builtJson(source, dir, command, path, toolchain, output),
+    Reviewed(subject, scope): "\"kind\":\"reviewed\",\"subject\":\{q(subject)},\"scope\":\{q(escape(scope))}",
+  };
+  return "{\{body},\"signer\":\"0x\{hex(s.signer)}\",\"signature\":\"0x\{hex(s.signature)}\"}";
+}
+
+string builtJson(string source, string dir, string[] command, string path, string toolchain, string output) {
+  string a = "";
+  for (i32 i = 0; i < command.len(); i++) { a += (i > 0 ? "," : "") + q(escape(command[i])); }
+  return "\"kind\":\"built\",\"source\":\{q(source)},\"dir\":\{q(escape(dir))},\"command\":[\{a}],\"path\":\{q(escape(path))},\"toolchain\":\{q(toolchain)},\"output\":\{q(output)}";
+}
+
+/** JSON string escaping for the two characters that need it in what statements hold. */
+string escape(string s) {
+  string out = "";
+  for (i32 i = 0; i < s.len(); i++) {
+    string c = s.slice(i, i + 1);
+    if (c == "\"" || c == "\\") { out += "\\"; }
+    out += c;
+  }
+  return out;
+}
+
+string str(JsonValue v, string key) { return v.member(key)?.text() ?? ""; }
+
+/** A statement from its JSON form, unverified. */
+export Result<Statement, string> fromJson(u8[] text) {
+  JsonValue v;
+  match (parse(text)) {
+    Err(e): { return Result.Err("not JSON: \{e.text()}"); }
+    Ok(x): { v = x; }
+  }
+  string kind = str(v, "kind");
+  Claim c;
+  if (kind == "built") {
+    string[] args = string[]();
+    JsonValue? arr = v.member("command");
+    if (arr is not null && arr!.array() is not null) {
+      i32 n = arr!.array()!.len();
+      args = string[].defaulted(n);
+      for (i32 i = 0; i < n; i++) { args[i] = arr!.array()!.get(i).text() ?? ""; }
+    }
+    c = Claim.Built(str(v, "source"), str(v, "dir"), args, str(v, "path"), str(v, "toolchain"), str(v, "output"));
+  } else if (kind == "reviewed") {
+    c = Claim.Reviewed(str(v, "subject"), str(v, "scope"));
+  } else {
+    return Result.Err("a statement of kind \"\{kind}\"");
+  }
+  u8[]? signer = unhex(str(v, "signer"));
+  u8[]? sig = unhex(str(v, "signature"));
+  if (signer is null || signer!.len() != 20) { return Result.Err("a signer that is not a 20-byte address"); }
+  if (sig is null) { return Result.Err("a signature that is not hex"); }
+  return Result.Ok(Statement(c, signer!, sig!));
+}
+
+/** The hash a statement is about, for indexing: a built statement's output, a review's subject. */
+export string subjectOf(Claim c) {
+  return match (c) {
+    Built(_, _, _, _, _, output): output,
+    Reviewed(subject, _): subject,
+  };
+}
+
+/** The address a 32-byte private key signs as. */
+export u8[] addressOfKey(u8[] priv) { return addressOf(publicKey(priv)); }

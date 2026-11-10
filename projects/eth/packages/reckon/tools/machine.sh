@@ -75,6 +75,10 @@ check deep abort
 check big abort
 check loop abort
 check floats "exit 0"
+# Every way a produced NaN can leave its arithmetic, each checked canonical by the program itself (exit 1 otherwise):
+# the test that the rewrite's skipped checks (src/canon.wac) never let a payload out.
+check nanpaths "exit 0"
+check nbody "exit 0"
 check probe "exit 0" differs
 
 # What the program could and could not reach, from its own log.
@@ -95,7 +99,7 @@ grep -q "refused climbing out" files.log && ok "files: cannot climb out of the r
 # offsets in every function, and every rewritten module valid.
 if command -v cargo >/dev/null 2>&1 && (cd "$here/tools/wasmscan" && cargo build --offline --release -q 2>/dev/null); then
   scan="$here/tools/wasmscan/target/release/wasmscan"
-  for m in derive obj floats files probe; do
+  for m in derive obj floats files probe nanpaths nbody; do
     wac derive.wasm canon "$m.wasm" "$m.canon.wasm" --scan "$m.mine" 2>/dev/null
     "$scan" scan "$m.wasm" | awk '{print $2" "$3}' | sed 's/ $//' > "$m.oracle"
     sed 's/ $//' "$m.mine" > "$m.mine2"

@@ -24,7 +24,7 @@ randomness) still needs a change in wac.
   what was written, and imports it under `unixfs-v1-2025`. The CID that import gives is the output.
 - With `--key`, it signs a `Derivation(recipe, output, runner)` statement and stores it.
 
-## What the corpus showed (51 checks)
+## What the corpus showed (51 checks, version 0)
 
 | program | ending | V8 = wasmtime | twice on one engine |
 | --- | --- | --- | --- |
@@ -95,8 +95,36 @@ move bits exactly, so a payload written with `fromBits` survives until an operat
   so a module it cannot read is never run without the profile. `tools/wasmscan`, built on wasmparser (the decoder
   wasmtime uses), is its oracle: across 4,418 functions in six modules, both find the same operators at the same
   offsets, and every rewritten module validates. `tools/machine.sh` repeats that check when cargo is available.
-- The cost is a call after each float operation. That is nothing for the corpus here, but measurable in float-heavy
-  code; inlining the check would remove the call.
+- The cost was a call after each float operation, which on float-heavy code was most of the running time (below).
+
+### Inline, and only where a NaN could be seen (2026-11-10)
+
+The rewrite no longer calls anything. After an operation whose NaN could be seen, it inserts
+`local.tee $t; const NaN; local.get $t; local.get $t; eq; select`, through one f64 and one f32 scratch local appended to
+the function. It also leaves the check out wherever the payload cannot be seen. That is a result consumed by another
+NaN-producing operation (itself checked), by a comparison, by a conversion to an integer or by `drop`, or one kept in a
+local that is only ever read that way. A small stack simulation over straight-line code decides this, and it counts
+anything it does not model as seeing the value.
+
+`corpus/nbody.wac`, the five-body simulation and a 120×120 matrix product, 10,000,000 steps, median of five runs on
+this container (4 cores; Node 22.23 for V8, the native wasmtime host):
+
+| nbody, 10M steps | unrewritten | version 1: a call after each op | inline, where seen |
+| --- | --- | --- | --- |
+| V8 | 1026 ms | 1775 ms (+73%) | 1192 ms (+16%) |
+| wasmtime | 2682 ms | 9216 ms (+244%) | 3095 ms (+15%) |
+| module size | 31,493 B | 31,810 B | 32,070 B |
+
+wasmtime does not inline the call, which is why version 1 cost so much more there. Inlining the check after
+*every* operation, without leaving any out, gave 1857 ms on V8 (+81%), no better than the call, because V8 had already
+inlined it: what costs is the check, so the gain is in not making it. All three give the same output bits.
+
+`corpus/nanpaths.wac` sends a produced NaN out every way it can leave: through a local, a chain, a local only read by
+arithmetic, an array, a struct, a return, a select, a loop-carried local, `neg`, `copysign`, an f32, and a comparison.
+The program checks each one itself. Unrewritten on V8 (x86) it fails 11 of 12, since `0/0` there is `fff8…`. Rewritten
+it passes on both engines, and so does `floats.wac`, whose output is the same bit for bit as under version 1.
+`tools/machine.sh`: 75 of 75 with wasmtime, and wasmscan finds the same operators at the same offsets in all seven
+modules, every one valid after the rewrite. `test/canon_test.wac` covers the cases one at a time.
 
 ## Running it
 

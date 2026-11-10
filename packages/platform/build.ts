@@ -650,7 +650,11 @@ async function produceApp(
       }
       const out = await Deno.readTextFile(dst);
       await Deno.remove(dst).catch(() => {});
-      return out;
+      // **The staging directory's name is not part of what was built** (`issues/system/0454e`). The bundler writes
+      // each module's path into its output — a comment, and the key its module table is indexed by — and that path
+      // runs through `work`, whose name is random (`makeTempDir`) or the cache key. Two builds of one program came out
+      // different in nothing else. The name is unique to this build, so replacing it touches nothing but itself.
+      return out.replaceAll(work.slice(work.lastIndexOf("/") + 1), "wac-app");
     };
 
     // Two passes. The worker bundle holds the application and the wasm; the launcher

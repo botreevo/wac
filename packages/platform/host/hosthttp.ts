@@ -11,8 +11,9 @@
  * Three requests from `base` (which callers take from `capability`'s answer, never this file's number):
  *
  * - **+0 open** — `text` is `"METHOD URL"`; `bytes` is the request's header lines, `Name: value\r\n` each, then an
- *   empty line, then the body, whole. Answers `n` a handle, `m` the status, `text` the URL the response came from,
- *   and `bytes` the response's header lines in the same form.
+ *   empty line, then the body, whole; `b` is a deadline in milliseconds for the whole request, body reads included,
+ *   or negative for none. Answers `n` a handle, `m` the status, `text` the URL the response came from, and `bytes`
+ *   the response's header lines in the same form. Running out is `FAULT_TIMED_OUT`, `timed out after <ms>ms`.
  * - **+1 read** — `a` the handle. Answers the body's next piece in `bytes`, at most `CHUNK`, and `flags` 1 once it
  *   has ended (with no bytes).
  * - **+2 close** — `a` the handle: the body is abandoned and the request aborted.
@@ -47,6 +48,7 @@ export const HTTP_CLOSE = HOST_HTTP.base + 2;
 const FAULT_OTHER = 5;
 const FAULT_UNSUPPORTED = 9;
 const FAULT_UNREACHABLE = 16;
+const FAULT_TIMED_OUT = 17;
 
 /** Whether a host providing `cap` satisfies `versions` — `^1`, `^1.2`, `1`, `1.0.0`, `*`: by major version. */
 export function versionMatches(cap: HostCapability, versions: string): boolean {
@@ -147,7 +149,21 @@ function splitHead(bytes: Uint8Array): { headers: [string, string][]; body: Uint
  * hands one in. Each open response is held until it is read to its end or closed.
  */
 export function httpHandlers(fetchFn: typeof fetch = globalThis.fetch.bind(globalThis)): Record<number, (p: Uint8Array) => Promise<Uint8Array>> {
-  type Open = { reader: ReadableStreamDefaultReader<Uint8Array> | null; held: Uint8Array; abort: AbortController };
+  type Open = {
+    reader: ReadableStreamDefaultReader<Uint8Array> | null;
+    held: Uint8Array;
+    abort: AbortController;
+    timer: ReturnType<typeof setTimeout> | undefined;
+    ms: number;
+  };
+  /** A deadline's abort, told apart from a `close`: the reason is this. */
+  const DEADLINE = "wac.http deadline";
+  const ranOut = (abort: AbortController) => abort.signal.aborted && abort.signal.reason === DEADLINE;
+  const finish = (id: number) => {
+    const o = open.get(id);
+    if (o !== undefined && o.timer !== undefined) clearTimeout(o.timer);
+    open.delete(id);
+  };
   const open = new Map<number, Open>();
   let next = 1;
 
@@ -162,6 +178,9 @@ export function httpHandlers(fetchFn: typeof fetch = globalThis.fetch.bind(globa
       const h = new Headers();
       for (const [name, value] of headers) if (!forbidden(name)) h.append(name, value);
       const abort = new AbortController();
+      const ms = Number(q.b);
+      // **One deadline for the request, body included**: the timer stays until the body ends or is closed.
+      const timer = ms >= 0 ? setTimeout(() => abort.abort(DEADLINE), ms) : undefined;
       let res: Response;
       try {
         res = await fetchFn(url, {
@@ -173,12 +192,14 @@ export function httpHandlers(fetchFn: typeof fetch = globalThis.fetch.bind(globa
           signal: abort.signal,
         });
       } catch (e) {
+        if (timer !== undefined) clearTimeout(timer);
+        if (ranOut(abort)) throw new Faulted(FAULT_TIMED_OUT, `timed out after ${ms}ms`);
         // A `TypeError` is every refusal a page is told about, CORS included and indistinguishably.
         if (e instanceof TypeError) throw new Faulted(FAULT_UNREACHABLE, "network error or CORS refusal");
         throw new Faulted(FAULT_OTHER, `wac.http: ${e instanceof Error ? e.message : String(e)}`);
       }
       const id = next++;
-      open.set(id, { reader: res.body === null ? null : res.body.getReader(), held: new Uint8Array(0), abort });
+      open.set(id, { reader: res.body === null ? null : res.body.getReader(), held: new Uint8Array(0), abort, timer, ms });
       let lines = "";
       res.headers.forEach((value, name) => { lines += `${name}: ${value}\r\n`; });
       return capAnswer({ n: BigInt(id), m: BigInt(res.status), text: res.url || url, bytes: enc.encode(lines) });
@@ -193,17 +214,18 @@ export function httpHandlers(fetchFn: typeof fetch = globalThis.fetch.bind(globa
         try {
           r = await o.reader.read();
         } catch (e) {
-          open.delete(Number(q.a));
+          finish(Number(q.a));
+          if (ranOut(o.abort)) throw new Faulted(FAULT_TIMED_OUT, `timed out after ${o.ms}ms`);
           throw new Faulted(FAULT_UNREACHABLE, `wac.http: the body stopped arriving — ${e instanceof Error ? e.message : String(e)}`);
         }
         if (r.done) {
-          open.delete(Number(q.a));
+          finish(Number(q.a));
           return capAnswer({ flags: 1 });
         }
         o.held = r.value;
       }
       if (o.held.length === 0) {
-        open.delete(Number(q.a));
+        finish(Number(q.a));
         return capAnswer({ flags: 1 });
       }
       // **At most a chunk per answer**: a response piece can be larger than the buffers the bridge pools.
@@ -215,7 +237,7 @@ export function httpHandlers(fetchFn: typeof fetch = globalThis.fetch.bind(globa
     [HTTP_CLOSE]: (p) => {
       const q = readCapRequest(p);
       const o = open.get(Number(q.a));
-      open.delete(Number(q.a));
+      finish(Number(q.a));
       if (o !== undefined) {
         o.abort.abort();
         o.reader?.cancel().catch(() => {});

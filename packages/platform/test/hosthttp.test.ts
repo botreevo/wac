@@ -122,3 +122,55 @@ Deno.test("close abandons the body, and the handle is gone after", async () => {
   }
   assert(caught, "a closed handle was still read");
 });
+
+/** A `fetch` that answers nothing until it is aborted, as a server that never replies. */
+const silent = (() => {
+  const f = ((_input: RequestInfo | URL, init?: RequestInit) =>
+    new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })) as typeof fetch;
+  return f;
+})();
+
+Deno.test("a deadline in the open request is kept: no answer by then is TIMED_OUT, worded with it", async () => {
+  const h = httpHandlers(silent);
+  const began = Date.now();
+  let caught: unknown = null;
+  try {
+    await h[HTTP_OPEN](capRequest(0n, 50n, "GET http://example.test/", enc.encode("\r\n")));
+  } catch (e) {
+    caught = e;
+  }
+  const took = Date.now() - began;
+  assert(caught instanceof Faulted, `threw ${caught}`);
+  assert((caught as Faulted).fault === 17, `fault ${(caught as Faulted).fault}`);
+  assert((caught as Faulted).message === "timed out after 50ms", (caught as Faulted).message);
+  assert(took >= 45 && took < 2000, `gave up after ${took}ms`);
+});
+
+Deno.test("...and it covers the body: a body that stops arriving times out at the same deadline", async () => {
+  const { f } = standIn((req) =>
+    new Response(new ReadableStream({
+      start(c) { c.enqueue(enc.encode("first")); },
+      pull: () => new Promise((_, reject) => req.signal.addEventListener("abort", () => reject(new Error("aborted")))),
+    }))
+  );
+  const h = httpHandlers(f);
+  const a = readCapAnswer(await h[HTTP_OPEN](capRequest(0n, 80n, "GET http://example.test/slow", enc.encode("\r\n"))));
+  const first = readCapAnswer(await h[HTTP_READ](capRequest(a.n, 0n, "", new Uint8Array(0))));
+  assert(dec.decode(first.bytes) === "first", "the first piece");
+  let caught: unknown = null;
+  try {
+    await h[HTTP_READ](capRequest(a.n, 0n, "", new Uint8Array(0)));
+  } catch (e) {
+    caught = e;
+  }
+  assert(caught instanceof Faulted && (caught as Faulted).fault === 17, `threw ${caught}`);
+});
+
+Deno.test("no deadline (negative) waits as long as the answer takes", async () => {
+  const { f } = standIn(() => new Promise((r) => setTimeout(() => r(new Response("late")), 120)));
+  const h = httpHandlers(f);
+  const a = readCapAnswer(await h[HTTP_OPEN](capRequest(0n, -1n, "GET http://example.test/", enc.encode("\r\n"))));
+  assert(a.m === 200n, `status ${a.m}`);
+});

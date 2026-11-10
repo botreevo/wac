@@ -41,3 +41,24 @@ Deno.test("--layout files is a browser layout", async () => {
   }
   assert(refused.includes("--target browser"), `refused with: ${refused}`);
 });
+
+Deno.test("a browser build names no staging directory, so two builds of one program are the same bytes", async () => {
+  // The bundler writes each module's path into its output, and the staging directory is in that path — under a random
+  // name, or the cache key. Neither is the program (`issues/system/0454e`).
+  const dir = await Deno.makeTempDir({ prefix: "wac-repro-" });
+  try {
+    await buildApp("packages/platform/example/hostget.wac", `${dir}/files`, { net: true }, "browser", false, { layout: "files" });
+    await buildApp("packages/platform/example/hostget.wac", `${dir}/page.html`, { net: true }, "browser");
+    const texts = [
+      await Deno.readTextFile(`${dir}/files/launcher.js`),
+      await Deno.readTextFile(`${dir}/files/worker.js`),
+      await Deno.readTextFile(`${dir}/page.html`),
+    ];
+    for (const t of texts) {
+      assert(!/wac-app-[0-9a-zA-Z]{4,}/.test(t), "a random staging name is in the output");
+      assert(!/stage\/[0-9a-f]{16,}/.test(t), "the cache key's staging name is in the output");
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});

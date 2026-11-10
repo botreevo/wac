@@ -6467,7 +6467,19 @@ export string typeOfExpr(C c, Expr e) {
           // anything here — so answering with the declaration's own text claims `Box<i32> b =
           // Box.of(5)` is a mismatch. The instantiation is what this checker does not model, and the
           // honest answer to a question it cannot answer is no answer.
-          if (c.isGeneric(recvT)) { return typeNone(); }
+          // **Except a static that uses none of the owner's letters** (ch19
+          // `§wac-generic-unused-param-unbound-k4p2xqz`): `Ticket.first(parts)` answers `Ticket<i32>`
+          // whatever `Ticket`'s `T` would be, so its written return type is the answer — and without
+          // it, `i32 which = Ticket.first(parts).wait();` passed (`issues/lang/0415a`).
+          if (c.isGeneric(recvT)) {
+            string sname = tokenText(c, nameTok);
+            if (c.ownerFree.indexOf("|" + recvT + "." + sname + "|") < 0) { return typeNone(); }
+            i32 fm = c.methodAt(recvT, sname);
+            // Letters of its own — `anyWithIndex<Ts>` — are bound by its arguments, which this does
+            // not model; the answer is then unknown, as it was.
+            if (fm < 0 || (fm < c.methodTypeParams.len() && c.methodTypeParams[fm] != "")) { return typeNone(); }
+            return c.methodReturns[fm];
+          }
           i32 mi = c.methodAt(recvT, tokenText(c, nameTok));
           // **An enum instantiation is not in the method table.** `Opt<i32>` has no entry of its own —
           // only the template `Opt` does, unlike a generic *struct*, whose instantiations are
@@ -11119,6 +11131,18 @@ bool nameable(C c, string t) {
     else if (endsWith(core, "?")) { core = unFn(dropLast(core, 1)); }
     else { break; }
   }
+  // **A union or a tuple is nameable when its members are** — `Result<i32, union<NotFound, Other>>`'s
+  // `Err(e)` bound `e` to nothing, and an assignment of it to a `string` passed (`issues/lang/0413a`).
+  if (isUnionName(core)) {
+    string[] ms = unionMembers(core);
+    for (i32 i = 0; i < ms.len(); i++) { if (!nameable(c, ms[i])) { return false; } }
+    return ms.len() > 0;
+  }
+  if (isTupleName(core)) {
+    string[] ms = tupleMembers(core);
+    for (i32 i = 0; i < ms.len(); i++) { if (!nameable(c, ms[i])) { return false; } }
+    return true;
+  }
   string base = genericBase(core);
   string at = base == "" ? core : base;
   return isPrimitiveName(at) || at == "string" || at == "bool" || startsWithFn(at) ||
@@ -11900,7 +11924,9 @@ void checkMember(C c, Expr at, Expr obj, string name) {
   // A payload is reachable through the enum's own name **inside an arm that narrowed it**, which is
   // where `B: return e.x;` gets its meaning — and the arm walk below retypes the subject for
   // exactly that reason. Outside one the enum has no such field, which the reference says too.
-  if (c.isEnum(t)) { c.report(errNoSuchField(), at.line, at.col); return; }
+  // **A generic enum's instance too** — `Result<S, E>` is no name in the enum table, `Result` is, so
+  // `look().isDir` on a `Result` passed and the build refused it (`issues/lang/0411a`).
+  if (c.isEnum(t) || (t.indexOf("<") > 0 && c.isEnum(templateOf(t)))) { c.report(errNoSuchField(), at.line, at.col); return; }
   // A primitive has no fields at all. Its *statics* are reached through a type name rather than a
   // value, so this cannot be one of those — `f64.toBits` has an `Ident` for an object, not a value.
   //
@@ -12162,6 +12188,15 @@ void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] 
   }
   if (recv == "string" && !isStringBuiltin(name)) {
     c.report(errNoMethod(), callee.line, callee.col);
+    return;
+  }
+  // **A union answers no method** — not even one every member declares: a value of it is taken apart
+  // with `match` (ch18 `§wac-union-match-type-rj837up`), and the emitter has no dispatch to do it for
+  // a call. A call on one passed whatever its name and the build declined the function
+  // (`issues/lang/0406a`).
+  if (isUnionName(recv)) {
+    c.reportWith(errNoMethod(), callee.line, callee.col,
+                 "no method '" + name + "' on every member of " + recv + " — match on it first");
     return;
   }
   // A private method, called — instance or static — outside its type's body.

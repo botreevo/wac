@@ -1,7 +1,6 @@
 # 0406a — a method call on a union value is not checked
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `check.wac`'s `checkMethodCall` refuses a call on a union; `spec/cases/0884`
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
 - **Kind:** diagnostic
@@ -26,3 +25,7 @@ interpolation converts through it (`§wac-interp-union-member-m3vq8ke`). The emi
 `union<Denied, …>.toString`, which this expression is emitted as and which is not in the program*. `"\{e}"` is
 the spelling that works. Possibly the same gap as 0403a (a match scrutinee's method is not checked either): the
 checker may type a call on a union, or on a value whose method it cannot find, as unknown and move on.
+
+## Fix
+
+A union answers no method — the spec gives it none, a value of one is taken apart with `match`, and the emitter has no dispatch for a call on one, so even a method every member declares stopped the build. `checkMethodCall` had no rule for a union receiver and said nothing; it now refuses the call with *no method … — match on it first*.

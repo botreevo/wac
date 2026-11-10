@@ -1,6 +1,6 @@
 # 0417a — a `std` struct initialised from a `Result` is not checked
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — the same gap as `issues/lang/0436d`, fixed there
 - **Reported by:** agent-a
 - **Date:** 2026-10-28
 - **Kind:** bug
@@ -33,3 +33,7 @@ The same blindness answers for `bool sent = sock.sendTo(h, p, bytes).wait();` �
 into a `bool`, clean in the checker and refused by the engine — where `bool b = t.wait();` over a ticket the file
 made is refused. Four more programs had this shape after step 5 (`datagram_probe.wac`, `quic`'s `handshake.wac`,
 `webrtc`'s `answer.wac`); a build sweep found them, the check sweep could not.
+
+## Fix
+
+`s.receive().wait()` had no type because `Ticket` reached this file only through `std`'s signatures, which the checker's reach did not follow — `issues/lang/0436d`. With that fixed the reproduction is refused: *expected Datagram, found Result<Datagram, …>*.

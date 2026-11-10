@@ -1,6 +1,6 @@
 # 0436d — a type reached only through `std` has no members to the checker, and everything after it goes quiet
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — `api.wac`'s reach follows `std` for core's names; `spec/cases/0886`
 - **Reported by:** cloud session, met writing a test; the shape of wac-kps's "the checker accepts things that only fail at build"
 - **Date:** 2026-11-08
 - **Kind:** bug
@@ -28,7 +28,7 @@ to the file that declares it) skipped `std` — "whose bodies are fixed when the
 signatures hand on from `core` was never declared here. `wait()` then had no member to find, the call answered
 unknown, and every rule after it went quiet.
 
-## Tried
+## Tried first
 
 Following `std` in the reach (dropping `|| paths[i] == "std"` from the skip in `checkFilesAutoIn`'s loop) makes the
 CLI refuse the reproduction, and the repository's entries still check clean — but two suite tests disagreed:
@@ -40,3 +40,14 @@ CLI refuse the reproduction, and the repository's entries still check clean — 
   type reached through `std` was declared where what it names (`core`'s `Result`) is not.
 
 Reverted 2026-11-08. A fix has to declare a reached type together with what its signature names, or not at all.
+
+## Fix
+
+The reach follows `std` now, for what it hands on from the core tree only — `Ticket`, `Result`, `Stuck` — not for a name `std` declares itself. Both false alarms from the first try were looked at again:
+
+- `packages/quic/test/wac/complete_test.wac` declares its own `struct Result`. The checker matches types by spelling, so core's `Result`, reached through `Ticket.wait()`, and the file's are one type to it. An entry declaring a name core exports is therefore not followed through `std` at all, and stays as quiet as it was; the clash guard also stops exempting core's names from the entry's own. Matching by key rather than spelling is what lifts this.
+- `packages/platform/example/roundtrip.wac` was right to be refused: it passed `flatten(fs.stat(a).wait())`'s `Err`, which includes `Stuck`, to `reason(FilesFault)`, whose union did not. `FilesFault` names `Stuck` now.
+
+The corpus runner's `dumpTypeErrorsFiles` never joined `std` at all, which is why the first try's case passed there; it joins it as a graph check does.
+
+`issues/lang/0417a` was the same gap, met through `Datagrams.receive()`.

@@ -1,7 +1,6 @@
 # 0411a — a field read on a `Result` is not checked
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `check.wac`'s field check asks the enum table for a generic instance's template; `spec/cases/0882`
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
 - **Kind:** bug
@@ -31,3 +30,7 @@ used to answer a `Stat` and now answers a `Result<Stat, LookFault>`: nine places
 lambda `$lambda$3/3011:1021`, which was `sh`'s `rm` builtin. Siblings: 0406a (a method call on a union value) and
 0410a (a method call on a nullable array) — in all three the member lookup on a receiver that is not a plain
 struct gives up without a diagnostic.
+
+## Fix
+
+`Result<S, E>` is not a name in the checker's enum table; `Result` is. The field check asked `isEnum` of the instance's whole name, got no, and fell through to say nothing. It now asks of the template too, so `look().isDir` on a `Result` is *no such field*, as it is on any non-generic enum. Found by running the open issues' reproductions through `wac compile`, which now validates.

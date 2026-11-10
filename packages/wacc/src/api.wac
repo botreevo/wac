@@ -1388,7 +1388,21 @@ string diagnoseFilesWithIn(string[] paths, string[] sources, Res res, string ent
 }
 
 export i32[] dumpTypeErrorsFiles(string[] paths, string[] sources, string entry) {
-  return errorsOf(checkFiles(paths, loweredSources(paths, sources), entry));
+  // **With `std` joined where something names it**, as a graph check joins it: without, an import from
+  // `std` declared nothing, and a case built on `Sys` passed every rule after its first `std` value
+  // (`issues/lang/0436d`, whose case the corpus accepted while the command refused it).
+  bool hasStd = false;
+  bool wantsStd = false;
+  for (i32 i = 0; i < paths.len(); i++) { if (paths[i] == "std") { hasStd = true; } }
+  for (i32 i = 0; i < sources.len(); i++) { if (sources[i].indexOf("\"std\"") >= 0) { wantsStd = true; } }
+  if (hasStd || !wantsStd) { return errorsOf(checkFiles(paths, loweredSources(paths, sources), entry)); }
+  string[] ps = string[].filled(paths.len() + 1, "std");
+  string[] ss = string[].filled(paths.len() + 1, stdSource());
+  for (i32 i = 0; i < paths.len(); i++) {
+    ps[i] = paths[i];
+    ss[i] = i < sources.len() ? sources[i] : "";
+  }
+  return errorsOf(checkFiles(ps, loweredSources(ps, ss), entry));
 }
 
 /**
@@ -2107,13 +2121,30 @@ C checkFilesAutoIn(string[] callerPaths, string[] callerSources, const Res res, 
       default: { }
     }
   }
+  // **An entry that declares a name `core` exports is not followed through `std`.** Types are matched by
+  // spelling here, so a file's own `struct Result` and the `Result` core's `Ticket.wait()` answers are one
+  // type to the checker — leaving `wait()` unknown keeps that file as quiet as it was, where following it
+  // reported a mismatch between two spellings of different types (`issues/lang/0436d`).
+  bool followStd = true;
+  for (i32 k = 0; k < on && followStd; k++) {
+    string[] home = followExport(paths, sources, lexes, progs, res, corePath(), own[k]);
+    if (home[0] == corePath()) { home = followExport(paths, sources, lexes, progs, res, "core", own[k]); }
+    if (home[0] != corePath() && home[0] != "core" && inCoreTree(home[0])) { followStd = false; }
+  }
   bool more = true;
   for (i32 round = 0; round < 32 && more; round++) {
     more = false;
     for (i32 i = 0; i < paths.len(); i++) {
       // **Not `core`'s entry or `std`**, whose bodies are fixed when the compiler is built. A file of `core`'s
       // is followed like any other: `Ticket`'s signatures reach `Result`, which `result.wac` declares.
-      if (paths[i] == entry || paths[i] == corePath() || paths[i] == "core" || paths[i] == "std") { continue; }
+      if (paths[i] == entry || paths[i] == corePath() || paths[i] == "core") { continue; }
+      // **`std` is followed for what it hands on from `core` alone** — `Clock.nowMillis` answers core's
+      // `Ticket`, and a file that never imported `Ticket` had no `wait()` to find, so the call answered
+      // unknown and every rule after it went quiet (`issues/lang/0436d`, `0417a`). A name `std` declares
+      // itself is not followed: declaring those here gave false alarms, a `std` type declared without
+      // what its own signatures name.
+      bool fromStd = paths[i] == "std";
+      if (fromStd && !followStd) { continue; }
       i32 asked = 0;
       for (i32 k = 0; k < n; k++) {
         if (wantFrom[k] == paths[i]) { asked = asked + 1; }
@@ -2140,6 +2171,7 @@ C checkFilesAutoIn(string[] callerPaths, string[] callerSources, const Res res, 
         rfrom = got[0];
         rname = got[1];
         if (indexOfPath(paths, rfrom) < 0) { continue; }
+        if (fromStd && !inCoreTree(rfrom)) { continue; }
         bool have = false;
         // **Two types of one spelling are left unknown rather than made one.** A reached name the
         // entry declares, or wants from somewhere else, would collide with it — and a false alarm is
@@ -2151,7 +2183,10 @@ C checkFilesAutoIn(string[] callerPaths, string[] callerSources, const Res res, 
             clash = true;
           }
         }
-        if (!inCoreTree(rfrom) && listHas(own, on, rname)) { clash = true; }
+        // Core's names too, against what the entry declares itself: a test file's own `struct Result` and
+        // core's `Result` reached through `std` are one spelling, and declaring the second over the first
+        // refused the file's every use of its own (`issues/lang/0436d`).
+        if (listHas(own, on, rname)) { clash = true; }
         if (have || clash || n >= wantFrom.len()) { continue; }
         wantFrom[n] = rfrom;
         wantName[n] = rname;

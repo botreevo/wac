@@ -8,8 +8,7 @@
 #    wac-eth at HEAD and the dependencies wac.lock pins by CID): cmd/web.wac, the admission module, and
 #    cmd/assemble.wac, the program that puts the extension together.
 # 2. The browser glue (wac's --target browser --layout files, by deno, outside any machine): index.html, launcher.js,
-#    worker.js. The random temporary directory it names is replaced by a fixed one, the only difference between two
-#    builds (a wac issue, reported).
+#    worker.js. It is built twice, independently, and the two must be the same bytes (wac 0454e made them so).
 # 3. The assembly, a derivation on both runners: assemble.wasm over three slots, `pages` (the extension's own files),
 #    `glue`, and `module` (web.wac's derived output). Its output's out/ is the extension: the pages, the glue under
 #    admit/, and admit/app.wasm, the derived module less its `wac.manifest` section. It must be the extension
@@ -53,7 +52,10 @@ CL="wac $work/claim.wasm"
 
 # 2. The glue, and the extension as build.sh makes it natively.
 sh "$here/build.sh" > "$work/build.log" 2>&1 || { tail -5 "$work/build.log"; exit 1; }
-for f in launcher.js worker.js; do sed -i 's|wac-app-[0-9a-f]\{16\}|wac-app|g' "$here/src/admit/$f"; done
+rm -rf "$work/glue-first" && cp -R "$here/src/admit" "$work/glue-first"
+sh "$here/build.sh" > "$work/build2.log" 2>&1 || { tail -5 "$work/build2.log"; exit 1; }
+diff -r "$work/glue-first" "$here/src/admit" > /dev/null || { diff -r "$work/glue-first" "$here/src/admit" | head; echo "release: two builds of the browser glue differ" >&2; exit 1; }
+echo "release: the browser glue, built twice, is the same bytes"
 
 # 3. The assembly, on both runners.
 cd "$work"

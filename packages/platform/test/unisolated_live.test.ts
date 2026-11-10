@@ -1,5 +1,3 @@
-// test-lane: exclusive — drives headless Chromium
-//
 // **A `main(Sys)` page in a frame that cannot be isolated** — `packages/platform/host/asynchost.ts`.
 //
 // wac-eth's reckon loads apps in an opaque-origin sandbox frame, which is never cross-origin isolated, so it has no

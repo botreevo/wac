@@ -38,6 +38,14 @@ cache="$HOME/.wac/cache/git"
 (cd "$cache/$(quote https://git.voltrevo.com/wac.git)/$commit" &&
   wac build --quiet --allow-read --allow-write --allow-run --allow-net --allow-env packages/wac/src/wac.wac -o "$work/wac")
 
+# The input tree is wac-eth at HEAD, and the dependencies are what the working wac.lock pins, so a tree with changes not
+# committed would build something other than what is on disk (a moved pin found the old wac missing from the copied
+# cache). Refuse it, saying what to do.
+if [ -n "$(git -C "$root" status --porcelain)" ]; then
+  echo "builddeps: the tree has changes not committed, and the build takes HEAD: commit first" >&2
+  git -C "$root" status --short >&2
+  exit 2
+fi
 # The input tree: wac-eth at HEAD under in/, and under home/cache/git/ every locked dependency as the cache holds it.
 cd "$work"
 rm -rf tree && mkdir -p tree/in tree/home/cache/git

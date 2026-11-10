@@ -1,7 +1,6 @@
 # 0305b — `wac check` passes a call to a method that does not exist, when the receiver is a generic method's returned `Option`
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `check.wac`'s `checkMethodCall` refuses a call on a nullable receiver; `spec/cases/0907`
 - **Reported by:** agent-b
 - **Date:** 2026-08-31
 - **Kind:** diagnostic
@@ -149,3 +148,7 @@ diagnostic, so it stays filed rather than being decided here.
 
 **Status stays open** for that. What is fixed is that when the emitter does catch it, the reader is
 told which line to look at.
+
+## Fix
+
+Re-read against today's `core`: `Map.get` answers `V?` rather than an `Option`, and an import from `core/map.wac` is no longer how `core` is named. What was left is the general rule the second half of this issue suspected. The receiver's type was known all along, but no method rule applied to a nullable one, so any name passed. A nullable answers no method, so a call on one is refused (*unwrap it with `!`, or call it with `?.`*), and the repository's own code and the corpus checked clean under the rule.

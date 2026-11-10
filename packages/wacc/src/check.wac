@@ -12308,6 +12308,22 @@ string variantCalleeOwner(C c, Expr callee) {
  * static — `Box.of`, called on the template, where nothing about the receiver says what `T` is and the
  * slot does. The caller has already computed it to give a lambda argument its target type.
  */
+/**
+ * How many arguments method `mi` takes on receiver `recv`: its parameters, less each one a `void` argument erased
+ * (`§wac-void-typearg-2mkx9db`) — `Ticket<void>.resolve()` takes none, where `resolve(T v)` is written with one. The
+ * emitter leaves the erased parameter out of the signature already; the count said one and refused the call
+ * (`issues/lang/0407a`).
+ */
+i32 erasedArity(C c, i32 mi, string recv) {
+  i32 n = c.methodParamCount[mi];
+  if (recv == "" || recv == typeNone() || recv.indexOf("void") < 0) { return n; }
+  i32 kept = 0;
+  for (i32 k = 0; k < n; k++) {
+    if (substituteType(c, recv, c.methodParamTypes[c.methodParamAt[mi] + k]) != "void") { kept = kept + 1; }
+  }
+  return kept;
+}
+
 void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] args, string inst) {
   string recv = "";
   bool isStatic = false;
@@ -12365,6 +12381,17 @@ void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] 
   }
   if (recv == "string" && !isStringBuiltin(name)) {
     c.report(errNoMethod(), callee.line, callee.col);
+    return;
+  }
+  // **A nullable answers no method** — `!` or `?.` reaches what it holds (spec ch10 `§wac-safe-call-hfr3mzk`). A call on
+  // one passed whatever its name: `m.get("x").nope(0)` on an `i32?` checked clean and the emitter refused it
+  // (`issues/lang/0305b`).
+  // Only for what `checkThroughNullable` leaves — a nullable number or `bool`, which has no members to reach — so a
+  // receiver with members is told once, there.
+  string held = withoutNull(recv);
+  if (!isStatic && recv != "" && recv != typeNone() && held != "" && (isPrimitiveName(held) || held == "bool")) {
+    c.reportWith(errThroughNullable(), callee.line, callee.col,
+                 name + " is called on a " + recv + " — unwrap it with `!`, or call it with `?.`");
     return;
   }
   // **A union answers no method** — not even one every member declares: a value of it is taken apart
@@ -12784,7 +12811,7 @@ void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] 
                    "no " + gbase + "." + name);
       return;
     }
-    if (gm >= 0 && args.len() != c.methodParamCount[gm]) {
+    if (gm >= 0 && args.len() != erasedArity(c, gm, recv)) {
       c.report(errCallArity(), call.line, call.col);
       return;
     }
@@ -12914,7 +12941,7 @@ void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] 
   // Real code is where this showed up. Seventeen of twenty missed diagnostics in a mutation of the
   // repository's own packages were this shape, and none of the four thousand generated programs had
   // ever called a method with the wrong number of arguments.
-  if (args.len() != c.methodParamCount[at]) {
+  if (args.len() != erasedArity(c, at, recv)) {
     c.report(errCallArity(), call.line, call.col);
     return;
   }

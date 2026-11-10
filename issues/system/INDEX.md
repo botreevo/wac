@@ -5,7 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0460e](open/0460e-a-page-does-not-serve-child-ended.md) | `Child.exit()` is answered from the new op `CHILD_ENDED` (74) since `71bc06729`, and wac-web's page host does not serve it, so a page that starts a process and awaits its exit gets *a page does not serve request 74* (`browser_live.test.ts`'s `procs`: status wanted `17`). Unnoticed because the live browser tests had not run since (`0452e`) | bug | a page's child cannot be waited for |
+| [0460e](closed/0460e-a-page-does-not-serve-child-ended.md) | `Child.exit()` is answered from the new op `CHILD_ENDED` (74) since `71bc06729`, and wac-web's page host does not serve it, so a page that starts a process and awaits its exit gets *a page does not serve request 74* (`browser_live.test.ts`'s `procs`: status wanted `17`). Unnoticed because the live browser tests had not run since (`0452e`) | bug | a page's child cannot be waited for |
 | [0454e](closed/0454e-two-browser-builds-of-one-program-differ-by-a-staging-directory-name.md) | two `--target browser` builds of one program differed only in the staging directory's name, which the bundler wrote into `launcher.js` and `worker.js` as a comment and a module key — random without a cache key, the key with one; `bundle` replaces it with `wac-app` | bug | a build that is not byte-reproducible |
 | [0453e](closed/0453e-the-ts-stripper-erases-satisfies-used-as-an-identifier.md) | `packages/ts`'s stripper erases `satisfies` wherever it appears, as if the operator — so `export function satisfies(…)` and a call to it become `export function {` and `if (!)`, which do not parse; `design/system/0009` D4 says a construct it cannot read is an error, never a rewrite. Found by `./bootstrap.sh --host nodejs` | bug | a bundle that does not parse |
 | [0452e](closed/0452e-live-browser-tests-assume-a-playwright-cache-and-version-a-cloud-container-lacks.md) | the live browser tests look for Chromium only under `~/.cache/ms-playwright` and import a floating `npm:playwright@1`, so in a cloud container (Chromium at `/opt/pw-browsers`) they skip — and the gate reads green — or, pointed at it, fail on the browser revision; launched with `executablePath` they pass | bug — in the test harness | a browser lane that passes having driven no browser |
@@ -142,7 +142,7 @@ own roadmap lives in its README. This tracker is for what crosses those lines.
 
 ## Closed
 
-360 issues, 283 closed.
+360 issues, 284 closed.
 
 The count is checked against the directory by `tools/wac/issuecounts_test.wac`, which reads both
 trackers. It was `compiler/wacSpec.test.ts` until that file went with the TypeScript compiler on

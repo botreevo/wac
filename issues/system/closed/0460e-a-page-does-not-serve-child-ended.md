@@ -1,7 +1,6 @@
 # 0460e — a page does not serve `CHILD_ENDED`, so a page's child cannot be waited for
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (wac2) — wac-web `a859d17`, pinned here
 - **Reported by:** wac2, running the live browser tests in a cloud container for the first time (`0452e`)
 - **Date:** 2026-11-10
 - **Kind:** bug
@@ -27,3 +26,15 @@ nothing noticed, because the live browser tests had not run anywhere since.
 
 wac-web's page host serves 74: the child's end as `Ended`, encoded as wac's own browser host
 (`packages/platform/host`) encodes it, then wac's pin moves to that commit.
+
+## Fixed — wac2, 2026-11-10
+
+wac-web `a859d17` serves 74. Each child keeps how it ended beside its exit code, settled wherever the code is:
+
+- an exit with its code;
+- a trap: the program's own `trap "…"` words when it left any (`$trap$message`), and otherwise the engine's message,
+  classified by the same table as wac's `packages/platform/host/children.ts` `trapEnding`;
+- a child its parent stopped (143), or one that could not be started (126), as a host limit saying so.
+
+Op 74 answers it as wac's browser host does: `n` how, `m` the code or kind, the text. `browser_live.test.ts` passes
+whole in a cloud container with the pin moved, `procs` included.

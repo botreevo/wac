@@ -31,12 +31,14 @@ same() {  # same DESCRIPTION A B
   if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "   PASS ($1: $2)"; else fail=$((fail+1)); echo "   FAIL ($1: $2 ≠ $3)"; fi
 }
 
-step "the reader, and a devnet: wacuum --dev"
+step "the reader, and a devnet: wacuum --dev, a block every 3 s"
 mkdir -p "$here/dist"
 wac build --allow-read --allow-write --allow-net --allow-env "$here/cmd/registry2.wac" -o "$here/dist/registry2" >/dev/null
 R="wac $here/dist/registry2.wasm"
+wac build --quiet --allow-read --allow-write --allow-net "$here/cmd/claim.wac" -o "$here/dist/claim" >/dev/null
+CL="wac $here/dist/claim.wasm"
 mkdir -p "$work/devnet"
-( cd "$work/devnet" && exec wac "$wacuum" --dev --datadir data --port "$port" > node.log 2>&1 ) &
+( cd "$work/devnet" && exec wac "$wacuum" --dev --dev-period 3 --datadir data --port "$port" > node.log 2>&1 ) &
 node_pid=$!
 trap 'kill $node_pid ${liar_pid:-} 2>/dev/null || true' EXIT
 until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "http://127.0.0.1:$port/" >/dev/null; do sleep 0.5; done
@@ -100,7 +102,28 @@ expect ok "…and the delay still 8 s" "$nameA delay 8s" -- $R resolve "hello@$P
 echo "   waiting out the 8 s delay"; sleep 9
 expect ok "after it, with no write since: app4, and the new delay" "$nameB delay 1s" -- $R resolve "hello@$P" $C
 
-step "5. a node that hides storage"
+step "5. claim admit, under a policy file, with --chain"
+cs="--store $work/claims"
+cid5=$($R cid "$work/app4.bin")
+s5=$($CL endorse "$cid5" "reviewed" --key "$keys/endorser" $cs 2>/dev/null)
+cat > "$work/policy.json5" <<POLICY
+{
+  signers: { endorser: "$addr_endorser" },
+  reject_lists: ["$addr_list"],
+  roles: { app: [{ endorsed: { by: ["endorser"], at_least: 1 } }] },
+}
+POLICY
+CH="--chain 127.0.0.1:$port --registry $registry --code-hash $codehash"
+expect ok "claim admit with the chain: nothing set" "0 revocation(s), 0 rejection(s) set" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs $CH
+expect ok "the followed list rejects it" -- $wallet reject "$keys/list" "$registry" "$cid5" "second thoughts"
+expect refused "claim admit refuses it" "on a rejection list you follow (on the chain)" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs $CH
+expect ok "unrejected" -- $wallet unreject "$keys/list" "$registry" "$cid5"
+expect ok "the endorser revokes the endorsement on chain" -- $wallet revoke "$keys/endorser" "$registry" "$s5"
+expect refused "claim admit refuses it" "endorsed by nobody" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs $CH
+expect ok "without --chain the chain is not asked, and it is admitted: the revocation lives only on chain" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs
+expect refused "a chain asked for and unreachable refuses rather than admits" "ECONNREFUSED" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs --chain 127.0.0.1:$((port + 40)) --registry "$registry" --code-hash "$codehash"
+
+step "6. a node that hides storage"
 node "$here/tools/liar.mjs" "$liar" "$port" & liar_pid=$!
 until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "http://127.0.0.1:$liar/" >/dev/null; do sleep 0.2; done
 L=$(printf '%s' "$A" | sed "s/127.0.0.1:$port/127.0.0.1:$liar/")
@@ -108,7 +131,7 @@ expect refused "admit app1 through a node hiding its revocation: its storage pro
 expect refused "resolve through a node hiding the name" "registry2: slot 0x" -- $R resolve "hello@$P" --rpc "127.0.0.1:$liar" --registry "$registry" --code-hash "$codehash"
 expect ok "where every slot is empty the lie changes nothing, and app3 is admitted" -- $R admit "$work/app3.bin" --statement "$work/e3" $L
 
-step "6. the registry's address running other code, or none"
+step "7. the registry's address running other code, or none"
 other=0x$(printf 'ab%.0s' $(seq 32))
 expect refused "a code hash that is not the registry's" "runs other code" -- $R admit "$work/app3.bin" --statement "$work/e3" --endorser "$addr_endorser" --list "$addr_list" --store "$work/objects" --rpc "127.0.0.1:$port" --registry "$registry" --code-hash "$other"
 expect refused "an address with no account" "there is no account" -- $R resolve "hello@$P" --rpc "127.0.0.1:$port" --registry 0x00000000000000000000000000000000000000ee --code-hash "$codehash"

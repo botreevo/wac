@@ -1,7 +1,7 @@
 # 0397a — an import alias inside a field's nested generic instance makes a bogus instance the emitter declines
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `Env.provisional`; `spec/cases/0914`
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-10-24
 - **Kind:** bug
@@ -56,3 +56,19 @@ A third face of one fault: a type imported **only under an alias** is registered
 union naming `NoSpace` and the importer's own type was `$gathered_NoSpace`: *the error `try` passes on does not
 fit*. The compiler stopped writing aliases of its own (gathered errors and the program adapter's `OutputClosed`
 import plainly now), so only a program that aliases such a type itself still meets it.
+
+## Why
+
+The emitter types each struct's fields twice: once as the struct is declared, when a name another file declares may
+not resolve yet, and again in `resolveStructRefs` once every file is walked. The second pass corrected `fieldTypes`,
+but the first had already *registered* each generic instance it spelled — `Pair<Thing,i32>` with `Thing` still the
+import alias — and that stale instance stayed in the list beside the right one, to be built and fail. Nothing about
+`async` or `Ticket`: `struct Holder { Cell<Pair<Thing, i32>> c; }` over plain structs fails the same way.
+
+## Fix
+
+`Env.provisional` is set around the first pass's `declareStructs`, and `instantiate` records nothing while it is;
+`resolveStructRefs` types every field again with the table whole and registers the instances it names then. The
+issue's program answers 1, and `spec/cases/0914` holds the synchronous form across two files. The checker and
+static-evaluator faces in the issue's later sections are not re-tested here — std stopped writing the aliases that
+reached them.

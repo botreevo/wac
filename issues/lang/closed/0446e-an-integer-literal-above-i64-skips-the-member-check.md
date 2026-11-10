@@ -1,7 +1,7 @@
 # 0446e — an integer literal above `i64`'s range skips the member check
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — refused as out of range; `spec/cases/0912`
+- **Claimed by:** wac2
 - **Reported by:** wac2 (cloud), found while triaging `0262c`
 - **Date:** 2026-11-10
 - **Kind:** bug
@@ -40,3 +40,16 @@ refused — so it is the receiver position, where there is no slot to type the l
 `packages/wacc/test/wac/declined_test.wac`'s u64-literal fixture (`issues/lang/0262c`) reaches the emitter through
 exactly this hole, so fixing this retires that fixture as well — `0262c`'s repoint-or-retire decision should be taken
 with this in view.
+
+## Why
+
+A literal's natural type is `i32`, else `i64`; one wider than both answered unknown in `naturalTypeOf`, and a member
+access on an unknown receiver is silent.
+
+## Fix
+
+`wideLiteralReceiver`, asked by `checkMember` and by a method call's receiver, reports *literal out of range for its
+type — a receiver gives it no type, and it is wider than i64*, at the literal: `9223372036854775808.nofield`,
+`18446744073709551615.nofield` and `18446744073709551616.len()` are all refused. A `u64` receiver is spelled with a
+cast, `(18446744073709551615 as u64).m()`. `spec/cases/0912`. `0262c`'s fixture reaches the emitter through this same
+hole, so its repoint-or-retire decision now has one answer fewer to weigh.

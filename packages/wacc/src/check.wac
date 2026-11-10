@@ -2188,10 +2188,17 @@ void declareTrueBindings(C c, Expr e) {
   }
 }
 
-/** The names a pattern binds, at the types it binds them — a matched value or payload slots. */
+/**
+ * The names a pattern binds, at the types it binds them — a matched value or payload slots.
+ *
+ * **One condition binds a name once** (`issues/lang/0395a`): `R p matches m && R p matches n` declared both into the
+ * condition's one scope and the second silently won, so `p.v` read `n`'s. Each name is asked about before it is
+ * declared, as a declaration statement's is.
+ */
 void declarePatternNames(C c, Pattern pat, string subjectT) {
   if (pat.type is not null) {
     if (pat.nameTok >= 0 && tokenText(c, pat.nameTok) != "_") {
+      c.refuseRedeclared(tokenText(c, pat.nameTok), pat.nameTok);
       string bt = typeOfTy(c, pat.type!);
       // `const Rect r` binds a `const` reference to a `Rect` (spec ch18).
       if (startsWith(bt, "const ")) { c.declareConst(tokenText(c, pat.nameTok), bt.slice(6, bt.len()), true, pat.nameTok, "local"); }
@@ -2205,6 +2212,7 @@ void declarePatternNames(C c, Pattern pat, string subjectT) {
     if (pat.slotNames[i] < 0) { continue; }
     string bn = tokenText(c, pat.slotNames[i]);
     if (bn == "_") { continue; }
+    c.refuseRedeclared(bn, pat.slotNames[i]);
     string ft = world == typeNone() ? typeNone() : substituteType(c, world, c.variantFieldAt(world, vname, i));
     c.declare(bn, ft, pat.slotNames[i]);
   }
@@ -11906,7 +11914,14 @@ void checkThroughNullable(C c, Expr at, Expr obj) {
   string t = typeOfExpr(c, obj);
   if (t == typeNone()) { return; }
   string inner = withoutNull(t);
-  if (inner != "" && c.isStruct(inner)) { c.report(errThroughNullable(), at.line, at.col); }
+  if (inner == "") { return; }
+  // **Every reference with members, not structs alone** (`issues/lang/0410a`): `u8[]? out; out.write(…)` and
+  // `a.len()` on a `string?` passed, the first into an emitter that had no `u8[].write` to call. An array, a
+  // string, an enum and a generic instance have members to reach through a nullable as a struct does.
+  if (c.isStruct(inner) || isArrayName(inner) || inner == "string" || c.isEnum(templateOf(inner))
+      || (genericBase(inner) != "" && !isUnionName(inner))) {
+    c.report(errThroughNullable(), at.line, at.col);
+  }
 }
 
 /**
@@ -11916,7 +11931,22 @@ void checkThroughNullable(C c, Expr at, Expr obj) {
  * method rather than a field is not missing either, which is why the method table is consulted before
  * complaining — `c.get` without parentheses is the reference's own separate diagnostic.
  */
+/**
+ * **A receiver gives a literal no slot to take its type from**, so it has its natural one — `i32`, else `i64` — and
+ * one wider than `i64` has none. That answered unknown and unknown is silent, so `9223372036854775808.nofield`
+ * checked clean and stopped the emitter (`issues/lang/0446e`). It is out of range, as the reference said; a `u64`
+ * spells it `(18446744073709551615 as u64).m()`. Answers whether it reported.
+ */
+bool wideLiteralReceiver(C c, Expr obj) {
+  if (litKindOf(obj) != litInteger()) { return false; }
+  string txt = decimalLiteralText(c, obj);
+  if (txt == "" || !decimalExceeds(txt, "9223372036854775807")) { return false; }
+  c.reportWith(errFloatRange(), obj.line, obj.col, "a receiver gives it no type, and it is wider than i64");
+  return true;
+}
+
 void checkMember(C c, Expr at, Expr obj, string name) {
+  if (wideLiteralReceiver(c, obj)) { return; }
   // **`E.nope` is a variant that is not there.** The object is a *type name* rather than a value, so
   // every rule below — which asks what the object's type is — had nothing to work with and stayed
   // silent. The variant table answers it directly, and answers it per enum: `Ok` belonging to some
@@ -12305,6 +12335,7 @@ void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] 
       // `("aaa, " + "bbb").toBytes(1)` had no receiver and no complaint. A literal takes its type
       // from context everywhere except here, where the receiver is the context — and that rule lives
       // in one function now rather than in two that disagree.
+      if (wideLiteralReceiver(c, obj)) { return; }
       recv = naturalTypeOf(c, obj);
       // **A generic enum's variant, used as a receiver.** `Maybe.Just(4).orElse(0)` has nowhere to
       // take its instantiation from: inference works from the expected type, and a receiver is the
@@ -12604,6 +12635,13 @@ void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] 
     return;
   }
   bool recvConst = !isStatic && constExpr(c, obj);
+  // **A `const T` receiver is a `T` that cannot be written through**: the qualifier says how, not which methods. A call's
+  // result typed `const Inner` looked for methods of a type named `const Inner`, found none, and returned in silence —
+  // so `o.get().mutate()` through a `const Inner get(this)` checked clean and the write landed (`issues/lang/0315a`).
+  if (!isStatic && startsWith(recv, "const ")) {
+    recv = recv.slice(6, recv.len());
+    recvConst = true;
+  }
   // **An instantiation answers to its template here.** `cli.readFile(path)` is a
   // `Pending<FileResult>`, and the struct table holds `Pending` — so the gate below saw a name that
   // is not a struct and returned, which is why `.wait(1)` went unreported in three files. Everything

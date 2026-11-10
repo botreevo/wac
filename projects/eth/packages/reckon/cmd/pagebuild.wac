@@ -3,13 +3,15 @@
 // is the work: `writePageModule` and `wrapBuiltPage` from wac-web's tools/build.wac (the `webbuild` package).
 //
 // What this adds is the machine's file system, made into one the builder can use. The builder reads and writes paths
-// relative to where it runs, and the machine gives a program a read-only input at /in and an empty /out. So: a path
-// is written below /out; and read from /out if the program wrote it, else from the recipe's `in` slot, /in/in. That
-// is how `--wrap` finds `<out>/page.wasm`, which an earlier derivation built, and writes `<out>/index.html` beside it.
+// relative to where it runs, and the machine gives a program a read-only input at /in and an empty /out. So the builder
+// runs in /out (`relativeTo`), and what it reads that an earlier derivation made — `--wrap`'s `<out>/page.wasm`, in the
+// recipe's `in` slot at /in/in — is copied there first, and taken away after, so the output is what the builder wrote.
+//
+// Not an overlay through `Files.of`: the builder waits on each request synchronously (`.wait()`), and a request to
+// files made with `Files.of` is answered by an `async` continuation that such a wait cannot drive — "nothing this wait
+// may drive can settle the ticket" on a read, and a write that lands only when the program drains at its end.
 
-import { Sys, Files, FileOps, Stat, Input, Output, ReadFault, WriteFault, LookFault, MkdirFault, MoveFault, ModeFault,
-         Unsupported } from "std";
-import { Result, Ticket, flatten } from "core";
+import { Sys, Files } from "std";
 import { writePageModule, wrapBuiltPage } from "webbuild";
 
 string clean(string p) {
@@ -19,37 +21,38 @@ string clean(string p) {
   return q;
 }
 
-/** The builder's file system: written below /out, read from /out when written there, else from /in/in. */
-Files overlay(Files base) {
-  fn<string(string)> w = (string p) => "/out/" + clean(p);
-  fn<string(string)> r = (string p) => flatten(base.stat("/out/" + clean(p)).wait()).isOk() ? "/out/" + clean(p) : "/in/in/" + clean(p);
-  return Files.of(FileOps(
-    (string p) => base.readFile(r(p)),
-    (string p, u8[] b) => base.writeFile(w(p), b),
-    (string p) => base.openRead(r(p)),
-    (string p) => base.openWrite(w(p)),
-    (string p) => base.openAppend(w(p)),
-    (string p) => base.stat(r(p)),
-    (string p) => base.linkStat(r(p)),
-    (string p) => base.readDir(r(p)),
-    (string p, bool parents) => base.mkdir(w(p), parents),
-    (string p, bool rec) => base.remove(w(p), rec),
-    (string a, string b) => base.rename(w(a), w(b)),
-    (string p, i32 mode) => base.chmod(w(p), mode),
-    (string p, bool on) => base.setExecutable(w(p), on),
-    (string p, string owner) => base.chown(w(p), owner)), "");
+/** The builder's `<out-dir>`: its second positional argument, the flags that take a value skipped as it skips them. */
+string outDirOf(string[] a) {
+  i32 positional = 0;
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] == "--wac" || a[i] == "--page" || a[i] == "--title" || a[i] == "--spawn" || a[i] == "--grant" || a[i] == "--app"
+        || a[i] == "--app-color") { i++; continue; }
+    if (a[i].len() >= 2 && a[i].slice(0, 2) == "--") { continue; }
+    positional++;
+    if (positional == 2) { return a[i]; }
+  }
+  return "";
 }
 
-export i32 main(Sys sys) {
+export async i32 main(Sys sys) {
   string[] a = sys.args();
   bool module = false;
   bool wrap = false;
   for (i32 i = 0; i < a.len(); i++) { if (a[i] == "--module-only") { module = true; } if (a[i] == "--wrap") { wrap = true; } }
   if (module == wrap) { sys.warn("pagebuild: one half of a page build: --module-only or --wrap, with the builder's arguments"); return 2; }
-  Files fs = overlay(sys.files());
-  i32 code = module ? writePageModule(a, sys.stderr(), sys.stdout(), fs) : wrapBuiltPage(a, sys.stderr(), sys.stdout(), fs);
-  // The builder waits on what it asked of the file system but leaves the continuations behind those waits queued;
-  // a program that ends with work queued is an error (exit 1), so run them first.
-  sys.drainFor(0 - 1);
+  Files fs = sys.files().relativeTo("/out");
+  if (module) { return writePageModule(a, sys.stderr(), sys.stdout(), fs); }
+  string out = clean(outDirOf(a));
+  if (out == "") { return wrapBuiltPage(a, sys.stderr(), sys.stdout(), fs); }
+  string wasm = out + "/page.wasm";
+  u8[] built;
+  match (await sys.files().readFile("/in/in/" + wasm)) {
+    Err(e): { sys.warn("pagebuild: /in/in/\{wasm}: \{e}"); return 1; }
+    Ok(b): { built = b; }
+  }
+  match (await sys.files().mkdir("/out/" + out, true)) { Err(e): { sys.warn("pagebuild: /out/\{out}: \{e}"); return 1; } Ok(_): { } }
+  match (await sys.files().writeFile("/out/" + wasm, built)) { Err(e): { sys.warn("pagebuild: /out/\{wasm}: \{e}"); return 1; } Ok(_): { } }
+  i32 code = wrapBuiltPage(a, sys.stderr(), sys.stdout(), fs);
+  match (await sys.files().remove("/out/" + wasm, false)) { Err(e): { sys.warn("pagebuild: /out/\{wasm}: \{e}"); return 1; } Ok(_): { } }
   return code;
 }

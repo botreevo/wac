@@ -44,6 +44,15 @@ mkdir -p "$work/devnet"
 node_pid=$!
 trap 'kill $node_pid ${liar_pid:-} ${http_pid:-} 2>/dev/null || true' EXIT
 until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:8545/ >/dev/null; do sleep 0.5; done
+# A wacuum built before it kept recent states (1fd0013) proves only its head, so a proof can lose the race with the
+# next block. dist/ is not in git: refuse a stale one, with the fix, rather than flake on it.
+_n() { curl -s -m2 -X POST -H 'content-type: application/json' --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" "http://127.0.0.1:$1/"; }
+until [ "$(_n 8545 eth_blockNumber '[]' | sed -n 's/.*"result":"0x\([0-9a-f]*\)".*/\1/p')" != 0 ]; do sleep 0.5; done
+sleep 2.5
+_b=$(_n 8545 eth_blockNumber '[]' | sed -n 's/.*"result":"\(0x[0-9a-f]*\)".*/\1/p')
+if _n 8545 eth_getBalance "[\"0x0000000000000000000000000000000000000000\",\"$(printf '0x%x' $((_b - 1)))\"]" | grep -q "not available"; then
+  echo "e2e: $wacuum keeps only its head's state; rebuild it (wac task wacuum:build)" >&2; exit 2
+fi
 printf '1111111111111111111111111111111111111111111111111111111111111111' > "$keys/dev"
 for k in publisher rebuilder1 rebuilder2 reviewer denylist thief; do
   [ -f "$keys/$k" ] || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$keys/$k"

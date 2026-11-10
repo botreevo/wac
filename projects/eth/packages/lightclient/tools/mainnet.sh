@@ -42,7 +42,9 @@ for f in bootstrap updates optimistic; do
   v=$(grep -i '^eth-consensus-version' "$work/$f.ssz.h" | tr -d '\r' | awk '{print $2}')
   [ "$v" = "$fork" ] || { echo "the node answered $f as $v and finality as $fork: this tool reads one fork at a time" >&2; exit 1; }
 done
-now=$((($(date +%s) - 1606824023) / 12))
+# The clock slot, read after the fetching (a slot can pass meanwhile, and the freshest updates are signed in the head
+# slot), with a second's allowance for clock disparity (the spec allows 500 ms; date has whole seconds).
+now=$((($(date +%s) + 1 - 1606824023) / 12))
 echo "node $NODE, $fork, finalized slot $final (period $period), clock slot $now"
 
 cd "$root"

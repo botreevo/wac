@@ -13,7 +13,7 @@ compiler, this one is things built with it.
 it builds on, and every program and page you can build, each with a line on what it does. It
 is generated from the tree by `wac task map` and checked by the suite, so it cannot drift.
 
-Today, give or take whatever landed this morning: **40 packages, 178,330 lines of wac, 2,950
+Today, give or take whatever landed this morning: **34 packages, 178,330 lines of wac, 2,950
 tests written in wac, 82 command-line programs and 13 browser pages.** Those are MAP.md's own
 figures, copied on 2026-10-30, after `web` became a repository of its own and took its pages with it
 — the set before, from 2026-10-29, said 15 pages where there were 13 a day later, and the one from

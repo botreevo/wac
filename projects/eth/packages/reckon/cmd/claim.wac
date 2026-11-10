@@ -12,14 +12,18 @@
 //                                                  …with revocations and rejections proved from the registry v2
 //                                                  (src/registry2.wac); a chain that cannot be read refuses (exit 3)
 //
-// --store DIR (default .objects), --mirror DIR (repeatable). A signed statement goes into the store and into the
+//     claim publish DIR                            the local index into the mirror DIR, added to what it holds
+//
+// --store DIR (default .objects), --mirror DIR or --mirror http://HOST:PORT (repeatable): where else to find blocks,
+// and claims: the index `admit`, `origins` and `dependents` use is the local one together with every mirror's, each
+// statement's signature verified, what fails reported and left out (docs/claims-mirror.md). A signed statement goes into the store and into the
 // store's index (`claims/index`), which is reloaded — every signature checked again — on each use.
 
 import { Sys } from "std";
 import { Result } from "core";
-import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.Block, ipfs.DAG_CBOR } from "@/lib.wac";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.httpStoreAt, ipfs.Block, ipfs.DAG_CBOR } from "@/lib.wac";
 import { Statement, Signed, signStatement, signedBlock, addressOfKey, recipeFrom, statementId } from "../src/claims.wac";
-import { Index, Held, loadIndex, saveIndex } from "../src/graph.wac";
+import { Index, Held, Loaded, loadIndex, saveIndex, loadIndexes, publishIndex } from "../src/graph.wac";
 import { slotsOf } from "../src/slots.wac";
 import { Chain, Decision, admit } from "../src/admit.wac";
 import { readPolicyFile } from "../src/policyfile.wac";
@@ -38,7 +42,11 @@ export async i32 main(Sys sys) {
   Store[] mirrors = Store[]();
   for (i32 i = 0; i + 1 < a.len(); i++) {
     if (a[i] != "--mirror") { continue; }
-    Store[] next = Store[].filled(mirrors.len() + 1, Store.dir(sys.files(), a[i + 1]));
+    Store m = Store.dir(sys.files(), a[i + 1]);
+    if (isHttp(a[i + 1])) {
+      match (httpStoreAt(sys.net(), a[i + 1])) { Err(e): { sys.warn("claim: \{e}"); return 2; } Ok(h): { m = h; } }
+    }
+    Store[] next = Store[].filled(mirrors.len() + 1, m);
     for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
     mirrors = next;
   }
@@ -61,7 +69,19 @@ export async i32 main(Sys sys) {
     return record(sys, store, signStatement(s, key!));
   }
 
-  Index ix = loadIndex(store).index;
+  if (cmd == "publish" && a.len() >= 2) {
+    match (publishIndex(loadIndex(store).index, Store.dir(sys.files(), a[1]))) {
+      Err(e): { sys.warn("claim: \{e}"); return 1; }
+      Ok(l): {
+        for (i32 i = 0; i < l.refused.len(); i++) { sys.warn("claim: \{a[1]} held, and is no longer listed: \{l.refused[i]}"); }
+        sys.log("\{a[1]}: \{l.index.signed.len()} statement(s), \{l.index.recipes.len()} recipe(s)");
+        return 0;
+      }
+    }
+  }
+  Loaded loaded = loadIndexes(store, mirrors);
+  for (i32 i = 0; i < loaded.refused.len(); i++) { sys.warn("claim: left out: \{loaded.refused[i]}"); }
+  Index ix = loaded.index;
   if (a.len() < 2) { sys.warn("claim: \{cmd} needs a CID"); return 2; }
   Cid c;
   match (parseCid(a[1])) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(x): { c = x; } }

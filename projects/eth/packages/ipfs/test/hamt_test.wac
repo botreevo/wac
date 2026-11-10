@@ -1,0 +1,257 @@
+// HAMT-sharded directories against the reference importer (tools/oracle/vectors.mjs, ipfs-unixfs-importer 16.1.1 and
+// @multiformats/murmur3): the hash, the CIDs of trees that shard at one level and many, nested and at the profile's own
+// 256 KiB, the trees read back whole, and a shard that misplaces, hides or mislabels an entry refused.
+
+import { json.parse, json.JsonValue, codec.hexEncode, codec.hexDecoded } from "wac";
+import { VECTORS } from "./vectors.wac";
+import { Cid, DAG_PB } from "../src/cid.wac";
+import { Params, Built, Block, Node, readNode, slotLabel } from "../src/unixfs.wac";
+import { FileIn, buildTree } from "../src/tree.wac";
+import { Store, Resolver, entriesOf, readTree, importFiles } from "../src/store.wac";
+import { Link, PbNode, encodePb, decodePb } from "../src/dagpb.wac";
+import { murmur3x64, hamtByte } from "../src/murmur3.wac";
+import { Check } from "./check.wac";
+
+u8[] content(i32 n, i64 seed) {
+  u8[] b = u8[].filled(n, 0);
+  u32 s = (seed & (0xffffffff as i64)) as@ u32;
+  if (s == 0) { s = 1; }
+  for (i32 i = 0; i < n; i++) {
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    b[i] = (s & 255) as@ u8;
+  }
+  return b;
+}
+
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+i32 num(JsonValue v, string k) { return (v.member(k)?.number() ?? 0.0) as~ i32; }
+string str(JsonValue v, string k) { return v.member(k)?.text() ?? ""; }
+JsonValue V() { return parse(VECTORS.toBytes()).ok()!; }
+
+string pad5(i32 i) {
+  string s = "\{i}";
+  while (s.len() < 5) { s = "0" + s; }
+  return s;
+}
+
+FileIn[] push(FileIn[] xs, FileIn x) {
+  FileIn[] out = FileIn[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+/** A case's files: each generated set (prefix + five digits, size i % sizes, seed + i), then the listed ones. */
+FileIn[] filesOf(JsonValue c) {
+  FileIn[] out = FileIn[]();
+  JsonValue sets = c.member("sets")!;
+  for (i32 s = 0; s < sets.array()!.len(); s++) {
+    JsonValue g = sets.array()!.get(s);
+    for (i32 i = 0; i < num(g, "count"); i++) {
+      out = push(out, FileIn(str(g, "prefix") + pad5(i), content(i % num(g, "sizes"), (num(g, "seed") + i) as i64)));
+    }
+  }
+  JsonValue fs = c.member("files")!;
+  for (i32 i = 0; i < fs.array()!.len(); i++) {
+    JsonValue f = fs.array()!.get(i);
+    out = push(out, FileIn(str(f, "path"), content(num(f, "size"), num(f, "seed") as i64)));
+  }
+  return out;
+}
+
+string[] dirsOf(JsonValue c) {
+  JsonValue ds = c.member("dirs")!;
+  string[] out = string[].defaulted(ds.array()!.len());
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ds.array()!.get(i).text()!; }
+  return out;
+}
+
+Params paramsOf(JsonValue c) { return Params(1048576, 1024, num(c, "shard")); }
+
+JsonValue caseNamed(string name) {
+  JsonValue hs = V().member("hamt")!;
+  for (i32 i = 0; i < hs.array()!.len(); i++) { if (str(hs.array()!.get(i), "name") == name) { return hs.array()!.get(i); } }
+  trap;
+}
+
+bool isShard(Node n) { return match (n) { Shard(_, _): true, Dir(_): false, File(_, _, _): false }; }
+
+export string test_murmur3_is_the_references() {
+  Check c = Check.create();
+  JsonValue ms = V().member("murmur")!;
+  c.ok(ms.array()!.len() == 8, "eight vectors");
+  for (i32 i = 0; i < ms.array()!.len(); i++) {
+    JsonValue m = ms.array()!.get(i);
+    c.eq(hex(murmur3x64(hexDecoded(str(m, "input")))), str(m, "hash"), "murmur3 of 0x\{str(m, "input")}");
+  }
+  return c.report();
+}
+
+export string test_sharded_trees_are_the_references() {
+  Check c = Check.create();
+  JsonValue hs = V().member("hamt")!;
+  for (i32 i = 0; i < hs.array()!.len(); i++) {
+    JsonValue h = hs.array()!.get(i);
+    match (buildTree(filesOf(h), dirsOf(h), paramsOf(h))) {
+      Err(e): { c.fail("\{str(h, "name")}: \{e}"); }
+      Ok(b): {
+        c.eq(b.root.text(), str(h, "cid"), "\{str(h, "name")}'s root");
+        Node root = readNode(b.root, b.blocks[0].data).ok()!;
+        c.ok(isShard(root) == (str(h, "rootType") == "hamt-sharded-directory"), "\{str(h, "name")}'s root is a \{str(h, "rootType")}");
+      }
+    }
+  }
+  return c.report();
+}
+
+/** The case built into a memory store: its root, and a resolver over it. */
+Resolver stored(JsonValue h, Store s) { return Resolver(s, Store[]()); }
+
+export string test_a_sharded_tree_reads_back_whole() {
+  Check c = Check.create();
+  for (string name in ["deep", "nested"]) {
+    JsonValue h = caseNamed(name);
+    Store s = Store.memory();
+    Cid root = importFiles(s, filesOf(h), dirsOf(h), paramsOf(h)).ok()!;
+    Resolver r = Resolver(s, Store[]());
+    match (readTree(r, root)) {
+      Err(e): { c.fail("\{name}: \{e}"); }
+      Ok(got): {
+        FileIn[] want = filesOf(h);
+        i32 files = 0;
+        for (i32 i = 0; i < got.len(); i++) { if (got[i].path.slice(got[i].path.len() - 1, got[i].path.len()) != "/") { files++; } }
+        c.ok(files == want.len(), "\{name}: \{files} files read back, \{want.len()} put in");
+        i32 matched = 0;
+        for (i32 i = 0; i < want.len(); i++) {
+          for (i32 j = 0; j < got.len(); j++) {
+            if (got[j].path == want[i].path && hex(got[j].content) == hex(want[i].content)) { matched++; break; }
+          }
+        }
+        c.ok(matched == want.len(), "\{name}: every file's path and bytes: \{matched} of \{want.len()}");
+      }
+    }
+  }
+  // In the nested case the root is plain and top/ is the HAMT, holding a HAMT of its own.
+  JsonValue n = caseNamed("nested");
+  Store s = Store.memory();
+  Cid root = importFiles(s, filesOf(n), dirsOf(n), paramsOf(n)).ok()!;
+  Resolver r = Resolver(s, Store[]());
+  Link[] top = entriesOf(r, root).ok()!;
+  Cid? t = null;
+  for (i32 i = 0; i < top.len(); i++) { if (top[i].name == "top") { t = top[i].cid; } }
+  c.ok(t is not null && isShard(readNode(t!, s.get(t!).ok()!).ok()!), "top/ is a HAMT");
+  Link[] inTop = entriesOf(r, t!).ok()!;
+  c.ok(inTop.len() == 150 + 4, "top/ lists 150 files, sub/, empty/, .hidden and é-ü 名: \{inTop.len()}");
+  bool sorted = true;
+  for (i32 i = 1; i < inTop.len(); i++) { if (inTop[i - 1].name.toBytes().len() > 0 && cmp(inTop[i - 1].name, inTop[i].name) >= 0) { sorted = false; } }
+  c.ok(sorted, "and lists them sorted by name, as a plain directory would");
+  return c.report();
+}
+
+i32 cmp(string a, string b) {
+  u8[] x = a.toBytes();
+  u8[] y = b.toBytes();
+  for (i32 i = 0; i < x.len() && i < y.len(); i++) { if (x[i] != y[i]) { return (x[i] as i32) - (y[i] as i32); } }
+  return x.len() - y.len();
+}
+
+/** The `deep` case's root shard, decoded, and a store holding the whole tree. */
+struct Deep {
+  Store s;
+  Cid root;
+  PbNode node;
+}
+
+Deep deep() {
+  JsonValue h = caseNamed("deep");
+  Store s = Store.memory();
+  Cid root = importFiles(s, filesOf(h), dirsOf(h), paramsOf(h)).ok()!;
+  return Deep(s, root, decodePb(s.get(root).ok()!).ok()!);
+}
+
+/** `node` stored as a new root shard, and what entriesOf makes of it. */
+string readAs(Deep d, PbNode node) {
+  u8[] enc = encodePb(node);
+  Cid c = Cid.of(DAG_PB(), enc);
+  d.s.put(Block(c, enc));
+  match (entriesOf(Resolver(d.s, Store[]()), c)) {
+    Ok(es): { return "read, \{es.len()} entries"; }
+    Err(e): { return e; }
+  }
+}
+
+export string test_a_shard_that_misplaces_hides_or_mislabels_an_entry_is_refused() {
+  Check c = Check.create();
+  Deep d = deep();
+  c.eq(readAs(d, d.node), "read, 600 entries", "the shard as built");
+  // An entry link moved to another slot, its label and the bitfield both changed to match: the hash says otherwise.
+  i32 leaf = -1;
+  for (i32 i = 0; i < d.node.links.len(); i++) { if (leaf < 0 && d.node.links[i].name.len() > 2) { leaf = i; } }
+  c.ok(leaf >= 0, "the root shard has an entry of its own");
+  Link[] moved = Link[].filled(d.node.links.len(), d.node.links[0]);
+  for (i32 i = 0; i < moved.len(); i++) { moved[i] = d.node.links[i]; }
+  string entry = moved[leaf].name.slice(2, moved[leaf].name.len());
+  i32 home = hamtByte(entry.toBytes(), 0);
+  i32 other = -1;
+  for (i32 s = 0; s < 256 && other < 0; s++) {
+    bool taken = false;
+    for (i32 i = 0; i < moved.len(); i++) { if (moved[i].name.slice(0, 2) == slotLabel(s)) { taken = true; } }
+    if (!taken) { other = s; }
+  }
+  if (other >= 0) {
+    moved[leaf] = Link(moved[leaf].cid, slotLabel(other) + entry, moved[leaf].tsize);
+    string why = readAs(d, PbNode(sortByName(moved), withBit(withoutBit(d.node.data, home), other), true));
+    c.ok(why.indexOf("its hash puts it elsewhere") >= 0, "an entry in a slot its hash does not give: \{why}");
+  } else { c.fail("no free slot to move an entry to"); }
+  // An entry dropped, the bitfield left as it was: the bitfield names a slot no link uses.
+  Link[] dropped = Link[].filled(d.node.links.len() - 1, d.node.links[0]);
+  i32 j = 0;
+  for (i32 i = 0; i < d.node.links.len(); i++) { if (i != leaf) { dropped[j] = d.node.links[i]; j++; } }
+  string why2 = readAs(d, PbNode(dropped, d.node.data, true));
+  c.ok(why2.indexOf("bitfield") >= 0 && why2.indexOf("does not match its links") >= 0, "an entry hidden, the bitfield unchanged: \{why2}");
+  // A sub-shard's slot pointed at a file instead.
+  i32 sub = -1;
+  for (i32 i = 0; i < d.node.links.len(); i++) { if (sub < 0 && d.node.links[i].name.len() == 2) { sub = i; } }
+  c.ok(sub >= 0, "the root shard has a sub-shard");
+  Link[] wrong = Link[].filled(d.node.links.len(), d.node.links[0]);
+  for (i32 i = 0; i < wrong.len(); i++) { wrong[i] = d.node.links[i]; }
+  wrong[sub] = Link(d.node.links[leaf].cid, d.node.links[sub].name, d.node.links[leaf].tsize);
+  string why3 = readAs(d, PbNode(wrong, d.node.data, true));
+  c.ok(why3.indexOf("where a sub-shard belongs") >= 0, "a sub-shard slot naming a file: \{why3}");
+  return c.report();
+}
+
+Link[] sortByName(Link[] xs) {
+  Link[] out = Link[].filled(xs.len(), xs[0]);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  for (i32 i = 1; i < out.len(); i++) {
+    Link e = out[i];
+    i32 j = i;
+    while (j > 0 && cmp(out[j - 1].name, e.name) > 0) { out[j] = out[j - 1]; j--; }
+    out[j] = e;
+  }
+  return out;
+}
+
+/** The UnixFS data of a HAMT with slot `s`'s bit set or cleared: the bitfield is field 2, after the type. */
+u8[] withBit(u8[] data, i32 s) { return setBit(data, s, true); }
+u8[] withoutBit(u8[] data, i32 s) { return setBit(data, s, false); }
+
+u8[] setBit(u8[] data, i32 s, bool on) {
+  // 08 05 12 <len> <bits> 28 22 30 80 02
+  i32 n = data[3] as i32;
+  u8[] bits = u8[].filled(32, 0);
+  for (i32 i = 0; i < n; i++) { bits[32 - n + i] = data[4 + i]; }
+  i32 byte = 31 - s / 8;
+  u8 mask = (1 << (s % 8)) as@ u8;
+  bits[byte] = on ? (bits[byte] | mask) : (bits[byte] & ~mask);
+  i32 lead = 0;
+  while (lead < 32 && bits[lead] == 0) { lead++; }
+  i32 m = 32 - lead;
+  u8[] out = u8[].filled(4 + m + (data.len() - 4 - n), 0);
+  out[0] = data[0]; out[1] = data[1]; out[2] = data[2]; out[3] = m as@ u8;
+  for (i32 i = 0; i < m; i++) { out[4 + i] = bits[lead + i]; }
+  for (i32 i = 4 + n; i < data.len(); i++) { out[4 + m + (i - 4 - n)] = data[i]; }
+  return out;
+}

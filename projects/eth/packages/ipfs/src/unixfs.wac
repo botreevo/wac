@@ -2,10 +2,16 @@
 //
 //     files        fixed 1 MiB chunks; raw leaves; a balanced tree of at most 1024 links per node; a single chunk is
 //                  the file itself, a raw block
-//     directories  links sorted by name, bytewise; Tsize the whole size of each child's blocks; the node sharded into
-//                  a HAMT once its encoded size exceeds 256 KiB — *not implemented here yet*, so such a directory
-//                  is refused rather than encoded some other way
+//     directories  links sorted by name, bytewise; Tsize the whole size of each child's blocks; once the plain node
+//                  would encode to more than 256 KiB, a HAMT instead (below)
 //     never        mode, mtime, symlinks
+//
+// **HAMT-sharded directories**, as the reference importer (ipfs-unixfs-importer, hamt-sharding) builds them: fanout
+// 256, so each level takes one byte of the name's hash (`murmur3.wac`'s `hamtByte`). A slot with one entry holds it as a
+// link named by the slot in two uppercase hex digits and then the entry's name; a slot with several holds a sub-shard
+// with the two digits alone as its name, built the same way one level down. Each shard's links are in slot order, and
+// its Data is `Type HAMTShard, Data <bitfield>, hashType 0x22 (murmur3-x64-64), fanout 256`, the bitfield being the
+// big-endian integer whose bit i is set for an occupied slot i. Tsize is the shard's block plus its children's.
 //
 // The chunk size and width are parameters so the tree shape can be tested against the reference importer on small
 // inputs; the profile is `PROFILE`.
@@ -17,6 +23,7 @@ import { Result } from "core";
 import { Out, In, slice, compare } from "./bytes.wac";
 import { Cid, RAW, DAG_PB } from "./cid.wac";
 import { Link, PbNode, encodePb, decodePb, pushLink } from "./dagpb.wac";
+import { hamtByte } from "./murmur3.wac";
 
 export struct Params {
   i32 chunk = 1048576;
@@ -43,6 +50,9 @@ export struct Built {
 
 static i64 T_DIRECTORY = 1;
 static i64 T_FILE = 2;
+static i64 T_HAMT = 5;
+static i64 HAMT_MURMUR3 = 0x22;
+static i64 FANOUT = 256;
 
 u8[] fileData(i64 filesize, i64[] blocksizes) {
   Out o = Out.create();
@@ -116,7 +126,7 @@ export struct Entry {
   Built built;
 }
 
-/** A directory's node, from its entries in any order; refused if it would need HAMT sharding. */
+/** A directory's node, from its entries in any order: plain, or a HAMT once the plain node passes the threshold. */
 export Result<Built, string> buildDir(Entry[] entries, Params p) {
   Entry[] sorted = sortEntries(entries);
   Link[] links = Link[]();
@@ -131,11 +141,74 @@ export Result<Built, string> buildDir(Entry[] entries, Params p) {
     blocks = addBlocks(blocks, sorted[i].built.blocks);
   }
   u8[] enc = encodePb(PbNode(links, dirData(), true));
-  if (enc.len() > p.shardBytes) {
-    return Result.Err("a directory of \{sorted.len()} entries encodes to \{enc.len()} bytes, past the profile's \{p.shardBytes}: it must be HAMT-sharded, which is not implemented yet");
-  }
+  if (enc.len() > p.shardBytes) { return shard(sorted, 0); }
   Cid c = Cid.of(DAG_PB(), enc);
   return Result.Ok(Built(c, addBlocks([Block(c, enc)], blocks), tsum + (enc.len() as i64), 0 as i64));
+}
+
+string HEX() { return "0123456789ABCDEF"; }
+
+/** A slot's label: two uppercase hex digits. */
+export string slotLabel(i32 slot) { return HEX().slice(slot >> 4, (slot >> 4) + 1) + HEX().slice(slot & 15, (slot & 15) + 1); }
+
+/** The bitfield of occupied slots: a big-endian integer with bit i set for slot i, no leading zero bytes. */
+u8[] bitfield(bool[] used) {
+  u8[] b = u8[].filled(32, 0);
+  i32 top = -1;
+  for (i32 i = 0; i < 256; i++) {
+    if (!used[i]) { continue; }
+    b[31 - i / 8] = b[31 - i / 8] | ((1 << (i % 8)) as@ u8);
+    if (i > top) { top = i; }
+  }
+  i32 n = top < 0 ? 0 : top / 8 + 1;
+  return slice(b, 32 - n, 32);
+}
+
+u8[] hamtData(u8[] bits) {
+  Out o = Out.create();
+  o.byte(0x08); o.varint(T_HAMT);
+  o.byte(0x12); o.varint(bits.len() as i64); o.all(bits);
+  o.byte(0x28); o.varint(HAMT_MURMUR3);
+  o.byte(0x30); o.varint(FANOUT);
+  return o.bytes();
+}
+
+/** One shard of a HAMT at `depth`, over `entries` (names unique). */
+Result<Built, string> shard(Entry[] entries, i32 depth) {
+  if (depth >= 64) { return Result.Err("a HAMT deeper than 64 levels: the names' hashes do not separate"); }
+  Entry[][] slots = Entry[][].filled(256, Entry[]());
+  bool[] used = bool[].filled(256, false);
+  for (i32 i = 0; i < entries.len(); i++) {
+    i32 at = hamtByte(entries[i].name.toBytes(), depth);
+    slots[at] = pushEntry(slots[at], entries[i]);
+    used[at] = true;
+  }
+  Link[] links = Link[]();
+  Block[] blocks = Block[]();
+  i64 tsum = 0 as i64;
+  for (i32 at = 0; at < 256; at++) {
+    if (slots[at].len() == 0) { continue; }
+    if (slots[at].len() == 1) {
+      Entry e = slots[at][0];
+      links = pushLink(links, Link(e.built.root, slotLabel(at) + e.name, e.built.tsize));
+      tsum += e.built.tsize;
+      blocks = addBlocks(blocks, e.built.blocks);
+    } else {
+      Built sub = try shard(slots[at], depth + 1);
+      links = pushLink(links, Link(sub.root, slotLabel(at), sub.tsize));
+      tsum += sub.tsize;
+      blocks = addBlocks(blocks, sub.blocks);
+    }
+  }
+  u8[] enc = encodePb(PbNode(links, hamtData(bitfield(used)), true));
+  Cid c = Cid.of(DAG_PB(), enc);
+  return Result.Ok(Built(c, addBlocks([Block(c, enc)], blocks), tsum + (enc.len() as i64), 0 as i64));
+}
+
+Entry[] pushEntry(Entry[] xs, Entry x) {
+  Entry[] out = Entry[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
 }
 
 /** Why a name cannot be a directory entry, or "". */
@@ -164,6 +237,8 @@ Entry[] sortEntries(Entry[] es) {
 export enum Node {
   File(i64 size, Link[] parts, u8[] inline),
   Dir(Link[] entries),
+  /** A HAMT shard: its links as stored (slot-labelled), and its bitfield. `store.wac`'s `entriesOf` reads them as entries. */
+  Shard(Link[] links, u8[] bitfield),
 }
 
 /** Read a block as a UnixFS node: a raw block is a whole file. */
@@ -177,17 +252,25 @@ export Result<Node, string> readNode(Cid cid, u8[] block) {
   i64 type = -1 as i64;
   i64 filesize = 0 as i64;
   u8[] inline = u8[]();
+  i64 hashType = -1 as i64;
+  i64 fanout = -1 as i64;
   while (!r.done()) {
     i64 tag = r.varint();
     if (tag == (0x08 as i64)) { type = r.varint(); }
     else if (tag == (0x12 as i64)) { inline = r.take(r.varint() as! i32); }
     else if (tag == (0x18 as i64)) { filesize = r.varint(); }
     else if (tag == (0x20 as i64)) { r.varint(); }
+    else if (tag == (0x28 as i64)) { hashType = r.varint(); }
+    else if (tag == (0x30 as i64)) { fanout = r.varint(); }
     else if (tag == (0x38 as i64) || tag == (0x42 as i64)) { return Result.Err("a node carrying mode or mtime, which this profile never records"); }
     else { return Result.Err("UnixFS field \{tag >>> (3 as i64)}, which this reader does not take"); }
     if (r.bad != "") { return Result.Err("UnixFS data: \{r.bad}"); }
   }
   if (type == T_FILE) { return Result.Ok(Node.File(filesize, n.links, inline)); }
   if (type == T_DIRECTORY) { return Result.Ok(Node.Dir(n.links)); }
-  return Result.Err("UnixFS type \{type}: only files and plain directories are read here");
+  if (type == T_HAMT) {
+    if (hashType != HAMT_MURMUR3 || fanout != FANOUT) { return Result.Err("a HAMT with hash \{hashType} and fanout \{fanout}: only murmur3 (0x22) and 256 are read here"); }
+    return Result.Ok(Node.Shard(n.links, inline));
+  }
+  return Result.Err("UnixFS type \{type}: only files, directories and HAMT shards are read here");
 }

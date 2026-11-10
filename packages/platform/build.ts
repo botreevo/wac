@@ -30,7 +30,7 @@
 // unless it is run with `--allow-read`.
 
 import { waccArtifacts } from "../../harness/waccBuild.ts";
-import { wacFilesWithRoots } from "../../harness/wacFiles.ts";
+import { type WacMap, wacFilesWithRoots } from "../../harness/wacFiles.ts";
 // Imported for its side effect as much as for `COV_DUMP_DIR`'s twin: under `WAC_PROFILE` it wraps
 // `Deno.test` so that what a *built* program executes is attributed to whichever test ran it. Every
 // subprocess-based test file reaches this module — that is how it builds the binary it runs — and none
@@ -349,24 +349,30 @@ export async function buildApp(
   const optimize = opts.optimize ?? false;
   // **With the roots** — see `buildNative`. Both compilers below need to be told which project each
   // file sits in, or a `@/` import resolves to a key nothing supplied. GitHub issue 22 finding 4.
-  const { files, roots } = await wacFilesWithRoots(entry);
-  const base = Deno.cwd();
+  const { files, roots, maps, base: walkedFrom } = await wacFilesWithRoots(entry);
+  const base = walkedFrom ?? Deno.cwd();
   // A page and a worker bundle are not runnable by themselves, so neither gets the execute bit.
   const executable = !workerOnly && target !== "browser";
 
-  const key = await appKey(entry, files, grants, target, workerOnly, coverage, optimize);
+  // **The mappings are part of what is built**: a project's lock decides which file `"wac"` names, so two graphs
+  // of the same texts can be two programs. Keyed as one more input, under a name no file can have.
+  const keyed = maps.length === 0 ? files : new Map([
+    ...files,
+    ["\u0000maps", maps.map((m) => `${m.from}\t${m.spec}\t${m.to}`).join("\n")],
+  ]);
+  const key = await appKey(entry, keyed, grants, target, workerOnly, coverage, optimize);
   if (key !== null) {
     const artifact = await cached("app", key, "", async (tmp) => {
       await Deno.writeTextFile(
         tmp,
-        await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize, key),
+        await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize, key, maps),
       );
     });
     await place(await Deno.readTextFile(artifact), out, executable);
     return;
   }
   await place(
-    await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize),
+    await produceApp(entry, files, roots, base, grants, target, workerOnly, coverage, optimize, null, maps),
     out,
     executable,
   );
@@ -505,6 +511,8 @@ async function produceApp(
   coverage: boolean,
   optimize = false,
   stageKey: string | null = null,
+  /** Package imports as the `wac` command mapped them — `wacFilesWithRoots`. */
+  maps: WacMap[] = [],
 ): Promise<string> {
   // **Which compiler builds an application: wacc.** All 55 programs here emit through it; box's
   // `wc`, `grep`, `sha256sum` and `cp` produce output identical to the reference-built ones, with
@@ -532,6 +540,7 @@ async function produceApp(
       optimize: optimize ? optimized : undefined,
       roots,
       base,
+      maps,
     });
     ({ wasm, glue, covLines } = a);
   }

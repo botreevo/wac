@@ -346,9 +346,66 @@ async function projectRootOf(path: string): Promise<string | undefined> {
  */
 export async function wacFilesWithRoots(
   entry: string,
-): Promise<{ files: Map<string, string>; roots: Map<string, string> }> {
+): Promise<{ files: Map<string, string>; roots: Map<string, string>; maps: WacMap[]; base?: string }> {
+  // **A project that pins packages is walked by the command, not here** — see `wacFilesFromCommand`.
+  const root = await projectRootOf(entry);
+  if (root !== undefined && await isFile(`${root}/wac.lock`)) return await wacFilesFromCommand(entry);
   const files = await wacFiles(entry);
-  return { files, roots: new Map(walked.get(entry)?.roots ?? []) };
+  return { files, roots: new Map(walked.get(entry)?.roots ?? []), maps: [] };
+}
+
+/** An import one file wrote as `spec`, which the package rules mapped to the key `to`. */
+export type WacMap = { from: string; spec: string; to: string };
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await Deno.stat(path)).isFile;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * **The graph of a program whose project has a `wac.lock`, as the `wac` command resolves it.**
+ *
+ * This walk knows relative, `@/`, `core` and `std` imports and not packages: `import { … } from "wac"` in a
+ * project that pins `wac` (all of wac-eth) was simply not followed, and its build failed with every such import
+ * unresolved. The package rules — the manifest's `imports`, the lock's commit, the cache under `$WAC_HOME`, a
+ * mapping's `subdir` bound — live in `packages/wac/src/sources.wac`, and a second copy of them here would drift.
+ * So `tools/wac/sources.wac` runs that walk and prints the files and the mappings, and wacc is handed both
+ * (`waccRes`). The binary is this checkout's own when it has been built, and `wac` on PATH otherwise.
+ */
+export async function wacFilesFromCommand(
+  entry: string,
+): Promise<{ files: Map<string, string>; roots: Map<string, string>; maps: WacMap[]; base: string }> {
+  const repo = decodeURIComponent(new URL("..", import.meta.url).pathname).replace(/\/$/, "");
+  const local = `${repo}/native/v8/target/release/wac`;
+  const bin = await isFile(local) ? local : "wac";
+  const out = await new Deno.Command(bin, {
+    args: ["run", "--allow-read", "--allow-env", `${repo}/tools/wac/sources.wac`, entry],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const said = new TextDecoder().decode(out.stdout);
+  if (!out.success) {
+    throw new Error(`${entry}: the wac command could not gather its sources: ${new TextDecoder().decode(out.stderr).trim()}`);
+  }
+  let base = Deno.cwd();
+  const files = new Map<string, string>();
+  const roots = new Map<string, string>();
+  const maps: WacMap[] = [];
+  for (const line of said.split("\n")) {
+    const f = line.split("\t");
+    if (f[0] === "B") base = f[1];
+    else if (f[0] === "F") {
+      // `std` and `core` are carried inside the compiler, not read: the walk names them `std`, `core`, and each of
+      // their files under a key beginning with a space, which no file on disk can have.
+      if (f[1] === "std" || f[1] === "core" || f[1].startsWith(" ")) continue;
+      files.set(f[1], await Deno.readTextFile(f[1].startsWith("/") ? f[1] : `${base}/${f[1]}`));
+      if (f[2] !== undefined && f[2] !== "") roots.set(f[1], f[2]);
+    } else if (f[0] === "M") maps.push({ from: f[1], spec: f[2], to: f[3] });
+  }
+  return { files, roots, maps, base };
 }
 
 export async function wacFiles(entry: string): Promise<Map<string, string>> {

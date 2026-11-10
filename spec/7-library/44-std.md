@@ -548,10 +548,16 @@ enum TrapKind { Explicit, UnreachableCode, MemoryBounds, TableBounds, DivideByZe
 `[§wac-std-spawn-grants-ykmq5tw]` A spawned child holds exactly the handles in its `Authority`, so it never holds more than
 its parent. Spawning needs the program's own `procs` authority — another instance of itself included.
 
+`[§wac-std-env-of-k7r2wdn]` `Env.of(lookup)` is an environment of exactly the variables `lookup` answers, `null` for one
+that is not set. Handed to a child in its `Authority`, it is served by this program as a composed `Files` is: the child's
+`env().get` asks it, and the child sees no variable of the host's. Its `cwd` is not a variable and stays the child's own,
+from where it was launched; asked of an `Env.of` itself, it is `Unsupported`.
+
 `[§wac-std-child-ended-q2v8mtf]` `ended()` says how a child ended, the same on every host: `Exited` with the code its
 `main` returned, `Trapped` with what stopped it — `Explicit` and the message for its own `trap "…"`, otherwise the
 engine's reason, classified, and `Unclassified` for one none of the kinds names — or `HostLimit` when the host stopped it,
-by its parent's `stop` or for want of memory. `exit()` answers the code for an exit and `Err` saying why for the other
+by its parent's `stop` or for want of memory. A float-to-integer conversion out of range is `BadConversion`, as for
+NaN; only a division's result out of range (`INT_MIN / -1`) is `IntegerOverflow`. `exit()` answers the code for an exit and `Err` saying why for the other
 two, so a trap is never a status a program could have returned.
 
 `[§wac-std-sealed-child-w4kq9ve]` A child launched `sealed` has no clock and no random bytes: `nowMillis`,

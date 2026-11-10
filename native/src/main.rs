@@ -642,6 +642,8 @@ struct World {
     engine: Engine,
     module: Module,
     manifest: Arc<Manifest>,
+    /// The module's bytes, for `trap_kind` to read the instruction a trap stopped at.
+    wasm: Arc<[u8]>,
 }
 
 /// How often the engine's epoch advances, and so the coarsest a stop can be.
@@ -823,7 +825,7 @@ fn run(m: Arc<Manifest>, wasm: &[u8], args: Vec<Vec<u8>>) -> Result<i32, wasmtim
     let engine = Engine::new(&config)?;
     tick_epochs(&engine);
     let module = compiled(&engine, wasm)?;
-    let world = Arc::new(World { engine: engine.clone(), module: module.clone(), manifest: m.clone() });
+    let world = Arc::new(World { engine: engine.clone(), module: module.clone(), manifest: m.clone(), wasm: Arc::from(wasm) });
     let mut host = Host::new(m.callbacks.len(), args, m.grants.clone());
     host.world = Some(world);
     let mut store = Store::new(&engine, host);
@@ -1190,7 +1192,7 @@ fn run_child(
             let (kind, said) = if let Some(at) = shown.find(" trapped: ") {
                 (0, shown[at + " trapped: ".len()..].to_string())
             } else {
-                (trap_kind(&e), format!("{}", e.root_cause()))
+                (trap_kind(&e, &world.wasm), format!("{}", e.root_cause()))
             };
             (1, 1, kind, said.into_bytes())
         }
@@ -1205,9 +1207,15 @@ fn run_child(
 }
 
 /// std's `TrapKind`, in order, for an engine trap: `Explicit` is 0 and is `enter`'s to say; `Other` is 10.
-fn trap_kind(e: &wasmtime::Error) -> i32 {
+fn trap_kind(e: &wasmtime::Error, wasm: &[u8]) -> i32 {
     use wasmtime::Trap;
     match e.downcast_ref::<Trap>() {
+        // **An out-of-range truncation is a bad conversion, as V8 says it.** wasmtime names both
+        // `INT_MIN / -1` and `i32.trunc_f64_s(1e20)` `IntegerOverflow`, and keeps
+        // `BadConversionToInteger` for NaN; V8 calls the second "float unrepresentable in integer
+        // range". §wac-std-child-ended-q2v8mtf says one kind on every host, so the instruction the
+        // trap stopped at decides: a `trunc` (0xA8–0xAB, 0xAE–0xB1) is `BadConversion`.
+        Some(Trap::IntegerOverflow) if trapped_at_trunc(e, wasm) => 6,
         Some(Trap::UnreachableCodeReached) => 1,
         Some(Trap::MemoryOutOfBounds) | Some(Trap::HeapMisaligned) | Some(Trap::ArrayOutOfBounds) => 2,
         Some(Trap::TableOutOfBounds) => 3,
@@ -1219,6 +1227,13 @@ fn trap_kind(e: &wasmtime::Error) -> i32 {
         Some(Trap::StackOverflow) => 9,
         _ => 10,
     }
+}
+
+/// Whether the innermost wasm frame of `e` stopped at a trapping float-to-int `trunc`.
+fn trapped_at_trunc(e: &wasmtime::Error, wasm: &[u8]) -> bool {
+    let Some(trace) = e.downcast_ref::<wasmtime::WasmBacktrace>() else { return false };
+    let Some(at) = trace.frames().first().and_then(|f| f.module_offset()) else { return false };
+    matches!(wasm.get(at), Some(0xA8..=0xAB) | Some(0xAE..=0xB1))
 }
 
 /// Whether two capabilities are the same behaviour, and so may share a slot.
@@ -2969,7 +2984,7 @@ fn world_from(engine: &Engine, wasm: &[u8]) -> Result<Arc<World>, String> {
     // Content-keyed, so a module spawned in a loop is compiled once and a `.cwasm` is shared with
     // every other process on this machine that runs it.
     let module = compiled(engine, wasm).map_err(|e| format!("it does not compile: {e}"))?;
-    Ok(Arc::new(World { engine: engine.clone(), module, manifest: m }))
+    Ok(Arc::new(World { engine: engine.clone(), module, manifest: m, wasm: Arc::from(wasm) }))
 }
 
 /// Start a program on its own thread, given the world it runs in.

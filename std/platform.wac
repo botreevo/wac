@@ -789,7 +789,14 @@ export struct Sys {
   bool interrupted(const this) { return this.host.__wacInterrupted(); }
 
   /** The environment. Each operation answers `NotGranted` when the host withheld it. */
-  Env env(this) { return Env.__wacOf(this.host); }
+  /**
+   * This program's environment: its variables its parent's to answer when it was spawned with an `Env.of` (spec ch44
+   * `§wac-std-env-of-k7r2wdn`), and otherwise the host's; where it stands is always its own.
+   */
+  Env env(this) {
+    if (this.parent.servesEnv()) { return Env.__wacServed(this.host, this.parent.route()); }
+    return Env.__wacOf(this.host);
+  }
 
   /**
    * The files this program was given: what its parent serves when it was spawned with a composed `Files` (spec ch44
@@ -1252,9 +1259,32 @@ Result<u8[], union<Unsupported>> bytesOk(Answer a) {
 /** The environment's variables and the directory relative paths resolve from. */
 export struct Env {
   private Host host;
+  /** Where its variables come from when not `host`: a lookup a program wrote (`Env.of`), or the parent serving one. */
+  private Host? vars;
+  /** Made by `Env.of`: what a parent hands a child is served, never granted. */
+  private bool composed;
 
   /** Made by std alone: its host is private (`issues/system/0372c`), so nothing outside can build one around it. */
-  Env __wacOf(Host host) { return Env(host); }
+  Env __wacOf(Host host) { return Env(host, null, false); }
+
+  /** The child's environment when its parent serves its variables: `cwd` still its own, from where it was launched. */
+  Env __wacServed(Host host, Host vars) { return Env(host, vars, false); }
+
+  /**
+   * **An environment of exactly the variables `lookup` answers** — `null` for one that is not set (spec ch44
+   * `§wac-std-env-of-k7r2wdn`). Handed to a child in its `Authority`, it is served by this program as a composed
+   * `Files` is, and the child sees no other variable: what a runner that must list a recipe's environment needs. Its
+   * `cwd` is `Unsupported`, since where a child stands is its `Launch`'s to say.
+   */
+  Env of(fn<u8[]?(string)> lookup) { return Env(envOfHost(null), envOfHost(lookup), true); }
+
+  /** Whether this environment was composed (`Env.of`), so a child is served it rather than granted the host's. */
+  bool __wacComposed(const this) { return this.composed; }
+
+  /** A variable request, as the parent answers a served child. */
+  Ticket<Answer> __wacAsk(this, i32 op, i64 a, i64 b, string text, u8[] bytes) {
+    return ask(this.vars is not null ? this.vars! : this.host, op, a, b, text, bytes);
+  }
 
   /**
    * A variable's value, `Ok(null)` when it is not set (`§wac-std-env-unset-r4c8tqb`).
@@ -1262,10 +1292,32 @@ export struct Env {
    * **Not yet able to say `NotGranted`**: the hosts answer a withheld environment as an unset variable, and
    * which it was is `issues/system/0261c`, which the host half of design/system/0013 settles.
    */
-  Ticket<Result<u8[]?, GrantedFault>> get(const this, string name) { return hostAsk(this.host, OP_ENV(), 0 as i64, 0 as i64, name, u8[](), envOf); }
+  Ticket<Result<u8[]?, GrantedFault>> get(const this, string name) {
+    return hostAsk(this.vars is not null ? this.vars! : this.host, OP_ENV(), 0 as i64, 0 as i64, name, u8[](), envOf);
+  }
 
   /** Where relative paths resolve from. */
   Ticket<Result<string, HostFault>> cwd(const this) { return hostAsk(this.host, OP_CWD(), 0 as i64, 0 as i64, "", u8[](), cwdOf); }
+}
+
+/**
+ * The host of `Env.of`: a variable request answered out of `lookup` at once, `flags` 1 for a value and 0 for none as the
+ * hosts answer; every other request — and every request at all with no `lookup`, where its `cwd` goes — `Unsupported`.
+ */
+Host envOfHost(fn<u8[]?(string)>? lookup) {
+  Layer l = layerState();
+  Host h = Host.of((i32 op, i32 id, i64 a, i64 b, string text, u8[] bytes) => {
+    if (op == OP_DROP()) { return; }
+    if (op == OP_ENV() && lookup is not null) {
+      u8[]? v = lookup!(text);
+      if (v is null) { layerAnswer(l, id, FAULT_NONE(), "", u8[](), 0 as i64, 0 as i64, 0); }
+      else { layerAnswer(l, id, FAULT_NONE(), "", v!, 0 as i64, 0 as i64, 1); }
+      return;
+    }
+    layerAnswer(l, id, FAULT_UNSUPPORTED(), "an Env.of answers its variables and nothing else", u8[](), 0 as i64, 0 as i64, 0);
+  }, (i32[] ids, i32 millis) => 0 - 1, (i32 code) => { }, () => false);
+  l.self = h;
+  return h;
 }
 
 Result<u8[]?, GrantedFault> envOf(Answer a) {
@@ -2265,6 +2317,8 @@ string servedHello() { return "wac served 3"; }
 /** In the hello's answer: the parent serves this program's files, and capabilities by name. */
 static i32 SERVES_FILES = 1;
 static i32 SERVES_CAPABILITIES = 2;
+/** The parent answers the child's environment variables (`Env.of`). */
+static i32 SERVES_ENV = 4;
 
 /** `OutputClosed` on the wire; it has no `FAULT_*` code because no host operation answers it. */
 static i32 WIRE_OUTPUT_CLOSED = 100;
@@ -2571,6 +2625,8 @@ struct ParentLine {
   bool servesFiles(this) { return this.serves() && (this.serving & SERVES_FILES) != 0; }
 
   bool servesCapabilities(this) { return this.serves() && (this.serving & SERVES_CAPABILITIES) != 0; }
+
+  bool servesEnv(this) { return this.serves() && (this.serving & SERVES_ENV) != 0; }
 
   /** The route to the parent: what served files and capability lookups both ask. */
   Host route(this) {
@@ -3006,16 +3062,57 @@ Host opsHost(FileOps ops) {
   Layer l = layerState();
   Host h = Host.of(
     (i32 op, i32 id, i64 a, i64 b, string text, u8[] bytes) => {
-      if (op != OP_DROP()) { opsAnswer(l, ops, open, op, id, a, b, text, bytes); }
+      if (op == OP_DROP()) { layerDrop(l, id); } else { opsAnswer(l, ops, open, op, id, a, b, text, bytes); }
     },
-    (i32[] ids, i32 millis) => 0 - 1, (i32 code) => { }, () => false);
+    (i32[] ids, i32 millis) => opsWait(l, ids, millis), (i32 code) => { }, () => false);
   l.self = h;
   return h;
 }
 
-async void opsAnswer(Layer l, FileOps ops, ServedStreams open, i32 op, i32 id, i64 a, i64 b, string text, u8[] bytes) {
-  Answer x = await answerRequest(ops, open, op, a, b, text, bytes);
-  layerAnswer(l, id, x.fault, x.text, x.bytes, x.n, x.m, x.flags);
+/**
+ * Answer request `id` out of `ops` — now, if it answers at once, as a `MemoryStore` does, and otherwise when it settles,
+ * kept in the layer meanwhile so a `wait` can drive it (`opsWait`).
+ */
+void opsAnswer(Layer l, FileOps ops, ServedStreams open, i32 op, i32 id, i64 a, i64 b, string text, u8[] bytes) {
+  Ticket<Answer> t = answerRequest(ops, open, op, a, b, text, bytes);
+  if (t.done) {
+    Answer x = t.value();
+    layerAnswer(l, id, x.fault, x.text, x.bytes, x.n, x.m, x.flags);
+    return;
+  }
+  l.sent.set(id, t);
+  t.whenSettled(() => {
+    l.sent.remove(id);
+    Answer x = t.value();
+    layerAnswer(l, id, x.fault, x.text, x.bytes, x.n, x.m, x.flags);
+  });
+}
+
+/**
+ * `waitAny` for `Files.of`: as a layer waits, and — for an answer `ops` is still working out, an `async` continuation
+ * with no host of its own to wait through — by waiting on that continuation, which drives what it awaits. Without this
+ * `Files.of(ops).readFile(p).wait()` refused at once (*nothing this wait may drive can settle the ticket*) and a write
+ * landed only at the program's last drain (`issues/system/0457d`). A wait with no time to spend does not block.
+ */
+i32 opsWait(Layer l, i32[] ids, i32 millis) {
+  Host me = l.self!;
+  while (true) {
+    Ticket<Answer>? below = null;
+    for (i32 i = 0; i < ids.len(); i++) {
+      if (!me.__wacWaiting(ids[i])) { return i; }
+      if (below is null) { below = l.sent.get(ids[i]); }
+    }
+    if (below is null) { return 0 - 1; }
+    if (below!.waitHost is not null) {
+      i32 w = below!.waitHost!([below!.hostId], millis);
+      if (w == HOST_CANNOT_WAIT()) { return HOST_CANNOT_WAIT(); }
+      if (w < 0) { return 0 - 1; }
+    } else {
+      if (millis == 0) { return 0 - 1; }
+      below!.wait();
+    }
+  }
+  return 0 - 1;
 }
 
 // ── The parent's end ──
@@ -3064,7 +3161,8 @@ async void serveFiles(Host host, i32 handle, Served served, Ticket<bool> stop) {
   Vec<i32> open = Vec.create();
   Capabilities caps = Capabilities(served.providers, Vec.create(), Vec.create(), Vec.create(),
                                    host.__wacRangeEnd() > PROVIDED_FROM ? host.__wacRangeEnd() : PROVIDED_FROM);
-  i32 serving = (served.files is not null ? SERVES_FILES : 0) | (served.providers.len() > 0 ? SERVES_CAPABILITIES : 0);
+  i32 serving = (served.files is not null ? SERVES_FILES : 0) | (served.providers.len() > 0 ? SERVES_CAPABILITIES : 0)
+              | (served.env is not null ? SERVES_ENV : 0);
   bool going = true;
   while (going) {
     WireReader q = await line.nextUnless(stop);
@@ -3091,6 +3189,8 @@ async void serveFiles(Host host, i32 handle, Served served, Ticket<bool> stop) {
         }
         if (!q.bad && op == OP_CAPABILITY()) {
           ans = await answerCapabilityRequest(host, caps, op, x, y, text, bytes);
+        } else if (!q.bad && op == OP_ENV() && served.env is not null) {
+          ans = await served.env!.__wacAsk(op, x, y, text, bytes);
         } else if (!q.bad && served.files is not null) {
           Files files = served.files!;
           // **Passed on as it is**: these files answer the host's own requests, whoever holds them. `chown` is the
@@ -3621,7 +3721,8 @@ export struct Authority {
     i32 g = 0;
     if (this.files is not null) { g = g | this.files!.hostGrants; }
     if (this.net is not null) { g = g | GRANT_NET; }
-    if (this.env is not null) { g = g | GRANT_ENV; }
+    // A composed environment (`Env.of`) is served, so it grants nothing of the host's.
+    if (this.env is not null && !this.env!.__wacComposed()) { g = g | GRANT_ENV; }
     if (this.procs is not null) { g = g | GRANT_RUN; }
     return g;
   }
@@ -3646,6 +3747,8 @@ export struct Provider {
 struct Served {
   Files? files;
   Provider[] providers;
+  /** The environment it serves the child, when it was handed an `Env.of`. */
+  Env? env;
 }
 
 /** How a child is started. */
@@ -3793,8 +3896,9 @@ u8[] execBytes(string program, string[] args, u8[] input, string[] pairs) {
 /** What a child holding `given` and provided `provides` is served, or null when it is served nothing. */
 Served? servedFor(Authority given, Provider[] provides) {
   Files? files = given.composedFiles() ? given.files : null;
-  if (files is null && provides.len() == 0) { return null; }
-  return Served(files, provides);
+  Env? env = given.env is not null && given.env!.__wacComposed() ? given.env : null;
+  if (files is null && provides.len() == 0 && env is null) { return null; }
+  return Served(files, provides, env);
 }
 
 Result<Child, SpawnFault> childOf(Host h, Answer a, Served? served) {

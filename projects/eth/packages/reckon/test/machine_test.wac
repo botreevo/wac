@@ -1,0 +1,79 @@
+// The deterministic machine's pure parts: how a run's ending is read, and the world a program is given.
+
+import { ipfs.FileIn } from "@/lib.wac";
+import { Ending, endingOf, trapName, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
+import { Written, clean } from "../src/world.wac";
+import { Check } from "./check.wac";
+
+string ends(Ending e) { return e.kind == "abort" ? "abort" : e.status(); }
+
+export string testEndings() {
+  Check c = Check.create();
+  c.eq(ends(endingOf(true, 0, u8[]())), "exit 0\n", "a clean exit");
+  c.eq(ends(endingOf(true, 7, "anything\n".toBytes())), "exit 7\n", "a status");
+  // Node: no status, the trap in V8's words. wasmtime: status 1 and its own words.
+  c.eq(ends(endingOf(false, 0, "wac: array element access out of bounds\n".toBytes())), "trap array-out-of-bounds\n", "V8 bounds");
+  c.eq(ends(endingOf(true, 1, "wac: x.wac trapped: wasm trap: out of bounds array access\n".toBytes())),
+       "trap array-out-of-bounds\n", "wasmtime bounds");
+  c.eq(ends(endingOf(false, 0, "wac: divide by zero".toBytes())), "trap divide-by-zero\n", "V8 division");
+  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: integer divide by zero".toBytes())), "trap divide-by-zero\n", "wasmtime division");
+  c.eq(ends(endingOf(false, 0, "wac: divide result unrepresentable".toBytes())), "trap integer-overflow\n", "V8 overflow");
+  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: integer overflow".toBytes())), "trap integer-overflow\n", "wasmtime overflow");
+  c.eq(ends(endingOf(false, 0, "wac: dereferencing a null pointer".toBytes())), "trap null\n", "V8 null");
+  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: null reference".toBytes())), "trap null\n", "wasmtime null");
+  c.eq(ends(endingOf(false, 0, "wac: unreachable".toBytes())), "trap unreachable\n", "V8 unreachable");
+  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: wasm `unreachable` instruction executed".toBytes())), "trap unreachable\n",
+       "wasmtime unreachable");
+  // Limits, and what nobody named, yield nothing.
+  c.eq(ends(endingOf(false, 0, "wac: Maximum call stack size exceeded".toBytes())), "abort", "V8 stack");
+  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: call stack exhausted".toBytes())), "abort", "wasmtime stack");
+  c.eq(ends(endingOf(false, 0, "wac: requested new array is too large".toBytes())), "abort", "V8 memory");
+  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: allocation size too large".toBytes())), "abort", "wasmtime memory");
+  c.eq(ends(endingOf(false, 0, u8[]())), "abort", "a stop with nothing said");
+  c.eq(ends(endingOf(false, 0, "wac: something new".toBytes())), "abort", "a stop nobody named");
+  // A status 1 is a status unless the host's trap words are on the last line.
+  c.eq(ends(endingOf(true, 1, "wac: x trapped: wasm trap: integer divide by zero\nthen more\n".toBytes())), "exit 1\n",
+       "words not on the last line");
+  c.eq(trapName("illegal cast"), "cast", "V8 cast");
+  c.eq(trapName("wasm trap: cast failure"), "cast", "wasmtime cast");
+  return c.report();
+}
+
+export string testArgs() {
+  Check c = Check.create();
+  c.ok(argsOf(null).len() == 0, "no file, no arguments");
+  string[] a = argsOf("x\ny\n".toBytes());
+  c.ok(a.len() == 2 && a[0] == "x" && a[1] == "y", "two lines");
+  string[] b = argsOf("x\n\nz".toBytes());
+  c.ok(b.len() == 3 && b[1] == "" && b[2] == "z", "an empty argument kept, no final newline");
+  return c.report();
+}
+
+export string testPaths() {
+  Check c = Check.create();
+  c.eq(clean("/in/a/../b")!, "in/b", "dot-dot inside");
+  c.eq(clean("in/./b//c")!, "in/b/c", "relative from the root");
+  c.ok(clean("/in/../../etc") is null, "climbing out is nothing");
+  c.ok(clean("/..") is null, "the root's parent is nothing");
+  c.eq(clean("/")!, "", "the root");
+  return c.report();
+}
+
+// The world's file operations answer through the scheduler, which a test here does not run; `corpus/files.wac` drives
+// them through `tools/machine.sh` instead. What is pure is checked here.
+export string testOutputTree() {
+  Check c = Check.create();
+  Written w = Written.create();
+  w.dirs = ["d", "d/e"];
+  w.put("d/f", "x".toBytes());
+  w.put("top", "y".toBytes());
+  w.put("d/f", "z".toBytes());
+  FileIn[] files = outputFiles(Ending.trapped("null"), "log".toBytes(), w);
+  c.ok(files.len() == 4 && files[0].path == "status" && files[1].path == "log", "status and log first");
+  c.eq(string.fromBytes(files[0].content), "trap null\n", "the status line");
+  c.ok(files[2].path == "out/d/f" && string.fromBytes(files[2].content) == "z", "a rewrite replaces");
+  string[] dirs = outputDirs(w);
+  c.ok(dirs.len() == 3 && dirs[0] == "out" && dirs[1] == "out/d" && dirs[2] == "out/d/e", "out is always a directory");
+  c.ok(outputDirs(Written.create()).len() == 1, "even when nothing was written");
+  return c.report();
+}

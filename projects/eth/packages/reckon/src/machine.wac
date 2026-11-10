@@ -1,0 +1,130 @@
+// The deterministic WebAssembly machine, version 0 — what a recipe naming it means, apart from any runner.
+//
+// **Input.** A directory tree with a file `program`, a WebAssembly module that speaks wac's host protocol (what
+// `wac build` writes), and optionally a file `args`, one argument per line. The whole input tree is what the program
+// sees at `/in`, read-only. It starts at `/`, which holds `/in` and an empty `/out`, and nothing else: no network, no
+// environment, no processes, no other files.
+//
+// **Output.** A directory tree of exactly three entries: `status`, `log` (everything the program wrote to its
+// output), and `out/` (what it left under `/out`). `status` is one line: `exit N` when the program ended with status
+// N, or `trap NAME` when WebAssembly stopped it for a reason the module itself determines (`NAME` below).
+//
+// **No output.** Running out of time, memory or stack is the runner's limit, not the program's meaning, so a runner
+// that hits one makes no claim at all. So does any stop it cannot name: a runner says nothing rather than guess.
+//
+// Version 0 because two things are known not to hold yet (`docs/runner.md`): a program can read a clock and random
+// bytes, which no runner built on wac's hosts can take away from it today; and NaN bits differ between engines, which
+// the machine must settle by canonicalising them (WebAssembly 3.0's deterministic profile).
+
+import { ipfs.FileIn } from "@/lib.wac";
+import { Written } from "./world.wac";
+
+export string MACHINE() { return "wasm-gc/wac-host/0"; }
+export string FORMAT() { return "unixfs-v1-2025+hidden"; }
+
+/** How a run ended: `exit` with a code, `trap` with a name, or `abort`, which yields nothing. */
+export struct Ending {
+  string kind;
+  i32 code;
+  string name;
+  /** For an abort: why, for a person. */
+  string why;
+
+  Ending exited(i32 code) { return Ending("exit", code, "", ""); }
+  Ending trapped(string name) { return Ending("trap", 0, name, ""); }
+  Ending aborted(string why) { return Ending("abort", 0, "", why); }
+
+  string status(this) { return this.kind == "exit" ? "exit \{this.code}\n" : "trap \{this.name}\n"; }
+}
+
+/**
+ * A trap's name, from what the host said about it, or "" when it is not one this machine names. Each name is a trap
+ * the module decides — the same on every engine — and each line pairs V8's words with wasmtime's.
+ */
+export string trapName(string said) {
+  if (has(said, "element access out of bounds") || has(said, "out of bounds array access")) { return "array-out-of-bounds"; }
+  if (has(said, "memory access out of bounds") || has(said, "out of bounds memory access")) { return "memory-out-of-bounds"; }
+  if (has(said, "table index is out of bounds") || has(said, "undefined element")) { return "table-out-of-bounds"; }
+  if (has(said, "divide by zero") || has(said, "remainder by zero")) { return "divide-by-zero"; }
+  if (has(said, "divide result unrepresentable") || has(said, "integer overflow")) { return "integer-overflow"; }
+  if (has(said, "float unrepresentable in integer range") || has(said, "invalid conversion to integer")) {
+    return "float-to-integer";
+  }
+  if (has(said, "dereferencing a null pointer") || has(said, "null reference") || has(said, "null function")) { return "null"; }
+  if (has(said, "illegal cast") || has(said, "cast failure")) { return "cast"; }
+  if (has(said, "unreachable")) { return "unreachable"; }
+  return "";
+}
+
+bool has(string s, string part) { return s.indexOf(part) >= 0; }
+
+/** The last non-empty line of what a program said on its diagnostic output: where both hosts report a trap. */
+export string lastLine(u8[] err) {
+  string s = string.fromBytes(err);
+  string[] ls = lines(s);
+  for (i32 i = ls.len() - 1; i >= 0; i--) { if (ls[i] != "") { return ls[i]; } }
+  return "";
+}
+
+/**
+ * How a run ended, from the host's answer and the program's diagnostic output.
+ *
+ * The hosts disagree about how to say a module trapped: Node's answers no status at all, and the wasmtime host
+ * answers status 1 with `trapped: wasm trap:` on the diagnostic output. Stack exhaustion is a limit (V8:
+ * "Maximum call stack size exceeded"; wasmtime: "call stack exhausted"), and anything unnamed is too.
+ */
+export Ending endingOf(bool ran, i32 code, u8[] err) {
+  string last = lastLine(err);
+  bool trapped = !ran || (code == 1 && has(last, "trapped: wasm trap: "));
+  if (!trapped) { return Ending.exited(code); }
+  if (has(last, "call stack") || has(last, "stack size")) { return Ending.aborted("out of stack: \{last}"); }
+  if (has(last, "too large") || has(last, "out of memory")) { return Ending.aborted("out of memory: \{last}"); }
+  string name = trapName(last);
+  if (name == "") { return Ending.aborted("an ending this machine does not name: \{last == "" ? "(nothing said)" : last}"); }
+  return Ending.trapped(name);
+}
+
+/** The `args` file: one argument per line, a final newline optional. */
+export string[] argsOf(u8[]? file) {
+  if (file is null || file!.len() == 0) { return string[](); }
+  string s = string.fromBytes(file!);
+  if (s.slice(s.len() - 1, s.len()) == "\n") { s = s.slice(0, s.len() - 1); }
+  return lines(s);
+}
+
+/** The output tree's files: `status`, `log`, and what was written below `out/`. */
+export FileIn[] outputFiles(Ending e, u8[] log, Written w) {
+  FileIn[] written = w.files();
+  FileIn[] out = FileIn[].filled(written.len() + 2, FileIn("", u8[]()));
+  out[0] = FileIn("status", e.status().toBytes());
+  out[1] = FileIn("log", log);
+  for (i32 i = 0; i < written.len(); i++) { out[i + 2] = FileIn("out/" + written[i].path, written[i].content); }
+  return out;
+}
+
+/** Its directories, `out` always among them so an empty one is kept. */
+export string[] outputDirs(Written w) {
+  string[] out = string[].defaulted(w.dirs.len() + 1);
+  out[0] = "out";
+  for (i32 i = 0; i < w.dirs.len(); i++) { out[i + 1] = "out/" + w.dirs[i]; }
+  return out;
+}
+
+/** `s` cut at every newline. */
+string[] lines(string s) {
+  string[] out = string[]();
+  u8[] b = s.toBytes();
+  i32 at = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '\n') {
+      string[] next = string[].defaulted(out.len() + 1);
+      for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+      u8[] piece = u8[].filled(i - at, 0);
+      piece.copyFrom(b, at, 0, i - at);
+      next[out.len()] = string.fromBytes(piece);
+      out = next;
+      at = i + 1;
+    }
+  }
+  return out;
+}

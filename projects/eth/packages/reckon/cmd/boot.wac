@@ -1,0 +1,238 @@
+// boot — a runner for the bootstrap's host-run machines, wac-l0/1 and wac-flatten/1 (`src/boot.wac`;
+// docs/l0-machine.md, docs/flatten-machine.md).
+//
+//     boot recipe --source F                         a wac-l0/1 recipe: F as `source`
+//     boot recipe --tree DIR --entry PATH            a wac-flatten/1 recipe: DIR as `tree/`, PATH (within it) as `entry`
+//                                                    either way: the input tree and the recipe into the store; prints
+//                                                    the recipe's CID
+//     boot run RECIPE --tool CMD [--key F --runner NAME] [--work DIR]
+//                                                    run it: prints the output tree's CID, or nothing when the runner
+//                                                    failed; with --key, signs a derivation, adds it to the store's
+//                                                    claim index, and prints its statement id too
+//
+// --store DIR (default .objects), --mirror DIR (repeatable) as for `obj`.
+//
+// The tool is a host command, run as `/bin/sh -c 'CMD "$1" "$2"' sh IN OUT`. IN is the L0 text, or the entry's path in
+// the tree written out under the work directory; OUT is where the answer goes. Its exit says which answer it gave: 0
+// with OUT written is an answer, 1 is a refusal, anything else is this runner's failure, and no claim is made. wac's
+// Rust assembler is exactly that shape (`wax IN OUT`); tools/boot/ gives the others the same one.
+
+import { Sys, ChildEnv, Launch } from "std";
+import { Result } from "core";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.FileIn, ipfs.PROFILE, ipfs.encode, ipfs.readTree,
+         ipfs.importFiles, ipfs.importDir, ipfs.filesOnly, ipfs.Block } from "@/lib.wac";
+import { Recipe, recipeFrom, recipeId, recipeValue, Statement, Signed, signStatement, statementId } from "../src/claims.wac";
+import { Index, loadIndex, saveIndex } from "../src/graph.wac";
+import { FORMAT } from "../src/machine.wac";
+import { L0_MACHINE, FLATTEN_MACHINE, isBootMachine, outName, answered, refused, dirsOf } from "../src/boot.wac";
+import { unhex } from "../src/hex.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 1) {
+    sys.warn("usage: boot recipe (--source F | --tree DIR --entry PATH) | boot run RECIPE --tool CMD [--key F --runner NAME] [--work DIR]  [--store DIR] [--mirror DIR]…");
+    return 2;
+  }
+  Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
+  Store[] mirrors = Store[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != "--mirror") { continue; }
+    Store[] next = Store[].filled(mirrors.len() + 1, Store.dir(sys.files(), a[i + 1]));
+    for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
+    mirrors = next;
+  }
+  if (a[0] == "recipe") { return await recipeCmd(sys, store, a); }
+  if (a[0] == "run" && a.len() >= 2) { return await runCmd(sys, store, Resolver(store, mirrors), a); }
+  sys.warn("boot: unknown command \{a[0]}");
+  return 2;
+}
+
+async i32 recipeCmd(Sys sys, Store store, string[] a) {
+  string source = flag(a, "--source", "");
+  string treeDir = flag(a, "--tree", "");
+  string entry = flag(a, "--entry", "");
+  string machine;
+  FileIn[] files;
+  string[] dirs = string[]();
+  if (source != "" && treeDir == "") {
+    machine = L0_MACHINE();
+    match (await sys.readFile(source)) {
+      Err(e): { sys.warn("boot: \{source}: \{e}"); return 1; }
+      Ok(b): { files = [FileIn("source", b)]; }
+    }
+  } else if (treeDir != "" && entry != "" && source == "") {
+    machine = FLATTEN_MACHINE();
+    // The directory through the importer, so it is read exactly as `obj add` reads it, then read back.
+    Cid sub;
+    match (await importDir(store, sys.files(), treeDir, PROFILE())) {
+      Err(e): { sys.warn("boot: \{treeDir}: \{e}"); return 1; }
+      Ok(c): { sub = c; }
+    }
+    match (readTree(Resolver(store, Store[]()), sub)) {
+      Err(e): { sys.warn("boot: \{e}"); return 1; }
+      Ok(fs): {
+        FileIn[] only = filesOnly(fs);
+        files = FileIn[].filled(only.len() + 1, FileIn("entry", (entry + "\n").toBytes()));
+        for (i32 i = 0; i < only.len(); i++) { files[i + 1] = FileIn("tree/" + only[i].path, only[i].content); }
+        dirs = ["tree"];
+      }
+    }
+  } else {
+    sys.warn("boot recipe: --source F, or --tree DIR with --entry PATH");
+    return 2;
+  }
+  Cid input;
+  match (importFiles(store, files, dirs, PROFILE())) {
+    Err(e): { sys.warn("boot: \{e}"); return 1; }
+    Ok(c): { input = c; }
+  }
+  Recipe recipe = Recipe(machine, FORMAT(), input);
+  Cid id = recipeId(recipe);
+  match (store.put(Block(id, encode(recipeValue(recipe))))) {
+    Err(e): { sys.warn("boot: \{e}"); return 1; }
+    Ok(_): { }
+  }
+  sys.warn("\{machine} input \{input.text()}");
+  sys.log(id.text());
+  return 0;
+}
+
+async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
+  Cid id;
+  match (parseCid(a[1])) {
+    Err(e): { sys.warn("boot: \{e}"); return 1; }
+    Ok(c): { id = c; }
+  }
+  Recipe recipe;
+  match (r.block(id)) {
+    Err(e): { sys.warn("boot: \{e}"); return 1; }
+    Ok(b): {
+      match (recipeFrom(b)) {
+        Err(e): { sys.warn("boot: \{e}"); return 1; }
+        Ok(x): { recipe = x; }
+      }
+    }
+  }
+  if (!isBootMachine(recipe.machine)) { sys.warn("boot: this runner is for \{L0_MACHINE()} and \{FLATTEN_MACHINE()}, not \{recipe.machine}"); return 1; }
+  if (recipe.format != FORMAT()) { sys.warn("boot: this runner reads \{FORMAT()}, not \{recipe.format}"); return 1; }
+  FileIn[] tree;
+  match (readTree(r, recipe.input)) {
+    Err(e): { sys.warn("boot: \{e}"); return 1; }
+    Ok(fs): { tree = filesOnly(fs); }
+  }
+  string tool = flag(a, "--tool", "");
+  if (tool == "") { sys.warn("boot run: --tool is required"); return 2; }
+
+  string work = flag(a, "--work", ".boot-work");
+  await sys.files().remove(work, true);
+  await sys.files().mkdir(work, true);
+  string inPath;
+  if (recipe.machine == L0_MACHINE()) {
+    // The input is exactly one file, `source`: anything more or less is not a recipe for this machine.
+    if (tree.len() != 1 || tree[0].path != "source") { sys.warn("boot: a wac-l0/1 input holds exactly one file, `source`"); return 1; }
+    inPath = work + "/source.l0";
+    match (await sys.writeFile(inPath, tree[0].content)) { Err(e): { sys.warn("boot: abort: \{e}"); return 3; } Ok(_): { } }
+  } else {
+    // `entry`, and the files under `tree/`, written out as they are; nothing else.
+    string entry = "";
+    for (i32 i = 0; i < tree.len(); i++) {
+      string p = tree[i].path;
+      if (p == "entry") { entry = firstLine(tree[i].content); continue; }
+      if (p.len() < 5 || p.slice(0, 5) != "tree/") { sys.warn("boot: a wac-flatten/1 input holds `entry` and `tree/`, not \{p}"); return 1; }
+      string at = work + "/" + p;
+      await sys.files().mkdir(at.slice(0, lastSlash(at)), true);
+      match (await sys.writeFile(at, tree[i].content)) { Err(e): { sys.warn("boot: abort: \{e}"); return 3; } Ok(_): { } }
+    }
+    if (entry == "" || entry.slice(0, 1) == "/" || hasDotDot(entry)) {
+      sys.warn("boot: a wac-flatten/1 input names its entry, within tree/, in `entry`");
+      return 1;
+    }
+    inPath = work + "/tree/" + entry;
+  }
+  string outPath = work + "/answer";
+  i32 status = -1;
+  match (await sys.procs().exec("/bin/sh", ["-c", tool + " \"$1\" \"$2\"", "sh", inPath, outPath], u8[](),
+                                ChildEnv.inherited(), Launch("", false, false, false, false))) {
+    Err(e): { sys.warn("boot: abort: the tool did not start: \{e}"); return 3; }
+    Ok(ran): {
+      if (ran.stderr.len() > 0) { await sys.stderr().write(ran.stderr); }
+      status = ran.ok() ? 0 : ran.status;
+    }
+  }
+  FileIn[] out;
+  bool ok = false;
+  if (status == 0) {
+    match (await sys.readFile(outPath)) {
+      Err(e): { sys.warn("boot: abort: the tool said ok and wrote nothing: \{e}; no claim"); return 3; }
+      Ok(b): { out = answered(recipe.machine, b); ok = true; }
+    }
+  } else if (status == 1) {
+    out = refused();
+  } else {
+    sys.warn("boot: abort: the tool failed (exit \{status}); no claim");
+    return 3;
+  }
+  await sys.files().remove(work, true);
+
+  Cid output;
+  match (importFiles(store, out, dirsOf(ok), PROFILE())) {
+    Err(e): { sys.warn("boot: \{e}"); return 1; }
+    Ok(c): { output = c; }
+  }
+  sys.warn("boot: \{recipe.machine}: \{ok ? "ok" : "refused"}");
+  sys.log(output.text());
+
+  string keyPath = flag(a, "--key", "");
+  if (keyPath == "") { return 0; }
+  u8[]? key = null;
+  match (await sys.readFile(keyPath)) {
+    Err(e): { sys.warn("boot: \{keyPath}: \{e}"); return 1; }
+    Ok(b): { key = unhex(hexOnly(b)); }
+  }
+  if (key is null) { sys.warn("boot: \{keyPath} is not a hex key"); return 1; }
+  Signed s = signStatement(Statement.Derivation(id, output, flag(a, "--runner", "reckon-boot/0")), key!);
+  Index ix = loadIndex(store).index;
+  match (ix.add(s)) { Err(e): { sys.warn("boot: \{e}"); return 1; } Ok(_): { } }
+  ix.addRecipe(recipe);
+  match (saveIndex(ix, store)) { Err(e): { sys.warn("boot: \{e}"); return 1; } Ok(_): { } }
+  sys.log(statementId(s.statement).text());
+  return 0;
+}
+
+/** The text up to the first newline. */
+string firstLine(u8[] b) {
+  i32 n = 0;
+  while (n < b.len() && b[n] != '\n' && b[n] != '\r') { n++; }
+  u8[] out = u8[].filled(n, 0);
+  out.copyFrom(b, 0, 0, n);
+  return string.fromBytes(out);
+}
+
+/** Where the last `/` is, or 0. */
+i32 lastSlash(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = b.len() - 1; i >= 0; i--) { if (b[i] == '/') { return i; } }
+  return 0;
+}
+
+/** Whether a path has a `..` segment, which could name something outside the tree. */
+bool hasDotDot(string p) {
+  string s = "/" + p + "/";
+  for (i32 i = 0; i + 4 <= s.len(); i++) { if (s.slice(i, i + 4) == "/../") { return true; } }
+  return false;
+}
+
+/** A key file's hex digits, without the whitespace around or within it. */
+string hexOnly(u8[] b) {
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] != ' ' && b[i] != '\n' && b[i] != '\r' && b[i] != '\t') { n++; } }
+  u8[] out = u8[].filled(n, 0);
+  i32 j = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] != ' ' && b[i] != '\n' && b[i] != '\r' && b[i] != '\t') { out[j] = b[i]; j++; } }
+  return string.fromBytes(out);
+}

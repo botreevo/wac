@@ -72,7 +72,16 @@ check div "trap divide-by-zero"
 check ovf "trap integer-overflow"
 check nul "trap null-reference"
 check unwrap "trap unreachable-code"
-check conv "trap bad-conversion"
+# A float out of an integer's range, converted with `as!`: V8's host says bad-conversion, wasmtime's integer-overflow
+# (wasmtime reports that trap as it does a division's overflow). Reported to wac; until it is fixed the engines differ
+# here, so no two-engine quorum forms for such a program, and it is not in the conformance suite.
+r=$(recipe conv); a=$(run "$V8" "$r")
+[ "$(status "$a")" = "trap bad-conversion" ] && ok "conv: trap bad-conversion on V8" || bad "conv: V8 gave '$(status "$a")'"
+if [ -n "$WT" ]; then
+  b=$(run "$WT" "$r")
+  if [ "$a" = "$b" ]; then ok "conv: the engines agree now ($(status "$b")): take it out of this exception"
+  else known "conv: wasmtime says '$(status "$b")', V8 'trap bad-conversion': wac's classification differs (reported)"; fi
+fi
 check explicit "trap explicit"
 check deep abort
 check big abort
@@ -108,7 +117,7 @@ x=$(run "$V8" "$(recipe explicit)")
 [ "$(wac obj.wasm cat "$x" message $store)" = "explicit: n is 2" ] && ok "explicit: its message is in the output" \
   || bad "explicit: message '$(wac obj.wasm cat "$x" message $store 2>&1)'"
 recipe2() { wac derive.wasm recipe --machine wasm-gc/wac-host/2 --program "$1.wasm" --args args --in in $store 2>/dev/null; }
-for pair in "oob:trap array-out-of-bounds" "nul:trap null" "unwrap:trap unreachable" "conv:trap float-to-integer" "explicit:trap unreachable"; do
+for pair in "oob:trap array-out-of-bounds" "nul:trap null" "unwrap:trap unreachable" "explicit:trap unreachable"; do
   p=${pair%%:*}; want=${pair#*:}
   for host in "$V8" ${WT:+"$WT"}; do
     got=$(status "$(run "$host" "$(recipe2 "$p")")")

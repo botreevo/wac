@@ -1,19 +1,22 @@
 # A runner for the deterministic WebAssembly machine
 
-`cmd/derive.wac` runs recipes for the machine `wasm-gc/wac-host/2`, defined in `src/machine.wac`. `tools/machine.sh`
+`cmd/derive.wac` runs recipes for the machine `wasm-gc/wac-host/3`, and still for `/2`, both in `src/machine.wac`. `tools/machine.sh`
 runs a corpus of programs (`corpus/`) through it on V8 (the Node host's `wac`) and on wasmtime (the native host's),
 and checks what the machine promises. This page records what that showed. Version 0 broke two of those promises.
 Version 1 kept one of them (finding 2, NaNs) by rewriting the module. Version 2 keeps the other (finding 1, clock and
-randomness): the program runs sealed, which wac now provides.
+randomness): the program runs sealed, which wac now provides. Version 3 records how a run ended as a value the host
+reports, not words read from the engine.
 
 ## The machine
 
-The definition is [machines/wasm-gc-wac-host-2.md](machines/wasm-gc-wac-host-2.md), named by CID in
+The definition is [machines/wasm-gc-wac-host-3.md](machines/wasm-gc-wac-host-3.md) (and, for `/2`,
+[machines/wasm-gc-wac-host-2.md](machines/wasm-gc-wac-host-2.md)), named by CID in
 [machines/README.md](machines/README.md). This section summarises it.
 
 - **Input**: a tree with a file `program` (a module `wac build` wrote) and, optionally, `args` (one argument per
   line). The program sees the whole input tree at `/in`, read-only, and an empty `/out`. Nothing else exists.
-- **Output**: a tree of `status` (`exit N` or `trap NAME`), `log` (its standard output) and `out/`.
+- **Output**: a tree of `status` (`exit N` or `trap KIND`), `log` (its standard output) and `out/`, and for the
+  program's own `trap "…"`, its `message`.
 - **No output** when the run hits a runner's limit (time, memory, stack) or stops in a way the machine does not name.
   The runner then makes no claim.
 
@@ -148,6 +151,42 @@ the machine could not promise. Now its log is the same on both engines:
 
 `tools/machine.sh`: 86 of 86 with wasmtime. Every program, probe included, gives one CID on V8 and wasmtime and
 the same one twice; each refusal above is checked; the floor holds; wasmscan agrees on all seven modules.
+
+## Version 3: how a run ended, as a value (2026-11-10)
+
+Up to `/2` the runner learned how a program ended from its exit code and the last line of what it printed, matched
+against each engine's words for each trap (`trapName`). wac `d48da8771` gives a parent `Child.ended()`, which is
+`Exited(code)`, `Trapped(kind, message)` or `HostLimit(why)`. The kind is classified by each host from its engine's
+own trap reasons, and is meant to be the same on every host. Version 3 records that kind:
+
+- `status` is `trap KIND`: `explicit`, `unreachable-code`, `memory-bounds`, `table-bounds`, `divide-by-zero`,
+  `integer-overflow`, `bad-conversion`, `null-reference` or `bad-cast`.
+- For `explicit`, the program's own `trap "…"`, the output also has `message`, the message itself. The program
+  decides it, so it is the same everywhere. An engine's words for its own traps never are, and are not recorded.
+- `StackExhausted`, `Unclassified` and `HostLimit` give no output, as running out of stack or memory always did.
+
+It is a new version, not an erratum, because the outputs change. An array access out of bounds was
+`array-out-of-bounds` and is now `memory-bounds`, since the host's kinds do not tell arrays from memory. An explicit
+trap was `unreachable`, and now carries its message. A `/2` recipe must keep giving what it gave, so the runner
+carries both:
+
+- `/3` takes the kind;
+- `/2` still reads its names from the engine's words, using the kind only where the words are missing and the kind
+  names exactly one `/2` name.
+
+The `/2` conformance suite (17 cases) gives every recorded output unchanged through this runner.
+`derive recipe --machine wasm-gc/wac-host/2` makes a `/2` recipe, and `/3` is the default.
+
+**What the corpus showed:**
+
+- V8 and wasmtime agree on every trap kind the corpus reaches: explicit (with its message), unreachable-code (an
+  `unwrap` of an Err), memory-bounds, divide-by-zero, integer-overflow (from division) and null-reference. `/2`'s
+  names come out as before on both.
+- **One disagreement, reported to wac.** A float outside an integer's range, converted with `as!`, is
+  `bad-conversion` on V8 and `integer-overflow` on wasmtime, because wasmtime reports that trap as it does a
+  division's overflow. Until wac's classification is fixed, the engines give such a program different outputs. No
+  two-engine quorum forms, which is safe, and the program (`corpus/conv.wac`) is kept out of the conformance suite.
+  `table-bounds` and `bad-cast` are named but nothing in the corpus reaches them.
 
 ## Minimum resources (machine /2, unchanged from /1)
 

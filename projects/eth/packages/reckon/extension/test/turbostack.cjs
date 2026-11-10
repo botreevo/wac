@@ -33,9 +33,15 @@ const ok = (c, what) => { if (c) { pass++; console.log(`ok    ${what}`); } else 
   console.log('   | ' + account.split('\n').filter((l) => /^name:|^chain:|^as of|^web: admitted|ADMITTED|REFUSED|written/.test(l)).join('\n   | '));
   ok(/^ADMITTED$/m.test(account) && account.includes(`web: admitted ${cid}`), `${subject} read by proof, admitted, and it is ${cid.slice(0, 16)}…`);
   ok(/written below trees\//.test(account), "the site fetched from the mirror into the extension's storage, every block checked");
+  if (!/^ADMITTED$/m.test(account)) {
+    console.log('   | the whole account:\n   | ' + account.split('\n').join('\n   | '));
+    await ctx.close();
+    console.log(`\n${pass} passed, ${fail} failed`);
+    process.exit(1);
+  }
 
   let frame = null;
-  for (let i = 0; i < 50 && !frame; i++) { frame = page.frames().find((f) => f.url().endsWith('/loader.html')); if (!frame) await page.waitForTimeout(100); }
+  for (let i = 0; i < 50 && !frame; i++) { frame = page.frames().find((f) => f.url().endsWith('/loader.html')) || null; if (!frame) await page.waitForTimeout(100); }
   ok(frame !== null, 'the page runs in the sandbox loader');
   // Each card's status line reads "N pieces" once its player is placing them; the page says so if the weights are missing.
   const counts = () => frame.evaluate(() => [...document.querySelectorAll('.status')].map((e) => {

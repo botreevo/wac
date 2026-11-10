@@ -143,7 +143,7 @@ cat > policy.json5 <<POLICY
   machines: ["wasm-gc/wac-host/2"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: {
-    site: [{ within: { role: "gathered", path: "out" } }],
+    app: [{ within: { role: "gathered", path: "out" } }],   // the extension admits what it opens as `app`
     gathered: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2,
                             slots: { program: "gatherer", args: "reviewed", page: "page", models: "reviewed" } } }],
     gatherer: [{ within: { role: "build", path: "out/gather.wasm" } }],
@@ -179,7 +179,7 @@ until curl -s -m1 -o /dev/null "http://127.0.0.1:$mport/" && curl -s -m1 -o /dev
 manifest="http://127.0.0.1:$fport/reckon-mirrors.json"
 
 step "6. admitted by name, and played in the extension"
-out=$($CL admit "name:turbostack@$pub" site --policy policy.json5 --store fresh --mirrors-from "$manifest" \
+out=$($CL admit "name:turbostack@$pub" app --policy policy.json5 --store fresh --mirrors-from "$manifest" \
   --rpc 127.0.0.1:$port --registry "$registry" --code-hash "$codehash" 2>&1) && code=0 || code=$?
 printf '%s\n' "$out" | sed 's/^/   | /'
 [ $code -eq 0 ] && printf '%s' "$out" | grep -q "^ADMITTED" && ok "claim admit name:turbostack@…: admitted through the derivations" || bad "claim admit: exit $code"

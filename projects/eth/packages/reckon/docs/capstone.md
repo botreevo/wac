@@ -6,6 +6,7 @@ an anchor. Every step is one this repository already does on its own, and the sc
 
     WASMTIME_WAC=/path/to/native/wac sh packages/reckon/tools/capstone.sh WORKDIR     # about 30 minutes
     QUICK=1 …                                                                       # a few minutes: no self-build
+    LADDER=… (not QUICK)                                                            # the ladder as a second origin
 
 ## What it does
 
@@ -51,10 +52,18 @@ compiler's fixed point (selfbuild.sh) seen from the outside: the derived compile
 
 Said plainly, because the point is to know exactly what an answer rests on.
 
-- **The seed compiler is a trust root.** The compiler that builds the app is derived (unless QUICK). But the compiler
-  that built it, wac's own at the pinned commit built natively, is named in the policy's `roots`. Replacing it with a
-  compiler derived from an auditable bootstrap (wac's hand-written ladder, run as derivations) is Andrew's decision
-  **D**, pending.
+- **The seed compiler is a trust root, but no longer the only origin.** The compiler that builds the app is derived
+  (unless QUICK). The compiler that built it, wac's own at the pinned commit built natively, is named in the policy's
+  `roots`.
+  - With `LADDER` (step 1a+), the compiler has a second, unrelated origin: wac's bootstrap ladder builds a compiler
+    from its hand-written rungs, and that one builds the same compiler tree inside the machine on both engines.
+  - The policy's `selfbuild` role is then `agree: [via the seed, via the ladder]`, which is diverse double-compiling.
+    The compiler is admitted only when both build it, so a backdoor in the seed would have to be in the ladder's
+    output too. With the ladder's origin withdrawn, the seed alone is refused.
+  - The ladder's output is endorsed by the key that ran the ladder (`bootstrap`) and is not a root. That is milestone
+    1's unsigned step, stated as what it is.
+  - Making the ladder's own steps derivations and taking the seed out of `roots` altogether is decision **D**'s
+    remaining work (docs/bootstrap-derivations.md).
 - **On the devnet, the anchor is a block hash taken from the node.** A devnet has no beacon chain, so nothing proves
   its headers. The run takes the node's latest block hash as the anchor, and every read is then fixed to it, so the
   node cannot answer from another block. But that the block is the "right" chain rests on the node. On mainnet the

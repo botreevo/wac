@@ -72,9 +72,10 @@ nones=$(grep -c ' none$' suite/cases || true)
 [ "$n" -eq 17 ] && ok "the suite: $n cases ($nones that give nothing), one object: $suite" || bad "the suite has $n cases"
 sed -n '3,$p' suite/cases | sed 's/^/   | /' | cut -c1-120
 
-# witness KEY NAME HOST: a runner witnessing the suite: every case it can run, signed.
+# witness KEY NAME HOST: a runner witnessing the suite: every case with an output, run and signed. A case that gives
+# none needs nothing from a conforming runner but to claim nothing.
 witness() {
-  sed -n '/^bafy/p' suite/cases | while read -r r want; do
+  sed -n '/^bafy/p' suite/cases | grep -v ' none$' | while read -r r want; do
     $3 derive.wasm run "$r" $st --timeout 300000 --key "$1.key" --runner "$2" >/dev/null 2>&1 || true
   done
 }

@@ -8,6 +8,9 @@ randomness): the program runs sealed, which wac now provides.
 
 ## The machine
 
+The definition is [machines/wasm-gc-wac-host-2.md](machines/wasm-gc-wac-host-2.md), named by CID in
+[machines/README.md](machines/README.md). This section summarises it.
+
 - **Input**: a tree with a file `program` (a module `wac build` wrote) and, optionally, `args` (one argument per
   line). The program sees the whole input tree at `/in`, read-only, and an empty `/out`. Nothing else exists.
 - **Output**: a tree of `status` (`exit N` or `trap NAME`), `log` (its standard output) and `out/`.

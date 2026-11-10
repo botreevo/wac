@@ -7,6 +7,10 @@
 #
 #     WASMTIME_WAC=/path/to/native/wac sh packages/reckon/tools/capstone.sh WORKDIR
 #     QUICK=1 …   the compiler that builds the app is the seed itself, not one it built (minutes instead of tens)
+#     LADDER=/path/to/bootstrap/rust-ladder/target/release/ladder …   (not QUICK) a second, unrelated origin for the
+#                 compiler: wac's bootstrap ladder builds one from its hand-written rungs, that one builds the compiler
+#                 inside the machine, and the policy admits the compiler only when both origins agree (diverse
+#                 double-compiling, the `agree` rule)
 #
 # Ports from PORT (8830): the devnet, the mirror over HTTP, the recorded beacon and execution nodes. 4b fetches
 # vitalik.eth's content from a public trustless gateway (GATEWAY, default https://trustless-gateway.link; GATEWAY= to
@@ -61,6 +65,7 @@ D="wac derive.wasm"; CL="wac claim.wasm"; O="wac obj.wasm"
 printf '%s\n' 4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 > v8.key
 printf '%s\n' 646f1ce2fdad0e6deeeb5c7e8e5543bdde65e86029e2fd9fc169899c440a7913 > wt.key
 printf '%s\n' add2f9f8b6e2bff7d0b6e7d1bbcd8fe16c3fbd8b5b1fbb1c0a63e5a0e7a2c3b1 > reviewer.key
+printf '%s\n' 8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba > bootstrap.key
 # derive2 RECIPE: the output on V8 and on wasmtime, each signed by its runner; prints "OUTPUT V8DERIVATION WTDERIVATION".
 derive2() {
   a=$($D run "$1" $st --timeout 7200000 --key v8.key --runner "reckon-derive/2 v8" 2>/dev/null)
@@ -77,6 +82,17 @@ if [ -z "${QUICK:-}" ]; then
   [ "$compilerTree" != ENGINES-DIFFER ] && ok "V8 and wasmtime derive the same compiler ($compilerTree)" || bad "the engines built different compilers"
   $O cat "$compilerTree" out/wac.wasm $st > compiler.wasm
   [ -s compiler.wasm ] && ok "the compiler: $(wc -c < compiler.wasm) bytes" || bad "no compiler: $($O cat "$compilerTree" status $st)"
+  if [ -n "${LADDER:-}" ]; then
+    step "1a+. a second origin: wac's bootstrap ladder builds a compiler from its hand-written rungs, and that one builds the same compiler"
+    (cd wacsrc/in && "$LADDER" packages/wacc/src/api.wac --with-wacc packages/wac/src/wac.wac \
+       --allow-read --allow-write --allow-env --allow-net --allow-run -o "$work/ladder.wasm" >/dev/null 2>&1)
+    [ -s ladder.wasm ] && ok "the ladder built a compiler from boot/l1.l0 … l5.l4 ($(wc -c < ladder.wasm) bytes), with no compiler binary" \
+      || bad "the ladder built nothing"
+    ladderbuild=$($D recipe --program ladder.wasm --args self.args --in wacsrc/in $st 2>/dev/null)
+    set -- $(derive2 "$ladderbuild")
+    [ "$1" = "$compilerTree" ] && ok "inside the machine, on both engines, the ladder's compiler builds the same compiler tree as the seed" \
+      || bad "the ladder's compiler built $1, the seed's $compilerTree"
+  fi
 else
   step "1a. QUICK: the seed is the compiler"
   cp seed.wasm compiler.wasm
@@ -113,17 +129,29 @@ cp -r builder mirror-unreviewed                                  # for 5b: a mir
 seed=$($CL slots "$build" $st 2>/dev/null | sed -n 's/^program //p')
 endorse() { for slot in in args; do $CL endorse "$($CL slots "$1" $st 2>/dev/null | sed -n "s/^$slot //p")" reviewed --key reviewer.key $st >/dev/null 2>&1; done; }
 endorse "$build"
+viaSeed='{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "seed", in: "source", args: "source" } } }'
+selfbuildRole="[$viaSeed]"
 if [ -z "${QUICK:-}" ]; then
   seed=$($CL slots "$selfbuild" $st 2>/dev/null | sed -n 's/^program //p')
   endorse "$selfbuild"
   compilerRole='[{ within: { role: "selfbuild", path: "out/wac.wasm" } }]'
+  if [ -n "${LADDER:-}" ]; then
+    # The ladder's output is vouched for by whoever ran the ladder (an unsigned step until D's later milestones make it
+    # derivations), and it is not a root: the seed's role admits only the seed, the ladder's only the ladder's output.
+    ladderEndorsement=$($CL endorse "$($CL slots "$ladderbuild" $st 2>/dev/null | sed -n 's/^program //p')" \
+      "built by wac's bootstrap ladder from boot/l1.l0 … l5.l4 at $commit" --key bootstrap.key $st 2>/dev/null)
+    viaLadder='{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "ladder", in: "source", args: "source" } } }'
+    selfbuildRole="[{ agree: [$viaSeed, $viaLadder] }]"
+  fi
 else
   compilerRole='["root"]'
 fi
 cat > policy.json5 <<POLICY
 {
-  // Trusted: these three keys, and the seed compiler (wac's, built natively at the pinned commit) as a root.
-  signers: { v8: "$($CL address --key v8.key)", wasmtime: "$($CL address --key wt.key)", reviewer: "$($CL address --key reviewer.key)" },
+  // Trusted: these keys, and the seed compiler (wac's, built natively at the pinned commit) as a root; with LADDER, the
+  // compiler is admitted only when the seed and the bootstrap ladder's compiler, which share nothing but the source, agree.
+  signers: { v8: "$($CL address --key v8.key)", wasmtime: "$($CL address --key wt.key)", reviewer: "$($CL address --key reviewer.key)",
+             bootstrap: "$($CL address --key bootstrap.key)" },
   roots: ["$seed"],
   machines: ["$(sed -n 's/.*MACHINE() { return "\([^"]*\)".*/\1/p' "$here/src/machine.wac")"],
   formats: ["unixfs-v1-2025+hidden"],
@@ -131,13 +159,21 @@ cat > policy.json5 <<POLICY
     app: [{ within: { role: "build", path: "out/capstone.wasm" } }],
     build: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "compiler", in: "source", args: "source" } } }],
     compiler: $compilerRole,
-    selfbuild: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "seed", in: "source", args: "source" } } }],
+    selfbuild: $selfbuildRole,
     seed: ["root"],
+    ladder: [{ endorsed: { by: ["bootstrap"], at_least: 1 } }],
     source: [{ endorsed: { by: ["reviewer"], at_least: 1 } }],
   },
 }
 POLICY
 expect ok "the builder admits the app from its own store" "ADMITTED" -- $CL admit "$appCid" app --policy policy.json5 $st
+if [ -n "${ladderEndorsement:-}" ]; then
+  # Diverse double-compiling: without the ladder's origin, the seed's alone does not admit the compiler.
+  cp -r builder builder-noladder
+  $CL revoke "$ladderEndorsement" --key bootstrap.key --store builder-noladder >/dev/null 2>&1
+  expect refused "with the ladder's origin withdrawn, the seed alone does not admit the compiler" "origin 2 of 2 does not hold" \
+    -- $CL admit "$appCid" app --policy policy.json5 --store builder-noladder
+fi
 cp -r builder mirror
 expect ok "everything the builder holds is in the mirror's index" "statement(s)" -- $CL publish mirror $st
 ( cd mirror && exec python3 -m http.server "$web" --bind 127.0.0.1 >/dev/null 2>&1 ) & pids="$pids $!"; up $web

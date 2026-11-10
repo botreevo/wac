@@ -11,6 +11,10 @@
 //     Analysis(analyser, …)        a derivation of `analyser` run on the object, witnessed enough, wrote `expect` at `path`
 //     Within(role, path)           the object is the file at `path` inside an output admitted in `role`: what a build
 //                                  produced (`out/app.wasm` in a compiler's output), taken out to be run
+//     Agree(rules)                 every rule holds, each `derived` one through a different recipe: one object with
+//                                  several unrelated origins that agree on it. Diverse double-compiling is this: a
+//                                  compiler admitted only when two compilers that share nothing but the source build it
+//                                  to the same bytes, so a backdoor would have to be in both
 //
 // and refused, whatever else holds, if a followed rejection list names it. A statement revoked by its own signer —
 // on the chain, or by a signed revocation in the index — counts for nothing.
@@ -44,6 +48,7 @@ export enum Rule {
   Derived(string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots),
   Analysis(Cid analyser, string slot, string path, string expect, string[] by, i32 atLeast),
   Within(string role, string path),
+  Agree(Rule[] rules),
 }
 
 export struct RoleRules {
@@ -179,10 +184,40 @@ Decision alternative(Ctx c, Cid cid, string role, Rule rule) {
       bool ok = who.len() >= atLeast;
       return Decision(ok, ["  endorsed by \{list(who)} (need \{atLeast})"]);
     }
-    Derived(by, atLeast, runners, slots, otherSlots): { return derived(c, cid, by, atLeast, runners, slots, otherSlots); }
+    Derived(by, atLeast, runners, slots, otherSlots): { return derived(c, cid, by, atLeast, runners, slots, otherSlots, Cid[]()).d; }
     Analysis(analyser, slot, path, expect, by, atLeast): { return analysis(c, cid, analyser, slot, path, expect, by, atLeast); }
     Within(role2, path): { return within(c, cid, role2, path); }
+    Agree(rules): { return agree(c, cid, role, rules); }
   }
+}
+
+/**
+ * Every rule, each `derived` one through a recipe none of the others used. Tried in order, each taking the first recipe
+ * that satisfies it, so rules whose programs differ (which is the point of asking for more than one) never compete.
+ */
+Decision agree(Ctx c, Cid cid, string role, Rule[] rules) {
+  Cid[] used = Cid[]();
+  string[] why = ["  every one of \{rules.len()} origins must hold, each through its own recipe:"];
+  for (i32 i = 0; i < rules.len(); i++) {
+    Via v = match (rules[i]) {
+      Derived(by, atLeast, runners, slots, otherSlots): derived(c, cid, by, atLeast, runners, slots, otherSlots, used),
+      Root: Via(alternative(c, cid, role, rules[i]), null),
+      Endorsed(_, _): Via(alternative(c, cid, role, rules[i]), null),
+      Analysis(_, _, _, _, _, _): Via(alternative(c, cid, role, rules[i]), null),
+      Within(_, _): Via(alternative(c, cid, role, rules[i]), null),
+      Agree(_): Via(Decision(false, ["  an agree rule cannot hold another"]), null),
+    };
+    why = plusAll(why, indent(v.d.why));
+    if (!v.d.ok) { return Decision(false, plus(why, "  origin \{i + 1} of \{rules.len()} does not hold")); }
+    if (v.rid is not null) { used = pushCid(used, v.rid!); }
+  }
+  return Decision(true, why);
+}
+
+/** A rule's decision, and the recipe it held through when it is a derivation. */
+struct Via {
+  Decision d;
+  Cid? rid;
 }
 
 string list(string[] xs) {
@@ -233,11 +268,11 @@ Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by, string machine) {
   return w;
 }
 
-Decision derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots) {
+Via derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots, Cid[] exclude) {
   string[] why = string[]();
-  Cid[] seen = Cid[]();
+  Cid[] seen = exclude;
   Held[] origins = c.ix.origins(cid);
-  if (origins.len() == 0) { return Decision(false, ["  no known recipe produces it"]); }
+  if (origins.len() == 0) { return Via(Decision(false, ["  no known recipe produces it"]), null); }
   for (i32 i = 0; i < origins.len(); i++) {
     Cid rid = match (origins[i].statement) { Derivation(r, _, _): r, Endorsement(s, _): s, Rejection(s, _): s, Revocation(s): s };
     if (contains(seen, rid)) { continue; }
@@ -265,10 +300,11 @@ Decision derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole
       sub = plusAll(sub, indent(d.why));
       if (!d.ok) { all = false; }
     }
-    if (all) { return Decision(true, plusAll(["  recipe \{short(rid)}: \{count}"], sub)); }
+    if (all) { return Via(Decision(true, plusAll(["  recipe \{short(rid)}: \{count}"], sub)), rid); }
     why = plusAll(plus(why, "  recipe \{short(rid)}: \{count}, but an input is refused"), sub);
   }
-  return Decision(false, why);
+  if (why.len() == 0) { why = ["  no other recipe produces it"]; }
+  return Via(Decision(false, why), null);
 }
 
 string[] indent(string[] xs) {

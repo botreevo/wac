@@ -1,7 +1,7 @@
 # 0283b — taking the gate lock starts the 20-minute cooldown, before the pull
 
-- **Status:** open — claimed, fix in the commit that files this
-- **Claimed by:** agent-b
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-b
 - **Date:** 2026-08-29
 - **Kind:** bug
@@ -70,3 +70,7 @@ point both paths pass through.
 
 The wording. *"agent-b ran one 12m ago"* is now true, so it stays — but if this ever gains a second
 stamping path, the sentence is the thing that will hide it again.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. The cooldown stamp is `markRun` now, written where the test lanes begin (`tools/wac/suitegate.wac`, `tools/runTests.wac`) rather than when the lock is taken.

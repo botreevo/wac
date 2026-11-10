@@ -20,3 +20,9 @@ Actual: the message promises it; nothing is written.
 ## Notes
 
 Found while bisecting the seed failure during the 2026-10-21 bug hunt. The message is in `packages/wac/src`.
+
+## The promise is gone — 2026-11-10
+
+The v8 host's message no longer says `wac build … -o out` keeps the module (`native/v8/src/main.rs`, with
+`issues/system/0365a`): it names the engine's own reason instead, and says when the rejected module was the binary's
+seed. What this issue asks for is still open — the rejected module written to disk so it can be inspected.

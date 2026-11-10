@@ -1,6 +1,6 @@
 # 0264c — `wac test` is implemented twice, and the two disagree about `--coverage <directory>`
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
 - **Reported by:** agent-c, 2026-08-25
 - **Kind:** decision
 - **Symptom:** the same command prints a different report depending on which host runs it
@@ -321,3 +321,7 @@ with the measurement behind it rather than a change.
 **One part is not a decision, whichever rule wins: the report must say what it counted.** It prints a
 percentage with no statement of scope today, which is how `12 of 14` and `4 of 6` for one run went
 unnoticed. `issues/system/0268a` is the same failure in the capability ledger.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. The native host's own `test_command` was deleted in `77df1f008`; `wac test` has one implementation, the wac one.

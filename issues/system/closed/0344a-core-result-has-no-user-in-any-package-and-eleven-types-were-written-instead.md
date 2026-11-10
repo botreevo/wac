@@ -1,6 +1,6 @@
 # 0344a — `core/result.wac` has no user in any package, and eleven types were written instead
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
 - **Reported by:** agent-a
 - **Date:** 2026-09-05
 - **Kind:** design decision
@@ -93,3 +93,7 @@ The first version of this count said `hashBytes` was zero. It matched `hashBytes
 `packages/json/src/value.wac` passes it as a **funcref** — `Map.withCapacity(this.count, hashBytes,
 bytesEq)` — so a call-shaped pattern under-counts exactly the values a language passes as functions.
 Corrected by grepping the name.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. **Superseded.** Its premise — that core's `Result` had no user — is false now: 21 files under `packages/*/src` import `Result` from `"core"`. Nothing here is left to do.

@@ -1,7 +1,7 @@
 # 0453e — the TypeScript stripper erases `satisfies` where it is an identifier, and emits broken JavaScript
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `strip.wac`'s `afterExpression`; `strip_test.wac`
+- **Claimed by:** wac2
 - **Reported by:** wac2 (cloud), found by the W1 gate at `./bootstrap.sh --host nodejs`
 - **Date:** 2026-11-10
 - **Kind:** bug
@@ -33,3 +33,11 @@ its position. Never a guess, never a silent pass-through"* — except worse than
 code that does not parse, found here only because `./bootstrap.sh --host nodejs` assembled the node host from it.
 W1 renamed its function (`hosthttp.ts`'s `versionMatches`); the stripper is unchanged. The operator form follows an
 expression, so a `satisfies` after `function`, after `(` or `,`, or before `(` is an identifier.
+
+## Fix
+
+`as` and `satisfies` are operators only after an expression, so the stripper now asks (`afterExpression`): a cast
+needs a closing bracket, a literal, or a name that is not a keyword beginning something (`function`, `return`, `new`,
+`typeof`, …) just before it, and otherwise the word is an identifier and left alone. `export function satisfies(…)`,
+`!satisfies(…)`, `function as(…)` and `as(2) as number` are in `packages/ts/test/wac/strip_test.wac`, and a file
+mixing all of them with real casts strips to JavaScript that node runs, the casts erased and the names kept.

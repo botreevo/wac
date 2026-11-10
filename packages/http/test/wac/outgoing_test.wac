@@ -1,0 +1,62 @@
+// What a caller may set on an `Outgoing`, and what the writer keeps for itself (`issues/system/0342a`).
+//
+// The writer decides the framing, the connection and the host, and a caller's own copy of any of them is a message
+// that disagrees with itself — this package's reader refuses two `Content-Length`s as smuggling. So `set` refuses
+// those names, and the list it refuses by is held here against what `write` actually emits: a header the writer
+// starts writing and nobody adds to `ownedHeader` fails this file.
+import { T } from "../../../wactest/src/assert.wac";
+import { Outgoing, ownedHeader, write } from "../../src/outgoing.wac";
+
+/** The names of the header lines in `wire`, the request line skipped. */
+string[] headerNames(u8[] wire) {
+  string text = string.fromBytes(wire);
+  string head = text.slice(0, text.indexOf("\r\n\r\n"));
+  string[] lines = string[]();
+  i32 from = head.indexOf("\r\n") + 2;
+  while (from < head.len()) {
+    i32 end = head.slice(from, head.len()).indexOf("\r\n");
+    string line = end < 0 ? head.slice(from, head.len()) : head.slice(from, from + end);
+    from = end < 0 ? head.len() : from + end + 2;
+    string[] grown = string[].filled(lines.len() + 1, "");
+    for (i32 i = 0; i < lines.len(); i++) { grown[i] = lines[i]; }
+    grown[lines.len()] = line.slice(0, line.indexOf(":"));
+    lines = grown;
+  }
+  return lines;
+}
+
+export string test_a_header_the_writer_owns_is_refused_and_not_added() {
+  T t = T.create();
+  Outgoing o = Outgoing.create("POST", "/x", "example.com");
+  o.body = "hello".toBytes();
+  for (string name in ["Content-Length", "content-length", "Transfer-Encoding", "Connection", "Host"]) {
+    t.isTrue(o.set(name, "0").isErr(), "\{name} was accepted");
+  }
+  t.isTrue(o.set("Accept", "text/plain").isOk(), "an ordinary header was refused");
+  u8[] wire = write(o, false);
+  string text = string.fromBytes(wire);
+  // The issue's reproduction: one Content-Length, the writer's.
+  i32 count = 0;
+  string rest = text;
+  while (rest.indexOf("Content-Length:") >= 0) {
+    count++;
+    rest = rest.slice(rest.indexOf("Content-Length:") + 15, rest.len());
+  }
+  t.eqI32(count, 1, "Content-Length fields on the wire:\n" + text);
+  t.isTrue(text.indexOf("Content-Length: 5\r\n") >= 0, "the writer's own length:\n" + text);
+  t.isTrue(text.indexOf("Accept: text/plain\r\n") >= 0, "the caller's header:\n" + text);
+  return t.report();
+}
+
+export string test_every_header_the_writer_emits_is_one_it_owns() {
+  T t = T.create();
+  // A body and a close, so every header the writer can emit is emitted.
+  Outgoing o = Outgoing.create("POST", "/x", "example.com");
+  o.body = "hello".toBytes();
+  string[] emitted = headerNames(write(o, false));
+  t.isTrue(emitted.len() >= 3, "the writer emitted \{emitted.len()} headers — is the parse here still right?");
+  for (string name in emitted) {
+    t.isTrue(ownedHeader(name.toBytes()), "write emits \{name}, which set would let a caller add as well");
+  }
+  return t.report();
+}

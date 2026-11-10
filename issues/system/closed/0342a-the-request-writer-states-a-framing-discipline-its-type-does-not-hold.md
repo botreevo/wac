@@ -1,7 +1,7 @@
 # 0342a — the request writer states a framing discipline its type does not hold
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `Outgoing.set` refuses the headers `write` owns; `outgoing_test.wac`
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-09-05
 - **Kind:** bug
@@ -88,3 +88,11 @@ is the part most likely to rot when chunked sending is added.
 
 Found while writing the vision counterpart of this file, which is the last of `packages/http`'s
 sources that nothing in `vision/` had predicted anything about.
+
+## Why
+
+`set` took any name, and `write` emitted every header the caller pushed and then its own framing — so `set("Content-Length", "0")` put two `Content-Length`s on the wire, a message this package's own reader refuses as smuggling.
+
+## Fix
+
+`ownedHeader` names the four the writer decides — `Content-Length`, `Transfer-Encoding` (never emitted, since this writer does not chunk, so a caller's would contradict the length it does emit), `Connection` and `Host` — and `set` refuses them, answering `Result<void, string>` and adding nothing. `packages/http/test/wac/outgoing_test.wac` holds the issue's reproduction (one `Content-Length`, the writer's) and **holds the list against what `write` emits**, so a header the writer starts writing without adding it here fails — the two-lists-that-agree-by-inspection this issue's Notes worried about. `Outgoing` still has no production caller; `limits_test.wac`'s uses are unaffected.

@@ -21,9 +21,123 @@ import { reason } from "../../../fs/src/words.wac";
  */
 i32 MAX_DEPTH() { return 64; }
 
+/**
+ * **What a path must satisfy to be printed** — the expression after the roots, as far as this applet reads one:
+ * `-name PATTERN` (a shell glob — `*`, `?`, `[…]` — against the last component) and `-type f` or `-type d`, every one
+ * of them required. Anything else is refused by name, as GNU refuses a predicate it does not have. It read none of
+ * this until 2026-11-10: `-name` takes a value, so the shared parser left it among the operands, and
+ * `find . -name m1.txt` printed the whole walk — a filter that matches nothing and one that matches everything were
+ * the same command (`issues/system/0299c`).
+ */
+struct Test {
+  string[] names;
+  string type;
+  string why;
+}
+
+/** The roots (leading operands, `.` when none) and the expression after them. */
+Test testOf(string[] own, string[] roots) {
+  Test t = Test(string[](), "", "");
+  i32 i = 0;
+  while (i < own.len() && !startsOption(own[i])) { i++; }
+  while (i < own.len()) {
+    string p = own[i];
+    if (p == "-name" || p == "-type") {
+      if (i + 1 >= own.len()) { t.why = "missing argument to `\{p}'"; return t; }
+      string v = own[i + 1];
+      if (p == "-name") {
+        string[] grown = string[].filled(t.names.len() + 1, "");
+        for (i32 k = 0; k < t.names.len(); k++) { grown[k] = t.names[k]; }
+        grown[t.names.len()] = v;
+        t.names = grown;
+      } else if (v == "f" || v == "d") {
+        t.type = v;
+      } else {
+        t.why = "Unknown argument to -type: \{v}";
+        return t;
+      }
+      i = i + 2;
+      continue;
+    }
+    t.why = "unknown predicate `\{p}'";
+    return t;
+  }
+  return t;
+}
+
+/** Whether an argument begins the expression rather than naming a root: a `-` first. */
+bool startsOption(string arg) { return arg.len() > 0 && arg.toBytes()[0] == '-'; }
+
+/** Whether `name` matches the shell glob `pat`: `*` any run, `?` one byte, `[…]` a set, `[!…]` its complement. */
+bool globMatches(u8[] pat, i32 pi, u8[] name, i32 ni) {
+  while (pi < pat.len()) {
+    u8 c = pat[pi];
+    if (c == '*') {
+      for (i32 k = ni; k <= name.len(); k++) { if (globMatches(pat, pi + 1, name, k)) { return true; } }
+      return false;
+    }
+    if (ni >= name.len()) { return false; }
+    if (c == '?') { pi++; ni++; continue; }
+    if (c == '[') {
+      i32 j = pi + 1;
+      bool negate = j < pat.len() && (pat[j] == '!' || pat[j] == '^');
+      if (negate) { j++; }
+      bool hit = false;
+      bool first = true;
+      while (j < pat.len() && (first || pat[j] != ']')) {
+        first = false;
+        if (j + 2 < pat.len() && pat[j + 1] == '-' && pat[j + 2] != ']') {
+          if (name[ni] >= pat[j] && name[ni] <= pat[j + 2]) { hit = true; }
+          j = j + 3;
+        } else {
+          if (name[ni] == pat[j]) { hit = true; }
+          j++;
+        }
+      }
+      // An unclosed `[` is a literal `[`, as in the shell.
+      if (j >= pat.len()) {
+        if (name[ni] != '[') { return false; }
+        pi++; ni++; continue;
+      }
+      if (hit == negate) { return false; }
+      pi = j + 1;
+      ni++;
+      continue;
+    }
+    if (c == '\\' && pi + 1 < pat.len()) { pi++; c = pat[pi]; }
+    if (name[ni] != c) { return false; }
+    pi++;
+    ni++;
+  }
+  return ni == name.len();
+}
+
+/** Whether `path` passes `t`. `st` is null when it could not be asked, which only `-type` minds. */
+bool passes(Test t, string path, Stat? st) {
+  string base = path;
+  while (base.len() > 1 && base.slice(base.len() - 1, base.len()) == "/") { base = base.slice(0, base.len() - 1); }
+  u8[] bb = base.toBytes();
+  i32 slash = 0 - 1;
+  for (i32 k = 0; k < bb.len(); k++) { if (bb[k] == '/') { slash = k; } }
+  if (slash >= 0 && base.len() > 1) { base = base.slice(slash + 1, base.len()); }
+  for (string pat in t.names) {
+    if (!globMatches(pat.toBytes(), 0, base.toBytes(), 0)) { return false; }
+  }
+  if (t.type != "") {
+    if (st is null) { return false; }
+    if ((t.type == "d") != st!.isDir) { return false; }
+  }
+  return true;
+}
+
 export async i32 find(Output err, Output out, Files fs, Args a) {
   if (refuseFlags(err, a)) { return 1; }
-  string root = a.rest.len() < 1 ? "." : a.rest[0];
+  Test t = testOf(a.own, string[]());
+  if (t.why != "") {
+    err.line(a.name + ": " + t.why);
+    return 1;
+  }
+  string root = a.own.len() < 1 || startsOption(a.own[0]) ? "." : a.own[0];
   auto looked = await fs.stat(root);
   Stat? st = looked.ok();
   // GNU quotes the path and gives no frame: `find: 'nosuch': No such file or directory`. Same story
@@ -33,12 +147,12 @@ export async i32 find(Output err, Output out, Files fs, Args a) {
     err.line(a.name + ": '" + root + "': " + reason(looked.err()!));
     return 1;
   }
-  out.line(root);
-  return await walk(err, out, fs, a.name, root, 0) ? 0 : 1;
+  if (passes(t, root, st)) { out.line(root); }
+  return await walk(err, out, fs, a.name, root, 0, t) ? 0 : 1;
 }
 
 /** False if any part of this subtree could not be listed. */
-async bool walk(Output err, Output out, Files fs, string name, string dir, i32 depth) {
+async bool walk(Output err, Output out, Files fs, string name, string dir, i32 depth, Test t) {
   if (depth > MAX_DEPTH()) {
     err.line("\{name}: \{dir}: deeper than \{MAX_DEPTH()}" +
       " levels, not descending (a symlink loop, or a genuinely deep tree)");
@@ -53,10 +167,10 @@ async bool walk(Output err, Output out, Files fs, string name, string dir, i32 d
   bool complete = true;
   for (i32 i = 0; i < found.len(); i++) {
     string path = "\{dir}/\{found[i]}";
-    out.line(path);
     Stat? st = (await fs.stat(path)).ok();
+    if (passes(t, path, st)) { out.line(path); }
     if ((st is not null) && st!.isDir) {
-      if (!(await walk(err, out, fs, name, path, depth + 1))) { complete = false; }
+      if (!(await walk(err, out, fs, name, path, depth + 1, t))) { complete = false; }
     }
   }
   return complete;

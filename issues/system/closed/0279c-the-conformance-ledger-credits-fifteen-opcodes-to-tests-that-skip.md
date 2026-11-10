@@ -1,6 +1,6 @@
 # 0279 — the conformance ledger credits fifteen opcodes to tests that skip
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
 - **Reported by:** agent-c
 - **Date:** 2026-08-29
 - **Kind:** missing feature
@@ -128,3 +128,7 @@ comparison with a hole exactly where the bugs are. The successor pattern — one
 several hosts, which `packages/ts/test/wac/bootstrap_test.wac` demonstrates — puts v8 in the
 comparison for the first time, because each host's `wac` runs the same artefact. That was verified by
 reintroducing `0277c` and watching it fail.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. The cited native tests no longer skip: `nativeBinaryPath` goes through `requireNativeHost` (`packages/wactest/src/host.wac`), which fails, naming how to build the binary, where it used to skip.

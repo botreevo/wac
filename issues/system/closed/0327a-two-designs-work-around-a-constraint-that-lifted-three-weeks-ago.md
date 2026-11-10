@@ -1,7 +1,7 @@
 # 0327a — two designs work around a constraint that lifted three weeks ago
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
 - **Kind:** design decision
@@ -225,3 +225,7 @@ reaches it.
 `packages/fs`'s mount table becomes std's `Files` handle, a struct of closures (`Files.memory()`,
 `.readOnly()`, `Files.mounted(…)`), and `Cli.capture` is deleted with `Cli`; keeping a program's output is
 spawning it and reading its stream. `design/system/0013`.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. The ruling (option 3) is implemented: std has `Files.mounted`, `Files.memory` and `Files.readOnly`, `Cli` is deleted, and `packages/fs` has no source left (`385d952b9`).

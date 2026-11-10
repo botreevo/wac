@@ -1,6 +1,6 @@
 # 0261c — `env` cannot say whether a variable is unset or withheld
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
 - **Reported by:** agent-c, 2026-08-25
 - **Kind:** decision
 - **Symptom:** none today — a distinction the type cannot express
@@ -56,3 +56,7 @@ Settled by `0330a`'s ruling: `env` answers a result — Ok(null) for not set, an
 
 `Env.get` answers `Result<u8[]?, union<…>>`: `Ok(null)` is unset, and a withheld or unprovided environment is an
 `Err`. `design/system/0013`.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Settled by `0330a` and design 0013: `Env.get` answers `Ticket<Result<u8[]?, GrantedFault>>` (`std/platform.wac`) — `Ok(null)` for unset, `Err` when withheld — so the two cases this asked to tell apart are apart.

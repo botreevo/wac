@@ -25,6 +25,24 @@ let shown = null;   // { tree, page }: what the frame shows, and the only tree i
 
 function account(lines) { $('account').textContent = lines.join('\n'); }
 
+const STALE_S = 3600;   // a decision older than this is marked: the chain may have moved since (a revocation, a name)
+
+/** The "as of" banner: which block and slot the decision was made at, when, and how long ago. */
+function showAsOf(asOf, ok) {
+  const el = $('asof');
+  if (!asOf || (asOf.block === null && asOf.slot === null)) { el.textContent = ''; el.className = ''; return; }
+  const t = asOf.blockTime ?? asOf.slotTime;
+  const age = t === null ? null : Math.max(0, Math.round(Date.now() / 1000 - t));
+  const ago = age === null ? '' : age < 120 ? `${age} s ago` : age < 7200 ? `${Math.round(age / 60)} min ago`
+    : age < 172800 ? `${Math.round(age / 3600)} h ago` : `${Math.round(age / 86400)} days ago`;
+  const parts = [];
+  if (asOf.block !== null) parts.push(`execution block ${asOf.block}`);
+  if (asOf.slot !== null) parts.push(`beacon slot ${asOf.slot}`);
+  el.textContent = `${ok ? 'Admitted' : 'Decided'} as of ${parts.join(', ')}` + (t === null ? '' : ` · ${new Date(t * 1000).toISOString().replace('.000Z', 'Z')} · ${ago}`)
+    + (age !== null && age > STALE_S ? ' · older than an hour: the chain may have changed since' : '');
+  el.className = age !== null && age > STALE_S ? 'stale' : 'fresh';
+}
+
 /** Show `page` of `tree` in a fresh sandbox loader. Exported for the tests, which put a tree in OPFS themselves. */
 export async function show(tree, page = 'index.html') {
   const { html, report } = buildDocument(tree, page);
@@ -72,10 +90,12 @@ function clear() {
 
 async function open(subject, role) {
   clear();
+  showAsOf(null, false);
   const settings = await loadSettings();
   account([`admitting ${subject} as ${role}…`]);
   const d = await admit(settings, subject, role);
   account(d.lines);
+  showAsOf(d.asOf, d.code === 0);
   if (d.code !== 0 || !d.cid) return;
   const tree = await openTree(d.cid);
   if (!tree) { account([...d.lines, `admitted, but its tree is not in storage: ${d.cid}`]); return; }

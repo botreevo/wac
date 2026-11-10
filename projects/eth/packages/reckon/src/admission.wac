@@ -22,7 +22,7 @@ import { Chain, Decision, admit } from "./admit.wac";
 import { readPolicyFile, NameRule, readNameRule, ensRefusal, delayRefusal } from "./policyfile.wac";
 import { Endpoint, Snapshot, NameAt, endpointOf, asksFor, chainFor, read, nameAt, nameSlot, plus } from "./registry2.wac";
 import { unhex, hex } from "./hex.wac";
-import { Anchored, Kept, anchorFrom, anchorFromNode, anchorResume, keptOf } from "./checkpoint.wac";
+import { Anchored, Kept, anchorFrom, anchorFromNode, anchorResume, keptOf, MAINNET_GENESIS } from "./checkpoint.wac";
 
 /**
  * The default bound on a kept state's age, in sync-committee periods (about 27 hours each): 12, about two weeks,
@@ -99,6 +99,25 @@ export struct Admitted {
   string anchor;
 }
 
+/**
+ * What the decision is as of: the latest block a read was pinned to (its number and time, from the name or the chain,
+ * bound to the anchor by the header's hash) and the light client's finalized beacon slot. -1 for what is not known.
+ */
+struct AsOf {
+  i64 block;
+  i64 time;
+  i64 slot;
+
+  void block_(this, i64 n, i64 t) { if (n > this.block) { this.block = n; this.time = t; } }
+
+  string text(this) {
+    string s = "";
+    if (this.block >= (0 as i64)) { s = "execution block \{this.block} (time \{this.time})"; }
+    if (this.slot >= (0 as i64)) { s = s + (s == "" ? "" : ", ") + "beacon slot \{this.slot} (time \{MAINNET_GENESIS() + this.slot * (12 as i64)})"; }
+    return s;
+  }
+}
+
 struct Say {
   Line[] lines;
   void out(this, string s) { this.lines = more(this.lines, Line(false, s)); }
@@ -123,6 +142,7 @@ i64 decimal(string s) {
 /** The whole of admission for `q`, over the claim index `ix` and the blocks `r` reaches. */
 export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r) {
   Say s = Say(Line[]());
+  AsOf asOf = AsOf(-1 as i64, -1 as i64, -1 as i64);
   Cid? none = null;
   // 1. The anchor (docs/admit.md): from the light client, resumed from its kept state or started from a checkpoint, or
   // given.
@@ -146,6 +166,7 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
         Ok(an): {
           for (i32 i = 0; i < an.log.len(); i++) { s.out(an.log[i]); }
           anchorHex = "0x" + hex(an.blockHash);
+          asOf.slot = an.beaconSlot;
           match (await keep(sys, q.statePath, an.state)) { Err(e): { s.warn("\{q.statePath}: the state was not kept: \{e}"); } Ok(_): { s.out("light client: state kept at \{q.statePath}, finalized slot \{an.beaconSlot}"); } }
           resumed = true;
         }
@@ -163,6 +184,7 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
       Ok(an): {
         for (i32 i = 0; i < an.log.len(); i++) { s.out(an.log[i]); }
         anchorHex = "0x" + hex(an.blockHash);
+        asOf.slot = an.beaconSlot;
         if (q.statePath != "") {
           match (await keep(sys, q.statePath, an.state)) { Err(e): { s.warn("\{q.statePath}: the state was not kept: \{e}"); } Ok(_): { s.out("light client: state kept at \{q.statePath}, finalized slot \{an.beaconSlot}"); } }
         }
@@ -199,6 +221,7 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
       Ok(x): { snap = x; }
     }
     NameAt n = nameAt(snap.values, snap.timestamp);
+    asOf.block_(snap.number, snap.timestamp);
     if (n.cid is null) {
       s.out("name: \{spec}: not a name its publisher has claimed (proved at block \{snap.number})");
       s.out("REFUSED");
@@ -227,6 +250,7 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
     match (ensContent(sys.net(), name, q.rpc.slice(0, colon), port, reg!, rc!, vc!, an!)) {
       Err(e): { s.warn("the name: \{e}"); s.out("REFUSED"); return ended(s, 3, none, anchorHex); }
       Ok(ans): {
+        asOf.block_(ans.block, ans.time);
         i32 nl = ans.out.indexOf("\n");
         s.out("name: \{name} → " + (nl < 0 ? ans.out : ans.out.slice(0, nl)));
         if (nl >= 0) { s.out("      " + ans.out.slice(nl + 1, ans.out.len())); }
@@ -252,6 +276,7 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
               Err(e): { s.warn("the chain: \{e}"); s.out("REFUSED"); return ended(s, 3, c, anchorHex); }
               Ok(pr): {
                 chain = pr.chain;
+                asOf.block_(pr.at.number, pr.at.timestamp);
                 s.out("chain: block \{pr.at.number}, \{pr.at.slots.len()} slot(s) proved" + (pr.at.anchored ? "" : " (no anchor)")
                       + "; \{chain.revokedId.len()} revocation(s), \{chain.rejected.len()} rejection(s) set");
               }
@@ -259,6 +284,7 @@ export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r
           }
         }
       }
+      if (asOf.text() != "") { s.out("as of " + asOf.text()); }
       Decision d = admit(p, ix, r, chain, c, q.role);
       for (i32 i = 0; i < d.why.len(); i++) { s.out(d.why[i]); }
       s.out(d.ok ? "ADMITTED" : "REFUSED");

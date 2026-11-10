@@ -71,7 +71,7 @@ r('done', 'index');
      'the page is cross-origin isolated: SharedArrayBuffer, for the admission worker');
   await page.waitForFunction(() => !/^admitting/.test(document.getElementById('account').textContent), null, { timeout: 120000 });
   const acct = await page.evaluate(() => document.getElementById('account').textContent);
-  ok(!/^ADMITTED$/m.test(acct) && /give --checkpoint to start it/.test(acct), 'with no settings, admission admits nothing, and says what it lacks (a checkpoint)');
+  ok(!/^ADMITTED$/m.test(acct) && /needs --rpc/.test(acct), 'with no settings, admission admits nothing, and says what it lacks (an RPC to read the name from)');
   ok(!(await page.evaluate(() => document.getElementById('app').classList.contains('shown'))), '…and nothing is shown');
 
   // A tree as admission will leave it in OPFS, and shown as an admitted one is.

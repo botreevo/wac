@@ -110,8 +110,19 @@ what the user installed, and its build can itself be a derivation, so it can be 
    - that second admission resumed the kept state, with no bootstrap;
    - it admits `ens:vitalik.eth` by proof, says its content is on no mirror here, and shows nothing.
    Still to do: a static site from the gateway, when it answers, and a hostile app that tries every way out.
-4. **State and freshness.** Light-client state persisted (R4), revocations proved on chain each time an app is
-   opened, and a visible "as of block N" on the page.
+4. **State and freshness. Done (2026-11-10).**
+   - **Light-client state:** kept and resumed (R4, `--state`).
+   - **Revocations at each open:** every open is a fresh admission, so with a registry set, revocations and rejections
+     are proved at each open, at the anchored block.
+   - **"As of":** admission now ends its reads with an "as of" line (`src/admission.wac`): the latest block a read was
+     pinned to, with its time (bound to the anchor by the header's hash), and the light client's finalized beacon
+     slot. The page shows it as a banner, "Admitted as of execution block N · time · age", marked once it is older
+     than an hour.
+   - **Test:** `extension/test/revoke.sh` passes 5 of 5, on a wacuum devnet with the registry v2. An app is admitted
+     as of block 4, the banner fresh; the endorser revokes on chain; the next open proves the revocation, refuses and
+     takes the app down, as of block 6. On recorded mainnet (`admit.sh`, 12 of 12) the banner says beacon slot
+     15621760 and marks it 10 hours old.
+   - **Not yet:** a decision does not expire while an app stays open; it is checked again at the next open.
 5. **Hardening.** Size and start-up time, the extension built as a derivation, and an admission of the extension by
    its own policy.
 6. **Published. Done (2026-11-10).** `extension/release.sh` makes `site/downloads/`, which the pages site serves:

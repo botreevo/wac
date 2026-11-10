@@ -14,7 +14,7 @@ The plan is in [../docs/browser-extension.md](../docs/browser-extension.md). Thi
 | `src/loader.html` | the sandbox page: a unique origin, no extension API, handed that document once |
 | `spike/` | how apps came to be shown this way: the five ways measured |
 
-Build it with `WAC_SRC=… sh build.sh`, then test it under Playwright's Chromium. `test/admit.sh WORKDIR` is admission and showing, end to end (11 of 11: see the plan's milestone 3). `node test/shell.cjs` passes 16 of 16:
+Build it with `WAC_SRC=… sh build.sh`, then test it under Playwright's Chromium. `test/admit.sh WORKDIR` is admission and showing, end to end (12 of 12: see the plan's milestone 3); `test/revoke.sh WORKDIR` is a revocation on chain taking effect at the next open, and the "as of" banner (5 of 5, milestone 4). `node test/shell.cjs` passes 16 of 16:
 - the extension loads, and its page is isolated;
 - with no settings, admission admits nothing, saying what it lacks, and nothing is shown;
 - a fixture app put in OPFS is shown through the loader: its styles (and one imported), image, `fetch` and XHR in the

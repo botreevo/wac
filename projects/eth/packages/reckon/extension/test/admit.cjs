@@ -36,6 +36,7 @@ const ok = (c, what) => { if (c) { pass++; console.log(`ok    ${what}`); } else 
       && !/^admitting/.test(document.getElementById('account').textContent), null, { timeout: 180000 });
     await page.waitForTimeout(1500);
     return page.evaluate(() => ({ account: document.getElementById('account').textContent,
+      asof: document.getElementById('asof').textContent, asofClass: document.getElementById('asof').className,
       shown: document.getElementById('app').classList.contains('shown'), got: window.__got, last: window.__reckon.last }));
   };
 
@@ -45,6 +46,8 @@ const ok = (c, what) => { if (c) { pass++; console.log(`ok    ${what}`); } else 
   ok(a.last && a.last.cid === appCid && a.last.paths.length === 4, `the tree read back is the admitted CID's, ${a.last ? a.last.paths.length : 0} files`);
   ok(a.shown && a.got.origin === 'null', 'the app is shown through the sandbox loader, its origin opaque');
   ok(a.got.color === 'rgb(7, 8, 9)' && a.got.fetch === 'from its own tree', 'its stylesheet applies, and its fetch is answered from its tree');
+  ok(/^Admitted as of beacon slot 15621760/.test(a.asof) && a.asofClass === 'stale',
+     `the page says what it is as of, and that recorded data is old: "${a.asof.slice(0, 70)}…"`);
 
   const b = await open(otherCid);
   ok(/^REFUSED$/m.test(b.account) && /endorsed by nobody/.test(b.account), 'a tree nobody reviewed is refused, saying why');

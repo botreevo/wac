@@ -183,11 +183,12 @@ program=$($CL slots "$recipe" $ds 2>/dev/null | sed -n 's/^program //p')
 for slot in program args in; do
   $CL endorse "$($CL slots "$recipe" $ds 2>/dev/null | sed -n "s/^$slot //p")" reviewed --key "$keys/reviewer" $ds >/dev/null 2>&1
 done
+machine=$(sed -n 's/.*MACHINE() { return "\([^"]*\)".*/\1/p' "$here/src/machine.wac")  # the version derive runs
 echo "recipe $recipe → output $output (derivation $deriv); program $program"
 cat > "$work/dpolicy.json5" <<POLICY
 {
   signers: { runner: "$addr_runner", reviewer: "$addr_reviewer" },
-  machines: ["wasm-gc/wac-host/1"],
+  machines: ["$machine"],
   formats: ["unixfs-v1-2025+hidden"],
   reject_lists: ["$addr_list"],
   roles: {

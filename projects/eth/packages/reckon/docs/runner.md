@@ -1,10 +1,10 @@
 # A runner for the deterministic WebAssembly machine
 
-`cmd/derive.wac` runs recipes for the machine `wasm-gc/wac-host/1`, defined in `src/machine.wac`. `tools/machine.sh`
+`cmd/derive.wac` runs recipes for the machine `wasm-gc/wac-host/2`, defined in `src/machine.wac`. `tools/machine.sh`
 runs a corpus of programs (`corpus/`) through it on V8 (the Node host's `wac`) and on wasmtime (the native host's),
 and checks what the machine promises. This page records what that showed. Version 0 broke two of those promises.
-Version 1 keeps one of them (finding 2, NaNs) by rewriting the module, and the other (finding 1, clock and
-randomness) still needs a change in wac.
+Version 1 kept one of them (finding 2, NaNs) by rewriting the module. Version 2 keeps the other (finding 1, clock and
+randomness): the program runs sealed, which wac now provides.
 
 ## The machine
 
@@ -126,14 +126,34 @@ it passes on both engines, and so does `floats.wac`, whose output is the same bi
 `tools/machine.sh`: 75 of 75 with wasmtime, and wasmscan finds the same operators at the same offsets in all seven
 modules, every one valid after the rewrite. `test/canon_test.wac` covers the cases one at a time.
 
-## Minimum resources (machine /1)
+## Version 2: sealed, no clock and no random bytes (2026-11-10)
+
+Finding 1 is settled the way it recommends, in wac (`4f77740a9`, `Launch.sealed()`): a child started sealed gets no
+clock and no random bytes, and neither does anything it spawns, on every host. Each request answers `Unsupported`.
+`cmd/derive.wac` spawns every program sealed, which is the whole of what changes between `/1` and `/2`. The rest of
+the machine (the world, canonical NaNs, the floor below) is as it was.
+
+`corpus/probe.wac`, which asked for everything the machine does not give, used to be the one program whose output
+the machine could not promise. Now its log is the same on both engines:
+
+    clock: refused this program was started sealed: it has no clock and no random bytes
+    monotonic: refused this program was started sealed: it has no clock and no random bytes
+    random: refused this program was started sealed: it has no clock and no random bytes
+    read /etc/hostname: refused /etc/hostname: No such file or directory
+    env HOME: refused Not granted to this application
+    cwd: /
+
+`tools/machine.sh`: 86 of 86 with wasmtime. Every program, probe included, gives one CID on V8 and wasmtime and
+the same one twice; each refusal above is checked; the floor holds; wasmscan agrees on all seven modules.
+
+## Minimum resources (machine /2, unchanged from /1)
 
 A run that exceeds what its runner allows aborts and yields no claim, which is safe but means two runners can disagree
 about whether there is an answer at all. So the machine names a floor, and every conforming runner provides at least
 this much. Programs that stay within it get an answer from every runner. Frame size depends on the code, so the floor
 is defined by two reference programs in `corpus/`, not in bytes:
 
-| resource | every runner of `/1` must complete | measured on this machine (V8 / wasmtime) |
+| resource | every runner of `/2` must complete | measured on this machine (V8 / wasmtime) |
 | --- | --- | --- |
 | stack | `depth.wac 10000`: 10,000 nested calls of a two-argument `i64` function | ~50,000–60,000 / ~10,000–12,000 |
 | heap | `heap.wac 1024`: 1 GiB live at once, in 1 MiB `u8[]` arrays | 1–2 GiB / at least 4 GiB |

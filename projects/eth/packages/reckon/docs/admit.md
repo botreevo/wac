@@ -42,6 +42,11 @@ the same code. `lc` stays the light client's own command.
 `0xa835…e937` (slot 15621760, period 1906), `--beacon-url` fetched the updates across the period boundary and arrived
 at finalized execution block `0xc3da8467…`. That is the block `packages/lightclient/tools/mainnet.sh` and `lc` gave
 from the node's own checkpoint minutes before. Five more runs from fresh checkpoints gave the same. That check also
-found two things this now handles: a node answers several periods' updates with one Eth-Consensus-Version per
-update, comma-separated; and a live optimistic update can be no newer than the finality update just applied, which
-the light client refuses. That refusal is why the optimistic update is not asked for.
+found two things this now handles. A node answers several periods' updates with one Eth-Consensus-Version per
+update, comma-separated. And once in five runs a live update was refused: the clock slot was read once, before
+fetching, and a node's freshest updates are signed in the head slot, so when a slot passed during the fetching an
+update was "signed in the future". The clock is now read as each update is checked, with the spec's 500 ms of
+disparity. Shown live with `lc`: a clock read one slot early refused the optimistic update 3 times in 4, and read
+after fetching, never. After the fix, 10 live runs out of 10 were admitted. (A first guess, that the optimistic
+update could be no newer than the finality update, was wrong: the light client accepts that.) The optimistic update
+is still not asked for; it adds nothing to a finalized anchor.

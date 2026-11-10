@@ -102,6 +102,13 @@ beacon finality
 expect refused "a node that changes a byte of the finality update" "the finality update did not verify" -- $CL admit ens:vitalik.eth app $B
 beacon fork
 expect refused "a node whose answers disagree about the fork" "answered the finality update as electra" -- $CL admit ens:vitalik.eth app $B
+beacon honest
+# An update signed in a slot later than the current one is refused, and a live node's freshest are signed in the head
+# slot: which is why, live, the clock is read as each update is checked (src/checkpoint.wac), not before fetching.
+sig=$(python3 -c "import sys; f=open(sys.argv[1],'rb').read(); o=int.from_bytes(f[0:4],'little'); print(int.from_bytes(f[o-8:o],'little'))" "$beacon/finality.ssz")
+C="--policy policy.json5 --checkpoint $checkpoint --beacon-url http://127.0.0.1:$bport --rpc 127.0.0.1:$port --store local"
+expect refused "a clock slot before the finality update was signed ($((sig - 1)))" "the finality update did not verify" -- $CL admit ens:vitalik.eth app $C --now $((sig - 1))
+expect ok "at the slot it was signed in ($sig)" "ADMITTED" -- $CL admit ens:vitalik.eth app $C --now $sig
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

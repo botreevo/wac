@@ -120,7 +120,17 @@ function workerModule(tree, path, report, memo = new Map(), stack = []) {
 function shim(pagePath, workers) {
   return `<script>(() => {
 const PAGE = ${JSON.stringify(pagePath)}, ORIGIN = ${JSON.stringify(ORIGIN)};
-const inTree = (ref) => { try { const u = new URL(String(ref), ORIGIN + '/' + PAGE); return u.origin === ORIGIN ? decodeURIComponent(u.pathname.slice(1)) : null; } catch { return null; } };
+// The document's own address is the loader's, so a URL beside it (a page that resolves names against location.href,
+// as a wac-web page's site does) means the same name beside the page in the tree.
+const HERE = location.href.replace(/[?#].*$/, '').replace(/[^/]*$/, '');
+const inTree = (ref) => {
+  try {
+    let s = String(ref);
+    if (s.startsWith(HERE)) s = s.slice(HERE.length);
+    const u = new URL(s, ORIGIN + '/' + PAGE);
+    return u.origin === ORIGIN ? decodeURIComponent(u.pathname.slice(1)) : null;
+  } catch { return null; }
+};
 const waiting = new Map(); let n = 0;
 addEventListener('message', (e) => { if (e.source !== parent || !e.data || !waiting.has(e.data.id)) return; const w = waiting.get(e.data.id); waiting.delete(e.data.id); w(e.data); });
 const ask = (path) => new Promise((done) => { const id = ++n; waiting.set(id, done); parent.postMessage({ ask: path, id }, '*'); });

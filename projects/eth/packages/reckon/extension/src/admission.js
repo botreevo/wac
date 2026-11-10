@@ -21,6 +21,8 @@ export function argsFor(settings, subject, role) {
   opt('--code-hash', settings.codeHash);
   opt('--now', settings.now);
   for (const m of String(settings.mirrors || '').split(/\s+/)) opt('--mirror', m);
+  // Manifests (docs/discovery.md): `web` follows them and adds the mirrors they lead to; what they serve is checked.
+  for (const m of String(settings.mirrorsFrom || '').split(/\s+/)) opt('--mirrors-from', m);
   return a;
 }
 

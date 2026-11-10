@@ -651,6 +651,26 @@ export string programSide() {
  */
 export string systemSide() {
   return """
+      // **A trap as `Child.ended()` says it**, classified as wac's `packages/platform/host/children.ts` `trapEnding` does
+      // — the same words, the same `TrapKind` numbers — so a page and every other host agree on how a child ended.
+      const wacEndedOf = (error) => {
+        const line = String(error).split(String.fromCharCode(10))[0];
+        if (line.startsWith("trapped: ")) return { how: 1, m: 0, text: line.slice(9) };
+        const own = line.indexOf("wac trap: ");
+        if (own >= 0) return { how: 1, m: 0, text: line.slice(own + 10) };
+        const w = line.toLowerCase();
+        const kind = w.includes("unreachable") ? 1
+          : w.includes("memory access out of bounds") || w.includes("array element access out of bounds") ? 2
+          : w.includes("table index is out of bounds") || w.includes("table access out of bounds") ? 3
+          : w.includes("divide by zero") || w.includes("remainder by zero") ? 4
+          : w.includes("divide result unrepresentable") || w.includes("integer overflow") ? 5
+          : w.includes("float unrepresentable") || w.includes("invalid conversion") ? 6
+          : w.includes("null") && (w.includes("dereferenc") || w.includes("function")) ? 7
+          : w.includes("illegal cast") || w.includes("signature mismatch") ? 8
+          : w.includes("call stack size exceeded") || w.includes("stack overflow") ? 9
+          : 10;
+        return { how: 1, m: kind, text: kind === 1 ? "" : line };
+      };
       // A queue of byte chunks with one reader at a time: what a child's streams arrive on.
       const wacQueue = () => {
         const items = [], waiters = [];
@@ -861,6 +881,16 @@ export string systemSide() {
               c.exit.then((code) => ok(id, NONE, BigInt(code)));
               return;
             }
+            // **`CHILD_ENDED`: how a child ended** (`Child.ended()`, wac 71bc06729), answered as wac's own browser host
+            // answers it — `n` 0 exited with code `m`, 1 trapped with kind `m` (std's `TrapKind`) saying `text`, 2 a host
+            // limit saying why. `Child.exit()` is answered from this too, so a page that did not serve it could not wait
+            // for a child at all (wac `issues/system/0460e`).
+            case 74: {
+              const c = handles.get(n)?.child;
+              if (c === undefined) return answer(id, 5, "not a child", NONE, 0n, 0n, 0);
+              c.ended.then((e) => answer(id, 0, e.text, NONE, BigInt(e.how), BigInt(e.m), 0));
+              return;
+            }
             // A file as a handle of its own. A read takes the whole file at once and queues it in pieces, so
             // `recv` serves it as it serves a child; a write goes to the browser's writable stream, which keeps
             // nothing until it is closed — so a file half-written by a program that stopped is not left behind.
@@ -931,9 +961,10 @@ export string systemSide() {
             default: return answer(id, 9, "a page does not serve request " + op, NONE, 0n, 0n, 0);
           }
         };
-        return { request, exit: (code) => {
+        // `ended` is how (`Child.ended()`, wac's `Ended`): absent for a plain exit with `code`.
+        return { request, exit: (code, ended) => {
           if (!me.child) throw new Error("the program exited with " + code);
-          me.post(["exit", code]);
+          me.post(["exit", code, ended]);
           close();
         } };
 
@@ -947,7 +978,7 @@ export string systemSide() {
         }
         // Only the page's thread, which started the child, can end it: asked to, it stops the child and whatever the
         // child started.
-        function stop(c, code) {
+        function stop(c, code, ended) {
           if (c.gone) return;
           c.gone = true;
           if (c.id >= 0) { wacTellPage(["stop", c.id]); wacChildFailed.delete(c.id); }
@@ -955,6 +986,7 @@ export string systemSide() {
           c.port?.close();
           c.out.end(); c.err.end(); c.fs.end();
           c.settle(code);
+          c.settleEnded(ended ?? (code === 143 ? { how: 2, m: 0, text: "stopped by its parent" } : { how: 0, m: code, text: "" }));
         }
         // `wasm` is a module to run (`OP_SPAWN`), or null for another copy of this page (`OP_SPAWN_SELF`). Either
         // way the child is a worker on this very script; its first message says which it is.
@@ -979,6 +1011,7 @@ export string systemSide() {
           const c = { id: -1, port: null, waiting: [], out: wacQueue(), err: wacQueue(), fs: wacQueue(), gone: false,
                       exit: new Promise((r) => { settle = r; }) };
           c.settle = settle;
+          c.ended = new Promise((r) => { c.settleEnded = r; });
           // What this program sends before the channel arrives waits for it.
           c.send = (m, transfer) => { if (c.port !== null) c.port.postMessage(m, transfer ?? []); else c.waiting.push([m, transfer]); };
           const h = nextHandle++, eh = nextHandle++, fh = serveFs ? nextHandle++ : -1;
@@ -995,7 +1028,7 @@ export string systemSide() {
             if (k === "out") { if (inheritOut) emit(false, v); else c.out.push(v); }
             else if (k === "err") { if (inheritOut) emit(true, v); else c.err.push(v); }
             else if (k === "fs") c.fs.push(v);
-            else if (k === "exit") stop(c, v);
+            else if (k === "exit") stop(c, v, e.data[2]);
           };
           // **Inherited input is read for the child while it runs** — from this program's input, which a page has
           // none of — and a piece read after it ended goes back for whoever reads next.
@@ -1021,7 +1054,7 @@ export string systemSide() {
             // page's thread, which saw it.
             wacChildFailed.set(id, (why) => {
               c.err.push(enc.encode((why || "the program stopped") + "\\n"));
-              stop(c, 134);
+              stop(c, 134, wacEndedOf(why || "the program stopped"));
             });
             for (const [m, t] of c.waiting) port.postMessage(m, t ?? []);
             c.waiting = [];
@@ -1271,7 +1304,7 @@ export string moduleSide() {
           said("this is not a wac program: it carries no wac.manifest section");
           return null;
         }
-        const { app } = wacDrive(mod, manifest);
+        const { app, trapSaid } = wacDrive(mod, manifest);
         let host = null, run = null, finished = false, turning = false, depth = 0;
         const arrived = [];
         const deliver = (a) => { if (!finished) app.__wacAnswered(host, ...a); };
@@ -1325,7 +1358,9 @@ export string moduleSide() {
           if (!finished) {
             said(String(e?.message ?? e));
             finished = true;
-            s.exit(134);
+            // A program's own `trap "…"` left its words behind; anything else is the engine's, classified.
+            const own = trapSaid();
+            s.exit(134, own !== "" ? { how: 1, m: 0, text: own } : wacEndedOf(String(e?.message ?? e)));
           }
         }
         return top;
@@ -1339,7 +1374,7 @@ export string moduleSide() {
         port.onmessage = (e) => wacFromParent(e.data, stdin, fsIn);
         const said = (text) => me.post(["err", new TextEncoder().encode(text + String.fromCharCode(10))]);
         if (wacRun(init.wasm, me, Number(init.grants), null, said) === null) {
-          me.post(["exit", 126]);
+          me.post(["exit", 126, { how: 2, m: 0, text: "the program could not be started" }]);
           close();
         }
       };

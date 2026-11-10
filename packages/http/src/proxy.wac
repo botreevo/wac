@@ -39,7 +39,7 @@
 // and that is operational information rather than a network error: the fix is a line in a file on the
 // host. A caller reporting "connection failed" sends somebody to look at the wrong thing.
 
-import { Net, Socket } from "std";
+import { Env, Net, Socket } from "std";
 import { Buf, Read, Result, flatten } from "core";
 
 /** Where a proxy is. */
@@ -257,4 +257,77 @@ string firstLine(u8[] b) {
     out.push(b[i]);
   }
   return out.toStr();
+}
+
+/**
+ * **The proxy a request to `host` goes through, or `""`** — as curl, Go and git read the environment: an
+ * `https` request takes `HTTPS_PROXY` (or `https_proxy`), a plain one `HTTP_PROXY` (or `http_proxy`), and a host
+ * `NO_PROXY` covers takes neither. One reading, for `packages/fetch` and `packages/git` alike: git's transport read
+ * `HTTP_PROXY` alone for its `https` remotes, so where only `HTTPS_PROXY` was set it connected directly
+ * (`issues/system/0451e`).
+ */
+export string proxyFor(Env env, bool tls, string host) {
+  return proxyChosen(firstEnv(env, "HTTPS_PROXY", "https_proxy"), firstEnv(env, "HTTP_PROXY", "http_proxy"),
+                     firstEnv(env, "NO_PROXY", "no_proxy"), tls, host);
+}
+
+/** `proxyFor` over the three values rather than an environment. */
+export string proxyChosen(string httpsProxy, string httpProxy, string noProxyList, bool tls, string host) {
+  string v = tls ? httpsProxy : httpProxy;
+  if (v != "" && noProxy(noProxyList, host)) { return ""; }
+  return v;
+}
+
+string envOr(Env env, string name) {
+  u8[]? v = flatten(env.get(name).wait()).orElse(null);
+  return v is null ? "" : string.fromBytes(v!);
+}
+
+/** The first of these variables that is set and not empty. */
+string firstEnv(Env env, string a, string b) {
+  string v = envOr(env, a);
+  return v != "" ? v : envOr(env, b);
+}
+
+string lowerAscii(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] >= 'A' && b[i] <= 'Z') { b[i] = b[i] + 32; } }
+  return string.fromBytes(b);
+}
+
+/**
+ * Whether `NO_PROXY` keeps `host` off the proxy: `*`, the host itself, or a domain it is under — `.a.b`,
+ * `*.a.b` and `a.b` all cover `x.a.b`, the reading curl and Go share. A CIDR range matches only when
+ * written as the very address, since resolving a name to test it is the proxy's job.
+ */
+export bool noProxy(string list, string host) {
+  string rest = list;
+  while (rest.len() > 0) {
+    i32 comma = rest.indexOf(",");
+    string entry = lowerAscii(trimSpaces(comma < 0 ? rest : rest.slice(0, comma)));
+    rest = comma < 0 ? "" : rest.slice(comma + 1, rest.len());
+    if (entry == "") { continue; }
+    if (entry == "*") { return true; }
+    i32 colon = entry.indexOf(":");
+    // A port on an entry ("host:8080") is not compared: the host is what decides, as in curl.
+    if (colon > 0 && entry.indexOf("::") < 0) { entry = entry.slice(0, colon); }
+    if (entry.len() >= 2 && entry.slice(0, 2) == "*.") { entry = entry.slice(1, entry.len()); }
+    if (entry.slice(0, 1) == ".") {
+      if (host == entry.slice(1, entry.len())) { return true; }
+      if (host.len() > entry.len() && host.slice(host.len() - entry.len(), host.len()) == entry) { return true; }
+      continue;
+    }
+    if (host == entry) { return true; }
+    if (host.len() > entry.len() + 1 && host.slice(host.len() - entry.len() - 1, host.len()) == "." + entry) { return true; }
+  }
+  return false;
+}
+
+string trimSpaces(string s) {
+  u8[] b = s.toBytes();
+  i32 a = 0;
+  i32 z = b.len();
+  while (a < z && (b[a] == ' ' || b[a] == '\t')) { a++; }
+  while (z > a && (b[z - 1] == ' ' || b[z - 1] == '\t')) { z--; }
+  return s.slice(a, z);
 }

@@ -65,3 +65,19 @@ export async function waitInPage(
     await new Promise((r) => setTimeout(r, 50));
   }
 }
+
+/**
+ * **Canvases drawn on the page's own thread**, so a test can read them back with `getContext("2d")`.
+ *
+ * wac-web hands a canvas to the program's worker the first time it is drawn (`transferControlToOffscreen`), and from
+ * then on the document cannot read its pixels: `getContext` throws *a canvas that has transferred its control to
+ * offscreen*. Where the element has no `transferControlToOffscreen`, the page draws the usual way — wac-web's own
+ * fallback — so hiding it before any page script runs puts every pixel back where these tests look. What is drawn is
+ * the same; *where* it is drawn is wac-web's to test, and `test/sense_live.test.ts` there does. Call before `goto`.
+ * Found when `issues/system/0452e` let these tests run in a container for the first time since the surfaces landed.
+ */
+// deno-lint-ignore no-explicit-any
+export async function canvasesOnThePage(page: any): Promise<void> {
+  await page.addInitScript(`Object.defineProperty(HTMLCanvasElement.prototype, "transferControlToOffscreen",
+    { value: undefined, configurable: true, writable: true });`);
+}

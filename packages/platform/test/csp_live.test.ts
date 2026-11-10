@@ -9,25 +9,17 @@
 import { buildApp } from "../build.ts";
 import { waitInPage } from "../../../harness/buildPage.ts";
 import "../../../harness/spawnRetry.ts";
+import { findChromium, launchOptions } from "../../../harness/chromium.ts";
 
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   if (got !== want) throw new Error(`${msg ?? "assertEquals"}\n  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`);
 }
 
+const CHROMIUM = findChromium();
+
+/** Why this run cannot drive a browser, or `""` — `harness/chromium.ts` looks (`issues/system/0452e`). */
 function canDriveBrowser(): string {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return "no `sys` permission: run this file with `deno test -A`";
-  }
-  const home = Deno.env.get("HOME");
-  if (home === undefined) return "no HOME to look for a browser under";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
-      .some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright: no browser installed`;
-  }
-  return "";
+  return CHROMIUM.cannot;
 }
 const cannotBecause = canDriveBrowser();
 if (cannotBecause !== "") console.error(`csp_live: skipped — ${cannotBecause}`);
@@ -61,7 +53,7 @@ function serve(dir: string): { port: number; stop(): Promise<void> } {
 async function runUnder(dir: string): Promise<{ text: string; refused: string[] }> {
   const { chromium } = await import("npm:playwright@1");
   const http = serve(dir);
-  const browser = await chromium.launch({ args: ["--no-proxy-server"] });
+  const browser = await chromium.launch(launchOptions(CHROMIUM));
   try {
     await Deno.writeTextFile(`${dir}/args.json`, JSON.stringify([`http://127.0.0.1:${http.port}/small`]));
     const tab = await browser.newPage();

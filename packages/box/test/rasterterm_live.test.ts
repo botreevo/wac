@@ -11,7 +11,8 @@
 // it is checked elsewhere against my own code. A browser typing `echo hi` and the letters appearing
 // in the right cell is the only assertion that spans all of them at once.
 
-import { buildPage, waitInPage } from "../../../harness/buildPage.ts";
+import { buildPage, waitInPage, canvasesOnThePage } from "../../../harness/buildPage.ts";
+import { findChromium, launchOptions } from "../../../harness/chromium.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -30,21 +31,9 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
  * not grant it, so a test that only checked for a browser would pass under `deno test -A` and fail
  * inside the suite with `NotCapable` from somewhere in an npm bundle.
  */
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return "no `sys` permission: run this file with `deno test -A`";
-  }
-  const home = Deno.env.get("HOME");
-  if (home === undefined) return "no HOME to look for a browser under";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
-      .some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright — run: ./node_modules/.bin/playwright install chromium`;
-  }
-  return "";
-})();
+// Found by `harness/chromium.ts`, which launches it by executable (`issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") {
   console.warn(
     `SKIPPING the raster terminal live test: ${cannotBecause}.\n` +
@@ -83,8 +72,9 @@ Deno.test({
     try {
       await buildPage("packages/box/example/rasterterm.wac", dir, ["--grant", "read,write", "--spawn", "applet"]);
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch(launchOptions(CHROMIUM));
       const page = await browser.newPage();
+      await canvasesOnThePage(page);
       const failures: string[] = [];
       page.on("pageerror", (e: Error) => failures.push(String(e)));
       await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
@@ -177,8 +167,9 @@ Deno.test({
     try {
       await buildPage("packages/box/example/rasterterm.wac", dir, ["--grant", "read,write", "--spawn", "applet"]);
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch(launchOptions(CHROMIUM));
       const page = await browser.newPage();
+      await canvasesOnThePage(page);
       const failures: string[] = [];
       page.on("pageerror", (e: Error) => failures.push(String(e)));
       await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
@@ -321,8 +312,9 @@ Deno.test({
     try {
       await buildPage("packages/box/example/rasterterm.wac", dir, ["--grant", "read,write", "--spawn", "applet"]);
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch(launchOptions(CHROMIUM));
       const page = await browser.newPage();
+      await canvasesOnThePage(page);
       const failures: string[] = [];
       page.on("pageerror", (e: Error) => failures.push(String(e)));
       await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
@@ -460,8 +452,9 @@ Deno.test({
     try {
       await buildPage("packages/box/example/rasterterm.wac", dir, ["--grant", "read,write", "--spawn", "applet"]);
       const port = (http = serve(dir)).port;
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch(launchOptions(CHROMIUM));
       const page = await browser.newPage();
+      await canvasesOnThePage(page);
       const failures: string[] = [];
       page.on("pageerror", (e: Error) => failures.push(String(e)));
       await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });

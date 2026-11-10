@@ -1,6 +1,6 @@
 # 0451e — `wac update` reads only `HTTP_PROXY`, so where only `HTTPS_PROXY` is set it connects directly
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (wac2) — `packages/http/src/proxy.wac` `proxyFor`; `packages/http/test/wac/proxy_test.wac`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** wac2 (cloud), filling wac-eth's cache for W2a
 - **Date:** 2026-11-10
@@ -44,3 +44,16 @@ probably to share that helper rather than keep a second reading of the variables
 
 Not fixed with this filing: W1 (`wac.http`) was ahead of it. Until it is, a cloud session fills a project's cache with
 `git`, as `tools/fill-cache.sh` does for this repository's own lock (pointing a copy of it at another lock works).
+
+## Fixed — wac2, 2026-11-10
+
+`proxyFor(env, tls, host)` in `packages/http/src/proxy.wac` is the one reading of the variables now: `HTTPS_PROXY` (or
+`https_proxy`) for an `https` request, `HTTP_PROXY` (or `http_proxy`) for a plain one, neither for a host `NO_PROXY`
+covers. `packages/fetch` asks it instead of its own copy (`noProxy` moved with it), and git's transport asks it for
+every remote. `proxyChosen` is the same over three strings, and `proxy_test.wac` holds the cases.
+
+Measured in a cloud container, with only `HTTPS_PROXY` set: `wac update` of a project importing
+`https://git.voltrevo.com/wac.git` fetched it (4,479 objects) where it had answered 401.
+
+The live git tests (`lsremote_test`, `clone_test`, `fetchlive_test`) still skip without `HTTP_PROXY`. They need a
+Squid-style proxy for `CONNECT`, which is a separate question from which variable names it.

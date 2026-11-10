@@ -56,7 +56,7 @@
 
 import {
   Arm, Case, Decl, DeclKind, Expr, ExprKind, JsxAttr, Lvalue, LvalueKind, Method, NamedArg, Param, Pattern,
-  Program, Stmt, StmtKind, Ty, TyKind, lvalueExpr, safeCallName, safeCallReceiver,
+  Program, Stmt, StmtKind, TupleBinding, Ty, TyKind, lvalueExpr, safeCallName, safeCallReceiver,
 } from "./ast.wac";
 import { Lexed, lex, tokenStride } from "./lex.wac";
 import { P, parseType } from "./parse.wac";
@@ -70,7 +70,7 @@ import {
   synthOk, synthErr, synthResult, synthTryV, synthTryE, synthGenerator, synthAsyncGenerator,
   synthSlot, synthAw, synthNum, synthZero, synthOne, synthArg,
 } from "./asyncsynth.wac";
-import { kAndAnd, kAwait, kFor, kIdent, kLparen, kOrOr, kQuestion } from "./kinds.wac";
+import { kAndAnd, kAssign, kAwait, kFor, kIdent, kLparen, kOrOr, kQuestion, kRparen } from "./kinds.wac";
 
 /** Everything the rewrite needs that is not the statement in front of it. */
 struct Ctx {
@@ -2952,6 +2952,7 @@ Stmt[] splitStmt(Rz z, Stmt s) {
   Ctx c = z.c;
   Pulled p = newPulled();
   match (s.kind) {
+    Destructure(whole, pattern, init): { return splitDestructure(z, s, whole, pattern, init); }
     Var(type, nameTok, init, isConst): {
       if (init is null) { return Stmt[].filled(1, s); }
       // `T x = await e;` is already a shape the flattening takes; only its operand is made linear.
@@ -3091,6 +3092,84 @@ Stmt[] splitStmt(Rz z, Stmt s) {
     }
     default: { return Stmt[].filled(1, s); }
   }
+}
+
+bool isDestructure(Stmt s) {
+  match (s.kind) {
+    Destructure(whole, pattern, init): { return true; }
+    default: { return false; }
+  }
+}
+
+/**
+ * `(T a, U b) = e;` as `X t = e; T a = t.0; U b = t.1;` — `issues/lang/0443d`.
+ *
+ * **A machine keeps its locals in cells, and the plan only hoists declarations it can see as `Var`s.**
+ * A destructuring declared its bindings as plain locals inside the step function, so a read after an
+ * `await` found nothing: the emitter refused `a` as "neither a local nor a module constant". As a
+ * temporary and one declaration per member, every binding is a `Var` like any other — hoisted,
+ * typed by `typeof` when the pattern writes no type, and an `await` in `e` is the `T x = await e;`
+ * shape the flattening already takes. A nested group is one more temporary, taken apart the same way.
+ */
+Stmt[] splitDestructure(Rz z, Stmt s, Ty? whole, TupleBinding pattern, Expr init) {
+  Ctx c = z.c;
+  i32 tmp = freshTmp(z);
+  // The pattern's own types when it writes them all: `(i32 a, i32 b) = (3, 4)` gives its literals
+  // their type from the pattern, and `typeof((3, 4))` has none to give.
+  Ty tt = whole is not null ? whole! : patternTyFor(z, pattern, init);
+  Stmt[] out = splitStmt(z, Stmt(StmtKind.Var(tt, tmp, init, false), s.line, freshCol(c)));
+  for (i32 k = 0; k < pattern.kids.len(); k++) {
+    TupleBinding b = pattern.kids[k];
+    Expr member = eDot(c, eId(c, tmp), tNum(c, k));
+    Stmt[] more = Stmt[]();
+    if (b.nameTok < 0) {
+      more = splitDestructure(z, s, b.type, b, member);
+    } else {
+      Ty bt = (b.type is null || isAutoTyL(z, b.type!)) ? typeofTy(c, eDot(c, eId(c, tmp), tNum(c, k))) : b.type!;
+      more = Stmt[].filled(1, Stmt(StmtKind.Var(bt, b.nameTok, member, false), b.line, b.col));
+    }
+    out = joinS(out, more);
+  }
+  return out;
+}
+
+/** The tuple type a pattern writes in full — `((i32, i32), u8)` for `((i32 a, i32 b), u8 c)` — or null. */
+Ty? patternTy(Rz z, TupleBinding b) {
+  if (b.nameTok >= 0) {
+    if (b.type is null || isAutoTyL(z, b.type!)) { return null; }
+    return b.type;
+  }
+  if (b.type is not null && !isAutoTyL(z, b.type!)) { return b.type; }
+  Ty[] ms = Ty[].filled(b.kids.len(), Ty(TyKind.TupleOf(Ty[]()), b.line, b.col));
+  for (i32 k = 0; k < b.kids.len(); k++) {
+    Ty? m = patternTy(z, b.kids[k]);
+    if (m is null) { return null; }
+    ms[k] = m!;
+  }
+  return Ty(TyKind.TupleOf(ms), b.line, b.col);
+}
+
+/**
+ * The type of what a pattern takes apart, position by position over a tuple written out: the pattern's
+ * type where it writes one, else `typeof` the member — so `(i32 a, auto b) = (1, x)` is `(i32,
+ * typeof(x))`, where `typeof((1, x))` would have no type for the `1`.
+ */
+Ty patternTyFor(Rz z, TupleBinding b, Expr e) {
+  Ty? whole = patternTy(z, b);
+  if (whole is not null) { return whole!; }
+  if (b.nameTok < 0) {
+    match (e.kind) {
+      TupleLit(elements): {
+        if (elements.len() == b.kids.len()) {
+          Ty[] ms = Ty[].filled(b.kids.len(), Ty(TyKind.TupleOf(Ty[]()), b.line, b.col));
+          for (i32 k = 0; k < b.kids.len(); k++) { ms[k] = patternTyFor(z, b.kids[k], elements[k]); }
+          return Ty(TyKind.TupleOf(ms), b.line, b.col);
+        }
+      }
+      default: { }
+    }
+  }
+  return typeofTy(z.c, valueForm(z, e));
 }
 
 /** `p?.m(args)` as a statement: `if (p is not null) { p!.m(args); }`, with the arguments made linear inside. */
@@ -3331,7 +3410,8 @@ Stmt[] splitBody(Rz z, Stmt[] body) {
   i32 n = 0;
   Stmt[][] parts = Stmt[][].filled(body.len(), Stmt[]());
   for (i32 i = 0; i < body.len(); i++) {
-    parts[i] = awaitInStmt(body[i]) ? splitStmt(z, body[i]) : Stmt[].filled(1, spellTypes(z, body[i]));
+    parts[i] = awaitInStmt(body[i]) || isDestructure(body[i]) ? splitStmt(z, body[i])
+                                                               : Stmt[].filled(1, spellTypes(z, body[i]));
     n = n + parts[i].len();
   }
   Stmt[] out = Stmt[].filled(n, body.len() > 0 ? body[0] : sRet(z.c, null));
@@ -3384,6 +3464,9 @@ i32 awaitTokens(Lexed lexed) {
     if (k == kAwait()) { n = n + 1; }
     // A `for … in` a machine rewrites takes two temporaries of the same family (`splitForIn`).
     if (k == kFor()) { n = n + 2; }
+    // A destructuring a machine takes apart, `(a, b) = e;`, takes one per group (`splitDestructure`):
+    // four covers three levels of nesting.
+    if (k == kRparen() && i + 1 < lexed.tokenCount && lexed.tokens[(i + 1) * tokenStride()] == kAssign()) { n = n + 4; }
   }
   return n;
 }

@@ -27,7 +27,9 @@ Steps 1 to 5 are `claim run --out` (docs/admit.md#claim-run), compiled to WebAss
 extension page (UI) ──► worker: admission (wac → wasm, main(Sys)) ──► fetch (host_permissions: beacon, RPC, mirrors)
         │                       │ store: OPFS (blocks, claim index, light-client state)
         ▼                       ▼
-sandboxed frame  ◄── extension service worker: answers /app/<root-cid>/<path> from verified blocks only
+sandbox loader (packaged, opaque origin, CSP: no network) ◄── the page posts it the app's document, built from
+        │                                                     verified blocks with subresources inlined
+        └── fetch(path) ──postMessage──► the page answers from the admitted tree only
 ```
 
 - **Admission runs as a `main(Sys)` program in a worker,** built with wac's `--target browser` (packages/platform).
@@ -46,9 +48,10 @@ sandboxed frame  ◄── extension service worker: answers /app/<root-cid>/<pa
   headers.
 - **Storage** is OPFS, which the platform's browser host already maps `Files` onto. The store directory, the
   claim index and the light client's state live there, per extension.
-- **Serving the app.** The extension's service worker answers requests under `chrome-extension://ID/app/<cid>/`
-  from blocks already in OPFS, by path inside the admitted tree. The frame showing the app must hold no extension
-  API, and must not be able to fetch outside its tree. This is the least certain part (see the risks below).
+- **Serving the app: measured, see "The spike" below.** A service worker can't serve an opaque-origin frame. Instead,
+  a packaged MV3 sandbox page (`sandbox.pages`: a unique origin, no extension API, its own CSP with `connect-src
+  'none'`) is handed the app's document, built from verified blocks. The document's subresources are inlined as
+  `data:` URLs, and `fetch` is answered by the extension page over `postMessage` from the admitted tree only.
 
 ## What changes, and where
 
@@ -61,7 +64,7 @@ sandboxed frame  ◄── extension service worker: answers /app/<root-cid>/<pa
 | R2 | **A browser entry,** `cmd/web.wac`: `main(Sys)` taking the subject, role and settings, running R1, then fetching the tree, so the worker hands verified blocks to the service worker | **[reckon]** |
 | R3 | **CORS on the replays.** `tools/replay.mjs` and `tools/beacon-replay.mjs` answer `OPTIONS` and send `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Eth-Consensus-Version`, so a page served from another port can use them | **[reckon]** |
 | R4 | **Light-client state kept between runs.** `src/checkpoint.wac` writes the store it ends with (finalized header, committees) and starts from it next time. A check is then a few requests, not a bootstrap | **[reckon]** (lightclient's store type is serialized here, not changed) |
-| R5 | **The extension.** Manifest, UI page, settings, service worker serving `/app/<cid>/…`, and the sandboxed frame | **[reckon]**, new `packages/reckon/extension/` |
+| R5 | **The extension.** Manifest, UI page, settings, the sandbox loader, and the document builder: an admitted tree's HTML with its scripts, styles, images and fonts inlined as `data:` URLs (CSS `url()` too), a `fetch`/XHR shim answered from the tree, and links within the tree re-rendered in place | **[reckon]**, `packages/reckon/extension/` |
 
 ## Trust roots and settings
 
@@ -90,22 +93,45 @@ what the user installed, and its build can itself be a derivation, so it can be 
    and counts nothing until they land.
 2. **The extension shell.** MV3 manifest, a UI page, the worker running milestone 1's module from packaged files
    (W2), and settings. It admits a name and shows the account. No app is served yet.
-3. **Serving the admitted app.** The service worker serves `/app/<cid>/…` from verified blocks, in the sandboxed
-   frame. Test it with the capstone's app and with a static site (vitalik.eth's, from the gateway).
+3. **Serving the admitted app,** through the sandbox loader (R5). Test it with the capstone's app, a static site
+   (vitalik.eth's, from the gateway), and a hostile app that tries every way out (the spike's `main.js` is the
+   start of one).
 4. **State and freshness.** Light-client state persisted (R4), revocations proved on chain each time an app is
    opened, and a visible "as of block N" on the page.
 5. **Hardening.** Size and start-up time, the extension built as a derivation, and an admission of the extension by
    its own policy.
+6. **Published.** A zip (and a `.crx` if signing is settled) with install instructions as a download on the reckon
+   pages site reckon1 is building, and live in-browser demos there if feasible. The download is named by its CID,
+   with the claims that admit it.
 
 ## Risks and open questions
 
-- **The sandboxed frame and the service worker.** MV3 "sandbox" pages get a unique origin and no extension APIs,
-  but they are packaged files, not served by the service worker. A frame with the `sandbox` attribute has an opaque
-  origin, and whether its subresource requests reach the extension's service worker needs a spike. The fallback is
-  a sandboxed frame whose document is built from verified bytes (`srcdoc`), with subresources served as `blob:`
-  URLs, rewritten from the tree. That works for static sites with relative links and not for apps that compute URLs.
+- **Apps that compute URLs.** The loader inlines what the HTML names, and answers `fetch` and XHR from the tree.
+  ES modules that import relative paths, workers, dynamic `import()` and navigation by `location` need more
+  rewriting (an import map of `data:` URLs, worker sources by message). A static site works as it is; an app may
+  not, and the page should say which it found.
 - **Size.** `claim.wasm` is about 540 KB today. With the light client and BLS it is still fine for an extension;
   start-up is measured in milestone 1.
 - **CPU.** The light client's BLS checks run in V8 as they do on the Node host. Milestone 1 will time them.
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
+
+## The spike (2026-11-10)
+
+`extension/spike/` is a minimal MV3 extension, run under Playwright's Chromium with `node run.cjs`, while
+`node hits.mjs` listens on 127.0.0.1:8899 to show whether anything an app tries reaches the network. The app tries:
+- its own script, style and image;
+- `fetch` in its tree, from another root, and from the internet;
+- XHR, a remote image, `sendBeacon`, a WebSocket, a frame and a popup.
+
+| How the app is shown | Origin and `chrome.*` | Subresources | Network |
+| --- | --- | --- | --- |
+| a frame with `sandbox="allow-scripts"`, its page from the extension's service worker | the frame never loads: its navigation does not reach the worker | none | none |
+| `sandbox="allow-scripts allow-same-origin"` | **the extension's own origin, with `tabs`, `management`, `runtime`…**: unacceptable | all through the worker, another root's too | the extension's CSP blocks it |
+| no attribute, the worker's response carrying `Content-Security-Policy: sandbox allow-scripts` | opaque | **not through the worker**: they go to the extension's packaged files and fail (`ERR_FILE_NOT_FOUND`) | none |
+| the same, everything inlined | opaque | **blocked**: the extension pages' CSP applies, and MV3 allows no inline or `data:` script there | none |
+| **a packaged `sandbox.pages` loader, handed the document by `postMessage`** | **`null`; no extension API** (only `loadTimes` and `csi`, which web pages have) | inlined `data:` URLs: script, CSS and image all load; `fetch` in the tree answered by the parent; another root and the internet refused | **nothing reached the listener**: `connect-src 'none'`, `img-src data:` and the sandbox block XHR, the remote image, the beacon (accepted, never sent), the WebSocket, the frame and the popup |
+
+So the main risk is settled. A service worker can't serve an opaque-origin frame. A packaged sandbox page, with the
+app inlined into it from verified bytes and a CSP that allows no network, can show it, with no extension API and
+nothing outside its tree.

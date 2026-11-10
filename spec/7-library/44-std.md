@@ -312,6 +312,7 @@ struct Files {
 
   Files readOnly(this);                    // the same files, every change answering NotGranted
   Files relativeTo(this, string dir);      // a relative path starts at dir
+  Files under(this, string dir);           // every path starts at dir, and none leaves it
   Files mounted(Mount[] mounts);           // each path to the longest mount that prefixes it
 }
 
@@ -336,7 +337,13 @@ to the mount that owns it. A rename across two mounts is `Other`, as a rename ac
 
 `[§wac-std-relative-files-c3n9vka]` `relativeTo(dir)` gives the same files with a relative path starting at `dir`, as a
 shell's current directory does. `.` and `..` are taken out before a path reaches the files beneath, `..` at the root
-stays there, and an absolute path is left alone.
+stays there, and an absolute path is left alone. It is not a boundary: whatever holds it reaches the files beneath by an
+absolute path.
+
+`[§wac-std-under-files-r8t2mqd]` `under(dir)` gives the files under `dir` and nothing else: a path, absolute or relative,
+is taken from `dir`, and `..` stops there, so `/etc/passwd` is `dir/etc/passwd`. It is composed, never a host grant, so a
+child handed it — alone or as a `Mount` — is served by its parent. A mount table takes `.` and `..` out of an absolute
+path before it chooses a mount, so no path climbs out of the mount it names.
 
 `[§wac-std-memory-store-p4k7wzn]` A `MemoryStore` is one tree in the program's memory, and `asUser(user)` is a `Files`
 acting as one person on it: what it creates is theirs — a file `0644`, a directory `0755` — and each operation is checked

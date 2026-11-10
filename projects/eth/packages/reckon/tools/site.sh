@@ -24,7 +24,7 @@ if [ "${1:-}" = --record ]; then
   mkdir -p "$work"
   cd "$root"
   shift 2
-  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten conformance}
+  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten conformance discovery}
   for d in $demos; do
     echo "recording $d"
     case $d in

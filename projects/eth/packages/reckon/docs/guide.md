@@ -70,7 +70,10 @@ see promptly, the registry contract holds them on chain (docs/registry2.md), and
 
     wac claim.wasm publish MIRROR_DIR        # the local index and its blocks, added to what MIRROR_DIR holds
 
-Serve `MIRROR_DIR` with any web server. Others then read it with `--mirror http://…`. A mirror can withhold a claim
+Serve `MIRROR_DIR` with any web server (with `Access-Control-Allow-Origin: *` if pages are to read it;
+`tools/serve.py` does). Others then read it with `--mirror http://HOST[/PATH]`. To be found, list it in a manifest
+(`claim manifest reckon-mirrors.json --lists URL`), and a client follows that with
+`claim mirrors https://…/reckon-mirrors.json` (docs/discovery.md). A mirror can withhold a claim
 but can't forge one: every signature is checked, and anything that fails is left out and reported.
 
 ## 5. Decide
@@ -156,6 +159,7 @@ signer counts for nothing.
 | `claim admit SUBJECT ROLE --policy F [anchor and chain flags]` | the decision, and why (docs/admit.md) |
 | `claim run SUBJECT ROLE --policy F […] [--out PATH] [-- ARGS…]` | admit, fetch, check and run it in the machine, or write it out |
 | `claim publish DIR` | the local index into a mirror |
+| `claim mirrors URL` · `claim manifest OUT [--lists URL]… [--follow URL]…` | find mirrors from a manifest; write one (docs/discovery.md) |
 | `deps pin` · `check` · `fetch [--git]` · `cids` · `admit ROLE --policy F` | `wac.lock` pinned by CID (docs/lock.md) |
 | `name resolve NAME --rpc … [--anchor H]` | an ENS name's contenthash, by proof (devnet) |
 | `lc --trusted ROOT --fork F --bootstrap FILE … --now SLOT` | the light client, from a checkpoint to an execution block, an ENS name, a contenthash |

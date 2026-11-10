@@ -62,6 +62,11 @@ DEMOS = {
                     "Each runner witnesses it as it witnesses anything; a policy that names the suite counts a runner's "
                     "word only once that runner has. A runner that never ran it, one that leaks its engine's NaNs, and "
                     "one with no floor are each left out, and admission says why."),
+    "discovery": ("Finding mirrors", "sh packages/reckon/tools/discovery.sh WORKDIR",
+                  "From one URL to every mirror: manifests are static JSON files, served with CORS, naming mirrors and "
+                  "further manifests. Two sites each carry one mirror and a manifest; following them finds both, and "
+                  "the decision needs both. A manifest leading to a lying mirror costs nothing but its forged "
+                  "statement, left out and named."),
     "demo": ("Two runners, one policy", "sh packages/reckon/tools/demo.sh WORKDIR",
              "The smallest whole loop, with no chain: one recipe on two engines, a reviewer's endorsements, a policy "
              "that needs both, and each kind of revocation."),
@@ -300,6 +305,9 @@ if left:
 write(os.path.join(out, "index.html"), index)
 shutil.copyfile(os.path.join(site, "style.css"), os.path.join(out, "style.css"))
 # Downloads (the extension, extension/release.sh): copied as they are, the zip, its manifest and its claims mirror.
+# The site's manifest (docs/discovery.md): the mirrors it carries, named relative to itself.
+if os.path.isfile(os.path.join(site, "reckon-mirrors.json")):
+    shutil.copyfile(os.path.join(site, "reckon-mirrors.json"), os.path.join(out, "reckon-mirrors.json"))
 if os.path.isdir(os.path.join(site, "downloads")):
     shutil.copytree(os.path.join(site, "downloads"), os.path.join(out, "downloads"))
 write(os.path.join(out, ".nojekyll"), "")

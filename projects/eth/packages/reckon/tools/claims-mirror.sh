@@ -3,14 +3,14 @@
 # into one mirror directory, a client with an empty store admits from it over HTTP, a tampered statement on the server
 # is left out and reported, and a revocation the first mirror lacks counts once a second mirror carries it.
 #
-#     sh packages/reckon/tools/claims-mirror.sh WORKDIR     (PORT defaults to 8780; the second mirror is PORT+1)
+#     sh packages/reckon/tools/claims-mirror.sh WORKDIR     (PORT defaults to 8780; the second mirror is PORT+1, the server above both PORT+2)
 #
 # Needs: wac on PATH, python3 and curl.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 root=$(cd "$here/../.." && pwd)
 work=$1; rm -rf "$work"; mkdir -p "$work"; work=$(cd "$work" && pwd)
-port=${PORT:-8780}; port2=$((port + 1))
+port=${PORT:-8780}; port2=$((port + 1)); port3=$((port + 2))
 for p in $port $port2; do
   if curl -s -m1 -o /dev/null "http://127.0.0.1:$p/" 2>/dev/null; then echo "claims-mirror: port $p is taken; set PORT" >&2; exit 2; fi
 done
@@ -49,7 +49,7 @@ expect ok "alice again: nothing changes" "2 statement(s)" -- $CL publish mirror 
 
 step "a client with an empty store, and the mirror over HTTP"
 ( cd mirror && exec python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) & srv=$!
-trap 'kill $srv ${srv2:-} 2>/dev/null || true' EXIT INT TERM
+trap 'kill $srv ${srv2:-} ${srv3:-} 2>/dev/null || true' EXIT INT TERM
 until curl -s -m1 -o /dev/null "http://127.0.0.1:$port/"; do sleep 0.2; done
 expect refused "nothing local, no mirror: refused" "endorsed by nobody" -- admit --store client
 expect ok "with the mirror: both endorsements, admitted" "ADMITTED" -- admit --store client --mirror "http://127.0.0.1:$port"
@@ -72,7 +72,12 @@ expect ok "bob publishes his revocation to the second mirror" "3 statement(s)" -
 until curl -s -m1 -o /dev/null "http://127.0.0.1:$port2/"; do sleep 0.2; done
 expect ok "from the first mirror alone, which lacks it: admitted" "ADMITTED" -- admit --store client3 --mirror "http://127.0.0.1:$port"
 expect refused "with the second as well: refused" "endorsed by alice (need 2)" -- admit --store client3 --mirror "http://127.0.0.1:$port" --mirror "http://127.0.0.1:$port2"
-expect refused "a mirror URL with a path is refused, not guessed at" "with no path" -- admit --store client3 --mirror "http://127.0.0.1:$port/claims"
+
+step "a mirror below a path, as a static site publishes one"
+( exec python3 -m http.server "$port3" --bind 127.0.0.1 >/dev/null 2>&1 ) & srv3=$!
+until curl -s -m1 -o /dev/null "http://127.0.0.1:$port3/"; do sleep 0.2; done
+expect ok "the first mirror, read at /mirror on a server whose root is above it: admitted" "ADMITTED" -- admit --store client4 --mirror "http://127.0.0.1:$port3/mirror"
+expect refused "a path with no mirror there: nothing found, refused" "endorsed by nobody" -- admit --store client5 --mirror "http://127.0.0.1:$port3/nowhere"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

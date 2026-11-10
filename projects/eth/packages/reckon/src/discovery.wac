@@ -1,0 +1,212 @@
+// Finding mirrors (docs/discovery.md). A manifest is a static JSON file naming mirrors and further manifests:
+//
+//     { "format": "reckon-mirrors/1",
+//       "mirrors": ["https://example.org/reckon/mirror", "../other/mirror"],
+//       "manifests": ["https://friend.example/reckon-mirrors.json"] }
+//
+// A mirror is a URL as `--mirror` takes it: a store directory (`claims/index`, `ipfs/CID`) published at that URL's
+// path, or a trustless gateway. Relative entries are resolved against the manifest's own URL, so a static site can
+// name the mirror it carries without knowing where it is hosted. Fields other than these three are ignored, so the
+// format can grow.
+//
+// **Discovery is availability only.** Whatever a manifest names is just one more place to look. Every block it leads
+// to is re-hashed and every statement's signature checked, exactly as for a mirror given by hand. A lying manifest
+// can name mirrors that withhold or serve garbage, which costs time, never a wrong decision. So the walk is bounded:
+// manifests are followed breadth-first, each fetched once, up to a limit of manifests and of mirrors, and every
+// failure is reported, not fatal.
+
+import { Result } from "core";
+import { json.parseJson5, json.JsonValue } from "wac";
+import { http.get, fetch.fetch, fetch.Caps } from "wac";
+
+export string MANIFEST_FORMAT() { return "reckon-mirrors/1"; }
+
+/** What one manifest says, its relative entries resolved against `url`. */
+export struct Manifest {
+  string[] mirrors;
+  string[] manifests;
+}
+
+/** Everything a walk found, in the order it found it, and what went wrong on the way. */
+export struct Discovered {
+  string[] mirrors;
+  string[] problems;
+  i32 manifests;
+}
+
+string[] plus(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+bool has(string[] xs, string x) {
+  for (i32 i = 0; i < xs.len(); i++) { if (xs[i] == x) { return true; } }
+  return false;
+}
+
+bool absolute(string u) { return u.indexOf("http://") == 0 || u.indexOf("https://") == 0; }
+
+/** `scheme://host[:port]` of an absolute URL. */
+string originOf(string u) {
+  i32 from = u.indexOf("://") + 3;
+  string rest = u.slice(from, u.len());
+  i32 slash = rest.indexOf("/");
+  return slash < 0 ? u : u.slice(0, from + slash);
+}
+
+/** `ref` against the URL `base` (a file's URL: its directory is what a relative path starts from). */
+export string resolveUrl(string base, string ref) {
+  if (absolute(ref)) { return ref; }
+  if (ref.indexOf("/") == 0) { return originOf(base) + ref; }
+  string origin = originOf(base);
+  string path = base.slice(origin.len(), base.len());
+  i32 q = path.indexOf("?");
+  if (q >= 0) { path = path.slice(0, q); }
+  string[] parts = string[]();
+  // The base's directory: its path up to the last `/`.
+  string[] baseParts = splitSlash(path);
+  for (i32 i = 0; i + 1 < baseParts.len(); i++) { if (baseParts[i] != "") { parts = plus(parts, baseParts[i]); } }
+  string[] refParts = splitSlash(ref);
+  for (i32 i = 0; i < refParts.len(); i++) {
+    string p = refParts[i];
+    if (p == "" || p == ".") { continue; }
+    if (p == "..") {
+      string[] up = string[]();
+      for (i32 j = 0; j + 1 < parts.len(); j++) { up = plus(up, parts[j]); }
+      parts = up;
+      continue;
+    }
+    parts = plus(parts, p);
+  }
+  string out = origin;
+  for (i32 i = 0; i < parts.len(); i++) { out += "/" + parts[i]; }
+  return out;
+}
+
+string[] splitSlash(string s) {
+  string[] out = string[]();
+  string rest = s;
+  while (true) {
+    i32 at = rest.indexOf("/");
+    if (at < 0) { return plus(out, rest); }
+    out = plus(out, rest.slice(0, at));
+    rest = rest.slice(at + 1, rest.len());
+  }
+  return out;
+}
+
+string[] texts(JsonValue? v) {
+  if (v is null || v!.array() is null) { return string[](); }
+  string[] out = string[]();
+  for (i32 i = 0; i < v!.array()!.len(); i++) {
+    string? t = v!.array()!.get(i).text();
+    if (t is not null && t! != "") { out = plus(out, t!); }
+  }
+  return out;
+}
+
+/** A manifest's text, read as `reckon-mirrors/1`, its entries resolved against `url`. */
+export Result<Manifest, string> readManifest(u8[] text, string url) {
+  JsonValue doc;
+  match (parseJson5(text)) {
+    Err(e): { return Result.Err("not JSON: \{e.text()}"); }
+    Ok(v): { doc = v; }
+  }
+  string format = doc.member("format")?.text() ?? "";
+  if (format != MANIFEST_FORMAT()) { return Result.Err("format is \"\{format}\", not \"\{MANIFEST_FORMAT()}\""); }
+  string[] ms = texts(doc.member("mirrors"));
+  string[] fs = texts(doc.member("manifests"));
+  string[] mirrors = string[]();
+  string[] manifests = string[]();
+  for (i32 i = 0; i < ms.len(); i++) { mirrors = plus(mirrors, resolveUrl(url, ms[i])); }
+  for (i32 i = 0; i < fs.len(); i++) { manifests = plus(manifests, resolveUrl(url, fs[i])); }
+  return Result.Ok(Manifest(mirrors, manifests));
+}
+
+/** A manifest as text, in the order given. */
+export string writeManifest(string[] mirrors, string[] manifests) {
+  string out = "{\n  \"format\": \"\{MANIFEST_FORMAT()}\",\n  \"mirrors\": [";
+  for (i32 i = 0; i < mirrors.len(); i++) { out += (i > 0 ? ", " : "") + quoted(mirrors[i]); }
+  out += "],\n  \"manifests\": [";
+  for (i32 i = 0; i < manifests.len(); i++) { out += (i > 0 ? ", " : "") + quoted(manifests[i]); }
+  return out + "]\n}\n";
+}
+
+string quoted(string s) {
+  u8[] b = s.toBytes();
+  string out = "\"";
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '"' || b[i] == '\\') { out += "\\"; }
+    u8[] one = u8[].filled(1, b[i]);
+    out += string.fromBytes(one);
+  }
+  return out + "\"";
+}
+
+/** GET `url`: `http://` directly (as `Store.http` does, so a local server is not sent through a proxy), `https://` through wac's fetch. */
+Result<u8[], string> getUrl(Caps caps, string url) {
+  if (url.indexOf("https://") == 0) {
+    match (fetch(caps, "GET", url, string[](), u8[]())) {
+      Err(e): { return Result.Err(e); }
+      Ok(res): { return res.status == 200 ? Result.Ok(res.body) : Result.Err("HTTP \{res.status}"); }
+    }
+  }
+  if (url.indexOf("http://") != 0) { return Result.Err("not an http:// or https:// URL"); }
+  string rest = url.slice(7, url.len());
+  i32 slash = rest.indexOf("/");
+  string hp = slash < 0 ? rest : rest.slice(0, slash);
+  string path = slash < 0 ? "/" : rest.slice(slash, rest.len());
+  i32 port = 80;
+  i32 colon = hp.indexOf(":");
+  if (colon >= 0) {
+    port = 0;
+    u8[] d = hp.slice(colon + 1, hp.len()).toBytes();
+    for (i32 k = 0; k < d.len(); k++) {
+      if (d[k] < 48 || d[k] > 57 || port > 65535) { return Result.Err("the port is not a number"); }
+      port = port * 10 + (d[k] as i32) - 48;
+    }
+    hp = hp.slice(0, colon);
+  }
+  match (get(caps.net, hp, port, path)) {
+    Err(e): { return Result.Err(e); }
+    Ok(res): { return res.status == 200 ? Result.Ok(res.body) : Result.Err("HTTP \{res.status}"); }
+  }
+}
+
+/**
+ * The mirrors reachable from the manifest at `url`: breadth-first, each manifest fetched once, at most `maxManifests`
+ * manifests and `maxMirrors` mirrors. Nothing found here is trusted; it is only where else to look.
+ */
+export Discovered discover(Caps caps, string url, i32 maxManifests, i32 maxMirrors) {
+  Discovered d = Discovered(string[](), string[](), 0);
+  string[] queue = [url];
+  string[] seen = [url];
+  i32 at = 0;
+  while (at < queue.len()) {
+    string u = queue[at];
+    at++;
+    if (d.manifests >= maxManifests) { d.problems = plus(d.problems, "\{u}: not fetched, past the limit of \{maxManifests} manifests"); continue; }
+    d.manifests++;
+    u8[] text;
+    match (getUrl(caps, u)) {
+      Err(e): { d.problems = plus(d.problems, "\{u}: \{e}"); continue; }
+      Ok(b): { text = b; }
+    }
+    match (readManifest(text, u)) {
+      Err(e): { d.problems = plus(d.problems, "\{u}: \{e}"); }
+      Ok(m): {
+        for (i32 i = 0; i < m.mirrors.len(); i++) {
+          if (has(d.mirrors, m.mirrors[i])) { continue; }
+          if (d.mirrors.len() >= maxMirrors) { d.problems = plus(d.problems, "\{m.mirrors[i]}: left out, past the limit of \{maxMirrors} mirrors"); continue; }
+          d.mirrors = plus(d.mirrors, m.mirrors[i]);
+        }
+        for (i32 i = 0; i < m.manifests.len(); i++) {
+          if (!has(seen, m.manifests[i])) { seen = plus(seen, m.manifests[i]); queue = plus(queue, m.manifests[i]); }
+        }
+      }
+    }
+  }
+  return d;
+}

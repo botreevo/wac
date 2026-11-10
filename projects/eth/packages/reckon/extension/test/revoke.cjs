@@ -38,7 +38,15 @@ const ok = (c, what) => { if (c) { pass++; console.log(`ok    ${what}`); } else 
   console.log('   | banner: ' + a.asof);
   ok(/^ADMITTED$/m.test(a.account) && /0 revocation\(s\)/.test(a.account) && a.shown, 'admitted and shown: the registry read by proof, no revocation set');
   ok(/^Admitted as of execution block \d+/.test(a.asof) && a.fresh === 'fresh', `the page says what it is as of, and that it is fresh: "${a.asof.slice(0, 60)}…"`);
+  await page.waitForFunction(() => /^re-checked .*still admitted/m.test(document.getElementById('account').textContent), null, { timeout: 30000 })
+    .then(() => ok(true, 'an open app is admitted again by itself (every 3 s here), and stays'), () => ok(false, 'no re-check while open'));
   execSync(revoke, { stdio: 'ignore' });
+  // Expiry while open: no click; the next re-admission proves the revocation and takes the app down.
+  const down = await page.waitForFunction(() => /no longer admitted, so it has been taken down/.test(document.getElementById('account').textContent)
+    && !document.getElementById('app').classList.contains('shown'), null, { timeout: 30000 }).then(() => true, () => false);
+  const auto = await page.evaluate(() => ({ account: document.getElementById('account').textContent, asof: document.getElementById('asof').textContent }));
+  ok(down && /endorsed by nobody/.test(auto.account), 'after the revocation, the open app is taken down by its next re-admission, with no click');
+  ok(/^Decided as of/.test(auto.asof) && block(auto.asof) > block(a.asof), `…its banner now the refusal's, as of block ${block(auto.asof)}`);
   const b = await open(appCid);
   console.log('   | ' + b.account.split('\n').filter((l) => /^chain:|^as of|endorsed|ADMITTED|REFUSED/.test(l)).join('\n   | '));
   console.log('   | banner: ' + b.asof);

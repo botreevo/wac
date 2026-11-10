@@ -3,7 +3,8 @@
 # the next open, and the page says what the decision is as of. On a wacuum devnet with the registry v2: a reviewed app
 # is admitted in the extension, the registry's revocations proved at the node's block (a devnet has no beacon chain,
 # so no light client: the settings name no checkpoint); then the endorser revokes the endorsement on chain, and the
-# same app opened again is refused, the revocation proved, as of a later block. See revoke.cjs.
+# open app is taken down by its next re-admission (every 3 s here), and opened again is refused, the revocation
+# proved, as of a later block. See revoke.cjs.
 #
 #     WAC_SRC=/path/to/wac sh packages/reckon/extension/test/revoke.sh WORKDIR    (PORT defaults to 8910, and 3 more)
 #
@@ -50,7 +51,7 @@ until curl -s -m1 -o /dev/null "http://127.0.0.1:$mport/" && curl -s -m1 -o /dev
 
 policy="{ signers: { endorser: \"$($wallet address keys/endorser)\" }, roles: { app: [{ endorsed: { by: [\"endorser\"], at_least: 1 } }] } }"
 cat > settings.json <<JSON
-{ "rpc": "127.0.0.1:$proxy", "registry": "$registry", "codeHash": "$codehash", "mirrors": "http://127.0.0.1:$mport",
+{ "rpc": "127.0.0.1:$proxy", "registry": "$registry", "codeHash": "$codehash", "mirrors": "http://127.0.0.1:$mport", "recheck": "3",
   "policy": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$policy") }
 JSON
 printf '#!/bin/sh\nRPC=%s %s revoke %s %s %s\n' "$RPC" "$wallet" "$work/keys/endorser" "$registry" "$statement" > revoke-now.sh

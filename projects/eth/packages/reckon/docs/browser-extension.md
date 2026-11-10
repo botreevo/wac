@@ -122,7 +122,10 @@ what the user installed, and its build can itself be a derivation, so it can be 
      as of block 4, the banner fresh; the endorser revokes on chain; the next open proves the revocation, refuses and
      takes the app down, as of block 6. On recorded mainnet (`admit.sh`, 12 of 12) the banner says beacon slot
      15621760 and marks it 10 hours old.
-   - **Not yet:** a decision does not expire while an app stays open; it is checked again at the next open.
+   - **Expiry while open:** an open app is admitted again every `recheck` seconds (a setting; 600 by default; 0 only
+     at open). If it is refused it is taken down, saying so. If its name now admits another tree, that tree is shown
+     in its place, saying so. The banner's age is kept live. In `revoke.sh` (8 of 8), with re-checks every 3 s, the
+     open app is taken down by itself after the revocation lands, with no click.
 5. **Hardening. Done (2026-11-10), but for the JavaScript.**
    - **The extension is a derived output, admitted by its own policy.** `cmd/assemble.wac` puts it together inside
      the machine, from three slots: `pages` (its own files), `glue` (wac's browser glue) and `module` (`web.wac`'s

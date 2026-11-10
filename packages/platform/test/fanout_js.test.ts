@@ -78,6 +78,7 @@ async void one(Sys sys, Socket sock) {
         match (r) {
           End: { sock.close(); return; }
           Data(b): { got += string.fromBytes(b); }
+          Failed(why): { sock.close(); return; }
         }
       }
     }

@@ -1,8 +1,8 @@
 # reckon
 
 **Attested derivations**: every result named by its hash, statements about how each was produced and whether it is
-acceptable, and a policy you own that reckons with both. [Design 0016](../design/system/0016-code-pinned-by-hash-and-trusted-by-attestation.md)
-is where it started; this directory is the experiment that built that design end to end. It was the wac-trust
+acceptable, and a policy you own that reckons with both. [Design 0016](../../design/system/0016-code-pinned-by-hash-and-trusted-by-attestation.md)
+is where it started; this package is the experiment that built that design end to end. It was the wac-trust
 repository until 2026-11-10, and its history came with it.
 
 **The code is the experiment, and the design has moved past it.** What it calls a build statement is one special case of
@@ -128,11 +128,11 @@ From wac-eth's root, with `wac` built and `sh tools/deps.sh` run as its README s
 
 ```sh
 wac task reckon:test                         # 23 unit tests
-wac task reckon:build                        # reckon/dist/reckon.wasm
-sh reckon/tools/agree.sh ../wac              # one tree hashed three ways, on any git repository
-(cd reckon/tools/oracle && npm install)      # ethers, js-sha3, solc: the oracles and the wallet
-(cd wacuum && wac build --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum)
-TOOLCHAIN=kt1:… sh reckon/tools/e2e.sh /tmp/e2e   # the whole run on a devnet; needs a clean commit
+wac task reckon:build                        # packages/reckon/dist/reckon.wasm
+sh packages/reckon/tools/agree.sh ../wac              # one tree hashed three ways, on any git repository
+(cd packages/reckon/tools/oracle && npm install)      # ethers, js-sha3, solc: the oracles and the wallet
+(cd packages/wacuum && wac build --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum)
+TOOLCHAIN=kt1:… sh packages/reckon/tools/e2e.sh /tmp/e2e   # the whole run on a devnet; needs a clean commit
 ```
 
 `mpt`, `ethrpc` and wacuum's secp256k1 come from `@/lib.wac`, and the devnet the end-to-end run uses is the wacuum beside

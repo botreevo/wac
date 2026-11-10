@@ -44,8 +44,8 @@ in about twenty minutes on the Node host (an hour and a half on wasmtime).
 
 ## Running it
 
-wacuum is part of [wac-eth](../README.md), with one wac pin for the whole repository: build the `wac` command
-and fill the package cache as the root README says. Then, from `wacuum/`:
+wacuum is part of [wac-eth](../../README.md), with one wac pin for the whole repository: build the `wac` command
+and fill the package cache as the root README says. Then, from `packages/wacuum/`:
 
 ```bash
 wac test test         # the unit tests, in about a second (or `wac task wacuum:test` from the root)

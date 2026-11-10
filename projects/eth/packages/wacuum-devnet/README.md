@@ -76,8 +76,8 @@ from before the snapshot, from its block, and says that its status, fee and logs
 
 ## Building
 
-The devnet is part of [wac-eth](../README.md), with one wac pin for the whole repository: build the `wac` command
-and fill the package cache as the root README says. Then, from `wacuum-devnet/`:
+The devnet is part of [wac-eth](../../README.md), with one wac pin for the whole repository: build the `wac` command
+and fill the package cache as the root README says. Then, from `packages/wacuum-devnet/`:
 
     wac test test      # the unit tests, in a second: pages, RPC, the faucet and its limits, against a real engine
     mkdir -p dist && wac app --allow-read --allow-write --allow-net cmd/devnet.wac -o dist/devnet
@@ -123,6 +123,6 @@ match; a follower that does it by itself is still to be written. Both are wacuum
 
 ## Dependencies
 
-wacuum is beside this in wac-eth, imported by path (`@/wacuum/src/lib.wac`), so the devnet always runs the
+wacuum is beside this in wac-eth, imported by path (`@/packages/wacuum/src/lib.wac`), so the devnet always runs the
 wacuum in the same commit. wac and **web** (components and `documentOf`) are pinned once, in wac-eth's root
 `wac.lock`; one pin means the JSON the engine answers with and the JSON this code reads are one type.

@@ -37,15 +37,15 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
 
 ## Building and testing here
 
-    sh ../tools/deps.sh  # the wac the root wac.lock pins, into the package cache with git — once, and after it moves
+    sh ../../tools/deps.sh # the wac the root wac.lock pins, into the package cache with git — once, and after it moves
     wac test test        # the unit tests, in about a second
     wac task vectors     # regenerate the U256 cases (needs node)
     wac task fixtures    # execution-spec-tests v5.4.0 into fixtures/
     wac task statetests  # every Cancun state test, about a minute
     wac task blocktests  # every Cancun blockchain test, about a minute; add Prague as an argument to the scripts
 
-- `wac update` could not reach the network in the container this was started in. `sh ../tools/use-local-wac.sh
-  <wac clone>` fills the package cache from a clone instead. The tasks below still run from `wacuum/`.
+- `wac update` could not reach the network in the container this was started in. `sh ../../tools/use-local-wac.sh
+  <wac clone>` fills the package cache from a clone instead. The tasks below still run from `packages/wacuum/`.
 - `wac check src` checks the sources; it also walks into the parts of wac they reach.
 
 ## Against other clients

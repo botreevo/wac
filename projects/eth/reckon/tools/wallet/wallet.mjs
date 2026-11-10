@@ -1,5 +1,5 @@
 // The writing side, with an ordinary Ethereum wallet (ethers), because that is what a publisher, a signer or a
-// deny-list keeper would use: wac-trust only reads and verifies. Every command takes the key from a file.
+// deny-list keeper would use: reckon only reads and verifies. Every command takes the key from a file.
 //
 //   node wallet.mjs deploy  KEYFILE                       → prints the registry's address
 //   node wallet.mjs fund    KEYFILE ADDRESS ETHER

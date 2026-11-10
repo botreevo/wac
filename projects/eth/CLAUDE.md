@@ -10,6 +10,8 @@ Read README.md first. This is what it does not say.
 - **What comes from wac comes through `"wac"`** — `crypto`, `bls`, `json`, `codec`, `bytes`, `http`, `wactest`.
   A name wac's `lib.wac` does not export is a change to wac's `lib.wac`, made there; do not copy the file here.
 - **What is ours comes by path**, or through `@/lib.wac` for the namespaces (`rlp`, `mpt`, `ethrpc`, …).
+- **One exception: `reckon/examples/`** holds example apps that are projects of their own on purpose — a build
+  statement covers a source tree with its own pinned dependencies — and `wac.json5` excludes them from `wac check`.
 - **wacuum and the devnet keep their own `CLAUDE.md`**, written when each was a repository; the parts about pins
   and dependencies are updated, the rest still holds.
 - **wac is unstable by choice, and so is this**: when nothing needs a thing, delete it (wac's `CLAUDE.md` has the

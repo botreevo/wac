@@ -2,14 +2,17 @@
 # The whole of design/system/0016, end to end, on a wacuum devnet: build, rebuild, sign, publish, name, run —
 # and then every attack the design says it stops, each checked to be stopped for the reason it claims.
 #
-#     sh tools/e2e.sh WORKDIR        (WACUUM: a wacuum.wasm built from wac-eth, which serves eth_getProof)
+#     sh reckon/tools/e2e.sh WORKDIR       (from anywhere; WACUUM defaults to wacuum/dist/wacuum.wasm, TOOLCHAIN to
+#                                          WORKDIR/toolchain: the kt1 of the wac tree the `wac` on PATH was built from)
 #
 # Needs: wac on PATH, node with tools/oracle's packages installed, git, curl, python3.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 work=$1; mkdir -p "$work"; work=$(cd "$work" && pwd)
-wacuum=${WACUUM:?set WACUUM to a wacuum.wasm built from wac-eth}
-W="wac $here/dist/wactrust.wasm"
+root=$(git -C "$here" rev-parse --show-toplevel)
+wacuum=${WACUUM:-$root/wacuum/dist/wacuum.wasm}
+[ -f "$wacuum" ] || { echo "e2e: build wacuum first: (cd wacuum && wac build --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum)" >&2; exit 2; }
+W="wac $here/dist/reckon.wasm"
 wallet="node $here/tools/wallet/wallet.mjs"
 keys=$work/keys; stmts=$work/stmts; mirror=$work/mirror; evil=$work/mirror-evil
 mkdir -p "$keys" "$stmts" "$mirror" "$evil"
@@ -42,14 +45,15 @@ set -- $($wallet deploy "$keys/dev"); registry=$1; codehash=$2
 echo "registry $registry, runtime code $codehash"
 
 step "build from a clean commit, and two independent rebuilds from a fresh clone"
-cd "$here"
-toolchain=$(cat "$work/toolchain" 2>/dev/null || $W tree --git "$here/../g/wac" 993f14741)
+cd "$root"
+toolchain=${TOOLCHAIN:-$(cat "$work/toolchain" 2>/dev/null || true)}
+[ -n "$toolchain" ] || { echo "e2e: set TOOLCHAIN, or write it to $work/toolchain" >&2; exit 2; }
 echo "$toolchain" > "$work/toolchain"
 commit=$(git rev-parse HEAD)
-$W build --dir examples/hello --path hello.wasm --toolchain "$toolchain" --key "$keys/publisher" --out "$stmts/hello.pub.json" -- wac build hello.wac -o hello
-$W build --dir examples/notes --path dist/index.html --toolchain "$toolchain" --key "$keys/publisher" --out "$stmts/notes.pub.json" \
+$W build --dir reckon/examples/hello --path hello.wasm --toolchain "$toolchain" --key "$keys/publisher" --out "$stmts/hello.pub.json" -- wac build hello.wac -o hello
+$W build --dir reckon/examples/notes --path dist/index.html --toolchain "$toolchain" --key "$keys/publisher" --out "$stmts/notes.pub.json" \
   -- wac run --allow-read --allow-write --allow-run build.wac src/app.wac dist --title notes
-rm -rf "$work/clone"; git clone -q "$here" "$work/clone"
+rm -rf "$work/clone"; git clone -q "$root" "$work/clone"
 for app in hello notes; do for r in rebuilder1 rebuilder2; do
   WAC_HOME=${WAC_HOME:-$HOME/.wac} $W rebuild "$stmts/$app.pub.json" --git "$work/clone" "$commit" --toolchain "$toolchain" --key "$keys/$r" --out "$stmts/$app.$r.json"
 done; done
@@ -60,7 +64,7 @@ notes=$(sed -n 's/.*"output":"\(kb1:[0-9a-f]*\)".*/\1/p' "$stmts/notes.pub.json"
 echo "hello $hello"; echo "notes $notes"
 
 step "publish to a mirror; name both apps on chain, each change to wait 20 s"
-$W publish "$mirror" --blob examples/hello/hello.wasm --blob examples/notes/dist/index.html $(for f in "$stmts"/*.json; do printf -- '--statement %s ' "$f"; done)
+$W publish "$mirror" --blob reckon/examples/hello/hello.wasm --blob reckon/examples/notes/dist/index.html $(for f in "$stmts"/*.json; do printf -- '--statement %s ' "$f"; done)
 $wallet claim "$keys/publisher" "$registry" hello "$hello" 20
 $wallet claim "$keys/publisher" "$registry" notes "$notes" 20
 cat > "$work/trust.json5" <<POLICY
@@ -83,11 +87,11 @@ step "1. the command-line app: resolved, decided, fetched, hash-checked, run hol
 expect ok "run hello" "hello from a verified module, world" -- $W run "hello@$pub" $P --mirror "$mirror" -- world
 step "2. the web app: the same, and the checked bytes written out to open from file://"
 expect ok "run notes" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
-cmp "$work/notes-verified/index.html" examples/notes/dist/index.html && echo "   the page written is the page built"
+cmp "$work/notes-verified/index.html" reckon/examples/notes/dist/index.html && echo "   the page written is the page built"
 
 step "3. a mirror serving other bytes is ignored when another has the right ones, and refused when it is the only one"
 mkdir -p "$evil/blobs"; cp -r "$mirror/statements" "$evil/"
-h=${hello#kb1:}; cp examples/notes/dist/index.html "$evil/blobs/$h"
+h=${hello#kb1:}; cp reckon/examples/notes/dist/index.html "$evil/blobs/$h"
 expect ok "evil mirror first, honest second" "hello from a verified module" -- $W run "hello@$pub" $P --mirror "$evil" --mirror "$mirror"
 expect refused "evil mirror only" "do not hash to" -- $W run "hello@$pub" $P --mirror "$evil"
 step "   ...and the same mirror over HTTP"
@@ -102,8 +106,8 @@ PY
 expect refused "verify a forged statement" "as it claims" -- $W verify "$work/forged.json"
 
 step "5. a stranger's statements count for nothing"
-$W build --dir examples/hello --path hello.wasm --toolchain "$toolchain" --key "$keys/thief" --out "$work/thief.json" -- wac build hello.wac -o hello >/dev/null 2>&1
-$W publish "$work/mirror-thief" --blob examples/hello/hello.wasm --statement "$work/thief.json" --statement "$stmts/hello.rebuilder1.json" --statement "$stmts/source.review.json" >/dev/null
+$W build --dir reckon/examples/hello --path hello.wasm --toolchain "$toolchain" --key "$keys/thief" --out "$work/thief.json" -- wac build hello.wac -o hello >/dev/null 2>&1
+$W publish "$work/mirror-thief" --blob reckon/examples/hello/hello.wasm --statement "$work/thief.json" --statement "$stmts/hello.rebuilder1.json" --statement "$stmts/source.review.json" >/dev/null
 expect refused "one rebuilder and a stranger" "built by rebuilder1 (need 2)" -- $W run "$hello" $P --mirror "$work/mirror-thief"
 
 step "6. a rebuilder revokes: the quorum is gone"
@@ -125,7 +129,7 @@ $wallet deny "$keys/denylist" "$registry" "$notes" off
 expect ok "taken off the list again" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
 
 step "9. the publisher's key is stolen and the name pointed at other code"
-cp examples/hello/hello.wasm "$work/evil.wasm"; printf 'evil' >> "$work/evil.wasm"
+cp reckon/examples/hello/hello.wasm "$work/evil.wasm"; printf 'evil' >> "$work/evil.wasm"
 evilid=$($W blob "$work/evil.wasm"); $W publish "$mirror" --blob "$work/evil.wasm" >/dev/null
 $wallet propose "$keys/publisher" "$registry" notes "$evilid"
 expect ok "during the delay the old page is still what notes means" "not followed yet" -- $W run "notes@$pub" $P --mirror "$mirror" --out "$work/notes-verified"
@@ -145,7 +149,7 @@ sed "s/$codehash/0x$(printf 'ab%.0s' $(seq 32))/" "$work/trust.json5" > "$work/t
 expect refused "a code hash that is not the registry's" "runs other code" -- $W check "$notes" --policy "$work/trust-code.json5" --mirror "$mirror"
 
 step "13. a dependency: wac-web's tree, as notes' lock pins it, reviewed"
-web=$(sed -n 's/.*"web": {[^}]*"tree": "\(kt1:[0-9a-f]*\)".*/\1/p' examples/notes/wac.lock)
+web=$(sed -n 's/.*"web": {[^}]*"tree": "\(kt1:[0-9a-f]*\)".*/\1/p' reckon/examples/notes/wac.lock)
 expect refused "unreviewed dependency" "reviewed by nobody" -- $W check "$web" $P --purpose dependency --mirror "$mirror"
 $W review "$web" "the page library" --key "$keys/reviewer" --out "$stmts/web.review.json" >/dev/null
 $W publish "$mirror" --statement "$stmts/web.review.json" >/dev/null

@@ -1,7 +1,7 @@
 // The EIP-712 vectors in test/statement_test.wac, from ethers rather than from the code under test:
 // the digest, the address of key 0x11…11, and its signature (RFC 6979, so wac's must be byte-identical).
 import { Wallet, TypedDataEncoder } from 'ethers';
-const domain = { name: 'wac-trust', version: '1' };
+const domain = { name: 'reckon', version: '1' };
 const types = {
   Built: [ { name: 'source', type: 'bytes32' }, { name: 'dir', type: 'string' }, { name: 'command', type: 'string[]' },
            { name: 'path', type: 'string' }, { name: 'toolchain', type: 'bytes32' }, { name: 'output', type: 'bytes32' } ],

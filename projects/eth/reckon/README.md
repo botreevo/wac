@@ -1,23 +1,34 @@
-# wac-trust
+# reckon
 
-Code pinned by hash, trusted by attestation: [wac design/system/0016](https://git.voltrevo.com/wac.git), built
-out as an experiment to see what holds up. The short version of that design: **a hash names bytes, and whatever serves
-those bytes is trusted only for serving them.** Whether bytes with a given hash should be installed or run is a separate
-question. It is answered by a policy you write, over statements other people sign, some of which are recorded on an
-Ethereum chain and read only through storage proofs.
+**Attested derivations**: every result named by its hash, statements about how each was produced and whether it is
+acceptable, and a policy you own that reckons with both. [Design 0016](../design/system/0016-code-pinned-by-hash-and-trusted-by-attestation.md)
+is where it started; this directory is the experiment that built that design end to end. It was the wac-trust
+repository until 2026-11-10, and its history came with it.
+
+**The code is the experiment, and the design has moved past it.** What it calls a build statement is one special case of
+a *derivation*: a *machine* (a fixed rule, such as a deterministic WebAssembly profile) applied to one input tree gives one
+output tree, and the program is just one object in the input. Objects are to be IPFS CIDs under the `unixfs-v1-2025`
+profile (hidden files included, no symlinks, no permissions) rather than the `kt1`/`kb1` Keccak trees here, and a recipe
+names its machine and object format so both can change. The explainer, *Attested derivations*, has the model and its
+terms; the code below is what was measured.
+
+The short version that still holds: **a hash names bytes, and whatever serves those bytes is trusted only for serving
+them.** Whether bytes with a given hash should be installed or run is a separate question, answered by a policy you
+write over statements other people sign, some of them recorded on an Ethereum chain and read only through storage
+proofs.
 
 Everything here is wac except three things: the registry contract (Solidity), the wallet that writes to it (ethers,
 because publishers and signers use ordinary wallets), and the JavaScript oracles the tests are checked against.
 
 ```
-wactrust tree DIR | tree --git REPO COMMIT [SUBDIR] | blob FILE      kt1 / kb1 ids
-wactrust lock pin | lock check | lock fetch NAME [--from URL]        wac.lock pinned by content
-wactrust build … -- COMMAND  |  rebuild STATEMENT --git REPO COMMIT  signed build statements, checked by rebuilding
-wactrust review ID SCOPE --key F  |  verify STATEMENT…               reviews; signature checks
-wactrust publish MIRROR --blob F --statement S…                      a mirror: a directory or anything served over HTTP
-wactrust check ID --policy P --mirror M… [--purpose app|dependency]  may this be used, and why
-wactrust resolve NAME@0xPUBLISHER --policy P                         what a name points at, proved
-wactrust run NAME@0xPUBLISHER|kb1:… --policy P --mirror M… [-- ARGS] resolve → decide → fetch → hash → run
+reckon tree DIR | tree --git REPO COMMIT [SUBDIR] | blob FILE      kt1 / kb1 ids
+reckon lock pin | lock check | lock fetch NAME [--from URL]        wac.lock pinned by content
+reckon build … -- COMMAND  |  rebuild STATEMENT --git REPO COMMIT  signed build statements, checked by rebuilding
+reckon review ID SCOPE --key F  |  verify STATEMENT…               reviews; signature checks
+reckon publish MIRROR --blob F --statement S…                      a mirror: a directory or anything served over HTTP
+reckon check ID --policy P --mirror M… [--purpose app|dependency]  may this be used, and why
+reckon resolve NAME@0xPUBLISHER --policy P                         what a name points at, proved
+reckon run NAME@0xPUBLISHER|kb1:… --policy P --mirror M… [-- ARGS] resolve → decide → fetch → hash → run
 ```
 
 ## What was built, and what it showed
@@ -27,7 +38,7 @@ wactrust run NAME@0xPUBLISHER|kb1:… --policy P --mirror M… [-- ARGS] resolve
 1. Two apps are built from a clean commit: a command-line module, and wac-web's template as one `index.html`.
 2. Two independent rebuilders reproduce both byte for byte from a fresh clone, and a reviewer reviews the source.
 3. Everything is published to a mirror, and both apps are named on chain with a 20-second change delay.
-4. `wactrust run hello@0x…` resolves the name, gathers statements, proves the revocation and deny-list slots, and
+4. `reckon run hello@0x…` resolves the name, gathers statements, proves the revocation and deny-list slots, and
    decides. It then fetches the bytes and checks their hash, and only then spawns the module **holding no authority at
    all**. For the page, it writes the checked bytes out to open from `file://`; the page works there
    (`docs/notes-verified.png`).
@@ -68,7 +79,7 @@ publisher's build had only passed because an ignored `dist/` was already on disk
 
 In the order I would act on them.
 
-1. **wac compiles from a tampered cache without noticing.** `wactrust lock check` refuses a cache entry with one byte
+1. **wac compiles from a tampered cache without noticing.** `reckon lock check` refuses a cache entry with one byte
    changed. `wac check` and `wac build` happily compile it. wac reads a `wac.lock` carrying `tree` and ignores the field.
    The check belongs inside wac's fetcher and resolver (0016 H2), and `wac update` presumably drops the field when it
    rewrites the lock; I did not test that.
@@ -104,8 +115,8 @@ In the order I would act on them.
 ## What it does not do
 
 - **The light client is not wired in** (finding 2).
-- **wac's own fetch and build do not enforce pins** (finding 1); `wactrust lock check` runs beside them.
-- **Stock browsers are not protected.** The page path is `wactrust run` writing checked bytes to open from `file://`.
+- **wac's own fetch and build do not enforce pins** (finding 1); `reckon lock check` runs beside them.
+- **Stock browsers are not protected.** The page path is `reckon run` writing checked bytes to open from `file://`.
   A loader page and an extension (0016 H9 options 2 and 3) are not built.
 - **Reproduction was measured on two hosts (Node, wasmtime) on one machine**, not on several machines or the V8 host.
 - **Signing in wac is for tests and the demo only.** wacuum's secp256k1 says it is not constant-time. Real signers use
@@ -113,17 +124,21 @@ In the order I would act on them.
 
 ## Running it
 
+From wac-eth's root, with `wac` built and `sh tools/deps.sh` run as its README says:
+
 ```sh
-sh tools/deps.sh                 # the locked wac and wacuum commits into wac's cache, with git
-wac test test                    # 23 unit tests
-wac build --allow-read --allow-write --allow-run --allow-net --allow-env cmd/wactrust.wac -o dist/wactrust
-sh tools/agree.sh ../wac         # one tree, three ways
-(cd tools/oracle && npm install) # ethers, js-sha3, solc: the oracles and the wallet
-sh tools/e2e.sh /tmp/e2e         # needs a wacuum.wasm built from wac-eth (WACUUM=…)
+wac task reckon:test                         # 23 unit tests
+wac task reckon:build                        # reckon/dist/reckon.wasm
+sh reckon/tools/agree.sh ../wac              # one tree hashed three ways, on any git repository
+(cd reckon/tools/oracle && npm install)      # ethers, js-sha3, solc: the oracles and the wallet
+(cd wacuum && wac build --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum)
+TOOLCHAIN=kt1:… sh reckon/tools/e2e.sh /tmp/e2e   # the whole run on a devnet; needs a clean commit
 ```
 
-Dependencies: [wac-eth](https://git.voltrevo.com/wac-eth.git) for `mpt`, `ethrpc` and wacuum's secp256k1 (and wacuum
-itself, which serves `eth_getProof` there), and wac at the commit wac-eth pins, so there is one copy of it.
+`mpt`, `ethrpc` and wacuum's secp256k1 come from `@/lib.wac`, and the devnet the end-to-end run uses is the wacuum beside
+this. The example apps under `examples/` are projects of their own on purpose: a build statement covers a source tree
+with its own pinned dependencies. `docs/report.html`, `docs/e2e-run.txt` and `docs/wacc-cases/` are records of runs made
+under the old name, and keep it.
 
 | | |
 | --- | --- |

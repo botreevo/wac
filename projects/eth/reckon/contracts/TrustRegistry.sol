@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-/// Names, revocations and deny lists for wac-trust (design/system/0016 H6-H8).
+/// Names, revocations and deny lists for reckon (design/system/0016 H6-H8).
 ///
 /// Everything a client checks is a storage slot, so that its absence can be proved with an
 /// eth_getProof against a state root: the client reads slots, never calls functions and never

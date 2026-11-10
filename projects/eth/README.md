@@ -12,6 +12,7 @@ client, and a devnet with its explorer, on one pin of wac.
 | `packages/ssz`, `packages/lightclient` | the beacon chain's layouts, and the sync-committee light client |
 | [`wacuum/`](wacuum/README.md) | an execution client: every execution-spec-tests fixture through Osaka, devp2p, sync, the Engine API |
 | [`wacuum-devnet/`](wacuum-devnet/README.md) | a devnet, its block explorer and its faucet, as one program; wacuum.voltrevo.com |
+| [`reckon/`](reckon/README.md) | attested derivations: objects pinned by hash, signed statements about how they were made and whether to use them, and a policy over both; the experiment behind design 0016 |
 | [`design/`](design/README.md) | where this is going: [0003](design/system/0003-an-ethereum-centric-reference-distribution.md), the distribution it converges on, and [0016](design/system/0016-code-pinned-by-hash-and-trusted-by-attestation.md), code pinned by hash |
 
 **Why one repository.** Until 2026-11-09 the packages lived in wac, and wacuum and the devnet in repositories of
@@ -29,7 +30,7 @@ Build the `wac` command from the commit `wac.lock` pins (a clone of wac, then `.
 without `--host` for the native one), put it on PATH, then here:
 
     sh tools/deps.sh        # the locked wac and web into wac's package cache, with git
-    wac task test           # every unit test: the seven packages, the client, the devnet
+    wac task test           # every unit test: the seven packages, reckon, the client, the devnet
     wac task check          # every file the manifest covers
 
 `sh tools/use-local-wac.sh <a clone of wac>` fills the cache from a clone instead, without a network. Each

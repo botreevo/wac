@@ -86,9 +86,9 @@ mkdir -p "$work/unzipped" && rm -rf "$work/unzipped"/* && (cd "$work/unzipped" &
 rm -rf "$downloads/claims" && $CL publish "$downloads/claims" $st > /dev/null
 origins=$($CL origins "$derived" $st)
 recipe=$(printf '%s\n' "$origins" | sed -n '1s/^recipe \([a-z0-9]*\) .*/\1/p')
-python3 - "$downloads/reckon-extension-$ext.json" <<PY
-import json, sys
-origins = """$origins""".strip().splitlines()
+ORIGINS="$origins" python3 - "$downloads/reckon-extension-$ext.json" <<PY
+import json, os, sys
+origins = os.environ["ORIGINS"].strip().splitlines()
 json.dump({
   "name": "reckon extension (Manifest V3)",
   "extension": "$ext",

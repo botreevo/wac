@@ -10,6 +10,9 @@ import * as raw from 'multiformats/codecs/raw'
 import { sha256 } from 'multiformats/hashes/sha2'
 import * as dagCbor from '@ipld/dag-cbor'
 import { CarWriter } from '@ipld/car/writer'
+import { murmur3128 } from '@multiformats/murmur3'
+import { UnixFS } from 'ipfs-unixfs'
+import * as dagPb from '@ipld/dag-pb'
 import fs from 'node:fs'
 
 const content = (n, seed) => { const b = new Uint8Array(n); let s = seed >>> 0 || 1; for (let i = 0; i < n; i++) { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; b[i] = s & 255 } return b }
@@ -56,6 +59,41 @@ out.trees.push({ ...tree2, chunk: 1048576, width: 1024, shard: 1 << 20, cid: awa
   const size = kept.get(root.toString()).length
   out.shardProbe = { size, atSize: await addTree(many, [], small(1048576, 1024, size)), belowSize: await addTree(many, [], small(1048576, 1024, size - 1)) }
 }
+// HAMT-sharded directories. File sets are generated, so the vectors carry {prefix, count, seed, sizes} instead of every
+// file: name prefix + i (five digits), size i % sizes, content seed + i. Each case records the root's UnixFS type, so a
+// case meant to shard is known to have sharded.
+out.murmur = []
+for (const s of ['', 'a', 'hello', '0123456789abcde', '0123456789abcdef', '0123456789abcdefg', 'é/ü 名前', 'x'.repeat(100)]) {
+  const b = new TextEncoder().encode(s); out.murmur.push({ input: hex(b), hash: hex(await murmur3128.encode(b)) })
+}
+const gen = (g) => { const fs = []; for (let i = 0; i < g.count; i++) fs.push({ path: g.prefix + String(i).padStart(5, '0'), size: i % g.sizes, seed: g.seed + i }); return fs }
+async function addHamt (c, opts) {
+  const kept = new Map(); const bs = { put: async (cid, bytes) => { kept.set(cid.toString(), bytes); return cid }, get: async (cid) => kept.get(cid.toString()), has: async (cid) => kept.has(cid.toString()) }
+  const files = [...c.sets.flatMap(gen), ...c.files]
+  const entries = [...c.dirs.map(d => ({ path: 'root/' + d })), ...files.map(f => ({ path: 'root/' + f.path, content: content(f.size, f.seed) }))]
+  let root; for await (const e of importer(entries, bs, opts)) if (e.path === 'root') root = e.cid
+  const type = UnixFS.unmarshal(dagPb.decode(kept.get(root.toString())).Data).type
+  return { cid: root.toString(), rootType: type, blocks: kept.size }
+}
+out.hamt = []
+{
+  // Many levels: a 1 KiB threshold over 600 entries, so slots collide and sub-shards nest.
+  const c = { sets: [{ prefix: 'e', count: 600, seed: 1000, sizes: 3 }], files: [], dirs: [], shard: 1024 }
+  out.hamt.push({ name: 'deep', ...c, ...(await addHamt(c, small(1048576, 1024, c.shard))) })
+}
+{
+  // Nested: a sharded directory holding a sharded subdirectory, a plain one, an empty one, hidden and non-ASCII names.
+  const c = { sets: [{ prefix: 'top/f', count: 150, seed: 3000, sizes: 4 }, { prefix: 'top/sub/g', count: 90, seed: 4000, sizes: 2 }],
+              files: [{ path: 'top/.hidden', size: 5, seed: 9 }, { path: 'top/é-ü 名', size: 2, seed: 10 }, { path: 'small/a', size: 1, seed: 11 }],
+              dirs: ['top/empty'], shard: 2048 }
+  out.hamt.push({ name: 'nested', ...c, ...(await addHamt(c, small(1048576, 1024, c.shard))) })
+}
+{
+  // The profile itself: 4000 long names pass 256 KiB.
+  const c = { sets: [{ prefix: 'an-entry-with-a-rather-long-name-', count: 4000, seed: 6000, sizes: 2 }], files: [], dirs: [], shard: 262144 }
+  out.hamt.push({ name: 'profile', ...c, ...(await addHamt(c, profile)) })
+}
+
 // DAG-CBOR records
 const c0 = CID.parse(out.cids[2].text)
 const records = [

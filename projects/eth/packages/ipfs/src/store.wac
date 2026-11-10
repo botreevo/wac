@@ -12,10 +12,11 @@ import { Files, Procs, ChildEnv, Launch, Net } from "std";
 import { http.get, http.Incoming } from "wac";
 import { Result, flatten } from "core";
 import { Cid, parseCid, RAW, DAG_PB } from "./cid.wac";
-import { Link } from "./dagpb.wac";
-import { Params, Built, Block, Node, readNode } from "./unixfs.wac";
+import { Params, Built, Block, Node, readNode, slotLabel } from "./unixfs.wac";
+import { hamtByte } from "./murmur3.wac";
 import { FileIn, buildTree } from "./tree.wac";
 import { readCar } from "./car.wac";
+import { Link, pushLink } from "./dagpb.wac";
 import { Out } from "./bytes.wac";
 
 export struct Store {
@@ -141,6 +142,7 @@ Result<bool, string> fileInto(Resolver r, Cid c, Out o, i32 depth) {
   Node n = try readNode(c, b);
   match (n) {
     Dir(_): { return Result.Err("\{c.text()} is a directory, where a file was expected"); }
+    Shard(_, _): { return Result.Err("\{c.text()} is a directory, where a file was expected"); }
     File(size, parts, inline): {
       i32 before = o.n;
       o.all(inline);
@@ -151,35 +153,102 @@ Result<bool, string> fileInto(Resolver r, Cid c, Out o, i32 depth) {
   }
 }
 
+/**
+ * A directory's entries by name, sorted bytewise, whether it is a plain node or a HAMT. A HAMT is read strictly: each
+ * shard's bitfield must name exactly the slots its links use, every sub-shard must be a shard, and every entry must sit
+ * in the slot its name hashes to at that depth, so a shard that hides, misplaces or duplicates an entry is refused
+ * rather than listed differently from how any other reader would list it.
+ */
+export Result<Link[], string> entriesOf(Resolver r, Cid c) {
+  u8[] b = try r.block(c);
+  Node n = try readNode(c, b);
+  match (n) {
+    File(_, _, _): { return Result.Err("\{c.text()} is a file, where a directory was expected"); }
+    Dir(entries): { return Result.Ok(entries); }
+    Shard(links, bits): {
+      Link[] out = try shardInto(r, c, links, bits, 0, Link[]());
+      return Result.Ok(sortLinks(out));
+    }
+  }
+}
+
+/** The entries under one shard at `depth`, appended to `acc`. */
+Result<Link[], string> shardInto(Resolver r, Cid at, Link[] links, u8[] bits, i32 depth, Link[] acc) {
+  Link[] out = acc;
+  if (depth >= 64) { return Result.Err("a HAMT deeper than 64 levels"); }
+  bool[] seen = bool[].filled(256, false);
+  for (i32 i = 0; i < links.len(); i++) {
+    string name = links[i].name;
+    if (name.len() < 2) { return Result.Err("a HAMT link named \"\{name}\" in \{at.text()}"); }
+    i32 slot = -1;
+    for (i32 s = 0; s < 256; s++) { if (slotLabel(s) == name.slice(0, 2)) { slot = s; } }
+    if (slot < 0) { return Result.Err("a HAMT link whose label \"\{name.slice(0, 2)}\" is not a slot, in \{at.text()}"); }
+    if (seen[slot]) { return Result.Err("slot \{name.slice(0, 2)} used twice in \{at.text()}"); }
+    seen[slot] = true;
+    if (name.len() == 2) {
+      u8[] sb = try r.block(links[i].cid);
+      Node sn = try readNode(links[i].cid, sb);
+      match (sn) {
+        Shard(sub, subBits): { out = try shardInto(r, links[i].cid, sub, subBits, depth + 1, out); }
+        File(_, _, _): { return Result.Err("slot \{name} of \{at.text()} names a file, where a sub-shard belongs"); }
+        Dir(_): { return Result.Err("slot \{name} of \{at.text()} names a directory, where a sub-shard belongs"); }
+      }
+    } else {
+      string entry = name.slice(2, name.len());
+      if (hamtByte(entry.toBytes(), depth) != slot) { return Result.Err("\{entry} is in slot \{name.slice(0, 2)} of \{at.text()}, and its hash puts it elsewhere"); }
+      out = pushLink(out, Link(links[i].cid, entry, links[i].tsize));
+    }
+  }
+  for (i32 s = 0; s < 256; s++) {
+    i32 byte = bits.len() - 1 - s / 8;
+    bool set = byte >= 0 && (((bits[byte] as i32) >> (s % 8)) & 1) == 1;
+    if (set != seen[s]) { return Result.Err("the bitfield of \{at.text()} does not match its links at slot \{slotLabel(s)}"); }
+  }
+  if (bits.len() > 32 || (bits.len() > 0 && bits[0] == 0)) { return Result.Err("the bitfield of \{at.text()} is not minimal"); }
+  return Result.Ok(out);
+}
+
+Link[] sortLinks(Link[] xs) {
+  Link[] out = xs;
+  for (i32 i = 1; i < out.len(); i++) {
+    Link e = out[i];
+    i32 j = i;
+    while (j > 0 && compareNames(out[j - 1].name, e.name) > 0) { out[j] = out[j - 1]; j--; }
+    out[j] = e;
+  }
+  return out;
+}
+
+i32 compareNames(string a, string b) {
+  u8[] x = a.toBytes();
+  u8[] y = b.toBytes();
+  for (i32 i = 0; i < x.len() && i < y.len(); i++) { if (x[i] != y[i]) { return (x[i] as i32) - (y[i] as i32); } }
+  return x.len() - y.len();
+}
+
 /** Every file in a tree, with its path; an empty directory as its path ending in `/`. */
 export Result<FileIn[], string> readTree(Resolver r, Cid c) { return treeOf(r, c, "", 0); }
 
 Result<FileIn[], string> treeOf(Resolver r, Cid c, string prefix, i32 depth) {
   if (depth > 64) { return Result.Err("a tree nested past 64 levels"); }
-  u8[] b = try r.block(c);
-  Node n = try readNode(c, b);
-  match (n) {
-    File(_, _, _): { return Result.Err("\{c.text()} is a file, where a directory was expected"); }
-    Dir(entries): {
-      if (entries.len() == 0 && prefix != "") { return Result.Ok([FileIn(prefix, u8[]())]); }
-      FileIn[] out = FileIn[]();
-      for (i32 i = 0; i < entries.len(); i++) {
-        Link e = entries[i];
-        string path = prefix == "" ? e.name : prefix + e.name;
-        u8[] eb = try r.block(e.cid);
-        Node en = try readNode(e.cid, eb);
-        bool isDir = match (en) { Dir(_): true, File(_, _, _): false };
-        if (isDir) {
-          FileIn[] sub = try treeOf(r, e.cid, path + "/", depth + 1);
-          out = joinFiles(out, sub);
-        } else {
-          u8[] bytes = try readFile(r, e.cid);
-          out = joinFiles(out, [FileIn(path, bytes)]);
-        }
-      }
-      return Result.Ok(out);
+  Link[] entries = try entriesOf(r, c);
+  if (entries.len() == 0 && prefix != "") { return Result.Ok([FileIn(prefix, u8[]())]); }
+  FileIn[] out = FileIn[]();
+  for (i32 i = 0; i < entries.len(); i++) {
+    Link e = entries[i];
+    string path = prefix == "" ? e.name : prefix + e.name;
+    u8[] eb = try r.block(e.cid);
+    Node en = try readNode(e.cid, eb);
+    bool isDir = match (en) { Dir(_): true, Shard(_, _): true, File(_, _, _): false };
+    if (isDir) {
+      FileIn[] sub = try treeOf(r, e.cid, path + "/", depth + 1);
+      out = joinFiles(out, sub);
+    } else {
+      u8[] bytes = try readFile(r, e.cid);
+      out = joinFiles(out, [FileIn(path, bytes)]);
     }
   }
+  return Result.Ok(out);
 }
 
 FileIn[] joinFiles(FileIn[] a, FileIn[] b) {
@@ -335,7 +404,7 @@ export Result<Block[], string> blocksOf(Resolver r, Cid c) {
   Block[] out = [Block(c, b)];
   if (c.codec == RAW()) { return Result.Ok(out); }
   Node n = try readNode(c, b);
-  Link[] links = match (n) { File(_, parts, _): parts, Dir(entries): entries };
+  Link[] links = match (n) { File(_, parts, _): parts, Dir(entries): entries, Shard(ls, _): ls };
   for (i32 i = 0; i < links.len(); i++) {
     Block[] sub = try blocksOf(r, links[i].cid);
     Block[] next = Block[].filled(out.len() + sub.len(), out[0]);

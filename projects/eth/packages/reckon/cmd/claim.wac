@@ -1,0 +1,141 @@
+// claim — statements about objects, the index that holds them, and admission over both.
+//
+//     claim address --key F                       the address a key signs as
+//     claim endorse SUBJECT SCOPE --key F          sign an endorsement
+//     claim reject SUBJECT REASON --key F          sign a rejection (your list)
+//     claim revoke STATEMENT --key F               sign a revocation of a statement you signed (by its id)
+//     claim slots RECIPE                           a recipe's input slots: name and CID
+//     claim origins CID                            the derivations claiming to produce it
+//     claim dependents CID                         outputs of recipes that take it as an input
+//     claim admit CID ROLE --policy F              may it be used in that role, and why
+//
+// --store DIR (default .objects), --mirror DIR (repeatable). A signed statement goes into the store and into the
+// store's index (`claims/index`), which is reloaded — every signature checked again — on each use.
+
+import { Sys } from "std";
+import { Result } from "core";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.Block, ipfs.DAG_CBOR } from "@/lib.wac";
+import { Statement, Signed, signStatement, signedBlock, addressOfKey, recipeFrom, statementId } from "../src/claims.wac";
+import { Index, Held, loadIndex, saveIndex } from "../src/graph.wac";
+import { slotsOf } from "../src/slots.wac";
+import { Chain, Decision, admit } from "../src/admit.wac";
+import { readPolicyFile } from "../src/policyfile.wac";
+import { unhex, hex } from "../src/statement.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 1) { sys.warn("usage: claim address|endorse|reject|revoke|slots|origins|dependents|admit … (see the source)"); return 2; }
+  Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
+  Store[] mirrors = Store[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != "--mirror") { continue; }
+    Store[] next = Store[].filled(mirrors.len() + 1, Store.dir(sys.files(), a[i + 1]));
+    for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
+    mirrors = next;
+  }
+  Resolver r = Resolver(store, mirrors);
+  string cmd = a[0];
+
+  if (cmd == "address") {
+    u8[]? key = await keyOf(sys, a);
+    if (key is null) { return 1; }
+    sys.log("0x" + hex(addressOfKey(key!)));
+    return 0;
+  }
+  if ((cmd == "endorse" || cmd == "reject") && a.len() >= 3 || cmd == "revoke" && a.len() >= 2) {
+    Cid subject;
+    match (parseCid(a[1])) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(c): { subject = c; } }
+    u8[]? key = await keyOf(sys, a);
+    if (key is null) { return 1; }
+    Statement s = cmd == "endorse" ? Statement.Endorsement(subject, a[2])
+                : cmd == "reject" ? Statement.Rejection(subject, a[2]) : Statement.Revocation(subject);
+    return record(sys, store, signStatement(s, key!));
+  }
+
+  Index ix = loadIndex(store).index;
+  if (a.len() < 2) { sys.warn("claim: \{cmd} needs a CID"); return 2; }
+  Cid c;
+  match (parseCid(a[1])) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(x): { c = x; } }
+  if (cmd == "slots") {
+    match (r.block(c)) {
+      Err(e): { sys.warn("claim: \{e}"); return 1; }
+      Ok(b): {
+        match (recipeFrom(b)) {
+          Err(e): { sys.warn("claim: \{e}"); return 1; }
+          Ok(rec): {
+            match (slotsOf(r, rec.input)) {
+              Err(e): { sys.warn("claim: \{e}"); return 1; }
+              Ok(ss): { for (i32 i = 0; i < ss.len(); i++) { sys.log("\{ss[i].name} \{ss[i].cid.text()}"); } return 0; }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (cmd == "origins") {
+    Held[] hs = ix.origins(c);
+    for (i32 i = 0; i < hs.len(); i++) {
+      match (hs[i].statement) {
+        Derivation(rid, _, runner): { sys.log("recipe \{rid.text()} by 0x\{hex(hs[i].signer)} on \"\{runner}\""); }
+        default: { }
+      }
+    }
+    return 0;
+  }
+  if (cmd == "dependents") {
+    Cid[] ds = ix.dependents(r, c);
+    for (i32 i = 0; i < ds.len(); i++) { sys.log(ds[i].text()); }
+    return 0;
+  }
+  if (cmd == "admit" && a.len() >= 3) {
+    string path = flag(a, "--policy", "");
+    u8[] text;
+    match (await sys.readFile(path)) { Err(e): { sys.warn("claim: \{path}: \{e}"); return 1; } Ok(b): { text = b; } }
+    match (readPolicyFile(text)) {
+      Err(e): { sys.warn("claim: \{e}"); return 1; }
+      Ok(p): {
+        Decision d = admit(p, ix, r, Chain.none(), c, a[2]);
+        for (i32 i = 0; i < d.why.len(); i++) { sys.log(d.why[i]); }
+        sys.log(d.ok ? "ADMITTED" : "REFUSED");
+        return d.ok ? 0 : 4;
+      }
+    }
+  }
+  sys.warn("claim: unknown command \{cmd}");
+  return 2;
+}
+
+async u8[]? keyOf(Sys sys, string[] a) {
+  string path = flag(a, "--key", "");
+  match (await sys.readFile(path)) {
+    Err(e): { sys.warn("claim: --key \{path}: \{e}"); return null; }
+    Ok(b): {
+      u8[]? k = unhex(trimmed(string.fromBytes(b)));
+      if (k is null || k!.len() != 32) { sys.warn("claim: \{path} is not a 32-byte hex key"); return null; }
+      return k;
+    }
+  }
+}
+
+string trimmed(string s) {
+  i32 from = 0;
+  i32 to = s.len();
+  while (from < to && (s.slice(from, from + 1) == " " || s.slice(from, from + 1) == "\n")) { from++; }
+  while (to > from && (s.slice(to - 1, to) == " " || s.slice(to - 1, to) == "\n")) { to--; }
+  return s.slice(from, to);
+}
+
+/** Keep a signed statement: its block in the store, and it in the store's index. Prints the statement's id, which a revocation names. */
+i32 record(Sys sys, Store store, Signed s) {
+  Index ix = loadIndex(store).index;
+  match (ix.add(s)) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(_): { } }
+  match (saveIndex(ix, store)) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(_): { } }
+  sys.warn("claim: signed block \{Cid.of(DAG_CBOR(), signedBlock(s)).text()}");
+  sys.log(statementId(s.statement).text());
+  return 0;
+}

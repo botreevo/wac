@@ -44,6 +44,7 @@ not wired into wac's own fetch and build: that waits until the design settles.
 | `src/admit.wac` | admission: a policy of trust roots and per-role rules, applied recursively over the derivation graph, with revocations and rejection lists |
 | `src/machine.wac`, `src/world.wac`, `cmd/derive.wac` | the deterministic WebAssembly machine and a runner for it; `docs/runner.md` has what V8 and wasmtime agree on, and the two places they do not |
 | `packages/lightclient`, `packages/ssz` | the light client past Altair, to Fulu and Gloas: per-fork types, execution headers, a fork-aware store, checked against Ethereum's vectors (see its README) |
+| `cmd/claim.wac`, `src/policyfile.wac`, `tools/demo.sh` | sign endorsements, rejections and revocations; query origins and dependents; admit under a JSON5 policy. The demo (8 checks): one recipe run on V8 and on wasmtime gives one output, both runners sign, a reviewer endorses the inputs, and the output is admitted only with both witnesses and every endorsement, and refused again when either is revoked |
 | registry v2 | revocations by (signer, statement CID), rejection lists and delayed names, read by proof — in progress |
 
 ## The first round: what was built, and what it showed

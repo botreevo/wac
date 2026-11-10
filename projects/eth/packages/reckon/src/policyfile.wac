@@ -1,0 +1,118 @@
+// An admission policy as a JSON5 file: what `admit.wac`'s `Policy` holds, in a form a person writes.
+//
+//     {
+//       signers: { v8: "0x…", wasmtime: "0x…", reviewer: "0x…" },    // names the rules use, for addresses
+//       roots: ["bafy…"],                                             // objects trusted as they are
+//       machines: ["wasm-gc/wac-host/0"],
+//       formats: ["unixfs-v1-2025+hidden"],
+//       reject_lists: ["0x…"],                                        // whose rejections to follow
+//       roles: {
+//         app: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2,
+//                            slots: { program: "program" }, other: "input" } }],
+//         program: [{ endorsed: { by: ["reviewer"], at_least: 1 } }],
+//         input: ["root", { endorsed: { by: ["reviewer"], at_least: 1 } }],
+//       },
+//     }
+//
+// A role's list is alternatives: the first that holds admits. `analysis: { analyser, slot, path, expect, by,
+// at_least }` is the fourth kind. Anything unrecognised is an error rather than ignored: a rule silently dropped is
+// a policy weaker than the one written.
+
+import { json.parseJson5, json.JsonValue, json.JsonObject } from "wac";
+import { ipfs.Cid, ipfs.parseCid } from "@/lib.wac";
+import { Result } from "core";
+import { Policy, Named, Rule, RoleRules, SlotRole } from "./admit.wac";
+import { unhex } from "./statement.wac";
+
+string[] texts(JsonValue? v) {
+  if (v is null || v!.array() is null) { return string[](); }
+  string[] out = string[].defaulted(v!.array()!.len());
+  for (i32 i = 0; i < out.len(); i++) { out[i] = v!.array()!.get(i).text() ?? ""; }
+  return out;
+}
+
+i32 count(JsonValue? v, i32 fallback) {
+  f64? n = v?.number();
+  return n is null ? fallback : n! as~ i32;
+}
+
+Result<u8[], string> address(string what, string text) {
+  u8[]? a = unhex(text);
+  if (a is null || a!.len() != 20) { return Result.Err("\{what} is not a 20-byte address: \{text}"); }
+  return Result.Ok(a!);
+}
+
+Result<Cid[], string> cids(JsonValue? v) {
+  string[] ts = texts(v);
+  Cid[] out = Cid[]();
+  for (i32 i = 0; i < ts.len(); i++) {
+    Cid c = try parseCid(ts[i]);
+    Cid[] next = Cid[].filled(out.len() + 1, c);
+    for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+    out = next;
+  }
+  return Result.Ok(out);
+}
+
+Result<Rule, string> ruleOf(string role, JsonValue v) {
+  string? word = v.text();
+  if (word is not null) {
+    if (word! == "root") { return Result.Ok(Rule.Root); }
+    return Result.Err("role \{role}: unknown rule \"\{word!}\"");
+  }
+  JsonValue? e = v.member("endorsed");
+  if (e is not null) { return Result.Ok(Rule.Endorsed(texts(e!.member("by")), count(e!.member("at_least"), 1))); }
+  JsonValue? d = v.member("derived");
+  if (d is not null) {
+    SlotRole[] slots = SlotRole[]();
+    JsonObject? so = d!.member("slots")?.object();
+    if (so is not null) {
+      slots = SlotRole[].filled(so!.len(), SlotRole("", ""));
+      for (i32 i = 0; i < so!.len(); i++) { slots[i] = SlotRole(so!.at(i).keyStr(), so!.at(i).value.text() ?? ""); }
+    }
+    return Result.Ok(Rule.Derived(texts(d!.member("by")), count(d!.member("at_least"), 1), count(d!.member("runners"), 1),
+                                  slots, d!.member("other")?.text() ?? ""));
+  }
+  JsonValue? a = v.member("analysis");
+  if (a is not null) {
+    Cid analyser = try parseCid(a!.member("analyser")?.text() ?? "");
+    return Result.Ok(Rule.Analysis(analyser, a!.member("slot")?.text() ?? "", a!.member("path")?.text() ?? "",
+                                   a!.member("expect")?.text() ?? "", texts(a!.member("by")), count(a!.member("at_least"), 1)));
+  }
+  return Result.Err("role \{role}: a rule must be \"root\", or have endorsed, derived or analysis");
+}
+
+export Result<Policy, string> readPolicyFile(u8[] text) {
+  JsonValue doc;
+  match (parseJson5(text)) {
+    Err(e): { return Result.Err("the policy: \{e.text()}"); }
+    Ok(v): { doc = v; }
+  }
+  Named[] signers = Named[]();
+  JsonObject? s = doc.member("signers")?.object();
+  if (s is not null) {
+    signers = Named[].filled(s!.len(), Named("", u8[]()));
+    for (i32 i = 0; i < s!.len(); i++) {
+      u8[] a = try address("signer \{s!.at(i).keyStr()}", s!.at(i).value.text() ?? "");
+      signers[i] = Named(s!.at(i).keyStr(), a);
+    }
+  }
+  string[] lists = texts(doc.member("reject_lists"));
+  u8[][] reject = u8[][].filled(lists.len(), u8[]());
+  for (i32 i = 0; i < lists.len(); i++) { reject[i] = try address("reject list", lists[i]); }
+  Cid[] roots = try cids(doc.member("roots"));
+  RoleRules[] roles = RoleRules[]();
+  JsonObject? ro = doc.member("roles")?.object();
+  if (ro is not null) {
+    roles = RoleRules[].filled(ro!.len(), RoleRules("", Rule[]()));
+    for (i32 i = 0; i < ro!.len(); i++) {
+      string role = ro!.at(i).keyStr();
+      JsonValue rv = ro!.at(i).value;
+      if (rv.array() is null) { return Result.Err("role \{role}: a list of rules is needed"); }
+      Rule[] rules = Rule[].filled(rv.array()!.len(), Rule.Root);
+      for (i32 j = 0; j < rules.len(); j++) { rules[j] = try ruleOf(role, rv.array()!.get(j)); }
+      roles[i] = RoleRules(role, rules);
+    }
+  }
+  return Result.Ok(Policy(signers, roots, texts(doc.member("machines")), texts(doc.member("formats")), reject, roles));
+}

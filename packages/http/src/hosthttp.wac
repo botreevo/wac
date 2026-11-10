@@ -1,0 +1,89 @@
+// HTTP by the host's `wac.http ^1` capability — the page's `fetch`, in a browser (`packages/platform/host/hosthttp.ts`).
+//
+// A page has no TCP, so `client.wac`'s `request` and `packages/fetch`'s `fetch` cannot open the socket they speak
+// HTTP over. Where the host provides HTTP itself they ask it instead, and everywhere else — every host but the
+// browser's, today — `hostHttpOf` answers null and they use sockets as before, so a program does not change.
+//
+// What comes back is what the host's HTTP exposes, which in a browser is not quite what the server sent: redirects
+// are followed (`url` says where the response came from), only the headers a page may read are there, and a request
+// the browser refuses — no route, or a cross-origin response without CORS headers, which a page is not told apart —
+// is `Err("network error or CORS refusal")`. Request headers a page may not set (`Host`, `Content-Length`, …) are
+// dropped by the host; the browser writes its own.
+import { Answer, Capability, FAULT_NONE, Net } from "std";
+import { Buf, Result, flatten } from "core";
+import { Headers } from "./headers.wac";
+
+/** `wac.http` on a `Net`'s host, as `capability` answered it: its requests are `cap.base` and the two after. */
+export struct HostHttp {
+  Net net;
+  Capability cap;
+}
+
+/**
+ * The host's HTTP, or null when it provides none — then the caller speaks HTTP over a socket itself. Asked once per
+ * call: the lookup is one round trip, and a library holding a `Net` has nowhere of its own to keep the answer.
+ */
+export HostHttp? hostHttpOf(Net net) {
+  auto found = flatten(net.capability("wac.http", "^1").wait());
+  if (found.isErr()) { return null; }
+  return HostHttp(net, found.unwrap());
+}
+
+/** A response the host's HTTP gave: the status, the URL it came from after any redirects, its headers and body. */
+export struct HostResponse {
+  i32 status;
+  string url;
+  Headers headers;
+  u8[] body;
+}
+
+/**
+ * `method` to `url` with `headers` (each `Name: value`) and `body`, sent whole, by the host; the whole response back.
+ * `Err` is the host's reason — `network error or CORS refusal` for a request the browser would not complete.
+ */
+export Result<HostResponse, string> hostRequest(HostHttp h, string method, string url, string[] headers, u8[] body) {
+  Buf req = Buf.create();
+  for (string line in headers) {
+    if (line.indexOf("\r") >= 0 || line.indexOf("\n") >= 0) { return Result.Err("a header field holds a line break"); }
+    if (line.indexOf(":") <= 0) { return Result.Err("a header field without a name: \{line}"); }
+    req.pushStr(line + "\r\n");
+  }
+  req.pushStr("\r\n");
+  req.pushAll(body);
+  auto opened = h.net.ask(h.cap.base, 0 as i64, 0 as i64, "\{method} \{url}", req.take()).wait();
+  if (opened.isErr()) { return Result.Err("wac.http: the request was not answered"); }
+  Answer a = opened.unwrap();
+  if (a.fault != FAULT_NONE()) { return Result.Err(a.text); }
+  i64 handle = a.n;
+  Buf got = Buf.create();
+  while (true) {
+    auto read = h.net.ask(h.cap.base + 1, handle, 0 as i64, "", u8[]()).wait();
+    if (read.isErr()) {
+      h.net.ask(h.cap.base + 2, handle, 0 as i64, "", u8[]());
+      return Result.Err("wac.http: a read of the body was not answered");
+    }
+    Answer r = read.unwrap();
+    if (r.fault != FAULT_NONE()) { return Result.Err(r.text); }
+    if ((r.flags & 1) != 0) { break; }
+    got.pushAll(r.bytes);
+  }
+  return Result.Ok(HostResponse(a.m as~ i32, a.text, headerLines(a.bytes), got.take()));
+}
+
+/** `Name: value\r\n` lines as `Headers`, in the order they came. */
+Headers headerLines(u8[] bytes) {
+  Headers out = Headers.create();
+  string all = string.fromBytes(bytes);
+  i32 from = 0;
+  while (from < all.len()) {
+    i32 end = all.slice(from, all.len()).indexOf("\r\n");
+    string line = end < 0 ? all.slice(from, all.len()) : all.slice(from, from + end);
+    from = end < 0 ? all.len() : from + end + 2;
+    i32 colon = line.indexOf(":");
+    if (colon <= 0) { continue; }
+    string value = line.slice(colon + 1, line.len());
+    while (value.len() > 0 && value.slice(0, 1) == " ") { value = value.slice(1, value.len()); }
+    out.push(line.slice(0, colon).toBytes(), value.toBytes());
+  }
+  return out;
+}

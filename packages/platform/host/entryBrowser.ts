@@ -14,9 +14,11 @@ import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import { browserWorld, type BrowserWorldOptions } from "./browser.ts";
 import { callMain, mainArgs, WacExit } from "./provider.ts";
+import { HOST_HTTP, type HostCapability } from "./hosthttp.ts";
 import type { AppModule } from "./entry.ts";
 
-type Start = { sab: SharedArrayBuffer; child?: boolean };
+/** `provides`: the capabilities the page answers by name (`hosthttp.ts`), which the worker's host offers. */
+type Start = { sab: SharedArrayBuffer; child?: boolean; provides?: HostCapability[] };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 /**
@@ -45,7 +47,8 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
       const b = bridgeOf(start.sab);
       try {
         const app = await load();
-        const code = callMain(b, app as unknown as Record<string, unknown>, mainArgs(b, app as unknown as Record<string, unknown>));
+        const asApp = app as unknown as Record<string, unknown>;
+        const code = callMain(b, asApp, mainArgs(b, asApp, start.provides ?? []));
         scope.postMessage({ ok: true, code });
       } catch (e) {
         if (e instanceof WacExit) { scope.postMessage({ ok: true, code: e.code }); return; }
@@ -104,7 +107,7 @@ export async function runInPage(opts: PageOptions): Promise<number> {
         e.preventDefault();
         reject(new Error(e.message));
       });
-      worker.postMessage({ sab: bridge.sab } as Start);
+      worker.postMessage({ sab: bridge.sab, provides: opts.http ? [HOST_HTTP] : [] } as Start);
     });
     return code;
   } finally {

@@ -717,6 +717,8 @@ async function produceApp(
           `    write: raw,\n` +
           `    root,\n` +
           `    writable: ${grants.write === true},\n` +
+          // **`--allow-net` is `wac.http`** in a page, which has no sockets: the capability is network access.
+          `    http: ${grants.net === true},\n` +
           `  });\n` +
           `  line("[exit " + code + "]", "meta");\n` +
           `} catch (e) {\n` +

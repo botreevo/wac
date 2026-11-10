@@ -1,0 +1,74 @@
+// `wac.http`, the client's side, on hosts with no browser.
+//
+// A parent serving the name to a child (`Procs.spawnProviding`) answers `capability` before any host does, so a
+// parent here plays the page: `packages/platform/example/hostget.wac`, run as its child, asks `packages/http`'s
+// client for two URLs, and the client — offered `wac.http` — sends them through it rather than a socket. That holds
+// the wire (open, read until the end flag, the header lines, the fault text) without Chromium; the page's own side is
+// `packages/platform/test/hosthttp.test.ts` and `hostget_live.test.ts`. And a native host offers no `wac.http`, so a
+// program there is unchanged: it speaks HTTP over sockets as before.
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath, scratch } from "../../../wactest/src/host.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { Answer, Authority, ChildEnv, Exec, Files, Launch, Procs, Provider, Sys, capability } from "std";
+import { Ticket, flatten } from "core";
+
+/** What has been read of each response so far: one piece of body, then the end. */
+struct Reads { i32 count; }
+
+/** A stand-in for the page's `fetch`: `/ok` answers 203 with a header and a three-byte body, `/refuse` is refused. */
+fn<Ticket<Answer>(i32, i64, i64, string, u8[])> pretendPage(Reads reads) {
+  return (i32 k, i64 a, i64 b, string text, u8[] bytes) => {
+    Ticket<Answer> t;
+    if (k == 0) {
+      if (contains(text, "/refuse")) {
+        t.resolve(Answer(16, "network error or CORS refusal", u8[](), 0 as i64, 0 as i64, 0));
+      } else if (!contains(text, "GET http://h:1/ok")) {
+        t.resolve(Answer(5, "asked for " + text, u8[](), 0 as i64, 0 as i64, 0));
+      } else {
+        t.resolve(Answer(0, "http://h:1/ok", "x-probe: from-parent\r\n".toBytes(), 1 as i64, 203 as i64, 0));
+      }
+    } else if (k == 1) {
+      reads.count = reads.count + 1;
+      if (reads.count == 1) { t.resolve(Answer(0, "", "abc".toBytes(), 0 as i64, 0 as i64, 0)); }
+      else { t.resolve(Answer(0, "", u8[](), 0 as i64, 0 as i64, 1)); }
+    } else {
+      t.resolve(Answer(0, "", u8[](), 0 as i64, 0 as i64, 0));
+    }
+    return t;
+  };
+}
+
+export async string test_the_client_asks_wac_http_when_the_host_provides_it(Sys sys) {
+  T t = T.create();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  string dir = scratch(sys.env(), "hosthttp");
+  fs.mkdir(dir, true).wait();
+  Exec built = flatten(procs.exec(binaryPath(sys.env()),
+                                  ["build", "--no-cache", "packages/platform/example/hostget.wac", "-o", dir + "/hostget"],
+                                  u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+  t.eqI32(built.status, 0, "the program builds: " + string.fromBytes(built.stderr));
+  u8[]? wasm = flatten(fs.readFile(dir + "/hostget.wasm").wait()).ok();
+  if (wasm is null) { return t.report(); }
+
+  Provider[] provides = [Provider("wac.http", "1.0.0", 3, pretendPage(Reads(0)))];
+  auto spawned = await procs.spawnProviding(wasm!, ["http://h:1/ok", "http://h:1/refuse"], Authority.none(), provides,
+                                            Launch.plain());
+  if (spawned.isErr()) { t.fail("the program did not start: \{spawned.err()!}"); return t.report(); }
+  auto child = spawned.ok()!;
+  string said = string.fromBytes((await child.output().readAll()).orElse(u8[]()));
+  string errs = string.fromBytes((await child.errors().readAll()).orElse(u8[]()));
+  t.eqI32((await child.exit()).orElse(0 - 1), 0, "it exits 0: " + errs);
+  t.isTrue(contains(said, "status 203 length 3 header from-parent\n"),
+           "the response came through wac.http, status, header and body:\n" + said);
+  t.isTrue(contains(said, "err h: network error or CORS refusal\n"), "the refusal is the host's words:\n" + said);
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+export async string test_a_native_host_offers_no_wac_http(Sys sys) {
+  T t = T.create();
+  auto found = await capability(sys.host, "wac.http", "^1");
+  t.isTrue(found.isErr(), "a native host answered wac.http, so the client would not use its sockets");
+  return t.report();
+}

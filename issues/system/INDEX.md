@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0451e](open/0451e-wac-update-reads-http-proxy-only-and-goes-direct-where-https-proxy-is-set.md) | `packages/git/src/transport.wac` asks for `HTTP_PROXY` and nothing else, so where only `HTTPS_PROXY` is set — every Claude cloud container — `wac update` connects to `git.voltrevo.com:443` directly, past the proxy that authenticates it, and the server answers 401 where `git` succeeds. `packages/fetch` already takes `HTTPS_PROXY` for an `https` URL and honours `NO_PROXY` | bug | `wac update` fails where `git` succeeds |
 | [0377w](open/0377w-keccak256-absorbs-a-byte-at-a-time.md) | `keccak256`'s `absorb` takes a byte at a time with a division, a remainder and a variable shift each, and costs as much as the permutation: lane-wide reads (wacuum's `keccak.wac`) make 32 bytes 498 ns against 942 | performance | 942 ns for 32 bytes |
 | [0376w](open/0376w-p256-verification-pays-for-constant-time-it-does-not-need.md) | `p256VerifyDigest` runs the constant-time `jacMul` twice — 512 doublings and 512 masked additions — for a verification whose inputs are all public; a variable-time joint wNAF (wacuum's `p256.wac`) is 0.44 ms against 7 | performance | 7 ms a verification |
 | [0375w](open/0375w-bls-fpinvert-is-three-times-slower-than-its-algorithm-needs.md) | `bls`'s `fpInvert` is the right algorithm at three times its cost: a fresh modulus array per wrapping subtraction, a call per limb, `u32` conversions. wacuum's `blsinv.wac` does the same in 18 µs against 56, and could replace it; and `g1AffineX` plus `g1AffineY` invert z twice | performance | 56 µs an inversion |
@@ -137,7 +138,7 @@ own roadmap lives in its README. This tracker is for what crosses those lines.
 
 ## Closed
 
-353 issues, 254 closed.
+354 issues, 254 closed.
 
 The count is checked against the directory by `tools/wac/issuecounts_test.wac`, which reads both
 trackers. It was `compiler/wacSpec.test.ts` until that file went with the TypeScript compiler on

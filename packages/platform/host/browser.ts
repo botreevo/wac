@@ -37,6 +37,7 @@ import { GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { randomBytes } from "./entropy.ts";
 import { joinPath } from "./child.ts";
 import { ByteQueue } from "./queue.ts";
+import { httpHandlers } from "./hosthttp.ts";
 import {
   type Child,
   failedChild,
@@ -109,6 +110,12 @@ export type DirHandle = {
 
 /** What the page gives the application. Everything is optional, and absent means denied. */
 export type BrowserWorldOptions = {
+  /**
+   * **`wac.http`, answered by `fetch`** (`hosthttp.ts`) — the page's own, or one a test hands in. Absent, the
+   * capability is not offered and its requests are refused, as on every other host; the launcher sets it when the
+   * build granted `--allow-net`.
+   */
+  http?: boolean | typeof fetch;
   /** Arguments the application sees. The launcher reads these from the query string. */
   /**
    * The program's arguments.
@@ -490,6 +497,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   };
 
   return {
+    // `wac.http`'s requests, when the page offers it — numbered from its own range, so nothing here collides.
+    ...(opts.http ? httpHandlers(typeof opts.http === "function" ? opts.http : undefined) : {}),
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
     [OP.MONOTONIC_NANOS]: () => i64le(BigInt(Math.round(performance.now() * 1e6))),
     // A timer, which is what makes a timeout expressible: waited on beside another ticket,

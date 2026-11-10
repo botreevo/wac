@@ -107,7 +107,8 @@ export const OP = {
   CALL: 65,
   UNLOAD: 66,
   VALIDATE: 67,
-  // A capability by name: none yet on this host; a parent serving a child answers its lookups itself.
+  // A capability by name: `wac.http` in a page that was granted the network (`hosthttp.ts`), none elsewhere; a parent
+  // serving a child answers its lookups itself.
   CAPABILITY: 68,
   /**
    * A file opened with `OPEN_FILE` how 3 (read anywhere) or 4 (read and write anywhere, created if absent and never

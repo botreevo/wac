@@ -34,7 +34,7 @@ wac-mono **0064**, now closed.
 | mainnet fork schedule and versions | **done** — `ssz/src/forks.wac` (Gloas unscheduled upstream) |
 | a fork-aware store (layout, gindices and fork version by fork) | **done** — `light_client_sync` for Capella, Deneb, Electra and Fulu: 40 steps |
 | a store crossing forks: a fork schedule, `upgrade_lc_*_to_*`, checks by each header's own epoch | **done** — 15 transition and legacy-data cases, Bellatrix to Electra |
-| a live beacon API | **not started** — 0066 |
+| mainnet, live | **done** — `cmd/lc.wac` and `tools/mainnet.sh` against lodestar-mainnet; a recorded run is a test |
 
 ## What the vectors cannot check, and what stands in for it
 
@@ -159,6 +159,22 @@ follow the chain across the fork.
   verifies under Bellatrix's version with Altair's types. All 15 of Ethereum's transition and legacy-data cases agree
   at every step (Bellatrix→Capella, Capella→Deneb, Deneb→Electra, two- and three-fork spans, and stores fed older
   data). Removing the Electra branch normalization fails them.
+
+- **On mainnet, live** (`cmd/lc.wac`, `tools/mainnet.sh`, 2026-11-10): the store takes a network's parameters (mainnet's
+  512-member committee, 32-slot epochs, 8192-slot periods, versions and fork epochs; `Schedule.mainnet()`). From a
+  trusted checkpoint root it verifies a bootstrap from lodestar-mainnet, the period's update, and the finality and
+  optimistic updates, and names the execution block and state root they prove (block 26382208,
+  `0x64d8a6b3…f99870`). The beacon node is only a source of bytes. That run is committed as a test
+  (`test/mainnet/`, `mainnet_test.wac`): real signatures by mainnet's committee, and refusals for a flipped
+  participation bit, another chain's genesis root, and a clock before the signature.
+- **What mainnet found that the vectors could not:** the optimistic update had 511 of 512 signers, and the store
+  bounded its signer loop by the participant count instead of the committee size, so it dropped the last member
+  and every partially signed update failed. That bug was mine, from today's refactor. Ethereum's vectors always
+  have near-full participation, so they cannot catch it; the recorded mainnet run now does. The JavaScript check
+  that ruled out the data (`@noble/curves`) needs the `_POP_` hash-to-curve tag, which Ethereum uses but noble does not
+  default to.
+- **Not yet exercised on mainnet:** committee rotation from an older checkpoint. Lodestar keeps no history (404 for
+  blocks a period back), so it cannot serve older bootstraps.
 
 **Still to do, in order:** wiring a header's block hash into `ethrpc.headerOf(block, hash)`, which already re-encodes an execution header
 and checks it against a given hash, so a Gloas block hash reaches a state root; mainnet's committee size and period length

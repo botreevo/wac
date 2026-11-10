@@ -1,0 +1,133 @@
+// lc — the light client on Ethereum mainnet, over data fetched from any beacon node (`tools/mainnet.sh` fetches it).
+//
+//     lc --trusted ROOT --fork NAME --bootstrap FILE [--updates FILE]… [--finality FILE] [--optimistic FILE] --now SLOT
+//
+// ROOT is a block root trusted from outside (a checkpoint); everything else is believed only as far as signatures by
+// the sync committee that ROOT's state names, and Merkle branches from there, carry it. Files are the beacon API's
+// `application/octet-stream` bodies: a bootstrap and the two single updates as bare SSZ; `updates` as its chunked
+// list (an 8-byte length, a 4-byte fork digest, the SSZ). NAME is the `Eth-Consensus-Version` the node answered with;
+// every file is read as that fork's layout.
+//
+// Prints what the client ends up believing: the finalized and optimistic beacon headers, and the execution block each
+// names — number, hash and state root — which is where a storage proof starts.
+
+import { Sys } from "std";
+import { codec.hexDecoded, codec.hexEncode } from "wac";
+import { forkNamed } from "../../ssz/src/forks.wac";
+import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, processOptimisticUpdate, headerSlot,
+         headerBeaconRoot } from "../src/store.wac";
+import { Schedule } from "../src/schedule.wac";
+import { executionBlockHash, executionStateRoot, partsOf } from "../src/header.wac";
+import { fieldsOf } from "../src/upgrade.wac";
+import { FT_EXECUTION_PAYLOAD_HEADER } from "../../ssz/src/forks.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+string[] flags(string[] a, string name) {
+  string[] out = string[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != name) { continue; }
+    string[] next = string[].defaulted(out.len() + 1);
+    for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+    next[out.len()] = a[i + 1];
+    out = next;
+  }
+  return out;
+}
+
+string hex(u8[] b) { return "0x" + string.fromBytes(hexEncode(b)); }
+u8[] unhex(string s) { return hexDecoded(s.len() >= 2 && s.slice(0, 2) == "0x" ? s.slice(2, s.len()) : s); }
+
+i64 decimal(string s) {
+  u8[] b = s.toBytes();
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < b.len(); i++) { v = v * (10 as i64) + ((b[i] as i32 - '0') as i64); }
+  return v;
+}
+
+i64 le64(u8[] b) {
+  i64 v = 0 as i64;
+  for (i32 i = 7; i >= 0; i--) { v = (v << (8 as i64)) | (b[i] as i64); }
+  return v;
+}
+
+/** Mainnet's genesis validators root: part of every signing domain, so a signature from another chain fails. */
+u8[] MAINNET_GVR() { return unhex("0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"); }
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  i32 fork = forkNamed(flag(a, "--fork", ""));
+  if (fork < 0) { sys.warn("lc: --fork altair|capella|deneb|electra|fulu, as the node answered"); return 2; }
+  Schedule net = Schedule.mainnet();
+  u8[] gvr = MAINNET_GVR();
+  i64 now = decimal(flag(a, "--now", "0"));
+
+  u8[] boot;
+  match (await sys.readFile(flag(a, "--bootstrap", ""))) { Err(e): { sys.warn("lc: \{e}"); return 1; } Ok(b): { boot = b; } }
+  Store? s = initializeStoreWith(net, fork, unhex(flag(a, "--trusted", "")), boot);
+  if (s is null) { sys.warn("lc: the bootstrap is not the trusted block's, or its committee is not proven by it"); return 1; }
+  Store store = s!;
+  sys.log("bootstrap   slot \{headerSlot(store.finalizedHeader)}, period \{net.periodAt(headerSlot(store.finalizedHeader))}: committee proven against the trusted root");
+
+  string[] lists = flags(a, "--updates");
+  for (i32 l = 0; l < lists.len(); l++) {
+    u8[] d;
+    match (await sys.readFile(lists[l])) { Err(e): { sys.warn("lc: \{e}"); return 1; } Ok(b): { d = b; } }
+    i32 at = 0;
+    while (at + 12 <= d.len()) {
+      i32 n = le64(cut(d, at, at + 8)) as~ i32;
+      u8[] u = cut(d, at + 12, at + 8 + n);
+      at = at + 8 + n;
+      bool ok = processUpdate(store, u, now, gvr);
+      sys.log("update      \{ok ? "accepted" : "REJECTED"}: finalized slot \{headerSlot(store.finalizedHeader)}, period \{net.periodAt(headerSlot(store.finalizedHeader))}");
+      if (!ok) { return 1; }
+    }
+  }
+  string fin = flag(a, "--finality", "");
+  if (fin != "") {
+    match (await sys.readFile(fin)) {
+      Err(e): { sys.warn("lc: \{e}"); return 1; }
+      Ok(b): {
+        bool ok = processFinalityUpdate(store, b, now, gvr);
+        sys.log("finality    \{ok ? "accepted" : "REJECTED"}");
+        if (!ok) { return 1; }
+      }
+    }
+  }
+  string opt = flag(a, "--optimistic", "");
+  if (opt != "") {
+    match (await sys.readFile(opt)) {
+      Err(e): { sys.warn("lc: \{e}"); return 1; }
+      Ok(b): {
+        bool ok = processOptimisticUpdate(store, b, now, gvr);
+        sys.log("optimistic  \{ok ? "accepted" : "REJECTED"}");
+        if (!ok) { return 1; }
+      }
+    }
+  }
+  show(sys, "finalized ", store.fork, store.finalizedHeader);
+  show(sys, "optimistic", store.fork, store.optimisticHeader);
+  return 0;
+}
+
+void show(Sys sys, string what, i32 fork, u8[] header) {
+  sys.log("\{what}  beacon slot \{headerSlot(header)} root \{hex(headerBeaconRoot(header))}");
+  u8[]? hash = executionBlockHash(fork, header);
+  u8[]? state = executionStateRoot(fork, header);
+  i64 number = -1 as i64;
+  auto p = partsOf(fork, header);
+  if (p is not null) {
+    u8[][] e = fieldsOf(fork, FT_EXECUTION_PAYLOAD_HEADER(), p!.execution);
+    if (e.len() > 6) { number = le64(e[6]); }
+  }
+  sys.log("\{what}  execution block \{number} hash \{hex(hash ?? u8[]())} state root \{hex(state ?? u8[]())}");
+}
+
+u8[] cut(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}

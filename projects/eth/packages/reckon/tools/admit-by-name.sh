@@ -72,6 +72,17 @@ $CL publish mirror --store local >/dev/null 2>&1
 expect ok "the endorsement from a mirror, into an empty store" "ADMITTED" -- $CL admit ens:vitalik.eth app $A --store empty2 --mirror mirror
 expect ok "the CID itself, under the same anchor" "ADMITTED" -- $CL admit "$content" app $A --store local
 
+step "which names the policy follows (K2): an ENS name moves at once"
+pol() { sed "s/{ signers:/{ names: $1, signers:/" policy.json5 > "$2"; }
+pol '{ ens: "refuse" }' policy-noens.json5
+pol '{ min_delay: 60 }' policy-delay.json5
+pol '{ min_delay: 60, ens: "allow" }' policy-delay-ens.json5
+N="--checkpoint $checkpoint --beacon $beacon --now 15630000 --rpc 127.0.0.1:$port --store local"
+expect refused "names.ens: refuse" "follows no ENS name" -- $CL admit ens:vitalik.eth app --policy policy-noens.json5 $N
+expect refused "a names.min_delay, ens unset: an ENS name cannot meet it" "moves at once" -- $CL admit ens:vitalik.eth app --policy policy-delay.json5 $N
+expect ok "a names.min_delay, and ens: allow" "ADMITTED" -- $CL admit ens:vitalik.eth app --policy policy-delay-ens.json5 $N
+expect ok "the CID itself under the policy that refuses ENS: the rule is about the pointer" "ADMITTED" -- $CL admit "$content" app --policy policy-noens.json5 $N
+
 step "what it refuses"
 expect refused "a checkpoint the bootstrap is not for" "not the checkpoint's" -- $CL admit ens:vitalik.eth app --policy policy.json5 --checkpoint 0x$(printf 'ab%.0s' $(seq 32)) --beacon "$beacon" --now 15630000 --rpc 127.0.0.1:$port --store local
 expect refused "a name the node has no record of" "not recorded" -- $CL admit ens:nick.eth app $A --store local

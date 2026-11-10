@@ -166,6 +166,15 @@ cat > "$work/policy.json5" <<POLICY
 POLICY
 CH="--rpc 127.0.0.1:$port --registry $registry --code-hash $codehash"
 expect ok "claim admit with the chain: nothing set" "0 revocation(s), 0 rejection(s) set" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs $CH
+
+step "5a. a registry name as the subject: name:NAME@0xPUBLISHER (K2), followed as the policy's names allow"
+expect ok "name:hello@… is read by proof, and its CID admitted" "name: hello@$P → $cid5, changes wait 1s" -- $CL admit "name:hello@$P" app --policy "$work/policy.json5" $cs $CH
+sed 's/^  roles:/  names: { min_delay: 10 },\n  roles:/' "$work/policy.json5" > "$work/policy-delay.json5"
+expect refused "a policy whose names.min_delay is 10 s does not follow a name whose changes wait 1 s" "less than the policy's names.min_delay of 10s" -- $CL admit "name:hello@$P" app --policy "$work/policy-delay.json5" $cs $CH
+expect ok "…and admits the CID itself: the delay is about the pointer, not the object" "ADMITTED" -- $CL admit "$cid5" app --policy "$work/policy-delay.json5" $cs $CH
+expect refused "a name its publisher never claimed" "not a name its publisher has claimed" -- $CL admit "name:nobody@$P" app --policy "$work/policy.json5" $cs $CH
+expect refused "the same name under another publisher is another name" "not a name its publisher has claimed" -- $CL admit "name:hello@$addr_endorser" app --policy "$work/policy.json5" $cs $CH
+expect refused "a registry name needs the registry" "needs --rpc and --registry" -- $CL admit "name:hello@$P" app --policy "$work/policy.json5" $cs --rpc "127.0.0.1:$port"
 expect ok "the followed list rejects it" -- $wallet reject "$keys/list" "$registry" "$cid5" "second thoughts"
 expect refused "claim admit refuses it" "on a rejection list you follow (on the chain)" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs $CH
 expect ok "unrejected" -- $wallet unreject "$keys/list" "$registry" "$cid5"
@@ -214,6 +223,7 @@ L=$(printf '%s' "$A" | sed "s/127.0.0.1:$port/127.0.0.1:$liar/")
 expect refused "admit app1 through a node hiding its revocation: its storage proof does not verify" "registry2: slot 0x" -- $R admit "$work/app1.bin" --statement "$work/e1" $L
 expect refused "resolve through a node hiding the name" "registry2: slot 0x" -- $R resolve "hello@$P" --rpc "127.0.0.1:$liar" --registry "$registry" --code-hash "$codehash"
 expect ok "where every slot is empty the lie changes nothing, and app3 is admitted" -- $R admit "$work/app3.bin" --statement "$work/e3" $L
+expect refused "claim admit name:hello@… through a node hiding the name" "the name: slot 0x" -- $CL admit "name:hello@$P" app --policy "$work/policy.json5" --store "$work/claims" --rpc "127.0.0.1:$liar" --registry "$registry" --code-hash "$codehash"
 
 step "7. the registry's address running other code, or none"
 other=0x$(printf 'ab%.0s' $(seq 32))

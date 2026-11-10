@@ -7,7 +7,9 @@
 //     claim slots RECIPE                           a recipe's input slots: name and CID
 //     claim origins CID                            the derivations claiming to produce it
 //     claim dependents CID                         outputs of recipes that take it as an input
-//     claim admit SUBJECT ROLE --policy F          may it be used in that role, and why: SUBJECT a CID or ens:NAME
+//     claim admit SUBJECT ROLE --policy F          may it be used in that role, and why: SUBJECT a CID, ens:NAME, or
+//                                                  name:NAME@0xPUBLISHER (the registry v2's delayed names, with
+//                                                  --registry); the policy's `names` says which it follows
 //         [--checkpoint ROOT (--beacon DIR | --beacon-url URL) [--fork F] [--now SLOT] | --anchor BLOCKHASH]
 //         [--rpc HOST:PORT [--registry ADDR --code-hash H] [--ens-registry ADDR --ens-registry-code H --resolver-code H]]
 //                                                  …from a checkpoint, through the light client's anchor, a name read by
@@ -40,8 +42,8 @@ import { Statement, Signed, signStatement, signedBlock, addressOfKey, recipeFrom
 import { Index, Held, Loaded, loadIndex, saveIndex, loadIndexes, publishIndex } from "../src/graph.wac";
 import { slotsOf } from "../src/slots.wac";
 import { Chain, Decision, admit } from "../src/admit.wac";
-import { readPolicyFile } from "../src/policyfile.wac";
-import { Endpoint, Proved, endpointOf, asksFor, chainFor } from "../src/registry2.wac";
+import { readPolicyFile, NameRule, readNameRule, ensRefusal, delayRefusal } from "../src/policyfile.wac";
+import { Endpoint, Proved, Snapshot, NameAt, endpointOf, asksFor, chainFor, read, nameAt, nameSlot, plus } from "../src/registry2.wac";
 import { unhex, hex } from "../src/hex.wac";
 import { Anchored, anchorFrom, anchorFromNode } from "../src/checkpoint.wac";
 import { NameAnswer, ensContent, ENS_REGISTRY, ENS_REGISTRY_CODE, PUBLIC_RESOLVER_CODE } from "../src/names.wac";
@@ -135,8 +137,52 @@ export async i32 main(Sys sys) {
       Ok(an): { for (i32 i = 0; i < an.log.len(); i++) { say(sys, quiet, an.log[i]); } anchorHex = "0x" + hex(an.blockHash); }
     }
   }
-  if (admitting && a[1].indexOf("ens:") == 0) {
-    // A name: whatever its contenthash says at the anchored block, read by proof.
+  // A name is a pointer, followed only as the policy's `names` allows (docs/decisions/K2-names.md), and read by proof.
+  NameRule follow = NameRule(0 as i64, "");
+  if (admitting && (a[1].indexOf("ens:") == 0 || a[1].indexOf("name:") == 0)) {
+    match (await sys.readFile(flag(a, "--policy", ""))) {
+      Err(e): { sys.warn("claim: --policy \{flag(a, "--policy", "")}: \{e}"); return 1; }
+      Ok(text): { match (readNameRule(text)) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(nr): { follow = nr; } } }
+    }
+  }
+  if (admitting && a[1].indexOf("name:") == 0) {
+    // A registry name: its eight words at the anchored block, read at that block's time.
+    string spec = a[1].slice(5, a[1].len());
+    i32 at = spec.indexOf("@");
+    u8[]? pub = at < 1 ? null : unhex(spec.slice(at + 1, spec.len()));
+    if (pub is null || pub!.len() != 20) { sys.warn("claim: name:NAME@0xPUBLISHER, the publisher a 20-byte address"); return 2; }
+    string name = spec.slice(0, at);
+    if (flag(a, "--rpc", "") == "" || flag(a, "--registry", "") == "") { sys.warn("claim: name:NAME@0xPUBLISHER needs --rpc and --registry"); return 2; }
+    Endpoint ep;
+    match (endpointOf(flag(a, "--rpc", ""), flag(a, "--registry", ""), flag(a, "--code-hash", ""), anchorHex)) {
+      Err(e): { sys.warn("claim: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
+      Ok(x): { ep = x; }
+    }
+    u8[] base = nameSlot(pub!, name);
+    u8[][] slots = u8[][].filled(8, u8[]());
+    for (i32 i = 0; i < 8; i++) { slots[i] = plus(base, i); }
+    Snapshot snap;
+    match (read(sys.net(), ep, slots)) {
+      Err(e): { sys.warn("claim: the name: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
+      Ok(x): { snap = x; }
+    }
+    NameAt n = nameAt(snap.values, snap.timestamp);
+    if (n.cid is null) {
+      say(sys, quiet, "name: \{spec}: not a name its publisher has claimed (proved at block \{snap.number})");
+      say(sys, quiet, "REFUSED");
+      return 3;
+    }
+    say(sys, quiet, "name: \{spec} → \{n.cid!.text()}, changes wait \{n.delay}s (proved at block \{snap.number}, time \{snap.timestamp})"
+                    + (snap.anchored ? "" : " (no anchor)"));
+    if (n.pending is not null) { say(sys, quiet, "      pending: \{n.pending!.text()} from \{n.effectiveAt}"); }
+    if (n.pendingDelay >= (0 as i64)) { say(sys, quiet, "      pending: a delay of \{n.pendingDelay}s from \{n.delayAt}"); }
+    string why = delayRefusal(follow, n.delay, n.pendingDelay, n.delayAt);
+    if (why != "") { say(sys, quiet, "not followed: \{why}"); say(sys, quiet, "REFUSED"); return 4; }
+    c = n.cid!;
+  } else if (admitting && a[1].indexOf("ens:") == 0) {
+    // An ENS name: whatever its contenthash says at the anchored block, read by proof.
+    string why = ensRefusal(follow);
+    if (why != "") { say(sys, quiet, "name: \{a[1].slice(4, a[1].len())}: not followed: \{why}"); say(sys, quiet, "REFUSED"); return 4; }
     string rpc = flag(a, "--rpc", "");
     i32 colon = rpc.indexOf(":");
     if (colon < 1) { sys.warn("claim: ens:NAME needs --rpc HOST:PORT"); return 2; }

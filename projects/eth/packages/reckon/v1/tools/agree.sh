@@ -11,7 +11,7 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 git -C "$repo" archive "$commit" | tar -x -C "$tmp"
 a=$(wac "$here/dist/reckon.wasm" tree "$tmp")
 b=$(wac "$here/dist/reckon.wasm" tree --git "$repo" "$commit")
-c=$(node "$here/tools/oracle/tree.mjs" "$tmp")
+c=$(node "$here/../tools/oracle/tree.mjs" "$tmp")
 n=$(git -C "$repo" ls-tree -r "$commit" | wc -l)
 echo "working tree  $a"; echo "git commit    $b"; echo "oracle        $c"
 [ "$a" = "$b" ] && [ "$b" = "$c" ] && echo "agree: $n files" || { echo "DISAGREE" >&2; exit 1; }

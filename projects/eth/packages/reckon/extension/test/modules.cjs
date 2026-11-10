@@ -30,6 +30,7 @@ import('./lazy.mjs').then((m) => r('dynamic', m.lazy()), (e) => r('dynamic', 'er
 const name = 'computed';
 import(new URL(\`./\${name}.mjs\`, import.meta.url)).then((m) => r('computed', m.v), (e) => r('computed', 'error ' + e));
 fetch(new URL('../data/x.json', import.meta.url)).then((x) => x.json()).then((j) => r('meta-fetch', j.v), (e) => r('meta-fetch', 'error ' + e));
+fetch(new URL('data/x.json', location.href)).then((x) => x.json()).then((j) => r('location-fetch', j.v), (e) => r('location-fetch', 'error ' + e));
 const w = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
 w.onmessage = (e) => r('worker', e.data);
 w.onerror = (e) => r('worker', 'error ' + (e.message || e));
@@ -77,6 +78,7 @@ try { new Worker('${NET}/w.js'); r('worker-net', 'created'); } catch (e) { r('wo
   ok(got.dynamic === 11, 'import() of a literal path, and that module\'s own import');
   ok(got.computed === 'computed', 'import() of a URL computed from import.meta.url');
   ok(got['meta-fetch'] === 'json', 'fetch of a URL computed from import.meta.url, answered from the tree');
+  ok(got['location-fetch'] === 'json', 'fetch of a name resolved against location.href (a wac-web page\'s site), answered from the tree');
   ok(got.worker === 21, 'a module worker from the tree, importing a module of its own');
   ok(got['import-net'] === 'refused', 'an import from the network: refused');
   ok(got['worker-net'] === 'refused', 'a worker from the network: refused');

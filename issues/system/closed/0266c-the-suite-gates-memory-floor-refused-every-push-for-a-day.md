@@ -1,7 +1,7 @@
 # 0266c — the suite gate's memory floor refused every push for a day, and the floor is self-described as unmeasured
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-c
 - **Date:** 2026-08-25
 - **Kind:** decision
@@ -303,3 +303,7 @@ against the best numbers in the tree rather than a derived figure — which is a
 (`issues/system/0142`). 4000 is 1000 MB above that, and the reason it is not the same bet is that those
 runs rose 4.9 GB where this one rose 2.5. If killed lanes reappear, this constant is the first thing to
 suspect — a floor that is too low does not fail loudly.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. The operator's decision is applied: the suite gate's memory floor is 4000 MB (`tools/wac/suitegate.wac`).

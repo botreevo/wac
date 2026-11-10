@@ -1,7 +1,7 @@
 # 0330a — a missing capability is a value in four places and a trap in forty-six, and two comments argue opposite sides
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
 - **Kind:** design question
@@ -98,3 +98,7 @@ each fault is its own type and a capability's error is the union of them, `Unsup
 `OutputClosed` reaching `main` exits quietly with status 0; `log`/`warn` become helpers over `write`; `wait()`
 answers `Result<T, Stuck>` and `Result.flatten()` joins the layers; no `string` errors anywhere in the repo.
 Order of work is in the note.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Design 0013 was agreed and built: the v8 host answers `Cap::Unsupported` with `FAULT_UNSUPPORTED` as a value, not a throw (`native/v8/src/main.rs`), and the `Cli` mapping is gone (`1afa908ef`).

@@ -1,7 +1,7 @@
 # 0234a — a bare specifier means two things, and the two hosts pick differently
 
-- **Status:** open — reproduction 2 is fixed; reproduction 1's *mapping* half is not
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-a, from GitHub issue 22's Deno-host case study
 - **Date:** 2026-08-21
 - **Kind:** bug
@@ -203,3 +203,6 @@ reads one — cannot tell a mapping from anything else. It now refuses rather th
 the better of the two failures, but it still cannot resolve a mapped import at all. Whether it should
 learn to is `design/lang/0009` D9-D11's question rather than this one's.
 
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Both reproductions are refused on master `12033f6b8`: the native binary answers repro 2 with *"sub/lib.wac is not a path and names no mapping"*, and the Deno host (`native.ts`) answers repro 1 with *"an import of a file that was not supplied"* — neither compiles the wrong file. (The Deno host's message still does not mention `wac update`; that wording is not what this issue was about.)

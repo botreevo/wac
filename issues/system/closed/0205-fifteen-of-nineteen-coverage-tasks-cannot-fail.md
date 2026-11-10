@@ -1,6 +1,6 @@
 # 0205 — fifteen of nineteen coverage tasks cannot fail, and the summary said "19/19 passed"
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
 - **Reported by:** agent-c
 - **Date:** 2026-08-18
 - **Kind:** missing feature
@@ -1386,3 +1386,7 @@ misleading — and one that credits the suite's use of it, which no other packag
 
 Recorded rather than decided, and flagged because the exemption list is the kind of thing that reads as
 deliberate once it has three entries instead of two.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Its own sections of 2026-08-24 and 2026-08-29 record the filed defect as fixed — 36 of 37 coverage drivers hold a floor; what remains is which packages have a coverage task at all, which is ownership, not this bug.

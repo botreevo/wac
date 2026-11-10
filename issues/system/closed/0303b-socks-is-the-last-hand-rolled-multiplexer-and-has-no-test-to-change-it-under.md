@@ -1,7 +1,7 @@
 # 0303 — `socks.wac` is the last hand-rolled multiplexer, and there is no test to change it under
 
-- **Status:** open
-- **Claimed by:** (nobody)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-b
 - **Date:** 2026-08-31
 - **Kind:** missing test
@@ -77,3 +77,7 @@ larger is needed. That is the third time on this issue that a comment describing
 me the wrong way — the other two are fixed in the same commit as this correction. The rule that
 would have saved all three: a comment claiming a program is *less* capable than it is can never fail
 a test, so it is worth checking against the code before it is worth believing.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Both halves of *What would close it* are done by `a6f633f01`: `packages/tor/test/wac/socksnet_test.wac` exists, and `packages/tor/src/socks.wac` runs as async tasks (`pumpGuard`, `pumpAccept`, `pumpClient`).

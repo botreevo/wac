@@ -1,7 +1,7 @@
 # 0302 — a frame cannot be given fewer grants than the program that made it
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-c
 - **Date:** 2026-08-31
 - **Kind:** decision
@@ -73,3 +73,7 @@ Nothing is wrong. Every one of those five tests passes and tests the right thing
 process, which is also the most honest way to ask a question about grants. This is filed because the
 gap is now the *only* reason any of them is spawned, which was not visible until everything else in
 that file had moved.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. `packages/platform/src/frame.wac` and `childCli` no longer exist — frames were removed — and handing a child fewer grants than its parent landed before that in `65b71133c` (`Authority`, `Procs.spawn`).

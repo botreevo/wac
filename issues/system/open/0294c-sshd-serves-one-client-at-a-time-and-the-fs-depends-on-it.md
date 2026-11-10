@@ -195,3 +195,7 @@ So the remaining ports — `sshd`, `hsserviced`, `hsfetch`, `hsconnect`, `app` �
 
 The second is a decision about a security-sensitive path rather than a translation, which is why it
 is written here rather than done.
+
+## Unblocked — 2026-11-10
+
+What this waited on, `issues/lang/0300b` (a program-made ticket the scheduler can dispatch, so a bounded `await`), is closed: a program makes a `Ticket` and resolves it, and std's `within` bounds an `await`. Still open as written: `packages/ssh/src/sshd.wac` awaits `serve(...)` inside its accept loop, so it serves one connection at a time (same as `0309b`).

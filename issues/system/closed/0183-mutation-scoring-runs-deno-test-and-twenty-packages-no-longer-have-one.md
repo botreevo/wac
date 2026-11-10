@@ -1,7 +1,7 @@
 # 0183 — mutation scoring runs `deno test`, and twenty packages no longer have one
 
-- **Status:** open
-- **Claimed by:** agent-c
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-c
 - **Date:** 2026-08-17
 - **Kind:** bug
@@ -435,3 +435,6 @@ list out of both sources and fails naming what is missing. Verified non-vacuous 
 and watching it go red. That is the part worth keeping — the comment asserting parity had been wrong
 for as long as the branch existed, and nothing could tell.
 
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Re-run on master `12033f6b8`: `deno test -A tools/mutate.test.ts` passes 17 of 17, among them *"the mutation runner grants what the suite's wac lane grants"* — the parity this issue's last section added (`--allow-net` in `tools/mutate.ts`'s wac branch), checked rather than written down. The native lane it asked for exists (`isBlindScope`, `testDirs`, `testCommand` dispatching to `wac test`), as that section records.

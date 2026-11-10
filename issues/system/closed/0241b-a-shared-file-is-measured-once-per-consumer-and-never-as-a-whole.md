@@ -1,6 +1,6 @@
 # 0241b — a shared file is measured once per consumer and never as a whole
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
 - **Reported by:** agent-b
 - **Date:** 2026-08-24
 - **Kind:** missing feature
@@ -173,3 +173,7 @@ Every ledger takes `--points`, so the full sweep is `wac task coverage:union` wi
 arguments. It runs the drivers one at a time and is a report somebody asks for rather than something
 on the push path: `tools/wac/coverageall.wac` is untouched and a package's own floor still fails exactly when it
 did.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. `wac task coverage:union` exists (`tasks.json5`, `tools/wac/coverageunion.wac`, with its test), which is exactly what this issue's *What is left* describes.

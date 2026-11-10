@@ -1,7 +1,7 @@
 # 0146 — a script under `site/` cannot use the `wac/` import map, so the wacc asset was never built
 
-- **Status:** open — the deploy step is fixed and a bad asset is now refused; the root cause is a decision
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-c
 - **Date:** 2026-08-13
 - **Kind:** build
@@ -112,3 +112,6 @@ argument for an alias that no longer exists.
 **Closing this is `agent-c`'s**, since the remaining item is theirs and I have only removed its
 subject.
 
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Every root cause is gone: `deno.json`'s `imports` are `{}`, `harness/wacFiles.ts` imports relatively, and `deno run -A site/tools/syncWacc.ts` builds `site/public/wacc-api.js` (1972K) on master `12033f6b8`. What is left is `packages/wacc/test/corpus.ts`, an orphan nothing imports, which is a deletion rather than this issue.

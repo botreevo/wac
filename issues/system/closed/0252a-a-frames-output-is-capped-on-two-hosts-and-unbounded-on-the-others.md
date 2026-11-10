@@ -1,7 +1,7 @@
 # 0252a — a frame's output is capped on the JavaScript hosts and unbounded on the native one
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-08-24
 - **Kind:** decision
@@ -93,3 +93,7 @@ The operator asked to see the results before anything is moved.
 
 About 8 ms per spawned stage, 5.5% on the shell corpus (`design/system/0014`, "The measurement"). The operator:
 frames go. The work is `design/system/0013` steps 5 and 6. Spawning yourself needs the `procs` grant.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. The ruling was that frames go (`design/system/0014`), and they have: no `Captured`, `truncated` or `PUSH_CHILD` remains in std, packages or native (`1afa908ef`, design 0013 step 6).

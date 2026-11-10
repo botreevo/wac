@@ -1,7 +1,7 @@
 # 0251b — an SCTP association ignores the peer's advertised receive window
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — already done on master; see Fix
+- **Claimed by:** wac2
 - **Reported by:** agent-b
 - **Date:** 2026-08-24
 - **Kind:** missing feature
@@ -58,3 +58,7 @@ bug sat next to the gap for as long as it did.
 the two values already read there, and `send` needs to respect it — bytes in flight against the
 smaller of `cwnd` and the peer's window, which is what RFC 4960 §6.1 says. The INIT-ACK path does not
 need it: this association is only ever the passive side, and `receive` has no INIT-ACK branch at all.
+
+## Fix
+
+Found already done in a triage of `issues/system/open`, 2026-11-10. Fixed by `073fffa8e`: `packages/webrtc/src/association.wac` reads `peerRwnd` from the INIT and stops sending when a chunk would exceed it.

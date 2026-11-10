@@ -18,13 +18,23 @@ site = os.path.join(here, "site")
 out = sys.argv[1]
 
 DEMOS = {
+    "turbostack": ("A third-party app, sealed end to end", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/turbostack.sh WORKDIR",
+                   "wac-turbostack's duel page — a Tetris network that taught itself by self-play against turbostack's "
+                   "original model — built only inside the sealed machine, with nothing of turbostack's run outside "
+                   "it: wac-web's own page builder writes the page's module, the compiler builds it, the builder wraps "
+                   "it into the page, and a gatherer puts the page beside the two models' weights, each step a "
+                   "derivation agreed by V8 and wasmtime. A reviewer's endorsements, a policy that admits the site "
+                   "through all four steps back to the compiler, the name turbostack on a devnet's registry, the "
+                   "mirror found from a manifest (--mirrors-from); then admitted by name in the browser extension, "
+                   "where both players load their weights and play in the sandbox loader."),
     "demo-app": ("A real app, admitted and run", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/demo-app.sh WORKDIR",
-                 "A Mandelbrot set as a wac-web page (demo/mandelbrot.wac), end to end: its module compiled inside the "
-                 "sealed machine on V8 and on wasmtime, the page put together there too from the builder's reviewed "
-                 "glue (byte for byte the builder's page), a reviewer's endorsements, the page named mandelbrot on a "
-                 "devnet's registry, admitted by name on the command line, then in the browser extension: the name "
-                 "read by proof, the page fetched and checked, and run in the sandbox loader, where it draws and "
-                 "zooms with no network and no extension API."),
+                 "A Mandelbrot set as a wac-web page (demo/mandelbrot.wac), end to end, every build step sealed: "
+                 "wac-web's own page builder (its two halves that start no process) and the compiler, each a "
+                 "derivation on V8 and on wasmtime, making the page the builder makes natively in one step (byte for "
+                 "byte but the entry path wac records in the module), a reviewer's endorsements, the page named "
+                 "mandelbrot on a devnet's registry, admitted by name on the command line, then in the browser "
+                 "extension: the name read by proof, the page fetched and checked, and run in the sandbox loader, "
+                 "where it draws and zooms with no network and no extension API."),
     "capstone": ("The capstone", "LADDER=… sh packages/reckon/tools/capstone.sh WORKDIR",
                  "Source to a compiler to an app to its run, each a derivation signed by a runner on V8 and one on "
                  "wasmtime. The compiler has two unrelated origins that must agree: the seed, and a compiler wac's "

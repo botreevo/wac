@@ -167,6 +167,14 @@ follow the chain across the fork.
   `0x64d8a6b3…f99870`). The beacon node is only a source of bytes. That run is committed as a test
   (`test/mainnet/`, `mainnet_test.wac`): real signatures by mainnet's committee, and refusals for a flipped
   participation bit, another chain's genesis root, and a clock before the signature.
+- **And on to state.** Given an execution node too (`ETH_RPC`, read from the environment and never written down), the
+  same run fetches the finalized execution block and an `eth_getProof` for an ENS name. The block is believed only
+  because its re-encoded header (`ethrpc.headerOf`) hashes to the block hash the light client proved; the proofs only
+  as far as they reach that header's state root. Live, from one trusted beacon root: `vitalik.eth` is owned by
+  `0xd8da6bf2…6045` with resolver `0x231b0ee1…5e8e63`. The recorded run (`test/mainnet/block.json`, `proof.json`)
+  is a test, with the same proofs refused against a later block's root and a block that is not the proven one refused
+  before any proof is read. This closes the first experiment's finding 2 ("proved" meant "proved relative to a header
+  someone gave you"): the only thing taken on trust now is the checkpoint root.
 - **What mainnet found that the vectors could not:** the optimistic update had 511 of 512 signers, and the store
   bounded its signer loop by the participant count instead of the committee size, so it dropped the last member
   and every partially signed update failed. That bug was mine, from today's refactor. Ethereum's vectors always

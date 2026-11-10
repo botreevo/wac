@@ -7,3 +7,6 @@ Ethereum mainnet light-client data, fetched from lodestar-mainnet.chainsafe.io o
 
 `test/wac/mainnet_test.wac` verifies them offline, as a regression test on real data: signatures by mainnet's own sync
 committee, partial participation included, and the execution block they prove.
+- `block.json`, `proof.json`: an execution node's `eth_getBlockByNumber` for the finalized execution block (26382137) and
+  `eth_getProof` of the ENS registry's owner and resolver slots for vitalik.eth at that block, as answered (JSON-RPC
+  bodies; fetched the same day).

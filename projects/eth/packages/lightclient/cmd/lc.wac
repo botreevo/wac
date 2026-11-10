@@ -10,8 +10,24 @@
 //
 // Prints what the client ends up believing: the finalized and optimistic beacon headers, and the execution block each
 // names — number, hash and state root — which is where a storage proof starts.
+//
+//     … --block FILE --proof FILE --ens NAME [--registry ADDR]
+//     lc ens-slots NAME
+//
+// With these, it carries on to state: FILE is an execution node's `eth_getBlockByNumber` answer for the finalized
+// execution block, believed only if its re-encoded header hashes to the block hash the light client proved, and an
+// `eth_getProof` answer for the ENS registry's owner and resolver slots of NAME (which `ens-slots` prints) at that
+// block, believed only as far as the proofs reach that header's state root. The answer is NAME's owner and resolver
+// on mainnet, from nothing but the trusted root.
 
 import { Sys } from "std";
+import { Result } from "core";
+import { json.parse, json.JsonValue, json.JsonArray } from "wac";
+import { headerOf, Header } from "../../ethrpc/src/header.wac";
+import { hexArray } from "../../ethrpc/src/jsonhex.wac";
+import { recordOf, Record } from "../../ens/src/verified.wac";
+import { ownerSlot, resolverSlot } from "../../ens/src/registry.wac";
+import { namehash } from "../../ens/src/ens.wac";
 import { codec.hexDecoded, codec.hexEncode } from "wac";
 import { forkNamed } from "../../ssz/src/forks.wac";
 import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, processOptimisticUpdate, headerSlot,
@@ -59,6 +75,12 @@ u8[] MAINNET_GVR() { return unhex("0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf
 
 export async i32 main(Sys sys) {
   string[] a = sys.args();
+  if (a.len() >= 2 && a[0] == "ens-slots") {
+    u8[] node = namehash(a[1].toBytes());
+    sys.log(hex(ownerSlot(node)));
+    sys.log(hex(resolverSlot(node)));
+    return 0;
+  }
   i32 fork = forkNamed(flag(a, "--fork", ""));
   if (fork < 0) { sys.warn("lc: --fork altair|capella|deneb|electra|fulu, as the node answered"); return 2; }
   Schedule net = Schedule.mainnet();
@@ -110,7 +132,55 @@ export async i32 main(Sys sys) {
   }
   show(sys, "finalized ", store.fork, store.finalizedHeader);
   show(sys, "optimistic", store.fork, store.optimisticHeader);
+  string blockFile = flag(a, "--block", "");
+  if (blockFile == "") { return 0; }
+  return await toState(sys, a, store.fork, store.finalizedHeader, blockFile);
+}
+
+/** From the finalized header to ENS: the execution block checked against the proven hash, then the proofs against its root. */
+async i32 toState(Sys sys, string[] a, i32 fork, u8[] header, string blockFile) {
+  u8[]? hash = executionBlockHash(fork, header);
+  u8[]? proven = executionStateRoot(fork, header);
+  if (hash is null || proven is null) { sys.warn("lc: the finalized header names no execution block"); return 1; }
+  JsonValue block;
+  match (await jsonFile(sys, blockFile)) { Err(e): { sys.warn("lc: \{e}"); return 1; } Ok(v): { block = v; } }
+  Header h;
+  match (headerOf(block, hash!)) {
+    Err(e): { sys.warn("lc: the execution node's block is not the proven one: \{e}"); return 1; }
+    Ok(x): { h = x; }
+  }
+  if (hex(h.stateRoot) != hex(proven!)) { sys.warn("lc: the block's state root is not the one the beacon chain committed to"); return 1; }
+  sys.log("block       the execution node's header hashes to the proven block hash; state root agrees");
+
+  JsonValue proof;
+  match (await jsonFile(sys, flag(a, "--proof", ""))) { Err(e): { sys.warn("lc: \{e}"); return 1; } Ok(v): { proof = v; } }
+  u8[][] accountNodes = hexArray(proof.member("accountProof") ?? JsonValue.Null);
+  JsonArray? sp = proof.member("storageProof")?.array();
+  if (sp is null || sp!.len() < 2) { sys.warn("lc: the proof needs the owner and resolver slots"); return 1; }
+  string name = flag(a, "--ens", "");
+  u8[] registry = unhex(flag(a, "--registry", "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e"));
+  Record r = recordOf(h.stateRoot, registry, name.toBytes(), accountNodes,
+                      hexArray(sp!.get(0).member("proof") ?? JsonValue.Null), hexArray(sp!.get(1).member("proof") ?? JsonValue.Null));
+  if (!r.ok) { sys.warn("lc: the proof does not hold: \{r.error}"); return 1; }
+  if (!r.present) { sys.log("ens         \{name}: no owner, proved absent"); return 0; }
+  sys.log("ens         \{name} owner \{hex(r.owner)} resolver \{hex(r.resolver)}");
+  sys.log("            proved from the trusted root alone: sync committee, beacon header, execution block, state trie");
   return 0;
+}
+
+async Result<JsonValue, string> jsonFile(Sys sys, string path) {
+  match (await sys.readFile(path)) {
+    Err(e): { return Result.Err("\{path}: \{e}"); }
+    Ok(b): {
+      match (parse(b)) {
+        Err(e): { return Result.Err("\{path}: not JSON: \{e.text()}"); }
+        Ok(v): {
+          JsonValue? result = v.member("result");
+          return Result.Ok(result ?? v);
+        }
+      }
+    }
+  }
 }
 
 void show(Sys sys, string what, i32 fork, u8[] header) {

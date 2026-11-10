@@ -7,9 +7,10 @@
 #   - the same output CID on both engines, where the machine promises one;
 #   - the same output CID twice on one engine.
 #
-# One program is expected to break that promise, and is reported rather than failed: probe.wac, which reads a clock and
-# random bytes no runner here can take away. floats.wac used to be the other (V8 and wasmtime choose different NaNs)
-# until the runner made NaNs canonical (src/canon.wac); it must now agree.
+# probe.wac asks for what the machine does not give: a host file, the environment, a clock (wall and monotonic) and
+# random bytes. Version 2 runs the program sealed, so it is refused all of them, and its output is the same on both
+# engines like everyone else's. floats.wac used to be the other disagreement (V8 and wasmtime choose different NaNs)
+# until the runner made NaNs canonical (src/canon.wac); it must agree too.
 #
 #     sh tools/machine.sh [WORKDIR]
 set -eu
@@ -79,7 +80,7 @@ check floats "exit 0"
 # the test that the rewrite's skipped checks (src/canon.wac) never let a payload out.
 check nanpaths "exit 0"
 check nbody "exit 0"
-check probe "exit 0" differs
+check probe "exit 0"
 
 # The minimums every runner of this machine must provide (docs/runner.md): 10,000 frames of depth.wac's recursion and
 # 1 GiB of heap held live by heap.wac. Within them a run must complete on both engines; past what an engine allows it
@@ -106,8 +107,9 @@ wac obj.wasm cat "$p" log $store > probe.log
 grep -q "read /etc/hostname: refused" probe.log && ok "probe: no host file" || bad "probe: read a host file"
 grep -q "env HOME: refused" probe.log && ok "probe: no environment" || bad "probe: read the environment"
 grep -q "^cwd: /$" probe.log && ok "probe: starts at /" || bad "probe: $(grep cwd probe.log)"
-grep -q "^clock: [0-9]" probe.log && known "probe: read the clock ($(grep '^clock' probe.log))"
-grep -q "^random: 4 bytes" probe.log && known "probe: read random bytes"
+grep -q "^clock: refused" probe.log && ok "probe: no clock" || bad "probe: $(grep '^clock' probe.log)"
+grep -q "^monotonic: refused" probe.log && ok "probe: no monotonic clock" || bad "probe: $(grep '^monotonic' probe.log)"
+grep -q "^random: refused" probe.log && ok "probe: no random bytes" || bad "probe: $(grep '^random' probe.log)"
 f=$(run "$V8" "$(recipe files)")
 wac obj.wasm cat "$f" log $store > files.log
 grep -q "refused /in/x" files.log && ok "files: the input is read-only" || bad "files: wrote to its input"

@@ -77,8 +77,8 @@ On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 
   nodes keep recent states and this does not come up.
 - **The liar's refusal is not always worded the same.** Depending on where the substitute proof diverges from the real
   trie, mpt says either "the proof ends where a node hashing to … was expected" or "node N hashes to …, but its parent
-  named …". v1's e2e matched the first phrase only. That held there by the luck of its trie shapes, and would have
-  failed here.
+  named …". v1's e2e matched the first phrase only, which held only because of the shape of its tries; it now accepts
+  either (fixed).
 - **`tools/oracle/package-lock.json` was out of sync** with its `package.json` (fixed): it lacked `multiformats`,
   `@ipld/dag-cbor` and `cborg`, so `npm ci` refused. Regenerated; every version it already pinned is unchanged.
 - **No wac blockers.** The only compiler friction was casts (`as!`, `as~`), where the diagnostics say what to write.

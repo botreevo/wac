@@ -15,6 +15,16 @@
 //                                                  the claims here and in every mirror (docs/admit.md); a step asked
 //                                                  for that cannot be done refuses (exit 3)
 //
+//     claim run SUBJECT ROLE --policy F [the admit flags] [--entry PATH] [--timeout MS] [--out PATH] [-- ARGS…]
+//                                                  admit, then fetch the admitted object (every block checked against
+//                                                  its CID) and run it in the machine: sealed (no clock, no random
+//                                                  bytes), canonical NaNs, no network, no environment, and the
+//                                                  machine's files: a tree read-only at /in (PATH is the program in
+//                                                  it), an /out held in memory and dropped, nothing else. The
+//                                                  program's exit code is the command's. With --out, write the bytes or
+//                                                  the tree to PATH instead of running them. Admission's account goes
+//                                                  to stderr, so stdout is the program's
+//
 //     claim publish DIR                            the local index into the mirror DIR, added to what it holds
 //
 // --store DIR (default .objects), --mirror DIR or --mirror http://HOST:PORT (repeatable): where else to find blocks,
@@ -22,30 +32,48 @@
 // statement's signature verified, what fails reported and left out (docs/claims-mirror.md). A signed statement goes into the store and into the
 // store's index (`claims/index`), which is reloaded — every signature checked again — on each use.
 
-import { Sys } from "std";
-import { Result } from "core";
-import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.httpStoreAt, ipfs.Block, ipfs.DAG_CBOR } from "@/lib.wac";
+import { Sys, Authority, Launch, Child, Files, Input, TimedOut } from "std";
+import { Result, Ticket } from "core";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.httpStoreAt, ipfs.Block, ipfs.DAG_CBOR,
+         ipfs.FileIn, ipfs.Node, ipfs.readNode, ipfs.readFile, ipfs.readTree, ipfs.filesOnly, ipfs.emptyDirsOf } from "@/lib.wac";
 import { Statement, Signed, signStatement, signedBlock, addressOfKey, recipeFrom, statementId } from "../src/claims.wac";
 import { Index, Held, Loaded, loadIndex, saveIndex, loadIndexes, publishIndex } from "../src/graph.wac";
 import { slotsOf } from "../src/slots.wac";
 import { Chain, Decision, admit } from "../src/admit.wac";
 import { readPolicyFile } from "../src/policyfile.wac";
 import { Endpoint, Proved, endpointOf, asksFor, chainFor } from "../src/registry2.wac";
-import { unhex, hex } from "../src/statement.wac";
+import { unhex, hex } from "../src/hex.wac";
 import { Anchored, anchorFrom, anchorFromNode } from "../src/checkpoint.wac";
 import { NameAnswer, ensContent, ENS_REGISTRY, ENS_REGISTRY_CODE, PUBLIC_RESOLVER_CODE } from "../src/names.wac";
+import { Written, worldFiles } from "../src/world.wac";
+import { canonicalize } from "../src/canon.wac";
 
+/** A flag's value. Nothing after `--` is a flag: it is the arguments `run` hands the program. */
 string flag(string[] a, string name, string fallback) {
-  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  for (i32 i = 0; i + 1 < a.len() && a[i] != "--"; i++) { if (a[i] == name) { return a[i + 1]; } }
   return fallback;
 }
 
+/** What follows `--`, or nothing. */
+string[] afterDashes(string[] a) {
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != "--") { continue; }
+    string[] out = string[].defaulted(a.len() - i - 1);
+    for (i32 j = i + 1; j < a.len(); j++) { out[j - i - 1] = a[j]; }
+    return out;
+  }
+  return string[]();
+}
+
+/** Admission's account: stdout for `admit`, stderr for `run`, whose stdout is the program's. */
+void say(Sys sys, bool quiet, string s) { if (quiet) { sys.warn(s); } else { sys.log(s); } }
+
 export async i32 main(Sys sys) {
   string[] a = sys.args();
-  if (a.len() < 1) { sys.warn("usage: claim address|endorse|reject|revoke|slots|origins|dependents|admit … (see the source)"); return 2; }
+  if (a.len() < 1) { sys.warn("usage: claim address|endorse|reject|revoke|slots|origins|dependents|admit|run|publish … (see the source)"); return 2; }
   Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
   Store[] mirrors = Store[]();
-  for (i32 i = 0; i + 1 < a.len(); i++) {
+  for (i32 i = 0; i + 1 < a.len() && a[i] != "--"; i++) {
     if (a[i] != "--mirror") { continue; }
     Store m = Store.dir(sys.files(), a[i + 1]);
     if (isHttp(a[i + 1])) {
@@ -57,6 +85,8 @@ export async i32 main(Sys sys) {
   }
   Resolver r = Resolver(store, mirrors);
   string cmd = a[0];
+  bool admitting = cmd == "admit" || cmd == "run";
+  bool quiet = cmd == "run";
 
   if (cmd == "address") {
     u8[]? key = await keyOf(sys, a);
@@ -91,7 +121,7 @@ export async i32 main(Sys sys) {
   Cid c;
   // Admission's anchor (docs/admit.md): from the light client with --checkpoint, or given with --anchor.
   string anchorHex = flag(a, "--anchor", "");
-  if (cmd == "admit" && flag(a, "--checkpoint", "") != "") {
+  if (admitting && flag(a, "--checkpoint", "") != "") {
     if (anchorHex != "") { sys.warn("claim: --checkpoint or --anchor, not both: one anchor"); return 2; }
     // --now fixes the slot (recorded data); without it the clock is read as each update is checked.
     i64 slot = flag(a, "--now", "") != "" ? decimalOf(flag(a, "--now", "")) : (-1 as i64);
@@ -101,11 +131,11 @@ export async i32 main(Sys sys) {
       ? await anchorFromNode(sys, flag(a, "--checkpoint", ""), url, flag(a, "--fork", ""), slot)
       : await anchorFrom(sys, flag(a, "--checkpoint", ""), flag(a, "--beacon", "."), flag(a, "--fork", "fulu"), slot);
     match (got) {
-      Err(e): { sys.warn("claim: \{e}"); sys.log("REFUSED"); return 3; }
-      Ok(an): { for (i32 i = 0; i < an.log.len(); i++) { sys.log(an.log[i]); } anchorHex = "0x" + hex(an.blockHash); }
+      Err(e): { sys.warn("claim: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
+      Ok(an): { for (i32 i = 0; i < an.log.len(); i++) { say(sys, quiet, an.log[i]); } anchorHex = "0x" + hex(an.blockHash); }
     }
   }
-  if (cmd == "admit" && a[1].indexOf("ens:") == 0) {
+  if (admitting && a[1].indexOf("ens:") == 0) {
     // A name: whatever its contenthash says at the anchored block, read by proof.
     string rpc = flag(a, "--rpc", "");
     i32 colon = rpc.indexOf(":");
@@ -118,12 +148,12 @@ export async i32 main(Sys sys) {
     if (reg is null || rc is null || vc is null || an is null) { sys.warn("claim: the ENS flags are hex"); return 2; }
     string name = a[1].slice(4, a[1].len());
     match (ensContent(sys.net(), name, rpc.slice(0, colon), port, reg!, rc!, vc!, an!)) {
-      Err(e): { sys.warn("claim: the name: \{e}"); sys.log("REFUSED"); return 3; }
+      Err(e): { sys.warn("claim: the name: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
       Ok(ans): {
         i32 nl = ans.out.indexOf("\n");
-        sys.log("name: \{name} → " + (nl < 0 ? ans.out : ans.out.slice(0, nl)));
-        if (nl >= 0) { sys.log("      " + ans.out.slice(nl + 1, ans.out.len())); }
-        if (ans.code != 0) { sys.log("REFUSED"); return 3; }
+        say(sys, quiet, "name: \{name} → " + (nl < 0 ? ans.out : ans.out.slice(0, nl)));
+        if (nl >= 0) { say(sys, quiet, "      " + ans.out.slice(nl + 1, ans.out.len())); }
+        if (ans.code != 0) { say(sys, quiet, "REFUSED"); return 3; }
         match (parseCid(ans.cid)) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(x): { c = x; } }
       }
     }
@@ -161,7 +191,7 @@ export async i32 main(Sys sys) {
     for (i32 i = 0; i < ds.len(); i++) { sys.log(ds[i].text()); }
     return 0;
   }
-  if (cmd == "admit" && a.len() >= 3) {
+  if (admitting && a.len() >= 3) {
     string path = flag(a, "--policy", "");
     u8[] text;
     match (await sys.readFile(path)) { Err(e): { sys.warn("claim: \{path}: \{e}"); return 1; } Ok(b): { text = b; } }
@@ -173,13 +203,13 @@ export async i32 main(Sys sys) {
         if (rpc != "" && flag(a, "--registry", "") != "") {
           // Fail closed: when the chain was asked for and cannot answer, what it would say is unknown.
           match (endpointOf(rpc, flag(a, "--registry", ""), flag(a, "--code-hash", ""), anchorHex)) {
-            Err(e): { sys.warn("claim: \{e}"); sys.log("REFUSED"); return 3; }
+            Err(e): { sys.warn("claim: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
             Ok(ep): {
               match (chainFor(sys.net(), ep, asksFor(p, ix, r, c))) {
-                Err(e): { sys.warn("claim: the chain: \{e}"); sys.log("REFUSED"); return 3; }
+                Err(e): { sys.warn("claim: the chain: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
                 Ok(pr): {
                   chain = pr.chain;
-                  sys.log("chain: block \{pr.at.number}, \{pr.at.slots.len()} slot(s) proved" + (pr.at.anchored ? "" : " (no anchor)")
+                  say(sys, quiet, "chain: block \{pr.at.number}, \{pr.at.slots.len()} slot(s) proved" + (pr.at.anchored ? "" : " (no anchor)")
                           + "; \{chain.revokedId.len()} revocation(s), \{chain.rejected.len()} rejection(s) set");
                 }
               }
@@ -187,9 +217,10 @@ export async i32 main(Sys sys) {
           }
         }
         Decision d = admit(p, ix, r, chain, c, a[2]);
-        for (i32 i = 0; i < d.why.len(); i++) { sys.log(d.why[i]); }
-        sys.log(d.ok ? "ADMITTED" : "REFUSED");
-        return d.ok ? 0 : 4;
+        for (i32 i = 0; i < d.why.len(); i++) { say(sys, quiet, d.why[i]); }
+        say(sys, quiet, d.ok ? "ADMITTED" : "REFUSED");
+        if (!d.ok || cmd == "admit") { return d.ok ? 0 : 4; }
+        return await runAdmitted(sys, a, r, c);
       }
     }
   }
@@ -232,4 +263,114 @@ i64 decimalOf(string s) {
   u8[] b = s.toBytes();
   for (i32 i = 0; i < b.len(); i++) { if (b[i] < 48 || b[i] > 57) { return -1 as i64; } v = v * (10 as i64) + ((b[i] as i64) - (48 as i64)); }
   return v;
+}
+
+// ---------------------------------------------------------------- run
+
+/**
+ * The admitted object, fetched and run, or written out with --out. Every block comes through the resolver, which
+ * checks it against its CID, and a file's size against its declared size, so the bytes are the admitted ones or
+ * there are none. Exit 1 when they cannot be had; the program's own exit code otherwise.
+ */
+async i32 runAdmitted(Sys sys, string[] a, Resolver r, Cid c) {
+  bool isDir;
+  match (r.block(c)) {
+    Err(e): { sys.warn("claim: the admitted object: \{e}"); return 1; }
+    Ok(b): {
+      match (readNode(c, b)) {
+        Err(e): { sys.warn("claim: the admitted object: \{e}"); return 1; }
+        Ok(n): { isDir = match (n) { Dir(_): true, Shard(_, _): true, File(_, _, _): false }; }
+      }
+    }
+  }
+  string out = flag(a, "--out", "");
+  string entry = flag(a, "--entry", "");
+  if (!isDir) {
+    if (entry != "") { sys.warn("claim: --entry: \{c.text()} is a file, not a tree"); return 2; }
+    u8[] bytes;
+    match (readFile(r, c)) { Err(e): { sys.warn("claim: the admitted bytes: \{e}"); return 1; } Ok(b): { bytes = b; } }
+    if (out != "") {
+      match (await sys.writeFile(out, bytes)) { Err(e): { sys.warn("claim: --out \{out}: \{e}"); return 1; } Ok(_): { } }
+      sys.warn("claim: \{c.text()}: \{bytes.len()} bytes, written to \{out}");
+      return 0;
+    }
+    return await runSealed(sys, bytes, FileIn[](), string[](), afterDashes(a), a);
+  }
+  FileIn[] tree;
+  match (readTree(r, c)) { Err(e): { sys.warn("claim: the admitted tree: \{e}"); return 1; } Ok(t): { tree = t; } }
+  FileIn[] files = filesOnly(tree);
+  string[] dirs = emptyDirsOf(tree);
+  if (out != "") {
+    for (i32 i = 0; i < dirs.len(); i++) { await sys.files().mkdir(out + "/" + dirs[i], true); }
+    for (i32 i = 0; i < files.len(); i++) {
+      string path = out + "/" + files[i].path;
+      i32 slash = path.len() - 1;
+      while (path.slice(slash, slash + 1) != "/") { slash--; }
+      await sys.files().mkdir(path.slice(0, slash), true);
+      match (await sys.writeFile(path, files[i].content)) { Err(e): { sys.warn("claim: --out \{path}: \{e}"); return 1; } Ok(_): { } }
+    }
+    sys.warn("claim: \{c.text()}: \{files.len()} file(s), written below \{out}");
+    return 0;
+  }
+  if (entry == "") { sys.warn("claim: \{c.text()} is a tree: say which file in it is the program, with --entry PATH"); return 2; }
+  for (i32 i = 0; i < files.len(); i++) {
+    if (files[i].path == entry) { return await runSealed(sys, files[i].content, files, dirs, afterDashes(a), a); }
+  }
+  sys.warn("claim: no file \{entry} in \{c.text()}");
+  return 1;
+}
+
+/**
+ * Run `program` as the machine runs a derivation (cmd/derive.wac): its NaNs made canonical, sealed, with `files`
+ * read-only at /in, an /out kept in memory and dropped, and nothing else (src/world.wac). Its output is passed on
+ * when it ends.
+ */
+async i32 runSealed(Sys sys, u8[] program, FileIn[] files, string[] dirs, string[] args, string[] a) {
+  u8[] runnable;
+  match (canonicalize(program)) {
+    Err(e): { sys.warn("claim: the program cannot be given canonical NaNs, so it is not run: \{e}"); return 1; }
+    Ok(m): { runnable = m.module; }
+  }
+  Files world = worldFiles(files, dirs, Written.create());
+  Child kid;
+  match (await sys.procs().spawn(runnable, args, Authority(world, null, null, null), Launch("/", false, false, false, false).sealed())) {
+    Err(e): { sys.warn("claim: the program did not start: \{e}"); return 1; }
+    Ok(k): { kid = k; }
+  }
+  await kid.input().close();
+  Ticket<Result<u8[], string>> log = drained(kid.output());
+  Ticket<Result<u8[], string>> err = drained(kid.errors());
+  i32 timeout = decimalOf(flag(a, "--timeout", "0")) as~ i32;
+  i32 code = 1;
+  match (await sys.clock().within(kid.exit(), timeout > 0 ? timeout : -1)) {
+    Ok(x): { code = x; }
+    Err(e): {
+      if (e is TimedOut) { kid.stop(); sys.warn("claim: out of time after \{timeout}ms"); }
+      else { sys.warn("claim: the program: \{e}"); }
+    }
+  }
+  Result<u8[], string> logged = await log;
+  Result<u8[], string> said = await err;
+  if (logged.isOk()) { await sys.stdout().write(logged.unwrap()); }
+  if (said.isOk()) { await sys.stderr().write(said.unwrap()); }
+  return code;
+}
+
+/** Everything a stream gives until it ends. */
+async Result<u8[], string> drained(Input in) {
+  u8[] all = u8[]();
+  while (true) {
+    auto got = await in.chunk();
+    if (got.isErr()) { return Result.Err("\{got.err()!}"); }
+    match (got.unwrap()) {
+      Data(bytes): {
+        u8[] next = u8[].filled(all.len() + bytes.len(), 0);
+        next.copyFrom(all, 0, 0, all.len());
+        next.copyFrom(bytes, 0, all.len(), bytes.len());
+        all = next;
+      }
+      End: { return Result.Ok(all); }
+      Failed(why): { return Result.Err("\{why}"); }
+    }
+  }
 }

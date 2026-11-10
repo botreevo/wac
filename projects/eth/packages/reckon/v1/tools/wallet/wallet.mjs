@@ -9,7 +9,7 @@
 //   node wallet.mjs propose KEYFILE REGISTRY NAME HASH
 //   node wallet.mjs address KEYFILE
 // RPC is $RPC, default http://127.0.0.1:8545.
-import { Wallet, JsonRpcProvider, ContractFactory, Contract, keccak256, toUtf8Bytes, parseEther } from '../oracle/node_modules/ethers/lib.esm/index.js';
+import { Wallet, JsonRpcProvider, ContractFactory, Contract, keccak256, toUtf8Bytes, parseEther } from '../../../tools/oracle/node_modules/ethers/lib.esm/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

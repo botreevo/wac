@@ -50,3 +50,33 @@ disparity. Shown live with `lc`: a clock read one slot early refused the optimis
 after fetching, never. After the fix, 10 live runs out of 10 were admitted. (A first guess, that the optimistic
 update could be no newer than the finality update, was wrong: the light client accepts that.) The optimistic update
 is still not asked for; it adds nothing to a finalized anchor.
+
+## `claim run`
+
+`claim run SUBJECT ROLE` takes every flag `claim admit` takes, and then, if the subject is admitted, fetches it and
+runs it:
+
+    claim run ens:NAME app --policy P --checkpoint ROOT --beacon-url URL --rpc NODE --mirror http://… -- ARGS…
+    claim run CID app --policy P --entry bin/app.wasm …        # a tree: PATH names the program in it
+    claim run CID app --policy P --out DIR …                   # write it out instead of running it
+
+- **What runs is what was admitted.** Every block comes through the resolver, which hashes it against its CID, and
+  a file's size is checked against what its root declares. A mirror serving other bytes ends the command (exit 1)
+  before anything runs.
+- **It runs in the machine,** as `derive` runs a recipe: its NaNs made canonical, launched sealed (no clock, no
+  random bytes, for it or anything it spawns), with no network and no environment. Its files are the machine's: a
+  tree is read-only at `/in`, and `/out` is writable but held in memory and dropped at the end. A program that is one
+  file sees an empty `/in`. Nothing reaches the host's disk.
+- **Its stdout and exit code are the command's.** Admission's account (the anchor, the name, the chain, the
+  decision) goes to stderr. Arguments after `--` are the program's, and none of them is read as a flag. The output is
+  passed on when the program ends, not streamed. `--timeout MS` bounds the run.
+- **Refusals:** not admitted, exit 4; a step of admission asked for and not done, exit 3, as for `admit`. In both
+  cases nothing is fetched or run.
+- **`--out PATH`** writes the admitted file's bytes to PATH, or the tree below PATH, and runs nothing. This is the
+  native helper of K3 (docs/decisions/K3-browser.md): a web app written out from checked bytes.
+
+`tools/run.sh` (task `reckon:run`, 16 checks) admits a one-file program and a tree from a mirror into an empty store
+and runs both. It checks that admission's account stays off stdout, that the program is sealed and can't reach host
+files or the environment, that a tree sees itself at `/in` read-only and may write `/out`, and that its arguments,
+stderr and exit code pass through. Then it writes both out with `--out`, and checks the refusals: a client without
+the endorsement runs nothing, and a mirror with other bytes for the program is caught at the fetch.

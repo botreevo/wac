@@ -1,0 +1,206 @@
+// deps — wac.lock's imports pinned by CID, checked, fetched and admitted (docs/lock.md).
+//
+//     deps pin                  fill in `cid` for every entry without one, from its cache checkout; never changes one
+//     deps check                re-hash every entry's cache checkout; refuse one that differs from its `cid`, or has none
+//     deps fetch [--git]        put each entry missing from the cache there: by CID from the store or a mirror, every
+//                               block checked, or with --git from its repository, hashed before it is kept; installed
+//                               only if it is its `cid`
+//     deps cids                 one `NAME CID` per entry
+//     deps admit ROLE --policy F
+//                               `claim admit CID ROLE` for every pinned entry, under one policy, over the claims here
+//                               and in every mirror; refused if any one is (no chain here: for revocations proved on
+//                               chain, run `claim admit` with its chain flags on each of `deps cids`)
+//
+// --lock F (default wac.lock), --store DIR (default .objects), --mirror DIR|http://HOST:PORT (repeatable). The cache
+// is $WAC_HOME/cache/git ($HOME/.wac by default), as wac and tools/deps.sh lay it out.
+
+import { Sys, ChildEnv, Launch } from "std";
+import { Result } from "core";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.httpStoreAt, ipfs.PROFILE, ipfs.FileIn,
+         ipfs.importDirExcept, ipfs.importGit, ipfs.readTree, ipfs.filesOnly, ipfs.emptyDirsOf } from "@/lib.wac";
+import { Dep, readDeps, writeDeps, cacheDirOf, MARKER } from "../src/deplock.wac";
+import { Index, Loaded, loadIndexes } from "../src/graph.wac";
+import { Chain, Decision, admit } from "../src/admit.wac";
+import { readPolicyFile } from "../src/policyfile.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+bool has(string[] a, string name) {
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] == name) { return true; } }
+  return false;
+}
+
+async string envOr(Sys sys, string name, string fallback) {
+  match (await sys.env().get(name)) {
+    Err(e): { return fallback; }
+    Ok(v): { return v is null || v!.len() == 0 ? fallback : string.fromBytes(v!); }
+  }
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 1) { sys.warn("usage: deps pin|check|fetch|cids|admit … (see the source)"); return 2; }
+  string cmd = a[0];
+  string lockPath = flag(a, "--lock", "wac.lock");
+  string home = await envOr(sys, "WAC_HOME", (await envOr(sys, "HOME", "")) + "/.wac");
+  Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
+  Store[] mirrors = Store[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != "--mirror") { continue; }
+    Store m = Store.dir(sys.files(), a[i + 1]);
+    if (isHttp(a[i + 1])) {
+      match (httpStoreAt(sys.net(), a[i + 1])) { Err(e): { sys.warn("deps: \{e}"); return 2; } Ok(h): { m = h; } }
+    }
+    Store[] next = Store[].filled(mirrors.len() + 1, m);
+    for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
+    mirrors = next;
+  }
+  Resolver r = Resolver(store, mirrors);
+
+  Dep[] deps;
+  match (await sys.readFile(lockPath)) {
+    Err(e): { sys.warn("deps: \{lockPath}: \{e}"); return 1; }
+    Ok(text): {
+      match (readDeps(text)) { Err(e): { sys.warn("deps: \{e}"); return 1; } Ok(ds): { deps = ds; } }
+    }
+  }
+
+  if (cmd == "pin") {
+    i32 added = 0;
+    for (i32 i = 0; i < deps.len(); i++) {
+      if (deps[i].cid != "") { continue; }
+      string dir = cacheDirOf(home, deps[i]);
+      if (!(await complete(sys, dir))) { sys.warn("deps: \{deps[i].name}: not in the cache at \{dir} (deps fetch --git)"); return 1; }
+      match (await importDirExcept(store, sys.files(), dir, PROFILE(), [MARKER()])) {
+        Err(e): { sys.warn("deps: \{deps[i].name}: \{e}"); return 1; }
+        Ok(c): { deps[i].cid = c.text(); added++; sys.log("\{deps[i].name} \{c.text()}"); }
+      }
+    }
+    if (added == 0) { sys.warn("deps: every entry is pinned already"); return 0; }
+    match (await sys.writeFile(lockPath, writeDeps(deps).toBytes())) { Err(e): { sys.warn("deps: \{lockPath}: \{e}"); return 1; } Ok(_): { } }
+    sys.warn("deps: \{added} pinned in \{lockPath}");
+    return 0;
+  }
+
+  if (cmd == "cids") {
+    for (i32 i = 0; i < deps.len(); i++) { sys.log("\{deps[i].name} \{deps[i].cid == "" ? "-" : deps[i].cid}"); }
+    return 0;
+  }
+
+  if (cmd == "check") {
+    i32 bad = 0;
+    for (i32 i = 0; i < deps.len(); i++) {
+      string why = await checked(sys, home, deps[i]);
+      if (why == "") { sys.log("ok    \{deps[i].name} \{deps[i].cid}"); } else { sys.log("BAD   \{deps[i].name}: \{why}"); bad++; }
+    }
+    return bad == 0 ? 0 : 1;
+  }
+
+  if (cmd == "fetch") {
+    i32 bad = 0;
+    for (i32 i = 0; i < deps.len(); i++) {
+      Dep d = deps[i];
+      string dir = cacheDirOf(home, d);
+      if (await complete(sys, dir)) { sys.log("have  \{d.name}"); continue; }
+      string why = await fetched(sys, home, store, r, d, has(a, "--git"));
+      if (why == "") { sys.log("got   \{d.name} \{d.cid}"); } else { sys.log("BAD   \{d.name}: \{why}"); bad++; }
+    }
+    return bad == 0 ? 0 : 1;
+  }
+
+  if (cmd == "admit" && a.len() >= 2) {
+    string path = flag(a, "--policy", "");
+    u8[] text;
+    match (await sys.readFile(path)) { Err(e): { sys.warn("deps: \{path}: \{e}"); return 1; } Ok(b): { text = b; } }
+    Loaded loaded = loadIndexes(store, mirrors);
+    for (i32 i = 0; i < loaded.refused.len(); i++) { sys.warn("deps: left out: \{loaded.refused[i]}"); }
+    match (readPolicyFile(text)) {
+      Err(e): { sys.warn("deps: \{e}"); return 1; }
+      Ok(p): {
+        i32 refused = 0;
+        for (i32 i = 0; i < deps.len(); i++) {
+          if (deps[i].cid == "") { sys.log("REFUSED \{deps[i].name}: not pinned (deps pin)"); refused++; continue; }
+          match (parseCid(deps[i].cid)) {
+            Err(e): { sys.log("REFUSED \{deps[i].name}: \{e}"); refused++; }
+            Ok(c): {
+              Decision d = admit(p, loaded.index, r, Chain.none(), c, a[1]);
+              sys.log((d.ok ? "ADMITTED " : "REFUSED ") + "\{deps[i].name} \{c.text()}");
+              for (i32 j = 0; j < d.why.len(); j++) { sys.log("  " + d.why[j]); }
+              if (!d.ok) { refused++; }
+            }
+          }
+        }
+        return refused == 0 ? 0 : 4;
+      }
+    }
+  }
+  sys.warn("deps: unknown command \{cmd}");
+  return 2;
+}
+
+/** Whether the cache holds a finished checkout at `dir`: the marker is written last. */
+async bool complete(Sys sys, string dir) { return (await sys.files().stat(dir + "/" + MARKER())).isOk(); }
+
+/** "" when `d`'s checkout in the cache is its `cid`, else why not. Nothing is kept: the blocks go to memory. */
+async string checked(Sys sys, string home, Dep d) {
+  if (d.cid == "") { return "not pinned: no cid (deps pin)"; }
+  string dir = cacheDirOf(home, d);
+  if (!(await complete(sys, dir))) { return "not in the cache at \{dir} (deps fetch)"; }
+  match (await importDirExcept(Store.memory(), sys.files(), dir, PROFILE(), [MARKER()])) {
+    Err(e): { return e; }
+    Ok(c): { return c.text() == d.cid ? "" : "the cache holds \{c.text()}, not \{d.cid}"; }
+  }
+}
+
+/**
+ * Put `d` into the cache, or say why not. The tree comes from the store or a mirror by its CID (each block checked),
+ * or with `git` from its repository, imported and compared with the CID before anything is kept. It is written
+ * beside the cache, moved into place, checked again from disk, and only then marked complete.
+ */
+async string fetched(Sys sys, string home, Store store, Resolver r, Dep d, bool git) {
+  if (d.cid == "") { return "not pinned: no cid, so nothing to check a fetch against"; }
+  Cid want;
+  match (parseCid(d.cid)) { Err(e): { return e; } Ok(c): { want = c; } }
+  string dir = cacheDirOf(home, d);
+  if (r.block(want).isErr()) {
+    if (!git) { return "no source has \{d.cid} (--mirror, or --git to fetch it from \{d.git})"; }
+    string scratch = dir + ".git-fetch";
+    await sys.files().remove(scratch, true);
+    await sys.files().mkdir(scratch, true);
+    match (await sys.procs().exec("git", ["clone", "-q", "--bare", d.git, scratch], u8[](), ChildEnv.inherited(), Launch("", false, false, false, false))) {
+      Err(e): { return "cannot run git: \{e}"; }
+      Ok(ran): { if (!ran.ok()) { await sys.files().remove(scratch, true); return "git clone \{d.git}: \{string.fromBytes(ran.stderr)}"; } }
+    }
+    Result<Cid, string> got = await importGit(store, sys.procs(), scratch, d.commit, PROFILE());
+    await sys.files().remove(scratch, true);
+    match (got) {
+      Err(e): { return "\{d.git} at \{d.commit}: \{e}"; }
+      Ok(c): { if (c.text() != d.cid) { return "\{d.git} at \{d.commit} is \{c.text()}, not \{d.cid}: refused, nothing kept in the cache"; } }
+    }
+  }
+  FileIn[] tree;
+  match (readTree(r, want)) { Err(e): { return e; } Ok(t): { tree = t; } }
+  string part = dir + ".partial";
+  await sys.files().remove(part, true);
+  string[] dirs = emptyDirsOf(tree);
+  for (i32 i = 0; i < dirs.len(); i++) { await sys.files().mkdir(part + "/" + dirs[i], true); }
+  FileIn[] files = filesOnly(tree);
+  for (i32 i = 0; i < files.len(); i++) {
+    string path = part + "/" + files[i].path;
+    i32 slash = path.len() - 1;
+    while (path.slice(slash, slash + 1) != "/") { slash--; }
+    await sys.files().mkdir(path.slice(0, slash), true);
+    match (await sys.writeFile(path, files[i].content)) { Err(e): { return "\{path}: \{e}"; } Ok(_): { } }
+  }
+  await sys.files().remove(dir, true);
+  match (await sys.files().rename(part, dir)) { Err(e): { return "\{dir}: \{e}"; } Ok(_): { } }
+  match (await importDirExcept(Store.memory(), sys.files(), dir, PROFILE(), [MARKER()])) {
+    Err(e): { return e; }
+    Ok(c): { if (c.text() != d.cid) { await sys.files().remove(dir, true); return "written, it reads back as \{c.text()}: removed"; } }
+  }
+  match (await sys.writeFile(dir + "/" + MARKER(), u8[]())) { Err(e): { return "\{dir}: \{e}"; } Ok(_): { } }
+  return "";
+}

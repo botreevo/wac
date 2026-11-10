@@ -44,7 +44,14 @@ an anchor. Every step is one this repository already does on its own, and the sc
 
 ## What it showed (2026-11-10)
 
-24 of 24, and 22 of 22 with QUICK. Every derivation agreed across V8 and wasmtime. The app's CID
+24 of 24, and 22 of 22 with QUICK. Every derivation agreed across V8 and wasmtime.
+
+With LADDER, at wac 64e87365, the run passes 27 of 27:
+- the ladder built a compiler from its rungs (2,614,977 bytes) with no compiler binary;
+- inside the machine, on both engines, that compiler built the same compiler tree as the seed;
+- the compiler was admitted through `agree`, both origins holding;
+- with the ladder's endorsement revoked on a copy of the store, the seed alone was refused ("origin 2 of 2 does not
+  hold"). The app's CID
 (`bafkreihqj7pxd3hu…`) is the same whether the seed or the compiler it built does the building. That is the
 compiler's fixed point (selfbuild.sh) seen from the outside: the derived compiler builds exactly what the seed builds.
 

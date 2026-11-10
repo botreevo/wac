@@ -18,12 +18,14 @@ site = os.path.join(here, "site")
 out = sys.argv[1]
 
 DEMOS = {
-    "capstone": ("The capstone", "QUICK=1 sh packages/reckon/tools/capstone.sh WORKDIR",
+    "capstone": ("The capstone", "LADDER=… sh packages/reckon/tools/capstone.sh WORKDIR",
                  "Source to a compiler to an app to its run, each a derivation signed by a runner on V8 and one on "
-                 "wasmtime; claims published to a mirror; an ENS name on a devnet pointing at the app; and a fresh "
-                 "client that resolves the name by proof, takes the claims from the mirror, fetches and checks the "
-                 "bytes, admits and runs it. Then the mainnet half from a checkpoint, and the refusals. QUICK uses the "
-                 "seed compiler for the app's build instead of one the seed built (the selfbuild demo shows those agree)."),
+                 "wasmtime. The compiler has two unrelated origins that must agree: the seed, and a compiler wac's "
+                 "bootstrap ladder builds from its hand-written rungs (diverse double-compiling, the agree rule); "
+                 "withdraw either and the compiler is refused. Then claims published to a mirror, an ENS name on a "
+                 "devnet pointing at the app, and a fresh client that resolves the name by proof, takes the claims "
+                 "from the mirror, fetches and checks the bytes, admits and runs it; the mainnet half from a "
+                 "checkpoint; and the refusals."),
     "admit-by-name": ("vitalik.eth, from a checkpoint", "sh packages/reckon/tools/admit-by-name.sh WORKDIR",
                       "Offline on recorded mainnet data: one claim admit from a beacon checkpoint to a decision, with "
                       "the beacon data from a directory and then over the light-client REST API from a replaying "

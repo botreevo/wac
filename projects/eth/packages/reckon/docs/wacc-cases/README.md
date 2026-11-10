@@ -22,7 +22,11 @@ file at line numbers that are not its own (47, 52, 212). The likely cause: varia
 
 ## Aggregated test modules and constants
 
-Also 2026-11-10. `wac test` over every suite in wac-eth fails to emit its aggregate module — *a constant whose value
-is not a constant expression* — once `packages/ipfs/test` is among them. The same suite passes alone and paired with
-any one other suite, and with nine of the eleven; it fails only when combined with both wacuum's suites and the rest.
-Not reduced. `tasks.json5` runs `packages/ipfs/test` as its own invocation meanwhile.
+Also 2026-11-10. `wac test` over several packages' suites at once compiles them into one aggregated module, and for
+some combinations wacc refuses to emit it: *a constant whose value is not a constant expression*. Seen with
+`packages/ipfs/test` in the full set, and with `packages/reckon/test/admit_test.wac` together with
+`packages/wacuum-devnet/test`. Each suite passes alone and alongside most others. For admit_test with the devnet's
+tests, the failure needs at least one test to reach the admission code: with only its helpers (which nothing reaches)
+it emits. Not caused by names admit_test declares: renaming its constants (one, `ALICE`, was also the devnet's) and
+turning them into functions changed nothing. Not reduced further. wac-eth's `test` task runs one package per
+invocation meanwhile.

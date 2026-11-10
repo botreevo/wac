@@ -47,7 +47,7 @@ has been fixed and why.
 | [0390a](closed/0390a-a-static-and-a-literal-are-not-duplicate-switch-cases.md) | `case K:` beside `case 3:` with `static i32 K = 3` is accepted — is a static a constant for duplicate cases? | missing feature | not implemented |
 | [0389a](closed/0389a-signed-minimum-remainder-minus-one-traps-or-answers-zero.md) | `i32.MIN % -1`: the spec says `%` traps on the signed minimum divided by `-1`; wasm and static evaluation answer 0 | missing feature | wrong answer |
 | [0388a](closed/0388a-two-symbols-spelled-alike-collide-as-members.md) | Two symbols with the same declared spelling name one member in the emitter: `p.[tag]` and `p.[other]` read the same field | bug | wrong answer |
-| [0379a](open/0379a-an-async-machine-is-attributed-to-its-struct-line-and-its-coroutine-to-line-one.md) | An `async` method's state machine is attributed to its struct's line and every coroutine's entry to line 1, so coverage keys all of a type's machines to one line | diagnostic | wrong answer |
+| [0379a](closed/0379a-an-async-machine-is-attributed-to-its-struct-line-and-its-coroutine-to-line-one.md) | An `async` method's state machine is attributed to its struct's line and every coroutine's entry to line 1, so coverage keys all of a type's machines to one line | diagnostic | wrong answer |
 | [0378a](closed/0378a-a-union-with-void-as-a-member-emits-invalid-wasm.md) | A union with `void` as a member — `Ticket.any` over a `Ticket<void>` — emits a module the engine refuses; the spec does not say what `union<A, void>` is, and the three answers differ | bug | invalid wasm |
 | [0377a](closed/0377a-a-leaving-match-arm-in-a-function-whose-error-type-is-gathered-emits-invalid-wasm.md) | In a function answering `Result<T>` (error type gathered), `Err(e): return Result.Err(…)` as a match-expression arm checks clean and emits a module the engine refuses — *a null in a never slot* for a `main`. Written `Result<T, string>` it works (case 0527), so the arm's `Err` seems not to reach what the union gathers | bug | invalid wasm |
 | [0376a](closed/0376a-manyfiles-test-traps-at-every-commit-since-the-spec-rewrite.md) | `manyfiles_test`'s first test, *more files than the linker's tables used to hold*, traps in about a second on `origin/master`, at `d59a48df0` and at `a93934733` (2026-10-03); older sources do not compile with today's compiler, and the test file last changed on 2026-10-01. The other four tests in the file pass | bug | trap |
@@ -148,7 +148,7 @@ has been fixed and why.
 
 ## Closed
 
-368 issues, 329 closed.
+368 issues, 330 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

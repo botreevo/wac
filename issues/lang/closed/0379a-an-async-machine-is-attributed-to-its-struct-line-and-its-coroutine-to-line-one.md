@@ -1,7 +1,6 @@
 # 0379a — an `async` machine's branch points land on its struct's line, and its coroutine's entry on line 1
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `packages/wacc/src/asynclower.wac`'s `loweredMethods` and `placeLike`; `packages/wacc/test/wac/coverage_test.wac` `test_coverage_an_async_methods_machine_is_on_the_methods_line`
 - **Reported by:** agent-a
 - **Date:** 2026-10-17
 - **Kind:** diagnostic
@@ -33,3 +32,7 @@ count of 0 among them — and every coroutine's `entry` in `fs.wac` and `remote.
   `remote.wac:1` with this issue as the reason; both pins go when this is fixed, and the points then
   land on the method lines, where the ledger's existing reasons (host mounts, live channels) apply.
 - Diagnostics in lowered code are affected the same way: a span inside a machine names the struct.
+
+## Fix
+
+A method's machine `Site` takes its line and column from `me.nameTok` rather than the struct's `Decl`, keeping `1000 + 100 * m` above the method's column for its lambdas. Each coroutine form's synthesised name token — appended after the source — is put at the position of the name it was lowered from (`placeLike`), for methods and free functions both. Measured on a struct with two `async` methods and an `async` function: 12 `case` and 2 `loop` points on the struct's line and four entries at `1:1` before; 6 `case` and 1 `loop` on each method's own line, and none at `1:1`, after. Two methods of one name in two structs of a file share one `__wacCo_` token, so the second's position wins for both entries. Separately, and as before: the same table gives `m.wac` points on lines past the end of the file (32–85 of a 25-line file), which look like lowered core or std code attributed to the entry — not looked into.

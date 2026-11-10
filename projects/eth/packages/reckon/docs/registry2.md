@@ -87,6 +87,20 @@ On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row p
   state of that block is not available") whenever a block landed in between. Through the liar, which adds a hop and a
   second proof request, that happened in 1 run in 3. A `--dev` node now keeps the last 16 blocks' states (the
   engine's `states`; `packages/wacuum/test/dev_test.wac`), and the readers here and in v1's `trust.wac` retry 8 times.
+- **The lying node sometimes told the truth** (fixed). It hid a set slot by substituting the proof that one fixed
+  other key (`0x…77`) is absent. In a secure trie, when that key's path and the slot's share a branch holding only
+  the slot's leaf, the absence proof *is* the slot's proof: the "lie" was the truth, the reader rightly believed it,
+  and admission refused for the honest reason, not because a proof failed. The keys are random each run, so this
+  happened on some runs only: reckon1 saw 63 of 66 once in five. Measured directly, the substitute was the honest
+  proof for 1 of 24 revocations in a fresh registry. `tools/liar.mjs` now tries other keys until the substitute
+  differs from the slot's own proof. v1's `e2e.sh` uses the same liar and gets the same fix.
+- **registry2.sh's own hygiene** (fixed). A run stopped by a signal left its devnet and lying node holding their ports,
+  since dash runs an EXIT trap on a normal exit only, and the next run then tested *that* chain without noticing (shown
+  by killing a run and starting another: 66 of 66, all against the orphan). It now kills its nodes on INT, TERM and
+  HUP too, refuses to start when either port already answers, checks the node that answers is its own, and refuses a
+  wacuum that keeps only its head's state (built before 1fd0013, since `dist/` is not in git) rather than flaking on
+  it. The delayed-name window was 8 s with 4–6 s to spare on an idle machine; it is 20 s, checked by one resolve. The
+  "unreachable chain" check uses port 1 rather than PORT+40, which another run could hold.
 - **The liar's refusal is not always worded the same.** Depending on where the substitute proof diverges from the real
   trie, mpt says either "the proof ends where a node hashing to … was expected" or "node N hashes to …, but its parent
   named …". v1's e2e matched the first phrase only, which held only because of the shape of its tries; it now accepts

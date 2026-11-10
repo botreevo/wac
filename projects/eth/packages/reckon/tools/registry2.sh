@@ -39,12 +39,35 @@ wac build --quiet --allow-read --allow-write --allow-net "$here/cmd/claim.wac" -
 wac build --quiet --allow-read --allow-write --allow-run "$here/cmd/derive.wac" -o "$here/dist/derive" >/dev/null
 wac build --quiet "$here/corpus/files.wac" -o "$here/dist/files" >/dev/null
 CL="wac $here/dist/claim.wasm"
+# Our own nodes only. A port something already answers on would have every check run against that instead (a devnet
+# left by a run that was killed, say): the run would test the wrong chain, and pass or fail for reasons of its own.
+rpc() { curl -s -m2 -X POST -H 'content-type: application/json' --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" "http://127.0.0.1:$1/"; }
+for p in $port $liar; do
+  if curl -s -m1 -o /dev/null "http://127.0.0.1:$p/" 2>/dev/null; then echo "registry2: port $p is taken (a node left by an earlier run?); stop it, or set PORT" >&2; exit 2; fi
+done
 mkdir -p "$work/devnet"
 ( cd "$work/devnet" && exec wac "$wacuum" --dev --datadir data --port "$port" > node.log 2>&1 ) &
 node_pid=$!
-trap 'kill $node_pid ${liar_pid:-} 2>/dev/null || true' EXIT
-until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "http://127.0.0.1:$port/" >/dev/null; do sleep 0.5; done
+# On any ending, the nodes this run started go with it. dash runs an EXIT trap on a normal exit only, so a run stopped
+# by a signal (a timeout, ^C) used to leave its devnet and lying node holding their ports.
+cleanup() { kill $node_pid ${liar_pid:-} 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM HUP
+until rpc $port eth_blockNumber '[]' >/dev/null; do
+  kill -0 $node_pid 2>/dev/null || { echo "registry2: the devnet did not start:" >&2; tail -5 "$work/devnet/node.log" >&2; exit 2; }
+  sleep 0.5
+done
 export RPC="http://127.0.0.1:$port"
+# A wacuum built before it kept recent states (1fd0013) proves only its head, so a proof can lose the race with the next
+# block: that showed as the three lying-node checks failing together. dist/ is not in git, so say so rather than flake.
+until [ "$(rpc $port eth_blockNumber '[]' | sed -n 's/.*"result":"0x\([0-9a-f]*\)".*/\1/p')" != 0 ]; do sleep 0.5; done
+sleep 2.5
+n=$(rpc $port eth_blockNumber '[]' | sed -n 's/.*"result":"\(0x[0-9a-f]*\)".*/\1/p')
+prev=$(printf '0x%x' $((n - 1)))
+if rpc $port eth_getBalance "[\"0x0000000000000000000000000000000000000000\",\"$prev\"]" | grep -q "not available"; then
+  echo "registry2: $wacuum keeps only its head's state; rebuild it (wac task wacuum:build)" >&2; exit 2
+fi
 printf '1111111111111111111111111111111111111111111111111111111111111111' > "$keys/dev"
 for k in endorser list otherlist publisher stranger relayer runner reviewer; do
   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$keys/$k"
@@ -116,14 +139,18 @@ step "4. delayed names"
 nameA=$($R cid "$work/app1.bin"); nameB=$($R cid "$work/app4.bin")
 P=$addr_publisher
 expect refused "a name nobody claimed" "is not a name" -- $R resolve "hello@$P" $C
-expect ok "claim hello → app1, changes to wait 8 s" -- $wallet claim "$keys/publisher" "$registry" hello "$nameA" 8
-expect ok "it resolves at once" "$nameA delay 8s" -- $R resolve "hello@$P" $C
+# The delay is the window for the checks during it: two transactions waiting for blocks and a resolve, which left 4 to 6
+# of 8 seconds to spare on an idle machine, and none on a busy one. 20 s leaves room for both.
+expect ok "claim hello → app1, changes to wait 20 s" -- $wallet claim "$keys/publisher" "$registry" hello "$nameA" 20
+expect ok "it resolves at once" "$nameA delay 20s" -- $R resolve "hello@$P" $C
 expect refused "a stranger cannot move someone else's name: under the stranger's address it is unclaimed" "not claimed" -- $wallet propose "$keys/stranger" "$registry" hello "$nameB"
 expect refused "nor claim it again" "already claimed" -- $wallet claim "$keys/publisher" "$registry" hello "$nameB" 0
 expect ok "the publisher proposes app4, and a delay of 1 s" -- sh -c "$wallet propose $keys/publisher $registry hello $nameB && $wallet propose-delay $keys/publisher $registry hello 1"
 expect ok "during the delay: still app1, with app4 and the shorter delay visible as pending" "pending $nameB" -- $R resolve "hello@$P" $C
-expect ok "…and the delay still 8 s" "$nameA delay 8s" -- $R resolve "hello@$P" $C
-echo "   waiting out the 8 s delay"; sleep 9
+during=$out   # one resolve for both checks of the window
+if printf '%s' "$during" | grep -qF "$nameA delay 20s"; then pass=$((pass+1)); echo "   PASS (…and the delay still 20 s)"
+else fail=$((fail+1)); echo "   FAIL (…and the delay still 20 s: $(printf '%s' "$during" | head -1))"; fi
+echo "   waiting out the 20 s delay"; sleep 21
 expect ok "after it, with no write since: app4, and the new delay" "$nameB delay 1s" -- $R resolve "hello@$P" $C
 
 step "5. claim admit, under a policy file, with --rpc: an endorsed object"
@@ -145,7 +172,7 @@ expect ok "unrejected" -- $wallet unreject "$keys/list" "$registry" "$cid5"
 expect ok "the endorser revokes the endorsement on chain" -- $wallet revoke "$keys/endorser" "$registry" "$s5"
 expect refused "claim admit refuses it" "endorsed by nobody" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs $CH
 expect ok "without --rpc the chain is not asked, and it is admitted: the revocation lives only on chain" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs
-expect refused "a chain asked for and unreachable refuses rather than admits" "ECONNREFUSED" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs --rpc 127.0.0.1:$((port + 40)) --registry "$registry" --code-hash "$codehash"
+expect refused "a chain asked for and unreachable refuses rather than admits" "ECONNREFUSED" -- $CL admit "$cid5" app --policy "$work/policy.json5" $cs --rpc 127.0.0.1:1 --registry "$registry" --code-hash "$codehash"
 
 step "5b. claim admit with --rpc: a derivation, its program rejected on chain and then its derivation revoked"
 ds="--store $work/dstore"

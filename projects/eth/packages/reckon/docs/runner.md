@@ -152,6 +152,20 @@ the policy, `compiler: [{ derived: { … program: "compiler" … } }]` with A as
 history would be told. Programs that import packages beyond std need those packages in the input tree, laid out where
 the compiler's lock resolves them; that is the next step toward building wac-eth itself this way.
 
+### With dependencies (2026-11-10)
+
+`tools/builddeps.sh` builds wac-eth's own `obj` command, which imports wac's library, the same way. The input tree is
+wac-eth's source plus every dependency `wac.lock` pins, laid out as wac's package cache (`home/cache/git/<repo>/<commit>/`).
+V8 and wasmtime derive the same output, and the program is byte-identical to the same compiler run natively, although
+the cache sits at a different absolute path in the two. The cache location is not in the output. The derived `obj`
+works.
+
+**One thing stands outside the machine.** The compiler finds its cache through `$WAC_HOME`, and the machine gives a
+program no environment. For now the runner hands the program its own (`derive --env-from-runner`), started under
+`env -i WAC_HOME=…`, and such a run is never signed. The fix is for the machine to take an `env` input (a file of
+`NAME=value` lines) that the runner serves as the program's whole environment. That needs wac to let a parent build an
+`Env` for a child, as `Files.of` builds its file system; it is asked of wac.
+
 ## Running it
 
 ```sh

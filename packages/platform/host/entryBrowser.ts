@@ -16,9 +16,27 @@ import { browserWorld, type BrowserWorldOptions } from "./browser.ts";
 import { callMain, mainArgs, WacExit } from "./provider.ts";
 import { HOST_HTTP, type HostCapability } from "./hosthttp.ts";
 import type { AppModule } from "./entry.ts";
+import { runAsync } from "./asynchost.ts";
+import type { DirHandle } from "./browser.ts";
 
 /** `provides`: the capabilities the page answers by name (`hosthttp.ts`), which the worker's host offers. */
 type Start = { sab: SharedArrayBuffer; child?: boolean; provides?: HostCapability[] };
+/**
+ * **Or no shared memory at all**, for a page that is not cross-origin isolated (`asynchost.ts`): the worker serves the
+ * program itself, with `browserWorld` handed what the page would have handed it, and sends back what it writes.
+ * `has` says which of the page's callbacks exist, so the world behaves as it would with the page's own options.
+ */
+type StartAsync = {
+  async: true;
+  args: (string | Uint8Array)[];
+  root?: DirHandle;
+  writable?: boolean;
+  http?: boolean;
+  cwd?: string;
+  has: { write: boolean; writeErr: boolean; warn: boolean; closeOutput: boolean };
+};
+/** What an async worker sends the page besides its result. */
+type Said = { said: "write" | "writeErr"; bytes: Uint8Array } | { said: "warn"; line: string } | { said: "close"; toErr: boolean };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 /**
@@ -42,6 +60,7 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
   // JavaScript gets a failed child rather than a dead parent. wac-mono issue 0021.
   (scope as unknown as { postMessage(m: unknown): void }).postMessage({ ready: true });
   scope.onmessage = (ev: MessageEvent) => {
+    if ((ev.data as StartAsync).async === true) return runAsyncWorker(ev.data as StartAsync, load, (m) => (scope as unknown as { postMessage(m: unknown): void }).postMessage(m));
     const start = ev.data as Start;
     void (async () => {
       const b = bridgeOf(start.sab);
@@ -59,6 +78,30 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
       }
     })();
   };
+}
+
+/** The worker half without shared memory: the program and its host in this worker (`asynchost.ts`). */
+function runAsyncWorker(start: StartAsync, load: () => Promise<AppModule>, post: (m: unknown) => void): void {
+  const say = (m: Said) => post(m);
+  void (async () => {
+    try {
+      const app = await load() as unknown as Record<string, unknown>;
+      const world = browserWorld({
+        args: start.args,
+        root: start.root,
+        writable: start.writable,
+        http: start.http,
+        cwd: start.cwd,
+        write: start.has.write ? (bytes) => say({ said: "write", bytes }) : undefined,
+        writeErr: start.has.writeErr ? (bytes) => say({ said: "writeErr", bytes }) : undefined,
+        warn: start.has.warn ? (line) => say({ said: "warn", line }) : undefined,
+        closeOutput: start.has.closeOutput ? (toErr) => say({ said: "close", toErr }) : undefined,
+      });
+      post(await runAsync(app, world, start.http ? [HOST_HTTP] : []));
+    } catch (e) {
+      post({ ok: false, error: e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e) });
+    }
+  })();
 }
 
 /** What a page needs to say about the environment it is offering. */
@@ -84,13 +127,9 @@ export type PageOptions = BrowserWorldOptions & {
 export async function runInPage(opts: PageOptions): Promise<number> {
   // Another one Deno's library does not declare, because it is a page property.
   const isolated = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated;
-  if (isolated !== true) {
-    throw new Error(
-      "this page is not cross-origin isolated, so SharedArrayBuffer is unavailable — " +
-        "serve it with Cross-Origin-Opener-Policy: same-origin and " +
-        "Cross-Origin-Embedder-Policy: require-corp",
-    );
-  }
+  // **Not isolated is not the end**: an `async` main runs without waiting (`asynchost.ts`), and one that is not is
+  // refused there, saying both ways out.
+  if (isolated !== true) return await runInPageAsync(opts);
 
   const bridge = newBridge();
   // `selfSource` so `spawnSelf` has something to run: a page has no filesystem of programs, and
@@ -126,6 +165,65 @@ export async function runInPage(opts: PageOptions): Promise<number> {
     worker.terminate();
     if (opts.workerSource !== undefined) URL.revokeObjectURL(url);
   }
+}
+
+/**
+ * `runInPage` for a page that is not cross-origin isolated: the worker serves its program itself, and the page only
+ * shows what it writes. Spawning is refused there, and so is a `main` that is not `async`.
+ */
+async function runInPageAsync(opts: PageOptions): Promise<number> {
+  if (opts.workerSource === undefined && opts.workerUrl === undefined) {
+    throw new Error("runInPage: neither a worker's source nor where it is");
+  }
+  // **An opaque origin refuses a module worker from a `blob:` URL** and takes one from a `data:` URL — measured in
+  // Chromium in a `sandbox="allow-scripts"` frame, which is the frame this path exists for.
+  const opaque = (globalThis as unknown as { origin?: string }).origin === "null";
+  const url = opts.workerSource === undefined
+    ? String(opts.workerUrl)
+    : opaque
+    ? "data:text/javascript;base64," + base64(new TextEncoder().encode(opts.workerSource))
+    : URL.createObjectURL(new Blob([opts.workerSource], { type: "text/javascript" }));
+  const worker = new Worker(url, { type: "module" });
+  try {
+    return await new Promise<number>((resolve, reject) => {
+      worker.addEventListener("message", (ev: MessageEvent) => {
+        const m = ev.data as Result | Said | { ready: true };
+        if ("ready" in m) return;
+        if ("said" in m) {
+          if (m.said === "warn") void opts.warn?.(m.line);
+          else if (m.said === "close") opts.closeOutput?.(m.toErr);
+          else if (m.said === "write") void opts.write?.(m.bytes);
+          else void opts.writeErr?.(m.bytes);
+          return;
+        }
+        if (m.ok) resolve(m.code);
+        else reject(new Error(m.error));
+      });
+      worker.addEventListener("error", (e: ErrorEvent) => {
+        e.preventDefault();
+        reject(new Error(e.message));
+      });
+      const start: StartAsync = {
+        async: true,
+        args: opts.args ?? [],
+        root: opts.root,
+        writable: opts.writable,
+        http: opts.http === true,
+        cwd: opts.cwd,
+        has: { write: !!opts.write, writeErr: !!opts.writeErr, warn: !!opts.warn, closeOutput: !!opts.closeOutput },
+      };
+      worker.postMessage(start);
+    });
+  } finally {
+    worker.terminate();
+    if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+  }
+}
+
+function base64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
 }
 
 /**

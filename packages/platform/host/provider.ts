@@ -64,9 +64,9 @@ export class WacExit extends Error {
 }
 
 /** An answer, in the one shape every request is answered in. */
-type Flat = { fault: number; text: string; bytes: Uint8Array; n: bigint; m: bigint; flags: number };
+export type Flat = { fault: number; text: string; bytes: Uint8Array; n: bigint; m: bigint; flags: number };
 
-const flat = (o: Partial<Flat>): Flat => ({
+export const flat = (o: Partial<Flat>): Flat => ({
   fault: o.fault ?? FAULT_NONE,
   text: o.text ?? "",
   bytes: o.bytes ?? EMPTY,
@@ -148,7 +148,7 @@ const nulJoined = (xs: Uint8Array[]): Uint8Array =>
   cat(...xs.flatMap((x, i) => (i === 0 ? [x] : [new Uint8Array([0]), x])));
 
 /** The launcher's payload for a request, or `null` for one it does not serve. */
-function payloadOf(op: number, a: number, b: number, text: string, bytes: Uint8Array): Uint8Array | null {
+export function payloadOf(op: number, a: number, b: number, text: string, bytes: Uint8Array): Uint8Array | null {
   switch (op) {
     case OP.NOW_MILLIS: case OP.MONOTONIC_NANOS: case OP.ARG_COUNT: case OP.READ_STDIN:
     case OP.READ_CHUNK: case OP.CWD: case OP.ASK_INTERRUPT:
@@ -230,7 +230,7 @@ const readOf = (out: Uint8Array): Flat => {
 };
 
 /** The launcher's reply to `op`, flattened as design 0013's answer table says. */
-function answerOf(op: number, out: Uint8Array): Flat {
+export function answerOf(op: number, out: Uint8Array): Flat {
   // A provided capability's answer carries every field itself (`hosthttp.ts`'s `capAnswer`).
   if (op >= HOST_HTTP.base && op < HOST_HTTP.base + HOST_HTTP.count) {
     const x = readCapAnswer(out);
@@ -310,7 +310,7 @@ function answerOf(op: number, out: Uint8Array): Flat {
 }
 
 /** A request whose answer, if it is dropped before it is read, still holds something to close. */
-const closerOf = (op: number): number | null => {
+export const closerOf = (op: number): number | null => {
   switch (op) {
     case OP.CONNECT: case OP.LISTEN: case OP.ACCEPT: case OP.BIND_DATAGRAM: case OP.SPAWN: case OP.SPAWN_SELF:
       return OP.CLOSE_SOCKET;

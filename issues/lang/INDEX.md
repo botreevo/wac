@@ -5,7 +5,7 @@ has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0449e](open/0449e-wait-on-an-async-call-has-no-type-without-a-ticket-import.md) | `async i32 one()` then `i32 x = one().wait();` in a file that imports nothing checks clean and emits an invalid module; with any `std` or `core` import it is *expected i32, found Result<i32, Stuck>* — `wait()` has no type when `Ticket` was reached only through an `async` result. wac1's area | bug | accepted program |
+| [0449e](closed/0449e-wait-on-an-async-call-has-no-type-without-a-ticket-import.md) | `async i32 one()` then `i32 x = one().wait();` in a file that imports nothing checks clean and emits an invalid module; with any `std` or `core` import it is *expected i32, found Result<i32, Stuck>* — `wait()` has no type when `Ticket` was reached only through an `async` result. wac1's area | bug | accepted program |
 | [0448e](open/0448e-ticket-any-over-only-void-tickets-emits-a-void-local.md) | `Ticket.any(f(), g())` over two `async void` calls checks clean and builds a module the engine refuses: `AnyValue<Ts>` collapses to `void` and `any`'s body declares a local of it. Left legal by `0378a`'s refusal, broken before it. wac1's area | bug | invalid wasm |
 | [0447e](open/0447e-the-spec-shows-within-with-nested-patterns-the-language-does-not-have.md) | `spec/7-library/44-std.md`'s only `within` example matches `Ok(Data(bytes))` and `Err(TimedOut t)` — nested patterns, which `0027` deferred — so the program it shows is *expected ')', found 't'*; it is marked `// fragment`, so nothing compiled it | diagnostic | a spec example that does not parse |
 | [0446e](closed/0446e-an-integer-literal-above-i64-skips-the-member-check.md) | `9223372036854775808.nofield` checks clean and the build cannot emit it (*member of an unknown type*); every literal up to `i64`'s maximum is refused with *no such field*, and so is the same value in a typed slot — a literal with no `i64` type is left untyped as a receiver, up to and past 2^64 | bug | accepted program |
@@ -42,10 +42,10 @@ has been fixed and why.
 | [0394a](open/0394a-wac-build-says-o-keeps-a-rejected-module-and-does-not.md) | When the engine rejects a built module, `wac` says `wac build … -o out` keeps it, and no file is written | bug | wrong answer |
 | [0393a](open/0393a-generic-tag-functions-and-markup-in-static-initialisers.md) | A generic tag function (`T first<T>(T[] kids)`) and markup in a static initialiser are refused | missing feature | not implemented |
 | [0392a](open/0392a-a-bound-method-with-its-own-type-arguments-as-a-value.md) | `c.pick<i32>` as a value is refused; the parser drops the written type arguments | missing feature | not implemented |
-| [0391a](open/0391a-a-lambda-capturing-a-match-binding-in-an-async-function.md) | A lambda capturing a match-arm binding inside an `async` function declines with "a type was registered while a body was being emitted … i32[][]" | bug | compile error |
+| [0391a](closed/0391a-a-lambda-capturing-a-match-binding-in-an-async-function.md) | A lambda capturing a match-arm binding inside an `async` function declines with "a type was registered while a body was being emitted … i32[][]" | bug | compile error |
 | [0390a](closed/0390a-a-static-and-a-literal-are-not-duplicate-switch-cases.md) | `case K:` beside `case 3:` with `static i32 K = 3` is accepted — is a static a constant for duplicate cases? | missing feature | not implemented |
 | [0389a](closed/0389a-signed-minimum-remainder-minus-one-traps-or-answers-zero.md) | `i32.MIN % -1`: the spec says `%` traps on the signed minimum divided by `-1`; wasm and static evaluation answer 0 | missing feature | wrong answer |
-| [0388a](open/0388a-two-symbols-spelled-alike-collide-as-members.md) | Two symbols with the same declared spelling name one member in the emitter: `p.[tag]` and `p.[other]` read the same field | bug | wrong answer |
+| [0388a](closed/0388a-two-symbols-spelled-alike-collide-as-members.md) | Two symbols with the same declared spelling name one member in the emitter: `p.[tag]` and `p.[other]` read the same field | bug | wrong answer |
 | [0379a](open/0379a-an-async-machine-is-attributed-to-its-struct-line-and-its-coroutine-to-line-one.md) | An `async` method's state machine is attributed to its struct's line and every coroutine's entry to line 1, so coverage keys all of a type's machines to one line | diagnostic | wrong answer |
 | [0378a](closed/0378a-a-union-with-void-as-a-member-emits-invalid-wasm.md) | A union with `void` as a member — `Ticket.any` over a `Ticket<void>` — emits a module the engine refuses; the spec does not say what `union<A, void>` is, and the three answers differ | bug | invalid wasm |
 | [0377a](closed/0377a-a-leaving-match-arm-in-a-function-whose-error-type-is-gathered-emits-invalid-wasm.md) | In a function answering `Result<T>` (error type gathered), `Err(e): return Result.Err(…)` as a match-expression arm checks clean and emits a module the engine refuses — *a null in a never slot* for a `main`. Written `Result<T, string>` it works (case 0527), so the arm's `Err` seems not to reach what the union gathers | bug | invalid wasm |
@@ -147,7 +147,7 @@ has been fixed and why.
 
 ## Closed
 
-366 issues, 316 closed.
+367 issues, 320 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

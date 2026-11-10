@@ -148,10 +148,11 @@ for (const name of files) {
       // **And the whole file set**, when there is one: what one file asks of another — a name it
       // re-exports, an import it may not make — is a question about both, and the entry alone
       // cannot answer it.
-      // A single file that imports is a file set too: what it is refused for may be a type `std` or
-      // `core` gives it, which the one-source checker never reads (spec case 0886).
+      // **Every refused case is a file set too**, one file or several: what it is refused for may be a type `std` or
+      // `core` gives it — imported (case 0886) or not (an `async` function's `Ticket`, case 0904) — which the one-source
+      // checker never reads. The file-set checker is the one `wac check` runs.
       let typedFiles = 0;
-      if (fileSet.length > 1 || /\bfrom\s+"/.test(src)) {
+      {
         e.drv_files(fileSet.length);
         for (const f of fileSet) {
           feed(f.text);

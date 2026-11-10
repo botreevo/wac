@@ -56,7 +56,7 @@ import { renderDiagnostics } from "../../wacc/src/render.wac";
 import { importSpecs } from "../../wacc/src/files.wac";
 import { Res, normalisePath, resolveFrom, resolveFromAt, resolveFromIn } from "../../wacc/src/path.wac";
 import { MANIFEST_NAME, candidateRoots, dirOf, isProjectSpecifier } from "../../wacpkg/src/root.wac";
-import { Gathered, ReadCache, Sources, exactly, gather, gatherRoots, gatherWith, projectRootAbs, resOf, wacHomeOf } from "./sources.wac";
+import { Gathered, ReadCache, Sources, exactly, gather, gatherFrom, gatherRoots, gatherRootsFrom, gatherWith, projectRootAbs, resOf, wacHomeOf } from "./sources.wac";
 import { Manifest, Match, Located, readManifest, manifestWhy, matchSpecifier, locate,
          M_OK } from "../../wacpkg/src/manifest.wac";
 import { Lock, LockEntry, readLock } from "../../wacpkg/src/lock.wac";
@@ -288,7 +288,7 @@ string buildCachePath(string[] argv, Env env, i32 argc, string cmd, string entry
   // stale hit would go on getting hits until the first build swept them away. Measured — a self-build
   // that should have recompiled came back in 160 ms with the bound at zero.
   if (keepBuilds(env) <= 0) { return ""; }
-  string home = wacHomeOf(env);
+  string home = homeOf(env, argv, argc);
   if (home == "") { return ""; }
   u8[]? id = flatten(env.get("WAC_COMPILER_ID").wait()).orElse(null);
   if ((id is null) || id!.len() == 0) { return ""; }
@@ -518,7 +518,7 @@ string[] allArgs(string[] argv, i32 argc) {
  */
 bool takesValue(string flag) {
   return flag == "-o" || flag == "--trace-slots" || flag == "--filter" || flag == "--ignore"
-      || flag == "--from" || flag == "--only";
+      || flag == "--from" || flag == "--only" || flag == "--wac-home";
 }
 
 string[] positionals(string[] argv, i32 argc) {
@@ -599,7 +599,7 @@ string[] flagsFor(string cmd) {
   if (cmd == "build") {
     return [
                     "--allow-read", "--allow-write", "--allow-net", "--allow-env", "--allow-run",
-                    "-o", "--quiet", "--coverage", "--trace", "--trace-slots", "--no-cache"
+                    "-o", "--quiet", "--coverage", "--trace", "--trace-slots", "--no-cache", "--wac-home"
     ];
   }
   if (cmd == "test") {
@@ -611,7 +611,7 @@ string[] flagsFor(string cmd) {
                     "--coverage", "--filter", "--ignore", "--quiet",
                     // **For the suite's chunks** (`onlyList` says why): run only these of the walked files, or
                     // build and remember the module and run nothing — the warm build every chunk then hits.
-                    "--only", "--compile-only"
+                    "--only", "--compile-only", "--wac-home"
     ];
   }
   // The grants and the destination, and nothing that needs a second command to finish — which is the
@@ -619,13 +619,13 @@ string[] flagsFor(string cmd) {
   if (cmd == "app") {
     return [
                     "--allow-read", "--allow-write", "--allow-net", "--allow-env", "--allow-run",
-                    "-o"
+                    "-o", "--wac-home"
     ];
   }
   // The grants govern the *program* these two start rather than this process, which is why they are
   // the only flags either takes: everything else on the line belongs to whatever is being run.
   if (cmd == "run") {
-    return ["--allow-read", "--allow-write", "--allow-net", "--allow-env", "--allow-run"];
+    return ["--allow-read", "--allow-write", "--allow-net", "--allow-env", "--allow-run", "--wac-home"];
   }
   if (cmd == "sh") {
     return [
@@ -636,7 +636,8 @@ string[] flagsFor(string cmd) {
   // `--js` asks for the glue rather than the bindings, so it is `bindgen`'s alone: on `check` or
   // `compile` it was accepted and read by nobody.
   if (cmd == "bindgen") { return ["--js", "--script", "--quiet"]; }
-  if (cmd == "compile") { return ["--quiet"]; }
+  if (cmd == "compile") { return ["--quiet", "--wac-home"]; }
+  if (cmd == "check") { return ["--wac-home"]; }
   if (cmd == "audit") { return ["--verbose"]; }
   if (cmd == "ctcompare") { return ["--all"]; }
   if (cmd == "self") { return ["--from", "--no-profile", "--keep-cache"]; }
@@ -756,6 +757,17 @@ i32 traceSlots(string[] argv, i32 argc) {
     return v;
   }
   return 0;
+}
+
+/**
+ * Where the package cache is: `--wac-home DIR` when it is given, else `$WAC_HOME` or `$HOME/.wac`. For a caller with no
+ * environment to hand the compiler — a deterministic runner gives its children none (wac-eth's reckon).
+ */
+string homeOf(Env env, string[] argv, i32 argc) {
+  for (i32 i = 1; i + 1 < argc; i++) {
+    if (argv[i] == "--wac-home") { return normalisePath(argv[i + 1]); }
+  }
+  return wacHomeOf(env);
 }
 
 /**
@@ -1307,7 +1319,7 @@ export async i32 main(Sys sys) {
   if (cmd == "check") {
     string[] given = string[].filled(pos.len(), "");
     for (i32 i = 0; i < pos.len(); i++) { given[i] = normalisePath(pos[i]); }
-    return await checkCommand(err, out, env, fs, given);
+    return await checkCommand(err, out, env, fs, given, homeOf(env, argv, argc));
   }
 
   // **A directory becomes one generated entry, before anything is compiled.** `wac test <dir>` walks
@@ -1442,7 +1454,7 @@ export async i32 main(Sys sys) {
     generated = aggregate;
   }
 
-  Sources src = await gather(fs, env, entry, cmd != "check" && cmd != "audit");
+  Sources src = await gatherFrom(fs, env, entry, cmd != "check" && cmd != "audit", homeOf(env, argv, argc));
   // **The aggregate is scratch, and this is the only place that has to know it.** `gather` has its
   // bytes now and every later use of `entry` is as a *name* — a cache key, a diagnostic, a report
   // heading — so nothing below reads the file again and it can go here, once, instead of at the
@@ -2275,7 +2287,7 @@ i32 installCommand(string[] argv, Output err, Output out, Env env, Files fs, i32
     return 2;
   }
 
-  string home = wacHomeOf(env);
+  string home = homeOf(env, argv, argc);
   if (home == "") {
     err.line("wac: neither WAC_HOME nor HOME is set, so there is nowhere to install to");
     return 2;
@@ -2368,7 +2380,7 @@ i32 uninstallCommand(string[] argv, Output err, Output out, Env env, Files fs, i
       return 2;
     }
   }
-  string home = wacHomeOf(env);
+  string home = homeOf(env, argv, argc);
   if (home == "") {
     err.line("wac: neither WAC_HOME nor HOME is set, so there is nowhere to uninstall from");
     return 2;
@@ -2503,7 +2515,7 @@ string diagnosticCount(string wire) {
  * `§wac-check-exclude-2ixx2cu`). One graph, merged from every root, checked once — and, like every
  * command, it ends by saying how much it read.
  */
-async i32 checkCommand(Output err, Output out, Env env, Files fs, string[] given) {
+async i32 checkCommand(Output err, Output out, Env env, Files fs, string[] given, string wacHome) {
   // **It always says what it read** (spec ch45 `§wac-cli-check-4mkq8wp`) — after errors and
   // warnings as much as after nothing, since the count is the part that cannot otherwise be seen.
   string[] roots = given;
@@ -2567,7 +2579,7 @@ async i32 checkCommand(Output err, Output out, Env env, Files fs, string[] given
     }
   }
   // **One graph from every root**, each file once: two roots that share an import share its check.
-  Gathered g = await gatherRoots(fs, env, roots);
+  Gathered g = await gatherRootsFrom(fs, env, roots, wacHome);
   if (g.error != "") {
     err.line("wacc: \{g.error}");
     return 1;

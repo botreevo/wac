@@ -11,11 +11,21 @@
 //     Analysis(analyser, …)        a derivation of `analyser` run on the object, witnessed enough, wrote `expect` at `path`
 //     Within(role, path)           the object is the file at `path` inside an output admitted in `role`: what a build
 //                                  produced (`out/app.wasm` in a compiler's output), taken out to be run
+//     Agree(rules)                 every rule holds, each `derived` one through a different recipe: one object with
+//                                  several unrelated origins that agree on it. Diverse double-compiling is this: a
+//                                  compiler admitted only when two compilers that share nothing but the source build it
+//                                  to the same bytes, so a backdoor would have to be in both
 //
 // and refused, whatever else holds, if a followed rejection list names it. A statement revoked by its own signer —
 // on the chain, or by a signed revocation in the index — counts for nothing.
+//
+// Conformance (docs/conformance.md): a policy may name, per machine, a suite: a tree whose `cases` file lists recipes
+// and the output each must give (or `none`: a run that must yield nothing, such as one past the machine's floor). A
+// witness to a derivation under that machine then counts only if the same signer, under the same runner name, has
+// witnessed every case as the suite says and none otherwise: a runner shows it implements the machine before its
+// word about anything else is taken.
 
-import { ipfs.Cid, ipfs.Resolver, ipfs.readFile, ipfs.readNode, ipfs.Node } from "@/lib.wac";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Resolver, ipfs.readFile, ipfs.readNode, ipfs.Node } from "@/lib.wac";
 import { Result } from "core";
 import { Recipe, recipeFrom, Statement } from "./claims.wac";
 import { Index, Held, same, contains, pushCid } from "./graph.wac";
@@ -38,11 +48,18 @@ export enum Rule {
   Derived(string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots),
   Analysis(Cid analyser, string slot, string path, string expect, string[] by, i32 atLeast),
   Within(string role, string path),
+  Agree(Rule[] rules),
 }
 
 export struct RoleRules {
   string role;
   Rule[] anyOf;
+}
+
+/** A machine's conformance suite: a tree whose `cases` file is `RECIPE OUTPUT` (or `RECIPE none`) per line. */
+export struct Conformance {
+  string machine;
+  Cid suite;
 }
 
 export struct Policy {
@@ -52,6 +69,7 @@ export struct Policy {
   string[] formats;
   u8[][] rejectLists;
   RoleRules[] roles;
+  Conformance[] conformance;
 }
 
 /** What the chain said: revocations as (signer, statement id), rejections as (list, subject). */
@@ -166,10 +184,40 @@ Decision alternative(Ctx c, Cid cid, string role, Rule rule) {
       bool ok = who.len() >= atLeast;
       return Decision(ok, ["  endorsed by \{list(who)} (need \{atLeast})"]);
     }
-    Derived(by, atLeast, runners, slots, otherSlots): { return derived(c, cid, by, atLeast, runners, slots, otherSlots); }
+    Derived(by, atLeast, runners, slots, otherSlots): { return derived(c, cid, by, atLeast, runners, slots, otherSlots, Cid[]()).d; }
     Analysis(analyser, slot, path, expect, by, atLeast): { return analysis(c, cid, analyser, slot, path, expect, by, atLeast); }
     Within(role2, path): { return within(c, cid, role2, path); }
+    Agree(rules): { return agree(c, cid, role, rules); }
   }
+}
+
+/**
+ * Every rule, each `derived` one through a recipe none of the others used. Tried in order, each taking the first recipe
+ * that satisfies it, so rules whose programs differ (which is the point of asking for more than one) never compete.
+ */
+Decision agree(Ctx c, Cid cid, string role, Rule[] rules) {
+  Cid[] used = Cid[]();
+  string[] why = ["  every one of \{rules.len()} origins must hold, each through its own recipe:"];
+  for (i32 i = 0; i < rules.len(); i++) {
+    Via v = match (rules[i]) {
+      Derived(by, atLeast, runners, slots, otherSlots): derived(c, cid, by, atLeast, runners, slots, otherSlots, used),
+      Root: Via(alternative(c, cid, role, rules[i]), null),
+      Endorsed(_, _): Via(alternative(c, cid, role, rules[i]), null),
+      Analysis(_, _, _, _, _, _): Via(alternative(c, cid, role, rules[i]), null),
+      Within(_, _): Via(alternative(c, cid, role, rules[i]), null),
+      Agree(_): Via(Decision(false, ["  an agree rule cannot hold another"]), null),
+    };
+    why = plusAll(why, indent(v.d.why));
+    if (!v.d.ok) { return Decision(false, plus(why, "  origin \{i + 1} of \{rules.len()} does not hold")); }
+    if (v.rid is not null) { used = pushCid(used, v.rid!); }
+  }
+  return Decision(true, why);
+}
+
+/** A rule's decision, and the recipe it held through when it is a derivation. */
+struct Via {
+  Decision d;
+  Cid? rid;
 }
 
 string list(string[] xs) {
@@ -191,16 +239,23 @@ Recipe? recipeOf(Ctx c, Cid id) {
 struct Witnessed {
   string[] names;
   string[] runners;
+  string[] excluded;
 }
 
-Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by) {
-  Witnessed w = Witnessed(string[](), string[]());
+Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by, string machine) {
+  Witnessed w = Witnessed(string[](), string[](), string[]());
+  Cid? suite = null;
+  for (i32 i = 0; i < c.p.conformance.len(); i++) { if (c.p.conformance[i].machine == machine) { suite = c.p.conformance[i].suite; } }
   Held[] origins = c.ix.origins(output);
   for (i32 i = 0; i < origins.len(); i++) {
     match (origins[i].statement) {
       Derivation(r, _, runner): {
         string n = nameOf(c.p, origins[i].signer);
         if (r.eq(rid) && has(by, n) && !has(w.names, n) && !revoked(c, origins[i])) {
+          if (suite is not null) {
+            string fault = conformanceFault(c, suite!, origins[i].signer, runner);
+            if (fault != "") { w.excluded = plus(w.excluded, "\{n} on \"\{runner}\": \{fault}"); continue; }
+          }
           w.names = plus(w.names, n);
           if (!has(w.runners, runner)) { w.runners = plus(w.runners, runner); }
         }
@@ -213,11 +268,11 @@ Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by) {
   return w;
 }
 
-Decision derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots) {
+Via derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots, Cid[] exclude) {
   string[] why = string[]();
-  Cid[] seen = Cid[]();
+  Cid[] seen = exclude;
   Held[] origins = c.ix.origins(cid);
-  if (origins.len() == 0) { return Decision(false, ["  no known recipe produces it"]); }
+  if (origins.len() == 0) { return Via(Decision(false, ["  no known recipe produces it"]), null); }
   for (i32 i = 0; i < origins.len(); i++) {
     Cid rid = match (origins[i].statement) { Derivation(r, _, _): r, Endorsement(s, _): s, Rejection(s, _): s, Revocation(s): s };
     if (contains(seen, rid)) { continue; }
@@ -226,8 +281,9 @@ Decision derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole
     if (rec is null) { why = plus(why, "  recipe \{short(rid)}: not found"); continue; }
     if (!has(c.p.machines, rec!.machine)) { why = plus(why, "  recipe \{short(rid)}: machine \{rec!.machine} is not one the policy accepts"); continue; }
     if (!has(c.p.formats, rec!.format)) { why = plus(why, "  recipe \{short(rid)}: format \{rec!.format} is not one the policy accepts"); continue; }
-    Witnessed w = witnesses(c, rid, cid, by);
+    Witnessed w = witnesses(c, rid, cid, by, rec!.machine);
     string count = "witnessed by \{list(w.names)} on \{w.runners.len()} runner(s) (need \{atLeast} on \{runners})";
+    for (i32 x = 0; x < w.excluded.len(); x++) { count += "; not counted: \{w.excluded[x]}"; }
     if (w.names.len() < atLeast || w.runners.len() < runners) { why = plus(why, "  recipe \{short(rid)}: \{count}"); continue; }
     Slot[] ss;
     match (slotsOf(c.r, rec!.input)) {
@@ -244,10 +300,11 @@ Decision derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole
       sub = plusAll(sub, indent(d.why));
       if (!d.ok) { all = false; }
     }
-    if (all) { return Decision(true, plusAll(["  recipe \{short(rid)}: \{count}"], sub)); }
+    if (all) { return Via(Decision(true, plusAll(["  recipe \{short(rid)}: \{count}"], sub)), rid); }
     why = plusAll(plus(why, "  recipe \{short(rid)}: \{count}, but an input is refused"), sub);
   }
-  return Decision(false, why);
+  if (why.len() == 0) { why = ["  no other recipe produces it"]; }
+  return Via(Decision(false, why), null);
 }
 
 string[] indent(string[] xs) {
@@ -272,7 +329,7 @@ Decision analysis(Ctx c, Cid cid, Cid analyser, string slot, string path, string
     for (i32 h = 0; h < c.ix.held.len(); h++) {
       Cid? out = match (c.ix.held[h].statement) { Derivation(r, o, _): r.eq(rid) ? o : null, Endorsement(_, _): null, Rejection(_, _): null, Revocation(_): null };
       if (out is null) { continue; }
-      Witnessed w = witnesses(c, rid, out!, by);
+      Witnessed w = witnesses(c, rid, out!, by, rec.machine);
       if (w.names.len() < atLeast) { continue; }
       u8[]? got = fileAt(c.r, out!, path);
       string text = got is null ? "(nothing)" : string.fromBytes(got!);
@@ -338,4 +395,63 @@ Cid? cidAt(Resolver r, Cid tree, string path) {
     if (!found) { return null; }
   }
   return at;
+}
+
+/**
+ * Why `signer`, running as `runner`, has not shown it implements the suite's machine; "" when it has. Every case must be
+ * witnessed by it, under that runner name and unrevoked, with the suite's output; a case whose output is `none` must
+ * have no such witness at all; and no witness of its may give a case another output.
+ */
+string conformanceFault(Ctx c, Cid suite, u8[] signer, string runner) {
+  u8[]? text = fileAt(c.r, suite, "cases");
+  if (text is null) { return "the suite \{short(suite)} has no `cases` it can read"; }
+  string[] lines = linesOf(text!);
+  i32 cases = 0;
+  i32 shown = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    string line = lines[i];
+    if (line == "" || line.slice(0, 1) == "#") { continue; }
+    i32 sp = line.indexOf(" ");
+    if (sp < 0) { return "the suite's line \"\{line}\" is not RECIPE OUTPUT"; }
+    Cid? rid = parseCid(line.slice(0, sp)).ok();
+    string want = line.slice(sp + 1, line.len());
+    if (rid is null) { return "the suite's line \"\{line}\" does not start with a CID"; }
+    if (want != "none") { cases++; }
+    bool gave = false;
+    for (i32 h = 0; h < c.ix.held.len(); h++) {
+      if (!same(c.ix.held[h].signer, signer) || revoked(c, c.ix.held[h])) { continue; }
+      match (c.ix.held[h].statement) {
+        Derivation(r, o, run): {
+          if (!r.eq(rid!) || run != runner) { continue; }
+          if (want == "none") { return "it claimed an output for \{short(rid!)}, where the machine gives none"; }
+          if (o.text() != want) { return "it gave \{short(o)} for \{short(rid!)}, where the suite says \{want.slice(0, 14)}…"; }
+          gave = true;
+        }
+        Endorsement(_, _): { }
+        Rejection(_, _): { }
+        Revocation(_): { }
+      }
+    }
+    if (gave) { shown++; }
+  }
+  if (shown < cases) { return "it has witnessed \{shown} of the suite's \{cases} cases with an output"; }
+  return "";
+}
+
+/** A text's lines, each without the spaces, tabs and carriage returns around it. */
+string[] linesOf(u8[] b) {
+  string[] out = string[]();
+  i32 from = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i < b.len() && b[i] != '\n') { continue; }
+    i32 a = from;
+    i32 z = i;
+    while (a < z && (b[a] == ' ' || b[a] == '\t' || b[a] == '\r')) { a++; }
+    while (z > a && (b[z - 1] == ' ' || b[z - 1] == '\t' || b[z - 1] == '\r')) { z--; }
+    u8[] line = u8[].filled(z - a, 0);
+    line.copyFrom(b, a, 0, z - a);
+    out = plus(out, string.fromBytes(line));
+    from = i + 1;
+  }
+  return out;
 }

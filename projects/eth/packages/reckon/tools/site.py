@@ -4,8 +4,8 @@
     python3 tools/site.py OUT [COMMIT]
 
 Writes OUT/index.html (the landing page with the demos' counts, the commit it is built from, and the docs list filled
-in), OUT/style.css, OUT/demos/NAME.html for each site/demos/NAME.txt, and OUT/docs/*.md.txt (the README and
-docs/*.md as plain text, since the site has no markdown renderer), and OUT/downloads/ from site/downloads/.
+in), OUT/style.css, OUT/demos/NAME.html for each site/demos/NAME.txt, OUT/docs/*.html (the README and docs/*.md,
+rendered), and OUT/downloads/ from site/downloads/.
 """
 import html
 import os
@@ -25,12 +25,14 @@ DEMOS = {
                  "devnet's registry, admitted by name on the command line, then in the browser extension: the name "
                  "read by proof, the page fetched and checked, and run in the sandbox loader, where it draws and "
                  "zooms with no network and no extension API."),
-    "capstone": ("The capstone", "QUICK=1 sh packages/reckon/tools/capstone.sh WORKDIR",
+    "capstone": ("The capstone", "LADDER=… sh packages/reckon/tools/capstone.sh WORKDIR",
                  "Source to a compiler to an app to its run, each a derivation signed by a runner on V8 and one on "
-                 "wasmtime; claims published to a mirror; an ENS name on a devnet pointing at the app; and a fresh "
-                 "client that resolves the name by proof, takes the claims from the mirror, fetches and checks the "
-                 "bytes, admits and runs it. Then the mainnet half from a checkpoint, and the refusals. QUICK uses the "
-                 "seed compiler for the app's build instead of one the seed built (the selfbuild demo shows those agree)."),
+                 "wasmtime. The compiler has two unrelated origins that must agree: the seed, and a compiler wac's "
+                 "bootstrap ladder builds from its hand-written rungs (diverse double-compiling, the agree rule); "
+                 "withdraw either and the compiler is refused. Then claims published to a mirror, an ENS name on a "
+                 "devnet pointing at the app, and a fresh client that resolves the name by proof, takes the claims "
+                 "from the mirror, fetches and checks the bytes, admits and runs it; the mainnet half from a "
+                 "checkpoint; and the refusals."),
     "admit-by-name": ("vitalik.eth, from a checkpoint", "sh packages/reckon/tools/admit-by-name.sh WORKDIR",
                       "Offline on recorded mainnet data: one claim admit from a beacon checkpoint to a decision, with "
                       "the beacon data from a directory and then over the light-client REST API from a replaying "
@@ -55,6 +57,16 @@ DEMOS = {
                 "one program. As a machine (wac-flatten/1), wac's JavaScript and Rust flatteners are its two runners; "
                 "they agree on wacc's 38 modules, the same 3.7 MB the ladder makes, and flattened wacc is admitted "
                 "only through both."),
+    "conformance": ("Runners that earn their word", "WASMTIME_WAC=… sh packages/reckon/tools/conformance.sh WORKDIR",
+                    "A conformance suite is 17 of the machine's own cases, with the output each must give, as one object. "
+                    "Each runner witnesses it as it witnesses anything; a policy that names the suite counts a runner's "
+                    "word only once that runner has. A runner that never ran it, one that leaks its engine's NaNs, and "
+                    "one with no floor are each left out, and admission says why."),
+    "discovery": ("Finding mirrors", "sh packages/reckon/tools/discovery.sh WORKDIR",
+                  "From one URL to every mirror: manifests are static JSON files, served with CORS, naming mirrors and "
+                  "further manifests. Two sites each carry one mirror and a manifest; following them finds both, and "
+                  "the decision needs both. A manifest leading to a lying mirror costs nothing but its forged "
+                  "statement, left out and named."),
     "demo": ("Two runners, one policy", "sh packages/reckon/tools/demo.sh WORKDIR",
              "The smallest whole loop, with no chain: one recipe on two engines, a reviewer's endorsements, a policy "
              "that needs both, and each kind of revocation."),
@@ -116,7 +128,7 @@ head = """<!doctype html>
 </head>
 <body>
 <main class="page">
-<nav class="top"><a class="mark" href="{up}">reckon</a><a href="{up}#how">how it works</a><a href="{up}#demos">demos</a><a href="{up}#trusted">still trusted</a><a href="{up}#source">source</a></nav>
+<nav class="top"><a class="mark" href="{up}">reckon</a><a href="{up}#how">how it works</a><a href="{up}#demos">demos</a><a href="{up}#trusted">still trusted</a><a href="{up}docs/guide.html">guide</a><a href="{up}#source">source</a></nav>
 """
 
 index = read(os.path.join(site, "index.html")).replace("@COMMIT@", built)
@@ -139,17 +151,153 @@ for name, (title, cmd, intro) in DEMOS.items():
     page += f'<pre class="term">{shade(text)}</pre>\n</main>\n</body>\n</html>\n'
     write(os.path.join(out, "demos", name + ".html"), page)
 
+# The docs, rendered: the README and docs/*.md (and docs/machines/*.md) as pages under docs/, with the Markdown these
+# files use (headings, paragraphs, lists, indented code, tables, inline code, emphasis, links). A link to another
+# rendered doc points at its page; a link to anything else is kept as text.
 docs = [("README.md", os.path.join(here, "README.md"))]
 docs += [(f, os.path.join(here, "docs", f)) for f in sorted(os.listdir(os.path.join(here, "docs"))) if f.endswith(".md")]
+mdir = os.path.join(here, "docs", "machines")
+docs += [("machines/" + f, os.path.join(mdir, f)) for f in sorted(os.listdir(mdir)) if f.endswith(".md")]
+pages = {f: f[:-3] + ".html" for f, _ in docs}
+
+
+def link(target, at):
+    """A doc's link target, as the page it now is (relative to the doc at `at`), or None for anything not rendered."""
+    path, _, frag = target.partition("#")
+    if path.startswith(("http://", "https://")):
+        return target
+    if path == "":
+        return "#" + frag
+    base = os.path.dirname(at)
+    norm = os.path.normpath(os.path.join(base, path)).replace("\\", "/")
+    if norm.startswith("docs/"):
+        norm = norm[5:]
+    if at == "README.md" and path.startswith("docs/"):
+        norm = path[5:]
+    if norm in pages:
+        rel = os.path.relpath(pages[norm], os.path.dirname(pages[at]) or ".")
+        return rel + ("#" + frag if frag else "")
+    return None
+
+
+def inline(text, at):
+    out = []
+    for i, part in enumerate(re.split(r"(`[^`]*`)", text)):
+        if i % 2 == 1:
+            out.append("<code>" + html.escape(part[1:-1]) + "</code>")
+            continue
+        t = html.escape(part, quote=False)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"(?<![\w*])\*([^*\s][^*]*?)\*(?![\w*])", r"<i>\1</i>", t)
+        def a(m):
+            href = link(html.unescape(m.group(2)), at)
+            return m.group(1) if href is None else f'<a href="{html.escape(href)}">{m.group(1)}</a>'
+        t = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", a, t)
+        out.append(t)
+    return "".join(out)
+
+
+def render(md, at):
+    lines = md.split("\n")
+    out = []
+    i = 0
+    def blank(l): return l.strip() == ""
+    while i < len(lines):
+        l = lines[i]
+        if blank(l):
+            i += 1
+            continue
+        if l.startswith("```"):
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith("```"):
+                j += 1
+            out.append("<pre><code>" + html.escape("\n".join(lines[i + 1:j])) + "</code></pre>")
+            i = j + 1
+            continue
+        m = re.match(r"^(#{1,4}) (.*)$", l)
+        if m:
+            n = len(m.group(1))
+            out.append(f"<h{n}>{inline(m.group(2), at)}</h{n}>")
+            i += 1
+            continue
+        if l.startswith("    "):
+            j = i
+            block = []
+            while j < len(lines) and (lines[j].startswith("    ") or (blank(lines[j]) and j + 1 < len(lines) and lines[j + 1].startswith("    "))):
+                block.append(lines[j][4:])
+                j += 1
+            out.append('<pre><code>' + html.escape("\n".join(block)) + "</code></pre>")
+            i = j
+            continue
+        if l.startswith("|"):
+            j = i
+            rows = []
+            while j < len(lines) and lines[j].startswith("|"):
+                row = lines[j].strip()[1:]
+                row = row[:-1] if row.endswith("|") and not row.endswith("\\|") else row
+                cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", row)]
+                if not all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                    rows.append(cells)
+                j += 1
+            t = ['<div class="table-wrap"><table>']
+            for k, r in enumerate(rows):
+                tag = "th" if k == 0 else "td"
+                t.append("<tr>" + "".join(f"<{tag}>{inline(c, at)}</{tag}>" for c in r) + "</tr>")
+            t.append("</table></div>")
+            out.append("\n".join(t))
+            i = j
+            continue
+        if re.match(r"^(\s*)(- |\d+\. )", l):
+            j = i
+            items = []   # (indent, ordered, text)
+            while j < len(lines) and not blank(lines[j]):
+                m = re.match(r"^(\s*)(- |\d+\. )(.*)$", lines[j])
+                if m:
+                    items.append([len(m.group(1)), m.group(2) != "- ", m.group(3)])
+                elif items:
+                    items[-1][2] += " " + lines[j].strip()
+                j += 1
+            stack = []
+            html_ = []
+            for ind, ordered, text in items:
+                while stack and stack[-1][0] > ind:
+                    html_.append("</li></" + ("ol" if stack.pop()[1] else "ul") + ">")
+                if not stack or stack[-1][0] < ind:
+                    html_.append("<" + ("ol" if ordered else "ul") + "><li>")
+                    stack.append((ind, ordered))
+                else:
+                    html_.append("</li><li>")
+                html_.append(inline(text, at))
+            while stack:
+                html_.append("</li></" + ("ol" if stack.pop()[1] else "ul") + ">")
+            out.append("".join(html_))
+            i = j
+            continue
+        j = i
+        para = []
+        while j < len(lines) and not blank(lines[j]) and not lines[j].startswith(("#", "|", "    ", "```")) \
+                and not re.match(r"^(\s*)(- |\d+\. )", lines[j]):
+            para.append(lines[j].strip())
+            j += 1
+        if not para:
+            para = [l.strip()]
+            j = i + 1
+        out.append("<p>" + inline(" ".join(para), at) + "</p>")
+        i = j
+    return "\n".join(out)
+
+
 cards = []
 for f, p in docs:
     text = read(p)
     m = re.search(r"^# (.+)$", text, re.M)
     title = m.group(1) if m else f
-    os.makedirs(os.path.join(out, "docs"), exist_ok=True)
-    shutil.copyfile(p, os.path.join(out, "docs", f + ".txt"))
+    up = "../" * (pages[f].count("/") + 1)
+    page = head.format(title=html.escape(re.sub(r"[`*]", "", title)), up=up)
     where = "packages/reckon/" + ("" if f == "README.md" else "docs/") + f
-    cards.append(f'  <a class="card" href="docs/{f}.txt"><h3>{html.escape(title)}</h3><p><code>{where}</code></p></a>')
+    page += f'<p class="eyebrow">{html.escape(where)}</p>\n<div class="doc">\n{render(text, f)}\n</div>\n</main>\n</body>\n</html>\n'
+    write(os.path.join(out, "docs", pages[f]), page)
+    cards.append(f'  <a class="card" href="docs/{pages[f]}"><h3>{inline(title, f)}</h3><p><code>{where}</code></p></a>')
 index = index.replace("@DOCS@", "\n".join(cards))
 left = re.findall(r"@[A-Z:a-z-]+@", index)
 if left:
@@ -157,6 +305,9 @@ if left:
 write(os.path.join(out, "index.html"), index)
 shutil.copyfile(os.path.join(site, "style.css"), os.path.join(out, "style.css"))
 # Downloads (the extension, extension/release.sh): copied as they are, the zip, its manifest and its claims mirror.
+# The site's manifest (docs/discovery.md): the mirrors it carries, named relative to itself.
+if os.path.isfile(os.path.join(site, "reckon-mirrors.json")):
+    shutil.copyfile(os.path.join(site, "reckon-mirrors.json"), os.path.join(out, "reckon-mirrors.json"))
 if os.path.isdir(os.path.join(site, "downloads")):
     shutil.copytree(os.path.join(site, "downloads"), os.path.join(out, "downloads"))
 write(os.path.join(out, ".nojekyll"), "")

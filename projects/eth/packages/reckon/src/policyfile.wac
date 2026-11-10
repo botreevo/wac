@@ -6,6 +6,8 @@
 //       machines: ["wasm-gc/wac-host/2"],
 //       formats: ["unixfs-v1-2025+hidden"],
 //       reject_lists: ["0x…"],                                        // whose rejections to follow
+//       conformance: { "wasm-gc/wac-host/2": "bafy…" },             // a runner's witness counts once it has shown
+//                                                                    // the machine's suite (docs/conformance.md)
 //       names: { min_delay: 3600, ens: "refuse" },                   // which names to follow (below)
 //       roles: {
 //         app: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2,
@@ -17,7 +19,9 @@
 //
 // A role's list is alternatives: the first that holds admits. `analysis: { analyser, slot, path, expect, by,
 // at_least }` is the fourth kind, and `within: { role, path }` the fifth: the file at `path` in an output admitted in
-// `role` (a built program, taken out of its build's output).
+// `role` (a built program, taken out of its build's output). `agree: [RULE, RULE, …]` is the sixth: every rule
+// holds, each `derived` one through a different recipe; diverse double-compiling is a compiler's role written as
+// `agree: [{ derived: { …, slots: { program: "seed" } } }, { derived: { …, slots: { program: "ladder" } } }]`.
 //
 // `names` says which names a subject may be given by (docs/decisions/K2-names.md). A name is only a pointer, and what
 // it points at is admitted as any CID is; this is about who can move the pointer, and how fast. `min_delay` (seconds,
@@ -29,7 +33,7 @@
 import { json.parseJson5, json.JsonValue, json.JsonObject } from "wac";
 import { ipfs.Cid, ipfs.parseCid } from "@/lib.wac";
 import { Result } from "core";
-import { Policy, Named, Rule, RoleRules, SlotRole } from "./admit.wac";
+import { Policy, Named, Rule, RoleRules, SlotRole, Conformance } from "./admit.wac";
 
 /** Which names the policy follows: its `names` field. */
 export struct NameRule {
@@ -138,13 +142,25 @@ Result<Rule, string> ruleOf(string role, JsonValue v) {
   }
   JsonValue? w = v.member("within");
   if (w is not null) { return Result.Ok(Rule.Within(w!.member("role")?.text() ?? "", w!.member("path")?.text() ?? "")); }
+  JsonValue? g = v.member("agree");
+  if (g is not null) {
+    if (g!.array() is null || g!.array()!.len() < 2) { return Result.Err("role \{role}: agree is a list of at least two rules"); }
+    Rule[] all = Rule[].filled(g!.array()!.len(), Rule.Root);
+    for (i32 j = 0; j < all.len(); j++) {
+      all[j] = try ruleOf(role, g!.array()!.get(j));
+      bool nested = match (all[j]) { Agree(_): true, Root: false, Endorsed(_, _): false, Derived(_, _, _, _, _): false,
+                                     Analysis(_, _, _, _, _, _): false, Within(_, _): false };
+      if (nested) { return Result.Err("role \{role}: an agree rule cannot hold another"); }
+    }
+    return Result.Ok(Rule.Agree(all));
+  }
   JsonValue? a = v.member("analysis");
   if (a is not null) {
     Cid analyser = try parseCid(a!.member("analyser")?.text() ?? "");
     return Result.Ok(Rule.Analysis(analyser, a!.member("slot")?.text() ?? "", a!.member("path")?.text() ?? "",
                                    a!.member("expect")?.text() ?? "", texts(a!.member("by")), count(a!.member("at_least"), 1)));
   }
-  return Result.Err("role \{role}: a rule must be \"root\", or have endorsed, derived, analysis or within");
+  return Result.Err("role \{role}: a rule must be \"root\", or have endorsed, derived, analysis, within or agree");
 }
 
 export Result<Policy, string> readPolicyFile(u8[] text) {
@@ -179,5 +195,18 @@ export Result<Policy, string> readPolicyFile(u8[] text) {
       roles[i] = RoleRules(role, rules);
     }
   }
-  return Result.Ok(Policy(signers, roots, texts(doc.member("machines")), texts(doc.member("formats")), reject, roles));
+  Conformance[] conformance = Conformance[]();
+  JsonValue? cv = doc.member("conformance");
+  if (cv is not null) {
+    JsonObject? co = cv!.object();
+    if (co is null) { return Result.Err("the policy: conformance is { MACHINE: \"SUITE CID\" }"); }
+    for (i32 i = 0; i < co!.len(); i++) {
+      Cid suite = try parseCid(co!.at(i).value.text() ?? "");
+      Conformance[] next = Conformance[].filled(conformance.len() + 1, Conformance(co!.at(i).keyStr(), suite));
+      for (i32 j = 0; j < conformance.len(); j++) { next[j] = conformance[j]; }
+      conformance = next;
+    }
+  }
+  return Result.Ok(Policy(signers, roots, texts(doc.member("machines")), texts(doc.member("formats")), reject, roles,
+                          conformance));
 }

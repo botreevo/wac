@@ -4,6 +4,8 @@
 //     claim endorse SUBJECT SCOPE --key F          sign an endorsement
 //     claim reject SUBJECT REASON --key F          sign a rejection (your list)
 //     claim revoke STATEMENT --key F               sign a revocation of a statement you signed (by its id)
+//     claim derivation RECIPE OUTPUT --runner NAME --key F
+//                                                  sign a derivation established some other way than by `derive`
 //     claim slots RECIPE                           a recipe's input slots: name and CID
 //     claim origins CID                            the derivations claiming to produce it
 //     claim dependents CID                         outputs of recipes that take it as an input
@@ -28,6 +30,10 @@
 //                                                  to stderr, so stdout is the program's
 //
 //     claim publish DIR                            the local index into the mirror DIR, added to what it holds
+//     claim mirrors URL                            the mirrors a manifest names, and those it leads to (docs/discovery.md):
+//                                                  one per line, to pass as --mirror; what could not be read, to stderr
+//     claim manifest OUT [--lists URL]… [--follow URL]…
+//                                                  write a manifest naming mirrors (--lists) and other manifests (--follow)
 //
 // --store DIR (default .objects), --mirror DIR or --mirror http://HOST:PORT (repeatable): where else to find blocks,
 // and claims: the index `admit`, `origins` and `dependents` use is the local one together with every mirror's, each
@@ -43,6 +49,7 @@ import { Statement, Signed, signStatement, signedBlock, addressOfKey, recipeFrom
 import { Index, Held, Loaded, loadIndex, saveIndex, loadIndexes, publishIndex } from "../src/graph.wac";
 import { slotsOf } from "../src/slots.wac";
 import { AdmitRequest, Admitted, admitSubject, writeOut } from "../src/admission.wac";
+import { Discovered, discover, writeManifest } from "../src/discovery.wac";
 import { unhex, hex } from "../src/hex.wac";
 import { Written, worldFiles } from "../src/world.wac";
 import { canonicalize } from "../src/canon.wac";
@@ -69,7 +76,7 @@ void say(Sys sys, bool quiet, string s) { if (quiet) { sys.warn(s); } else { sys
 
 export async i32 main(Sys sys) {
   string[] a = sys.args();
-  if (a.len() < 1) { sys.warn("usage: claim address|endorse|reject|revoke|slots|origins|dependents|admit|run|publish … (see the source)"); return 2; }
+  if (a.len() < 1) { sys.warn("usage: claim address|endorse|reject|revoke|derivation|mirrors|manifest|slots|origins|dependents|admit|run|publish … (see the source)"); return 2; }
   Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
   Store[] mirrors = Store[]();
   for (i32 i = 0; i + 1 < a.len() && a[i] != "--"; i++) {
@@ -103,6 +110,39 @@ export async i32 main(Sys sys) {
     return record(sys, store, signStatement(s, key!));
   }
 
+  if (cmd == "derivation" && a.len() >= 3) {
+    // A derivation established some other way than by `derive`: another runner of the machine, a hardware attestation,
+    // a machine this repository has no runner for. Its weight is the signer's and the runner's, as any witness's is.
+    Cid recipe;
+    Cid output;
+    match (parseCid(a[1])) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(c): { recipe = c; } }
+    match (parseCid(a[2])) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(c): { output = c; } }
+    string runner = flag(a, "--runner", "");
+    if (runner == "") { sys.warn("claim derivation: --runner NAME is required: it says what established it"); return 2; }
+    u8[]? key = await keyOf(sys, a);
+    if (key is null) { return 1; }
+    return record(sys, store, signStatement(Statement.Derivation(recipe, output, runner), key!));
+  }
+
+  if (cmd == "mirrors" && a.len() >= 2) {
+    // Discovery: only where else to look. Every block and statement from these is checked like any other mirror's.
+    Discovered d = discover(Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files()), a[1], 16, 32);
+    for (i32 i = 0; i < d.problems.len(); i++) { sys.warn("claim: \{d.problems[i]}"); }
+    for (i32 i = 0; i < d.mirrors.len(); i++) { sys.log(d.mirrors[i]); }
+    return d.mirrors.len() > 0 ? 0 : 1;
+  }
+  if (cmd == "manifest" && a.len() >= 2) {
+    string[] lists = string[]();
+    string[] follow = string[]();
+    for (i32 i = 2; i + 1 < a.len(); i++) {
+      if (a[i] == "--lists") { lists = appended(lists, a[i + 1]); }
+      if (a[i] == "--follow") { follow = appended(follow, a[i + 1]); }
+    }
+    match (await sys.writeFile(a[1], writeManifest(lists, follow).toBytes())) {
+      Err(e): { sys.warn("claim: \{a[1]}: \{e}"); return 1; }
+      Ok(_): { sys.log("\{a[1]}: \{lists.len()} mirror(s), \{follow.len()} manifest(s)"); return 0; }
+    }
+  }
   if (cmd == "publish" && a.len() >= 2) {
     match (publishIndex(loadIndex(store).index, Store.dir(sys.files(), a[1]))) {
       Err(e): { sys.warn("claim: \{e}"); return 1; }
@@ -303,4 +343,11 @@ async Result<u8[], string> drained(Input in) {
       Failed(why): { return Result.Err("\{why}"); }
     }
   }
+}
+
+string[] appended(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
 }

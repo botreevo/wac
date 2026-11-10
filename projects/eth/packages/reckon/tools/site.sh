@@ -5,8 +5,8 @@
 #
 #     sh packages/reckon/tools/site.sh                 build dist/site from what is recorded
 #     WASMTIME_WAC=… sh packages/reckon/tools/site.sh --record WORKDIR [DEMO…]
-#                                                      run the demos (all eight, or those named) again into
-#                                                      site/demos first (about 30 minutes for all; ladder.sh and
+#                                                      run the demos (all nine, or those named) again into
+#                                                      site/demos first (about 75 minutes for all; capstone.sh (in full, with LADDER), ladder.sh and
 #                                                      flatten.sh take LADDER or build the ladder with cargo; a demo
 #                                                      that fails stops it), then build
 #     sh packages/reckon/tools/site.sh --publish       build, then commit dist/site as the `pages` branch's next
@@ -24,12 +24,12 @@ if [ "${1:-}" = --record ]; then
   mkdir -p "$work"
   cd "$root"
   shift 2
-  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten}
+  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten conformance discovery}
   for d in $demos; do
     echo "recording $d"
     case $d in
       selfbuild) env SELF=1 sh "$here/tools/$d.sh" "$work/$d" ;;
-      capstone) env QUICK=1 sh "$here/tools/$d.sh" "$work/$d" ;;
+      capstone) if [ -n "${LADDER:-}" ]; then sh "$here/tools/$d.sh" "$work/$d"; else env QUICK=1 sh "$here/tools/$d.sh" "$work/$d"; fi ;;
       *) sh "$here/tools/$d.sh" "$work/$d" ;;
     esac > "$work/$d.txt" 2>&1 || { echo "site: $d failed; see $work/$d.txt"; exit 1; }
     # Paths of this machine's work directory are not part of what was shown.

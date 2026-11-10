@@ -1,0 +1,214 @@
+// From a beacon checkpoint to an execution block hash: the light client (packages/lightclient), run as `lc` runs it,
+// over beacon light-client data from a directory or fetched live from a beacon node. The hash is the anchor every
+// chain read is then checked against (docs/anchoring.md), so the checkpoint is the one thing trusted. Wherever the
+// data comes from, it is believed only as far as the sync committee's signatures and Merkle branches carry it.
+//
+// A directory holds what `packages/lightclient/tools/mainnet.sh` fetches:
+//
+//     DIR/bootstrap.ssz    the light-client bootstrap for the checkpoint (required)
+//     DIR/updates.ssz      updates by period, in the beacon API's chunked list form (optional)
+//     DIR/finality.ssz     the latest finality update (optional)
+//
+// A beacon node is asked the same, over its light-client REST API, as `application/octet-stream`:
+//
+//     GET /eth/v1/beacon/light_client/bootstrap/{checkpoint}
+//     GET /eth/v1/beacon/light_client/updates?start_period={the bootstrap's}&count={to the clock's period}
+//     GET /eth/v1/beacon/light_client/finality_update
+//
+// each answer's fork taken from its Eth-Consensus-Version header (for updates of several periods, one per update,
+// comma-separated); all of them must be the same fork.
+//
+// The anchor is the *finalized* execution block, so the optimistic update, which `lc` also reads, is not asked for:
+// it adds nothing to the anchor, and asked for live it can be no newer than the finality update just applied, which
+// the light client refuses (seen against a public node, once in five runs).
+//
+// Mainnet only: its fork schedule and genesis validators root are what signatures are checked under.
+
+import { Sys } from "std";
+import { Result } from "core";
+import { codec.hexEncode, codec.hexDecoded, fetch.fetch, fetch.Caps, fetch.Fetched } from "wac";
+import { forkNamed } from "../../ssz/src/forks.wac";
+import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, headerSlot }
+  from "../../lightclient/src/store.wac";
+import { Schedule } from "../../lightclient/src/schedule.wac";
+import { executionBlockHash, executionStateRoot } from "../../lightclient/src/header.wac";
+
+/** What the light client ends up believing: the finalized execution block, and how it got there. */
+export struct Anchored {
+  u8[] blockHash;
+  u8[] stateRoot;
+  i64 beaconSlot;
+  string[] log;
+}
+
+/** Mainnet's genesis validators root: part of every signing domain, so a signature from another chain fails. */
+u8[] MAINNET_GVR() { return hexDecoded("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"); }
+
+/** Mainnet's genesis time: the clock slot, when none is given, is counted from it. */
+export i64 MAINNET_GENESIS() { return 1606824023 as i64; }
+
+i64 PERIOD() { return 8192 as i64; }
+
+string hx(u8[] b) { return "0x" + string.fromBytes(hexEncode(b)); }
+
+u8[] cut(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+i64 le64(u8[] b) {
+  i64 v = 0 as i64;
+  for (i32 i = 7; i >= 0; i--) { v = (v << (8 as i64)) | (b[i] as i64); }
+  return v;
+}
+
+string[] more(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+// ---------------------------------------------------------------- the light client, step by step
+
+/** The light client part-way: its store, and what it has said so far. */
+struct Run {
+  Store store;
+  string[] log;
+}
+
+Result<u8[], string> rootOf(string checkpoint) {
+  string body = checkpoint.len() >= 2 && checkpoint.slice(0, 2) == "0x" ? checkpoint.slice(2, checkpoint.len()) : checkpoint;
+  if (body.len() != 64) { return Result.Err("the light client: a checkpoint is a 32-byte beacon block root"); }
+  u8[]? root = hexDecoded(body);
+  if (root is null) { return Result.Err("the light client: a checkpoint is a 32-byte beacon block root"); }
+  return Result.Ok(root!);
+}
+
+Result<Run, string> start(u8[] root, i32 fork, u8[] boot, string from) {
+  Store? s = initializeStoreWith(Schedule.mainnet(), fork, root, boot);
+  if (s is null) { return Result.Err("the light client: the bootstrap \{from} is not the checkpoint's, or its committee is not proven by it"); }
+  return Result.Ok(Run(s!, ["light client: bootstrap \{from} proven against checkpoint \{hx(root)}, slot \{headerSlot(s!.finalizedHeader)}"]));
+}
+
+/** Updates in the beacon API's chunked list form: each an 8-byte length, a 4-byte fork digest, the SSZ. */
+Result<bool, string> updates(Run r, u8[] d, i64 now) {
+  i32 at = 0;
+  while (at + 12 <= d.len()) {
+    i32 n = le64(cut(d, at, at + 8)) as~ i32;
+    if (n < 4 || at + 8 + n > d.len()) { return Result.Err("the light client: the updates are not a chunked list"); }
+    if (!processUpdate(r.store, cut(d, at + 12, at + 8 + n), now, MAINNET_GVR())) { return Result.Err("the light client: an update did not verify"); }
+    at = at + 8 + n;
+    r.log = more(r.log, "light client: update accepted, finalized slot \{headerSlot(r.store.finalizedHeader)}");
+  }
+  return Result.Ok(true);
+}
+
+Result<bool, string> finality(Run r, u8[] d, i64 now) {
+  if (!processFinalityUpdate(r.store, d, now, MAINNET_GVR())) { return Result.Err("the light client: the finality update did not verify"); }
+  r.log = more(r.log, "light client: finality update accepted, finalized slot \{headerSlot(r.store.finalizedHeader)}");
+  return Result.Ok(true);
+}
+
+Result<Anchored, string> finish(Run r) {
+  u8[]? hash = executionBlockHash(r.store.fork, r.store.finalizedHeader);
+  u8[]? state = executionStateRoot(r.store.fork, r.store.finalizedHeader);
+  if (hash is null || state is null) { return Result.Err("the light client: the finalized header names no execution block"); }
+  string[] log = more(r.log, "light client: finalized execution block \{hx(hash!)}: the anchor");
+  return Result.Ok(Anchored(hash!, state!, headerSlot(r.store.finalizedHeader), log));
+}
+
+// ---------------------------------------------------------------- from a directory
+
+async u8[]? optional(Sys sys, string path) { return (await sys.readFile(path)).ok(); }
+
+/**
+ * The finalized execution block, from the beacon block root `checkpoint`, the beacon data in `dir`, read as fork
+ * `forkName`, at clock slot `now`. Refused when the bootstrap is not the checkpoint's, or an update does not verify.
+ */
+export async Result<Anchored, string> anchorFrom(Sys sys, string checkpoint, string dir, string forkName, i64 now) {
+  i32 fork = forkNamed(forkName);
+  if (fork < 0) { return Result.Err("the light client: \{forkName} is not a fork it reads"); }
+  u8[] root = try rootOf(checkpoint);
+  u8[]? boot = await optional(sys, dir + "/bootstrap.ssz");
+  if (boot is null) { return Result.Err("the light client: no \{dir}/bootstrap.ssz"); }
+  Run r = try start(root, fork, boot!, "from \{dir}");
+  u8[]? ups = await optional(sys, dir + "/updates.ssz");
+  if (ups is not null) { try updates(r, ups!, now); }
+  u8[]? fin = await optional(sys, dir + "/finality.ssz");
+  if (fin is not null) { try finality(r, fin!, now); }
+  return finish(r);
+}
+
+// ---------------------------------------------------------------- from a beacon node
+
+string lower(string s) {
+  u8[] b = s.toBytes();
+  u8[] o = u8[].filled(b.len(), 0);
+  for (i32 i = 0; i < b.len(); i++) { o[i] = b[i] >= 65 && b[i] <= 90 ? b[i] + 32 : b[i]; }
+  return string.fromBytes(o);
+}
+
+/** Whether a comma-separated list of forks (one per update) names only `want`. */
+bool allAre(string forks, string want) {
+  string rest = forks;
+  while (true) {
+    i32 c = rest.indexOf(",");
+    string one = c < 0 ? rest : rest.slice(0, c);
+    while (one.len() > 0 && one.slice(0, 1) == " ") { one = one.slice(1, one.len()); }
+    while (one.len() > 0 && one.slice(one.len() - 1, one.len()) == " ") { one = one.slice(0, one.len() - 1); }
+    if (one != want) { return false; }
+    if (c < 0) { return true; }
+    rest = rest.slice(c + 1, rest.len());
+  }
+}
+
+/** One light-client endpoint's answer as SSZ, and the fork it says it is. */
+struct Got {
+  u8[] body;
+  string fork;
+}
+
+Result<Got, string> get(Caps caps, string url, string path) {
+  Fetched f;
+  match (fetch(caps, "GET", url + path, ["Accept: application/octet-stream"], u8[]())) {
+    Err(e): { return Result.Err("the beacon node: \{path}: \{e}"); }
+    Ok(x): { f = x; }
+  }
+  if (f.status != 200) { return Result.Err("the beacon node: \{path}: HTTP \{f.status}"); }
+  string fork = "";
+  for (i32 i = 0; i < f.headers.len(); i++) {
+    if (lower(string.fromBytes(f.headers.nameAt(i))) == "eth-consensus-version") { fork = lower(string.fromBytes(f.headers.valueAt(i))); }
+  }
+  if (fork == "") { return Result.Err("the beacon node: \{path}: no Eth-Consensus-Version in its answer"); }
+  return Result.Ok(Got(f.body, fork));
+}
+
+/**
+ * The same from a beacon node at `url` (http:// or https://), asked live. `forkName`, when not "", must be what the
+ * node answers; otherwise the node's word for the fork is taken, and only decides how the bytes are read: a wrong
+ * one fails verification. Updates are asked from the bootstrap's period to the clock's.
+ */
+export Result<Anchored, string> anchorFromNode(Sys sys, string checkpoint, string url, string forkName, i64 now) {
+  u8[] root = try rootOf(checkpoint);
+  string base = url.len() > 0 && url.slice(url.len() - 1, url.len()) == "/" ? url.slice(0, url.len() - 1) : url;
+  Caps caps = Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files());
+  Got boot = try get(caps, base, "/eth/v1/beacon/light_client/bootstrap/\{hx(root)}");
+  string want = forkName == "" ? boot.fork : forkName;
+  if (boot.fork != want) { return Result.Err("the beacon node answered the bootstrap as \{boot.fork}, not \{want}"); }
+  i32 fork = forkNamed(want);
+  if (fork < 0) { return Result.Err("the light client: \{want} is not a fork it reads"); }
+  Run r = try start(root, fork, boot.body, "from \{base}");
+  i64 from = headerSlot(r.store.finalizedHeader) / PERIOD();
+  i64 to = now / PERIOD();
+  if (to >= from) {
+    Got ups = try get(caps, base, "/eth/v1/beacon/light_client/updates?start_period=\{from}&count=\{to - from + 1}");
+    if (!allAre(ups.fork, want)) { return Result.Err("the beacon node answered the updates as \{ups.fork}, and the bootstrap as \{want}"); }
+    try updates(r, ups.body, now);
+  }
+  Got fin = try get(caps, base, "/eth/v1/beacon/light_client/finality_update");
+  if (fin.fork != want) { return Result.Err("the beacon node answered the finality update as \{fin.fork}, and the bootstrap as \{want}"); }
+  try finality(r, fin.body, now);
+  return finish(r);
+}

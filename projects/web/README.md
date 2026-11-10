@@ -225,7 +225,7 @@ for the clock and the sleeps it wakes, `paint` for frames, `answerValue`, `hand`
 ## Building one
 
     wac run --allow-read --allow-write --allow-run tools/build.wac \
-        <entry.wac> <out-dir> [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
+        <entry.wac> <out-dir> [--module-only | --wrap] [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
 
 `tools/build.wac` writes three files: `page.wac`, **the page's program as a module** — a `main(Sys sys)` that
 opens the page its host provides, runs your `main(Page page)`, and renders each time a view has something to
@@ -268,6 +268,13 @@ there and imports the program.
 
 `--page` names the module the page's module imports `Page` from: `web` by default, which is how a project
 that depends on this package spells it, and `./src/page.wac` from this repository's root.
+
+**Where nothing may start a process, it is three steps of its own.** The build runs `wac build` as a command, and a
+sealed builder cannot: so `--module-only` writes `page.wac` and stops, the builder compiles it however it compiles
+(`wac build <out-dir>/page.wac -o <out-dir>/page`), and `--wrap`, given the same arguments, wraps the `page.wasm` that
+made into `index.html` (and an app's files). Neither half needs `--allow-run`, and the page is byte for byte the one
+the whole build writes into the same directory. From wac, they are `writePageModule` and `wrapBuiltPage`, beside
+`buildPage`.
 
 ## Where it is used
 

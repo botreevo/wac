@@ -28,7 +28,7 @@ for attempt in 1 2 3; do
   # cores, 2026-11-03: about 60s in a row.
   out="$(mktemp -d)"
   "$WAC" check . > "$out/check" 2>&1 & checkPid=$!
-  "$WAC" test test/wac > "$out/wac" 2>&1 & wacPid=$!
+  "$WAC" test --allow-read --allow-write test/wac > "$out/wac" 2>&1 & wacPid=$!
   echo "== deno ==" && deno test -A --unstable-net --no-check test/; denoStatus=$?
   wait "$checkPid"; check=$?
   wait "$wacPid"; tested=$?

@@ -25,7 +25,7 @@ directory of wac, and they are still the reasons.
 
 ## Running things
 
-    wac check . && wac test test/wac                 the package, with no browser — about a second
+    wac check . && wac test --allow-read --allow-write test/wac   the package, with no browser — about a second
     deno test -A --unstable-net --no-check test/     the template outside the repository, and pages in Chromium
     tools/push.sh                                    all of it, then push
 

@@ -17,7 +17,8 @@
 //
 // **A program, not a script in someone else's language**, so a project outside this repository builds
 // a page with the `wac` it already has and this package as a dependency (`template/`). It
-// runs `wac build` as a command, which is why it needs `--allow-run`; `--wac <path>` names a binary
+// runs `wac build` as a command, which is why it needs `--allow-run` — unless it is asked for one half, `--module-only`
+// or `--wrap`, which start nothing (`writePageModule`, `wrapBuiltPage`); `--wac <path>` names a binary
 // other than the one on `PATH`, and `--page <spec>` the module the page's module imports `Page` from when the
 // project does not map this package as `web`.
 
@@ -81,6 +82,11 @@ Asked askedOf(string[] argv) {
     }
     if (w == "--in-page") {
       a.inPage = true;
+      i++;
+      continue;
+    }
+    // Which steps to run is `buildPage`'s to read; the arguments are the same either way.
+    if (w == "--module-only" || w == "--wrap") {
       i++;
       continue;
     }
@@ -2110,12 +2116,16 @@ string head(string title) {
        + "<title>" + title + "</title>\n</head>\n<body>\n<div id=\"app\"></div>\n";
 }
 
-export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs procs) {
+/**
+ * **A page in three steps, and the two that spawn nothing are steps of their own** — for a builder that may not start
+ * a process (a sealed machine, as reckon's): `writePageModule` writes `<out>/page.wac`; `wac build <out>/page.wac -o
+ * <out>/page` is run by whoever builds, as its own sealed step; and `wrapBuiltPage` wraps `<out>/page.wasm` into
+ * `index.html` (and the app's files, with `--app`). On the command line they are `--module-only` and `--wrap`, with
+ * the same arguments as the whole build; `buildPage` is all three, which is what it always was.
+ */
+export i32 writePageModule(string[] argv, Output err, Output out, Files fs) {
   Asked a = askedOf(argv);
-  if (a.entry == "" || a.out == "") {
-    err.write("usage: build.wac <entry.wac> <out-dir> [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
-    return 2;
-  }
+  if (a.entry == "" || a.out == "") { return usage(err); }
   // **The page's module is a module of this project**, so it is written inside it: from anywhere else its
   // imports would cross a project boundary, and the build would fail naming an import rather than this.
   if (leavesHere(a.out)) {
@@ -2123,22 +2133,18 @@ export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs proc
     return 2;
   }
   fs.mkdir(a.out, true).wait();
-  string source = a.out + "/page.wac";
   // A path names the file from here, and the module sits in `out`; anything else is a mapped name.
   bool pagePath = a.pageSpec.len() > 0 && (a.pageSpec.slice(0, 1) == "." || a.pageSpec.slice(0, 1) == "/");
   string pageSpec = pagePath ? relativeTo(a.out, a.pageSpec) : a.pageSpec;
   string entrySpec = relativeTo(a.out, a.entry);
-  fs.writeFile(source, moduleFor(entrySpec, pageSpec, a.spawn, a.dev).toBytes()).wait();
-  auto builtRan = flatten(procs.exec(a.wac, ["build", source, "-o", a.out + "/page"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
-  Exec? built = builtRan.ok();
-  if (built is null || !built!.ok()) {
-    if (built is not null) {
-      err.write(built!.stderr);
-      err.write(built!.stdout);
-    }
-    if (builtRan.isErr()) { flatten(err.write("build.wac: \{a.wac}: \{builtRan.err()!}\n".toBytes()).wait()).isOk(); }
-    return 1;
-  }
+  fs.writeFile(a.out + "/page.wac", moduleFor(entrySpec, pageSpec, a.spawn, a.dev).toBytes()).wait();
+  return 0;
+}
+
+/** The page around a module already built at `<out>/page.wasm`: `index.html`, and with `--app` the app's files. */
+export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
+  Asked a = askedOf(argv);
+  if (a.entry == "" || a.out == "") { return usage(err); }
   string wasmPath = a.out + "/page.wasm";
   auto wasmRead = flatten(fs.readFile(wasmPath).wait());
   u8[]? wasm = wasmRead.ok();
@@ -2164,6 +2170,40 @@ export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs proc
   fs.writeFile(index, page.toBytes()).wait();
   out.line("\{index}: \{wasm!.len()} bytes of module");
   return 0;
+}
+
+i32 usage(Output err) {
+  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --wrap] [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
+  return 2;
+}
+
+export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs procs) {
+  bool moduleOnly = false;
+  bool wrapOnly = false;
+  for (string w in argv) {
+    if (w == "--module-only") { moduleOnly = true; }
+    if (w == "--wrap") { wrapOnly = true; }
+  }
+  if (moduleOnly && wrapOnly) {
+    err.write("build.wac: --module-only and --wrap are the two halves of a build; ask for one\n".toBytes());
+    return 2;
+  }
+  if (wrapOnly) { return wrapBuiltPage(argv, err, out, fs); }
+  i32 wrote = writePageModule(argv, err, out, fs);
+  if (wrote != 0 || moduleOnly) { return wrote; }
+  Asked a = askedOf(argv);
+  string source = a.out + "/page.wac";
+  auto builtRan = flatten(procs.exec(a.wac, ["build", source, "-o", a.out + "/page"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? built = builtRan.ok();
+  if (built is null || !built!.ok()) {
+    if (built is not null) {
+      err.write(built!.stderr);
+      err.write(built!.stdout);
+    }
+    if (builtRan.isErr()) { flatten(err.write("build.wac: \{a.wac}: \{builtRan.err()!}\n".toBytes()).wait()).isOk(); }
+    return 1;
+  }
+  return wrapBuiltPage(argv, err, out, fs);
 }
 
 export i32 main(Sys sys) { return buildPage(sys.args(), sys.stderr(), sys.stdout(), sys.files(), sys.procs()); }

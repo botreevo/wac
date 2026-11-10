@@ -48,6 +48,11 @@ DEMOS = {
                 "one program. As a machine (wac-flatten/1), wac's JavaScript and Rust flatteners are its two runners; "
                 "they agree on wacc's 38 modules, the same 3.7 MB the ladder makes, and flattened wacc is admitted "
                 "only through both."),
+    "conformance": ("Runners that earn their word", "WASMTIME_WAC=… sh packages/reckon/tools/conformance.sh WORKDIR",
+                    "A conformance suite is 17 of the machine's own cases, with the output each must give, as one object. "
+                    "Each runner witnesses it as it witnesses anything; a policy that names the suite counts a runner's "
+                    "word only once that runner has. A runner that never ran it, one that leaks its engine's NaNs, and "
+                    "one with no floor are each left out, and admission says why."),
     "demo": ("Two runners, one policy", "sh packages/reckon/tools/demo.sh WORKDIR",
              "The smallest whole loop, with no chain: one recipe on two engines, a reviewer's endorsements, a policy "
              "that needs both, and each kind of revocation."),

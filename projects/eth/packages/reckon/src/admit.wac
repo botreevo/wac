@@ -14,8 +14,14 @@
 //
 // and refused, whatever else holds, if a followed rejection list names it. A statement revoked by its own signer —
 // on the chain, or by a signed revocation in the index — counts for nothing.
+//
+// Conformance (docs/conformance.md): a policy may name, per machine, a suite: a tree whose `cases` file lists recipes
+// and the output each must give (or `none`: a run that must yield nothing, such as one past the machine's floor). A
+// witness to a derivation under that machine then counts only if the same signer, under the same runner name, has
+// witnessed every case as the suite says and none otherwise: a runner shows it implements the machine before its
+// word about anything else is taken.
 
-import { ipfs.Cid, ipfs.Resolver, ipfs.readFile, ipfs.readNode, ipfs.Node } from "@/lib.wac";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Resolver, ipfs.readFile, ipfs.readNode, ipfs.Node } from "@/lib.wac";
 import { Result } from "core";
 import { Recipe, recipeFrom, Statement } from "./claims.wac";
 import { Index, Held, same, contains, pushCid } from "./graph.wac";
@@ -45,6 +51,12 @@ export struct RoleRules {
   Rule[] anyOf;
 }
 
+/** A machine's conformance suite: a tree whose `cases` file is `RECIPE OUTPUT` (or `RECIPE none`) per line. */
+export struct Conformance {
+  string machine;
+  Cid suite;
+}
+
 export struct Policy {
   Named[] signers;
   Cid[] roots;
@@ -52,6 +64,7 @@ export struct Policy {
   string[] formats;
   u8[][] rejectLists;
   RoleRules[] roles;
+  Conformance[] conformance;
 }
 
 /** What the chain said: revocations as (signer, statement id), rejections as (list, subject). */
@@ -191,16 +204,23 @@ Recipe? recipeOf(Ctx c, Cid id) {
 struct Witnessed {
   string[] names;
   string[] runners;
+  string[] excluded;
 }
 
-Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by) {
-  Witnessed w = Witnessed(string[](), string[]());
+Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by, string machine) {
+  Witnessed w = Witnessed(string[](), string[](), string[]());
+  Cid? suite = null;
+  for (i32 i = 0; i < c.p.conformance.len(); i++) { if (c.p.conformance[i].machine == machine) { suite = c.p.conformance[i].suite; } }
   Held[] origins = c.ix.origins(output);
   for (i32 i = 0; i < origins.len(); i++) {
     match (origins[i].statement) {
       Derivation(r, _, runner): {
         string n = nameOf(c.p, origins[i].signer);
         if (r.eq(rid) && has(by, n) && !has(w.names, n) && !revoked(c, origins[i])) {
+          if (suite is not null) {
+            string fault = conformanceFault(c, suite!, origins[i].signer, runner);
+            if (fault != "") { w.excluded = plus(w.excluded, "\{n} on \"\{runner}\": \{fault}"); continue; }
+          }
           w.names = plus(w.names, n);
           if (!has(w.runners, runner)) { w.runners = plus(w.runners, runner); }
         }
@@ -226,8 +246,9 @@ Decision derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole
     if (rec is null) { why = plus(why, "  recipe \{short(rid)}: not found"); continue; }
     if (!has(c.p.machines, rec!.machine)) { why = plus(why, "  recipe \{short(rid)}: machine \{rec!.machine} is not one the policy accepts"); continue; }
     if (!has(c.p.formats, rec!.format)) { why = plus(why, "  recipe \{short(rid)}: format \{rec!.format} is not one the policy accepts"); continue; }
-    Witnessed w = witnesses(c, rid, cid, by);
+    Witnessed w = witnesses(c, rid, cid, by, rec!.machine);
     string count = "witnessed by \{list(w.names)} on \{w.runners.len()} runner(s) (need \{atLeast} on \{runners})";
+    for (i32 x = 0; x < w.excluded.len(); x++) { count += "; not counted: \{w.excluded[x]}"; }
     if (w.names.len() < atLeast || w.runners.len() < runners) { why = plus(why, "  recipe \{short(rid)}: \{count}"); continue; }
     Slot[] ss;
     match (slotsOf(c.r, rec!.input)) {
@@ -272,7 +293,7 @@ Decision analysis(Ctx c, Cid cid, Cid analyser, string slot, string path, string
     for (i32 h = 0; h < c.ix.held.len(); h++) {
       Cid? out = match (c.ix.held[h].statement) { Derivation(r, o, _): r.eq(rid) ? o : null, Endorsement(_, _): null, Rejection(_, _): null, Revocation(_): null };
       if (out is null) { continue; }
-      Witnessed w = witnesses(c, rid, out!, by);
+      Witnessed w = witnesses(c, rid, out!, by, rec.machine);
       if (w.names.len() < atLeast) { continue; }
       u8[]? got = fileAt(c.r, out!, path);
       string text = got is null ? "(nothing)" : string.fromBytes(got!);
@@ -338,4 +359,63 @@ Cid? cidAt(Resolver r, Cid tree, string path) {
     if (!found) { return null; }
   }
   return at;
+}
+
+/**
+ * Why `signer`, running as `runner`, has not shown it implements the suite's machine; "" when it has. Every case must be
+ * witnessed by it, under that runner name and unrevoked, with the suite's output; a case whose output is `none` must
+ * have no such witness at all; and no witness of its may give a case another output.
+ */
+string conformanceFault(Ctx c, Cid suite, u8[] signer, string runner) {
+  u8[]? text = fileAt(c.r, suite, "cases");
+  if (text is null) { return "the suite \{short(suite)} has no `cases` it can read"; }
+  string[] lines = linesOf(text!);
+  i32 cases = 0;
+  i32 shown = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    string line = lines[i];
+    if (line == "" || line.slice(0, 1) == "#") { continue; }
+    i32 sp = line.indexOf(" ");
+    if (sp < 0) { return "the suite's line \"\{line}\" is not RECIPE OUTPUT"; }
+    Cid? rid = parseCid(line.slice(0, sp)).ok();
+    string want = line.slice(sp + 1, line.len());
+    if (rid is null) { return "the suite's line \"\{line}\" does not start with a CID"; }
+    if (want != "none") { cases++; }
+    bool gave = false;
+    for (i32 h = 0; h < c.ix.held.len(); h++) {
+      if (!same(c.ix.held[h].signer, signer) || revoked(c, c.ix.held[h])) { continue; }
+      match (c.ix.held[h].statement) {
+        Derivation(r, o, run): {
+          if (!r.eq(rid!) || run != runner) { continue; }
+          if (want == "none") { return "it claimed an output for \{short(rid!)}, where the machine gives none"; }
+          if (o.text() != want) { return "it gave \{short(o)} for \{short(rid!)}, where the suite says \{want.slice(0, 14)}…"; }
+          gave = true;
+        }
+        Endorsement(_, _): { }
+        Rejection(_, _): { }
+        Revocation(_): { }
+      }
+    }
+    if (gave) { shown++; }
+  }
+  if (shown < cases) { return "it has witnessed \{shown} of the suite's \{cases} cases with an output"; }
+  return "";
+}
+
+/** A text's lines, each without the spaces, tabs and carriage returns around it. */
+string[] linesOf(u8[] b) {
+  string[] out = string[]();
+  i32 from = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i < b.len() && b[i] != '\n') { continue; }
+    i32 a = from;
+    i32 z = i;
+    while (a < z && (b[a] == ' ' || b[a] == '\t' || b[a] == '\r')) { a++; }
+    while (z > a && (b[z - 1] == ' ' || b[z - 1] == '\t' || b[z - 1] == '\r')) { z--; }
+    u8[] line = u8[].filled(z - a, 0);
+    line.copyFrom(b, a, 0, z - a);
+    out = plus(out, string.fromBytes(line));
+    from = i + 1;
+  }
+  return out;
 }

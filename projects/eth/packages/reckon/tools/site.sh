@@ -5,7 +5,7 @@
 #
 #     sh packages/reckon/tools/site.sh                 build dist/site from what is recorded
 #     WASMTIME_WAC=… sh packages/reckon/tools/site.sh --record WORKDIR [DEMO…]
-#                                                      run the demos (all eight, or those named) again into
+#                                                      run the demos (all nine, or those named) again into
 #                                                      site/demos first (about 30 minutes for all; ladder.sh and
 #                                                      flatten.sh take LADDER or build the ladder with cargo; a demo
 #                                                      that fails stops it), then build
@@ -24,7 +24,7 @@ if [ "${1:-}" = --record ]; then
   mkdir -p "$work"
   cd "$root"
   shift 2
-  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten}
+  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten conformance}
   for d in $demos; do
     echo "recording $d"
     case $d in

@@ -61,9 +61,16 @@ Said plainly, because the point is to know exactly what an answer rests on.
   anchor comes from the light client and a checkpoint (4b), and nothing else is trusted.
 - **The devnet's contracts are fixtures.** DevENS has ENS's storage layout and none of its hierarchy, and the
   registry is deployed fresh. Their code hashes are checked, against what this run deployed.
-- **Mainnet content is not fetched.** 4b ends at a proven CID and an admission. The content it names is not on the
-  mirror, and nothing fetches it from IPFS's public network. Whether and how a client should fetch from public
-  gateways, which are trusted only to serve bytes that are then hash-checked, is Andrew's decision **G**, pending.
+- **Mainnet content comes from a public gateway, when it answers.** Andrew decided **G**: a public trustless gateway
+  may serve content, trusted only to be there. A gateway is a `--mirror https://HOST` like any other: `Store.gateway`
+  asks for each block raw (`/ipfs/CID?format=raw`) through wac's `fetch`, with TLS checked against the trust store,
+  and every block is re-hashed against its CID. 4b runs `claim run ens:vitalik.eth site … --mirror
+  https://trustless-gateway.link --out`, which admits the CID, fetches the site and writes it out from checked
+  blocks. **Not yet seen to pass:** on 2026-11-10 the gateway answered every request from Cloudflare with HTTP 522 (its
+  origin timed out), and later 526 (its origin's certificate is invalid). So 4b reports a skip and counts nothing,
+  and the QUICK run is 22 of 22 with that skip. The same path passes against a local HTTPS mirror
+  (`tools/run.sh`, `packages/ipfs/tools/http-mirror.sh`). Nothing is recorded yet: the content is fetched live, and
+  whether it is small enough to record is unknown until the gateway answers.
 - **The mainnet half is recorded.** Its beacon and execution data come from `packages/lightclient/test/mainnet`,
   replayed by local servers. The live path (`--beacon-url` against a public node) is shown in docs/admit.md.
 - **Keys and the policy are the user's.** The three signers and the policy file are what the client trusts by

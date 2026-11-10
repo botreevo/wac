@@ -19,7 +19,15 @@ const read = (f) => fs.readFileSync(path.join(dir, f));
 const CHECKPOINT = '0xa8356934e2fba13cb82917ea04203c75ca84bb735cefe3cf2f35976628e1e937';
 const [port, mode = 'honest'] = [Number(process.argv[2]), process.argv[3]];
 const flip = (b, at) => { const c = Buffer.from(b); c[at] ^= 0x01; return c; };
+// CORS, with the fork header exposed, as the public beacon node docs/admit.md checked serves it (R3).
 http.createServer((req, res) => {
+  res.setHeader('access-control-allow-origin', '*');
+  res.setHeader('access-control-expose-headers', 'eth-consensus-version');
+  if (req.method === 'OPTIONS') {
+    res.setHeader('access-control-allow-methods', 'GET, OPTIONS');
+    res.setHeader('access-control-allow-headers', 'accept');
+    res.statusCode = 204; res.end(); return;
+  }
   const u = new URL(req.url, 'http://x');
   let body = null; let fork = 'fulu';
   if (u.pathname.startsWith('/eth/v1/beacon/light_client/bootstrap/')) {

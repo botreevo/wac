@@ -24,7 +24,7 @@ published it, so anyone can republish anyone's statements, and a mirror can be a
 ## Fetching
 
 Every command that reads the index (`admit`, `origins`, `dependents`) takes `--mirror DIR` or
-`--mirror http://HOST:PORT`, repeatable. The index it uses is the local one together with each mirror's. Each mirror's
+`--mirror http://HOST:PORT`, or `--mirror https://HOST[:PORT]` (through wac's `fetch`, TLS checked against the trust store and `SSL_CERT_FILE`, through the environment's proxy; a public trustless gateway such as https://trustless-gateway.link is one, serving blocks and no claims), repeatable. The index it uses is the local one together with each mirror's. Each mirror's
 is loaded by `loadIndex`, which re-hashes every block and verifies every signature. What fails is left out and
 reported on standard error, and the rest of that mirror is still used. Statements are kept by (signer, statement
 id), so the same statement from two places is one.

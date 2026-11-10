@@ -8,7 +8,9 @@
 #     WASMTIME_WAC=/path/to/native/wac sh packages/reckon/tools/capstone.sh WORKDIR
 #     QUICK=1 …   the compiler that builds the app is the seed itself, not one it built (minutes instead of tens)
 #
-# Ports from PORT (8830): the devnet, the mirror over HTTP, the recorded beacon and execution nodes.
+# Ports from PORT (8830): the devnet, the mirror over HTTP, the recorded beacon and execution nodes. 4b fetches
+# vitalik.eth's content from a public trustless gateway (GATEWAY, default https://trustless-gateway.link; GATEWAY= to
+# skip), and says so, counting nothing, when the gateway does not answer.
 # Needs: wac on PATH, node with tools/oracle's packages installed, python3, curl, git.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -46,7 +48,7 @@ up() { until curl -s -m1 -o /dev/null "http://127.0.0.1:$1/"; do sleep 0.3; done
 step "tools, and the seed: wac's compiler at the pinned commit, built natively"
 cd "$root"
 wac build --quiet --allow-read --allow-write --allow-run "$here/cmd/derive.wac" -o "$work/derive"
-wac build --quiet --allow-read --allow-write --allow-net --allow-env "$here/cmd/claim.wac" -o "$work/claim"
+wac build --quiet --allow-read --allow-write --allow-net --allow-env --allow-run "$here/cmd/claim.wac" -o "$work/claim"
 wac build --quiet --allow-read --allow-write --allow-net packages/ipfs/cmd/obj.wac -o "$work/obj"
 commit=$(sed -n 's/.*"wac": {.*"commit": "\([0-9a-f]\{40\}\)".*/\1/p' "$root/wac.lock" | head -1)
 src=${WACSRC:-$HOME/.wac/cache/git/https%3A%2F%2Fgit.voltrevo.com%2Fwac.git/$commit}
@@ -180,9 +182,29 @@ node "$here/tools/beacon-replay.mjs" $bport & pids="$pids $!"; node "$here/tools
 expect ok "claim admit ens:vitalik.eth --checkpoint …: light client → anchor → name → mirror's claims" "ADMITTED" -- \
   $CL admit ens:vitalik.eth site --policy mainnet/policy.json5 --store client-mainnet $M \
     --checkpoint 0xa8356934e2fba13cb82917ea04203c75ca84bb735cefe3cf2f35976628e1e937 --beacon-url http://127.0.0.1:$bport --now 15630000 --rpc 127.0.0.1:$eport
-expect refused "its content is not on this mirror, and is not fetched from anywhere else (docs/capstone.md: G)" "no source has" -- $O cat "$vitalik" --store client-mainnet $M
+expect refused "the claims mirror does not hold its content" "no source has" -- $O cat "$vitalik" --store client-mainnet $M
+# The content from a public trustless gateway (decision G): `claim run --out`, so the same command admits it and fetches
+# it, every block from the gateway checked against its CID, and writes the tree out. The gateway is trusted for nothing
+# but being there; a gateway that is not there is reported, and counts neither way.
+gateway=${GATEWAY-https://trustless-gateway.link}
+if [ -n "$gateway" ]; then
+  code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H 'Accept: application/vnd.ipld.raw' "$gateway/ipfs/$vitalik?format=raw" || true)
+  if [ "$code" = 200 ]; then
+    expect ok "claim run ens:vitalik.eth --out: admitted, then its content from $gateway, every block checked" "ADMITTED" -- \
+      $CL run ens:vitalik.eth site --policy mainnet/policy.json5 --store client-mainnet $M --mirror "$gateway" --out mainnet/site \
+        --checkpoint 0xa8356934e2fba13cb82917ea04203c75ca84bb735cefe3cf2f35976628e1e937 --beacon-url http://127.0.0.1:$bport --now 15630000 --rpc 127.0.0.1:$eport
+    n=$(find mainnet/site -type f 2>/dev/null | wc -l)
+    [ "$n" -gt 0 ] && ok "the site written out from checked blocks: $n file(s), $(du -sh mainnet/site | cut -f1)" || bad "nothing written out"
+    expect ok "and now the client's own store has it: no mirror needed" -- $O ls "$vitalik" --store client-mainnet
+  else
+    echo "   SKIP ($gateway answered HTTP ${code:-nothing} for the raw block: content not fetched, nothing counted)"
+  fi
+fi
 
 step "5. what it refuses"
+# A fresh anchor, still before 5d's revocation: the devnet keeps the state of its last 16 blocks only, and 4b can take
+# long enough (a gateway that does not answer) for step 4's anchor to fall out of that window.
+anchor=$(rpc $port eth_getBlockByNumber '["latest",false]' | sed -n 's/.*"hash":"\(0x[0-9a-f]*\)".*/\1/p')
 # 5a. A tampered build output: the app's block, and then the build's tree, changed on a mirror.
 cp -r mirror mirror-bad-app; printf 'not the app' > "mirror-bad-app/ipfs/$appCid"
 expect refused "a mirror serving other bytes for the app: fetched and refused" "does not hash" -- $O cat "$appCid" --store client-5a --mirror mirror-bad-app

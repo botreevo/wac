@@ -9,7 +9,7 @@
         [--rpc HOST:PORT]                                             an execution node: trusted for nothing it says
         [--registry ADDR --code-hash H]                               revocations and rejections, proved (registry v2)
         [--ens-registry ADDR --ens-registry-code H --resolver-code H] for SUBJECT ens:NAME (mainnet ENS by default)
-        [--store DIR] [--mirror DIR|http://HOST:PORT]…                where claims and blocks are
+        [--store DIR] [--mirror DIR|http://HOST:PORT|https://HOST]…  where claims and blocks are
 
 SUBJECT is a CID, or `ens:NAME` for whatever the name's contenthash says. The steps, each one checked:
 
@@ -80,3 +80,24 @@ and runs both. It checks that admission's account stays off stdout, that the pro
 files or the environment, that a tree sees itself at `/in` read-only and may write `/out`, and that its arguments,
 stderr and exit code pass through. Then it writes both out with `--out`, and checks the refusals: a client without
 the endorsement runs nothing, and a mirror with other bytes for the program is caught at the fetch.
+
+## Which names are followed
+
+Decision K2 (docs/decisions/K2-names.md): a subject is a CID, `ens:NAME`, or `name:NAME@0xPUBLISHER`, a name in
+the registry v2. The scheme is always explicit, and neither kind of name takes precedence over the other. A name is
+only a pointer, and the CID it gives is admitted like any other. The policy's `names` field decides which pointers
+are followed, by who can move them and how fast:
+
+    names: { min_delay: 3600, ens: "allow" }
+
+- `name:NAME@0xPUB` is read by proof at the anchored block (with `--rpc` and `--registry`), and read at that
+  block's time: the CID in effect then, the delay in force, and any pending change. It is followed only if its delay
+  is at least `min_delay` (default 0) and no shorter delay is pending. The second condition matters: a publisher who
+  lowers the delay must wait out the old one, and a follower sees it coming and stops following before it applies.
+- `ens:NAME` moves at once, since ENS has no delay. It is followed when `ens` is "allow", never when it is "refuse",
+  and when `ens` is unset only while `min_delay` is 0. A policy with no `names` field follows both kinds, as before.
+- A name not followed is refused (exit 4) before any claim is read. The same CID given directly is unaffected.
+
+Tested in `tools/registry2.sh` (5a and 6: a followed name, a delay under the minimum, an unclaimed name, another
+publisher's, a lying node) and `tools/admit-by-name.sh` (`ens: "refuse"`, `min_delay` with ens unset and with
+"allow"), and unit-tested in `test/policyfile_test.wac`.

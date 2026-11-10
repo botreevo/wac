@@ -1,7 +1,7 @@
 # Registry v2
 
 Build list item 9, a prototype: the on-chain half of attested derivations, for objects named by IPFS CIDs, read only by
-proof. v1 (`v1/contracts/TrustRegistry.sol`, `v1/src/registry.wac`, `v1/src/trust.wac`) is quarantined under `v1/`, for reference.
+proof. v1 (`TrustRegistry.sol`, `src/registry.wac`, `src/trust.wac`) is deleted; it is in the history at 2a2241d.
 
 ## What was built
 
@@ -46,7 +46,7 @@ reach (the target, every subject and output, and each recipe's input slots). `ch
 and `chainOf` turns the answers into admit's `Chain`. Asking for a superset means anything admit isn't told about has
 been proved absent, not skipped.
 
-## The end-to-end run: 66 of 66
+## The end-to-end run: 73 of 73
 
 On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row passed):
 
@@ -71,8 +71,12 @@ On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row p
    Then a derivation (`derive` on the V8 host, a quorum of one runner, every input endorsed): admitted; refused
    when the followed list rejects the *program* it was derived with, which `asksFor` reached through the recipe's
    slots; admitted again once it is unrejected; refused when the runner revokes its derivation on chain.
+   5a. A registry name as the subject, `claim admit name:hello@0xPUB` (decision K2). The name is read by proof and
+   its CID admitted. A policy with `names: { min_delay: 10 }` refuses to follow it, since its changes wait 1 s, and
+   still admits the CID given directly. A name never claimed, the same name under another publisher, and a name
+   given without `--registry` are refused.
 6. Through `tools/liar.mjs` (v1's lying node, unmodified), the hidden revocation and the hidden name are both refused
-   because their storage proofs do not verify. Where every slot really is empty, the lie changes nothing and
+   because their storage proofs do not verify. So is `claim admit name:…` through it. Where every slot really is empty, the lie changes nothing and
    admission goes through.
 7. A wrong code hash is refused ("runs other code"), and so is an address with no account.
 

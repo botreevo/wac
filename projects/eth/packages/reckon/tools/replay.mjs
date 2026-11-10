@@ -49,7 +49,14 @@ const answer = (q) => {
   }
   return { error: { code: -32601, message: `replay: ${q.method} is not recorded` } };
 };
+// CORS, so a page served from elsewhere can ask (docs/browser-extension.md, R3): what a public RPC answers too.
 http.createServer((req, res) => {
+  res.setHeader('access-control-allow-origin', '*');
+  if (req.method === 'OPTIONS') {
+    res.setHeader('access-control-allow-methods', 'POST, OPTIONS');
+    res.setHeader('access-control-allow-headers', 'content-type');
+    res.statusCode = 204; res.end(); return;
+  }
   let d = ''; req.on('data', (c) => d += c); req.on('end', () => {
     let a;
     try { const q = JSON.parse(d); a = { jsonrpc: '2.0', id: q.id ?? 1, ...answer(q) }; }

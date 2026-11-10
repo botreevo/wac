@@ -7,7 +7,9 @@
 //     claim slots RECIPE                           a recipe's input slots: name and CID
 //     claim origins CID                            the derivations claiming to produce it
 //     claim dependents CID                         outputs of recipes that take it as an input
-//     claim admit SUBJECT ROLE --policy F          may it be used in that role, and why: SUBJECT a CID or ens:NAME
+//     claim admit SUBJECT ROLE --policy F          may it be used in that role, and why: SUBJECT a CID, ens:NAME, or
+//                                                  name:NAME@0xPUBLISHER (the registry v2's delayed names, with
+//                                                  --registry); the policy's `names` says which it follows
 //         [--checkpoint ROOT (--beacon DIR | --beacon-url URL) [--fork F] [--now SLOT] | --anchor BLOCKHASH]
 //         [--rpc HOST:PORT [--registry ADDR --code-hash H] [--ens-registry ADDR --ens-registry-code H --resolver-code H]]
 //                                                  …from a checkpoint, through the light client's anchor, a name read by
@@ -34,17 +36,14 @@
 
 import { Sys, Authority, Launch, Child, Files, Input, TimedOut } from "std";
 import { Result, Ticket } from "core";
-import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.httpStoreAt, ipfs.Block, ipfs.DAG_CBOR,
+import { fetch.Caps } from "wac";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.mirrorAt, ipfs.Block, ipfs.DAG_CBOR,
          ipfs.FileIn, ipfs.Node, ipfs.readNode, ipfs.readFile, ipfs.readTree, ipfs.filesOnly, ipfs.emptyDirsOf } from "@/lib.wac";
 import { Statement, Signed, signStatement, signedBlock, addressOfKey, recipeFrom, statementId } from "../src/claims.wac";
 import { Index, Held, Loaded, loadIndex, saveIndex, loadIndexes, publishIndex } from "../src/graph.wac";
 import { slotsOf } from "../src/slots.wac";
-import { Chain, Decision, admit } from "../src/admit.wac";
-import { readPolicyFile } from "../src/policyfile.wac";
-import { Endpoint, Proved, endpointOf, asksFor, chainFor } from "../src/registry2.wac";
+import { AdmitRequest, Admitted, admitSubject } from "../src/admission.wac";
 import { unhex, hex } from "../src/hex.wac";
-import { Anchored, anchorFrom, anchorFromNode } from "../src/checkpoint.wac";
-import { NameAnswer, ensContent, ENS_REGISTRY, ENS_REGISTRY_CODE, PUBLIC_RESOLVER_CODE } from "../src/names.wac";
 import { Written, worldFiles } from "../src/world.wac";
 import { canonicalize } from "../src/canon.wac";
 
@@ -77,7 +76,7 @@ export async i32 main(Sys sys) {
     if (a[i] != "--mirror") { continue; }
     Store m = Store.dir(sys.files(), a[i + 1]);
     if (isHttp(a[i + 1])) {
-      match (httpStoreAt(sys.net(), a[i + 1])) { Err(e): { sys.warn("claim: \{e}"); return 2; } Ok(h): { m = h; } }
+      match (mirrorAt(Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files()), a[i + 1])) { Err(e): { sys.warn("claim: \{e}"); return 2; } Ok(h): { m = h; } }
     }
     Store[] next = Store[].filled(mirrors.len() + 1, m);
     for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
@@ -118,48 +117,24 @@ export async i32 main(Sys sys) {
   for (i32 i = 0; i < loaded.refused.len(); i++) { sys.warn("claim: left out: \{loaded.refused[i]}"); }
   Index ix = loaded.index;
   if (a.len() < 2) { sys.warn("claim: \{cmd} needs a CID"); return 2; }
+  if (admitting && a.len() >= 3) {
+    // Admission (src/admission.wac), and for `run`, then the admitted object fetched and run.
+    string path = flag(a, "--policy", "");
+    u8[] text;
+    match (await sys.readFile(path)) { Err(e): { sys.warn("claim: \{path}: \{e}"); return 1; } Ok(b): { text = b; } }
+    AdmitRequest q = AdmitRequest(a[1], a[2], text, flag(a, "--checkpoint", ""), flag(a, "--beacon", ""), flag(a, "--beacon-url", ""),
+                                  flag(a, "--fork", ""), flag(a, "--now", "") != "" ? decimalOf(flag(a, "--now", "")) : (-1 as i64),
+                                  flag(a, "--anchor", ""), flag(a, "--rpc", ""), flag(a, "--registry", ""), flag(a, "--code-hash", ""),
+                                  flag(a, "--ens-registry", ""), flag(a, "--ens-registry-code", ""), flag(a, "--resolver-code", ""));
+    Admitted d = await admitSubject(sys, q, ix, r);
+    for (i32 i = 0; i < d.lines.len(); i++) {
+      if (d.lines[i].warn) { sys.warn("claim: " + d.lines[i].text); } else { say(sys, quiet, d.lines[i].text); }
+    }
+    if (d.code != 0 || cmd == "admit") { return d.code; }
+    return await runAdmitted(sys, a, r, d.cid!);
+  }
   Cid c;
-  // Admission's anchor (docs/admit.md): from the light client with --checkpoint, or given with --anchor.
-  string anchorHex = flag(a, "--anchor", "");
-  if (admitting && flag(a, "--checkpoint", "") != "") {
-    if (anchorHex != "") { sys.warn("claim: --checkpoint or --anchor, not both: one anchor"); return 2; }
-    // --now fixes the slot (recorded data); without it the clock is read as each update is checked.
-    i64 slot = flag(a, "--now", "") != "" ? decimalOf(flag(a, "--now", "")) : (-1 as i64);
-    string url = flag(a, "--beacon-url", "");
-    if (url != "" && flag(a, "--beacon", "") != "") { sys.warn("claim: --beacon DIR or --beacon-url URL, not both"); return 2; }
-    Result<Anchored, string> got = url != ""
-      ? await anchorFromNode(sys, flag(a, "--checkpoint", ""), url, flag(a, "--fork", ""), slot)
-      : await anchorFrom(sys, flag(a, "--checkpoint", ""), flag(a, "--beacon", "."), flag(a, "--fork", "fulu"), slot);
-    match (got) {
-      Err(e): { sys.warn("claim: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
-      Ok(an): { for (i32 i = 0; i < an.log.len(); i++) { say(sys, quiet, an.log[i]); } anchorHex = "0x" + hex(an.blockHash); }
-    }
-  }
-  if (admitting && a[1].indexOf("ens:") == 0) {
-    // A name: whatever its contenthash says at the anchored block, read by proof.
-    string rpc = flag(a, "--rpc", "");
-    i32 colon = rpc.indexOf(":");
-    if (colon < 1) { sys.warn("claim: ens:NAME needs --rpc HOST:PORT"); return 2; }
-    i32 port = decimalOf(rpc.slice(colon + 1, rpc.len())) as~ i32;
-    u8[]? reg = unhex(flag(a, "--ens-registry", ENS_REGISTRY()));
-    u8[]? rc = unhex(flag(a, "--ens-registry-code", ENS_REGISTRY_CODE()));
-    u8[]? vc = unhex(flag(a, "--resolver-code", PUBLIC_RESOLVER_CODE()));
-    u8[]? an = anchorHex == "" ? u8[]() : unhex(anchorHex);
-    if (reg is null || rc is null || vc is null || an is null) { sys.warn("claim: the ENS flags are hex"); return 2; }
-    string name = a[1].slice(4, a[1].len());
-    match (ensContent(sys.net(), name, rpc.slice(0, colon), port, reg!, rc!, vc!, an!)) {
-      Err(e): { sys.warn("claim: the name: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
-      Ok(ans): {
-        i32 nl = ans.out.indexOf("\n");
-        say(sys, quiet, "name: \{name} → " + (nl < 0 ? ans.out : ans.out.slice(0, nl)));
-        if (nl >= 0) { say(sys, quiet, "      " + ans.out.slice(nl + 1, ans.out.len())); }
-        if (ans.code != 0) { say(sys, quiet, "REFUSED"); return 3; }
-        match (parseCid(ans.cid)) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(x): { c = x; } }
-      }
-    }
-  } else {
-    match (parseCid(a[1])) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(x): { c = x; } }
-  }
+  match (parseCid(a[1])) { Err(e): { sys.warn("claim: \{e}"); return 1; } Ok(x): { c = x; } }
   if (cmd == "slots") {
     match (r.block(c)) {
       Err(e): { sys.warn("claim: \{e}"); return 1; }
@@ -190,39 +165,6 @@ export async i32 main(Sys sys) {
     Cid[] ds = ix.dependents(r, c);
     for (i32 i = 0; i < ds.len(); i++) { sys.log(ds[i].text()); }
     return 0;
-  }
-  if (admitting && a.len() >= 3) {
-    string path = flag(a, "--policy", "");
-    u8[] text;
-    match (await sys.readFile(path)) { Err(e): { sys.warn("claim: \{path}: \{e}"); return 1; } Ok(b): { text = b; } }
-    match (readPolicyFile(text)) {
-      Err(e): { sys.warn("claim: \{e}"); return 1; }
-      Ok(p): {
-        Chain chain = Chain.none();
-        string rpc = flag(a, "--rpc", "");
-        if (rpc != "" && flag(a, "--registry", "") != "") {
-          // Fail closed: when the chain was asked for and cannot answer, what it would say is unknown.
-          match (endpointOf(rpc, flag(a, "--registry", ""), flag(a, "--code-hash", ""), anchorHex)) {
-            Err(e): { sys.warn("claim: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
-            Ok(ep): {
-              match (chainFor(sys.net(), ep, asksFor(p, ix, r, c))) {
-                Err(e): { sys.warn("claim: the chain: \{e}"); say(sys, quiet, "REFUSED"); return 3; }
-                Ok(pr): {
-                  chain = pr.chain;
-                  say(sys, quiet, "chain: block \{pr.at.number}, \{pr.at.slots.len()} slot(s) proved" + (pr.at.anchored ? "" : " (no anchor)")
-                          + "; \{chain.revokedId.len()} revocation(s), \{chain.rejected.len()} rejection(s) set");
-                }
-              }
-            }
-          }
-        }
-        Decision d = admit(p, ix, r, chain, c, a[2]);
-        for (i32 i = 0; i < d.why.len(); i++) { say(sys, quiet, d.why[i]); }
-        say(sys, quiet, d.ok ? "ADMITTED" : "REFUSED");
-        if (!d.ok || cmd == "admit") { return d.ok ? 0 : 4; }
-        return await runAdmitted(sys, a, r, c);
-      }
-    }
   }
   sys.warn("claim: unknown command \{cmd}");
   return 2;

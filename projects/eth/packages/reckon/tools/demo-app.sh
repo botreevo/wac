@@ -62,10 +62,11 @@ CL="wac $work/claim.wasm"
 cd "$work"
 $O cat "$builderOut" out/pagebuild.wasm $st > pagebuild.wasm
 # derive2 NAME ARGSFILE PROGRAM [derive recipe flags…]: the recipe run on both runners, each signing; the agreed output,
-# and the recipe in $recipe.
+# and the recipe in NAME.recipe (it runs in a command substitution, so a variable would not reach the caller).
 derive2() {
   name=$1; argsf=$2; prog=$3; shift 3
   recipe=$($D recipe --program "$prog" --args "$argsf" "$@" $st 2>/dev/null)
+  echo "$recipe" > "$name.recipe"
   a=$($D run "$recipe" $st --timeout 1800000 --key keys/v8.key --runner "reckon-derive/2 v8" 2>/dev/null | sed -n 1p)
   b=$($WASMTIME_WAC "$B/derive.wasm" run "$recipe" $st --timeout 1800000 --key keys/wt.key --runner "reckon-derive/2 wasmtime" 2>/dev/null | sed -n 1p)
   if [ -n "$a" ] && [ "$a" = "$b" ] && [ "$($O cat "$a" status $st)" = "exit 0" ]; then echo "$a"; return 0; fi
@@ -89,12 +90,12 @@ rm -rf src && mkdir -p src && cp -R "$B/tree/in" "$B/tree/home" src/
 mkdir -p src/in/packages/reckon/demo/dist && cp page.wac src/in/packages/reckon/demo/dist/page.wac
 printf 'build\n--wac-home\n/in/in/home\nin/in/in/packages/reckon/demo/dist/page.wac\n-o\n/out/page\n' > compile.args
 compiled=$(derive2 compile compile.args "$B/wac.wasm" --in src) || { bad "(b) the compile"; exit 1; }
-compileRecipe=$recipe
+compileRecipe=$(cat compile.recipe)
 ok "(b) the compiler built page.wasm from it ($compiled)"
 export_tree "$compiled" compiled
 printf '%s\n' packages/reckon/demo/mandelbrot.wac out --in-page --title "$TITLE" --wrap > wrap.args
 pageOut=$(derive2 wrap wrap.args pagebuild.wasm --in compiled) || { bad "(c) --wrap"; exit 1; }
-wrapRecipe=$recipe
+wrapRecipe=$(cat wrap.recipe)
 ok "(c) --wrap: the page ($pageOut)"
 mkdir -p app && $O cat "$pageOut" out/out/index.html $st > app/index.html
 cd "$root"

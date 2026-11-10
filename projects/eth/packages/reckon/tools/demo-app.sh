@@ -13,7 +13,8 @@
 #    b. the compiler builds it, from wac-eth's source and the locked dependencies with that page.wac added beside the
 #       app (where the builder means it to be: it imports the app relatively, and `web` through the manifest);
 #    c. `pagebuild --wrap`: (b)'s output, its module wrapped into index.html.
-#    The page must be what wac-web's builder makes in one step, natively, byte for byte.
+#    The page must be what wac-web's builder makes in one step, natively, byte for byte but one field: the entry path
+#    wac records in the module's manifest, which in the machine is below its input (tools/samepage.py).
 # 3. A reviewer endorses what was reviewed: the builds' source and arguments, and (b)'s source, which is wac-eth's
 #    with (a)'s page.wac added (the script checks that it is). A policy (WORKDIR/policy.json5) admits the page
 #    through (c), the builder and (b), back to the compiler as the root.
@@ -105,8 +106,11 @@ rm -rf "$here/demo/dist"
 wac run --allow-read --allow-write --allow-run "$webdir/tools/build.wac" packages/reckon/demo/mandelbrot.wac packages/reckon/demo/dist \
   --in-page --title "$TITLE" > "$work/native.log" 2>&1 || { tail -5 "$work/native.log"; exit 1; }
 cd "$work"
-cmp -s app/index.html "$here/demo/dist/index.html" && ok "the page is the one wac-web's builder makes natively in one step, byte for byte" \
-  || { bad "the sealed page differs from the builder's one-step page"; exit 1; }
+# The same page but for one field: wac records the entry it compiled in the module's manifest, and the machine's
+# compile was given it below its input (in/in/in/), where the native build was given it from wac-eth's root.
+python3 -I "$here/tools/samepage.py" app/index.html "$here/demo/dist/index.html" in/in/in/ > samepage.log 2>&1 \
+  && ok "the page is the one wac-web's builder makes natively in one step, byte for byte but the manifest's entry path" \
+  || { bad "the sealed page differs from the builder's one-step page: $(cat samepage.log)"; exit 1; }
 cmp -s page.wac "$here/demo/dist/page.wac" && ok "…and so is page.wac" || bad "page.wac differs from the builder's"
 rm -rf "$here/demo/dist"
 app=$($O add app $st)

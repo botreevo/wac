@@ -45,7 +45,7 @@ not wired into wac's own fetch and build: that waits until the design settles.
 | `src/machine.wac`, `src/world.wac`, `src/canon.wac`, `cmd/derive.wac` | the deterministic WebAssembly machine (`wasm-gc/wac-host/1`) and a runner for it. NaNs are made canonical by rewriting the module, so V8 and wasmtime agree on floats too. `docs/runner.md` has the results; the one gap left is the clock and randomness, which need a change in wac |
 | `packages/lightclient`, `packages/ssz` | the light client past Altair, to Fulu and Gloas: per-fork types, execution headers, a fork-aware store, checked against Ethereum's vectors (see its README) |
 | `cmd/claim.wac`, `src/policyfile.wac`, `tools/demo.sh` | sign endorsements, rejections and revocations; query origins and dependents; admit under a JSON5 policy. The demo (8 checks): one recipe run on V8 and on wasmtime gives one output, both runners sign, a reviewer endorses the inputs, and the output is admitted only with both witnesses and every endorsement, and refused again when either is revoked |
-| registry v2 | revocations by (signer, statement CID), rejection lists and delayed names, read by proof; `claim admit --chain` — [done](docs/registry2.md): 40 of 40 on a devnet |
+| registry v2 | revocations by (signer, statement CID), rejection lists and delayed names, read by proof; `claim admit --rpc` — [done](docs/registry2.md): 47 of 47 on a devnet |
 
 ## The first round: what was built, and what it showed
 
@@ -134,8 +134,8 @@ In the order I would act on them.
 Revocations are keyed by (signer, statement CID) and can also be relayed as signed EIP-712 Revocations. Rejection
 lists hold a reason hash. Names point at a CID, and changes to the CID or to the delay itself both wait out the
 delay. The reader proves every question admission could ask and turns the answers into admit's `Chain`. Its
-end-to-end run on a devnet passes 40 of 40 checks, including a lying node and a wrong code hash. `claim admit
-… --chain HOST:PORT --registry ADDR --code-hash H` uses it in place of `Chain.none()`. What was built, the
+end-to-end run on a devnet passes 47 of 47 checks, including a lying node and a wrong code hash. `claim admit
+… --rpc HOST:PORT --registry ADDR --code-hash H` uses it in place of `Chain.none()`. What was built, the
 layout, and the findings (wacuum drops revert data, among others) are in [docs/registry2.md](docs/registry2.md).
 
 ## What it does not do
@@ -159,7 +159,7 @@ sh packages/reckon/tools/agree.sh ../wac              # one tree hashed three wa
 (cd packages/reckon/tools/oracle && npm install)      # ethers, js-sha3, solc: the oracles and the wallet
 (cd packages/wacuum && wac build --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum)
 TOOLCHAIN=kt1:… sh packages/reckon/tools/e2e.sh /tmp/e2e   # the whole run on a devnet; needs a clean commit
-sh packages/reckon/tools/registry2.sh /tmp/r2             # the registry v2 on a devnet: 40 checks
+sh packages/reckon/tools/registry2.sh /tmp/r2             # the registry v2 on a devnet: 47 checks
 ```
 
 `mpt`, `ethrpc` and wacuum's secp256k1 come from `@/lib.wac`, and the devnet the end-to-end run uses is the wacuum beside

@@ -11,7 +11,7 @@ proof. v1 (`contracts/TrustRegistry.sol`, `src/registry.wac`, `src/trust.wac`) i
 | `contracts/Registry.bin`, `Registry.layout.json` | solc 0.8.28 output (`node tools/registry2/compile.cjs`): creation code, and the storage layout the tests are generated from |
 | `src/registry2.wac` | the slots, reading them by `eth_getProof` with the account's code hash checked, a `Chain` for `admit`, and `resolveName` |
 | `test/registry2_test.wac` | 10 tests: every slot against vectors from solc's layout and ethers (`tools/registry2/vectors.mjs`), the name rule, answers into a `Chain` |
-| `cmd/claim.wac` | `claim admit … --chain HOST:PORT --registry ADDR --code-hash H [--anchor BLOCKHASH]`: the `Chain` proved from the registry, in place of `Chain.none()`. A chain asked for and unreadable refuses (exit 3) |
+| `cmd/claim.wac` | `claim admit … --rpc HOST:PORT --registry ADDR --code-hash H [--anchor BLOCKHASH]`: the `Chain` proved from the registry, in place of `Chain.none()`. A chain asked for and unreadable refuses (exit 3) |
 | `cmd/registry2.wac` | a harness: `endorse`, `admit` under one fixed policy shape, `resolve`, `slot`, `cid` |
 | `tools/registry2/wallet.mjs` | the writing side, with ethers |
 | `tools/registry2.sh` | the end-to-end run on a wacuum devnet (`wac task reckon:registry2 -- WORKDIR`) |
@@ -38,9 +38,9 @@ reach (the target, every subject and output, and each recipe's input slots). `ch
 and `chainOf` turns the answers into admit's `Chain`. Asking for a superset means anything admit isn't told about has
 been proved absent, not skipped.
 
-## The end-to-end run: 40 of 40
+## The end-to-end run: 47 of 47
 
-On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 s; four runs in a row passed):
+On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row passed):
 
 1. An endorsed object is admitted, with every slot proved absent.
 2. A stranger's "revocation" of the endorser's statement is recorded under the stranger and changes nothing. The
@@ -52,9 +52,12 @@ On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 
 4. An unclaimed name is refused. A claim resolves at once. A stranger cannot move it, and the publisher cannot claim
    it twice. During the 8 s delay the old CID holds and the proposal and the shorter delay show as pending. After the
    delay the new CID and delay are in effect with no write in between.
-5. `claim admit` with a JSON5 policy file and `--chain`: admitted with nothing set; refused while the followed list
-   rejects the object; refused after the endorser revokes on chain. Without `--chain` the same object is admitted,
-   because that revocation lives only on chain. With `--chain` pointing at nothing it is refused, not admitted.
+5. `claim admit` with a JSON5 policy file and `--rpc`: admitted with nothing set; refused while the followed list
+   rejects the object; refused after the endorser revokes on chain. Without `--rpc` the same object is admitted,
+   because that revocation lives only on chain. With `--rpc` pointing at nothing it is refused, not admitted.
+   Then a derivation (`derive` on the V8 host, a quorum of one runner, every input endorsed): admitted; refused
+   when the followed list rejects the *program* it was derived with, which `asksFor` reached through the recipe's
+   slots; admitted again once it is unrejected; refused when the runner revokes its derivation on chain.
 6. Through `tools/liar.mjs` (v1's lying node, unmodified), the hidden revocation and the hidden name are both refused
    because their storage proofs do not verify. Where every slot really is empty, the lie changes nothing and
    admission goes through.
@@ -62,24 +65,21 @@ On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 
 
 ## Findings
 
-- **wacuum drops revert data.** A reverting `eth_estimateGas` answers a bare `execution reverted`, and a reverting
-  `eth_call` puts the revert data in the message (`execution reverted: 0x08c379a0…`) rather than in `error.data`. ethers
-  therefore reports "missing revert data" for every refused transaction. The wallet works around it by replaying the
-  call with a raw `eth_call` and decoding `Error(string)` from the message. The fix belongs in
-  `packages/wacuum/src/engine/engine.wac` (`call` and `estimateGas`): put the output in `data`, and have
-  `estimateGas` return the reverting run's output too.
-- **A wacuum devnet proves only its head.** `--dev` finalizes every block as it makes it, and the world keeps the
-  finalized block's state and nothing older. A proof requested for the header just fetched is therefore refused
-  ("the state of that block is not available") whenever a block lands in between. Through the liar, which adds a hop
-  and a second proof request, that happened in 1 of 3 runs at the default 2 s period even with 4 retries. The reader
-  now retries 8 times and the run uses `--dev-period 3`. v1's `readRetrying` has the same exposure. On a real chain,
-  nodes keep recent states and this does not come up.
+- **wacuum dropped revert data** (fixed). A reverting `eth_estimateGas` answered a bare `execution reverted`, and a
+  reverting `eth_call` put the data in the message rather than in `error.data`, so ethers reported "missing revert
+  data" for every refused transaction. wacuum now answers as geth does: code 3, `execution reverted: <reason>`, and
+  the data in `error.data` (`packages/wacuum/test/revert_test.wac`). The wallet's workaround is gone.
+- **A wacuum devnet proved only its head** (fixed). `--dev` finalizes every block as it makes it, and the world kept
+  the finalized block's state and nothing older, so a proof asked for the header just fetched was refused ("the
+  state of that block is not available") whenever a block landed in between. Through the liar, which adds a hop and a
+  second proof request, that happened in 1 run in 3. A `--dev` node now keeps the last 16 blocks' states (the
+  engine's `states`; `packages/wacuum/test/dev_test.wac`), and the readers here and in v1's `trust.wac` retry 8 times.
 - **The liar's refusal is not always worded the same.** Depending on where the substitute proof diverges from the real
   trie, mpt says either "the proof ends where a node hashing to … was expected" or "node N hashes to …, but its parent
-  named …". v1's e2e matched the first phrase only. That held there by the luck of its trie shapes, and would have
-  failed here.
-- **`tools/oracle/package-lock.json` is out of sync** with its `package.json`: it lacks `multiformats` and
-  `@ipld/dag-cbor`, so `npm ci` refuses. `npm install` works. It is not changed here because it belongs to v1's tools.
+  named …". v1's e2e matched the first phrase only, which held only because of the shape of its tries; it now accepts
+  either (fixed).
+- **`tools/oracle/package-lock.json` was out of sync** with its `package.json` (fixed): it lacked `multiformats`,
+  `@ipld/dag-cbor` and `cborg`, so `npm ci` refused. Regenerated; every version it already pinned is unchanged.
 - **No wac blockers.** The only compiler friction was casts (`as!`, `as~`), where the diagnostics say what to write.
 - **`now` belongs to the caller.** A name's meaning at a time does not depend on which block proved it, because the
   pending value and its time are in storage. A follower can therefore see a change coming for the whole delay,

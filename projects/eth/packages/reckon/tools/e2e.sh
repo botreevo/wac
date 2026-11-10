@@ -18,14 +18,23 @@ keys=$work/keys; stmts=$work/stmts; mirror=$work/mirror; evil=$work/mirror-evil
 mkdir -p "$keys" "$stmts" "$mirror" "$evil"
 pass=0; fail=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-expect() {  # expect ok|refused DESCRIPTION [BECAUSE] -- command…   (BECAUSE: a phrase the output must contain)
+matches() {  # matches OUTPUT 'PHRASE || PHRASE …': whether OUTPUT contains any one of the phrases
+  rest=$2
+  while :; do
+    case "$rest" in *" || "*) p=${rest%%" || "*}; rest=${rest#*" || "} ;; *) p=$rest; rest="" ;; esac
+    if printf '%s' "$1" | grep -qF -- "$p"; then return 0; fi
+    if [ -z "$rest" ]; then return 1; fi
+  done
+}
+expect() {  # expect ok|refused DESCRIPTION [BECAUSE] -- command…   (BECAUSE: a phrase the output must contain, or
+            # several separated by " || ", any one of which will do)
   want=$1; what=$2; because=""; shift 2
   if [ "$1" != "--" ]; then because=$1; shift; fi
   shift
   if out=$("$@" 2>&1); then got=ok; else got=refused; fi
   printf '%s\n' "$out" | sed 's/^/   | /'
   if [ "$got" != "$want" ]; then fail=$((fail+1)); echo "   FAIL ($what: wanted $want, got $got)"
-  elif [ -n "$because" ] && ! printf '%s' "$out" | grep -qF -- "$because"; then fail=$((fail+1)); echo "   FAIL ($what: $got, but not because \"$because\")"
+  elif [ -n "$because" ] && ! matches "$out" "$because"; then fail=$((fail+1)); echo "   FAIL ($what: $got, but not because \"$because\")"
   else pass=$((pass+1)); echo "   PASS ($what: $got${because:+, because \"$because\"})"; fi
 }
 
@@ -120,7 +129,9 @@ step "7. a node that hides that revocation is caught by the proof"
 node "$here/tools/liar.mjs" 8546 8545 & liar_pid=$!
 until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:8546/ >/dev/null; do sleep 0.2; done
 sed 's/127.0.0.1:8545/127.0.0.1:8546/' "$work/trust.json5" > "$work/trust-liar.json5"
-expect refused "run hello by hash through the lying node" "the proof ends where" -- $W run "$hello" --policy "$work/trust-liar.json5" --mirror "$mirror"
+# mpt words the refusal by where the substitute proof leaves the real trie: it ends early, or a node's hash is not
+# the one its parent names. Which one depends on the trie's shape, so either will do.
+expect refused "run hello by hash through the lying node" "the proof ends where || but its parent named" -- $W run "$hello" --policy "$work/trust-liar.json5" --mirror "$mirror"
 
 step "8. a deny list you follow names the web app"
 $wallet deny "$keys/denylist" "$registry" "$notes" on

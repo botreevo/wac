@@ -1,6 +1,6 @@
 # 0376a — `manyfiles_test`'s first test traps, at every commit the current compiler can build
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; passes; fixed by `875264250`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-10-15
@@ -26,3 +26,13 @@ last changed in `be1f345b4` (2026-10-01).
 A second ago is too fast for the emit and run the comments describe (`blockedFiles` 167ms, emit 200ms,
 run 15ms) to have finished, so the trap is probably early — in `blockedFiles` or in the emit — and inside
 the test module, which carries wacc's own sources. Not looked at further.
+
+## Why
+
+The 561-file program trapped in `manyfiles_test`'s first test at every commit since the spec rewrite.
+
+## Fix
+
+Fixed by commit `875264250`. Re-checked on master `715162c8d`: all five tests in
+`packages/wacc/test/wac/manyfiles_test.wac` pass, `test_more_files_than_the_linkers_tables_used_to_hold` in 339 ms. The
+test file is the regression test.

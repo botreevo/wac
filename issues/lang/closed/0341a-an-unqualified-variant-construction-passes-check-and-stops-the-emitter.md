@@ -1,6 +1,6 @@
 # 0341a — an unqualified variant construction passes `check` and stops the emitter
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; checks, builds and runs; `spec/cases/0837`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-05
@@ -102,3 +102,14 @@ minimal programs, one per proposed construct. The other fifteen behave as the de
 `fn<>`, `gen`/`yield`, `defer`, brace patterns, list literals, `never`, re-export, typedef and
 `default:`-in-a-value-match are all refused at parse or type; `trap "…";` and a `const` parameter
 already exist, which `vision/GRAMMAR.md` also records.
+
+## Why
+
+Construction through an unqualified variant name passed the checker on the argument-list path and stopped the emitter, with no source position.
+
+## Fix
+
+Unqualified variants are now specified (`[§enum-construct-unqualified-r8vn2kd]`) and lowered: on master `715162c8d`
+`enum E { A(i32 x), B(i32 y) }` with `E e = A(7);` checks, builds and runs, answering 7, so check and build agree. The
+second reproduction cannot arise as written — `Ok` is no longer importable by name, and `Ok(x)` is the unqualified
+spelling instead. `spec/cases/0837` already constructs `Circle(3)`, `Dot` and `Ok(…)` this way and answers 12.

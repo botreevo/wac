@@ -1,6 +1,6 @@
 # 0319a — a generic method on a non-generic struct cannot be emitted
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; emits and runs; `spec/cases/0893`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
@@ -66,3 +66,14 @@ Both halves were first measured through a seed three `packages/wacc/src` commits
 enough to date an answer without failing — one of the constructs in `vision/GRAMMAR.md` moved on the
 rebuild for exactly that reason. Re-run after `./bootstrap.sh --no-install`: the plain struct still
 answers `cannot emit`, the generic struct still builds. The reproduction stands.
+
+## Why
+
+A method declaring type parameters its owner does not have registered a type while a body was being emitted, after the type section was sized, when the owner had no type parameters of its own.
+
+## Fix
+
+The issue's two lines build on master `715162c8d` (`g.wasm: 695 bytes`) and a test asserting
+`s.pick<i32>(3) == 3` passes. Found during a triage of the open tree; no commit names this number, so the fix is
+somewhere in the emitter's type registration since 2026-09. `spec/cases/0893` instantiates it at two type arguments.
+`packages/wactest/src/assert.wac:36` still keeps `okOf` a free function because of this issue.

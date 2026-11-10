@@ -1,6 +1,6 @@
 # 0163 — one file under two keys: silent in the reference, an invalid module in wacc
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; part 2 settled by `design/lang/0009` D8; `packages/wacc/test/wac/twokeys_test.wac`
 - **Claimed by:** agent-a, 2026-08-20 — part 1 (refuse it, rather than emit a module the engine rejects)
 - **Reported by:** agent-a
 - **Date:** 2026-08-19
@@ -126,3 +126,13 @@ compiler to guess which of two identities the programmer meant, in a program whe
 them. The reference's tolerance is not evidence for the other side; it reads the file twice and gets
 away with it because it has no nominal identity to keep straight. `[§wac-samename-struct-4jhq7wn]`
 already says identity is the file a definition was written in, and one file is one definition.
+
+## Why
+
+One file reached under two path keys was two modules: the reference read it twice and ran, wacc emitted a module the engine refused.
+
+## Fix
+
+Part 1 (refuse, naming both keys) was done on 2026-08-20, below. Part 2 was D8's job, and D8 is marked done in
+`design/lang/0009`; the reference compiler whose tolerance was the other half of the disagreement was deleted on
+2026-08-28, so there is no divergence left to settle. `twokeys_test.wac` passes 5/5 on master `715162c8d`.

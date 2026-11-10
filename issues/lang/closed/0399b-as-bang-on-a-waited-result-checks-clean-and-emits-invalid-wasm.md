@@ -1,7 +1,7 @@
 # 0399b — `as!` on a waited `Result` checks clean and emits a module the engine refuses
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — refused by the checker; `spec/cases/0900`
+- **Claimed by:** wac2
 - **Reported by:** agent-b
 - **Date:** 2026-10-27
 - **Kind:** bug
@@ -36,3 +36,22 @@ from `Result<T, E>` to `T` (and stop suggesting it), or define it as "`Ok`'s val
 and emit that. `match` on the waited value works today, which is what `packages/tor`'s tests do.
 
 Found while writing a test for `issues/lang/0398b`.
+
+## Why
+
+`isCastRef` asked `isEnum` and `isStruct` with the operand's spelling, and `Result<i32, Stuck>` is neither — so a
+cast out of one was neither a reference cast nor a numeric one, and `checkCast` checked it as nothing. And the
+mismatch diagnostic's help offered `as!` for exactly this shape.
+
+## Fix
+
+**Refused, and `!` named instead** — `spec/3-expressions/24-casts.md` gives `as!` no meaning on an enum, and
+`!`/`unwrap()` already take `Ok`'s value. `isCastRef` counts any generic instance as a reference (no primitive takes
+type arguments). A cast out of an enum — or out of a `Result` by name, as `try` knows it, since a file can hold one
+it never imported — to anything but its own variant, itself or `anyref` is *wrong cast operator*, where it was a
+downcast warned to always trap and then emitted invalid. Its help, and the help of `T x = r;` where `r` is a
+`Result<T, …>`, is *"`!` or `.unwrap()` takes `Ok`'s value and traps on an `Err`; `match` handles the error"*
+(`unwrapHint`). The issue's program is refused at the cast. `spec/cases/0900`.
+
+Without any import a file's `one().wait()` has no type at all, so the cast in it is still unchecked; that is a reach
+gap of its own, `issues/lang/0449e`.

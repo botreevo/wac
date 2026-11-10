@@ -1,6 +1,6 @@
 # 0324a — `null as T?` type-checks and cannot be emitted
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; builds and runs; `spec/cases/0894`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
@@ -53,3 +53,12 @@ built, and the checker says nothing.
 Same class as `0323a`, filed an hour earlier: the checker accepts and the emitter cannot. Whether
 the fix is to emit it or to refuse it at check time is the decision — refusing would make
 `null as T?` unwritable and the middle state unreachable, so emitting is likely what is wanted.
+
+## Why
+
+`null as T?` checked as a null of `T?` and then could not be emitted.
+
+## Fix
+
+Re-checked on master `715162c8d`: `i32? n = null as i32?; return n is null ? 1 : 0;` checks, builds and answers 1.
+Found during a triage of the open tree; no commit names this number. `spec/cases/0894` holds it.

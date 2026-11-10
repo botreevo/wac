@@ -1,6 +1,6 @@
 # 0073 — named re-export, so a library can have one entry point
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; the spec's re-export section; `spec/1-programs/02-modules-and-imports.md` examples
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a, from the operator's call (2026-08-05)
 - **Date:** 2026-08-05
@@ -96,3 +96,16 @@ export i32 test() { return foo(); }   // wanted: 42
 Expected: `42`.
 Actual: `b.wac` does not parse, and the `import { foo } from "./a.wac"` workaround plus
 `import { foo } from "./b.wac"` is `[§wac-no-reexport-f7kn4wq]`.
+
+## Why
+
+A library had no way to export a name it imports, so every one-entry-point package wrote a wrapper per name.
+
+## Fix
+
+Named re-export exists and is specified: `export { a, b } from "m"`, `export { a as b } from "m"`, with identity,
+no-binding and collision rules (`spec/1-programs/02-modules-and-imports.md`, `[§wac-reexport-names-khyrww8]` and the
+four tags after it), every example compiled and run by the spec-examples tests. Re-checked on master `715162c8d`:
+`export { foo } from "./a.wac"` checks and a test through it answers 42. Found during a triage of the open tree; no
+commit names this number. `packages/wacc/src/files.wac:24` and `packages/quic/src/initial.wac:23` still cite this
+issue for wrappers that a re-export could now replace.

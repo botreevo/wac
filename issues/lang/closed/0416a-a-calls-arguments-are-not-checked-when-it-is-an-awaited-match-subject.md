@@ -1,6 +1,6 @@
 # 0416a — a call's arguments are not checked when it is the awaited subject of a `match`
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; refused by the checker; `spec/cases/0897`
 - **Reported by:** agent-a
 - **Date:** 2026-10-28
 - **Kind:** bug
@@ -26,3 +26,13 @@ Actual: checked clean; the module is invalid (*call[4] expected type (ref null 1
 
 Found merging `packages/wactest/src/inline.wac`, written against `exec`'s older signature: it merged cleanly,
 passed `wac check`, and every inline-oracle test then failed with "the module just built will not load".
+
+## Why
+
+An awaited call used as a `match` subject did not have its arguments checked against its parameters.
+
+## Fix
+
+Refused on master `715162c8d`: the issue's `match (await sys.procs().exec("true", string[](), u8[](), string[](), …))`
+is *"expected ChildEnv, found string[]"* at 3:61. Found during a triage of the open tree, and confirmed independently
+by wac1; no commit names this number. `spec/cases/0897` holds the same shape with no `std`.

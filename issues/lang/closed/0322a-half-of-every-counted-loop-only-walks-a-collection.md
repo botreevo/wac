@@ -1,6 +1,6 @@
 # 0322a — half of every counted loop only walks a collection
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; `for (T v in xs)` over an array and over a `Vec`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
@@ -59,3 +59,14 @@ about `Vec` — which is a built-in knowing about a library type — or `Vec` gr
 desugaring calls. The second is cleaner and is a decision rather than work.
 
 **Nothing about generators**, which the general form needs and this does not.
+
+## Why
+
+Half of every counted loop used its counter only to index, because there was no loop over a collection's elements.
+
+## Fix
+
+It exists and is specified (`spec/3-expressions/25-control-flow.md`, `spec/7-library/38-vec.md`). Re-checked on
+master `715162c8d`: `for (u8 b in bytes)` over a `u8[]` sums to 6 and `for (i32 x in v)` over a `Vec<i32>` to 3. The
+open decision was whether the binding is `const`; it is not — assigning to it checks. The 1,991 sites convert at
+leisure, as the issue said.

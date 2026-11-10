@@ -1,6 +1,6 @@
 # 0403a — a match scrutinee calling a missing method is not diagnosed
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; refused by the checker; `spec/cases/0896`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
@@ -30,3 +30,13 @@ named at all.
 Found writing a test for a `Files` method before adding it. The same call as a statement, or awaited as a statement, is
 reported properly, so the gap is the match scrutinee. Related to but not the same as 0305b (a missing method on a
 generic's returned `Option`).
+
+## Why
+
+A call in a `match` subject was not type-checked, so a missing method passed the check and stopped the emitter.
+
+## Fix
+
+Refused on master `715162c8d` by both `check` and `build` with *"no such method"*, for `match (p.nope())` and for
+`match (await sys.nope())`. Found during a triage of the open tree, and confirmed independently by wac1; no commit names
+this number. `spec/cases/0896` holds the synchronous form.

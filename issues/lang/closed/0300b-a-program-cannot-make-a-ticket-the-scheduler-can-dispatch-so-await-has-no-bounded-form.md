@@ -1,6 +1,6 @@
 # 0300 — a program cannot make a ticket the scheduler can dispatch, so `await` has no bounded form
 
-- **Status:** open — a language/platform gap, found by trying to write around it and failing
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; a program-made `Ticket` resolves, and std's `within` bounds an `await`
 - **Claimed by:** (nobody — `issues/system/0294c` is the migration this blocks)
 - **Reported by:** agent-b
 - **Date:** 2026-08-30
@@ -141,3 +141,16 @@ now; `app`, `link`, `hsserviced`, `bootstrap` and `network` use *bounded* waits 
 one; `ssh/conn.wac` reads through a method and is behind `0301b`. `fs/remote.wac` and
 `platform/frame.wac` mention `waitAny` only in comments — they hand tickets to callers rather than
 multiplexing, so they are not waiting on anything.
+
+## Why
+
+The only deadline was `core.waitAny`, which blocks; a program could not make a ticket the scheduler dispatched, so a bounded `await` could not be written.
+
+## Fix
+
+Both halves of the first option under *What would close it* exist: a program makes a `Ticket<T>` and resolves it
+(`t.resolve(v)`, `core`), and `std` has `within` (`std/platform.wac`, spec ch44 `[§wac-std-within-8mdio9r]`). Re-checked
+on master `715162c8d`: `Ticket<Result<i32, string>> never;` then `await sys.clock().within(never, 200)` resumes with
+`TimedOut` after the deadline — exit 7 in 1.2 s, and no *continuation(s) still waiting*. Found during a triage; no
+commit names this number. `packages/tor/src/socks.wac:55` and `:381` still cite it for a wait-and-look-again loop that
+can now be bounded.

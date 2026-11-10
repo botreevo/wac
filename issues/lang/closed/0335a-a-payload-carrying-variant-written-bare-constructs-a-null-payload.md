@@ -1,6 +1,6 @@
 # 0335a — a payload-carrying variant written bare constructs a default payload, and a null one for a reference
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; refused by the checker; `spec/cases/0895`
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
@@ -100,3 +100,14 @@ carve out `T = void`, which is the `Result<void, E>` question above and should b
 because the carve-out is where the rule would go.
 
 Measured through `deno run -A bootstrap/ts/ask_wacc.ts`, ten probes, 2026-09-04.
+
+## Why
+
+The payload-arity check ran only on the with-arguments path, so `Sh.B` written bare took the payload-less path and constructed a null payload.
+
+## Fix
+
+Refused on master `715162c8d`: `return Sh.B;` for `B(string s)` is *"B carries a payload, and constructing it must
+supply one"* — the wording `spec/2-types/13-enums.md`'s example gives, under
+`[§enum-construct-payload-required-uc2cir8]`. Found during a triage of the open tree; no commit names this number.
+`spec/cases/0895` holds the issue's program.

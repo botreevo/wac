@@ -6,7 +6,7 @@ has been fixed and why.
 | # | summary | kind | symptom |
 |---|---|---|---|
 | [0449e](closed/0449e-wait-on-an-async-call-has-no-type-without-a-ticket-import.md) | `async i32 one()` then `i32 x = one().wait();` in a file that imports nothing checks clean and emits an invalid module; with any `std` or `core` import it is *expected i32, found Result<i32, Stuck>* — `wait()` has no type when `Ticket` was reached only through an `async` result. wac1's area | bug | accepted program |
-| [0448e](open/0448e-ticket-any-over-only-void-tickets-emits-a-void-local.md) | `Ticket.any(f(), g())` over two `async void` calls checks clean and builds a module the engine refuses: `AnyValue<Ts>` collapses to `void` and `any`'s body declares a local of it. Left legal by `0378a`'s refusal, broken before it. wac1's area | bug | invalid wasm |
+| [0448e](closed/0448e-ticket-any-over-only-void-tickets-emits-a-void-local.md) | `Ticket.any(f(), g())` over two `async void` calls checks clean and builds a module the engine refuses: `AnyValue<Ts>` collapses to `void` and `any`'s body declares a local of it. Left legal by `0378a`'s refusal, broken before it. wac1's area | bug | invalid wasm |
 | [0447e](open/0447e-the-spec-shows-within-with-nested-patterns-the-language-does-not-have.md) | `spec/7-library/44-std.md`'s only `within` example matches `Ok(Data(bytes))` and `Err(TimedOut t)` — nested patterns, which `0027` deferred — so the program it shows is *expected ')', found 't'*; it is marked `// fragment`, so nothing compiled it | diagnostic | a spec example that does not parse |
 | [0446e](open/0446e-an-integer-literal-above-i64-skips-the-member-check.md) | `9223372036854775808.nofield` checks clean and the build cannot emit it (*member of an unknown type*); every literal up to `i64`'s maximum is refused with *no such field*, and so is the same value in a typed slot — a literal with no `i64` type is left untyped as a receiver, up to and past 2^64 | bug | accepted program |
 | [0438d](open/0438d-a-generic-call-named-only-inside-a-lambda-argument-is-not-instantiated.md) | A generic function called only in the bodies of lambdas handed to a constructor (`std`'s `RandomFile(…)` calling `hostAsk<U>`) is never instantiated: *a call to `hostAsk` … not in the program* | bug | emit failure |
@@ -25,7 +25,7 @@ has been fixed and why.
 | [0410a](open/0410a-a-method-call-on-a-nullable-array-is-not-checked.md) | `out.write(b)` on a `u8[]? out` passes `wac check` and fails in the emitter; the same call on `u8[]` is *no such method* | diagnostic | compile error |
 | [0409a](open/0409a-a-narrower-union-does-not-widen-into-a-nullable-wider-one.md) | `Wide? n = narrow` is *initialiser does not match*: a narrower union widens into `Wide` and into a `Wide` parameter, not into `Wide?` | bug | compile error |
 | [0408a](closed/0408a-a-core-type-imported-by-name-loses-its-text-conversion.md) | `import { Stuck } from "core"` and `"\{e}"` on a `Stuck` was *no conversion to text*: a built-in's `[toString]` types were recorded only from aliased imports of `toString`. **Closed 2026-10-27** by 3a4b7424e | bug | compile error |
-| [0407a](open/0407a-a-void-type-argument-does-not-erase-a-method-parameter.md) | `Ticket<void>.resolve()` is *wrong number of arguments*: a `void` type argument erases a funcref's parameter and not a method's | bug | compile error |
+| [0407a](closed/0407a-a-void-type-argument-does-not-erase-a-method-parameter.md) | `Ticket<void>.resolve()` is *wrong number of arguments*: a `void` type argument erases a funcref's parameter and not a method's | bug | compile error |
 | [0406a](closed/0406a-a-method-call-on-a-union-value-is-not-checked.md) | `e.nothing()` on a `union<A, B>` passes the checker and fails in the emitter — found as `e.toString()` on a fault union, where `"\{e}"` works | diagnostic | compile error |
 | [0405a](closed/0405a-an-await-in-the-ok-arm-of-a-match-on-result-void-emits-invalid-wasm.md) | An `await` inside the `Ok(v)` arm of a match on a `Result<void, E>` in an `async` function emits a module the engine refuses (`array.set` short an operand) | bug | invalid wasm |
 | [0404a](open/0404a-a-generic-call-in-a-lambdas-ternary-or-a-local-lambda-is-not-instantiated.md) | A generic call taking a lambda, inside a lambda, is not instantiated when it is a ternary's branch or the lambda is held by a local: "a call to `make` … which is not in the program" | bug | compile error |
@@ -147,7 +147,7 @@ has been fixed and why.
 
 ## Closed
 
-367 issues, 316 closed.
+367 issues, 318 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

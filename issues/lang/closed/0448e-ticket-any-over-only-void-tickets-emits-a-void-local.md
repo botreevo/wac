@@ -1,7 +1,6 @@
 # 0448e — `Ticket.any` over only `void` tickets checks and builds a module the engine refuses
 
-- **Status:** open — wac1's area (`core/ticket.wac`, the async tickets)
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `emit.wac`: a `void` local holds nothing; with `issues/lang/0407a`; `spec/cases/0906`
 - **Reported by:** wac2 (cloud), found while fixing `0378a`
 - **Date:** 2026-11-10
 - **Kind:** bug
@@ -28,3 +27,7 @@ just built will not load — the engine would not compile it*.
 `AnyValue<Ts> v = tickets.[i].value();` — a `void` local, which `§wac-void-no-values-uieaw93` forbids in a program and
 which the instantiation reaches unchecked. A `static_if` on the collapsed type, settling `out` with nothing, is the
 likely shape. `Ticket.all` over `void` tickets works (`spec/cases/0890`, `0414a`), so its body is the model.
+
+## Fix
+
+`any`'s body declares `AnyValue<Ts> v = tickets.[i].value();` and resolves with it. At `AnyValue<Ts> = void` the declaration was a `local.set` of nothing, and `resolve(v)` passed an argument to a parameter `void` erases. A `void` local now runs its initialiser and is in scope as a value of nothing, as an erased parameter is, and 0407a made the `resolve` call's count right.

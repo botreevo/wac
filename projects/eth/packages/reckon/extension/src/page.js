@@ -6,7 +6,9 @@ import { buildDocument, typeOf } from './build-doc.js';
 
 const $ = (id) => document.getElementById(id);
 const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'policy', 'now'];
-const DEFAULTS = { mirrors: 'https://trustless-gateway.link', policy: '{ signers: {}, roles: {} }' };
+// No mirror by default: a public gateway is a choice to make, and one that is down slows every admission until it is
+// left out. The settings suggest one.
+const DEFAULTS = { mirrors: '', policy: '{ signers: {}, roles: {} }' };
 
 async function loadSettings() {
   const got = await chrome.storage.local.get('settings');

@@ -74,8 +74,8 @@ decision:
   the light client's own state as it advances (R4).
 - **Policy:** the JSON5 file `claim admit` reads, pasted or picked.
 - **Beacon node(s) and execution RPC(s):** trusted for availability only.
-- **Mirrors and gateways:** trusted for availability only. The default gateway is https://trustless-gateway.link
-  (decision G).
+- **Mirrors and gateways:** trusted for availability only. None by default; the settings suggest
+  https://trustless-gateway.link (decision G).
 - **Registry address and code hash,** for revocations, rejections and `name:` subjects (K1).
 
 Nothing else is trusted. In particular, the extension never loads code from the network for itself. Its own code is
@@ -127,9 +127,12 @@ what the user installed, and its build can itself be a derivation, so it can be 
 - **Size.** `claim.wasm` is about 540 KB today. With the light client and BLS it is still fine for an extension;
   start-up is measured in milestone 1.
 - **CPU.** The light client's BLS checks run in V8 as they do on the Node host. Milestone 1 will time them.
-- **A mirror that does not answer delays admission.** Each mirror is asked for its claim index, and a public gateway
-  that is down (as trustless-gateway.link was on 2026-11-10) holds an admission for about 90 s before it is left
-  out. Timeouts per mirror, or asking mirrors in parallel, would fix it.
+- **A mirror that does not answer delays admission, once.** A mirror that fails (no answer, or a 5xx such as a down
+  gateway's 522) is now marked down and asked nothing more in that run (`packages/ipfs`'s `Store.http` and
+  `Store.gateway`), so a tree no longer waits on it for every block. But its first request still waits as long as
+  the server takes to fail: wac's `fetch` and HTTP client have no timeout, and a store's reads are synchronous, so
+  neither a deadline nor asking mirrors in parallel can be done in reckon. That is asked of wac (a request timeout).
+  The extension no longer defaults to a gateway.
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
 

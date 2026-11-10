@@ -72,7 +72,7 @@ printf '%s\n' add2f9f8b6e2bff7d0b6e7d1bbcd8fe16c3fbd8b5b1fbb1c0a63e5a0e7a2c3b1 >
 cat > policy.json5 <<EOF
 {
   signers: { reviewer: "$(wac claim.wasm address --key reviewer.key)" },
-  machines: ["wasm-gc/wac-host/2"],
+  machines: ["wasm-gc/wac-host/3"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: { dependency: [{ endorsed: { by: ["reviewer"], at_least: 1 } }] },
 }

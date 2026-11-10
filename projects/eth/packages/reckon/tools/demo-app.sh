@@ -128,7 +128,7 @@ cat > policy.json5 <<POLICY
   signers: { v8: "$($CL address --key keys/v8.key)", wasmtime: "$($CL address --key keys/wt.key)",
              reviewer: "$($CL address --key keys/reviewer.key)" },
   roots: ["$(slot "$builderRecipe" program)"],
-  machines: ["wasm-gc/wac-host/2"],
+  machines: ["wasm-gc/wac-host/3"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: {
     app: [{ within: { role: "page", path: "out/out" } }],

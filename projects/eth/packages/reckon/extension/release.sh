@@ -99,7 +99,7 @@ cat > "$downloads/policy.json5" <<POLICY
   signers: { v8: "$($CL address --key "$work/keys/v8.key")", wasmtime: "$($CL address --key "$work/keys/wt.key")",
              reviewer: "$($CL address --key "$work/keys/reviewer.key")" },
   roots: ["$compiler"],
-  machines: ["wasm-gc/wac-host/2"],
+  machines: ["wasm-gc/wac-host/3"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: {
     extension: [{ within: { role: "assembly", path: "out" } }],

@@ -41,7 +41,7 @@ A recipe is a program, its arguments and its input, as one tree, together with t
     wac derive.wasm run RECIPE --key my.key --runner "my-runner/1 v8"      # prints the output's CID, then the claim's id
     $WASMTIME_WAC derive.wasm run RECIPE --key my2.key --runner "my-runner/1 wasmtime"
 
-- **Machine.** `run` runs the program on `wasm-gc/wac-host/2` (docs/machines/wasm-gc-wac-host-2.md): sealed,
+- **Machine.** `run` runs the program on `wasm-gc/wac-host/3` (docs/machines/wasm-gc-wac-host-3.md): sealed,
   canonical NaNs, its input read-only at `/in`, its `/out` kept.
 - **Output.** The output tree is `status`, `log` and `out/`.
 - **Claim.** With `--key`, `run` signs a derivation ("recipe R gives output O, on this runner") into the store's
@@ -119,10 +119,10 @@ JSON5. Nobody's policy but yours applies to you, and there is no default list of
     {
       signers: { v8: "0x…", wasmtime: "0x…", reviewer: "0x…" },     // names for addresses; rules use the names
       roots: ["bafy…"],                                              // objects you accept as they are
-      machines: ["wasm-gc/wac-host/2"],                              // machines whose derivations count
+      machines: ["wasm-gc/wac-host/3"],                              // machines whose derivations count
       formats: ["unixfs-v1-2025+hidden"],                            // object formats likewise
       reject_lists: ["0x…"],                                         // whose rejections you follow
-      conformance: { "wasm-gc/wac-host/2": "bafy…suite" },           // count a runner only once it has shown the suite
+      conformance: { "wasm-gc/wac-host/3": "bafy…suite" },           // count a runner only once it has shown the suite
       names: { min_delay: 3600, ens: "refuse" },                     // which names you follow, and how slow they must move
       roles: {
         app: [RULE, RULE, …],                                        // alternatives: any one admits
@@ -149,7 +149,7 @@ signer counts for nothing.
 | command | does |
 | --- | --- |
 | `obj add DIR` · `add-git REPO COMMIT` · `cat CID [PATH]` · `ls CID` · `car CID OUT` · `import-car FILE` | objects under `unixfs-v1-2025` in a store, checked on every read |
-| `derive recipe --program F [--args F] [--in DIR]` | a `wasm-gc/wac-host/2` recipe |
+| `derive recipe --program F [--args F] [--in DIR] [--machine M]` | a `wasm-gc/wac-host/3` recipe (or `/2` with `--machine`) |
 | `derive run RECIPE [--timeout MS] [--key F --runner NAME]` | run it; with a key, sign the derivation |
 | `derive canon IN OUT` | a module with canonical NaNs, as `run` makes it |
 | `boot recipe (--source F \| --tree DIR --entry PATH)` · `boot run RECIPE --tool CMD [--key F --runner NAME]` | the bootstrap's `wac-l0/1` and `wac-flatten/1` |

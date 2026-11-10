@@ -58,7 +58,7 @@ wac claim.wasm publish pub $P >/dev/null
 cat > policy.json5 <<EOF
 {
   signers: { reviewer: "$(wac claim.wasm address --key reviewer.key)" },
-  machines: ["wasm-gc/wac-host/2"],
+  machines: ["wasm-gc/wac-host/3"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: { app: [{ endorsed: { by: ["reviewer"], at_least: 1 } }] },
 }

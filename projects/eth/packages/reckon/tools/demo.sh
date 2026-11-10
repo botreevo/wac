@@ -53,7 +53,7 @@ cat > policy.json5 <<EOF
 {
   signers: { v8: "$(claim address --key v8.key)", wasmtime: "$(claim address --key wt.key)",
              reviewer: "$(claim address --key reviewer.key)" },
-  machines: ["wasm-gc/wac-host/2"],
+  machines: ["wasm-gc/wac-host/3"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: {
     result: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "program" }, other: "input" } }],

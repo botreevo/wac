@@ -16,10 +16,12 @@ A conformance suite is an object: a tree whose `cases` file has one case per lin
     RECIPE OUTPUT       the recipe must give this output tree
     RECIPE none         the recipe must give no output: the machine aborts it (past its floor, out of time)
 
-The suite for `wasm-gc/wac-host/2` is built from `corpus/`, the programs `tools/machine.sh` checks. It has 17 cases:
+The suite for `wasm-gc/wac-host/3` is built from `corpus/`, the programs `tools/machine.sh` checks. It has 18 cases:
 
-- every ending the machine names: exit 0, exit 7, and the five traps (out of bounds, divide by zero, integer
-  overflow, null, unreachable);
+- every ending the corpus reaches and both engines agree on: exit 0, exit 7, and six kinds of trap (memory-bounds,
+  divide-by-zero, integer-overflow, null-reference, unreachable-code, and explicit, whose message is part of the
+  output). The suite for `/2` had 17, with `/2`'s names. A float-to-integer conversion's kind still differs between
+  the engines' hosts (reported to wac; docs/runner.md), so it waits outside the suite;
 - the float programs, whose NaNs must come out canonical (floats, nanpaths, nbody);
 - the probe, which must be refused the host's files, environment, clock and random bytes;
 - the resource floor: depth.wac at 10,000 frames and heap.wac at 1 GiB must complete;
@@ -32,7 +34,7 @@ chooses whose suite to trust, as with any root.
 
 ## The rule
 
-    conformance: { "wasm-gc/wac-host/2": "bafy…suite" },
+    conformance: { "wasm-gc/wac-host/3": "bafy…suite" },
 
 With that in a policy, a witness to a derivation under that machine counts only if its signer, **under the same
 runner name**, meets all of these:

@@ -64,7 +64,8 @@ export async function show(tree, page = 'index.html') {
   const notes = [];
   if (report.missing.length) notes.push(`not in the tree: ${report.missing.join(', ')}`);
   if (report.outside.length) notes.push(`outside the tree, so not loaded: ${report.outside.join(', ')}`);
-  if (report.modules.length) notes.push(`module scripts with relative imports, which may not run: ${report.modules.join(', ')}`);
+  if (report.bare.length) notes.push(`module specifiers no import map names, which will not load: ${report.bare.join(', ')}`);
+  if (report.cycles.length) notes.push(`module cycles a worker cannot be given: ${report.cycles.join('; ')}`);
   return { report, notes };
 }
 

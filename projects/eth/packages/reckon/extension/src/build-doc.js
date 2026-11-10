@@ -58,8 +58,66 @@ export function inlineCss(text, from, tree, report, depth = 0) {
     .replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (all, q, ref) => { const d = one(ref.trim()); return d ? `url("${d}")` : all; });
 }
 
+// ---------------------------------------------------------------- ES modules
+//
+// A module from a `data:` URL has no base, so its relative imports cannot resolve. So every module in the tree is
+// rewritten: each specifier that names the tree (`./`, `../`, `/`, or a tree URL) becomes the absolute tree URL
+// (https://tree.invalid/PATH), and `import.meta.url` its own tree URL, so `new URL('./x.js', import.meta.url)` names
+// the tree too. Then an import map maps every module's tree URL to its rewritten `data:` URL. That serves static
+// imports, `import()` with a literal or a computed tree URL, and cycles, since modules name each other by URL.
+//
+// Dedicated workers do not read the page's import map, so a module worker gets its graph inlined instead: each
+// specifier replaced by the `data:` URL of the module it names, itself inlined the same way. A cycle in a worker's
+// graph cannot be inlined and is reported. `new Worker(treeUrl)` is mapped by the shim, and a worker from anywhere
+// else is refused.
+
+const MODULE = /\.m?js$/i;
+const SPECIFIERS = /(\b(?:import|export)\b[^;'"`]*?\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(['"])([^'"\n]+)\2/g;
+
+/** `src`, a module at `path`, with every specifier that names the tree replaced by `to(path)`, and import.meta.url
+ *  by its tree URL. */
+function rewriteModule(src, path, to, report) {
+  return src
+    .replace(SPECIFIERS, (all, head, q, spec) => {
+      if (!/^(\.{0,2}\/|https:\/\/tree\.invalid\/)/.test(spec)) {
+        if (/^[a-z][a-z0-9+.-]*:/i.test(spec)) { if (!/^(data|blob):/i.test(spec)) report.outside.push(spec); }
+        else report.bare.push(spec);
+        return all;
+      }
+      const target = inTree(spec, path);
+      if (target === null) return all;
+      const t = to(target);
+      return t === null ? all : `${head}${q}${t}${q}`;
+    })
+    .replace(/\bimport\.meta\.url\b/g, JSON.stringify(`${ORIGIN}/${path}`));
+}
+
+/** The import map for the page: every module in the tree, at its tree URL, as a rewritten `data:` URL. */
+function importMap(tree, report) {
+  const imports = {};
+  for (const p of tree.paths || []) {
+    if (!MODULE.test(p)) continue;
+    const src = utf8.decode(tree.read(p));
+    imports[`${ORIGIN}/${p}`] = dataUrl('text/javascript', new TextEncoder().encode(
+      rewriteModule(src, p, (t) => tree.read(t) === null ? (report.missing.push(t), null) : `${ORIGIN}/${t}`, report)));
+  }
+  return imports;
+}
+
+/** A module worker's script: its graph inlined as `data:` URLs (dedicated workers ignore import maps). */
+function workerModule(tree, path, report, memo = new Map(), stack = []) {
+  if (memo.has(path)) return memo.get(path);
+  if (stack.includes(path)) { report.cycles.push([...stack, path].join(' → ')); return null; }
+  const bytes = tree.read(path);
+  if (bytes === null) { report.missing.push(path); return null; }
+  const src = rewriteModule(utf8.decode(bytes), path, (t) => workerModule(tree, t, report, memo, [...stack, path]), report);
+  const url = dataUrl('text/javascript', new TextEncoder().encode(src));
+  memo.set(path, url);
+  return url;
+}
+
 /** The shim, run first in the page: fetch, XHR and links within the tree go to the extension page. */
-function shim(pagePath) {
+function shim(pagePath, workers) {
   return `<script>(() => {
 const PAGE = ${JSON.stringify(pagePath)}, ORIGIN = ${JSON.stringify(ORIGIN)};
 const inTree = (ref) => { try { const u = new URL(String(ref), ORIGIN + '/' + PAGE); return u.origin === ORIGIN ? decodeURIComponent(u.pathname.slice(1)) : null; } catch { return null; } };
@@ -101,6 +159,13 @@ document.addEventListener('click', (e) => {
   if (path !== null) parent.postMessage({ navigate: path }, '*');
 }, true);
 document.addEventListener('submit', (e) => e.preventDefault(), true);
+const WORKERS = ${JSON.stringify(workers)};
+const RealWorker = window.Worker;
+window.Worker = function (url, options) {
+  const path = inTree(url instanceof URL ? url.href : url);
+  if (path !== null && WORKERS[path]) return new RealWorker(WORKERS[path], options);
+  throw new TypeError('reckon: a worker can only be a module of the admitted tree' + (path === null ? '' : ': ' + path));
+};
 })();</script>`;
 }
 
@@ -116,7 +181,7 @@ const ATTRS = [
  * that import relative paths, which a `data:` URL cannot resolve).
  */
 export function buildDocument(tree, pagePath) {
-  const report = { missing: [], outside: [], modules: [] };
+  const report = { missing: [], outside: [], modules: [], bare: [], cycles: [] };
   const bytes = tree.read(pagePath);
   if (bytes === null) throw new Error(`${pagePath} is not in the admitted tree`);
   const doc = new DOMParser().parseFromString(utf8.decode(bytes), 'text/html');
@@ -126,7 +191,12 @@ export function buildDocument(tree, pagePath) {
     if (path === null) { if (!/^(data:|#)/.test(ref)) report.outside.push(ref); return; }
     const b = tree.read(path);
     if (b === null) { report.missing.push(path); return; }
-    if (el.localName === 'script' && el.type === 'module' && /\bimport\b[^;]*['"]\.\.?\//.test(utf8.decode(b))) report.modules.push(path);
+    if (el.localName === 'script' && el.type === 'module') {
+      // A module's own imports go through the import map, so the script itself is the rewritten module.
+      el.setAttribute(attr, dataUrl('text/javascript', new TextEncoder().encode(
+        rewriteModule(utf8.decode(b), path, (t) => `${ORIGIN}/${t}`, report))));
+      return;
+    }
     el.setAttribute(attr, dataUrl(typeOf(path), b));
   };
   for (const [sel, attr] of ATTRS) for (const el of doc.querySelectorAll(sel)) inline(el, attr);
@@ -148,8 +218,30 @@ export function buildDocument(tree, pagePath) {
   }
   for (const el of doc.querySelectorAll('style')) el.textContent = inlineCss(el.textContent, pagePath, tree, report);
   for (const el of doc.querySelectorAll('[style]')) el.setAttribute('style', inlineCss(el.getAttribute('style'), pagePath, tree, report));
+  // Modules: inline module scripts rewritten as from the page; the app's own import map folded into the tree's.
+  const imports = importMap(tree, report);
+  for (const el of doc.querySelectorAll('script[type=importmap]')) {
+    try {
+      const theirs = JSON.parse(el.textContent).imports || {};
+      for (const [k, v] of Object.entries(theirs)) { const t = inTree(v, pagePath); imports[k] = t === null ? v : (imports[`${ORIGIN}/${t}`] || v); }
+    } catch { report.outside.push('an import map that is not JSON'); }
+    el.remove();
+  }
+  for (const el of doc.querySelectorAll('script[type=module]:not([src])')) {
+    el.textContent = rewriteModule(el.textContent, pagePath, (t) => `${ORIGIN}/${t}`, report);
+  }
+  // Workers: every module the tree's scripts might start as one, inlined, if any script mentions a Worker.
+  const workers = {};
+  if ((tree.paths || []).some((p) => MODULE.test(p) && /\bWorker\s*\(/.test(utf8.decode(tree.read(p))))) {
+    for (const p of tree.paths) if (MODULE.test(p)) { const u = workerModule(tree, p, { missing: [], outside: [], modules: [], bare: [], cycles: [] }); if (u) workers[p] = u; }
+  }
+  // What is left to say: each once, and a bare specifier only if no import map names it.
+  report.bare = [...new Set(report.bare)].filter((b) => !(b in imports));
+  report.outside = [...new Set(report.outside)];
+  report.missing = [...new Set(report.missing)];
   for (const el of doc.querySelectorAll('base, meta[http-equiv]')) el.remove();
   const head = doc.head || doc.documentElement;
-  head.insertAdjacentHTML('afterbegin', shim(pagePath));
+  head.insertAdjacentHTML('afterbegin', shim(pagePath, workers) +
+    (Object.keys(imports).length ? `<script type="importmap">${JSON.stringify({ imports }).replace(/</g, '\\u003c')}</script>` : ''));
   return { html: '<!doctype html>\n' + doc.documentElement.outerHTML, report };
 }

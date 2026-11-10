@@ -163,10 +163,14 @@ what the user installed, and its build can itself be a derivation, so it can be 
 
 ## Risks and open questions
 
-- **Apps that compute URLs.** The loader inlines what the HTML names, and answers `fetch` and XHR from the tree.
-  ES modules that import relative paths, workers, dynamic `import()` and navigation by `location` need more
-  rewriting (an import map of `data:` URLs, worker sources by message). A static site works as it is; an app may
-  not, and the page should say which it found.
+- **Apps that compute URLs: modules now work.** `build-doc.js` rewrites every module in the tree so its specifiers
+  that name the tree become absolute tree URLs, and `import.meta.url` its own. An import map maps each to the
+  rewritten module as a `data:` URL, so static imports (cycles included), `import()` of a literal or of a URL
+  computed from `import.meta.url`, and the app's own import map all resolve in the tree. A module worker gets its
+  graph inlined, since dedicated workers ignore import maps, and `new Worker` of anything outside the tree is
+  refused. `extension/test/modules.cjs` passes 12 of 12, and nothing an app tries reaches the network.
+  Still not: `fetch` from inside a worker (the shim is the page's), classic workers' `importScripts`, a cycle inside a
+  worker's graph, and URLs the app builds from strings that are not tree URLs.
 - **Size.** `claim.wasm` is about 540 KB today. With the light client and BLS it is still fine for an extension;
   start-up is measured in milestone 1.
 - **CPU.** The light client's BLS checks run in V8 as they do on the Node host. Milestone 1 will time them.

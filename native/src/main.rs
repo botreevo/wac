@@ -2627,7 +2627,7 @@ fn serve(
         }
         OP_EXEC => {
             // A host program, run to completion. `issues/system/0165`.
-            // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0460d`).
+            // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0462d`).
             if caller.data().grants.sealed {
                 return Ok(fault(FAULT_UNSUPPORTED, "this program was started sealed: it may not run a host program, which has a clock and random bytes of its own"));
             }

@@ -1098,7 +1098,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      */
     [OP.EXEC]: async (p) => {
       const { path, args, env, stdin, clearEnv, inherit, cwd } = unpackExec(p);
-      // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0460d`).
+      // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0462d`).
       if (opts.sealed === true) return execBytes(0, EMPTY, EMPTY, "this program was started sealed: it may not run a host program, which has a clock and random bytes of its own");
       if (opts.run !== true) return execBytes(0, EMPTY, EMPTY, "Not granted to this application");
       try {

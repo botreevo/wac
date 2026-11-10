@@ -3513,7 +3513,7 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
             // once. Issue 0211, held by `packages/platform/test/wac/exec_test.wac`. The lost overlap
             // was the smaller half: a ticket that exists only after the work is over cannot be
             // watched by `waitAny`, so a child that wedged had nothing bounding it.
-            // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0460d`).
+            // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0462d`).
             if HOST.with(|h| h.borrow().as_ref().is_some_and(|s| s.grants.sealed)) {
                 return Reply::Now(Answer::Change(FAULT_UNSUPPORTED, "this program was started sealed: it may not run a host program, which has a clock and random bytes of its own".into()));
             }

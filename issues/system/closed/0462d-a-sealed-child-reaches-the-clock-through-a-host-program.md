@@ -1,4 +1,4 @@
-# 0460d — a sealed child reaches the clock through a host program
+# 0462d — a sealed child reaches the clock through a host program
 
 - **Status:** closed 2026-11-10 (cloud) — the `exec` handler of each host (`native/v8/src/main.rs`, `native/src/main.rs`,
   `packages/platform/host/node.ts`, `packages/platform/host/deno.ts`); `packages/platform/test/wac/sealed_test.wac`

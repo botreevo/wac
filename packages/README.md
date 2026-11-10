@@ -66,12 +66,10 @@ being ported to wac, so it can eventually compile itself, and **`wacpkg`** reads
 that says where a project's dependencies come from — `design/lang/0009` D6 and D9, the manifest
 and its mapping table, with the fetching and the lockfile still to come.
 
-**Ethereum, checked rather than trusted.** `bls` verifies BLS12-381 signatures against
-Ethereum's own fixtures, `ssz` is its serialization and Merkle proofs, and `lightclient` runs
-the Altair sync protocol through all four of Ethereum's `light_client/sync` cases. On top of
-those, the execution side: `rlp`, `abi`, `ens`, and `mpt` — Merkle-Patricia proofs, which is
-what turns "a provider told me" into "the state root I already verified commits to this". See
-[design/0003](../design/system/0003-an-ethereum-centric-reference-distribution.md) for where that is going.
+**Ethereum lives in [wac-eth](https://git.voltrevo.com/wac-eth.git)** since 2026-11-09: `ssz`, `lightclient`,
+`rlp`, `abi`, `ens`, `mpt` and `ethrpc` moved there with their history, beside wacuum and its devnet, on one pin
+of this repository. `bls` stays here — BLS12-381 is not only Ethereum's, and it is the compiler's heaviest
+program — as do `crypto`'s keccak256 and everything else wac-eth imports from `"wac"`.
 
 **`fs` — a filesystem that belongs to the program**, in memory or mounted on the host's, so a
 session can be sealed off from the machine that started it.
@@ -159,7 +157,6 @@ wac task map             # regenerate MAP.md; the suite fails if it is stale
 wac task coverage:all        # branch coverage of every package, from its wac-native tests
 wac task coverage:<pkg> --points   # that package's per-point table, unfiltered, one row each
 wac task coverage:union # what a file shared between packages reads across all of them
-wac task coverage:abi
 wac task coverage:bls
 wac task coverage:bignum # ...and the host-driven exercises, per package
 wac task coverage:bytes
@@ -167,25 +164,19 @@ wac task coverage:codec
 wac task coverage:core
     wac task coverage:crypto
 wac task coverage:datetime
-wac task coverage:ens
-wac task coverage:ethrpc
 wac task coverage:fmt
 wac task coverage:fs
 wac task coverage:gzip
 wac task coverage:git
 wac task coverage:http
 wac task coverage:json
-wac task coverage:lightclient
-wac task coverage:mpt
 wac task coverage:platform
 wac task coverage:quic
 wac task coverage:regex
-wac task coverage:rlp
 wac task coverage:raster
 wac task coverage:server
 wac task coverage:sh
 wac task coverage:ssh
-wac task coverage:ssz
 wac task coverage:stream
 wac task coverage:tor
 wac task coverage:tty

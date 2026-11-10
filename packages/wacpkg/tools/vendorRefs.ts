@@ -3,7 +3,7 @@
 //     deno run -A packages/wacpkg/tools/vendorRefs.ts > packages/wacpkg/test/vendor/refs.json
 //
 // Run by hand. The corpus is committed, so the tests need neither `git` nor a network and cannot
-// start passing because a command was missing. `packages/ens/tools/vendor.ts` is the pattern.
+// start passing because a command was missing. wac-eth's packages/ens/tools/vendor.ts is the pattern.
 //
 // **The repository is built here rather than described.** A ref table typed out by hand would be a
 // table of what I believe `git ls-remote` prints, and the interesting rows are exactly the ones

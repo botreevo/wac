@@ -62,8 +62,6 @@ await wacTestRun("packages/crypto/test/wac/field25519_test.wac", "field25519");
 await wacTestRun("packages/crypto/test/wac/ghash_test.wac", "ghash");
 await wacTestRun("packages/crypto/test/wac/layout_test.wac", "layout");
 await wacTestRun("packages/crypto/test/wac/traps_test.wac", "crypto-traps");
-await wacTestRun("packages/ens/test/wac/traps_test.wac", "ens-traps");
-await wacTestRun("packages/ethrpc/test/wac/jsonhex_test.wac", "jsonhex");
 await wacTestRun("packages/gzip/test/wac/crc32_incremental_test.wac", "crc32-incremental");
 await wacTestRun("packages/gzip/test/wac/crc32_test.wac", "crc32");
 await wacTestRun("packages/gzip/test/wac/inflate_at_test.wac", "inflate-at");
@@ -73,7 +71,6 @@ await wacTestRun("packages/quic/test/wac/connection_test.wac", "quic-connection"
 await wacTestRun("packages/quic/test/wac/short_test.wac", "quic-short");
 await wacTestRun("packages/quic/test/wac/tamper_test.wac", "quic-tamper");
 await wacTestRun("packages/quic/test/wac/varint_test.wac", "quic");
-await wacTestRun("packages/rlp/test/wac/traps_test.wac", "rlp-traps");
 await wacTestRun("core/test/traps_test.wac", "std-traps");
 await wacTestRun("packages/tls/test/wac/hybrid_traps_test.wac", "tls-hybrid-traps");
 await wacTestRun("packages/tls/test/wac/hybrid_test.wac", "hybrid");

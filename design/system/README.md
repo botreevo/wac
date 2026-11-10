@@ -27,7 +27,7 @@ pieces rather than steps, ordered by dependency rather than intent.
 
 The distinction earns its place because the two fail differently. A direction with no order of work is
 incomplete; a destination with one invites somebody to follow it top to bottom, which is exactly the
-mistake [0003](0003-an-ethereum-centric-reference-distribution.md) exists to prevent — its verification
+mistake 0003 (now in wac-eth: `design/system/0003` there) exists to prevent — its verification
 core is finished and its plumbing is not, so reading it as a sequence would start at the wrong end. If a destination
 acquires a sequence, it becomes an ordinary direction and says so.
 
@@ -57,7 +57,7 @@ which is worth more to the next reader than deleting it.
 |---|---|---|
 | [0001](0001-a-self-contained-system.md) | a self-contained system: a filesystem, processes and users in wac, with the ssh and browser demos as its terminals | active |
 | [0002](0002-the-whole-tor-stack.md) | the whole Tor stack: relays, authorities and onion services, and a network of our own | active |
-| [0003](0003-an-ethereum-centric-reference-distribution.md) | an Ethereum-centric reference distribution: what arriving looks like | destination |
+| 0003 | an Ethereum-centric reference distribution: what arriving looks like — **moved to [wac-eth](https://git.voltrevo.com/wac-eth.git) on 2026-11-09**, with the packages it is about | destination |
 | [0004](0004-rendering-that-backs-a-desktop.md) | rendering that backs a desktop: one surface, from a kernel or from a tab | proposal |
 | [0005](0005-git-in-wac.md) | git in wac: a client that can clone this repository and be believed | met |
 | [0006](0006-candidates-for-what-to-build-next.md) | candidates for what to build next, and the oracle each one would have | candidates, none chosen |

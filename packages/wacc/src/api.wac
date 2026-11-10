@@ -15,7 +15,7 @@ import { checkMessage, lexMessage, parseMessage, warnMessage, hintFor, parseHint
          displayTypes } from "./diag.wac";
 import { P, parseProgram } from "./parse.wac";
 import { declsOfFiles, declsOfProgram, evalAllConsts } from "./consteval.wac";
-import { Method, Param, Program, Ty } from "./ast.wac";
+import { Field, Method, Param, Program, Ty } from "./ast.wac";
 import { Pr, printProgram } from "./print.wac";
 import { C, checkModule, checkProgram, contextsOf, declareModule, errorsOf, hintsOf, notesOf,
          warningsOf, widthsOf, errNoSuchExport, errStaleBuiltinEmbedding, isBuiltinSubpath,
@@ -3588,9 +3588,13 @@ bool isScalarSpelling(string t) {
  * A free function named with no receiver; the names are gathered across every file supplied.
  *
  * **And a method with no receiver**, gathered as `Owner.name` and packed where a call writes the owner —
- * `Box.count(…)` or `Box<i32>.count(…)`. That is the shape of core's `Ticket.all`. A method with a
- * receiver is not lowered: which `count` `x.count(…)` calls depends on `x`'s type, and this works on
- * text. `issues/lang/0373a`.
+ * `Box.count(…)` or `Box<i32>.count(…)`. That is the shape of core's `Ticket.all`.
+ *
+ * **And a method with a receiver, by its name alone**, gathered as `.name`. Which `plus` `x.plus(…)` calls depends
+ * on `x`'s type, which text does not have — but it does not need it when every member of the program called `plus`
+ * is a variadic method with one fixed-parameter count, since then every one of them packs the call the same way.
+ * Where anything else shares the name — another method, a field, in this program or in `core` and `std` — the
+ * name is not packed and the call is refused as it was (`receiverVariadicClashes`). `issues/lang/0373a`.
  */
 string[] lowerVariadics(Reads reads, string[] sources) {
   bool any = false;
@@ -3629,11 +3633,12 @@ string[] lowerVariadics(Reads reads, string[] sources) {
         StructDecl(nameTok, parentTok, fields, methods, exported, isConst, typeParams): {
           for (i32 m = 0; m < methods.len(); m++) {
             Param[] mps = methods[m].params;
-            if (methods[m].hasThis || mps.len() == 0) { continue; }
+            if (mps.len() == 0) { continue; }
             i32 mlast = mps[mps.len() - 1].nameTok;
             if (mlast < 3 || lx.tokens[(mlast - 1) * st] != kDot() || lx.tokens[(mlast - 2) * st] != kDot()
                 || lx.tokens[(mlast - 3) * st] != kDot()) { continue; }
-            names = names + tokenTextOf(src, lx, nameTok) + "." + tokenTextOf(src, lx, methods[m].nameTok) + "|";
+            string owner = methods[m].hasThis ? "" : tokenTextOf(src, lx, nameTok);
+            names = names + owner + "." + tokenTextOf(src, lx, methods[m].nameTok) + "|";
             fixed = fixed + numText(mps.len() - 1) + "|";
             markers = markers + numText(f) + ":" + numText(lx.tokens[(mlast - 3) * st + 1]) + ";";
           }
@@ -3643,6 +3648,7 @@ string[] lowerVariadics(Reads reads, string[] sources) {
     }
   }
   if (names == "|") { return sources; }
+  string clashes = receiverVariadicClashes(reads, sources, names, fixed);
   string[] out = string[].filled(sources.len(), "");
   for (i32 f = 0; f < sources.len(); f++) {
     // The declaration's `...` goes once the calls are packed: what is left is a tuple parameter, and
@@ -3655,9 +3661,61 @@ string[] lowerVariadics(Reads reads, string[] sources) {
       i32 off = decimalOfApi(rest.slice(0, rest.indexOf(";")));
       text = text.slice(0, off) + "   " + text.slice(off + 3, text.len());
     }
-    out[f] = variadicCallsOf(reads, text, names, fixed);
+    out[f] = variadicCallsOf(reads, text, names, fixed, clashes);
   }
   return out;
+}
+
+/**
+ * The receiver methods of `names` — gathered as `.name` — that cannot be packed by name, as `|.name|…`: those that
+ * share their name with anything else a receiver could reach by it. Another receiver method of that name that is not
+ * variadic, or is with a different fixed-parameter count; a field, which may hold a function; or two variadic
+ * declarations disagreeing on the count. Read across every file supplied and `core`'s and `std`'s carried text,
+ * which a call like `v.get(1)` could equally mean. Empty, and nothing read, when no receiver method is variadic.
+ */
+string receiverVariadicClashes(Reads reads, string[] sources, string names, string fixed) {
+  if (names.indexOf("|.") < 0) { return "|"; }
+  string clashes = "|";
+  string[] carried = carriedKeys();
+  i32 scanned = sources.len() + carried.len();
+  i32 st = tokenStride();
+  for (i32 f = 0; f < scanned; f++) {
+    string text = f < sources.len() ? sources[f] : carriedText(carried[f - sources.len()]);
+    i32 srcRead = readOf(reads, text);
+    u8[] src = readSrc(reads, srcRead);
+    Lexed lx = readParsedLexed(reads, srcRead);
+    Program prog = readProgram(reads, srcRead);
+    for (i32 d = 0; d < prog.decls.len(); d++) {
+      Method[] methods = Method[]();
+      Field[] fields = Field[]();
+      match (prog.decls[d].kind) {
+        StructDecl(nameTok, parentTok, fs, ms, exported, isConst, typeParams): { methods = ms; fields = fs; }
+        EnumDecl(nameTok, variants, exported, ms, typeParams): { methods = ms; }
+        default: { continue; }
+      }
+      for (i32 k = 0; k < fields.len(); k++) {
+        string fkey = "." + tokenTextOf(src, lx, fields[k].nameTok);
+        if (names.indexOf("|" + fkey + "|") >= 0) { clashes = clashes + fkey + "|"; }
+      }
+      for (i32 m = 0; m < methods.len(); m++) {
+        if (!methods[m].hasThis) { continue; }
+        string mkey = "." + tokenTextOf(src, lx, methods[m].nameTok);
+        i32 want = variadicFixed(names, fixed, mkey);
+        if (want < 0) { continue; }
+        Param[] mps = methods[m].params;
+        bool variadic = false;
+        if (mps.len() > 0) {
+          i32 mlast = mps[mps.len() - 1].nameTok;
+          variadic = mlast >= 3 && lx.tokens[(mlast - 1) * st] == kDot() && lx.tokens[(mlast - 2) * st] == kDot()
+              && lx.tokens[(mlast - 3) * st] == kDot();
+        }
+        // Its key is in `names` only while some declaration still carries its marker, so a lowering run again over
+        // text it already packed finds nothing to compare here.
+        if (!variadic || mps.len() - 1 != want) { clashes = clashes + mkey + "|"; }
+      }
+    }
+  }
+  return clashes;
 }
 
 i32 decimalOfApi(string s) {
@@ -3743,7 +3801,7 @@ string staticOwnerText(u8[] src, Lexed lx, i32 t) {
   return tokenTextOf(src, lx, t - 1);
 }
 
-string variadicCallsOf(Reads reads, string text, string names, string fixed) {
+string variadicCallsOf(Reads reads, string text, string names, string fixed, string clashes) {
   i32 srcRead = readOf(reads, text);
   u8[] src = readSrc(reads, srcRead);
   Lexed lx = readLexed(reads, srcRead);
@@ -3758,8 +3816,13 @@ string variadicCallsOf(Reads reads, string text, string names, string fixed) {
     string callee = tokenTextOf(src, lx, t);
     if (t > 0 && lx.tokens[(t - 1) * st] == kDot()) {
       string owner = staticOwnerText(src, lx, t - 2);
-      if (owner == "") { continue; }
-      callee = owner + "." + callee;
+      string named = callee;
+      callee = owner == "" ? "" : owner + "." + named;
+      // **Otherwise a receiver method, by its name** — sound only where nothing else shares it (`clashes`).
+      if (variadicFixed(names, fixed, callee) < 0) {
+        callee = "." + named;
+        if (clashes.indexOf("|" + callee + "|") >= 0) { continue; }
+      }
     }
     i32 fx = variadicFixed(names, fixed, callee);
     if (fx < 0) { continue; }

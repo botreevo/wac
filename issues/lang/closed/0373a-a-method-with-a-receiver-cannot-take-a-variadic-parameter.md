@@ -1,7 +1,7 @@
 # 0373a — A method with a receiver cannot take a variadic parameter
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `lowerVariadics` packs a receiver method by name; `spec/cases/0903`
+- **Claimed by:** wac2
 - **Reported by:** agent-a
 - **Date:** 2026-10-14
 - **Kind:** missing feature
@@ -30,3 +30,22 @@ free function and, since 2026-10-14, a method with no receiver (`Box.count(…)`
 `Owner.name`, which is the shape of core's `Ticket.all`). `x.plus(…)` cannot be lowered that way: which
 `plus` it calls depends on `x`'s type, which text does not have. Packing has to move to a phase that knows the
 receiver's type, or the call site has to be found some other way.
+
+## Why
+
+Variadics are packed by a text rewrite keyed by name, and `x.plus(…)` was skipped because which `plus` it calls
+depends on `x`'s type.
+
+## Fix
+
+The type is not needed where nothing else shares the name: if every member called `plus` — across the program and
+`core`'s and `std`'s carried text — is a variadic method with a receiver and one fixed-parameter count, every one of
+them packs a call the same way. `lowerVariadics` gathers such methods as `.plus` and packs `x.plus(…)`,
+`f().plus(…)` and the rest by name; `receiverVariadicClashes` drops a name that another receiver method of a
+different shape, or a field (which may hold a function), also answers to, and such a call is refused as before.
+The issue's `b.plus("x", true)` answers 2. `spec/cases/0903` holds a generic owner, an empty call and fixed
+parameters before the pack.
+
+Not changed, and not this issue: an untyped integer literal gives a variadic's `Ts` nothing to infer, so
+`b.plus(3)` is *nothing here says what Ts is* — write `3 as i32`, as the spec's own `count(1 as i32, "a")` does.
+That is true of a free function too.

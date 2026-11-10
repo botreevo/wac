@@ -1,6 +1,6 @@
 # 0336a — `u8` is not in the primitive table, and the restriction that governs it is stated for its two neighbours
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; packed types are ordinary scalars; the primitive table has the rows
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
@@ -72,3 +72,13 @@ byte* and accepts 300.
 
 Whether the rule should stay is `vision/QUESTIONS.md`'s to argue. What this issue asks for is
 smaller: **say, on the page that says it for `i8`, that it applies to `u8`.**
+
+## Why
+
+`u8` had no row in the primitive table, and the array-element-only restriction it obeyed was stated only for `i8` and `i16`.
+
+## Fix
+
+The restriction is gone rather than documented: commit `32f6b4768` made the packed types ordinary scalar types, and
+`spec/2-types/08-primitives.md` lists `u8` with the rest. Re-checked on master `715162c8d`: `u8 x = 65` as a local
+checks and prints 65.

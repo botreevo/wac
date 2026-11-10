@@ -1,11 +1,40 @@
 # 0074 — values with no identity: tuples, or value structs
 
-- **Status:** open
+- **Status:** open — narrowed 2026-11-10 (cloud) to the required optimisation: tuples are decided and shipped, and the lowering that was the point of them is not done
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-08-06
 - **Kind:** missing feature
 - **Symptom:** not implemented
+
+## Narrowed 2026-11-10: the decisions are made, the lowering is not
+
+**The syntax and semantics this issue asked to be decided are decided.** `spec/2-types/14-tuples.md` defines tuples
+— `(a, b)`, `t.0`, structural types, destructuring, `(a, b) = e`, equality — and settles the identity question
+the other way from *The crux* below: **a tuple is a reference** (`[§wac-tuple-reference-qvgasjf]`). What this issue
+called the crux survives as that chapter's *A required optimisation*: a synchronous function that builds the tuple
+it returns, where nothing can hold the tuple after the call and some caller destructures it or reads one member,
+**must** return the members rather than the tuple.
+
+**That requirement is not met.** On master `715162c8d`:
+
+```wac
+(u32, u32) divmod(u32 n, u32 d) { return (n / d, n % d); }
+export i32 f() {
+  (u32 q, u32 r) = divmod(17, 5);
+  return (q * 10 + r) as! i32;
+}
+```
+
+compiles to a module whose type section holds `struct (i32, i32)` and gives `divmod` the type
+`(i32, i32) -> (ref null struct)` — no function in it has two results, so every call allocates the tuple, which is
+the outcome this issue was filed to prevent. It answers 32 correctly; it is the cost that is wrong.
+`packages/wacc/src` has no multi-value lowering to find. So what is left here is the lowering, and a test that
+asserts it from the module rather than from an answer — an answer cannot tell the two forms apart, which is how
+the requirement went unmet without anything failing.
+
+The array-element widening of 2026-09-05 (in `INDEX.md`'s row) is a separate question about value structs and is
+not narrowed by any of this.
 
 Filed because the blocker is a set of decisions, not the work. The operator asked for tuples specifically
 and wants the design settled later; this is what the decision looks like, with the measurements that

@@ -1,6 +1,6 @@
 # 0290 — a funcref of the wrong type in a struct field is emitted rather than refused
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — already fixed on master; refused by the checker; `spec/cases/0892`
 - **Reported by:** agent-c
 - **Date:** 2026-08-29
 - **Kind:** bug
@@ -85,3 +85,15 @@ comparison is between the funcref's type and the field's declared type. Same que
 types available, no diagnostic, and an invalid module instead.
 
 So a fix is plausibly small: make the `struct.new` path ask what the call path already asks.
+
+## Why
+
+A struct field of function type was filled without comparing the function's signature against the field's, so a wrong-arity function reached the emitter.
+
+## Fix
+
+The checker now compares them: `Cap(two)` where the field is `fn<i32(i32, i32, i32)>` and `two` takes two is
+*"field does not match the declared type … expected fn<i32(i32, i32, i32)>, found fn<i32(i32, i32)>"*. Re-checked on
+master `715162c8d` for positional and named construction, a field assignment, and a struct imported from another
+file — all four refused. Found during a triage of the open tree; no commit names this number. `spec/cases/0892` holds
+the positional form.

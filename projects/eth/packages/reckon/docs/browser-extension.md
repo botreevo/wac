@@ -110,10 +110,42 @@ what the user installed, and its build can itself be a derivation, so it can be 
    - that second admission resumed the kept state, with no bootstrap;
    - it admits `ens:vitalik.eth` by proof, says its content is on no mirror here, and shows nothing.
    Still to do: a static site from the gateway, when it answers, and a hostile app that tries every way out.
-4. **State and freshness.** Light-client state persisted (R4), revocations proved on chain each time an app is
-   opened, and a visible "as of block N" on the page.
-5. **Hardening.** Size and start-up time, the extension built as a derivation, and an admission of the extension by
-   its own policy.
+4. **State and freshness. Done (2026-11-10).**
+   - **Light-client state:** kept and resumed (R4, `--state`).
+   - **Revocations at each open:** every open is a fresh admission, so with a registry set, revocations and rejections
+     are proved at each open, at the anchored block.
+   - **"As of":** admission now ends its reads with an "as of" line (`src/admission.wac`): the latest block a read was
+     pinned to, with its time (bound to the anchor by the header's hash), and the light client's finalized beacon
+     slot. The page shows it as a banner, "Admitted as of execution block N · time · age", marked once it is older
+     than an hour.
+   - **Test:** `extension/test/revoke.sh` passes 5 of 5, on a wacuum devnet with the registry v2. An app is admitted
+     as of block 4, the banner fresh; the endorser revokes on chain; the next open proves the revocation, refuses and
+     takes the app down, as of block 6. On recorded mainnet (`admit.sh`, 12 of 12) the banner says beacon slot
+     15621760 and marks it 10 hours old.
+   - **Expiry while open:** an open app is admitted again every `recheck` seconds (a setting; 600 by default; 0 only
+     at open). If it is refused it is taken down, saying so. If its name now admits another tree, that tree is shown
+     in its place, saying so. The banner's age is kept live. In `revoke.sh` (8 of 8), with re-checks every 3 s, the
+     open app is taken down by itself after the revocation lands, with no click.
+5. **Hardening. Done (2026-11-10), but for the JavaScript.**
+   - **The extension is a derived output, admitted by its own policy.** `cmd/assemble.wac` puts it together inside
+     the machine, from three slots: `pages` (its own files), `glue` (wac's browser glue) and `module` (`web.wac`'s
+     derived build), writing `admit/app.wasm` as the module less its `wac.manifest` section. `derive recipe --slot`
+     names the slots.
+   - **`release.sh`:**
+     - builds `web.wac` and `assemble.wac` with `builddeps`;
+     - runs the assembly on V8 and wasmtime;
+     - holds its `out/` to the extension `build.sh` makes, file for file;
+     - has a reviewer endorse what is reviewed rather than derived (the build's source and arguments, the pages,
+       the glue);
+     - ships `policy.json5`.
+     From an empty store, `claim admit EXTENSION extension --policy policy.json5 --mirror claims/` says ADMITTED,
+     through: assembly (two runners), assembler and module (each built by two runners from reviewed source by the
+     root compiler), and pages and glue (reviewed). A copy with one byte changed is refused.
+   - **Size and start-up:** a 194 KB zip, 608 KB unpacked, of which the admission module is 422 KB. In the
+     extension an admission decides in 0.9 s from a checkpoint and 0.2 s resumed (`test/admit.sh`, which bounds it
+     at 30 s), on recorded mainnet with local servers.
+   - **Not yet:** the JavaScript is reviewed, not derived (the pages are source; the glue is deno's bundle, which
+     wac's 0454e will make reproducible, dropping the release's rewrite of its temporary name).
 6. **Published. Done (2026-11-10).** `extension/release.sh` makes `site/downloads/`, which the pages site serves:
    - the zip, named by the unpacked extension's CID (unzip it, `obj add` the folder: the same CID; three builds gave
      the same one);
@@ -131,10 +163,14 @@ what the user installed, and its build can itself be a derivation, so it can be 
 
 ## Risks and open questions
 
-- **Apps that compute URLs.** The loader inlines what the HTML names, and answers `fetch` and XHR from the tree.
-  ES modules that import relative paths, workers, dynamic `import()` and navigation by `location` need more
-  rewriting (an import map of `data:` URLs, worker sources by message). A static site works as it is; an app may
-  not, and the page should say which it found.
+- **Apps that compute URLs: modules now work.** `build-doc.js` rewrites every module in the tree so its specifiers
+  that name the tree become absolute tree URLs, and `import.meta.url` its own. An import map maps each to the
+  rewritten module as a `data:` URL, so static imports (cycles included), `import()` of a literal or of a URL
+  computed from `import.meta.url`, and the app's own import map all resolve in the tree. A module worker gets its
+  graph inlined, since dedicated workers ignore import maps, and `new Worker` of anything outside the tree is
+  refused. `extension/test/modules.cjs` passes 12 of 12, and nothing an app tries reaches the network.
+  Still not: `fetch` from inside a worker (the shim is the page's), classic workers' `importScripts`, a cycle inside a
+  worker's graph, and URLs the app builds from strings that are not tree URLs.
 - **Size.** `claim.wasm` is about 540 KB today. With the light client and BLS it is still fine for an extension;
   start-up is measured in milestone 1.
 - **CPU.** The light client's BLS checks run in V8 as they do on the Node host. Milestone 1 will time them.
@@ -146,6 +182,35 @@ what the user installed, and its build can itself be a derivation, so it can be 
   The extension no longer defaults to a gateway.
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
+
+## A real app (2026-11-10)
+
+`tools/demo-app.sh` takes a wac-web page, `demo/mandelbrot.wac`, which draws a Mandelbrot set, end to end. It passes
+9 of 9, and is recorded as a site demo with screenshots.
+- **Build:** wac-web's page builder (the `web` package wac.lock pins) builds the page.
+- **Derived:** the page's module (from `demo/page/page.wac`, the builder's wrapper, as committed) and
+  `cmd/embed.wac`, each in the sealed machine on V8 and wasmtime.
+- **Embedded:** the embedding derivation puts the builder's glue (its `index.html` with the module left out)
+  together with the derived module, giving byte for byte the builder's page.
+- **Reviewed:** a reviewer endorses the build's source and arguments and the glue, and a policy admits the page
+  through the derivations back to the compiler root.
+- **Named:** the page is claimed as `mandelbrot` on a devnet's registry v2.
+- **Admitted:** `claim admit name:mandelbrot@0xPUB app` admits it. In the extension, the name is read by proof,
+  the page is fetched and checked, and it runs in the sandbox loader. It draws (86,400 pixels in about 15 ms), a
+  click zooms, its origin is opaque, and it holds no extension API.
+
+What it found:
+- **wac's `--target browser` apps cannot run in the loader.** An opaque-origin sandbox frame is not cross-origin
+  isolated, so it has no `SharedArrayBuffer`, which those apps' blocking worker needs. Delegating
+  `allow="cross-origin-isolated"`, or making the frame `credentialless`, does not change that. wac-web pages
+  (`main(Page)`) need none, so the demo is one. Running wac's `main(Sys)` apps would take a wac browser target that
+  does not block (a wac question), or a loader that is not a sandbox page.
+- **A wac-web page loads its own glue from a `blob:` URL and compiles its own wasm.** So the sandbox's CSP now
+  allows `blob:` and `'wasm-unsafe-eval'` for scripts. Neither reaches the network: a blob is made from bytes the
+  page holds. The worker shim likewise lets a page start a worker from its own `blob:` or `data:` bytes.
+- **wac-web's builder runs `wac build` and `wac bindgen` as commands,** so it cannot run inside the machine. Its
+  wrapper is committed (and checked against what the builder writes), and its page is reproduced inside the machine
+  by `embed`. A library mode in wac-web would let the builder itself be a derivation (asked of wac).
 
 ## The spike (2026-11-10)
 

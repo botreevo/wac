@@ -9,8 +9,10 @@ const TIMEOUT_MS = 180000;
 
 /** The arguments `web` is run with, from the settings. */
 export function argsFor(settings, subject, role) {
-  const a = [subject, role, '--policy-text', settings.policy || '{}', '--store', 'store', '--state', 'lc.state',
-    '--out-root', 'trees'];
+  const a = [subject, role, '--policy-text', settings.policy || '{}', '--store', 'store', '--out-root', 'trees'];
+  // The light client's state is kept once a checkpoint is set, and resumed from after that. Without a checkpoint (a
+  // devnet, which has no beacon chain) there is no light client, and reads are of the node's latest block.
+  if (settings.checkpoint && String(settings.checkpoint).trim() !== '') a.push('--state', 'lc.state');
   const opt = (flag, v) => { if (v && String(v).trim() !== '') a.push(flag, String(v).trim()); };
   opt('--checkpoint', settings.checkpoint);
   opt('--beacon-url', settings.beaconUrl);
@@ -22,6 +24,18 @@ export function argsFor(settings, subject, role) {
   return a;
 }
 
+/**
+ * What the decision is as of, from admission's "as of …" line: the execution block and its time, the beacon slot and
+ * its time; null for what it did not say.
+ */
+export function asOfIn(lines) {
+  const l = lines.find((x) => x.startsWith('as of '));
+  if (!l) return null;
+  const num = (re) => { const m = re.exec(l); return m ? Number(m[1]) : null; };
+  return { block: num(/execution block (\d+)/), blockTime: num(/execution block \d+ \(time (\d+)\)/),
+           slot: num(/beacon slot (\d+)/), slotTime: num(/beacon slot \d+ \(time (\d+)\)/) };
+}
+
 /** The account `web` printed, read back: its lines, its exit code, and the CID it admitted. */
 export function readAccount(text) {
   const lines = text.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l !== '');
@@ -31,6 +45,7 @@ export function readAccount(text) {
     code: exit ? Number(exit[1]) : 3,
     cid: exit && Number(exit[1]) === 0 && admitted ? admitted[1] : null,
     lines: lines.filter((l) => !/^\[exit -?\d+\]$/.test(l)),
+    asOf: asOfIn(lines),
   };
 }
 

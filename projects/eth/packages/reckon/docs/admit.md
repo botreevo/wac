@@ -132,3 +132,14 @@ it. Tested:
   refusal, the kept state unchanged after one;
 - `tools/browser-admit.sh`: a page keeps the state in the browser's storage, and the next page resumes from it with
   no checkpoint.
+
+## What a decision is as of
+
+Before its decision, admission says what the decision is as of:
+
+    as of execution block 26382137 (time 1794285143), beacon slot 15621760 (time 1794285143)
+
+The execution block is the latest a read was pinned to (the name's, or the chain's), with the time from its header,
+which the anchor's hash binds. The beacon slot is the light client's finalized one, and its time is the slot's. On
+recorded mainnet data the two agree, since the finalized execution block is that slot's. The extension shows it as a
+banner and marks it once it is an hour old.

@@ -18,6 +18,13 @@ site = os.path.join(here, "site")
 out = sys.argv[1]
 
 DEMOS = {
+    "demo-app": ("A real app, admitted and run", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/demo-app.sh WORKDIR",
+                 "A Mandelbrot set as a wac-web page (demo/mandelbrot.wac), end to end: its module compiled inside the "
+                 "sealed machine on V8 and on wasmtime, the page put together there too from the builder's reviewed "
+                 "glue (byte for byte the builder's page), a reviewer's endorsements, the page named mandelbrot on a "
+                 "devnet's registry, admitted by name on the command line, then in the browser extension: the name "
+                 "read by proof, the page fetched and checked, and run in the sandbox loader, where it draws and "
+                 "zooms with no network and no extension API."),
     "capstone": ("The capstone", "LADDER=… sh packages/reckon/tools/capstone.sh WORKDIR",
                  "Source to a compiler to an app to its run, each a derivation signed by a runner on V8 and one on "
                  "wasmtime. The compiler has two unrelated origins that must agree: the seed, and a compiler wac's "
@@ -131,6 +138,11 @@ for name, (title, cmd, intro) in DEMOS.items():
     page += f'<p class="eyebrow">Demo · recorded {date} at {commit}</p>\n<h1>{html.escape(title)}</h1>\n'
     page += f'<p class="lede">{html.escape(intro)}</p>\n<pre><code>{html.escape(cmd)}</code></pre>\n'
     page += f'<p class="meta"><span>{ok} ok</span><span>{bad} failed</span><span>unedited output</span></p>\n'
+    shots = sorted(f for f in os.listdir(os.path.join(site, "demos")) if f.startswith(name + "-") and f.endswith(".png"))
+    os.makedirs(os.path.join(out, "demos"), exist_ok=True)
+    for f in shots:
+        shutil.copyfile(os.path.join(site, "demos", f), os.path.join(out, "demos", f))
+        page += f'<p><img src="{f}" alt="{html.escape(title)}: {html.escape(f[len(name) + 1:-4])}" style="width:100%;height:auto;border:1px solid var(--line);border-radius:8px"></p>\n'
     page += f'<pre class="term">{shade(text)}</pre>\n</main>\n</body>\n</html>\n'
     write(os.path.join(out, "demos", name + ".html"), page)
 

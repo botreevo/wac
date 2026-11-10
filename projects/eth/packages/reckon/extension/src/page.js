@@ -5,10 +5,10 @@ import { openTree } from './tree.js';
 import { buildDocument, typeOf } from './build-doc.js';
 
 const $ = (id) => document.getElementById(id);
-const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'policy', 'now'];
+const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'policy', 'now', 'recheck'];
 // No mirror by default: a public gateway is a choice to make, and one that is down slows every admission until it is
 // left out. The settings suggest one.
-const DEFAULTS = { mirrors: '', policy: '{ signers: {}, roles: {} }' };
+const DEFAULTS = { mirrors: '', policy: '{ signers: {}, roles: {} }', recheck: '600' };
 
 async function loadSettings() {
   const got = await chrome.storage.local.get('settings');
@@ -24,6 +24,27 @@ async function saveSettings() {
 let shown = null;   // { tree, page }: what the frame shows, and the only tree its requests are answered from
 
 function account(lines) { $('account').textContent = lines.join('\n'); }
+
+const STALE_S = 3600;   // a decision older than this is marked: the chain may have moved since (a revocation, a name)
+
+let banner = { asOf: null, ok: false };   // what the banner shows, kept so its age stays live
+
+/** The "as of" banner: which block and slot the decision was made at, when, and how long ago. */
+function showAsOf(asOf, ok) {
+  banner = { asOf, ok };
+  const el = $('asof');
+  if (!asOf || (asOf.block === null && asOf.slot === null)) { el.textContent = ''; el.className = ''; return; }
+  const t = asOf.blockTime ?? asOf.slotTime;
+  const age = t === null ? null : Math.max(0, Math.round(Date.now() / 1000 - t));
+  const ago = age === null ? '' : age < 120 ? `${age} s ago` : age < 7200 ? `${Math.round(age / 60)} min ago`
+    : age < 172800 ? `${Math.round(age / 3600)} h ago` : `${Math.round(age / 86400)} days ago`;
+  const parts = [];
+  if (asOf.block !== null) parts.push(`execution block ${asOf.block}`);
+  if (asOf.slot !== null) parts.push(`beacon slot ${asOf.slot}`);
+  el.textContent = `${ok ? 'Admitted' : 'Decided'} as of ${parts.join(', ')}` + (t === null ? '' : ` · ${new Date(t * 1000).toISOString().replace('.000Z', 'Z')} · ${ago}`)
+    + (age !== null && age > STALE_S ? ' · older than an hour: the chain may have changed since' : '');
+  el.className = age !== null && age > STALE_S ? 'stale' : 'fresh';
+}
 
 /** Show `page` of `tree` in a fresh sandbox loader. Exported for the tests, which put a tree in OPFS themselves. */
 export async function show(tree, page = 'index.html') {
@@ -43,7 +64,8 @@ export async function show(tree, page = 'index.html') {
   const notes = [];
   if (report.missing.length) notes.push(`not in the tree: ${report.missing.join(', ')}`);
   if (report.outside.length) notes.push(`outside the tree, so not loaded: ${report.outside.join(', ')}`);
-  if (report.modules.length) notes.push(`module scripts with relative imports, which may not run: ${report.modules.join(', ')}`);
+  if (report.bare.length) notes.push(`module specifiers no import map names, which will not load: ${report.bare.join(', ')}`);
+  if (report.cycles.length) notes.push(`module cycles a worker cannot be given: ${report.cycles.join('; ')}`);
   return { report, notes };
 }
 
@@ -70,24 +92,63 @@ function clear() {
   frame.replaceWith(blank);
 }
 
+// What is open, and the timer that admits it again: a decision is as of a block, and the chain moves on (a revocation,
+// a name pointed elsewhere), so an open app is re-admitted every `recheck` seconds and taken down if it is refused.
+let current = null;   // { subject, role, cid }
+let timer = null;
+
+function stopRecheck() { if (timer !== null) { clearInterval(timer); timer = null; } }
+
+async function recheck() {
+  if (!current) return;
+  const { subject, role, cid } = current;
+  const settings = await loadSettings();
+  const d = await admit(settings, subject, role);
+  if (!current || current.subject !== subject) return;   // something else was opened meanwhile
+  const when = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+  if (d.code !== 0 || !d.cid) {
+    stopRecheck(); current = null; clear();
+    account([`re-checked ${when}: ${subject} is no longer admitted, so it has been taken down.`, ...d.lines]);
+    showAsOf(d.asOf, false);
+    return;
+  }
+  if (d.cid !== cid) {
+    const tree = await openTree(d.cid);
+    if (!tree) { stopRecheck(); current = null; clear(); account([`re-checked ${when}: ${subject} now admits ${d.cid}, which is not in storage; taken down.`, ...d.lines]); return; }
+    current.cid = d.cid;
+    await show(tree);
+    account([`re-checked ${when}: ${subject} now points at ${d.cid}, admitted, and shown in place of ${cid}.`, ...d.lines]);
+  } else {
+    account([`re-checked ${when}: still admitted.`, ...d.lines]);
+  }
+  showAsOf(d.asOf, true);
+}
+
 async function open(subject, role) {
+  stopRecheck(); current = null;
   clear();
+  showAsOf(null, false);
   const settings = await loadSettings();
   account([`admitting ${subject} as ${role}…`]);
   const d = await admit(settings, subject, role);
   account(d.lines);
+  showAsOf(d.asOf, d.code === 0);
   if (d.code !== 0 || !d.cid) return;
   const tree = await openTree(d.cid);
   if (!tree) { account([...d.lines, `admitted, but its tree is not in storage: ${d.cid}`]); return; }
   window.__reckon.last = { subject, cid: d.cid, paths: tree.paths };
   const { notes } = await show(tree);
   if (notes.length) account([...d.lines, ...notes]);
+  current = { subject, role, cid: d.cid };
+  const every = Number(settings.recheck);
+  if (every > 0) timer = setInterval(recheck, every * 1000);
 }
 
 (async () => {
   const s = await loadSettings();
   for (const f of FIELDS) $(f).value = s[f] ?? '';
   $('save').addEventListener('click', saveSettings);
+  setInterval(() => { if (banner.asOf) showAsOf(banner.asOf, banner.ok); }, 10000);   // the age, kept live
   $('open').addEventListener('submit', (e) => { e.preventDefault(); open($('subject').value.trim(), $('role').value.trim() || 'app'); });
   const q = new URLSearchParams(location.search).get('open');
   if (q) { $('subject').value = q; open(q, $('role').value); }

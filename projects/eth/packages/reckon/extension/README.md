@@ -10,11 +10,11 @@ The plan is in [../docs/browser-extension.md](../docs/browser-extension.md). Thi
 | `build.sh` | builds `src/admit/` (not in git), and with `OUT.zip`, packs the extension |
 | `release.sh` | a release for the pages site, in `../site/downloads/`: the zip named by the unpacked extension's CID, its manifest, and the claims that its admission module was derived by two runners (see the plan's milestone 6) |
 | `src/tree.js` | admitted trees in OPFS, `trees/<cid>/`, as admission writes them out |
-| `src/build-doc.js` | the document an admitted page is shown as: what it names from the tree (scripts, styles and their `@import`/`url()`, images, `srcset`, icons, media) inlined as `data:` URLs, and a shim answering `fetch`, XHR and links within the tree |
+| `src/build-doc.js` | the document an admitted page is shown as: what it names from the tree (scripts, styles and their `@import`/`url()`, images, `srcset`, icons, media) inlined as `data:` URLs; ES modules rewritten and served through an import map, module workers inlined; and a shim answering `fetch`, XHR and links within the tree |
 | `src/loader.html` | the sandbox page: a unique origin, no extension API, handed that document once |
 | `spike/` | how apps came to be shown this way: the five ways measured |
 
-Build it with `WAC_SRC=… sh build.sh`, then test it under Playwright's Chromium. `test/admit.sh WORKDIR` is admission and showing, end to end (11 of 11: see the plan's milestone 3). `node test/shell.cjs` passes 16 of 16:
+Build it with `WAC_SRC=… sh build.sh`, then test it under Playwright's Chromium. `test/admit.sh WORKDIR` is admission and showing, end to end (12 of 12: see the plan's milestone 3); `test/revoke.sh WORKDIR` is a revocation on chain taking effect at the next open, and the "as of" banner (5 of 5, milestone 4). `node test/modules.cjs` is an app of ES modules (12 of 12). `node test/shell.cjs` passes 16 of 16:
 - the extension loads, and its page is isolated;
 - with no settings, admission admits nothing, saying what it lacks, and nothing is shown;
 - a fixture app put in OPFS is shown through the loader: its styles (and one imported), image, `fetch` and XHR in the

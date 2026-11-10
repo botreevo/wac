@@ -370,6 +370,10 @@ shadowing block ends.
 `[§wac-shadow-loop-vwe8gfz]` A `for` initialiser may shadow a local of the enclosing scope, which is
 unchanged after the loop.
 
+`[§wac-redeclare-same-scope-q6m3ztc]` A scope may not declare one local name twice: `i32 n = 1; … i32 n = 2;` in one block
+is refused, where it would otherwise read the second wherever the first was meant. Shadowing is a nested block's, and `_`
+names nothing, so it may be bound any number of times.
+
 Shadowing works because the inner name expires:
 
 ```wac

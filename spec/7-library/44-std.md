@@ -525,6 +525,10 @@ struct Launch {
   bool inheritIn;              // it reads this program's input rather than a queue
   bool inheritOut;             // it writes this program's output and diagnostic output rather than queues
   bool detached;               // dropping its Child does not stop it
+  bool isSealed;               // it has no clock and no random bytes
+
+  Launch plain();              // "", queues, stopped when dropped, not sealed
+  Launch sealed(const this);   // the same, sealed
 }
 
 struct Child {
@@ -538,6 +542,11 @@ struct Child {
 
 `[§wac-std-spawn-grants-ykmq5tw]` A spawned child holds exactly the handles in its `Authority`, so it never holds more than
 its parent. Spawning needs the program's own `procs` authority — another instance of itself included.
+
+`[§wac-std-sealed-child-w4kq9ve]` A child launched `sealed` has no clock and no random bytes: `nowMillis`,
+`monotonicNanos`, `sleepMillis` and `Random.bytes` answer `Unsupported`, on every host. Every program has these without
+asking, so sealing is joined rather than narrowed — a child is sealed when its parent is or when it is asked, and nothing a
+sealed program spawns has them back. It is what makes a child's run a function of what it was handed.
 
 `[§wac-std-files-served-t5h2mzr]` A child handed a `Files` built in this program — a `MemoryStore` view, a `mounted` table,
 a `relativeTo` over either — is served it: the child's `sys.files()` asks this program, which answers out of that
@@ -563,7 +572,7 @@ Exec r = try await procs.exec("git", ["status"], u8[](), ChildEnv.inherited().se
 async Result<i32> runSource(Sys sys, string src) {
   u8[] wasm = try compile("main.wac", src);
   Authority given = Authority(sys.files().readOnly(), null, null, null);
-  Child child = try await sys.procs().spawn(wasm, [], given, Launch("", false, false, false));
+  Child child = try await sys.procs().spawn(wasm, [], given, Launch("", false, false, false, false));
   return Result.Ok(try await child.exit());
 }
 ```

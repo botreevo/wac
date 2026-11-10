@@ -594,7 +594,7 @@ fn run_seed(args: &[String]) -> Result<i32, wasmtime::Error> {
     let raised = Arc::get_mut(&mut m).ok_or_else(|| {
         wasmtime::Error::msg("the seed's manifest was shared before its grants were set")
     })?;
-    raised.grants = manifest::Grants { read: true, write: true, env: true, net: true, run: true };
+    raised.grants = manifest::Grants { read: true, write: true, env: true, net: true, run: true, sealed: raised.grants.sealed };
     let program_args: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
     run(m, wasm, program_args)
 }
@@ -910,6 +910,8 @@ fn load_module(caller: &mut Caller<'_, Host>, wasm: &[u8], asked: i32) -> Result
         // **Inheritable now**, and by the same intersection as the four above: `GRANT_RUN` exists and
         // this stage is the one the old note asked for. `issues/system/0264c`.
         run: mine.run && (asked & GRANT_RUN) != 0,
+        // A module a sealed program loads is sealed too, or loading one would be the way back to a clock.
+        sealed: mine.sealed || (asked & GRANT_SEALED) != 0,
     };
     // The rest of the caller's authority is shared by reference — see `HeldModule`.
     let mut host = Host::new(m.callbacks.len(), caller.data().args.clone(), grants);
@@ -1637,6 +1639,10 @@ fn serve(
             let i = a as i32;
             let bytes = caller.data().args.get(i as usize).cloned().unwrap_or_default();
             return now(Kind::Bytes, Outcome::Bytes(bytes));
+        }
+        // **Sealed: no clock and no random bytes** (`Launch.sealed()`, spec ch44 `§wac-std-sealed-child-w4kq9ve`).
+        OP_NOW_MILLIS | OP_MONOTONIC_NANOS | OP_SLEEP_MILLIS | OP_RANDOM_BYTES if caller.data().grants.sealed => {
+            return Ok(fault(FAULT_UNSUPPORTED, "this program was started sealed: it has no clock and no random bytes"));
         }
         OP_NOW_MILLIS => {
             let ms = SystemTime::now()
@@ -2962,6 +2968,7 @@ fn spawn_instance(
         // forbids.
         run: mine.run && (want & GRANT_RUN) != 0,
         net: mine.net && (want & GRANT_NET) != 0,
+        sealed: mine.sealed || (want & GRANT_SEALED) != 0,
     };
 
     // Its input is uncapped and its two outputs are not: the parent chooses how much to send, and a
@@ -3110,6 +3117,8 @@ const GRANT_ENV: i32 = 8;
 /// authority a confined module's confinement is about, so it was refused outright until there was a
 /// bit to narrow with. `issues/system/0264c`.
 const GRANT_RUN: i32 = 16;
+/// `GRANT_SEALED` in `platform.wac`: no clock and no random bytes, for this program and whatever it starts.
+const GRANT_SEALED: i32 = 32;
 
 /// A request's packed `bytes`: parts that are a little-endian `u32` length then the bytes, and lists that
 /// are a `u32` count then their parts — design/system/0013's request table.

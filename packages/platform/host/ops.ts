@@ -142,3 +142,8 @@ export const GRANT_ENV = 8;
  * be able to refuse a host binary without refusing both, and a page always refuses this one.
  */
 export const GRANT_RUN = 16;
+/**
+ * Not a grant but the opposite of one — `GRANT_SEALED` in `platform.wac`, `Launch.sealed()`: the child has no clock and
+ * no random bytes. Joined rather than narrowed, so nothing a sealed program starts has them back.
+ */
+export const GRANT_SEALED = 32;

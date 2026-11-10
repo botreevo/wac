@@ -2457,6 +2457,8 @@ export i32 errCaseNotConstant() { return 250; }
  * the error. spec ch36; `issues/lang/0338a`.
  */
 export i32 errDroppedOutcome() { return 251; }
+/** A local declared a second time in the scope that already has it (`§wac-redeclare-same-scope-q6m3ztc`). */
+export i32 errRedeclaredLocal() { return 252; }
 /** Two declarations of one name at file scope. */
 export i32 errDuplicateName() { return 64; }
 /** Two fields, two methods, or a field and a method of one name in one struct. */
@@ -4330,7 +4332,9 @@ export struct C {
     // `checkStmt`'s `Var` arm calls `setType` when it reaches the declaration, which is what makes it
     // correct after.
     for (i32 i = 0; i < this.nameCount; i++) {
-      if (this.names[i] == name && this.sameScope(i)) { return; }
+      if (this.names[i] == name && this.sameScope(i)) {
+        return;
+      }
     }
     if (this.nameCount >= this.names.len()) { return; }
     this.names[this.nameCount] = name;
@@ -4346,6 +4350,26 @@ export struct C {
         : this.noScope;
     }
     this.nameCount = this.nameCount + 1;
+  }
+
+  /**
+   * **Two locals of one name in one scope are refused** (`§wac-redeclare-same-scope-q6m3ztc`) — `i32 n = …; … i32 n = …;`
+   * read the second wherever the author meant the first, and cost wac-eth a light client that rejected every update.
+   * Asked of a declaration statement only: a pattern's repeated binding has a diagnostic of its own. The walk that
+   * declares a body ahead of checking it meets each declaration twice, at one position, which is not a second one.
+   */
+  void refuseRedeclared(this, string name, i32 tok) {
+    if (name == "_" || tok < 0) { return; }
+    i32 line = this.toks[tok * tokenStride() + 3];
+    i32 col = this.toks[tok * tokenStride() + 4];
+    for (i32 i = 0; i < this.nameCount; i++) {
+      if (this.names[i] != name || !this.sameScope(i) || i >= this.nameSites.len() || this.nameSites[i] is null) { continue; }
+      DeclSite was = this.nameSites[i]!;
+      if (was.kind == "local" && (was.line != line || was.col != col)) {
+        this.reportTok(errRedeclaredLocal(), tok, "'" + name + "' is declared on line " + countText(was.line) + " already");
+      }
+      return;
+    }
   }
 
   /** Whether name `i` was declared in the scope now innermost — where a redeclaration collides. */
@@ -13300,6 +13324,7 @@ void declareStmt(C c, Stmt s) {
         string wt = writtenTy(c, type);
         if (wt != "" && !isActiveParam(c, wt) && mentionsActiveParam(c, wt)) { vt = wt; }
       }
+      c.refuseRedeclared(tokenText(c, nameTok), nameTok);
       c.declareConst(tokenText(c, nameTok), vt, isConst || aliasesConst, nameTok, "local");
       // Recorded as the aliasing kind, so a write *through* it is still refused while rebinding the
       // name is not. `while (cur is not null) { cur = cur!.next; }` walks a list in a `const this`
@@ -14791,8 +14816,14 @@ void checkImportCollisions(C c, Program prog) {
           }
           // **A variant of the file's own enum is a name at file scope too** (spec ch13), so an import
           // of that name collides with it as with any declaration: `x is Element` could mean either.
-          if (!clash) { clash = declaresVariant(c, prog, alias); }
-          if (clash) {
+          // Said as a variant, because the variant is the declaration nobody thinks of as a name: an enum's `Map(…)`
+          // against core's `Map` read as an import of something already declared, with nothing declared by that name.
+          bool asVariant = false;
+          if (!clash) { clash = declaresVariant(c, prog, alias); asVariant = clash; }
+          if (clash && asVariant) {
+            c.reportTok(errDuplicateImport(), items[i].aliasTok,
+                        "'" + alias + "' is a variant of an enum this file declares, and a variant is a name at file scope");
+          } else if (clash) {
             c.reportTok(errDuplicateImport(), items[i].aliasTok, "");
           } else if (n < seen.len()) {
             seen[n] = alias;

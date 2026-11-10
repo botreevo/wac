@@ -33,6 +33,7 @@ commit=$(git -C "$root" rev-parse HEAD)
 # 1. The derived module, signed by two runners with keys made for this release.
 mkdir -p "$work/keys"
 [ -f "$work/keys/v8.key" ] || { openssl rand -hex 32 > "$work/keys/v8.key"; openssl rand -hex 32 > "$work/keys/wt.key"; }
+rm -rf "$work/derive"   # a fresh store: the claims published are this commit's derivation, and nothing else
 RUNNER_KEYS="$work/keys" sh "$reckon/tools/builddeps.sh" "$work/derive" packages/reckon/cmd/web.wac:read,write,net,env > "$work/derive.log" 2>&1 \
   || { tail -5 "$work/derive.log"; echo "release: the derivation failed" >&2; exit 1; }
 derived=$(sed -n 's/^ok    web: V8 and wasmtime derive the same output (\([a-z0-9]*\)).*/\1/p' "$work/derive.log")
@@ -88,7 +89,7 @@ origins=$($CL origins "$derived" $st)
 recipe=$(printf '%s\n' "$origins" | sed -n '1s/^recipe \([a-z0-9]*\) .*/\1/p')
 ORIGINS="$origins" python3 - "$downloads/reckon-extension-$ext.json" <<PY
 import json, os, sys
-origins = os.environ["ORIGINS"].strip().splitlines()
+origins = list(dict.fromkeys(os.environ["ORIGINS"].strip().splitlines()))
 json.dump({
   "name": "reckon extension (Manifest V3)",
   "extension": "$ext",

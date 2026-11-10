@@ -16,7 +16,7 @@ bad() { fail=$((fail + 1)); echo "FAIL  $*"; }
 step() { echo; echo "## $*"; }
 
 cd "$root"
-wac build --quiet --allow-read --allow-write --allow-run --allow-net packages/reckon/cmd/claim.wac -o "$work/claim"
+wac build --quiet --allow-read --allow-write --allow-run --allow-net --allow-env packages/reckon/cmd/claim.wac -o "$work/claim"
 wac build --quiet --allow-read --allow-write --allow-net packages/ipfs/cmd/obj.wac -o "$work/obj"
 wac build --quiet packages/reckon/corpus/probe.wac -o "$work/probe"
 
@@ -111,6 +111,26 @@ if [ -n "$blk" ]; then
 else
   bad "could not find the probe's block in the mirror to tamper with: $(find bad-mirror -type f | head -3)"
 fi
+
+step "a mirror over HTTPS, as a public trustless gateway is reached (--mirror https://…)"
+sport=${PORT:-8790}
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj /CN=localhost \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+cat > https.py <<'PY'
+import http.server, ssl, sys, functools
+h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[2])
+s = http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), h)
+c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain("cert.pem", "key.pem")
+s.socket = c.wrap_socket(s.socket, server_side=True)
+s.serve_forever()
+PY
+python3 https.py "$sport" pub 2>/dev/null & srv=$!
+trap 'kill $srv 2>/dev/null || true' EXIT
+until curl -s -m1 --cacert cert.pem -o /dev/null "https://127.0.0.1:$sport/"; do sleep 0.2; done
+rm -rf client-tls
+code=0; SSL_CERT_FILE="$work/cert.pem" wac claim.wasm run "$treeCid" app --policy policy.json5 --store client-tls --mirror "https://127.0.0.1:$sport" \
+  --entry app.wasm > tls.out 2> tls.err || code=$?
+[ $code -eq 7 ] && grep -q "^data: from the tree" tls.out && ok "claims and blocks over TLS: admitted, fetched, run" || bad "exit $code: $(tail -3 tls.err)"
 
 echo
 echo "$pass passed, $fail failed"

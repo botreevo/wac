@@ -9,7 +9,7 @@
         [--rpc HOST:PORT]                                             an execution node: trusted for nothing it says
         [--registry ADDR --code-hash H]                               revocations and rejections, proved (registry v2)
         [--ens-registry ADDR --ens-registry-code H --resolver-code H] for SUBJECT ens:NAME (mainnet ENS by default)
-        [--store DIR] [--mirror DIR|http://HOST:PORT]…                where claims and blocks are
+        [--store DIR] [--mirror DIR|http://HOST:PORT|https://HOST]…  where claims and blocks are
 
 SUBJECT is a CID, or `ens:NAME` for whatever the name's contenthash says. The steps, each one checked:
 

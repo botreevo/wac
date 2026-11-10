@@ -2,7 +2,9 @@
 # Store.http against a real HTTP server: a store directory served by a static web server, which answers a trustless
 # gateway's raw block requests (`GET /ipfs/<cid>?format=raw`) because it ignores the query. `obj` fetches a tree from
 # it into an empty store, every block re-hashed; then one block on the server is tampered with, and a fresh fetch of
-# what needs it is refused for that block, while the server's other blocks are still taken.
+# what needs it is refused for that block, while the server's other blocks are still taken. Then the same over HTTPS
+# (`Store.gateway`, through wac's fetch: `--mirror https://…`), against a local TLS server whose certificate the
+# trust store is given by SSL_CERT_FILE, and refused when the certificate is not trusted.
 #
 #     sh packages/ipfs/tools/http-mirror.sh [WORKDIR]     (PORT defaults to 8770; needs python3 for the server)
 set -eu
@@ -15,7 +17,7 @@ ok() { pass=$((pass + 1)); echo "ok    $*"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $*"; }
 
 cd "$root"
-wac build --quiet --allow-read --allow-write --allow-net packages/ipfs/cmd/obj.wac -o "$work/obj"
+wac build --quiet --allow-read --allow-write --allow-net --allow-env packages/ipfs/cmd/obj.wac -o "$work/obj"
 cd "$work"
 O="wac $work/obj.wasm"
 mkdir -p src/sub
@@ -47,6 +49,32 @@ a=$(basename "$(grep -lx hello served/ipfs/* | head -1)")
 [ "$($O cat "$a" --store fresh2 $M 2>&1)" = hello ] && ok "the same server's other blocks still come through: a.txt, $a" || bad "a.txt after tampering"
 out=$($O cat bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku --store fresh2 $M 2>&1) && got=ok || got=refused
 [ "$got" = refused ] && ok "a block the server does not have: not here ($(printf '%s' "$out" | grep -o 'mirror 0: [^;]*' | head -1))" || bad "a missing block: $out"
+
+# HTTPS: the same store behind a TLS server (PORT+1), as a trustless gateway is reached.
+sport=$((port + 1))
+printf 'second file\n' > "served/ipfs/$leaf"                          # the honest block back
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj /CN=localhost \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+cat > https.py <<'PY'
+import http.server, ssl, sys, functools
+h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[2])
+
+s = http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), h)
+c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain("cert.pem", "key.pem")
+s.socket = c.wrap_socket(s.socket, server_side=True)
+s.serve_forever()
+PY
+python3 https.py "$sport" served 2>/dev/null & ssrv=$!
+trap 'kill $srv $ssrv 2>/dev/null || true' EXIT
+until curl -s -m1 --cacert cert.pem -o /dev/null "https://127.0.0.1:$sport/"; do sleep 0.2; done
+S="--mirror https://127.0.0.1:$sport"
+[ "$(SSL_CERT_FILE=$work/cert.pem $O cat "$tree" a.txt --store fresh3 $S 2>&1)" = hello ] && ok "over HTTPS: a file from the gateway, into an empty store" || bad "cat a.txt over https: $(SSL_CERT_FILE=$work/cert.pem $O cat "$tree" a.txt --store fresh3 $S 2>&1)"
+[ "$(SSL_CERT_FILE=$work/cert.pem $O cat "$tree" big.bin --store fresh3 $S | wc -c)" -eq 3000000 ] && ok "over HTTPS: the 3 MB file" || bad "big.bin over https"
+out=$($O cat "$tree" a.txt --store fresh4 $S 2>&1) && got=ok || got=refused
+[ "$got" = refused ] && ok "a certificate the trust store does not hold: nothing fetched" || bad "an untrusted certificate was accepted: $out"
+printf 'tampered!!!\n' > "served/ipfs/$leaf"
+out=$(SSL_CERT_FILE=$work/cert.pem $O cat "$tree" sub/b.txt --store fresh5 $S 2>&1) && got=ok || got=refused
+[ "$got" = refused ] && printf '%s' "$out" | grep -q "does not hash to" && ok "over HTTPS, a tampered block is refused" || bad "a tampered block over https ($got): $out"
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

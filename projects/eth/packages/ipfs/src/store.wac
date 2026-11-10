@@ -9,7 +9,7 @@
 // any trustless gateway, or any web server in front of a store directory, without trusting it.
 
 import { Files, Procs, ChildEnv, Launch, Net } from "std";
-import { http.get, http.Incoming } from "wac";
+import { http.get, http.Incoming, fetch.fetch, fetch.Caps } from "wac";
 import { Result, flatten } from "core";
 import { Cid, parseCid, RAW, DAG_PB } from "./cid.wac";
 import { Params, Built, Block, Node, readNode, slotLabel } from "./unixfs.wac";
@@ -50,6 +50,27 @@ export struct Store {
         string path = "/" + p + (p.indexOf("ipfs/") == 0 ? "?format=raw" : "");
         u8[]? none = null;
         match (get(net, host, port, path)) {
+          Err(_): { return none; }
+          Ok(res): { return res.status == 200 ? res.body : none; }
+        }
+      },
+      (string p, u8[] b) => false);
+  }
+
+  /**
+   * A trustless gateway over HTTPS at `base` (`https://host[:port]`), read-only, through wac's `fetch`: TLS checked
+   * against the trust store, and the proxy the environment names. The same requests as `http`: a block is
+   * `GET /ipfs/<cid>?format=raw` asking for `application/vnd.ipld.raw`, anything else `GET /<path>`. Anything but a
+   * 200 is "not here", and what a 200 says is re-hashed by `get`, so a public gateway is trusted only to be there.
+   */
+  Store gateway(Caps caps, string base) {
+    return Store(
+      (string p) => {
+        bool block = p.indexOf("ipfs/") == 0;
+        string url = base + "/" + p + (block ? "?format=raw" : "");
+        string[] headers = block ? ["Accept: application/vnd.ipld.raw"] : string[]();
+        u8[]? none = null;
+        match (fetch(caps, "GET", url, headers, u8[]())) {
           Err(_): { return none; }
           Ok(res): { return res.status == 200 ? res.body : none; }
         }
@@ -103,12 +124,26 @@ export struct Store {
   bool has(this, Cid c) { return this.read("ipfs/" + c.text()) is not null; }
 }
 
-/** Whether a mirror is named by URL rather than as a directory. */
-export bool isHttp(string spec) { return spec.indexOf("http://") == 0; }
+/** Whether a mirror is named by URL (`http://` or `https://`) rather than as a directory. */
+export bool isHttp(string spec) { return spec.indexOf("http://") == 0 || spec.indexOf("https://") == 0; }
+
+/**
+ * A mirror named by URL: `http://HOST[:PORT]` as `Store.http`, `https://HOST[:PORT]` as `Store.gateway` (a public
+ * trustless gateway such as https://trustless-gateway.link, or a store directory behind any HTTPS server).
+ */
+export Result<Store, string> mirrorAt(Caps caps, string url) {
+  if (url.indexOf("http://") == 0) { return httpStoreAt(caps.net, url); }
+  if (url.indexOf("https://") != 0) { return Result.Err("\{url} is not an http:// or https:// URL"); }
+  string hp = url.slice(8, url.len());
+  if (hp.len() > 0 && hp.slice(hp.len() - 1, hp.len()) == "/") { hp = hp.slice(0, hp.len() - 1); }
+  if (hp.indexOf("/") >= 0) { return Result.Err("\{url}: a mirror is a host and port, with no path"); }
+  if (hp.len() == 0 || hp.indexOf(":") == 0) { return Result.Err("\{url}: no host"); }
+  return Result.Ok(Store.gateway(caps, "https://" + hp));
+}
 
 /** `http://HOST[:PORT][/]` as a read-only `Store.http`, or why it is not one. */
 export Result<Store, string> httpStoreAt(Net net, string url) {
-  if (!isHttp(url)) { return Result.Err("\{url} is not an http:// URL"); }
+  if (url.indexOf("http://") != 0) { return Result.Err("\{url} is not an http:// URL"); }
   string hp = url.slice(7, url.len());
   if (hp.len() > 0 && hp.slice(hp.len() - 1, hp.len()) == "/") { hp = hp.slice(0, hp.len() - 1); }
   if (hp.indexOf("/") >= 0) { return Result.Err("\{url}: a mirror is a host and port, with no path"); }

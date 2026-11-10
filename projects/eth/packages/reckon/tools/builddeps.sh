@@ -3,18 +3,23 @@
 # library), compiled by wac's compiler inside the machine, from an input tree holding wac-eth's source and, laid out as
 # wac's package cache, every dependency wac.lock pins.
 #
-#     WASMTIME_WAC=/path/to/native/wac sh packages/reckon/tools/builddeps.sh [WORKDIR] [ENTRY]
+#     WASMTIME_WAC=/path/to/native/wac sh packages/reckon/tools/builddeps.sh [WORKDIR] [ENTRY[:GRANTS]]…
+#
+# With no ENTRY it builds four of wac-eth's commands in one run, from one input tree: obj, claim, derive and lc. GRANTS
+# are the build's `--allow-…` flags, comma-separated: the module records them, so they are part of what it is.
 #
 # **This steps outside the machine, and says so.** The compiler finds its package cache through $WAC_HOME, and the
 # machine gives a program no environment. Until wac lets a runner serve a fixed environment, the runner hands the
 # program its own (`derive --env-from-runner`), started under `env -i` with WAC_HOME alone; such a run is never signed.
-# What it shows is that nothing else stands in the way: the build reproduces on both engines and is byte-identical to
-# the same compiler run natively, although the cache sits at different absolute paths in the two.
+# What it shows is that nothing else stands in the way: each build reproduces on both engines and is the same module the
+# same compiler makes natively (all but the manifest's record of the entry path, which is absolute in the machine),
+# although the cache sits at different absolute paths in the two.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 root=$(cd "$here/../.." && pwd)
 work=${1:-$(mktemp -d)}
-entry=${2:-packages/ipfs/cmd/obj.wac}
+shift $(( $# > 0 ? 1 : 0 ))
+entries=${*:-packages/ipfs/cmd/obj.wac:read,write packages/reckon/cmd/claim.wac:read,write,net packages/reckon/cmd/derive.wac:read,write,run,env packages/lightclient/cmd/lc.wac:read}
 WT=${WASMTIME_WAC:?set WASMTIME_WAC to the wac of the native host}
 mkdir -p "$work"
 pass=0; fail=0
@@ -43,29 +48,39 @@ sed -n 's/.*"git": "\([^"]*\)".*"commit": "\([0-9a-f]\{40\}\)".*/\1 \2/p' "$root
   mkdir -p "tree/home/cache/git/$d" && cp -r "$cache/$d/." "tree/home/cache/git/$d/"
 done
 st="--store $work/store"
-stem=$(basename "$entry" .wac)
-# `--in tree` puts the tree at /in/in/ for a program that starts at /.
-printf 'build\nin/in/in/%s\n-o\n/out/%s\n--allow-read\n--allow-write\n' "$entry" "$stem" > args
-recipe=$(wac derive.wasm recipe --program wac.wasm --args args --in tree $st 2>/dev/null)
 clean() { env -i PATH="$PATH" WAC_HOME=/in/in/home "$@"; }
-o1=$(clean "$node" "$(command -v wac)" derive.wasm run "$recipe" $st --env-from-runner --timeout 1800000 2>/dev/null)
-o2=$(clean "$WT" derive.wasm run "$recipe" $st --env-from-runner --timeout 1800000 2>/dev/null)
-[ "$(wac obj.wasm cat "$o1" status $st)" = "exit 0" ] && ok "the compiler builds $entry, dependencies and all, inside the machine" \
-  || bad "the build: $(wac obj.wasm cat "$o1" log $st | tail -3)"
-[ "$o1" = "$o2" ] && ok "V8 and wasmtime derive the same output ($o1)" || bad "the engines differ: $o1, $o2"
-wac obj.wasm cat "$o1" "out/$stem.wasm" $st > derived.wasm
+for spec in $entries; do
+  entry=${spec%%:*}
+  grants=$([ "$spec" = "$entry" ] && echo "" || echo "${spec#*:}" | tr ',' ' ')
+  flags=""; for g in $grants; do flags="$flags --allow-$g"; done
+  stem=$(basename "$entry" .wac)
+  # `--in tree` puts the tree at /in/in/. The entry is given absolute: given relative, inside the machine, wac's
+  # compiler refuses an `@/` import as leaving its project (a wac issue, reported; natively the same build works).
+  { printf 'build\n/in/in/in/%s\n-o\n/out/%s\n' "$entry" "$stem"; for f in $flags; do echo "$f"; done; } > "$stem.args"
+  recipe=$(wac derive.wasm recipe --program wac.wasm --args "$stem.args" --in tree $st 2>/dev/null)
+  o1=$(clean "$node" "$(command -v wac)" derive.wasm run "$recipe" $st --env-from-runner --timeout 1800000 2>/dev/null)
+  o2=$(clean "$WT" derive.wasm run "$recipe" $st --env-from-runner --timeout 1800000 2>/dev/null)
+  [ "$(wac obj.wasm cat "$o1" status $st)" = "exit 0" ] && ok "$stem: the compiler builds $entry, dependencies and all, inside the machine" \
+    || { bad "$stem: the build: $(wac obj.wasm cat "$o1" log $st | tail -3)"; continue; }
+  [ "$o1" = "$o2" ] && ok "$stem: V8 and wasmtime derive the same output ($o1)" || bad "$stem: the engines differ: $o1, $o2"
+  wac obj.wasm cat "$o1" "out/$stem.wasm" $st > "$stem.derived.wasm"
 
-# The same compiler, natively, on the same relative entry path, with the cache at another absolute path.
-rm -rf native && mkdir -p native/in/in && cp -r tree/in tree/home native/in/in/
-(cd native && env -i PATH="$PATH" WAC_HOME="$work/native/in/in/home" "$node" "$(command -v wac)" ../wac.wasm build \
-  "in/in/in/$entry" -o "$stem" --allow-read --allow-write >/dev/null 2>&1)
-cmp -s derived.wasm "native/$stem.wasm" && ok "byte-identical to the same compiler run natively ($(wc -c < derived.wasm) bytes)" \
-  || bad "differs from the native build"
-if [ "$stem" = obj ]; then
-  wac derived.wasm ls "$o1" $st > listed.txt 2>/dev/null || true
-  [ "$(head -1 listed.txt | cut -f1)" = log ] && ok "and the derived obj works: it lists its own build's output" \
-    || bad "the derived obj does not run"
-fi
+  # The same compiler, natively, on the same relative entry path, with the cache at another absolute path.
+  [ -d native ] || { mkdir -p native/in/in && cp -r tree/in tree/home native/in/in/; }
+  (cd native && env -i PATH="$PATH" WAC_HOME="$work/native/in/in/home" "$node" "$(command -v wac)" ../wac.wasm build \
+    "in/in/in/$entry" -o "$stem" $flags >/dev/null 2>&1)
+  # The manifest records the entry path as given, /in/… here and relative on the host; everything else must match.
+  [ "$(python3 "$here/tools/wasmdiff.py" "$stem.derived.wasm" "native/$stem.wasm")" = same ] \
+    && ok "$stem: the same module as the same compiler run natively, but for the manifest's entry path ($(wc -c < "$stem.derived.wasm") bytes)" \
+    || bad "$stem: differs from the native build"
+  # And it runs: with no arguments each of these refuses politely, saying how it is used, rather than trapping.
+  wac "$stem.derived.wasm" > "$stem.said" 2>&1 || true
+  if [ -s "$stem.said" ] && ! grep -qi "trap\|unreachable\|RuntimeError" "$stem.said"; then
+    ok "$stem: the derived program runs (\"$(head -1 "$stem.said" | cut -c1-60)…\")"
+  else
+    bad "$stem: the derived program did not run: $(head -2 "$stem.said")"
+  fi
+done
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

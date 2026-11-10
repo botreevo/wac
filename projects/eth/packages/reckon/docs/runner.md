@@ -154,11 +154,18 @@ the compiler's lock resolves them; that is the next step toward building wac-eth
 
 ### With dependencies (2026-11-10)
 
-`tools/builddeps.sh` builds wac-eth's own `obj` command, which imports wac's library, the same way. The input tree is
+`tools/builddeps.sh` builds four of wac-eth's own commands, `obj`, `claim`, `derive` and `lc`, which import wac's
+library and wac-eth's packages, the same way, from one input tree (16 checks; the run is kept in
+`docs/builds-run.txt`). The input tree is
 wac-eth's source plus every dependency `wac.lock` pins, laid out as wac's package cache (`home/cache/git/<repo>/<commit>/`).
-V8 and wasmtime derive the same output, and the program is byte-identical to the same compiler run natively, although
-the cache sits at a different absolute path in the two. The cache location is not in the output. The derived `obj`
-works.
+For each command, V8 and wasmtime derive the same output, and the program is the same module the same compiler makes
+natively, although the cache sits at a different absolute path in the two (the cache location is not in the output).
+It differs only in the manifest's record of the entry path, which the build is given as `/in/…` (`tools/wasmdiff.py`
+compares the rest). Each derived program runs.
+
+The entry is given absolute because of a wac issue, now reported: given a relative entry inside the machine, the
+compiler refuses an `@/` import as "leaving its project", although the same tree builds natively. `obj` and `lc` use
+only relative imports, so they built either way; `claim` and `derive` use `@/lib.wac`.
 
 **One thing stands outside the machine.** The compiler finds its cache through `$WAC_HOME`, and the machine gives a
 program no environment. For now the runner hands the program its own (`derive --env-from-runner`), started under

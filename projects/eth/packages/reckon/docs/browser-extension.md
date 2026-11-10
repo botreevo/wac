@@ -183,6 +183,35 @@ what the user installed, and its build can itself be a derivation, so it can be 
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
 
+## A real app (2026-11-10)
+
+`tools/demo-app.sh` takes a wac-web page, `demo/mandelbrot.wac`, which draws a Mandelbrot set, end to end. It passes
+9 of 9, and is recorded as a site demo with screenshots.
+- **Build:** wac-web's page builder (the `web` package wac.lock pins) builds the page.
+- **Derived:** the page's module (from `demo/page/page.wac`, the builder's wrapper, as committed) and
+  `cmd/embed.wac`, each in the sealed machine on V8 and wasmtime.
+- **Embedded:** the embedding derivation puts the builder's glue (its `index.html` with the module left out)
+  together with the derived module, giving byte for byte the builder's page.
+- **Reviewed:** a reviewer endorses the build's source and arguments and the glue, and a policy admits the page
+  through the derivations back to the compiler root.
+- **Named:** the page is claimed as `mandelbrot` on a devnet's registry v2.
+- **Admitted:** `claim admit name:mandelbrot@0xPUB app` admits it. In the extension, the name is read by proof,
+  the page is fetched and checked, and it runs in the sandbox loader. It draws (86,400 pixels in about 15 ms), a
+  click zooms, its origin is opaque, and it holds no extension API.
+
+What it found:
+- **wac's `--target browser` apps cannot run in the loader.** An opaque-origin sandbox frame is not cross-origin
+  isolated, so it has no `SharedArrayBuffer`, which those apps' blocking worker needs. Delegating
+  `allow="cross-origin-isolated"`, or making the frame `credentialless`, does not change that. wac-web pages
+  (`main(Page)`) need none, so the demo is one. Running wac's `main(Sys)` apps would take a wac browser target that
+  does not block (a wac question), or a loader that is not a sandbox page.
+- **A wac-web page loads its own glue from a `blob:` URL and compiles its own wasm.** So the sandbox's CSP now
+  allows `blob:` and `'wasm-unsafe-eval'` for scripts. Neither reaches the network: a blob is made from bytes the
+  page holds. The worker shim likewise lets a page start a worker from its own `blob:` or `data:` bytes.
+- **wac-web's builder runs `wac build` and `wac bindgen` as commands,** so it cannot run inside the machine. Its
+  wrapper is committed (and checked against what the builder writes), and its page is reproduced inside the machine
+  by `embed`. A library mode in wac-web would let the builder itself be a derivation (asked of wac).
+
 ## The spike (2026-11-10)
 
 `extension/spike/` is a minimal MV3 extension, run under Playwright's Chromium with `node run.cjs`, while

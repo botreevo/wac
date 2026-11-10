@@ -3,7 +3,7 @@
 // A store is one tree; `store.asUser(user)` is a `Files` acting as that user, so two views of one store are two
 // people on one machine. The checks assert the fault's type, which is what a caller matches on.
 
-import { Sys, Files, Mount, Stat, MemoryStore, StoreEntry, Input, Output, NotFound, NotADir, NotGranted, Denied, Exists, IsDir, NotEmpty, Other, Procs,
+import { Sys, Files, FileOps, Mount, Stat, MemoryStore, StoreEntry, Input, Output, NotFound, NotADir, NotGranted, Denied, Exists, IsDir, NotEmpty, Other, Procs,
          Exec, SpawnFault, ChildEnv, Launch,
          Unsupported } from "std";
 import { Result, Read, flatten } from "core";
@@ -279,6 +279,45 @@ export async string test_a_view_under_a_directory_cannot_be_left(Sys sys) {
   // stays a decision rather than an accident.
   Files cwd = root.relativeTo("/jail");
   t.eqStr(await text(cwd, "/etc/hostname"), "the host", "relativeTo is not a boundary");
+  return t.report();
+}
+
+/** `Files.of` over the host's own files, every operation forwarded — what an overlay writes before it changes anything. */
+Files forwarding(Files fs) {
+  return Files.of(FileOps(
+    (string p) => fs.readFile(p),
+    (string p, u8[] b) => fs.writeFile(p, b),
+    (string p) => fs.openRead(p),
+    (string p) => fs.openWrite(p),
+    (string p) => fs.openAppend(p),
+    (string p) => fs.stat(p),
+    (string p) => fs.linkStat(p),
+    (string p) => fs.readDir(p),
+    (string p, bool parents) => fs.mkdir(p, parents),
+    (string p, bool r) => fs.remove(p, r),
+    (string from, string to) => fs.rename(from, to),
+    (string p, i32 mode) => fs.chmod(p, mode),
+    (string p, bool on) => fs.setExecutable(p, on),
+    (string p, string owner) => fs.chown(p, owner)), "");
+}
+
+/**
+ * **A synchronous `wait()` through `Files.of`** — `issues/system/0457d`. Answered by an `async` continuation it had no
+ * way to drive, `readFile(p).wait()` refused at once and a write landed only at the program's last drain; wac-web's
+ * builder, which waits on its files by design, could not run over an overlay. Not `async`, so nothing here is awaited.
+ */
+export string test_a_files_of_over_the_host_answers_a_synchronous_wait(Sys sys) {
+  T t = T.create();
+  Files host = sys.files();
+  string dir = flatten(sys.env().cwd().wait()).unwrap() + "/.cache/wac-filesof-wait";
+  host.mkdir(dir, true).wait();
+  Files over = forwarding(host);
+  t.isTrue(flatten(over.writeFile(dir + "/a", "written".toBytes()).wait()).isOk(), "a write through it, waited for");
+  t.eqStr(string.fromBytes(flatten(host.readFile(dir + "/a").wait()).orElse(u8[]())), "written",
+          "and on the disk at once, not at the last drain");
+  t.eqStr(string.fromBytes(flatten(over.readFile(dir + "/a").wait()).orElse(u8[]())), "written", "a read through it, waited for");
+  t.isTrue(flatten(over.stat(dir + "/a").wait()).isOk(), "a stat");
+  host.remove(dir, true).wait();
   return t.report();
 }
 

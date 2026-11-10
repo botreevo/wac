@@ -1,0 +1,92 @@
+// Claims through mirrors (docs/claims-mirror.md), over memory stores: publishing only adds, two publishers share a
+// mirror, a client with nothing local admits from what a mirror carries, a tampered statement is left out while the
+// rest of its mirror still counts, and a revocation one mirror withholds counts when another carries it.
+
+import { codec.hexDecoded } from "wac";
+import { ipfs.Cid, ipfs.RAW, ipfs.Store, ipfs.Resolver } from "@/lib.wac";
+import { Statement, statementId, signStatement, addressOfKey } from "../src/claims.wac";
+import { Index, Loaded, loadIndex, saveIndex, loadIndexes, publishIndex } from "../src/graph.wac";
+import { Policy, Rule, RoleRules, Named, Chain, Decision, admit } from "../src/admit.wac";
+import { Check } from "./check.wac";
+
+string rep(string two) { string out = ""; for (i32 i = 0; i < 32; i++) { out += two; } return out; }
+u8[] key(string two) { return hexDecoded(rep(two)); }
+Cid object() { return Cid.of(RAW(), "an object worth vouching for".toBytes()); }
+
+/** A store whose index holds one endorsement of `object()` by `who`. */
+Store endorsedBy(string who) {
+  Store s = Store.memory();
+  Index ix = Index.create();
+  ix.add(signStatement(Statement.Endorsement(object(), "reviewed"), key(who)));
+  saveIndex(ix, s);
+  return s;
+}
+
+Policy policy() {
+  return Policy([Named("alice", addressOfKey(key("a1"))), Named("bob", addressOfKey(key("b2")))], Cid[](), string[](),
+                string[](), u8[][](), [RoleRules("app", [Rule.Endorsed(["alice", "bob"], 2)])]);
+}
+
+Decision decide(Loaded l) {
+  return admit(policy(), l.index, Resolver(Store.memory(), Store[]()), Chain.none(), object(), "app");
+}
+
+export string test_publishing_only_adds_and_two_publishers_share_a_mirror() {
+  Check c = Check.create();
+  Store mirror = Store.memory();
+  Loaded first = publishIndex(loadIndex(endorsedBy("a1")).index, mirror).ok()!;
+  c.ok(first.index.signed.len() == 1, "alice's endorsement published");
+  Loaded both = publishIndex(loadIndex(endorsedBy("b2")).index, mirror).ok()!;
+  c.ok(both.index.signed.len() == 2, "bob's added beside it, not over it: \{both.index.signed.len()}");
+  Loaded again = publishIndex(loadIndex(endorsedBy("a1")).index, mirror).ok()!;
+  c.ok(again.index.signed.len() == 2, "publishing alice's again changes nothing");
+  c.ok(loadIndex(mirror).refused.len() == 0, "and the mirror loads cleanly");
+  return c.report();
+}
+
+export string test_a_client_with_nothing_local_admits_from_a_mirror() {
+  Check c = Check.create();
+  Store mirror = Store.memory();
+  publishIndex(loadIndex(endorsedBy("a1")).index, mirror);
+  publishIndex(loadIndex(endorsedBy("b2")).index, mirror);
+  c.ok(!decide(loadIndexes(Store.memory(), Store[]())).ok, "nothing local: refused");
+  Decision d = decide(loadIndexes(Store.memory(), [mirror]));
+  c.ok(d.ok, "with the mirror: both endorsements, admitted");
+  return c.report();
+}
+
+export string test_a_tampered_statement_is_left_out_and_the_rest_still_counts() {
+  Check c = Check.create();
+  Store m1 = Store.memory();
+  publishIndex(loadIndex(endorsedBy("a1")).index, m1);
+  Store m2 = Store.memory();
+  publishIndex(loadIndex(endorsedBy("b2")).index, m2);
+  // Bob's signed block in m2 replaced by alice's, under bob's CID: it does not hash to its name.
+  string list = string.fromBytes(m2.read("claims/index")!);
+  string bobs = list.slice(list.indexOf(" ") + 1, list.indexOf("\n"));
+  string alices = string.fromBytes(m1.read("claims/index")!);
+  alices = alices.slice(alices.indexOf(" ") + 1, alices.indexOf("\n"));
+  m2.write("ipfs/" + bobs, m1.read("ipfs/" + alices)!);
+  Loaded l = loadIndexes(Store.memory(), [m1, m2]);
+  c.ok(l.refused.len() == 1 && l.refused[0].indexOf("mirror 1") == 0 && l.refused[0].indexOf("does not hash") >= 0,
+       "bob's tampered block is reported against mirror 1: \{l.refused.len() > 0 ? l.refused[0] : "(nothing)"}");
+  c.ok(l.index.signed.len() == 1, "alice's, from mirror 0, still counts");
+  c.ok(!decide(l).ok, "and with one endorsement of two, refused");
+  return c.report();
+}
+
+export string test_a_revocation_one_mirror_withholds_counts_when_another_carries_it() {
+  Check c = Check.create();
+  Store all = Store.memory();
+  publishIndex(loadIndex(endorsedBy("a1")).index, all);
+  publishIndex(loadIndex(endorsedBy("b2")).index, all);
+  Store withheld = Store.memory();
+  publishIndex(loadIndex(all).index, withheld);          // a copy of it, without what comes next
+  Index rev = Index.create();
+  rev.add(signStatement(Statement.Revocation(statementId(Statement.Endorsement(object(), "reviewed"))), key("b2")));
+  publishIndex(rev, all);
+  c.ok(decide(loadIndexes(Store.memory(), [withheld])).ok, "a mirror that withholds bob's revocation: admitted");
+  c.ok(!decide(loadIndexes(Store.memory(), [withheld, all])).ok, "with any mirror that carries it: refused");
+  c.ok(!decide(loadIndexes(Store.memory(), [all, withheld])).ok, "in either order");
+  return c.report();
+}

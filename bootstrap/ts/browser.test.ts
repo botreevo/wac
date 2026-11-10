@@ -14,9 +14,12 @@
 // install and does not manage — if it is absent, `bootstrap/hosts/node.js` is the nearest proxy, since the
 // two differ only in where the bytes come from.
 
+import { chromiumExecutable } from "../../harness/chromium.ts";
+
 const HERE = new URL(".", import.meta.url).pathname;
 const ROOT = `${HERE}..`;
-const CHROME = `${Deno.env.get("HOME")}/.cache/ms-playwright/chromium-1234/chrome-linux/chrome`;
+// Wherever this machine keeps it — `harness/chromium.ts` (`issues/system/0452e`); "" when it has none.
+const CHROME = chromiumExecutable().executablePath;
 
 async function have(path: string): Promise<boolean> {
   try {
@@ -29,7 +32,7 @@ async function have(path: string): Promise<boolean> {
 
 Deno.test({
   name: "the ladder builds and runs a wac program inside a browser",
-  ignore: !(await have(CHROME)),
+  ignore: CHROME === "" || !(await have(CHROME)),
   sanitizeResources: false,
   sanitizeOps: false,
   fn: async () => {

@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `wac task map` after adding a package or an entry point; `wac task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-34 packages, 183,158 lines of wac, 2886 tests,
-80 command-line programs and 13 browser pages.
+34 packages, 183,214 lines of wac, 2888 tests,
+81 command-line programs and 13 browser pages.
 
 ## Packages
 
@@ -24,7 +24,7 @@ In dependency order: nothing here imports anything below it.
 | [`unicode`](packages/unicode/) | UTF-8 as code points, simple case mapping, and whether a code point is printable. | 251 | 4 | — |
 | [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,229 | 10 | — |
 | [`zstd`](packages/zstd/) | Zstandard (RFC 8878) in wac. | 3,364 | 77 | — |
-| [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 1,524 | 50 | `bytes` `codec` |
+| [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 1,597 | 51 | `bytes` `codec` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac — and JSON5, as a second entry point. | 1,640 | 44 | `fmt` |
 | [`raster`](packages/raster/) | A pixel buffer and the three things a desktop draws into one: rectangles, a one-pixel frame, and text in a fixed cell. | 1,113 | 28 | `unicode` |
 | [`stream`](packages/stream/) | Run a wac transform as a `ReadableStream`/`WritableStream` pair, so it consumes input as it arrives instead of taking the whole thing at once. | 97 | 14 | `unicode` |
@@ -33,10 +33,10 @@ In dependency order: nothing here imports anything below it.
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,177 | 55 | `crypto` |
 | [`box`](packages/box/) | 66 applets in one program, chosen by the first argument — 65 tools and `help`, which prints the list. | 8,650 | 88 | `bytes` `codec` `crypto` `datetime` `fmt` `fs` `gzip` `http` `json` `platform` `raster` `regex` `server` `sh` `tls` `unicode` `url` `zstd` |
 | [`crypto`](packages/crypto/) | The hashes, AEADs, curves and one KEM the rest of this repo is built on — written in wac, calling nothing. | 7,381 | 316 | `bignum` `codec` `wactest` |
-| [`fetch`](packages/fetch/) | One HTTP request to a URL — `http://` or `https://` — and the whole response back. | 385 | 2 | `bytes` `http` `tls` |
+| [`fetch`](packages/fetch/) | One HTTP request to a URL — `http://` or `https://` — and the whole response back. | 343 | 2 | `bytes` `http` `tls` |
 | [`fs`](packages/fs/) | What a system needs around a filesystem that is its own: the trees that exist only when read (`/dev`, `/proc`, `/bin`), an image to keep a… | 1,269 | 14 | `gzip` `platform` |
-| [`git`](packages/git/) | git in wac: the object database, a working tree, and a client that clones a real repository over its own TLS. | 5,778 | 60 | `bytes` `codec` `crypto` `gzip` `http` `tls` |
-| [`platform`](packages/platform/) | The hosts a wac program runs on, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell the time… | 3,784 | 289 | `fs` `http` `json` `wacc` |
+| [`git`](packages/git/) | git in wac: the object database, a working tree, and a client that clones a real repository over its own TLS. | 5,781 | 60 | `bytes` `codec` `crypto` `gzip` `http` `tls` |
+| [`platform`](packages/platform/) | The hosts a wac program runs on, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell the time… | 3,806 | 290 | `fs` `http` `json` `wacc` |
 | [`quic`](packages/quic/) | QUIC version 1 — RFC 9000 and RFC 9001 — in wac. | 5,726 | 104 | `crypto` `tls` |
 | [`sh`](packages/sh/) | A shell, in wac, whose definition of *correct* is GNU bash: a corpus of scripts runs through both and the two must agree on standard output… | 7,417 | 43 | `codec` `fmt` `fs` `platform` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 4,212 | 58 | `box` `bytes` `codec` `crypto` `fs` `sh` `tty` |
@@ -111,6 +111,7 @@ reach — see `packages/platform/README.md`.
 | `packages/platform/example/stop.wac` | Stopping a child that is not going to stop itself. |
 | `packages/platform/example/testrun.wac` | A test runner, in wac — the whole of what `wac test` does to one file, in forty lines. |
 | `packages/platform/example/twin.wac` | A program that runs itself. |
+| `packages/platform/example/unwaiting.wac` | An `async` program in a page that cannot wait: no shared memory, no cross-origin isolation. |
 | `packages/platform/example/wacland.wac` | The conformance program for a host: what a runtime must be able to do, as a program rather than prose. |
 | `packages/platform/example/waiter.wac` | A program that does not end by itself. |
 | `packages/platform/example/wc.wac` | A word-count application, entire. There is no TypeScript in this directory. |

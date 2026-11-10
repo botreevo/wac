@@ -14,7 +14,8 @@
 // **Skipped loudly** when there is no browser, in the same words `browser_live.test.ts` uses — a
 // skip that reads like a pass is how a differential comes to compare nothing.
 
-import { buildPage, waitInPage } from "../../../harness/buildPage.ts";
+import { buildPage, waitInPage, canvasesOnThePage } from "../../../harness/buildPage.ts";
+import { findChromium, launchOptions } from "../../../harness/chromium.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -39,20 +40,9 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
  * `packages/platform/test/browser_live.test.ts` already worked out: ask, and let the answer decide.
  * The shared suite should not be the thing that needs a browser.
  */
-const cannotBecause = ((): string => {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return "no `sys` permission: run this file with `deno test -A`";
-  }
-  const home = Deno.env.get("HOME") ?? "";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
-      .some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright — run: ./node_modules/.bin/playwright install chromium`;
-  }
-  return "";
-})();
+// Found by `harness/chromium.ts`, which launches it by executable (`issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
 if (cannotBecause !== "") {
   console.warn(
     `SKIPPING the raster live test: ${cannotBecause}.\n` +
@@ -93,8 +83,9 @@ Deno.test({
       const port = (http = serve(dir)).port;
       // --no-proxy-server: this container sets HTTP_PROXY, and Chromium would send 127.0.0.1
       // through Squid, which cannot reach it.
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch(launchOptions(CHROMIUM));
       const page = await browser.newPage();
+      await canvasesOnThePage(page);
       const failures: string[] = [];
       page.on("pageerror", (e: Error) => failures.push(String(e)));
       await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });

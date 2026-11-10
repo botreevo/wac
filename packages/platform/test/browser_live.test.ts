@@ -28,10 +28,11 @@
 // landed, an interactive application driven by real clicks and real typing.
 
 import { buildApp } from "../build.ts";
-import { buildPage, waitInPage } from "../../../harness/buildPage.ts";
+import { buildPage, waitInPage, canvasesOnThePage } from "../../../harness/buildPage.ts";
 // Imported for its side effect: retries a spawn that fails with "Text file busy" and names
 // whoever held the file, if anyone did. wac-mono 0074.
 import "../../../harness/spawnRetry.ts";
+import { findChromium, launchOptions } from "../../../harness/chromium.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -54,20 +55,11 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
  * `wac task test`, which is the right way round: the shared suite should not be the thing
  * that needs a browser.
  */
+const CHROMIUM = findChromium();
+
+/** Why this run cannot drive a browser, or `""` — `harness/chromium.ts` looks (`issues/system/0452e`). */
 function canDriveBrowser(): string {
-  if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return "no `sys` permission: run this file with `deno test -A`";
-  }
-  const home = Deno.env.get("HOME");
-  if (home === undefined) return "no HOME to look for a browser under";
-  try {
-    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
-      .some((e) => e.isDirectory && e.name.startsWith("chromium"));
-    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
-  } catch {
-    return `no ${home}/.cache/ms-playwright: no browser installed`;
-  }
-  return "";
+  return CHROMIUM.cannot;
 }
 
 /**
@@ -157,8 +149,9 @@ Deno.test({
       const port = (http = serve(dir)).port;
       // --no-proxy-server: this container sets HTTP_PROXY, and Chromium would send 127.0.0.1
       // through Squid, which cannot reach it.
-      browser = await chromium.launch({ args: ["--no-proxy-server"] });
+      browser = await chromium.launch(launchOptions(CHROMIUM));
       const page = await browser.newPage();
+      await canvasesOnThePage(page);
       const failures: string[] = [];
       page.on("pageerror", (e: Error) => failures.push(String(e)));
 

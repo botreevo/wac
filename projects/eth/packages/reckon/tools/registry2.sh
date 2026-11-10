@@ -31,7 +31,7 @@ same() {  # same DESCRIPTION A B
   if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "   PASS ($1: $2)"; else fail=$((fail+1)); echo "   FAIL ($1: $2 ≠ $3)"; fi
 }
 
-step "the reader, and a devnet: wacuum --dev, a block every 3 s"
+step "the reader, and a devnet: wacuum --dev"
 mkdir -p "$here/dist"
 wac build --allow-read --allow-write --allow-net --allow-env "$here/cmd/registry2.wac" -o "$here/dist/registry2" >/dev/null
 R="wac $here/dist/registry2.wasm"
@@ -40,7 +40,7 @@ wac build --quiet --allow-read --allow-write --allow-run "$here/cmd/derive.wac" 
 wac build --quiet "$here/corpus/files.wac" -o "$here/dist/files" >/dev/null
 CL="wac $here/dist/claim.wasm"
 mkdir -p "$work/devnet"
-( cd "$work/devnet" && exec wac "$wacuum" --dev --dev-period 3 --datadir data --port "$port" > node.log 2>&1 ) &
+( cd "$work/devnet" && exec wac "$wacuum" --dev --datadir data --port "$port" > node.log 2>&1 ) &
 node_pid=$!
 trap 'kill $node_pid ${liar_pid:-} 2>/dev/null || true' EXIT
 until curl -s -m1 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "http://127.0.0.1:$port/" >/dev/null; do sleep 0.5; done

@@ -40,7 +40,7 @@ been proved absent, not skipped.
 
 ## The end-to-end run: 47 of 47
 
-On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 s; four runs in a row passed):
+On a fresh wacuum devnet (`tools/registry2.sh`, about 80 s; five runs in a row passed):
 
 1. An endorsed object is admitted, with every slot proved absent.
 2. A stranger's "revocation" of the endorser's statement is recorded under the stranger and changes nothing. The
@@ -69,12 +69,11 @@ On a fresh wacuum devnet with a block every 3 s (`tools/registry2.sh`, about 80 
   reverting `eth_call` put the data in the message rather than in `error.data`, so ethers reported "missing revert
   data" for every refused transaction. wacuum now answers as geth does: code 3, `execution reverted: <reason>`, and
   the data in `error.data` (`packages/wacuum/test/revert_test.wac`). The wallet's workaround is gone.
-- **A wacuum devnet proves only its head.** `--dev` finalizes every block as it makes it, and the world keeps the
-  finalized block's state and nothing older. A proof requested for the header just fetched is therefore refused
-  ("the state of that block is not available") whenever a block lands in between. Through the liar, which adds a hop
-  and a second proof request, that happened in 1 of 3 runs at the default 2 s period even with 4 retries. The reader
-  now retries 8 times and the run uses `--dev-period 3`. v1's `readRetrying` has the same exposure. On a real chain,
-  nodes keep recent states and this does not come up.
+- **A wacuum devnet proved only its head** (fixed). `--dev` finalizes every block as it makes it, and the world kept
+  the finalized block's state and nothing older, so a proof asked for the header just fetched was refused ("the
+  state of that block is not available") whenever a block landed in between. Through the liar, which adds a hop and a
+  second proof request, that happened in 1 run in 3. A `--dev` node now keeps the last 16 blocks' states (the
+  engine's `states`; `packages/wacuum/test/dev_test.wac`), and the readers here and in v1's `trust.wac` retry 8 times.
 - **The liar's refusal is not always worded the same.** Depending on where the substitute proof diverges from the real
   trie, mpt says either "the proof ends where a node hashing to … was expected" or "node N hashes to …, but its parent
   named …". v1's e2e matched the first phrase only, which held only because of the shape of its tries; it now accepts

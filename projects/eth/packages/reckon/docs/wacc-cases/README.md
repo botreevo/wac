@@ -11,3 +11,18 @@ reduced yet: small programs written to isolate them compiled correctly.
 
 All three involve a loop over values with a `match` or an `await` in it, inside an `async` function. The
 repository's current code moves the first into an ordinary function (`about()`), and uses an index for the third.
+
+## An enum variant named `Map`
+
+Found 2026-11-10 in `packages/ipfs`. An enum with a variant named `Map` (`Value.Map` in `src/dagcbor.wac`, before it
+became `Dict`) compiles alone, and so does a file importing it. A file that imports it *together with* the `json`
+namespace from `"wac"` gets three diagnostics, `undefined type` with a three-character caret, attributed to the importing
+file at line numbers that are not its own (47, 52, 212). The likely cause: variant names are file-scope type names, and
+`Map` is also `core`'s map type, which the json package uses. Renaming the variant made all three disappear.
+
+## Aggregated test modules and constants
+
+Also 2026-11-10. `wac test` over every suite in wac-eth fails to emit its aggregate module — *a constant whose value
+is not a constant expression* — once `packages/ipfs/test` is among them. The same suite passes alone and paired with
+any one other suite, and with nine of the eleven; it fails only when combined with both wacuum's suites and the rest.
+Not reduced. `tasks.json5` runs `packages/ipfs/test` as its own invocation meanwhile.

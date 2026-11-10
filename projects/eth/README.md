@@ -11,6 +11,7 @@ Everything is a package, as in wac: some are libraries, and some also have comma
 | `packages/mpt` | Merkle-Patricia proofs — a value, or its absence, against a state root |
 | `packages/ethrpc` | asking a node, in the shapes `mpt` verifies; a node is trusted for availability, never for what it says |
 | `packages/ens` | names, and resolving one by proof |
+| [`packages/ipfs`](packages/ipfs/README.md) | objects under IPFS's `unixfs-v1-2025` profile: CIDs, UnixFS, DAG-CBOR, CAR, a checked store; reckon's object layer |
 | `packages/ssz`, `packages/lightclient` | the beacon chain's layouts, and the sync-committee light client |
 | [`packages/wacuum`](packages/wacuum/README.md) | an execution client: every execution-spec-tests fixture through Osaka, devp2p, sync, the Engine API |
 | [`packages/wacuum-devnet`](packages/wacuum-devnet/README.md) | a devnet, its block explorer and its faucet, as one program; wacuum.voltrevo.com |

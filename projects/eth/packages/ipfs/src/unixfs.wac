@@ -1,0 +1,193 @@
+// UnixFS under the `unixfs-v1-2025` profile (IPIP-0499), building and reading files and directories.
+//
+//     files        fixed 1 MiB chunks; raw leaves; a balanced tree of at most 1024 links per node; a single chunk is
+//                  the file itself, a raw block
+//     directories  links sorted by name, bytewise; Tsize the whole size of each child's blocks; the node sharded into
+//                  a HAMT once its encoded size exceeds 256 KiB — *not implemented here yet*, so such a directory
+//                  is refused rather than encoded some other way
+//     never        mode, mtime, symlinks
+//
+// The chunk size and width are parameters so the tree shape can be tested against the reference importer on small
+// inputs; the profile is `PROFILE`.
+//
+//     message Data { DataType Type = 1; bytes Data = 2; uint64 filesize = 3; repeated uint64 blocksizes = 4; … }
+//     enum DataType { Raw = 0; Directory = 1; File = 2; Metadata = 3; Symlink = 4; HAMTShard = 5; }
+
+import { Result } from "core";
+import { Out, In, slice, compare } from "./bytes.wac";
+import { Cid, RAW, DAG_PB } from "./cid.wac";
+import { Link, PbNode, encodePb, decodePb, pushLink } from "./dagpb.wac";
+
+export struct Params {
+  i32 chunk = 1048576;
+  i32 width = 1024;
+  i32 shardBytes = 262144;
+}
+
+export Params PROFILE() { return Params(1048576, 1024, 262144); }
+
+/** One block: its CID and bytes. */
+export struct Block {
+  Cid cid;
+  u8[] data;
+}
+
+/** A built object: its root, every block it is made of, and the Tsize a parent's link to it carries. */
+export struct Built {
+  Cid root;
+  Block[] blocks;
+  i64 tsize = 0 as i64;
+  /** For a file: its byte length. */
+  i64 size = 0 as i64;
+}
+
+static i64 T_DIRECTORY = 1;
+static i64 T_FILE = 2;
+
+u8[] fileData(i64 filesize, i64[] blocksizes) {
+  Out o = Out.create();
+  o.byte(0x08); o.varint(T_FILE);
+  o.byte(0x18); o.varint(filesize);
+  for (i32 i = 0; i < blocksizes.len(); i++) { o.byte(0x20); o.varint(blocksizes[i]); }
+  return o.bytes();
+}
+
+u8[] dirData() {
+  Out o = Out.create();
+  o.byte(0x08); o.varint(T_DIRECTORY);
+  return o.bytes();
+}
+
+Block[] addBlocks(Block[] xs, Block[] more) {
+  if (more.len() == 0) { return xs; }
+  Block[] out = Block[].filled(xs.len() + more.len(), more[0]);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  for (i32 i = 0; i < more.len(); i++) { out[xs.len() + i] = more[i]; }
+  return out;
+}
+
+/** A file's DAG. */
+export Built buildFile(u8[] content, Params p) {
+  // Leaves: raw chunks. An empty file is one empty raw block.
+  i32 count = content.len() == 0 ? 1 : (content.len() + p.chunk - 1) / p.chunk;
+  Built[] level = Built[].filled(count, Built(Cid.of(RAW, u8[]()), Block[](), 0 as i64, 0 as i64));
+  for (i32 i = 0; i < count; i++) {
+    i32 from = i * p.chunk;
+    i32 to = from + p.chunk < content.len() ? from + p.chunk : content.len();
+    u8[] chunk = slice(content, from, to);
+    Cid c = Cid.of(RAW, chunk);
+    level[i] = Built(c, [Block(c, chunk)], chunk.len() as i64, chunk.len() as i64);
+  }
+  // Balanced: group each level into parents of at most `width` children until one remains.
+  while (level.len() > 1) {
+    i32 parents = (level.len() + p.width - 1) / p.width;
+    Built[] up = Built[].filled(parents, level[0]);
+    for (i32 g = 0; g < parents; g++) {
+      i32 from = g * p.width;
+      i32 to = from + p.width < level.len() ? from + p.width : level.len();
+      up[g] = parentOf(level, from, to);
+    }
+    level = up;
+  }
+  return level[0];
+}
+
+Built parentOf(Built[] kids, i32 from, i32 to) {
+  Link[] links = Link[]();
+  i64[] sizes = i64[].filled(to - from, 0 as i64);
+  i64 total = 0 as i64;
+  i64 tsum = 0 as i64;
+  Block[] blocks = Block[]();
+  for (i32 i = from; i < to; i++) {
+    links = pushLink(links, Link(kids[i].root, "", kids[i].tsize));
+    sizes[i - from] = kids[i].size;
+    total += kids[i].size;
+    tsum += kids[i].tsize;
+    blocks = addBlocks(blocks, kids[i].blocks);
+  }
+  u8[] enc = encodePb(PbNode(links, fileData(total, sizes), true));
+  Cid c = Cid.of(DAG_PB, enc);
+  return Built(c, addBlocks([Block(c, enc)], blocks), tsum + (enc.len() as i64), total);
+}
+
+/** One entry of a directory being built: a name and what it is. */
+export struct Entry {
+  string name;
+  Built built;
+}
+
+/** A directory's node, from its entries in any order; refused if it would need HAMT sharding. */
+export Result<Built, string> buildDir(Entry[] entries, Params p) {
+  Entry[] sorted = sortEntries(entries);
+  Link[] links = Link[]();
+  Block[] blocks = Block[]();
+  i64 tsum = 0 as i64;
+  for (i32 i = 0; i < sorted.len(); i++) {
+    if (i > 0 && sorted[i].name == sorted[i - 1].name) { return Result.Err("two entries named \{sorted[i].name}"); }
+    string fault = nameFault(sorted[i].name);
+    if (fault != "") { return Result.Err(fault); }
+    links = pushLink(links, Link(sorted[i].built.root, sorted[i].name, sorted[i].built.tsize));
+    tsum += sorted[i].built.tsize;
+    blocks = addBlocks(blocks, sorted[i].built.blocks);
+  }
+  u8[] enc = encodePb(PbNode(links, dirData(), true));
+  if (enc.len() > p.shardBytes) {
+    return Result.Err("a directory of \{sorted.len()} entries encodes to \{enc.len()} bytes, past the profile's \{p.shardBytes}: it must be HAMT-sharded, which is not implemented yet");
+  }
+  Cid c = Cid.of(DAG_PB, enc);
+  return Result.Ok(Built(c, addBlocks([Block(c, enc)], blocks), tsum + (enc.len() as i64), 0 as i64));
+}
+
+/** Why a name cannot be a directory entry, or "". */
+export string nameFault(string name) {
+  if (name.len() == 0) { return "an empty name"; }
+  if (name == "." || name == "..") { return "the name \"\{name}\""; }
+  if (name.indexOf("/") >= 0) { return "a name holding '/': \{name}"; }
+  return "";
+}
+
+Entry[] sortEntries(Entry[] es) {
+  if (es.len() == 0) { return es; }
+  Entry[] out = Entry[].filled(es.len(), es[0]);
+  for (i32 i = 0; i < es.len(); i++) {
+    Entry e = es[i];
+    i32 j = i;
+    while (j > 0 && compare(out[j - 1].name.toBytes(), e.name.toBytes()) > 0) { out[j] = out[j - 1]; j--; }
+    out[j] = e;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- reading
+
+/** What a node is, read from its block. */
+export enum Node {
+  File(i64 size, Link[] parts, u8[] inline),
+  Dir(Link[] entries),
+}
+
+/** Read a block as a UnixFS node: a raw block is a whole file. */
+export Result<Node, string> readNode(Cid cid, u8[] block) {
+  if (!cid.names(block)) { return Result.Err("a block that does not hash to \{cid.text()}"); }
+  if (cid.codec == RAW) { return Result.Ok(Node.File(block.len() as i64, Link[](), block)); }
+  if (cid.codec != DAG_PB) { return Result.Err("\{cid.text()} is not UnixFS"); }
+  PbNode n = try decodePb(block);
+  if (!n.hasData) { return Result.Err("a dag-pb node with no UnixFS data"); }
+  In r = In.of(n.data);
+  i64 type = -1 as i64;
+  i64 filesize = 0 as i64;
+  u8[] inline = u8[]();
+  while (!r.done()) {
+    i64 tag = r.varint();
+    if (tag == (0x08 as i64)) { type = r.varint(); }
+    else if (tag == (0x12 as i64)) { inline = r.take(r.varint() as! i32); }
+    else if (tag == (0x18 as i64)) { filesize = r.varint(); }
+    else if (tag == (0x20 as i64)) { r.varint(); }
+    else if (tag == (0x38 as i64) || tag == (0x42 as i64)) { return Result.Err("a node carrying mode or mtime, which this profile never records"); }
+    else { return Result.Err("UnixFS field \{tag >>> (3 as i64)}, which this reader does not take"); }
+    if (r.bad != "") { return Result.Err("UnixFS data: \{r.bad}"); }
+  }
+  if (type == T_FILE) { return Result.Ok(Node.File(filesize, n.links, inline)); }
+  if (type == T_DIRECTORY) { return Result.Ok(Node.Dir(n.links)); }
+  return Result.Err("UnixFS type \{type}: only files and plain directories are read here");
+}

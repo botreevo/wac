@@ -1,0 +1,321 @@
+// Blocks kept under their CIDs, and objects moved in and out of them with every block checked.
+//
+// A store is two functions over relative paths, so the same code runs over a directory on disk and over memory in
+// the tests. Blocks live at `ipfs/<cid>` — the path a trustless IPFS gateway answers as `/ipfs/<cid>?format=raw`, so a
+// directory laid out this way, served by any static web server, *is* a resolver.
+//
+// Nothing read is believed: `get` re-hashes what it reads, so a store whose disk was edited behind its back, or a
+// mirror that serves other bytes, is caught at the block, wherever it came from.
+
+import { Files, Procs, ChildEnv, Launch } from "std";
+import { Result, flatten } from "core";
+import { Cid, parseCid, RAW, DAG_PB } from "./cid.wac";
+import { Link } from "./dagpb.wac";
+import { Params, Built, Block, Node, readNode } from "./unixfs.wac";
+import { FileIn, buildTree } from "./tree.wac";
+import { readCar } from "./car.wac";
+import { Out } from "./bytes.wac";
+
+export struct Store {
+  fn<u8[]?(string)> read;
+  fn<bool(string, u8[])> write;
+
+  /** A directory on disk. */
+  Store dir(Files fs, string root) {
+    return Store(
+      (string p) => flatten(fs.readFile(root + "/" + p).wait()).ok(),
+      (string p, u8[] b) => {
+        flatten(fs.mkdir(root + "/ipfs", true).wait());
+        return flatten(fs.writeFile(root + "/" + p, b).wait()).isOk();
+      });
+  }
+
+  /** Memory, for tests: the map is the closures' own. */
+  Store memory() {
+    string[] keys = string[]();
+    u8[][] vals = u8[][]();
+    return Store(
+      (string p) => {
+        for (i32 i = 0; i < keys.len(); i++) { if (keys[i] == p) { return vals[i]; } }
+        u8[]? none = null;
+        return none;
+      },
+      (string p, u8[] b) => {
+        for (i32 i = 0; i < keys.len(); i++) { if (keys[i] == p) { vals[i] = b; return true; } }
+        string[] nk = string[].defaulted(keys.len() + 1);
+        u8[][] nv = u8[][].filled(vals.len() + 1, u8[]());
+        for (i32 i = 0; i < keys.len(); i++) { nk[i] = keys[i]; nv[i] = vals[i]; }
+        nk[keys.len()] = p;
+        nv[vals.len()] = b;
+        keys = nk;
+        vals = nv;
+        return true;
+      });
+  }
+
+  /** Keep a block, refusing one that is not what its CID names. */
+  Result<bool, string> put(this, Block b) {
+    if (!b.cid.names(b.data)) { return Result.Err("a block that does not hash to \{b.cid.text()}"); }
+    if (!this.write("ipfs/" + b.cid.text(), b.data)) { return Result.Err("cannot write \{b.cid.text()}"); }
+    return Result.Ok(true);
+  }
+
+  Result<bool, string> putAll(this, Block[] bs) {
+    for (i32 i = 0; i < bs.len(); i++) { try this.put(bs[i]); }
+    return Result.Ok(true);
+  }
+
+  /** A block by CID, re-hashed on the way out. */
+  Result<u8[], string> get(this, Cid c) {
+    u8[]? b = this.read("ipfs/" + c.text());
+    if (b is null) { return Result.Err("not here: \{c.text()}"); }
+    if (!c.names(b!)) { return Result.Err("the copy of \{c.text()} here does not hash to it"); }
+    return Result.Ok(b!);
+  }
+
+  bool has(this, Cid c) { return this.read("ipfs/" + c.text()) is not null; }
+}
+
+// ---------------------------------------------------------------- resolving
+
+/** Somewhere blocks might be: tried in order, each answer checked. Only the store is written to. */
+export struct Resolver {
+  Store local;
+  Store[] mirrors;
+
+  /** A block, from the local store or the first mirror whose copy hashes to it, then kept locally. */
+  Result<u8[], string> block(this, Cid c) {
+    match (this.local.get(c)) {
+      Ok(b): { return Result.Ok(b); }
+      Err(_): { }
+    }
+    string why = "";
+    for (i32 i = 0; i < this.mirrors.len(); i++) {
+      match (this.mirrors[i].get(c)) {
+        Ok(b): { this.local.put(Block(c, b)); return Result.Ok(b); }
+        Err(e): { why += "; mirror \{i}: \{e}"; }
+      }
+    }
+    return Result.Err("no source has \{c.text()}\{why}");
+  }
+}
+
+// ---------------------------------------------------------------- export
+
+/** A file's bytes, assembled from its blocks, with its declared size checked. */
+export Result<u8[], string> readFile(Resolver r, Cid c) {
+  Out o = Out.create();
+  try fileInto(r, c, o, 0);
+  return Result.Ok(o.bytes());
+}
+
+Result<bool, string> fileInto(Resolver r, Cid c, Out o, i32 depth) {
+  if (depth > 32) { return Result.Err("a file nested past 32 levels"); }
+  u8[] b = try r.block(c);
+  Node n = try readNode(c, b);
+  match (n) {
+    Dir(_): { return Result.Err("\{c.text()} is a directory, where a file was expected"); }
+    File(size, parts, inline): {
+      i32 before = o.n;
+      o.all(inline);
+      for (i32 i = 0; i < parts.len(); i++) { try fileInto(r, parts[i].cid, o, depth + 1); }
+      if (((o.n - before) as i64) != size) { return Result.Err("\{c.text()} declares \{size} bytes and holds \{o.n - before}"); }
+      return Result.Ok(true);
+    }
+  }
+}
+
+/** Every file in a tree, with its path; an empty directory as its path ending in `/`. */
+export Result<FileIn[], string> readTree(Resolver r, Cid c) { return treeOf(r, c, "", 0); }
+
+Result<FileIn[], string> treeOf(Resolver r, Cid c, string prefix, i32 depth) {
+  if (depth > 64) { return Result.Err("a tree nested past 64 levels"); }
+  u8[] b = try r.block(c);
+  Node n = try readNode(c, b);
+  match (n) {
+    File(_, _, _): { return Result.Err("\{c.text()} is a file, where a directory was expected"); }
+    Dir(entries): {
+      if (entries.len() == 0 && prefix != "") { return Result.Ok([FileIn(prefix, u8[]())]); }
+      FileIn[] out = FileIn[]();
+      for (i32 i = 0; i < entries.len(); i++) {
+        Link e = entries[i];
+        string path = prefix == "" ? e.name : prefix + e.name;
+        u8[] eb = try r.block(e.cid);
+        Node en = try readNode(e.cid, eb);
+        bool isDir = match (en) { Dir(_): true, File(_, _, _): false };
+        if (isDir) {
+          FileIn[] sub = try treeOf(r, e.cid, path + "/", depth + 1);
+          out = joinFiles(out, sub);
+        } else {
+          u8[] bytes = try readFile(r, e.cid);
+          out = joinFiles(out, [FileIn(path, bytes)]);
+        }
+      }
+      return Result.Ok(out);
+    }
+  }
+}
+
+FileIn[] joinFiles(FileIn[] a, FileIn[] b) {
+  if (b.len() == 0) { return a; }
+  FileIn[] out = FileIn[].filled(a.len() + b.len(), b[0]);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
+
+/** Split readTree's answer back into the files and empty directories buildTree takes. */
+export string[] emptyDirsOf(FileIn[] fs) {
+  string[] out = string[]();
+  for (i32 i = 0; i < fs.len(); i++) {
+    string p = fs[i].path;
+    if (p.len() > 0 && p.slice(p.len() - 1, p.len()) == "/") {
+      string[] next = string[].defaulted(out.len() + 1);
+      for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+      next[out.len()] = p.slice(0, p.len() - 1);
+      out = next;
+    }
+  }
+  return out;
+}
+
+export FileIn[] filesOnly(FileIn[] fs) {
+  FileIn[] out = FileIn[]();
+  for (i32 i = 0; i < fs.len(); i++) {
+    string p = fs[i].path;
+    if (!(p.len() > 0 && p.slice(p.len() - 1, p.len()) == "/")) { out = joinFiles(out, [fs[i]]); }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- import
+
+/** A tree built from files in memory, its blocks kept. */
+export Result<Cid, string> importFiles(Store s, FileIn[] files, string[] dirs, Params p) {
+  Built b = try buildTree(files, dirs, p);
+  try s.putAll(b.blocks);
+  return Result.Ok(b.root);
+}
+
+/** A CAR's blocks, each checked, kept; its roots answered. */
+export Result<Cid[], string> importCar(Store s, u8[] car) {
+  auto k = try readCar(car);
+  try s.putAll(k.blocks);
+  return Result.Ok(k.roots);
+}
+
+/** A directory on disk: hidden files included, symlinks refused, `.git` at the top left out. */
+export async Result<Cid, string> importDir(Store s, Files fs, string path, Params p) {
+  FileIn[] files = FileIn[]();
+  string[] dirs = string[]();
+  string[] todo = [""];
+  while (todo.len() > 0) {
+    string rel = todo[todo.len() - 1];
+    string[] rest = string[].defaulted(todo.len() - 1);
+    for (i32 i = 0; i < rest.len(); i++) { rest[i] = todo[i]; }
+    todo = rest;
+    string full = rel == "" ? path : path + "/" + rel;
+    string[] names;
+    match (await fs.readDir(full)) {
+      Err(e): { return Result.Err("\{full}: \{e}"); }
+      Ok(n): { names = n; }
+    }
+    if (names.len() == 0 && rel != "") { dirs = pushS(dirs, rel); }
+    for (i32 i = 0; i < names.len(); i++) {
+      if (rel == "" && names[i] == ".git") { continue; }
+      string child = rel == "" ? names[i] : rel + "/" + names[i];
+      auto st = (await fs.linkStat(path + "/" + child)).ok();
+      if (st is null) { return Result.Err("\{child}: cannot stat"); }
+      if (st!.isSymlink) { return Result.Err("\{child}: a symlink, which the profile here refuses"); }
+      if (st!.isDir) { todo = pushS(todo, child); continue; }
+      u8[]? bytes = (await fs.readFile(path + "/" + child)).ok();
+      if (bytes is null) { return Result.Err("\{child}: cannot read"); }
+      files = joinFiles(files, [FileIn(child, bytes!)]);
+    }
+  }
+  return importFiles(s, files, dirs, p);
+}
+
+/** A git commit's tree, from `git` (a locator only: the CIDs come from the bytes it hands over). */
+export async Result<Cid, string> importGit(Store s, Procs procs, string repo, string commit, Params p) {
+  u8[] listing = try await git(procs, ["-C", repo, "ls-tree", "-r", "-z", commit], u8[]());
+  string[] paths = string[]();
+  string[] shas = string[]();
+  i32 start = 0;
+  string ask = "";
+  for (i32 i = 0; i < listing.len(); i++) {
+    if (listing[i] != 0) { continue; }
+    string rec = string.fromBytes(sliceOf(listing, start, i));
+    start = i + 1;
+    i32 tab = rec.indexOf("\t");
+    string mode = rec.slice(0, rec.indexOf(" "));
+    if (mode == "120000") { return Result.Err("\{rec.slice(tab + 1, rec.len())}: a symlink, which the profile here refuses"); }
+    if (mode == "160000") { return Result.Err("\{rec.slice(tab + 1, rec.len())}: a submodule"); }
+    string head = rec.slice(0, tab);
+    string sha = head.slice(head.len() - 40, head.len());
+    paths = pushS(paths, rec.slice(tab + 1, rec.len()));
+    shas = pushS(shas, sha);
+    ask += sha + "\n";
+  }
+  u8[] batch = try await git(procs, ["-C", repo, "cat-file", "--batch"], ask.toBytes());
+  FileIn[] files = FileIn[]();
+  i32 at = 0;
+  for (i32 i = 0; i < shas.len(); i++) {
+    i32 nl = at;
+    while (batch[nl] != 10) { nl++; }
+    string h = string.fromBytes(sliceOf(batch, at, nl));
+    i32 size = 0;
+    u8[] digits = h.slice(lastSpace(h) + 1, h.len()).toBytes();
+    for (i32 d = 0; d < digits.len(); d++) { size = size * 10 + ((digits[d] - '0') as i32); }
+    files = joinFiles(files, [FileIn(paths[i], sliceOf(batch, nl + 1, nl + 1 + size))]);
+    at = nl + 1 + size + 1;
+  }
+  return importFiles(s, files, string[](), p);
+}
+
+async Result<u8[], string> git(Procs procs, string[] args, u8[] input) {
+  match (await procs.exec("git", args, input, ChildEnv.inherited(), Launch.plain())) {
+    Err(e): { return Result.Err("cannot run git: \{e}"); }
+    Ok(r): {
+      if (r.ok()) { return Result.Ok(r.stdout); }
+      return Result.Err("git \{args[2]}: \{r.ran() ? string.fromBytes(r.stderr) : r.error}");
+    }
+  }
+}
+
+u8[] sliceOf(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+i32 lastSpace(string s) {
+  i32 at = -1;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == ' ') { at = i; } }
+  return at;
+}
+
+string[] pushS(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+/** Every block under `c`, fetched and checked: what a CAR of the object holds. */
+export Result<Block[], string> blocksOf(Resolver r, Cid c) {
+  u8[] b = try r.block(c);
+  Block[] out = [Block(c, b)];
+  if (c.codec == RAW) { return Result.Ok(out); }
+  Node n = try readNode(c, b);
+  Link[] links = match (n) { File(_, parts, _): parts, Dir(entries): entries };
+  for (i32 i = 0; i < links.len(); i++) {
+    Block[] sub = try blocksOf(r, links[i].cid);
+    Block[] next = Block[].filled(out.len() + sub.len(), out[0]);
+    for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+    for (i32 j = 0; j < sub.len(); j++) { next[out.len() + j] = sub[j]; }
+    out = next;
+  }
+  return Result.Ok(out);
+}

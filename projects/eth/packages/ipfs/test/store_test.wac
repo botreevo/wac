@@ -1,0 +1,102 @@
+// The store and resolver, over memory: what goes in comes out, and nothing that does not hash to its CID gets
+// through, whichever side of the store it was tampered with on.
+
+import { Result } from "core";
+import { Cid, RAW } from "../src/cid.wac";
+import { Params, Built, Block, buildFile } from "../src/unixfs.wac";
+import { FileIn, buildTree } from "../src/tree.wac";
+import { Store, Resolver, readFile, readTree, filesOnly, emptyDirsOf, importFiles, importCar } from "../src/store.wac";
+import { writeCar } from "../src/car.wac";
+import { Check } from "./check.wac";
+
+u8[] bytes(i32 n, i32 seed) {
+  u8[] b = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { b[i] = ((i * 31 + seed * 7) & 255) as@ u8; }
+  return b;
+}
+
+FileIn[] sample() {
+  return [FileIn("a.txt", bytes(10, 1)), FileIn(".hidden", bytes(3, 2)), FileIn("src/big.bin", bytes(200, 3)),
+          FileIn("src/x/y", bytes(0, 4))];
+}
+
+Params small() { return Params(16, 4, 262144); }
+
+export string test_a_tree_goes_in_and_comes_out_the_same() {
+  Check c = Check.create();
+  Store s = Store.memory();
+  Cid root = importFiles(s, sample(), ["empty"], small()).ok()!;
+  Resolver r = Resolver(s, Store[]());
+  match (readTree(r, root)) {
+    Err(e): { c.fail(e); }
+    Ok(fs): {
+      c.ok(fs.len() == 5, "four files and an empty directory: \{fs.len()}");
+      Built again = buildTree(filesOnly(fs), emptyDirsOf(fs), small()).ok()!;
+      c.eq(again.root.text(), root.text(), "read back and rebuilt, the same root");
+      for (i32 i = 0; i < fs.len(); i++) {
+        if (fs[i].path == "src/big.bin") { c.ok(fs[i].content.len() == 200 && fs[i].content[199] == bytes(200, 3)[199], "a multi-block file's bytes"); }
+      }
+    }
+  }
+  return c.report();
+}
+
+export string test_a_mirror_serving_other_bytes_is_passed_over() {
+  Check c = Check.create();
+  Built f = buildFile(bytes(100, 9), small());
+  Store good = Store.memory();
+  good.putAll(f.blocks);
+  Store evil = Store.memory();
+  // The evil mirror holds every block, but one leaf's bytes are wrong under its name.
+  for (i32 i = 0; i < f.blocks.len(); i++) {
+    u8[] d = f.blocks[i].data;
+    if (i == f.blocks.len() - 1) { d = bytes(d.len(), 77); }
+    evil.write("ipfs/" + f.blocks[i].cid.text(), d);
+  }
+  Resolver both = Resolver(Store.memory(), [evil, good]);
+  match (readFile(both, f.root)) {
+    Err(e): { c.fail("with a good mirror behind the evil one: \{e}"); }
+    Ok(b): { c.ok(b.len() == 100 && b[99] == bytes(100, 9)[99], "the right bytes, from the mirror whose copy hashes"); }
+  }
+  Resolver onlyEvil = Resolver(Store.memory(), [evil]);
+  c.ok(readFile(onlyEvil, f.root).isErr(), "with only the evil mirror: refused");
+  return c.report();
+}
+
+export string test_a_store_edited_behind_its_back_is_caught() {
+  Check c = Check.create();
+  Store s = Store.memory();
+  Built f = buildFile(bytes(5, 1), small());
+  s.putAll(f.blocks);
+  s.write("ipfs/" + f.root.text(), bytes(5, 2));
+  c.ok(s.get(f.root).isErr(), "the edited block is refused on the way out");
+  c.ok(s.put(Block(f.root, bytes(5, 3))).isErr(), "and a block under the wrong CID is refused on the way in");
+  return c.report();
+}
+
+export string test_a_car_imports_whole_or_not_at_all() {
+  Check c = Check.create();
+  Built t = buildTree(sample(), string[](), small()).ok()!;
+  u8[] car = writeCar([t.root], t.blocks);
+  Store s = Store.memory();
+  match (importCar(s, car)) {
+    Err(e): { c.fail(e); }
+    Ok(roots): { c.eq(roots[0].text(), t.root.text(), "its root"); c.ok(readTree(Resolver(s, Store[]()), roots[0]).isOk(), "and its tree reads"); }
+  }
+  car[car.len() - 1] = car[car.len() - 1] ^ 1;
+  c.ok(importCar(Store.memory(), car).isErr(), "a flipped bit refuses it");
+  return c.report();
+}
+
+export string test_a_file_whose_size_lies_is_refused() {
+  Check c = Check.create();
+  Built f = buildFile(bytes(40, 1), small());
+  Store s = Store.memory();
+  s.putAll(f.blocks);
+  // A missing block is a refusal, not a short file.
+  Store gap = Store.memory();
+  for (i32 i = 0; i < f.blocks.len() - 1; i++) { gap.put(f.blocks[i]); }
+  c.ok(readFile(Resolver(gap, Store[]()), f.root).isErr(), "a missing leaf");
+  c.ok(readFile(Resolver(s, Store[]()), f.root).isOk(), "all present");
+  return c.report();
+}

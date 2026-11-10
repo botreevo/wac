@@ -1,0 +1,82 @@
+// obj — objects under the `unixfs-v1-2025` profile, in a local store, checked on every read.
+//
+//     obj add DIR                      import a directory (hidden files included, symlinks refused); print its CID
+//     obj add-git REPO COMMIT          import a commit's tree, every CID from the bytes git hands over
+//     obj cat CID                      a file's bytes, to standard output
+//     obj ls CID                       a tree's files, one path and size per line
+//     obj car CID OUT                  every block of an object, as a CAR file
+//     obj import-car FILE              a CAR's blocks into the store, each checked; print its roots
+//
+// --store DIR (default .objects) is where blocks are kept; --mirror DIR (repeatable) is where else to look.
+
+import { Sys } from "std";
+import { Result } from "core";
+import { Cid, parseCid } from "../src/cid.wac";
+import { PROFILE } from "../src/unixfs.wac";
+import { Store, Resolver, importDir, importGit, importCar, readFile, readTree, blocksOf } from "../src/store.wac";
+import { writeCar } from "../src/car.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 2) { sys.warn("usage: obj add DIR | add-git REPO COMMIT | cat CID | ls CID | car CID OUT | import-car FILE  [--store DIR] [--mirror DIR]…"); return 2; }
+  Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
+  Store[] mirrors = Store[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != "--mirror") { continue; }
+    Store[] next = Store[].filled(mirrors.len() + 1, Store.dir(sys.files(), a[i + 1]));
+    for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
+    mirrors = next;
+  }
+  Resolver r = Resolver(store, mirrors);
+  string cmd = a[0];
+  if (cmd == "add") { return say(sys, await importDir(store, sys.files(), a[1], PROFILE())); }
+  if (cmd == "add-git" && a.len() >= 3) { return say(sys, await importGit(store, sys.procs(), a[1], a[2], PROFILE())); }
+  if (cmd == "import-car") {
+    match (await sys.readFile(a[1])) {
+      Err(e): { sys.warn("obj: \{e}"); return 1; }
+      Ok(b): {
+        match (importCar(store, b)) {
+          Err(e): { sys.warn("obj: \{e}"); return 1; }
+          Ok(roots): { for (i32 i = 0; i < roots.len(); i++) { sys.log(roots[i].text()); } return 0; }
+        }
+      }
+    }
+  }
+  Cid c;
+  match (parseCid(a[1])) {
+    Err(e): { sys.warn("obj: \{e}"); return 1; }
+    Ok(x): { c = x; }
+  }
+  if (cmd == "cat") {
+    match (readFile(r, c)) {
+      Err(e): { sys.warn("obj: \{e}"); return 1; }
+      Ok(b): { sys.log(string.fromBytes(b)); return 0; }
+    }
+  }
+  if (cmd == "ls") {
+    match (readTree(r, c)) {
+      Err(e): { sys.warn("obj: \{e}"); return 1; }
+      Ok(fs): { for (i32 i = 0; i < fs.len(); i++) { sys.log("\{fs[i].path}\t\{fs[i].content.len()}"); } return 0; }
+    }
+  }
+  if (cmd == "car" && a.len() >= 3) {
+    match (blocksOf(r, c)) {
+      Err(e): { sys.warn("obj: \{e}"); return 1; }
+      Ok(bs): { await sys.writeFile(a[2], writeCar([c], bs)); sys.log("\{bs.len()} blocks"); return 0; }
+    }
+  }
+  sys.warn("obj: unknown command \{cmd}");
+  return 2;
+}
+
+i32 say(Sys sys, Result<Cid, string> r) {
+  match (r) {
+    Err(e): { sys.warn("obj: \{e}"); return 1; }
+    Ok(c): { sys.log(c.text()); return 0; }
+  }
+}

@@ -1,0 +1,64 @@
+// CAR version 1: how blocks travel together — a header naming the roots, then each block as its CID and bytes. A
+// reader checks every block against its CID before handing it on, so a CAR from anywhere is as good as one from
+// anyone.
+//
+//     car    = varint(len) ‖ dag-cbor { roots: [link…], version: 1 } ‖ block*
+//     block  = varint(len(cid) + len(data)) ‖ cid ‖ data
+
+import { Result } from "core";
+import { Out, In } from "./bytes.wac";
+import { Cid, readCid } from "./cid.wac";
+import { Value, encode, decode, field, listOf, linkOf, intOf } from "./dagcbor.wac";
+import { Block } from "./unixfs.wac";
+
+export u8[] writeCar(Cid[] roots, Block[] blocks) {
+  Value[] rs = Value[].filled(roots.len(), Value.Null);
+  for (i32 i = 0; i < roots.len(); i++) { rs[i] = Value.Link(roots[i]); }
+  u8[] header = encode(Value.Dict(["roots", "version"], [Value.List(rs), Value.Int(1 as i64)]));
+  Out o = Out.create();
+  o.varint(header.len() as i64); o.all(header);
+  for (i32 i = 0; i < blocks.len(); i++) {
+    u8[] c = blocks[i].cid.bytes();
+    o.varint((c.len() + blocks[i].data.len()) as i64); o.all(c); o.all(blocks[i].data);
+  }
+  return o.bytes();
+}
+
+export struct Car {
+  Cid[] roots;
+  Block[] blocks;
+}
+
+/** Every block checked against its CID; a CAR with one bad block is refused whole. */
+export Result<Car, string> readCar(u8[] b) {
+  In r = In.of(b);
+  i64 hlen = r.varint();
+  u8[] hb = r.take(hlen as! i32);
+  if (r.bad != "") { return Result.Err("CAR: \{r.bad}"); }
+  Value h = try decode(hb);
+  i64? version = intOf(field(h, "version"));
+  if (version is null || version! != (1 as i64)) { return Result.Err("CAR: only version 1 is read"); }
+  Value[]? rs = listOf(field(h, "roots"));
+  if (rs is null) { return Result.Err("CAR: a header without roots"); }
+  Cid[] roots = Cid[].filled(rs!.len(), Cid { });
+  for (i32 i = 0; i < roots.len(); i++) {
+    Cid? c = linkOf(rs![i]);
+    if (c is null) { return Result.Err("CAR: a root that is not a link"); }
+    roots[i] = c!;
+  }
+  Block[] blocks = Block[]();
+  while (!r.done()) {
+    i64 len = r.varint();
+    i32 start = r.at;
+    if (r.bad != "") { return Result.Err("CAR: \{r.bad}"); }
+    Cid c = try readCid(r);
+    i32 dataLen = (len as! i32) - (r.at - start);
+    u8[] data = r.take(dataLen);
+    if (r.bad != "") { return Result.Err("CAR: \{r.bad}"); }
+    if (!c.names(data)) { return Result.Err("CAR: a block that does not hash to its CID \{c.text()}"); }
+    Block[] next = Block[].filled(blocks.len() + 1, Block(c, data));
+    for (i32 i = 0; i < blocks.len(); i++) { next[i] = blocks[i]; }
+    blocks = next;
+  }
+  return Result.Ok(Car(roots, blocks));
+}

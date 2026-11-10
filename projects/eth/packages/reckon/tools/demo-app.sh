@@ -1,22 +1,25 @@
 #!/bin/sh
 # A real wac app, end to end through reckon and the extension: demo/mandelbrot.wac, a wac-web page that draws a
-# Mandelbrot set. It is built, derived, reviewed, published, named on chain, admitted by a policy, and run in the
-# extension, with nothing reaching the network.
+# Mandelbrot set. It is built in sealed steps, reviewed, published, named on chain, admitted by a policy, and run in
+# the extension, with nothing reaching the network.
 #
 #     WASMTIME_WAC=/path/to/native/wac WAC_SRC=/path/to/wac sh packages/reckon/tools/demo-app.sh WORKDIR
 #
-# 1. wac-web's page builder (the `web` package wac.lock pins) builds the page: demo/dist/page.wac (the wrapper,
-#    which must be demo/page/page.wac as committed), page.js and index.html, the module base64 inside.
-# 2. Inside the sealed machine, on V8 and on wasmtime, each runner signing (tools/builddeps.sh, from HEAD and the
-#    dependencies pinned by CID): the page's module, compiled from demo/page/page.wac; and cmd/embed.wac.
-# 3. The embedding, a derivation on both runners: embed.wasm over two slots, `glue` (the builder's index.html with
-#    the module left out) and `module` (the derived build). Its out/index.html must be the builder's, byte for byte:
-#    so the page a person opens is a derived output.
-# 4. A reviewer endorses what was reviewed: the build's source and arguments, and the glue. A policy (WORKDIR/
-#    policy.json5) admits the page through the derivations, back to the compiler as the root.
-# 5. A wacuum devnet with the registry v2: the page's CID claimed as `mandelbrot` by a publisher. A mirror: the store,
+# 1. Inside the sealed machine, on V8 and on wasmtime, each runner signing (tools/builddeps.sh, from HEAD and the
+#    dependencies pinned by CID): cmd/pagebuild.wac, which runs the two halves of wac-web's page builder that start
+#    no process (W5).
+# 2. The page, in three derivations, each on both runners:
+#    a. `pagebuild --module-only`: the builder writes the page's module, page.wac;
+#    b. the compiler builds it, from wac-eth's source and the locked dependencies with that page.wac added beside the
+#       app (where the builder means it to be: it imports the app relatively, and `web` through the manifest);
+#    c. `pagebuild --wrap`: (b)'s output, its module wrapped into index.html.
+#    The page must be what wac-web's builder makes in one step, natively, byte for byte.
+# 3. A reviewer endorses what was reviewed: the builds' source and arguments, and (b)'s source, which is wac-eth's
+#    with (a)'s page.wac added (the script checks that it is). A policy (WORKDIR/policy.json5) admits the page
+#    through (c), the builder and (b), back to the compiler as the root.
+# 4. A wacuum devnet with the registry v2: the page's CID claimed as `mandelbrot` by a publisher. A mirror: the store,
 #    served with CORS.
-# 6. `claim admit name:mandelbrot@0xPUB app`: admitted, on the command line. Then the extension
+# 5. `claim admit name:mandelbrot@0xPUB app`: admitted, on the command line. Then the extension
 #    (extension/test/demo-app.cjs): the name read by proof in the page, the claims from the mirror, the page fetched
 #    and checked, then run in the sandbox loader. It draws, a click zooms, and nothing reaches the network.
 #    Screenshots go in WORKDIR/shots.
@@ -41,82 +44,101 @@ trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM HUP
 rpc() { curl -s -m2 -X POST -H 'content-type: application/json' --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "http://127.0.0.1:$port/"; }
 [ -z "$(git -C "$root" status --porcelain)" ] || { echo "demo-app: commit first: the builds are from HEAD" >&2; exit 2; }
+TITLE="A Mandelbrot set, admitted"
 
-step "1. the page, built by wac-web's builder (the reviewed glue)"
+step "1. the page builder, derived on two runners"
+mkdir -p "$work/keys"
+for k in v8 wt reviewer publisher; do openssl rand -hex 32 | tr -d '\n' > "$work/keys/$k.key"; done
+RUNNER_KEYS="$work/keys" sh "$here/tools/builddeps.sh" "$work/builds" packages/reckon/cmd/pagebuild.wac:read,write \
+  > "$work/builds.log" 2>&1 || { tail -8 "$work/builds.log"; exit 1; }
+grep -E "^(ok|FAIL)" "$work/builds.log"
+builderOut=$(sed -n "s/^ok    pagebuild: V8 and wasmtime derive the same output (\([a-z0-9]*\)).*/\1/p" "$work/builds.log")
+[ -n "$builderOut" ] && ok "the builder $builderOut, agreed by V8 and wasmtime" || { bad "the builder"; exit 1; }
+B="$work/builds"; st="--store $B/store"
+O="wac $B/obj.wasm"; D="wac $B/derive.wasm"
+cd "$root"
+wac build --quiet --allow-read --allow-write --allow-net --allow-env "$here/cmd/claim.wac" -o "$work/claim"
+CL="wac $work/claim.wasm"
+cd "$work"
+$O cat "$builderOut" out/pagebuild.wasm $st > pagebuild.wasm
+# derive2 NAME ARGSFILE PROGRAM [derive recipe flags…]: the recipe run on both runners, each signing; the agreed output,
+# and the recipe in $recipe.
+derive2() {
+  name=$1; argsf=$2; prog=$3; shift 3
+  recipe=$($D recipe --program "$prog" --args "$argsf" "$@" $st 2>/dev/null)
+  a=$($D run "$recipe" $st --timeout 1800000 --key keys/v8.key --runner "reckon-derive/2 v8" 2>/dev/null | sed -n 1p)
+  b=$($WASMTIME_WAC "$B/derive.wasm" run "$recipe" $st --timeout 1800000 --key keys/wt.key --runner "reckon-derive/2 wasmtime" 2>/dev/null | sed -n 1p)
+  if [ -n "$a" ] && [ "$a" = "$b" ] && [ "$($O cat "$a" status $st)" = "exit 0" ]; then echo "$a"; return 0; fi
+  echo "$name: V8 ${a:-nothing}, wasmtime ${b:-nothing}: $($O cat "${a:-$b}" log $st 2>/dev/null | tail -3)" >&2
+  return 1
+}
+# export CID DIR: a tree out of the store into DIR, so a later recipe can take it as a slot (it imports to the same CID).
+export_tree() {
+  mkdir -p "$2"
+  $O ls "$1" $st | while IFS="$(printf '\t')" read -r p size; do mkdir -p "$2/$(dirname "$p")"; $O cat "$1" "$p" $st > "$2/$p"; done
+  [ "$($O add "$2" --store "$work/scratch")" = "$1" ] || { echo "export: $2 is not $1" >&2; return 1; }
+}
+
+step "2. the page, in three derivations"
+mkdir -p empty
+printf '%s\n' packages/reckon/demo/mandelbrot.wac packages/reckon/demo/dist --in-page --title "$TITLE" --module-only > module.args
+moduleOut=$(derive2 module module.args pagebuild.wasm --in empty) || { bad "(a) --module-only"; exit 1; }
+$O cat "$moduleOut" out/packages/reckon/demo/dist/page.wac $st > page.wac
+ok "(a) --module-only: the builder wrote page.wac ($moduleOut)"
+rm -rf src && mkdir -p src && cp -R "$B/tree/in" "$B/tree/home" src/
+mkdir -p src/in/packages/reckon/demo/dist && cp page.wac src/in/packages/reckon/demo/dist/page.wac
+printf 'build\n--wac-home\n/in/in/home\nin/in/in/packages/reckon/demo/dist/page.wac\n-o\n/out/page\n' > compile.args
+compiled=$(derive2 compile compile.args "$B/wac.wasm" --in src) || { bad "(b) the compile"; exit 1; }
+compileRecipe=$recipe
+ok "(b) the compiler built page.wasm from it ($compiled)"
+export_tree "$compiled" compiled
+printf '%s\n' packages/reckon/demo/mandelbrot.wac out --in-page --title "$TITLE" --wrap > wrap.args
+pageOut=$(derive2 wrap wrap.args pagebuild.wasm --in compiled) || { bad "(c) --wrap"; exit 1; }
+wrapRecipe=$recipe
+ok "(c) --wrap: the page ($pageOut)"
+mkdir -p app && $O cat "$pageOut" out/out/index.html $st > app/index.html
 cd "$root"
 web=$(sed -n 's/.*"web": {[^}]*"git": "\([^"]*\)".*"commit": "\([0-9a-f]\{40\}\)".*/\1 \2/p' wac.lock)
 webdir="${WAC_HOME:-$HOME/.wac}/cache/git/$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${web% *}")/${web#* }"
 rm -rf "$here/demo/dist"
 wac run --allow-read --allow-write --allow-run "$webdir/tools/build.wac" packages/reckon/demo/mandelbrot.wac packages/reckon/demo/dist \
-  --in-page --title "A Mandelbrot set, admitted" > "$work/build.log" 2>&1 || { tail -5 "$work/build.log"; exit 1; }
-cmp -s "$here/demo/dist/page.wac" "$here/demo/page/page.wac" && ok "the builder's wrapper is demo/page/page.wac, as committed" \
-  || { bad "the builder wrote another wrapper: commit demo/dist/page.wac as demo/page/page.wac"; exit 1; }
-mkdir -p "$work/glue"
-python3 - "$here/demo/dist/index.html" "$work/glue/index.html" <<'PY'
-import re, sys
-s = open(sys.argv[1]).read()
-t, n = re.subn(r'const WASM = "[A-Za-z0-9+/=]+"', 'const WASM = ""', s)
-assert n == 1, n
-open(sys.argv[2], "w").write(t)
-PY
-ok "the glue: the builder's index.html with its module left out ($(wc -c < "$work/glue/index.html") of $(wc -c < "$here/demo/dist/index.html") bytes)"
-
-step "2. the page's module and the embedder, derived on two runners"
-mkdir -p "$work/keys"
-for k in v8 wt reviewer publisher; do openssl rand -hex 32 | tr -d '\n' > "$work/keys/$k.key"; done
-RUNNER_KEYS="$work/keys" sh "$here/tools/builddeps.sh" "$work/builds" packages/reckon/demo/page/page.wac \
-  packages/reckon/cmd/embed.wac:read,write > "$work/builds.log" 2>&1 || { tail -8 "$work/builds.log"; exit 1; }
-grep -E "^(ok|FAIL)" "$work/builds.log"
-out() { sed -n "s/^ok    $1: V8 and wasmtime derive the same output (\([a-z0-9]*\)).*/\1/p" "$work/builds.log"; }
-pageOut=$(out page); embedOut=$(out embed)
-[ -n "$pageOut" ] && [ -n "$embedOut" ] && ok "page module $pageOut, embedder $embedOut: each agreed by V8 and wasmtime" || { bad "the builds"; exit 1; }
-B="$work/builds"; st="--store $B/store"
-O="wac $B/obj.wasm"; D="wac $B/derive.wasm"
-wac build --quiet --allow-read --allow-write --allow-net --allow-env "$here/cmd/claim.wac" -o "$work/claim"
-CL="wac $work/claim.wasm"
-
-step "3. the embedding, derived on two runners: the page a person opens"
+  --in-page --title "$TITLE" > "$work/native.log" 2>&1 || { tail -5 "$work/native.log"; exit 1; }
 cd "$work"
-mkdir -p module/out
-$O cat "$pageOut" status $st > module/status; $O cat "$pageOut" log $st > module/log; $O cat "$pageOut" out/page.wasm $st > module/out/page.wasm
-[ "$($O add module --store "$work/scratch")" = "$pageOut" ] || { bad "the module slot is not the derived output"; exit 1; }
-$O cat "$embedOut" out/embed.wasm $st > embed.wasm
-recipe=$($D recipe --program embed.wasm --slot glue glue --slot module module $st 2>/dev/null)
-e1=$($D run "$recipe" $st --key keys/v8.key --runner "reckon-derive/2 v8" 2>/dev/null | sed -n 1p)
-e2=$($WASMTIME_WAC "$B/derive.wasm" run "$recipe" $st --key keys/wt.key --runner "reckon-derive/2 wasmtime" 2>/dev/null | sed -n 1p)
-[ -n "$e1" ] && [ "$e1" = "$e2" ] && ok "V8 and wasmtime embed the same page ($e1), each signing it" || { bad "the embedding: $e1, $e2"; exit 1; }
-mkdir -p app && $O cat "$e1" out/index.html $st > app/index.html
-cmp -s app/index.html "$here/demo/dist/index.html" && ok "the derived page is the builder's index.html, byte for byte" || { bad "the derived page differs from the builder's"; exit 1; }
+cmp -s app/index.html "$here/demo/dist/index.html" && ok "the page is the one wac-web's builder makes natively in one step, byte for byte" \
+  || { bad "the sealed page differs from the builder's one-step page"; exit 1; }
+cmp -s page.wac "$here/demo/dist/page.wac" && ok "…and so is page.wac" || bad "page.wac differs from the builder's"
+rm -rf "$here/demo/dist"
 app=$($O add app $st)
 echo "   the page: $app"
 
-step "4. the reviewer, and the policy"
+step "3. the reviewer, and the policy"
 slot() { $CL slots "$1" $st | sed -n "s/^$2 //p"; }
-origin() { $CL origins "$1" $st | sed -n '1s/^recipe \([a-z0-9]*\) .*/\1/p'; }
-pageRecipe=$(origin "$pageOut"); embedRecipe=$(origin "$embedOut")
-for c in "$(slot "$pageRecipe" in)" "$(slot "$pageRecipe" args)" "$(slot "$embedRecipe" args)" "$(slot "$recipe" glue)"; do
+builderRecipe=$($CL origins "$builderOut" $st | sed -n '1s/^recipe \([a-z0-9]*\) .*/\1/p')
+[ "$(slot "$compileRecipe" in)" = "$($O add src --store "$work/scratch2")" ] || { bad "(b)'s source"; exit 1; }
+for c in "$(slot "$builderRecipe" in)" "$(slot "$builderRecipe" args)" "$(slot "$compileRecipe" in)" "$(slot "$compileRecipe" args)" "$(slot "$wrapRecipe" args)"; do
   $CL endorse "$c" reviewed --key keys/reviewer.key $st >/dev/null 2>&1
 done
 cat > policy.json5 <<POLICY
 {
   signers: { v8: "$($CL address --key keys/v8.key)", wasmtime: "$($CL address --key keys/wt.key)",
              reviewer: "$($CL address --key keys/reviewer.key)" },
-  roots: ["$(slot "$pageRecipe" program)"],
+  roots: ["$(slot "$builderRecipe" program)"],
   machines: ["wasm-gc/wac-host/2"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: {
-    app: [{ within: { role: "embedding", path: "out" } }],
-    embedding: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "embedder", glue: "reviewed", module: "build" } } }],
-    embedder: [{ within: { role: "build", path: "out/embed.wasm" } }],
+    app: [{ within: { role: "page", path: "out/out" } }],
+    page: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "builder", args: "reviewed", in: "module" } } }],
+    builder: [{ within: { role: "build", path: "out/pagebuild.wasm" } }],
+    module: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "compiler", in: "reviewed", args: "reviewed" } } }],
     build: [{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "compiler", in: "reviewed", args: "reviewed" } } }],
     compiler: ["root"],
     reviewed: [{ endorsed: { by: ["reviewer"], at_least: 1 } }],
   },
 }
 POLICY
-ok "the reviewer endorsed the build's source and arguments and the glue; policy.json5 written"
+ok "the reviewer endorsed the sources and arguments; (b)'s source is wac-eth's with (a)'s page.wac, checked"
 
-step "5. a devnet, the registry, the name; a mirror"
+step "4. a devnet, the registry, the name; a mirror"
 mkdir -p devnet && ( cd devnet && exec wac "$wacuum" --dev --datadir data --port "$port" > node.log 2>&1 ) & pids="$pids $!"
 until [ -n "$(rpc eth_blockNumber '[]' | sed -n 's/.*"result":"0x\([0-9a-f]*\)".*/\1/p')" ] && [ "$(rpc eth_blockNumber '[]' | sed -n 's/.*"result":"0x\([0-9a-f]*\)".*/\1/p')" != 0 ]; do sleep 0.5; done
 export RPC="http://127.0.0.1:$port"
@@ -132,7 +154,7 @@ node "$here/tools/browser/serve.mjs" $mport "$B/store" & pids="$pids $!"
 node "$here/tools/browser/cors-proxy.mjs" $proxy $port & pids="$pids $!"
 until curl -s -m1 -o /dev/null "http://127.0.0.1:$mport/" && curl -s -m1 -o /dev/null -X OPTIONS "http://127.0.0.1:$proxy/"; do sleep 0.2; done
 
-step "6. admitted by name, on the command line and in the extension"
+step "5. admitted by name, on the command line and in the extension"
 out=$($CL admit "name:mandelbrot@$pub" app --policy policy.json5 --store fresh --mirror "http://127.0.0.1:$mport" \
   --rpc 127.0.0.1:$port --registry "$registry" --code-hash "$codehash" 2>&1) && code=0 || code=$?
 printf '%s\n' "$out" | sed 's/^/   | /'

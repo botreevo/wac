@@ -1,0 +1,51 @@
+// pagebuild — wac-web's page builder, its two halves that start no process, run inside the sealed machine
+// (tools/demo-app.sh). The arguments are the builder's own (`<entry.wac> <out-dir> --module-only | --wrap …`), and so
+// is the work: `writePageModule` and `wrapBuiltPage` from wac-web's tools/build.wac (the `webbuild` package).
+//
+// What this adds is the machine's file system, made into one the builder can use. The builder reads and writes paths
+// relative to where it runs, and the machine gives a program a read-only input at /in and an empty /out. So: a path
+// is written below /out; and read from /out if the program wrote it, else from the recipe's `in` slot, /in/in. That
+// is how `--wrap` finds `<out>/page.wasm`, which an earlier derivation built, and writes `<out>/index.html` beside it.
+
+import { Sys, Files, FileOps, Stat, Input, Output, ReadFault, WriteFault, LookFault, MkdirFault, MoveFault, ModeFault,
+         Unsupported } from "std";
+import { Result, Ticket, flatten } from "core";
+import { writePageModule, wrapBuiltPage } from "webbuild";
+
+string clean(string p) {
+  string q = p;
+  while (q.len() >= 2 && q.slice(0, 2) == "./") { q = q.slice(2, q.len()); }
+  while (q.len() >= 1 && q.slice(0, 1) == "/") { q = q.slice(1, q.len()); }
+  return q;
+}
+
+/** The builder's file system: written below /out, read from /out when written there, else from /in/in. */
+Files overlay(Files base) {
+  fn<string(string)> w = (string p) => "/out/" + clean(p);
+  fn<string(string)> r = (string p) => flatten(base.stat("/out/" + clean(p)).wait()).isOk() ? "/out/" + clean(p) : "/in/in/" + clean(p);
+  return Files.of(FileOps(
+    (string p) => base.readFile(r(p)),
+    (string p, u8[] b) => base.writeFile(w(p), b),
+    (string p) => base.openRead(r(p)),
+    (string p) => base.openWrite(w(p)),
+    (string p) => base.openAppend(w(p)),
+    (string p) => base.stat(r(p)),
+    (string p) => base.linkStat(r(p)),
+    (string p) => base.readDir(r(p)),
+    (string p, bool parents) => base.mkdir(w(p), parents),
+    (string p, bool rec) => base.remove(w(p), rec),
+    (string a, string b) => base.rename(w(a), w(b)),
+    (string p, i32 mode) => base.chmod(w(p), mode),
+    (string p, bool on) => base.setExecutable(w(p), on),
+    (string p, string owner) => base.chown(w(p), owner)), "");
+}
+
+export i32 main(Sys sys) {
+  string[] a = sys.args();
+  bool module = false;
+  bool wrap = false;
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] == "--module-only") { module = true; } if (a[i] == "--wrap") { wrap = true; } }
+  if (module == wrap) { sys.warn("pagebuild: one half of a page build: --module-only or --wrap, with the builder's arguments"); return 2; }
+  Files fs = overlay(sys.files());
+  return module ? writePageModule(a, sys.stderr(), sys.stdout(), fs) : wrapBuiltPage(a, sys.stderr(), sys.stdout(), fs);
+}

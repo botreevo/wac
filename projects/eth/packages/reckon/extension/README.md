@@ -8,6 +8,7 @@ The plan is in [../docs/browser-extension.md](../docs/browser-extension.md). Thi
 | `src/page.html`, `page.js` | settings (checkpoint, beacon node, RPC, registry, mirrors, policy) in extension storage; a subject to open; admission's account; the app |
 | `src/admission.js` | admission: `cmd/web.wac`, built into `src/admit/` by `build.sh` (wac's `--target browser --layout files`), run in a hidden frame of the extension's origin. It keeps blocks, the light client's state and admitted trees in the extension's OPFS |
 | `build.sh` | builds `src/admit/` (not in git), and with `OUT.zip`, packs the extension |
+| `release.sh` | a release for the pages site, in `../site/downloads/`: the zip named by the unpacked extension's CID, its manifest, and the claims that its admission module was derived by two runners (see the plan's milestone 6) |
 | `src/tree.js` | admitted trees in OPFS, `trees/<cid>/`, as admission writes them out |
 | `src/build-doc.js` | the document an admitted page is shown as: what it names from the tree (scripts, styles and their `@import`/`url()`, images, `srcset`, icons, media) inlined as `data:` URLs, and a shim answering `fetch`, XHR and links within the tree |
 | `src/loader.html` | the sandbox page: a unique origin, no extension API, handed that document once |

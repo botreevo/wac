@@ -114,9 +114,20 @@ what the user installed, and its build can itself be a derivation, so it can be 
    opened, and a visible "as of block N" on the page.
 5. **Hardening.** Size and start-up time, the extension built as a derivation, and an admission of the extension by
    its own policy.
-6. **Published.** A zip (and a `.crx` if signing is settled) with install instructions as a download on the reckon
-   pages site reckon1 is building, and live in-browser demos there if feasible. The download is named by its CID,
-   with the claims that admit it.
+6. **Published. Done (2026-11-10).** `extension/release.sh` makes `site/downloads/`, which the pages site serves:
+   - the zip, named by the unpacked extension's CID (unzip it, `obj add` the folder: the same CID; three builds gave
+     the same one);
+   - a manifest;
+   - a claims mirror with the derivation.
+
+   The admission module is derived: `cmd/web.wac` compiled inside the sealed machine on V8 and on wasmtime (by
+   `builddeps`, from HEAD and the dependencies wac.lock pins by CID), each runner signing it with keys made for the
+   release and not published. The shipped `admit/app.wasm` must be that output, byte for byte, less its
+   `wac.manifest` section (all wac's browser build changes), or there is no release.
+
+   Not derived: the JavaScript (the extension's own, in git; wac's browser glue, bundled by deno). Two deno builds
+   differ only in a random temporary directory name, which the release replaces with a fixed one (a wac issue,
+   reported). The site's card says what it does not verify yet.
 
 ## Risks and open questions
 

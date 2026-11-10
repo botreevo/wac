@@ -196,7 +196,7 @@ the compiler's lock resolves them; that is the next step toward building wac-eth
 ### With dependencies (2026-11-10)
 
 `tools/builddeps.sh` builds four of wac-eth's own commands, `obj`, `claim`, `derive` and `lc`, which import wac's
-library and wac-eth's packages, the same way, from one input tree (16 checks; the run is kept in
+library and wac-eth's packages, the same way, from one input tree (17 checks; the run is kept in
 `docs/builds-run.txt`). The input tree is
 wac-eth's source plus every dependency `wac.lock` pins, laid out as wac's package cache (`home/cache/git/<repo>/<commit>/`).
 Before anything is built, every dependency in the input is hashed again, less the cache's marker, and must be the

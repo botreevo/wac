@@ -188,7 +188,7 @@ expect refused "the claims mirror does not hold its content" "no source has" -- 
 # but being there; a gateway that is not there is reported, and counts neither way.
 gateway=${GATEWAY-https://trustless-gateway.link}
 if [ -n "$gateway" ]; then
-  code=$(curl -s -m 30 -o /dev/null -w '%{http_code}' -H 'Accept: application/vnd.ipld.raw' "$gateway/ipfs/$vitalik?format=raw" || true)
+  code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H 'Accept: application/vnd.ipld.raw' "$gateway/ipfs/$vitalik?format=raw" || true)
   if [ "$code" = 200 ]; then
     expect ok "claim run ens:vitalik.eth --out: admitted, then its content from $gateway, every block checked" "ADMITTED" -- \
       $CL run ens:vitalik.eth site --policy mainnet/policy.json5 --store client-mainnet $M --mirror "$gateway" --out mainnet/site \
@@ -202,6 +202,9 @@ if [ -n "$gateway" ]; then
 fi
 
 step "5. what it refuses"
+# A fresh anchor, still before 5d's revocation: the devnet keeps the state of its last 16 blocks only, and 4b can take
+# long enough (a gateway that does not answer) for step 4's anchor to fall out of that window.
+anchor=$(rpc $port eth_getBlockByNumber '["latest",false]' | sed -n 's/.*"hash":"\(0x[0-9a-f]*\)".*/\1/p')
 # 5a. A tampered build output: the app's block, and then the build's tree, changed on a mirror.
 cp -r mirror mirror-bad-app; printf 'not the app' > "mirror-bad-app/ipfs/$appCid"
 expect refused "a mirror serving other bytes for the app: fetched and refused" "does not hash" -- $O cat "$appCid" --store client-5a --mirror mirror-bad-app

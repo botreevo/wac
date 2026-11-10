@@ -13,12 +13,18 @@
 //
 //     … --block FILE --proof FILE --ens NAME [--registry ADDR]
 //     lc ens-slots NAME
+//     … --contenthash FILE [--version V]
+//     lc contenthash-slots NAME VERSION LENGTH
 //
 // With these, it carries on to state: FILE is an execution node's `eth_getBlockByNumber` answer for the finalized
 // execution block, believed only if its re-encoded header hashes to the block hash the light client proved, and an
 // `eth_getProof` answer for the ENS registry's owner and resolver slots of NAME (which `ens-slots` prints) at that
 // block, believed only as far as the proofs reach that header's state root. The answer is NAME's owner and resolver
 // on mainnet, from nothing but the trusted root.
+//
+// With --contenthash, FILE is an `eth_getProof` of the proven resolver's slots that `contenthash-slots` lists (the
+// name's record version, the contenthash's head, its data), and the answer goes on to the content NAME points at: its
+// EIP-1577 contenthash, as a CID.
 
 import { Sys } from "std";
 import { Result } from "core";
@@ -28,6 +34,8 @@ import { hexArray } from "../../ethrpc/src/jsonhex.wac";
 import { recordOf, Record } from "../../ens/src/verified.wac";
 import { ownerSlot, resolverSlot } from "../../ens/src/registry.wac";
 import { namehash } from "../../ens/src/ens.wac";
+import { contenthashOf, slotsFor } from "../../ens/src/contenthash.wac";
+import { cidFromBytes } from "../../ipfs/src/cid.wac";
 import { codec.hexDecoded, codec.hexEncode } from "wac";
 import { forkNamed } from "../../ssz/src/forks.wac";
 import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, processOptimisticUpdate, headerSlot,
@@ -75,6 +83,11 @@ u8[] MAINNET_GVR() { return unhex("0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf
 
 export async i32 main(Sys sys) {
   string[] a = sys.args();
+  if (a.len() >= 4 && a[0] == "contenthash-slots") {
+    u8[][] ss = slotsFor(namehash(a[1].toBytes()), decimal(a[2]), decimal(a[3]) as~ i32);
+    for (i32 i = 0; i < ss.len(); i++) { sys.log(hex(ss[i])); }
+    return 0;
+  }
   if (a.len() >= 2 && a[0] == "ens-slots") {
     u8[] node = namehash(a[1].toBytes());
     sys.log(hex(ownerSlot(node)));
@@ -164,8 +177,36 @@ async i32 toState(Sys sys, string[] a, i32 fork, u8[] header, string blockFile) 
   if (!r.ok) { sys.warn("lc: the proof does not hold: \{r.error}"); return 1; }
   if (!r.present) { sys.log("ens         \{name}: no owner, proved absent"); return 0; }
   sys.log("ens         \{name} owner \{hex(r.owner)} resolver \{hex(r.resolver)}");
+  string chFile = flag(a, "--contenthash", "");
+  if (chFile != "") {
+    JsonValue cp;
+    match (await jsonFile(sys, chFile)) { Err(e): { sys.warn("lc: \{e}"); return 1; } Ok(v): { cp = v; } }
+    JsonArray? cs = cp.member("storageProof")?.array();
+    if (cs is null) { sys.warn("lc: the contenthash proof has no storage proofs"); return 1; }
+    u8[][][] nodes = u8[][][].filled(cs!.len(), u8[][]());
+    for (i32 i = 0; i < cs!.len(); i++) { nodes[i] = hexArray(cs!.get(i).member("proof") ?? JsonValue.Null); }
+    // The resolver is the one the registry proof named, never one the caller supplies.
+    match (contenthashOf(h.stateRoot, r.resolver, namehash(name.toBytes()), decimal(flag(a, "--version", "0")),
+                         hexArray(cp.member("accountProof") ?? JsonValue.Null), nodes)) {
+      Err(e): { sys.warn("lc: the contenthash proof does not hold: \{e}"); return 1; }
+      Ok(bytes): { sys.log("content     \{name} → \{eip1577(bytes)}"); }
+    }
+  }
   sys.log("            proved from the trusted root alone: sync committee, beacon header, execution block, state trie");
   return 0;
+}
+
+/** EIP-1577: a multicodec namespace (0xe3 ipfs, 0xe5 ipns) as a varint, then a CID. */
+string eip1577(u8[] b) {
+  if (b.len() == 0) { return "(no contenthash)"; }
+  if (b.len() > 2 && b[1] == (0x01 as u8) && (b[0] == (0xe3 as u8) || b[0] == (0xe5 as u8))) {
+    u8[] cidBytes = cut(b, 2, b.len());
+    match (cidFromBytes(cidBytes)) {
+      Ok(c): { return (b[0] == (0xe3 as u8) ? "ipfs://" : "ipns://") + c.text(); }
+      Err(e): { return "a contenthash whose CID does not parse (\{e}): \{hex(b)}"; }
+    }
+  }
+  return "a contenthash in a namespace this does not read: \{hex(b)}";
 }
 
 async Result<JsonValue, string> jsonFile(Sys sys, string path) {

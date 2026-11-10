@@ -1,0 +1,129 @@
+// A name's contenthash (EIP-1577), read out of the ENS PublicResolver's storage and believed only by proof.
+//
+// The resolver keeps every record under a version, so that clearing a name's records is one write:
+//
+//     slot 0   mapping(bytes32 node => uint64) recordVersions              (ResolverBase)
+//     slot 3   mapping(uint64 version => mapping(bytes32 node => bytes)) versionable_hashes   (ContentHashResolver)
+//
+// Slots 1 and 2 are the ABI and address records, in the order PublicResolver inherits them. This layout was read off
+// mainnet's resolver 0x231b0ee1…5e8e63 by finding the slot whose bytes `contenthash()` returns, and it matches the
+// inheritance in ens-contracts.
+//
+// So the contenthash is two lookups, each a proof: the name's version, then the bytes stored under that version.
+// The bytes are Solidity's `bytes`: up to 31 inline with the length in the last byte, otherwise a head word holding
+// `length * 2 + 1` and the data in consecutive slots from `keccak256(slot)`. A proof of the version comes first,
+// because the version decides where the rest is, and a node that proves bytes under some other version has proved
+// nothing about this one.
+
+import { crypto.keccak256 } from "wac";
+import { Result } from "core";
+import { accountAt, storageAt, AccountProof, StorageProof } from "../../mpt/src/account.wac";
+
+export i32 RECORD_VERSIONS_SLOT() { return 0; }
+export i32 CONTENTHASH_SLOT() { return 3; }
+
+u8[] word(i64 v) {
+  u8[] w = u8[].filled(32, 0);
+  i64 x = v;
+  for (i32 i = 31; i >= 24; i--) { w[i] = (x & (255 as i64)) as~ u8; x = x >> (8 as i64); }
+  return w;
+}
+
+u8[] mapSlot(u8[] key, u8[] slot) {
+  u8[] j = u8[].filled(64, 0);
+  j.copyFrom(key, 0, 0, 32);
+  j.copyFrom(slot, 0, 32, 32);
+  return keccak256(j);
+}
+
+/** `recordVersions[node]`. */
+export u8[] versionSlot(u8[] node) { return mapSlot(node, word(RECORD_VERSIONS_SLOT() as i64)); }
+
+/** `versionable_hashes[version][node]`: the head of the `bytes`. */
+export u8[] contenthashSlot(u8[] node, i64 version) {
+  return mapSlot(node, mapSlot(word(version), word(CONTENTHASH_SLOT() as i64)));
+}
+
+/** The `i`th data slot of a long `bytes` whose head is at `head`. */
+export u8[] dataSlot(u8[] head, i32 i) {
+  u8[] base = keccak256(head);
+  u8[] out = u8[].filled(32, 0);
+  out.copyFrom(base, 0, 0, 32);
+  i32 carry = i;
+  for (i32 k = 31; k >= 0 && carry != 0; k--) {
+    i32 s = (out[k] as i32) + (carry & 255);
+    out[k] = (s & 255) as@ u8;
+    carry = (carry >> 8) + (s >> 8);
+  }
+  return out;
+}
+
+/** How many data slots a `bytes` of `length` occupies outside its head: none when it fits inline. */
+export i32 dataSlots(i32 length) { return length <= 31 ? 0 : (length + 31) / 32; }
+
+u8[] padded(u8[] v) {
+  u8[] w = u8[].filled(32, 0);
+  w.copyFrom(v, 0, 32 - v.len(), v.len());
+  return w;
+}
+
+i64 asI64(u8[] v) {
+  i64 x = 0 as i64;
+  for (i32 i = 0; i < v.len(); i++) { x = (x << (8 as i64)) | (v[i] as i64); }
+  return x;
+}
+
+/** One proven storage value, as a 32-byte word: zero when the slot is absent. */
+Result<u8[], string> proven(u8[] storageRoot, u8[] slot, u8[][] nodes) {
+  StorageProof p = storageAt(storageRoot, slot, nodes);
+  if (!p.ok) { return Result.Err(p.error); }
+  if (p.value.len() > 32) { return Result.Err("a storage value longer than a word"); }
+  return Result.Ok(padded(p.value));
+}
+
+/**
+ * The contenthash bytes of `node`, proven against `stateRoot`. `nodes` are the storage proofs in the order
+ * `slotsFor` lists the slots: the version, the head, then each data slot. Empty bytes mean no contenthash.
+ */
+export Result<u8[], string> contenthashOf(u8[] stateRoot, u8[] resolver, u8[] node, i64 version, u8[][] accountNodes,
+                                          u8[][][] nodes) {
+  AccountProof a = accountAt(stateRoot, resolver, accountNodes);
+  if (!a.ok) { return Result.Err("the resolver's account: \{a.error}"); }
+  if (!a.present) { return Result.Err("there is no resolver account at that address"); }
+  if (nodes.len() < 2) { return Result.Err("the version and the head must both be proven"); }
+  u8[] root = a.account.storageRoot;
+  u8[] v = try proven(root, versionSlot(node), nodes[0]);
+  if (asI64(v) != version) {
+    return Result.Err("the name's record version is \{asI64(v)}, and the proofs are for version \{version}");
+  }
+  u8[] headSlot = contenthashSlot(node, version);
+  u8[] head = try proven(root, headSlot, nodes[1]);
+  if ((head[31] & (1 as u8)) == 0) {
+    i32 n = (head[31] as i32) / 2;                         // short: inline, length * 2 in the last byte
+    u8[] out = u8[].filled(n, 0);
+    out.copyFrom(head, 0, 0, n);
+    return Result.Ok(out);
+  }
+  i64 n64 = (asI64(head) - (1 as i64)) / (2 as i64);
+  if (n64 > (4096 as i64)) { return Result.Err("a contenthash of \{n64} bytes"); }
+  i32 n = n64 as~ i32;
+  i32 k = dataSlots(n);
+  if (nodes.len() != 2 + k) { return Result.Err("\{n} bytes need \{k} data slots proven, and \{nodes.len() - 2} were"); }
+  u8[] out = u8[].filled(n, 0);
+  for (i32 i = 0; i < k; i++) {
+    u8[] w = try proven(root, dataSlot(headSlot, i), nodes[2 + i]);
+    i32 take = n - i * 32 < 32 ? n - i * 32 : 32;
+    out.copyFrom(w, 0, i * 32, take);
+  }
+  return Result.Ok(out);
+}
+
+/** The slots to ask `eth_getProof` for: the version, the head, and the data slots for a `bytes` of `length`. */
+export u8[][] slotsFor(u8[] node, i64 version, i32 length) {
+  i32 k = dataSlots(length);
+  u8[][] out = u8[][].filled(2 + k, u8[]());
+  out[0] = versionSlot(node);
+  out[1] = contenthashSlot(node, version);
+  for (i32 i = 0; i < k; i++) { out[2 + i] = dataSlot(out[1], i); }
+  return out;
+}

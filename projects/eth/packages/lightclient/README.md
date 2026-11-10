@@ -175,6 +175,10 @@ follow the chain across the fork.
   is a test, with the same proofs refused against a later block's root and a block that is not the proven one refused
   before any proof is read. This closes the first experiment's finding 2 ("proved" meant "proved relative to a header
   someone gave you"): the only thing taken on trust now is the checkpoint root.
+- **And on to content.** The name's resolver, proved by the registry, is asked for its EIP-1577 contenthash (`ens`'s
+  `contenthash.wac`: the record version, then `bytes` under that version, each by proof). Live: `vitalik.eth` →
+  `ipfs://bafybeia5eyombgegdwmvfzwisveadaaok2vdjkv5rklfdmcljysjrjc4km`. That is a CID, the name reckon gives an object,
+  reached from a mainnet ENS name with nothing trusted but a beacon checkpoint. Recorded as a test (`contenthash.json`).
 - **What mainnet found that the vectors could not:** the optimistic update had 511 of 512 signers, and the store
   bounded its signer loop by the participant count instead of the committee size, so it dropped the last member
   and every partially signed update failed. That bug was mine, from today's refactor. Ethereum's vectors always

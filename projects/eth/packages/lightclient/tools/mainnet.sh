@@ -63,4 +63,22 @@ rpc() { curl -sSf -m 60 -X POST -H 'content-type: application/json' --data "$1" 
 rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"$(printf '0x%x' "$number")\",false]}" block.json
 rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getProof\",\"params\":[\"0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e\",[\"$owner\",\"$resolver\"],\"$(printf '0x%x' "$number")\"]}" proof.json
 echo "execution node: block $number and the ENS proofs for $name fetched"
-lc --block "$work/block.json" --proof "$work/proof.json" --ens "$name" | grep -E '^(block|ens|  )' 
+lc --block "$work/block.json" --proof "$work/proof.json" --ens "$name" | tee "$work/ens.out" | grep -E '^(block|ens|  )'
+
+# The name's contenthash, from the resolver the registry proof named. The version and the length are read first with
+# eth_getStorageAt only to know which slots to ask a proof of; lc believes neither until the proof says the same.
+resolver_addr=$(sed -n 's/^ens .* resolver \(0x[0-9a-f]*\)$/\1/p' "$work/ens.out")
+[ -n "$resolver_addr" ] || exit 0
+at=$(printf '0x%x' "$number")
+storage() {
+  rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getStorageAt\",\"params\":[\"$resolver_addr\",\"$1\",\"$at\"]}" s.json
+  python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["result"], 16))' "$work/s.json"
+}
+heads=$(wac "$work/lc.wasm" contenthash-slots "$name" 0 0 | tr '\n' ' ')
+version=$(storage "$(echo $heads | cut -d' ' -f1)")
+head=$(storage "$(wac "$work/lc.wasm" contenthash-slots "$name" "$version" 0 | sed -n 2p)")
+length=$(( head % 2 == 1 ? (head - 1) / 2 : (head % 256) / 2 ))
+list=$(wac "$work/lc.wasm" contenthash-slots "$name" "$version" "$length" | sed 's/.*/"&"/' | paste -sd, -)
+rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getProof\",\"params\":[\"$resolver_addr\",[$list],\"$at\"]}" contenthash.json
+lc --block "$work/block.json" --proof "$work/proof.json" --ens "$name" --contenthash "$work/contenthash.json" \
+  --version "$version" | grep -E '^(content|  )' 

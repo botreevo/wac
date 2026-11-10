@@ -2627,6 +2627,10 @@ fn serve(
         }
         OP_EXEC => {
             // A host program, run to completion. `issues/system/0165`.
+            // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0460d`).
+            if caller.data().grants.sealed {
+                return Ok(fault(FAULT_UNSUPPORTED, "this program was started sealed: it may not run a host program, which has a clock and random bytes of its own"));
+            }
             // `bytes` is the program, its arguments, its input and the `NAME=value` pairs. Decoded lossily —
             // a path or an argument that is not UTF-8 is a case the wac side cannot express anyway.
             let lossy = |v: Vec<Vec<u8>>| -> Vec<String> {

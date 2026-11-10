@@ -1,6 +1,6 @@
 # 0419a — an `await` on the right of `&&` can yield the wrong value when its ticket answers late
 
-- **Status:** open
+- **Status:** closed 2026-11-10 (cloud) — not a compiler bug: the two spellings are different programs
 - **Reported by:** agent-a
 - **Date:** 2026-10-28
 - **Kind:** bug
@@ -37,3 +37,7 @@ it failed two gates in a row on this. Three other sites have an `await` on the r
 not been seen to fail: `packages/wac/src/wac.wac` (`severalOrDir`), `packages/box/src/applets/split.wac`,
 `packages/sh/src/exec.wac` (`/proc/self`). The loop, the conditional `parts`, and a resumption that is
 not the first are what the reductions so far leave out.
+
+## Fix
+
+`&&` short-circuits its right side, `await` included (spec ch12; the lowering is `t = reading; if (t) { a = await …; t = a == 0; }`). Once `reading` is false, `reading && (await Ticket.first(parts)) == 0` does not wait at all, so the loop reads `errT` whether or not it has settled; `i32 won = await …` waits every time round. Load decides only whether stdout ends while stderr's read is still in flight. Deterministic without load: the loop above with stdout ending after three chunks and stderr after 400 picked an unsettled ticket 398 times on v8. `drain` keeps the `won` form, which is the right program, and its comment now says why.

@@ -561,7 +561,8 @@ NaN; only a division's result out of range (`INT_MIN / -1`) is `IntegerOverflow`
 two, so a trap is never a status a program could have returned.
 
 `[§wac-std-sealed-child-w4kq9ve]` A child launched `sealed` has no clock and no random bytes: `nowMillis`,
-`monotonicNanos`, `sleepMillis` and `Random.bytes` answer `Unsupported`, on every host. Every program has these without
+`monotonicNanos`, `sleepMillis` and `Random.bytes` answer `Unsupported`, on every host — and so does `exec`, since a
+host program has both of its own. Every program has these without
 asking, so sealing is joined rather than narrowed — a child is sealed when its parent is or when it is asked, and nothing a
 sealed program spawns has them back. It is what makes a child's run a function of what it was handed.
 

@@ -893,6 +893,48 @@ string typeParamDefaultE(Env env, u8[] src, Lexed lexed, i32 tok) {
   return typeOfTyName(env, src, lexed, parseType(p));
 }
 
+/**
+ * The letters a lambda argument's answer binds, for a call whose other arguments and slot left some open:
+ * an expression-bodied lambda with every parameter written is typed by its body, with those parameters in
+ * scope, and its `fn[R(P…)]` matched against the parameter. Only open letters are filled, and a body that
+ * is a bare number binds nothing — the slot says what a number is (spec ch09).
+ */
+void lambdaArgBinds(Env env, u8[] src, Lexed lexed, u8[] cs, Lexed cl, Param[] params, Expr[] args,
+                    i32[] typeParams, string[] bound) {
+  for (i32 i = 0; i < args.len(); i++) {
+    match (args[i].kind) {
+      Lambda(lps, lbody, lamAsync): {
+        if (lamAsync || lbody.len() != 1) { continue; }
+        Expr? rv = null;
+        match (lbody[0].kind) {
+          Return(value): { rv = value; }
+          ExprStmt(x): { rv = x; }
+          default: { }
+        }
+        if (rv is null || isNumericLiteralE(rv!)) { continue; }
+        i32 saved = env.localCount;
+        string sig = "";
+        bool typed = true;
+        for (i32 k = 0; k < lps.len(); k++) {
+          string pt = typeOfTyName(env, src, lexed, lps[k].type);
+          if (pt == "") { typed = false; }
+          if (k > 0) { sig = sig + ","; }
+          sig = sig + pt;
+          env.addLocal(tokenTextOf(src, lexed, lps[k].nameTok), pt);
+        }
+        string ret = typed ? typeOfE(src, lexed, env, rv!) : "";
+        env.localCount = saved;
+        if (ret == "" || ret == "null") { continue; }
+        string[] got = string[].defaulted(typeParams.len());
+        for (i32 j = 0; j < got.len(); j++) { got[j] = bound[j]; }
+        if (!matchTypeParams(env, cs, cl, params[i].type, "fn[" + ret + "(" + sig + ")]", typeParams, got)) { continue; }
+        for (i32 j = 0; j < bound.len(); j++) { if (bound[j] == "") { bound[j] = got[j]; } }
+      }
+      default: { }
+    }
+  }
+}
+
 string genericCallInstance(Env env, u8[] src, Lexed lexed, i32 tok, Expr[] args) {
   if (env.prog is null) { return ""; }
   string raw = tokenTextOf(src, lexed, tok);
@@ -958,6 +1000,18 @@ string genericCallInstance(Env env, u8[] src, Lexed lexed, i32 tok, Expr[] args)
             slot = srest.slice(0, srest.indexOf(";"));
           }
           if (slot != "" && !matchTypeParams(env, cs, cl, returnType, slot, typeParams, bound)) { return ""; }
+          // **Then what a lambda argument answers** (`issues/lang/0404a`): `make(true, (bool b) => named(b))`
+          // binds `U` from `named(b)`'s type when no slot did — in a ternary's branch, or in a lambda's body,
+          // the call initialises nothing. Asked only while discovering, where a parameter added to type the
+          // body touches no emitted frame; the answer is recorded below, and every later visit reads it.
+          bool still = false;
+          for (i32 i = 0; i < bound.len(); i++) { if (bound[i] == "") { still = true; } }
+          if (still && env.discovering) {
+            lambdaArgBinds(env, src, lexed, cs, cl, params, args, typeParams, bound);
+          } else if (still && env.wantInsts.indexOf(wkey) >= 0) {
+            string lrest = env.wantInsts.slice(env.wantInsts.indexOf(wkey) + wkey.len(), env.wantInsts.len());
+            return lrest.slice(0, lrest.indexOf(";"));
+          }
           // Then a number's own type, for a letter nothing else bound — `id(4)` is `id<i32>`. Not
           // recorded: the same arguments answer the same way every time this call is asked about.
           string[] fromNum = string[].defaulted(typeParams.len());

@@ -1,7 +1,6 @@
 # 0404a — a generic call in a lambda's ternary, or in a lambda held by a local, is not instantiated
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `packages/wacc/src/emit.wac`'s `lambdaArgBinds`; `spec/cases/0908-a-lambda-argument-binds-a-generics-letter.wac`
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
 - **Kind:** bug
@@ -44,3 +43,7 @@ A function reference in place of the inner lambda (`make(true, named)`) runs in 
 Found writing `std/platform.wac`'s file `Output`, whose `write` was
 `shut[0] ? writeAfterClose(p) : hostTicket(cli.send(h, b), wait, (bool went) => fileWrittenOf(went, p))`: bootstrap
 declined `packages/wac/src/wac.wac` naming `hostTicket`. std now spells it with a named function and an `if`.
+
+## Fix
+
+A lambda argument had no type of its own, so `genericCallInstance` bound `U` only from the slot the call initialised — and a call in a ternary's branch or a lambda's body initialises none. `lambdaArgBinds` types an expression-bodied lambda argument by its body, with its written parameters in scope, and matches its `fn[R(P…)]` against the parameter, filling only letters still open; a bare number binds nothing. It runs while discovering instances, and the answer is recorded under the call's token for every later visit.

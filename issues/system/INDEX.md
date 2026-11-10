@@ -141,7 +141,7 @@ own roadmap lives in its README. This tracker is for what crosses those lines.
 
 ## Closed
 
-359 issues, 281 closed.
+360 issues, 282 closed.
 
 The count is checked against the directory by `tools/wac/issuecounts_test.wac`, which reads both
 trackers. It was `compiler/wacSpec.test.ts` until that file went with the TypeScript compiler on

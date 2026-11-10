@@ -67,6 +67,8 @@ pub enum Outcome {
     Exec(i32, Vec<u8>, Vec<u8>, String),
     /// `Change{fault, message}` — what happened to something that changes state.
     Change(i32, String),
+    /// How a child ended (`Child.ended()`): how, the code or trap kind, and what was said.
+    Ended(i32, i32, Vec<u8>),
     /// `FileResult{ok, bytes, error, fault}`.
     FileResult(bool, Vec<u8>, String, i32),
     /// `Stat{exists, isFile, isDir, size, modifiedMillis, isSymlink, isExecutable, fault}`.

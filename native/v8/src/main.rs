@@ -157,6 +157,7 @@ enum Cap {
     Spawn,
     SpawnOther,
     ExitCode,
+    ChildEnded,
     CloseFeed,
     Connect,
     Listen,
@@ -221,6 +222,7 @@ fn cap_of_op(op: i32) -> Cap {
         26 => Cap::CloseSocket,
         27 => Cap::SpawnOther,
         28 => Cap::ExitCode,
+        74 => Cap::ChildEnded,
         29 => Cap::CloseFeed,
         30 => Cap::SleepMillis,
         41 => Cap::Cwd,
@@ -299,6 +301,45 @@ const OP_SPAWN_SELF: i32 = 49;
 const OP_BIND_DATAGRAM: i32 = 53;
 const OP_RECEIVE_FROM: i32 = 54;
 const OP_OPEN_FILE: i32 = 61;
+thread_local! {
+    /// How the program on this thread ended, when it trapped — `(how, kind, text)` for `Child.ended()`; read once.
+    static ENDING: std::cell::RefCell<Option<(i32, i32, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// How a child ended, waited for by every `Child.ended()` that asks.
+#[derive(Default)]
+struct EndCell {
+    v: std::sync::Mutex<Option<(i32, i32, String)>>,
+    cv: std::sync::Condvar,
+}
+
+impl EndCell {
+    fn set(&self, how: i32, m: i32, text: String) {
+        *self.v.lock().unwrap() = Some((how, m, text));
+        self.cv.notify_all();
+    }
+    fn wait(&self) -> (i32, i32, String) {
+        let mut v = self.v.lock().unwrap();
+        while v.is_none() { v = self.cv.wait(v).unwrap(); }
+        v.clone().unwrap()
+    }
+}
+
+/// std's `TrapKind`, in order, for V8's words about an engine trap (`Explicit`, 0, is the program's own).
+fn v8_trap_kind(why: &str) -> i32 {
+    let w = why.to_lowercase();
+    if w.contains("unreachable") { 1 }
+    else if w.contains("memory access out of bounds") || w.contains("data segment") || w.contains("array element access out of bounds") { 2 }
+    else if w.contains("table index is out of bounds") || w.contains("table access out of bounds") { 3 }
+    else if w.contains("divide by zero") || w.contains("remainder by zero") { 4 }
+    else if w.contains("divide result unrepresentable") || w.contains("integer overflow") { 5 }
+    else if w.contains("float unrepresentable") || w.contains("invalid conversion") { 6 }
+    else if w.contains("null") && (w.contains("dereferenc") || w.contains("function")) { 7 }
+    else if w.contains("illegal cast") || w.contains("signature mismatch") || w.contains("function signature") { 8 }
+    else if w.contains("call stack size exceeded") || w.contains("stack overflow") { 9 }
+    else { 10 }
+}
+
 /// `Launch.detached`, in a spawn's `b`: dropping the child's ticket does not stop it.
 const DETACHED: i32 = 4;
 /// `Launch.flags()`'s bits as `spawn` carries them in `b` — `INHERIT_IN`, `INHERIT_OUT`, and
@@ -562,6 +603,9 @@ struct HostState {
     resolves_own_paths: bool,
     /// Which ticket carries each child's exit code, by the handle its parent holds.
     child_exits: HashMap<i32, i32>,
+    /// How each child ended, once it has — asked any number of times (`Child.ended()`, and `exit()` through it), so a
+    /// cell to wait on rather than one ticket, which can be collected once.
+    child_ended: HashMap<i32, Arc<EndCell>>,
     /// Each child's input queue, so `closeFeed` can end it.
     child_feeds: HashMap<i32, Arc<Stream>>,
     /// **The module's own bytes**, kept so a child can compile them in its own isolate. There is no
@@ -1108,6 +1152,7 @@ fn run_as_with(m: &Manifest, wasm: &[u8], manifest_text: &str, as_child: AsChild
             // and a program nobody spawned.
             resolves_own_paths: as_child.fs_req.is_none(),
             child_exits: HashMap::new(),
+            child_ended: HashMap::new(),
             child_feeds: HashMap::new(),
             wasm: wasm.to_vec(),
             manifest_text: manifest_text.to_string(),
@@ -1257,6 +1302,10 @@ fn run_as_with(m: &Manifest, wasm: &[u8], manifest_text: &str, as_child: AsChild
             } else {
                 eprintln!("wac: {} trapped", m.entry);
             }
+            // **How, as a value** (`Child.ended()`): the program's own words make it `Explicit`; the engine's are
+            // classified; neither is a bare `trap;`, which is the program's too.
+            let ending = if !said.is_empty() || why.is_empty() { (0, said.clone()) } else { (v8_trap_kind(&why), why.clone()) };
+            ENDING.with(|e| *e.borrow_mut() = Some((1, ending.0, ending.1)));
             return 1;
         }
     };
@@ -1888,6 +1937,7 @@ fn flat(a: Answer) -> (i32, String, Vec<u8>, i64, i64, i32) {
             }
         }
         Answer::Called(status, text, value) => (FAULT_NONE, text, Vec::new(), value as i64, 0, status),
+        Answer::Ended(how, m, text) => (FAULT_NONE, text, Vec::new(), how as i64, m as i64, 0),
     }
 }
 
@@ -2451,6 +2501,8 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
             }
             let Some(t) = table() else { return no_table() };
             let exit_id = t.submit();
+            let ended_cell = Arc::new(EndCell::default());
+            let ended_set = ended_cell.clone();
             let worker = t.clone();
             let child = AsChild {
                 argv,
@@ -2470,6 +2522,7 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                     Err(_) => {
                         out.finish();
                         err.finish();
+                        ended_set.set(2, 0, "the child could not be started".into());
                         let _ = worker.complete(exit_id, Answer::I32(127));
                         return;
                     }
@@ -2490,11 +2543,14 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 // waiting for the next request, and the child having exited is the only thing that
                 // says there will not be one. 0157.
                 if let Some(req) = fs_req.as_ref() { req.finish(); }
+                let ending = ENDING.with(|e| e.borrow_mut().take()).unwrap_or((0, code, String::new()));
+                ended_set.set(ending.0, ending.1, ending.2);
                 let _ = worker.complete(exit_id, Answer::I32(code));
             });
             HOST.with(|h| {
                 if let Some(s) = h.borrow_mut().as_mut() {
                     s.child_exits.insert(handle, exit_id);
+                    s.child_ended.insert(handle, ended_cell.clone());
                     s.child_feeds.insert(handle, feed);
                 }
             });
@@ -2596,6 +2652,8 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
             }
             let Some(t) = table() else { return no_table() };
             let exit_id = t.submit();
+            let ended_cell = Arc::new(EndCell::default());
+            let ended_set = ended_cell.clone();
             let worker = t.clone();
             let child = AsChild {
                 argv,
@@ -2619,16 +2677,32 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 out.finish();
                 err.finish();
                 if let Some(req) = fs_req.as_ref() { req.finish(); }   // see the arm above — 0157
+                let ending = ENDING.with(|e| e.borrow_mut().take()).unwrap_or((0, code, String::new()));
+                ended_set.set(ending.0, ending.1, ending.2);
                 let _ = worker.complete(exit_id, Answer::I32(code));
             });
             HOST.with(|h| {
                 if let Some(s) = h.borrow_mut().as_mut() {
                     s.child_exits.insert(handle, exit_id);
+                    s.child_ended.insert(handle, ended_cell.clone());
                     s.child_feeds.insert(handle, feed);
                 }
             });
             let a = Answer::Child(handle, err_handle, fs_handle, String::new());
             return Reply::Now(a);
+        }
+        Cap::ChildEnded => {
+            let handle = r.a as i32;
+            let known = HOST.with(|h| h.borrow().as_ref().and_then(|s| s.child_ended.get(&handle).cloned()));
+            let Some(cell) = known else { return Reply::Now(Answer::Change(FAULT_OTHER, "not a child".into())) };
+            let Some(t) = table() else { return no_table() };
+            let id = t.submit();
+            let worker = t.clone();
+            std::thread::spawn(move || {
+                let (how, m, text) = cell.wait();
+                let _ = worker.complete(id, Answer::Ended(how, m, text));
+            });
+            return Reply::Later(id);
         }
         Cap::ExitCode => {
             // **The child's ticket, not a poll.** A parent may ask before the child has started;

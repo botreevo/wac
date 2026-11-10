@@ -73,6 +73,9 @@ pub enum Answer {
     /// `(status, text, value)` — a loaded module's export called: 0 returned, 1 trapped with `text`
     /// what it said, 2 no such export, 3 not callable.
     Called(i32, String, i32),
+    /// `(how, m, text)` — how a child ended (`Child.ended()`): 0 exited with code `m`, 1 trapped with kind `m` (std's
+    /// `TrapKind`, in order) saying `text`, 2 stopped by a limit the host imposed.
+    Ended(i32, i32, String),
 }
 
 /// What a `recv` produced, in the three shapes `enum Read` has.

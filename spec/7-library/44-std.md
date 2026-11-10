@@ -535,13 +535,24 @@ struct Child {
   Input output(this);          // what it writes, unless inherited
   Input errors(this);          // what it writes to its diagnostic output, unless inherited
   Output input(this);          // what it reads, unless inherited; closing it ends its input and it goes on running
-  async Result<i32, HostFault> exit(this);
+  async Result<i32, HostFault> exit(this);      // the code; Err when it trapped or was stopped
+  async Result<Ended, HostFault> ended(this);   // how it ended
   void stop(this);
 }
+
+enum Ended { Exited(i32 code), Trapped(TrapKind kind, string message), HostLimit(string why) }
+enum TrapKind { Explicit, Unreachable, MemoryBounds, TableBounds, DivideByZero, IntegerOverflow, BadConversion,
+                NullReference, BadCast, StackExhausted, Other }
 ```
 
 `[§wac-std-spawn-grants-ykmq5tw]` A spawned child holds exactly the handles in its `Authority`, so it never holds more than
 its parent. Spawning needs the program's own `procs` authority — another instance of itself included.
+
+`[§wac-std-child-ended-q2v8mtf]` `ended()` says how a child ended, the same on every host: `Exited` with the code its
+`main` returned, `Trapped` with what stopped it — `Explicit` and the message for its own `trap "…"`, otherwise the
+engine's reason, classified, and `Other` for one none of the kinds names — or `HostLimit` when the host stopped it,
+by its parent's `stop` or for want of memory. `exit()` answers the code for an exit and `Err` saying why for the other
+two, so a trap is never a status a program could have returned.
 
 `[§wac-std-sealed-child-w4kq9ve]` A child launched `sealed` has no clock and no random bytes: `nowMillis`,
 `monotonicNanos`, `sleepMillis` and `Random.bytes` answer `Unsupported`, on every host. Every program has these without

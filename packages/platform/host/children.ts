@@ -175,6 +175,8 @@ export type Child = {
   fsRep: ByteQueue;
   /** Resolves with the exit code, or a negative number if it failed to run. */
   exit: Promise<number>;
+  /** How it ended (`Child.ended()`), settled with `exit`. */
+  ended: Promise<Ended>;
   /**
    * Whether the source loaded: the empty string when it did, the host's message when it did not.
    *
@@ -490,6 +492,7 @@ export function spawnChild(
       fsReq,
       fsRep,
       exit: Promise.resolve(-1),
+      ended: Promise.resolve({ how: 2, m: 0, text: "the child could not be started" }),
       loaded: Promise.resolve(
         why,
       ),
@@ -549,6 +552,8 @@ export function spawnChild(
   // (`test/childlife_model.test.ts`), which reported it at depth one: `kill` on a newborn child left
   // both `loaded` and `exit` unsettled.
   let settleExit: (code: number) => void;
+  let settleEnded: (e: Ended) => void = () => {};
+  const ended = new Promise<Ended>((r) => { settleEnded = r; });
   const exit = new Promise<number>((resolve) => {
     settleExit = resolve;
     worker.onMessage((data) => {
@@ -571,6 +576,7 @@ export function spawnChild(
         err.endWith(new TextEncoder().encode("wac: " + r.error.split("\n")[0] + "\n"));
       }
       shutdown();
+      settleEnded(r.ok ? { how: 0, m: r.code, text: "" } : trapEnding(r.error));
       resolve(r.ok ? r.code : -1);
     });
     worker.onError((message) => {
@@ -590,6 +596,7 @@ export function spawnChild(
         err.endWith(new TextEncoder().encode("wac: " + message.split("\n")[0] + "\n"));
       }
       shutdown();
+      settleEnded({ how: 2, m: 0, text: message });
       resolve(-1);
     });
   });
@@ -607,11 +614,39 @@ export function spawnChild(
   const kill = (): void => {
     done(started ? "" : "the child was killed before it reported ready");
     shutdown();
+    settleEnded({ how: 2, m: 0, text: "stopped by its parent" });
     settleExit(-1);
   };
 
   worker.post({ sab: bridge.sab, child: true });
-  return { out, err, in: input, fsReq, fsRep, exit, loaded, kill };
+  return { out, err, in: input, fsReq, fsRep, exit, ended, loaded, kill };
+}
+
+/** How a child ended: `how` 0 exited with code `m`, 1 trapped with kind `m` (std's `TrapKind`) saying `text`, 2 a host limit. */
+export type Ended = { how: number; m: number; text: string };
+
+/**
+ * A trap as `Child.ended()` says it: `trapped: …` or `wac trap: …` is the program's own `trap "…"`, and anything else is
+ * the engine's words, classified as the native V8 host classifies them.
+ */
+export function trapEnding(error: string): Ended {
+  const line = error.split("\n")[0];
+  if (line.startsWith("trapped: ")) return { how: 1, m: 0, text: line.slice("trapped: ".length) };
+  // The JavaScript hosts' own words for it, which a child's `main` throws.
+  const own = line.indexOf("wac trap: ");
+  if (own >= 0) return { how: 1, m: 0, text: line.slice(own + "wac trap: ".length) };
+  const w = line.toLowerCase();
+  const kind = w.includes("unreachable") ? 1
+    : w.includes("memory access out of bounds") || w.includes("array element access out of bounds") ? 2
+    : w.includes("table index is out of bounds") || w.includes("table access out of bounds") ? 3
+    : w.includes("divide by zero") || w.includes("remainder by zero") ? 4
+    : w.includes("divide result unrepresentable") || w.includes("integer overflow") ? 5
+    : w.includes("float unrepresentable") || w.includes("invalid conversion") ? 6
+    : w.includes("null") && (w.includes("dereferenc") || w.includes("function")) ? 7
+    : w.includes("illegal cast") || w.includes("signature mismatch") ? 8
+    : w.includes("call stack size exceeded") || w.includes("stack overflow") ? 9
+    : 10;
+  return { how: 1, m: kind, text: kind === 1 ? "" : line };
 }
 
 /**

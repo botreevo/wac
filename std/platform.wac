@@ -3846,11 +3846,19 @@ export struct Child {
   }
 
   /** Its status when it ends — and, when this program serves it files, once the serving has ended too. */
-  Ticket<Result<i32, HostFault>> exit(this) {
-    Ticket<Result<i32, HostFault>> code = hostAsk(this.host, OP_EXIT_CODE(), this.handle as i64, 0 as i64, "", u8[](),
-                                                  exitedOf);
-    if (this.serving is null) { return code; }
-    return exitAfterServing(code, this.serving!);
+  /**
+   * Its exit code, once it has ended — and `Err` saying so when it did not end by exiting: a trap, with what it said, or a
+   * limit the host imposed. A trap used to be `Ok(1)` on one host and an unexplained `Err` on another, which a program
+   * returning 1 could imitate (spec ch44 `§wac-std-child-ended-q2v8mtf`).
+   */
+  Ticket<Result<i32, HostFault>> exit(this) { return exitOf(this.ended()); }
+
+  /** How it ended: `Exited` with its code, `Trapped` with the kind and what was said, or stopped by a `HostLimit`. */
+  Ticket<Result<Ended, HostFault>> ended(this) {
+    Ticket<Result<Ended, HostFault>> how = hostAsk(this.host, OP_CHILD_ENDED(), this.handle as i64, 0 as i64, "", u8[](),
+                                                   endedOf);
+    if (this.serving is null) { return how; }
+    return endedAfterServing(how, this.serving!);
   }
 
   /**
@@ -3868,16 +3876,70 @@ export struct Child {
   }
 }
 
-async Result<i32, HostFault> exitAfterServing(Ticket<Result<i32, HostFault>> code, Ticket<void> serving) {
-  Result<i32, HostFault> status = await code;
+async Result<Ended, HostFault> endedAfterServing(Ticket<Result<Ended, HostFault>> how, Ticket<void> serving) {
+  Result<Ended, HostFault> e = await how;
   await serving;
-  return status;
+  return e;
 }
 
-Result<i32, HostFault> exitedOf(Answer a) {
+/** `exit()` from `ended()`: the code, or why there is none. */
+async Result<i32, HostFault> exitOf(Ticket<Result<Ended, HostFault>> how) {
+  match (await how) {
+    Err(e): { return Result.Err(e); }
+    Ok(e): {
+      match (e) {
+        Exited(code): { return Result.Ok(code); }
+        Trapped(kind, said): { return Result.Err(Other(said == "" ? "the child trapped" : "the child trapped: \{said}")); }
+        HostLimit(why): { return Result.Err(Other("the child was stopped: \{why}")); }
+      }
+    }
+  }
+}
+
+Result<Ended, HostFault> endedOf(Answer a) {
   if (a.fault != FAULT_NONE()) { return Result.Err(hostFaultOf(a.fault, a.text)); }
-  if (a.n < 0 as i64) { return Result.Err(Other("the child did not run to an end")); }
-  return Result.Ok(a.n as~ i32);
+  if (a.n == 0 as i64) { return Result.Ok(Ended.Exited(a.m as~ i32)); }
+  if (a.n == 1 as i64) { return Result.Ok(Ended.Trapped(trapKindOf(a.m as~ i32), a.text)); }
+  return Result.Ok(Ended.HostLimit(a.text));
+}
+
+TrapKind trapKindOf(i32 k) {
+  if (k == 0) { return TrapKind.Explicit; }
+  if (k == 1) { return TrapKind.Unreachable; }
+  if (k == 2) { return TrapKind.MemoryBounds; }
+  if (k == 3) { return TrapKind.TableBounds; }
+  if (k == 4) { return TrapKind.DivideByZero; }
+  if (k == 5) { return TrapKind.IntegerOverflow; }
+  if (k == 6) { return TrapKind.BadConversion; }
+  if (k == 7) { return TrapKind.NullReference; }
+  if (k == 8) { return TrapKind.BadCast; }
+  if (k == 9) { return TrapKind.StackExhausted; }
+  return TrapKind.Other;
+}
+
+/**
+ * What stopped a program that trapped (spec ch44 `§wac-std-child-ended-q2v8mtf`): its own `trap "…"`, or the engine's
+ * reason — classified from what each engine says, so `Other` is a kind an engine named that none of these is.
+ */
+export enum TrapKind {
+  Explicit,
+  Unreachable,
+  MemoryBounds,
+  TableBounds,
+  DivideByZero,
+  IntegerOverflow,
+  BadConversion,
+  NullReference,
+  BadCast,
+  StackExhausted,
+  Other
+}
+
+/** How a child ended: it exited with a code, it trapped, or the host stopped it — out of memory, or its parent's stop. */
+export enum Ended {
+  Exited(i32 code),
+  Trapped(TrapKind kind, string message),
+  HostLimit(string why)
 }
 
 async Result<u8[], HostFault> streamAll(Host host, i32 h) {
@@ -4417,6 +4479,8 @@ export i32 OP_FILE_SIZE() { return 71; }
 export i32 OP_TRUNCATE_FILE() { return 72; }
 /** `a` handle: what was written is on the disk before this answers. */
 export i32 OP_SYNC_FILE() { return 73; }
+/** `Child.ended()`: how a child ended — `n` how (0 exited, 1 trapped, 2 a host limit), `m` the code or `TrapKind`, `text` said. */
+export i32 OP_CHILD_ENDED() { return 74; }
 /** `a` 1 for standard error: that stream ends while the program runs on. */
 export i32 OP_CLOSE_OUTPUT() { return 63; }
 /** `bytes` a module, `a` grants → `n` its handle. Answered at once. */

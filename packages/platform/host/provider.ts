@@ -154,7 +154,7 @@ function payloadOf(op: number, a: number, b: number, text: string, bytes: Uint8A
       return EMPTY;
     case OP.RANDOM_BYTES: case OP.ARG: case OP.SLEEP_MILLIS: case OP.ACCEPT: case OP.RECV:
     case OP.CLOSE_SOCKET: case OP.CLOSE_SEND: case OP.CLOSE_FILE: case OP.CLOSE_OUTPUT:
-    case OP.RECEIVE_FROM: case OP.CLOSE_FEED: case OP.EXIT_CODE:
+    case OP.RECEIVE_FROM: case OP.CLOSE_FEED: case OP.EXIT_CODE: case OP.CHILD_ENDED:
       return i32le(a);
     case OP.ENV: case OP.READ_FILE: case OP.STAT: case OP.LINK_STAT: case OP.READ_DIR:
       return str(text);
@@ -235,6 +235,9 @@ function answerOf(op: number, out: Uint8Array): Flat {
       return flat({ n: readI64le(out) });
     case OP.ARG_COUNT: case OP.EXIT_CODE:
       return flat({ n: BigInt(readI32le(out)) });
+    // How, the code or kind, then what was said.
+    case OP.CHILD_ENDED:
+      return flat({ n: BigInt(readI32le(out)), m: BigInt(readI32le(out, 4)), text: unstr(out.subarray(8)) });
     case OP.RANDOM_BYTES: case OP.ARG: case OP.READ_STDIN: case OP.READ_FILE:
       return flat({ bytes: out, flags: 1 });
     case OP.ENV:

@@ -34,6 +34,8 @@ export const OP = {
   CLOSE_SOCKET: 26,
   SPAWN: 27,
   EXIT_CODE: 28,
+  /** How a child ended — `Child.ended()`: how (0 exited, 1 trapped, 2 a host limit), the code or trap kind, and what was said. */
+  CHILD_ENDED: 74,
   CLOSE_FEED: 29,
   SLEEP_MILLIS: 30,
   // 31–40 were std's `Page` — render, text, values, events, title, pixels, files, downloads — and

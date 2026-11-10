@@ -162,7 +162,10 @@ document.addEventListener('submit', (e) => e.preventDefault(), true);
 const WORKERS = ${JSON.stringify(workers)};
 const RealWorker = window.Worker;
 window.Worker = function (url, options) {
-  const path = inTree(url instanceof URL ? url.href : url);
+  const href = url instanceof URL ? url.href : String(url);
+  // A worker made from the page's own bytes (blob:, data:) holds nothing the page did not: allowed.
+  if (/^(blob|data):/.test(href)) return new RealWorker(url, options);
+  const path = inTree(href);
   if (path !== null && WORKERS[path]) return new RealWorker(WORKERS[path], options);
   throw new TypeError('reckon: a worker can only be a module of the admitted tree' + (path === null ? '' : ': ' + path));
 };

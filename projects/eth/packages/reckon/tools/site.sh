@@ -4,10 +4,11 @@
 # site, at https://pages.voltrevo.com/wac-eth/.
 #
 #     sh packages/reckon/tools/site.sh                 build dist/site from what is recorded
-#     WASMTIME_WAC=… sh packages/reckon/tools/site.sh --record WORKDIR
-#                                                      run the six demos again into site/demos first (about 30
-#                                                      minutes; ladder.sh takes LADDER or builds the ladder with
-#                                                      cargo; a demo that fails stops it), then build
+#     WASMTIME_WAC=… sh packages/reckon/tools/site.sh --record WORKDIR [DEMO…]
+#                                                      run the demos (all eight, or those named) again into
+#                                                      site/demos first (about 30 minutes for all; ladder.sh and
+#                                                      flatten.sh take LADDER or build the ladder with cargo; a demo
+#                                                      that fails stops it), then build
 #     sh packages/reckon/tools/site.sh --publish       build, then commit dist/site as the `pages` branch's next
 #                                                      commit and push it (needs a clean checkout: it names the commit)
 #
@@ -22,7 +23,9 @@ if [ "${1:-}" = --record ]; then
   : "${WASMTIME_WAC:?set WASMTIME_WAC to the wac of the native host}"
   mkdir -p "$work"
   cd "$root"
-  for d in demo admit-by-name claims-mirror selfbuild capstone ladder; do
+  shift 2
+  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten}
+  for d in $demos; do
     echo "recording $d"
     case $d in
       selfbuild) env SELF=1 sh "$here/tools/$d.sh" "$work/$d" ;;
@@ -30,13 +33,13 @@ if [ "${1:-}" = --record ]; then
       *) sh "$here/tools/$d.sh" "$work/$d" ;;
     esac > "$work/$d.txt" 2>&1 || { echo "site: $d failed; see $work/$d.txt"; exit 1; }
     # Paths of this machine's work directory are not part of what was shown.
-    sed "s|$work/$d|WORKDIR|g; s|$root|wac-eth|g" "$work/$d.txt" > "$here/site/demos/$d.txt"
+    sed "s|$work/$d|WORKDIR|g; s|$root|wac-eth|g; s|$HOME|~|g" "$work/$d.txt" > "$here/site/demos/$d.txt"
+    echo "$(date -u +%Y-%m-%d) $(git -C "$root" rev-parse --short HEAD)" > "$here/site/demos/$d.recorded"
   done
-  echo "$(date -u +%Y-%m-%d) $(git -C "$root" rev-parse --short HEAD)" > "$here/site/demos/RECORDED"
 fi
 
 rm -rf "$out"
-python3 "$here/tools/site.py" "$out"
+python3 "$here/tools/site.py" "$out" "$(git -C "$root" rev-parse --short HEAD)"
 
 if [ "${1:-}" = --publish ]; then
   [ -z "$(git -C "$root" status --porcelain)" ] || { echo "site: commit first: the pages commit names the source commit"; exit 1; }

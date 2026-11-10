@@ -29,7 +29,7 @@ src=${WACSRC:-$HOME/.wac/cache/git/https%3A%2F%2Fgit.voltrevo.com%2Fwac.git/$com
 short=$(echo "$commit" | cut -c1-9)
 
 cd "$root"
-wac build --quiet --allow-read --allow-write --allow-run packages/reckon/cmd/l0.wac -o "$work/l0"
+wac build --quiet --allow-read --allow-write --allow-run packages/reckon/cmd/boot.wac -o "$work/boot"
 wac build --quiet --allow-read --allow-write packages/reckon/cmd/claim.wac -o "$work/claim"
 wac build --quiet --allow-read --allow-write packages/ipfs/cmd/obj.wac -o "$work/obj"
 echo "building wax, the Rust assembler, from $short (no dependencies)"
@@ -39,7 +39,7 @@ rm -rf store texts && mkdir texts
 st="--store $work/store"
 claim() { wac claim.wasm "$@" $st 2>/dev/null; }
 RUST="$work/wax-target/release/wax"
-JS="node $here/tools/l0/assemble.mjs $src/bootstrap/js/assemble.js"
+JS="node $here/tools/boot/assemble.mjs $src/bootstrap/js/assemble.js"
 printf '%s\n' 4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 > rust.key
 printf '%s\n' 646f1ce2fdad0e6deeeb5c7e8e5543bdde65e86029e2fd9fc169899c440a7913 > js.key
 printf '%s\n' add2f9f8b6e2bff7d0b6e7d1bbcd8fe16c3fbd8b5b1fbb1c0a63e5a0e7a2c3b1 > reviewer.key
@@ -49,9 +49,9 @@ JS_NAME="wax.js (node) at wac $short"
 
 # assemble NAME FILE: one recipe, run by both runners; both outputs must be one CID. Sets $recipe and $out.
 assemble() {
-  recipe=$(wac l0.wasm recipe --source "$2" $st 2>/dev/null)
-  a=$(wac l0.wasm run "$recipe" $st --work w-rust --assembler "$RUST" --key rust.key --runner "$RUST_NAME" 2>/dev/null | sed -n 1p)
-  b=$(wac l0.wasm run "$recipe" $st --work w-js --assembler "$JS" --key js.key --runner "$JS_NAME" 2>/dev/null | sed -n 1p)
+  recipe=$(wac boot.wasm recipe --source "$2" $st 2>/dev/null)
+  a=$(wac boot.wasm run "$recipe" $st --work w-rust --tool "$RUST" --key rust.key --runner "$RUST_NAME" 2>/dev/null | sed -n 1p)
+  b=$(wac boot.wasm run "$recipe" $st --work w-js --tool "$JS" --key js.key --runner "$JS_NAME" 2>/dev/null | sed -n 1p)
   out=$a
   [ -n "$a" ] && [ "$a" = "$b" ] && [ "$(wac obj.wasm cat "$a" status $st)" = "${3:-ok}" ] \
     && ok "$1: both assemblers give one output, ${3:-ok} ($a)" || bad "$1: rust $a, js $b"
@@ -96,8 +96,8 @@ echo; echo "## what is not an answer"
 printf 'func $f -> i32\n  i32.bogus\nend\n' > texts/bad.l0
 assemble "a text that is not L0" texts/bad.l0 refused
 [ "$(wac obj.wasm ls "$out" $st | grep -c module.wasm || true)" = 0 ] && ok "and a refusal holds no module" || bad "a refusal with a module"
-crashed=$(wac l0.wasm run "$l1recipe" $st --work w-crash --assembler "sh -c 'exit 2' --" --key rust.key --runner crash 2>crash.log | sed -n 1p || true)
-[ -z "$crashed" ] && grep -q "abort: the assembler failed" crash.log && ok "an assembler that fails gives no output and signs nothing" \
+crashed=$(wac boot.wasm run "$l1recipe" $st --work w-crash --tool "sh -c 'exit 2' --" --key rust.key --runner crash 2>crash.log | sed -n 1p || true)
+[ -z "$crashed" ] && grep -q "abort: the tool failed" crash.log && ok "an assembler that fails gives no output and signs nothing" \
   || bad "a failed assembler gave $crashed: $(cat crash.log)"
 
 echo; echo "## admission: the L1 interpreter, through both runners and a reviewed source"
@@ -106,7 +106,7 @@ cat > liar.sh <<'EOF'
 # The Rust assembler, then one byte changed: what a compromised runner would sign.
 "$WAX" "$1" "$2" && python3 -c "import sys; b=bytearray(open(sys.argv[1],'rb').read()); b[-1]^=1; open(sys.argv[1],'wb').write(b)" "$2"
 EOF
-lied=$(WAX="$RUST" wac l0.wasm run "$l1recipe" $st --work w-liar --assembler "WAX=$RUST sh $work/liar.sh" --key liar.key --runner "wax (Rust), altered" 2>/dev/null | sed -n 1p)
+lied=$(WAX="$RUST" wac boot.wasm run "$l1recipe" $st --work w-liar --tool "WAX=$RUST sh $work/liar.sh" --key liar.key --runner "wax (Rust), altered" 2>/dev/null | sed -n 1p)
 [ -n "$lied" ] && [ "$lied" != "$l1out" ] && ok "a lying assembler gets another output ($lied), and signs it" || bad "the liar: $lied"
 n=$(claim origins "$l1out" | grep -c . || true)
 [ "$n" = 2 ] && ok "the index has two derivations of the honest output" || bad "origins: $(claim origins "$l1out")"
@@ -135,7 +135,7 @@ endorsement=$(claim endorse "$source" reviewed --key reviewer.key)
 cat admit.log | sed 's/^/   | /'
 [ "$(admit "$liarl1")" = no ] && grep -q "on 1 runner" admit.log && ok "the liar's module is refused: one runner's word" \
   || bad "the liar's module: $(cat admit.log)"
-d=$(wac l0.wasm run "$l1recipe" $st --work w-js --assembler "$JS" --key js.key --runner "$JS_NAME" 2>/dev/null | sed -n 2p)
+d=$(wac boot.wasm run "$l1recipe" $st --work w-js --tool "$JS" --key js.key --runner "$JS_NAME" 2>/dev/null | sed -n 2p)
 claim revoke "$d" --key js.key >/dev/null
 [ "$(admit "$l1")" = no ] && grep -q "on 1 runner" admit.log && ok "the JavaScript runner revokes its derivation: the Rust one alone is not enough" \
   || bad "after a revocation: $(cat admit.log)"

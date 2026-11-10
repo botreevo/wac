@@ -31,22 +31,22 @@ not a change to this one.
 
 ## The runners
 
-`cmd/l0.wac` is the runner. It runs an assembler as a host command, `CMD IN OUT`: exit 0 with OUT written is a module,
+`cmd/boot.wac` is the runner, for this machine and `wac-flatten/1` (docs/flatten-machine.md). It runs an assembler as a host command, `CMD IN OUT`: exit 0 with OUT written is a module,
 exit 1 a refusal, anything else a failure.
 
 | runner | implementation, at fade22039 | size |
 | --- | --- | --- |
 | `wax (Rust) at wac fade22039` | `bootstrap/rust/src/lib.rs` (`bafkreicqule7…`) and `main.rs` (`bafkreifjfzpv…`), no dependencies, built with cargo | 1,217 + 31 lines |
-| `wax.js (node) at wac fade22039` | `bootstrap/js/assemble.js` (`bafkreihgzalz…`), through `tools/l0/assemble.mjs`, which gives it the same `IN OUT` shape | 1,065 lines |
+| `wax.js (node) at wac fade22039` | `bootstrap/js/assemble.js` (`bafkreihgzalz…`), through `tools/boot/assemble.mjs`, which gives it the same `IN OUT` shape | 1,065 lines |
 
 Wac requires the two to agree, and `bootstrap/ts/differential.test.ts` checks it in wac's own tests. Here each one signs
 a derivation, so a policy can ask for both. It writes that with `runners: 2` and the two keys, and gets a module only
 when two implementations written apart, in different languages and run by different toolchains, produced the same
 bytes.
 
-    l0 recipe --source boot/l1.l0 --store S
-    l0 run RECIPE --assembler "PATH/TO/wax" --key rust.key --runner "wax (Rust) at wac fade22039" --store S
-    l0 run RECIPE --assembler "node tools/l0/assemble.mjs PATH/TO/assemble.js" --key js.key --runner "wax.js (node) at wac fade22039" --store S
+    boot recipe --source boot/l1.l0 --store S
+    boot run RECIPE --tool "PATH/TO/wax" --key rust.key --runner "wax (Rust) at wac fade22039" --store S
+    boot run RECIPE --tool "node tools/boot/assemble.mjs PATH/TO/assemble.js" --key js.key --runner "wax.js (node) at wac fade22039" --store S
 
 ## A policy
 

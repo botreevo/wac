@@ -1,7 +1,8 @@
 # Bootstrap derivations: rooting trust at reviewed sources (decision D)
 
-**Status, 2026-11-10: milestones 1 (`tools/ladder.sh`) and 2 (`wac-l0/1`, docs/l0-machine.md, `tools/l0.sh`) done.
-Milestones 3–5 are a plan, waiting on the choice below. Milestone 2 is needed under either choice.**
+**Status, 2026-11-10: milestones 1 (`tools/ladder.sh`) and 2 (`wac-l0/1`, docs/l0-machine.md, `tools/l0.sh`) done, and
+the flattener from milestone 4 (`wac-flatten/1`, docs/flatten-machine.md, `tools/flatten.sh`). Each is needed under
+either choice. Milestone 3, the rest of 4, and 5 wait on the choice below.**
 
 Today every compiler in reckon's chains is derived from one *seed*: wac's compiler at the pinned commit, built natively
 and named in the policy's `roots`. selfbuild.sh and the capstone show the seed is consistent with its source. A
@@ -104,7 +105,7 @@ the ones wac already argues for. Every step is a function of bytes to bytes, so 
    one. Each rung up to L5 becomes a signed derivation. Checked: the L0 text at each rung agrees with what
    `hosts_agree` records.
 4. **Flatten and wacc.**
-   - `wac-flatten/1`, with the JS and Rust flatteners as runners.
+   - `wac-flatten/1`, with the JS and Rust flatteners as runners. **Done:** docs/flatten-machine.md, 9 of 9.
    - The wacc driving step: it compiles `packages/wac/src/wac.wac` with the ladder's wacc. It becomes a machine
      (`wacc-drive/1`) or, under (B), a wac program in the main machine.
    - Then the fixed-point rounds in `wasm-gc/wac-host/2` as today.

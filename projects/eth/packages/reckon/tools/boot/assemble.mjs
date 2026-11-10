@@ -1,6 +1,6 @@
 // wac's JavaScript L0 assembler (bootstrap/js/assemble.js) in the shape of its Rust one: `wax IN OUT`.
 //
-//     node tools/l0/assemble.mjs ASSEMBLE_JS IN OUT
+//     node tools/boot/assemble.mjs ASSEMBLE_JS IN OUT
 //
 // Exit 0 with OUT written: assembled. Exit 1: the text is not L0 (a WaxError). Anything else is a failure of this
 // command, not an answer. ASSEMBLE_JS is the file at the commit the machine names; nothing else of wac's is loaded.

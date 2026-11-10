@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """reckon's pages site, from site/ and the recorded transcripts in site/demos (see tools/site.sh).
 
-    python3 tools/site.py OUT
+    python3 tools/site.py OUT [COMMIT]
 
-Writes OUT/index.html (the landing page with the demos' counts, the recording's date and commit, and the docs list
-filled in), OUT/style.css, OUT/demos/NAME.html for each site/demos/NAME.txt, and OUT/docs/*.md.txt (the README and
+Writes OUT/index.html (the landing page with the demos' counts, the commit it is built from, and the docs list filled
+in), OUT/style.css, OUT/demos/NAME.html for each site/demos/NAME.txt, and OUT/docs/*.md.txt (the README and
 docs/*.md as plain text, since the site has no markdown renderer).
 """
 import html
@@ -38,6 +38,16 @@ DEMOS = {
                "to wacc, builds the wac command from source with no compiler binary at all. Inside the sealed machine, "
                "on V8 and on wasmtime, that command compiles wac, and so does the seed: the same output tree, one CID. "
                "The ladder step itself is not yet a signed derivation (docs/bootstrap-derivations.md)."),
+    "l0": ("Assembling the bootstrap's root", "sh packages/reckon/tools/l0.sh WORKDIR",
+           "Decision D, milestone 2: wac-L0, the hand-written wasm text the bootstrap ladder starts from, as a machine "
+           "(wac-l0/1) whose rule is wac's written spec and whose two runners are wac's Rust and JavaScript "
+           "assemblers. They agree on every L0 text wac's tests hold and on the ladder's first rung, the L1 "
+           "interpreter, which is admitted only through both runners and a reviewed source."),
+    "flatten": ("Flattening wacc", "LADDER=… sh packages/reckon/tools/flatten.sh WORKDIR",
+                "The step outside every rung: wac-L5 ignores imports, so the bootstrap flattens a module graph into "
+                "one program. As a machine (wac-flatten/1), wac's JavaScript and Rust flatteners are its two runners; "
+                "they agree on wacc's 38 modules, the same 3.7 MB the ladder makes, and flattened wacc is admitted "
+                "only through both."),
     "demo": ("Two runners, one policy", "sh packages/reckon/tools/demo.sh WORKDIR",
              "The smallest whole loop, with no chain: one recipe on two engines, a reviewer's endorsements, a policy "
              "that needs both, and each kind of revocation."),
@@ -61,8 +71,7 @@ def write(p, s):
         f.write(s)
 
 
-recorded = read(os.path.join(site, "demos", "RECORDED")).split()
-date, commit = recorded[0], recorded[1]
+built = sys.argv[2] if len(sys.argv) > 2 else "?"          # the commit the site is built from
 
 
 def counts(text):
@@ -103,9 +112,10 @@ head = """<!doctype html>
 <nav class="top"><a class="mark" href="{up}">reckon</a><a href="{up}#how">how it works</a><a href="{up}#demos">demos</a><a href="{up}#trusted">still trusted</a><a href="{up}#source">source</a></nav>
 """
 
-index = read(os.path.join(site, "index.html")).replace("@DATE@", date).replace("@COMMIT@", commit)
+index = read(os.path.join(site, "index.html")).replace("@COMMIT@", built)
 for name, (title, cmd, intro) in DEMOS.items():
     text = read(os.path.join(site, "demos", name + ".txt"))
+    date, commit = read(os.path.join(site, "demos", name + ".recorded")).split()[:2]
     ok, bad = counts(text)
     if bad:
         sys.exit(f"site: the {name} recording has {bad} failing checks; record it again")

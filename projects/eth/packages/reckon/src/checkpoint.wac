@@ -18,9 +18,14 @@
 // each answer's fork taken from its Eth-Consensus-Version header (for updates of several periods, one per update,
 // comma-separated); all of them must be the same fork.
 //
-// The anchor is the *finalized* execution block, so the optimistic update, which `lc` also reads, is not asked for:
-// it adds nothing to the anchor, and asked for live it can be no newer than the finality update just applied, which
-// the light client refuses (seen against a public node, once in five runs).
+// The anchor is the *finalized* execution block, so the optimistic update, which `lc` also reads, is not asked for: it
+// adds nothing to the anchor.
+//
+// **The clock.** An update is refused when it is signed in a slot later than the current one, and a node's freshest
+// updates are signed in the head slot. So the current slot is read from the clock when each update is checked, not
+// before the fetching began (a slot can pass while it goes on), with the spec's 500 ms of clock disparity allowed.
+// Reading it once at the start refused a live finality or optimistic update now and then (once in five runs against
+// a public node). `now` >= 0 fixes the slot instead, for recorded data.
 //
 // Mainnet only: its fork schedule and genesis validators root are what signatures are checked under.
 
@@ -119,13 +124,21 @@ Result<Anchored, string> finish(Run r) {
   return Result.Ok(Anchored(hash!, state!, headerSlot(r.store.finalizedHeader), log));
 }
 
+/** The slot an update is checked against: `fixed` when it is one (>= 0), else mainnet's clock slot at this moment,
+ *  allowing MAXIMUM_GOSSIP_CLOCK_DISPARITY (500 ms), as the spec's light client does. */
+async i64 slotNow(Sys sys, i64 fixed) {
+  if (fixed >= (0 as i64)) { return fixed; }
+  i64 ms = (await sys.clock().nowMillis()).orElse(0 as i64) + (500 as i64);
+  return (ms / (1000 as i64) - MAINNET_GENESIS()) / (12 as i64);
+}
+
 // ---------------------------------------------------------------- from a directory
 
 async u8[]? optional(Sys sys, string path) { return (await sys.readFile(path)).ok(); }
 
 /**
  * The finalized execution block, from the beacon block root `checkpoint`, the beacon data in `dir`, read as fork
- * `forkName`, at clock slot `now`. Refused when the bootstrap is not the checkpoint's, or an update does not verify.
+ * `forkName`, at slot `now` (or the clock's, when `now` is negative: `slotNow`). Refused when the bootstrap is not the checkpoint's, or an update does not verify.
  */
 export async Result<Anchored, string> anchorFrom(Sys sys, string checkpoint, string dir, string forkName, i64 now) {
   i32 fork = forkNamed(forkName);
@@ -135,9 +148,9 @@ export async Result<Anchored, string> anchorFrom(Sys sys, string checkpoint, str
   if (boot is null) { return Result.Err("the light client: no \{dir}/bootstrap.ssz"); }
   Run r = try start(root, fork, boot!, "from \{dir}");
   u8[]? ups = await optional(sys, dir + "/updates.ssz");
-  if (ups is not null) { try updates(r, ups!, now); }
+  if (ups is not null) { try updates(r, ups!, await slotNow(sys, now)); }
   u8[]? fin = await optional(sys, dir + "/finality.ssz");
-  if (fin is not null) { try finality(r, fin!, now); }
+  if (fin is not null) { try finality(r, fin!, await slotNow(sys, now)); }
   return finish(r);
 }
 
@@ -190,7 +203,7 @@ Result<Got, string> get(Caps caps, string url, string path) {
  * node answers; otherwise the node's word for the fork is taken, and only decides how the bytes are read: a wrong
  * one fails verification. Updates are asked from the bootstrap's period to the clock's.
  */
-export Result<Anchored, string> anchorFromNode(Sys sys, string checkpoint, string url, string forkName, i64 now) {
+export async Result<Anchored, string> anchorFromNode(Sys sys, string checkpoint, string url, string forkName, i64 now) {
   u8[] root = try rootOf(checkpoint);
   string base = url.len() > 0 && url.slice(url.len() - 1, url.len()) == "/" ? url.slice(0, url.len() - 1) : url;
   Caps caps = Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files());
@@ -201,14 +214,14 @@ export Result<Anchored, string> anchorFromNode(Sys sys, string checkpoint, strin
   if (fork < 0) { return Result.Err("the light client: \{want} is not a fork it reads"); }
   Run r = try start(root, fork, boot.body, "from \{base}");
   i64 from = headerSlot(r.store.finalizedHeader) / PERIOD();
-  i64 to = now / PERIOD();
+  i64 to = (await slotNow(sys, now)) / PERIOD();
   if (to >= from) {
     Got ups = try get(caps, base, "/eth/v1/beacon/light_client/updates?start_period=\{from}&count=\{to - from + 1}");
     if (!allAre(ups.fork, want)) { return Result.Err("the beacon node answered the updates as \{ups.fork}, and the bootstrap as \{want}"); }
-    try updates(r, ups.body, now);
+    try updates(r, ups.body, await slotNow(sys, now));
   }
   Got fin = try get(caps, base, "/eth/v1/beacon/light_client/finality_update");
   if (fin.fork != want) { return Result.Err("the beacon node answered the finality update as \{fin.fork}, and the bootstrap as \{want}"); }
-  try finality(r, fin.body, now);
+  try finality(r, fin.body, await slotNow(sys, now));
   return finish(r);
 }

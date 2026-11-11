@@ -1,0 +1,110 @@
+// The two ways a shell can run an applet, held to each other — **called** and **spawned**.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/routes_test.wac
+//
+// `sh.external` runs an applet in this instance, through `pushChild`/`popChild`; `externalSpawnable` runs it as a
+// real child. Both are live and they are supposed to be indistinguishable. Until 2026-08-09 nearly everything took
+// the called route, so every differential covered it by accident; then wac-mono 0116 turned spawning on for
+// `sealedsh`, `imaged`, `sshd -i` and the browser terminal, which left the called route with no coverage at all. It
+// is still shipped and reachable: `packages/box/example/boxsh.wac` is the shell with spawning off.
+//
+// **A bounded slice, and the bound is stated**: the first 40 of the corpus; `wac task corpus:routes` is the whole.
+// Both shells are spawned as modules — the subject is which route the shell takes *inside* itself, not the process
+// boundary — each script in a directory of its own, each run bounded so a hang is a report. It was box's TypeScript
+// `routes.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtProgram } from "../../../wactest/src/built.wac";
+import { freshDir, scratch } from "../../../wactest/src/host.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { corpus } from "../../../sh/test/wac/corpus.wac";
+import { Authority, Child, ChildEnv, Exec, Launch, Sys, TimedOut } from "std";
+import { flatten } from "core";
+
+static i32 SAMPLE = 40;
+
+struct Said {
+  string out;
+  string err;
+  i32 status;
+  bool hung;
+}
+
+u8[] module(Sys sys, string entry, string name) {
+  string path = builtProgram(sys.env(), sys.files(), sys.procs(), entry, name, ["--allow-read", "--allow-write", "--allow-env"]);
+  return flatten(sys.files().readFile(path).wait()).orElse(u8[]());
+}
+
+/** `script` by the shell `wasm`, in `dir`, its input at its end, given at most 30 seconds. */
+async Said run(Sys sys, u8[] wasm, string dir, string script) {
+  auto spawned = await sys.procs().spawn(wasm, ["-c", script], Authority(sys.files(), null, sys.env(), null),
+                                         Launch(dir, false, false, false, false));
+  if (spawned.isErr()) { return Said("", "did not start: \{spawned.err()!}", 0 - 1, false); }
+  Child child = spawned.unwrap();
+  child.input().close();
+  // Read while it runs: a queue nobody drains is a child that cannot finish writing.
+  auto outT = child.output().readAll();
+  auto errT = child.errors().readAll();
+  auto ended = await sys.clock().within(child.exit(), 30000);
+  if (ended.isErr()) {
+    child.stop();
+    return Said("", "\{ended.err()!}", 0 - 1, ended.err()! is TimedOut);
+  }
+  string out = string.fromBytes((await outT).orElse(u8[]()));
+  string err = string.fromBytes((await errT).orElse(u8[]()));
+  return Said(out, err, ended.unwrap(), false);
+}
+
+/** One script's two answers, each in a fresh directory of its own so neither sees the other's files. */
+async Said[] both(Sys sys, u8[] called, u8[] spawned, string root, string script) {
+  freshDir(sys.files(), "\{root}/a");
+  freshDir(sys.files(), "\{root}/b");
+  Said a = await run(sys, called, "\{root}/a", script);
+  Said b = await run(sys, spawned, "\{root}/b", script);
+  return [a, b];
+}
+
+export async string test_the_two_routes_are_one_program_the_same_applets_answer_the_same_either_way(Sys sys) {
+  T t = T.create();
+  u8[] called = module(sys, "packages/box/example/boxsh.wac", "routes-boxsh");
+  u8[] spawned = module(sys, "packages/box/src/bin/sh.wac", "routes-sh");
+  string root = scratch(sys.env(), "box-routes");
+  string[] scripts = corpus();
+  t.isTrue(scripts.len() >= SAMPLE, "the corpus has \{scripts.len()} scripts");
+  for (i32 i = 0; i < SAMPLE && i < scripts.len(); i++) {
+    Said[] ab = await both(sys, called, spawned, root, scripts[i]);
+    Said a = ab[0];
+    Said b = ab[1];
+    t.isFalse(a.hung || b.hung, "\{scripts[i]}: a route did not finish (called \{a.hung}, spawned \{b.hung})");
+    t.isTrue(a.out == b.out && a.err == b.err && a.status == b.status,
+             "\{scripts[i]}\n  called  \{a.out}\{a.err} (\{a.status})\n  spawned \{b.out}\{b.err} (\{b.status})");
+  }
+  sys.files().remove(root, true).wait();
+  return t.report();
+}
+
+/**
+ * **...and they are genuinely two routes**, which is what makes the agreement mean anything. A called applet's output
+ * is captured in this program's memory and capped; a spawned one's queue drains as the next stage reads it. Past the
+ * cap the called route refuses with a sentence and a failing status, and writes nothing it cannot vouch for — where it
+ * used to answer a short count, silently. Asserted rather than avoided, because the test above goes vacuous the day
+ * `boxsh` quietly starts to spawn.
+ */
+export async string test_and_they_are_genuinely_two_routes(Sys sys) {
+  T t = T.create();
+  u8[] called = module(sys, "packages/box/example/boxsh.wac", "routes-boxsh");
+  u8[] spawned = module(sys, "packages/box/src/bin/sh.wac", "routes-sh");
+  string root = scratch(sys.env(), "box-routes-two");
+  Said[] ab = await both(sys, called, spawned, root, "seq 1 1500000");
+  Exec? gnu = flatten(sys.procs().exec("bash", ["-c", "seq 1 1500000"], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+  if (gnu is null) {
+    sys.stderr().line("routes_test: the bash half skipped — no bash to compare with");
+  } else {
+    t.eqI32(ab[1].out.len(), gnu!.stdout.len(), "the spawned route matches bash byte for byte");
+  }
+  t.isTrue(contains(ab[0].err, "output exceeded"), "the called route said it could not hold the output: \{ab[0].err}");
+  t.isTrue(ab[0].status != 0, "a refusal that reports success is the thing this replaced");
+  t.eqI32(ab[0].out.len(), 0, "the called route produced no output it could not vouch for");
+  sys.files().remove(root, true).wait();
+  return t.report();
+}

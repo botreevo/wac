@@ -192,7 +192,7 @@ export function hangReport(
  * `bounded`, without holding the thread — for a caller running several at once.
  *
  * `outputSync` is the right shape for one comparison and the wrong one for forty: forty scripts down
- * two routes each, one spawn at a time, was ten seconds of `packages/box/test/routes.test.ts` on an
+ * two routes each, one spawn at a time, was ten seconds of box's `routes.test.ts` (now `packages/box/test/wac/routes_test.wac`) on an
  * otherwise idle machine. Nothing about the comparison needed to be serial — each script gets a
  * directory of its own by construction.
  *

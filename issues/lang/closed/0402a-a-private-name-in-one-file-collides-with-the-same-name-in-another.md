@@ -1,7 +1,6 @@
 # 0402a — a private function or struct in one file collides with one of the same name in another
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-10 (cloud) — `packages/wacc/src/emit.wac`'s `declareFuncs`; `spec/cases/0909-a-generic-is-its-files-beside-another-files-private-function.wac`
 - **Reported by:** agent-a
 - **Date:** 2026-10-24
 - **Kind:** bug
@@ -40,3 +39,7 @@ file; whatever typed the return did not). The test's helper is renamed until thi
 `core`'s `flatten`. Once step 5 put `flatten(t.wait())` in `packages/box/src/shrun.wac` and `site/wac/figures.wac`,
 every graph that also imported `web` — `box`'s `desk`, `term` and `rasterterm`, and the site build — stopped at the
 emitter with *no method void.orElse*, all checking clean. `view.wac`'s helper is `flattenInto` until this is fixed.
+
+## Fix
+
+A generic function's name was never `declare`d — only its instances were registered, later and under names of their own — so in its own file the name resolved through `keyAt` to whatever held the bare key, and another file's private plain `wrap(i32)` did: the call was typed as that one. `declareFuncs` now declares a generic's name too, with no function entry, so `keyAt` finds the file's own declaration first and the call falls through to `genericCallInstance`. Both shapes this issue records reproduce on 7f559349c and run with the change: the `wrap` pair exits 7, and a library's private `void flatten(i32, Vec<i32>)` beside core's generic `flatten` used from the entry exits 4. The private-struct shape already ran before this change. `view.wac`'s `flattenInto` and the renamed ticket helper can take their names back.

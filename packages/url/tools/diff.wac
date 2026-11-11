@@ -1,0 +1,88 @@
+// Print wac's parse of one input beside the host's `new URL`. The development loop for this package.
+//
+//     wac run --allow-run packages/url/tools/diff.wac 'http://a/b?c#d'
+//     wac run --allow-run packages/url/tools/diff.wac '../x' 'http://a/b/c'
+//
+// It was `tools/diff.ts`, which drove the wac parser from TypeScript. Deno is only the oracle now: an inline script
+// that answers what `new URL` makes of the input, one field a line, and the comparing and printing happen here. The
+// suite's own check against `new URL` is `test/wac`; this is for looking at one URL by hand.
+
+import { T } from "../../wactest/src/assert.wac";
+import { Lines } from "../../wactest/src/oracle.wac";
+import { askScript } from "../../wactest/src/inline.wac";
+import { Sys } from "std";
+import { parse, parseWithBase } from "../test/probe.wac";
+
+/** `new URL(input[, base])`'s fields, one per line, JSON-quoted — or `"0"` alone when it throws. */
+static string HOST_URL =
+  "const L = (await new Response(Deno.stdin.readable).text()).split(String.fromCharCode(10)).filter((l, i, a) => i < a.length - 1);\n" +
+  "let out;\n" +
+  "try {\n" +
+  "  const u = L.length > 1 ? new URL(L[0], L[1]) : new URL(L[0]);\n" +
+  "  out = ['1', u.href, u.protocol.slice(0, -1), u.username, u.password, u.hostname, u.port, u.pathname, u.search, u.hash];\n" +
+  "} catch { out = ['0']; }\n" +
+  "console.log(out.map((f) => JSON.stringify(f)).concat(['DONE ' + L.length]).join(String.fromCharCode(10)));\n";
+
+/** `s` quoted as JSON quotes a string of printable text: a backslash and a quote escaped, nothing else. */
+string quoted(string s) {
+  string q = string.fromCodepoint(34);
+  string out = q;
+  for (i32 i = 0; i < s.len(); i++) {
+    string c = s.slice(i, i + 1);
+    if (c == q || c == string.fromCodepoint(92)) { out = out + string.fromCodepoint(92); }
+    out = out + c;
+  }
+  return out + q;
+}
+
+/** `s` split at every NUL. */
+string[] fieldsOf(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 1;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == 0 as u8) { n = n + 1; } }
+  string[] out = string[].filled(n, "");
+  i32 at = 0;
+  i32 from = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i < b.len() && b[i] != 0 as u8) { continue; }
+    out[at] = s.slice(from, i);
+    at = at + 1;
+    from = i + 1;
+  }
+  return out;
+}
+
+/** `s` padded with spaces to `w`. */
+string padded(string s, i32 w) {
+  string out = s;
+  while (out.len() < w) { out = out + " "; }
+  return out;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  string input = args.len() > 0 ? args[0] : "";
+  bool hasBase = args.len() > 1;
+  string[] got = fieldsOf(string.fromBytes(hasBase ? parseWithBase(input.toBytes(), args[1].toBytes())
+                                                   : parse(input.toBytes())));
+  T t = T.create();
+  Lines asked = Lines.create();
+  asked.add(input);
+  if (hasBase) { asked.add(args[1]); }
+  string[] want = await askScript(t, sys.procs(), HOST_URL, asked, "new URL");
+  if (want.len() == 0) {
+    await sys.stderr().line(t.report());
+    return 1;
+  }
+  string[] names = ["ok", "href", "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash"];
+  for (i32 i = 0; i < names.len(); i++) {
+    bool haveG = i < got.len();
+    bool haveW = i < want.len();
+    if (!haveG && !haveW) { continue; }
+    string g = haveG ? quoted(got[i]) : "undefined";
+    string w = haveW ? want[i] : "undefined";
+    string mark = g == w ? "  " : "->";
+    await sys.stdout().line("\{mark} \{padded(names[i], 9)} wac \{g}  host \{w}");
+  }
+  return 0;
+}

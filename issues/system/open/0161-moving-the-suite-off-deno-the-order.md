@@ -1063,7 +1063,7 @@ this page — what is the *subject* — and it splits them three and three:
 
 | program | lines | verdict |
 |---|---|---|
-| `packages/fmt/tools/sweep.ts` | 35 | **stays.** 500k random doubles against JavaScript's own `String(x)`, and 100k decimals back through `atof`. JS *is* the oracle. |
+| `packages/fmt/tools/sweep.ts` | 35 | **ported** 2026-11-11 — `packages/fmt/tools/sweep.wac`: the same two sweeps with the TS draws, JavaScript an inline oracle (`wactest/src/inline.wac`) that only answers, and the comparing in wac. The 2026-11-11 policy: Deno is a host or an oracle invoked from wac. |
 | `packages/crypto/bench/hash.ts` | 83 | **stays.** Imports `node:crypto`; the number is ours against Node's. |
 | `packages/zstd/bench/ratio.ts` | 91 | **stays.** Our ratio against zlib's, driven through a `node -e` child. |
 | `packages/json/bench/throughput.ts` | 85 | **ported and deleted** — `packages/json/bench/throughput.wac`. All thirteen shapes agree with the Deno table within noise, including the exponent-form cliff the two rows exist to separate. |

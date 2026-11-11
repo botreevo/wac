@@ -59,7 +59,7 @@ runtime was running the tests.
 `wac task coverage:url` reports **95.0%** as of 2026-08-11, with `url.wac` at 98.4% and `host.wac`
 at 94.2%.
 
-`deno run -A packages/url/tools/diff.ts '<input>' ['<base>']` prints wac's answer beside the
+`wac run --allow-run packages/url/tools/diff.wac '<input>' ['<base>']` prints wac's answer beside the
 host's, field by field. It is the loop this was written in.
 
 ### The bug that was not in this package

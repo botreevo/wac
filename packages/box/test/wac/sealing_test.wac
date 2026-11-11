@@ -1,0 +1,281 @@
+// A sealed session cannot reach the machine it is running on — **including through a pipeline**.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/sealing_test.wac
+//
+// design/0001's opening sentence is that a session finds a filesystem "none of which touches the host it happens to be
+// running on". Every other test of that asks a simple command; this asks through a pipe, because that is where it
+// broke: a spawned stage is a fresh instance, `boxApplet` gave it `Fs.onHost`, and `echo inimage > /f; cat /f` said
+// "No such file" while `cat /etc/hostname` printed the machine's. wac-mono 0116 gave a spawned stage a **channel to
+// its parent's filesystem** instead — there is nothing else for it to read — and the canary is `ps`, because a session
+// that quietly stopped spawning would pass every seal test here by running its stages in process.
+//
+// The rest is design/0001 D4 one capability at a time: `readFile` and its kin are the VFS's, `arg`/`env` the session's,
+// `spawn` through the process table. It was box's TypeScript `sealing.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains, trimmed } from "../../../wactest/src/strings.wac";
+import { ChildEnv, Env, Exec, Launch, Sys, TimedOut } from "std";
+import { flatten } from "core";
+
+struct Said {
+  string out;
+  string err;
+  i32 status;
+  bool hung;
+}
+
+struct Rig {
+  string sealed;
+  string imaged;
+  string dir;
+}
+
+Rig rig(Sys sys, string name) {
+  string dir = scratch(sys.env(), "box-sealing-\{name}");
+  freshDir(sys.files(), dir);
+  return Rig(builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sealedsh.wac", "sealing-sealedsh", string[]()),
+             builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/imaged.wac", "sealing-imaged",
+                      ["--allow-read", "--allow-write"]), dir);
+}
+
+async Said runIn(Sys sys, string dir, string cmd, string[] args, string input) {
+  auto got = await sys.clock().within(sys.procs().exec(cmd, args, input.toBytes(), ChildEnv.inherited(),
+                                                       Launch(dir, false, false, false, false)), 60000);
+  if (got.isErr()) { return Said("", "\{got.err()!}", 0 - 1, got.err()! is TimedOut); }
+  Exec x = got.unwrap();
+  return Said(string.fromBytes(x.stdout), string.fromBytes(x.stderr), x.status, false);
+}
+
+/** The session shell `cmd`, with `extra` before `-c script` (an image, for `imaged`). */
+async Said run(Sys sys, Rig r, string cmd, string[] extra, string script) {
+  string[] args = string[].filled(extra.len() + 2, "");
+  args.copyFrom(extra, 0, 0, extra.len());
+  args[extra.len()] = "-c";
+  args[extra.len() + 1] = script;
+  return await runIn(sys, r.dir, cmd, args, "");
+}
+
+/** A file that exists on this machine and cannot exist in a fresh session: its path and first line, or `""`. */
+string[] hostFile(Sys sys) {
+  for (string path in ["/etc/hostname", "/etc/hosts", "/etc/passwd"]) {
+    u8[]? b = flatten(sys.files().readFile(path).wait()).ok();
+    if (b is not null && b!.len() > 0) {
+      string text = string.fromBytes(b!);
+      i32 nl = text.indexOf("\n");
+      return [path, nl < 0 ? text : text.slice(0, nl)];
+    }
+  }
+  return ["", ""];
+}
+
+export async string test_a_sealed_session_reads_its_own_filesystem_through_a_pipe_not_the_hosts(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "own");
+  Said s = await run(sys, r, r.sealed, string[](), "echo inimage > /f; cat /f; cat /f | wc -c");
+  t.eqStr(s.out, "inimage\n8\n", "sealed: a stage did not read the session's own file — \{s.err}");
+  Said i = await run(sys, r, r.imaged, ["\{r.dir}/seal.wacimg"], "echo inimage > /f; cat /f; cat /f | wc -c");
+  t.eqStr(i.out, "inimage\n8\n", "image: a stage did not read the session's own file — \{i.err}");
+  return t.report();
+}
+
+/**
+ * Not by any route. `fails` says whether the *last* command of a route must fail, since `$?` is a pipeline's last
+ * stage — `cat nosuch | head -1` exits 0 in bash too. The content check is the one that holds for every route.
+ */
+export async string test_a_sealed_session_cannot_read_the_machine_by_any_route(Sys sys) {
+  T t = T.create();
+  string[] hf = hostFile(sys);
+  if (hf[0] == "") { return t.report(); }
+  Rig r = rig(sys, "nohost");
+  string[] routes = ["cat \{hf[0]}", "cat \{hf[0]} | head -1", "head -1 \{hf[0]} | cat", "wc -c < \{hf[0]}"];
+  bool[] fails = [true, false, false, true];
+  for (i32 k = 0; k < 2; k++) {
+    string cmd = k == 0 ? r.sealed : r.imaged;
+    string[] extra = k == 0 ? string[]() : ["\{r.dir}/nohost.wacimg"];
+    string name = k == 0 ? "sealed" : "image";
+    for (i32 i = 0; i < routes.len(); i++) {
+      Said got = await run(sys, r, cmd, extra, "\{routes[i]}; echo status=$?");
+      t.isFalse(contains(got.out, hf[1]), "\{name} read the machine through `\{routes[i]}`: \{got.out}");
+      if (fails[i]) { t.isFalse(contains(got.out, "status=0"), "\{name}: `\{routes[i]}` succeeded"); }
+    }
+  }
+  return t.report();
+}
+
+/**
+ * A sealed session's environment is its own (D4). It was the server's: an unset variable fell back to `cli.env`. The
+ * third shell is built **with** the env grant, the only one that tests `Shell.hostEnv` rather than an absent grant — the
+ * first version passed with the rule forced back on, because the grants were withholding the environment.
+ */
+export async string test_a_sealed_sessions_environment_is_its_own_not_the_machines(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "env");
+  string withEnv = builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/imaged.wac", "sealing-imaged-env",
+                            ["--allow-read", "--allow-write", "--allow-env"]);
+  string script = "echo HOME=[$HOME] PATHLEN=${#PATH} USER=[$USER]";
+  t.eqStr((await run(sys, r, r.sealed, string[](), script)).out, "HOME=[] PATHLEN=0 USER=[]\n", "sealed");
+  t.eqStr((await run(sys, r, r.imaged, ["\{r.dir}/env.wacimg"], script)).out, "HOME=[] PATHLEN=0 USER=[]\n", "image");
+  t.eqStr((await run(sys, r, withEnv, ["\{r.dir}/granted.wacimg"], script)).out, "HOME=[] PATHLEN=0 USER=[]\n",
+          "image with the env grant read the machine's environment");
+  // This machine *has* those variables, so an empty answer means they were withheld.
+  t.isTrue(flatten(sys.env().get("HOME").wait()).orElse(null) is not null, "this machine has no HOME to leak");
+  return t.report();
+}
+
+/** Its arguments and input are its own: `$#` and `$0` are the shell's own, and what it reads is what it was given. */
+export async string test_a_sealed_sessions_arguments_and_input_are_its_own(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "args");
+  Said args = await run(sys, r, r.sealed, string[](), "echo count=[$#] zero=[$0] one=[$1]");
+  t.eqStr(args.out, "count=[0] zero=[] one=[]\n", args.err);
+  Said fed = await runIn(sys, r.dir, r.sealed, ["-c", "cat; echo done"], "given\n");
+  t.isFalse(fed.hung, "the sealed shell never finished reading its input");
+  t.eqStr(fed.out, "given\ndone\n", fed.err);
+  return t.report();
+}
+
+/** The shell over the real filesystem is the exception, and really is one: `wacsh` must read what a session must not. */
+export async string test_the_shell_over_the_real_filesystem_is_the_exception_and_really_is_one(Sys sys) {
+  T t = T.create();
+  string[] hf = hostFile(sys);
+  if (hf[0] == "") { return t.report(); }
+  Rig r = rig(sys, "wacsh");
+  string host = builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sh.wac", "sealing-sh",
+                         ["--allow-read", "--allow-write", "--allow-env"]);
+  Said piped = await run(sys, r, host, string[](), "cat \{hf[0]} | head -1");
+  t.isTrue(contains(piped.out, hf[1]), "wacsh could not read \{hf[0]}: \{piped.err}");
+  return t.report();
+}
+
+/** 0116's two lines, in order: a stage sees what the session wrote, and nothing else. */
+export async string test_a_spawned_stage_sees_the_sessions_filesystem_and_not_the_machines(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "stage");
+  Said own = await run(sys, r, r.sealed, string[](), "echo inimage > /f; cat /f | cat");
+  t.eqStr(own.out, "inimage\n", own.err);
+  string[] hf = hostFile(sys);
+  if (hf[0] != "") {
+    Said machine = await run(sys, r, r.sealed, string[](), "cat \{hf[0]} | head -1");
+    t.eqStr(machine.out, "", "a stage read \{hf[0]}");
+    t.isTrue(contains(machine.err, "No such file"), "expected the session to have no such file, got: \{machine.err}");
+  }
+  return t.report();
+}
+
+/**
+ * **The canary for every other test here**: `ps` shows the pipeline it is running (design/0001 step 3). Three rows means
+ * three instances alive at once, which a sequential shell cannot produce.
+ */
+export async string test_ps_shows_the_pipeline_it_is_running(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "ps");
+  Said seen = await run(sys, r, r.sealed, string[](), "seq 1 200000 | ps");
+  string[] rows = rowsOf(trimmed(seen.out));
+  t.eqI32(rows.len(), 4, "expected a header and three processes, got:\n\{seen.out}\{seen.err}");
+  if (rows.len() == 4) {
+    t.isTrue(contains(rows[1], "sealedsh"), rows[1]);
+    t.isTrue(contains(rows[2], "seq 1 200000"), rows[2]);
+    t.isTrue(contains(rows[3], "ps"), rows[3]);
+  }
+  return t.report();
+}
+
+string[] rowsOf(string s) {
+  i32 n = s.len() == 0 ? 0 : 1;
+  for (i32 i = 0; i < s.len(); i++) { if (s.slice(i, i + 1) == "\n") { n = n + 1; } }
+  string[] out = string[].filled(n, "");
+  i32 at = 0;
+  i32 from = 0;
+  for (i32 i = 0; i <= s.len() && n > 0; i++) {
+    if (i == s.len() || s.slice(i, i + 1) == "\n") { out[at] = s.slice(from, i); at = at + 1; from = i + 1; }
+  }
+  return out;
+}
+
+/** What a stage writes is what the session wrote: there is only one filesystem. */
+export async string test_what_a_stage_writes_is_what_the_session_wrote(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "writes");
+  Said wrote = await run(sys, r, r.sealed, string[](), "seq 1 5 | sort -nr > /out; cat /out");
+  t.eqStr(wrote.out, "5\n4\n3\n2\n1\n", wrote.err);
+  Said changed = await run(sys, r, r.sealed, string[](), "mkdir -p /a/b; echo x | cat > /a/b/f; cat /a/b/f; rm -r /a; ls /a");
+  t.eqStr(changed.out, "x\n", changed.err);
+  t.isTrue(contains(changed.err, "No such file"), "rm from a stage did not take: \{changed.err}");
+  return t.report();
+}
+
+/**
+ * A spawned stage *writes* and *renames* through the channel — found by mutation: breaking `decodeChange` left this
+ * file passing, because `>`, `mkdir` and `rm` are the shell's own. `cp`, `touch` and `mv` are applets, real children
+ * asking the session to change something. **The statuses, not just the listing**: with the decoded answer broken the
+ * parent still does the work, so only the status moves. And a refusal carries its own reason across.
+ */
+export async string test_a_spawned_stage_writes_and_renames_through_the_channel(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "channel");
+  Said wrote = await run(sys, r, r.sealed, string[](), "echo one > /a; cp /a /b; echo cp=$?; cat /b; touch /c; echo t=$?; ls /");
+  t.eqStr(wrote.out, "cp=0\none\nt=0\na\nb\nbin\nc\ndev\nproc\ntmp\n", wrote.out + wrote.err);
+  Said refused = await run(sys, r, r.sealed, string[](), "touch /bin/x; echo st=$?");
+  t.eqStr(refused.out, "st=1\n", refused.out + refused.err);
+  t.isTrue(contains(refused.err, "Read-only file system"), "the reason did not survive the channel: \{refused.err}");
+  Said moved = await run(sys, r, r.sealed, string[](), "echo one > /a; mv /a /b; echo mv=$?; cat /b; ls /");
+  t.eqStr(moved.out, "mv=0\none\nb\nbin\ndev\nproc\ntmp\n", moved.out + moved.err);
+  Said across = await run(sys, r, r.sealed, string[](), "echo one > /b; mv /b /bin/x; echo st=$?");
+  t.eqStr(across.out, "st=1\n", across.out + across.err);
+  t.isTrue(contains(across.err, "different mounts"), "the reason did not survive the channel: \{across.err}");
+  return t.report();
+}
+
+/** A background job in a sealed session reads the session's files, answered at the shell's own check points. */
+export async string test_a_background_job_in_a_sealed_session_reads_the_sessions_files(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "bg");
+  Said bg = await run(sys, r, r.sealed, string[](), "seq 1 200 > big; wc -l big & jobs; wait");
+  t.isTrue(contains(bg.out, "200 big"), bg.out + bg.err);
+  t.isTrue(contains(bg.out, "Running"), bg.out + bg.err);
+  return t.report();
+}
+
+/** A program nobody spawned still gets the host: `box cat` typed on a command line is the same `main`. */
+export async string test_a_program_nobody_spawned_still_gets_the_host(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "plain");
+  string box = builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/box.wac", "sealing-box",
+                        ["--allow-read", "--allow-write"]);
+  t.eqStr(putFile(sys.files(), "\{r.dir}/plain.txt", "on the host\n"), "", "the fixture");
+  Said got = await runIn(sys, r.dir, box, ["cat", "plain.txt"], "");
+  t.eqStr(got.out, "on the host\n", got.err);
+  return t.report();
+}
+
+/**
+ * What a session's file *is* does not depend on what the machine has at that path: `tar` asked the *capability*
+ * whether a name was a link, so the same image archived or refused a file depending on this computer. Two things
+ * hold it (`Fs.linkStat` dispatching, and a session with no host mount spawning stages with no grants), so the
+ * check is that the two runs agree *and* that the answer is the file's.
+ */
+export async string test_what_a_sessions_file_is_does_not_depend_on_what_the_machine_has_at_that_path(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "link");
+  string image = "\{r.dir}/link.wacimg";
+  string collide = "\{r.dir}/collide";
+  string script = "mkdir -p \{r.dir}; echo mine > \{collide}; tar \{collide} | wc -c";
+  sys.files().remove(image, false).wait();
+  await runIn(sys, r.dir, "ln", ["-s", "/etc/hostname", collide], "");
+  Said withLink = await run(sys, r, r.imaged, [image], script);
+  sys.files().remove(image, false).wait();
+  sys.files().remove(collide, false).wait();
+  Said without = await run(sys, r, r.imaged, [image], script);
+  t.eqStr(withLink.out, without.out, "the machine's symlink changed what the session's own file is:\n  with: " +
+          "\{withLink.out}\{withLink.err}\n  without: \{without.out}\{without.err}");
+  t.eqStr(trimmed(without.out), "2048", without.out + without.err);
+  // The other direction: on a filesystem that really is the host's, a symbolic link is still refused.
+  string host = builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sh.wac", "sealing-sh",
+                         ["--allow-read", "--allow-write", "--allow-env"]);
+  await runIn(sys, r.dir, "ln", ["-s", "/etc/hostname", "\{r.dir}/alink"], "");
+  Said real = await run(sys, r, host, string[](), "tar \{r.dir}/alink | wc -c");
+  t.isTrue(contains(real.err, "symbolic link"), "wacsh should still refuse a real symlink: \{real.out}\{real.err}");
+  return t.report();
+}

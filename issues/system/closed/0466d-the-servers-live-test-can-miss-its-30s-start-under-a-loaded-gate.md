@@ -1,7 +1,8 @@
 # 0466d — the server's live test can see its Deno server say nothing for 30 s under a loaded gate
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-11 (cloud) — `packages/server/src/main.wac` replaces packages/server/host/serve.ts (deleted
+  2026-11-11); `packages/server/test/wac/live_test.wac` and `packages/http/test/wac/interop_test.wac` build it with
+  `builtApp` before starting it
 - **Reported by:** wac1
 - **Date:** 2026-11-11
 - **Kind:** flaky test
@@ -42,3 +43,23 @@ The gate for bd9165da8 failed `packages/http/test/wac/interop_test.wac`'s `test_
 the same way — *"the wac server never listened: "*, the log empty — and the file passed alone, 5 of 5. Earlier the same
 day it had failed once more and passed on a rerun. Two packages, one shape: a server started from a test that prints
 nothing before the test gives up, under a loaded gate. The fix is likely shared.
+
+## The likely cause, read from the server (2026-11-11)
+
+`packages/server/host/serve.ts` prints `listening on` only after
+`await wacBind("packages/server/test/probe.wac")` — it *compiles a wac program* through `harness/wacBind.ts` before it
+opens the socket. Cold, or with the build cache contended by four gate workers, that compile alone can outlast 30 s, and it
+prints nothing while it runs — which is the empty log. A third occurrence the same day, in the gate for a9d1c1d9c
+(`test_fetch_is_satisfied_by_every_route`), passed alone 9/9 in 29.5 s — close to the deadline even unloaded.
+
+The fix the 2026-11-11 policy points at fixes this too: the server's accept loop in wac (its own header notes ten wac files
+already run accept loops, and that "TypeScript" here is a choice, not a constraint), started with `wac run`, so there is no
+compile on the critical path and no TypeScript driving wac.
+
+## Fixed (2026-11-11)
+
+The accept loop is wac: `packages/server/src/main.wac` — `listen`, an `accept` loop that starts each connection's machine
+unawaited, the buffer-then-`serve` discipline, and the three limits on its command line, with `Clock.within` bounding each
+`recv`. Both tests build it with `builtApp` *before* the start clock runs, so what the 30 s / 20 s waits now cover is a
+native program binding a socket. Unloaded, `live_test.wac` went from 29.5 s to 1.6 s (9/9) and `interop_test.wac` passes
+5/5 in 0.9 s. `wac task serve` runs the same file under `wac run`.

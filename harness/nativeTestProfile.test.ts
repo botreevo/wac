@@ -15,7 +15,7 @@
 // Skipped when there is no binary, exactly as `tools/wac/seedfresh_test.wac` skips when there is no seed:
 // a checkout without one is a perfectly good checkout.
 
-import { ROOT } from "./programs.ts";
+import { ROOT } from "./root.ts";
 
 const BIN = `${ROOT}/native/v8/target/release/wac`;
 

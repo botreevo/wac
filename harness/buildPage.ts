@@ -4,7 +4,7 @@
 // by this checkout's `wac`, which is what `web`'s template runs and what the site's demos are. A test
 // that built its page some other way would be testing a page nobody ships.
 
-import { ROOT } from "./programs.ts";
+import { ROOT } from "./root.ts";
 
 const WAC = `${ROOT}/native/v8/target/release/wac`;
 

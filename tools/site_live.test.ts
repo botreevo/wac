@@ -8,7 +8,7 @@
 // which is where GitHub Pages serves it.
 //
 // **Skipped loudly** when there is no browser, in the words `test/view_live.test.ts` in `web` uses.
-import { ROOT } from "../harness/programs.ts";
+import { ROOT } from "../harness/root.ts";
 import { findChromium, launchOptions } from "../harness/chromium.ts";
 
 function assertEquals<T>(got: T, want: T, msg?: string): void {

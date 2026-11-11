@@ -20,7 +20,7 @@
 
 import { denoTestName } from "./wacTestRun.ts";
 import { wacTestRegistrations } from "./testRegistrars.ts";
-import { ROOT } from "./programs.ts";
+import { ROOT } from "./root.ts";
 
 Deno.test("the registered name is the label and the test name without its prefix", () => {
   const cases: [string, string | undefined, string, string][] = [

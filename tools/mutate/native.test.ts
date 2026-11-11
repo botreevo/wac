@@ -10,7 +10,7 @@
 // Skipped without a binary, as `tools/wac/seedfresh_test.wac` skips without a seed.
 
 import { classify, isWacRun, mergeRuns, splitHalves, WAC_BIN, wacTestArgs } from "./native.ts";
-import { ROOT } from "../../harness/programs.ts";
+import { ROOT } from "../../harness/root.ts";
 
 /** A file with several passing tests and no host oracle, so every code below is reachable. */
 const SUBJECT = "core/test/map_test.wac";

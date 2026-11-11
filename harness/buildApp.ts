@@ -24,7 +24,7 @@
 // is a real loss and it is written down rather than discovered later from a coverage number that
 // quietly dropped — which is the failure `issues/system/0160` already cost two days.
 
-import { ROOT } from "./programs.ts";
+import { ROOT } from "./root.ts";
 
 const BIN_DIR = `${ROOT}/native/v8/target/release`;
 

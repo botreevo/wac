@@ -31,7 +31,7 @@
 // wrong *from* a point — the tokens before it agreeing is what tells you where to look.
 
 import { createRequire } from "node:module";
-import { ROOT } from "../../../harness/programs.ts";
+import { ROOT } from "../../../harness/root.ts";
 
 // **`createRequire`, because `typescript` ships CommonJS.** A bare `import` of it fails with *does
 // not provide an export named 'default'*, which reads like a missing package and is not one. The

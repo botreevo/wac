@@ -399,7 +399,7 @@ made it a second capability.
 
 ### Two mistakes it caught immediately, neither of which the model could have
 
-- **A page program's entry is `page`, not `main`.** `harness/programs.ts` decides what a program is
+- **A page program's entry is `page`, not `main`.** harness/programs.ts (deleted 2026-11-11; now `tools/wac/programs.wac`) decided what a program is
   by looking for one or the other and the launchers dispatch the same way — `entry.ts` runs `main`,
   `entryBrowser.ts` runs `page`. Declared as `main` with three parameters, the browser called it with
   two, and that arrives as *"Cannot read properties of undefined (reading '$ref')"* from inside the

@@ -32,7 +32,7 @@
 // relative strings, so the Deno-hosted path only worked with the wac checkout as the working
 // directory: from a project of your own it died with `NotFound … readfile
 // 'packages/wacc/src/api.wac'` and a ten-frame stack. GitHub issue 21, `issues/system/0228a`.
-import { ROOT } from "./programs.ts";
+import { ROOT } from "./root.ts";
 import { wacFilesWithRoots } from "./wacFiles.ts";
 import { profileDir, registerProfiled } from "./wacProfile.ts";
 import { cached, contentKey, filesParts, harnessKeyParts, hashDir } from "./buildCache.ts";

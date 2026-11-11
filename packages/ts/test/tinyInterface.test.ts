@@ -12,7 +12,7 @@
 // produce the same bytes, because "works on the machine I tried" is exactly the failure the
 // bootstrap exists to avoid.
 
-import { ROOT } from "../../../harness/programs.ts";
+import { ROOT } from "../../../harness/root.ts";
 
 const WAC = `${ROOT}/native/v8/target/release/wac`;
 const HOST = `${ROOT}/packages/ts/host/run.js`;

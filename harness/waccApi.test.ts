@@ -23,7 +23,7 @@
 // caveat, and the alternative — generating the declaration from the wire, `0231a`'s option 2 — is the
 // thing that would make the caveat go away.
 
-import { ROOT } from "./programs.ts";
+import { ROOT } from "./root.ts";
 
 /** `throw` on a false claim — the convention `tools/wac/benchcompile_test.wac` uses, and no import for it. */
 function must(ok: boolean, why: string): void {

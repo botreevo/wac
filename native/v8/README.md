@@ -420,7 +420,7 @@ a pass — and there are **125 files** written that way here. Every one of them 
 in 53 files** passing natively, plus `packages/wactest`'s deliberately failing fixture, which fails —
 the check that this reads the report rather than assuming it.
 
-**Every program here compiles through it to the same bytes.** All 73 that `harness/programs.ts`
+**Every program here compiles through it to the same bytes.** All 73 that harness/programs.ts (now `tools/wac/programs.wac`)
 finds — 14 MB of module — byte for byte against the library, which covers the binary's own I/O path
 over the shapes a repository actually has: an import that goes up a directory, a package whose graph
 is 179 files, a path with a space in it. Also checked by hand and consistent with the reference: CRLF

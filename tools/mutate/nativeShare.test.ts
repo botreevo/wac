@@ -17,7 +17,7 @@
 import { countTestsDeclaredHere, wacTestRegistrations } from "../../harness/testRegistrars.ts";
 import { denoTestName } from "../../harness/wacTestRun.ts";
 import { WAC_BIN } from "./native.ts";
-import { ROOT } from "../../harness/programs.ts";
+import { ROOT } from "../../harness/root.ts";
 
 /**
  * The subjects: three wac entries from three packages, cheap to run.

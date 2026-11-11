@@ -2491,6 +2491,7 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
             let err = Arc::new(Stream::capped());
             let input = Arc::new(Stream::uncapped());
             let feed = input.clone();
+            let inherited = input_for_child(inherits, input);
             let (wasm, manifest_text, parent_grants) = HOST.with(|h| {
                 let b = h.borrow();
                 let s = b.as_ref().expect("host");
@@ -2552,8 +2553,8 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 // None is what `emit_bytes` falls through on: no parent queue, so the real stream.
                 out: if inherit_out { None } else { Some(out.clone()) },
                 err: if inherit_out { None } else { Some(err.clone()) },
-                input: Some(input),
-                inherits,
+                input: Some(inherited.0),
+                inherits: inherited.1,
                 fs_req: fs_req.clone(),
                 fs_rep: fs_rep.clone(),
             };
@@ -2648,6 +2649,7 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
             let err = Arc::new(Stream::capped());
             let input = Arc::new(Stream::uncapped());
             let feed = input.clone();
+            let inherited = input_for_child(inherits, input);
             let parent_grants = HOST.with(|h| h.borrow().as_ref().map(|s| s.grants).unwrap_or_default());
             let grants = Grants {
                 read: parent_grants.read && grant_bits & GRANT_READ != 0,
@@ -2703,8 +2705,8 @@ fn serve(scope: &mut v8::PinScope, cap: Cap, op: i32, r: &Req) -> Reply {
                 // None is what `emit_bytes` falls through on: no parent queue, so the real stream.
                 out: if inherit_out { None } else { Some(out.clone()) },
                 err: if inherit_out { None } else { Some(err.clone()) },
-                input: Some(input),
-                inherits,
+                input: Some(inherited.0),
+                inherits: inherited.1,
                 fs_req: fs_req.clone(),
                 fs_rep: fs_rep.clone(),
             };
@@ -4247,6 +4249,30 @@ const STDIN_HANDLE: i32 = 0;
 /// parent for a filesystem on. `packages/platform/host/children.ts` calls the same number `n_HANDLE`
 /// and checks for it *before* looking anything up in its socket table.
 ///
+/// **What a child reads, and whether it reads this process's own input.**
+///
+/// A child that inherits its input reads what its parent reads. For a program this process started that is the
+/// process's standard input; for a *child* of one — a pipeline's first stage, which a shell spawns to inherit the
+/// shell's input (wac-mono 0110) — it is the queue the parent itself reads. This used to pass `inherits` through, and
+/// an inheriting child read `std::io::stdin()` wherever it was in the tree: a grandchild read the *process's* input
+/// instead of the shell's, and after a spawned shell ran a pipeline the next child its parent spawned found its own
+/// open input already ended (`issues/system/0470e`). So the parent's queue is handed down, and the child is told it is
+/// reading a queue rather than inheriting.
+fn input_for_child(inherits: bool, own: Arc<Stream>) -> (Arc<Stream>, bool) {
+    if !inherits {
+        return (own, false);
+    }
+    let parents = HOST.with(|h| {
+        let b = h.borrow();
+        let s = b.as_ref()?;
+        if s.inherits { None } else { s.child_input.clone() }
+    });
+    match parents {
+        Some(q) => (q, false),
+        None => (own, true),
+    }
+}
+
 /// **Reserved, because this host used to allocate it.** `next_handle` began at 1, so the first
 /// socket handed out — a child's stdout — took the number that already meant "ask my parent". Two
 /// faults came of it, and the quiet one is worse: before any spawn `recv(PARENT_FS)` found nothing

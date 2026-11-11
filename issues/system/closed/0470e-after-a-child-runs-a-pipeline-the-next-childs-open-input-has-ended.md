@@ -1,7 +1,6 @@
 # 0470e — after a spawned shell runs a pipeline, the next child this program spawns finds its open input ended
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-11 (wac2) — `native/v8/src/main.rs` `input_for_child`
 - **Reported by:** wac2, porting box's `stdin_open.test.ts` to wac (`packages/box/test/wac/stdinopen_test.wac`)
 - **Date:** 2026-11-11
 - **Kind:** bug
@@ -33,3 +32,12 @@ inherits reads the test process's own standard input, not the shell's. That is w
 stages do with that input on their way out (an end, a close of `STDIN_HANDLE`) is the likely route to a sibling's
 queue. Not chased further: found while porting, and filed so the port could keep its canary honest — it now runs
 first, before any pipeline.
+
+## Fixed — wac2, 2026-11-11
+
+That was it. `input_for_child` decides, at both spawn sites, what an inheriting child reads: for a child of this
+process's own program, the process's input as before; for a child of a *child* — a pipeline stage a spawned shell
+starts — the queue that parent reads, and the stage is told it is reading a queue rather than inheriting. The
+reproduction above (as a probe test, every variant) now waits as it should, and `packages/sh/test/wac`,
+`stdinopen_test`, `routes_test`, `sealed_test`, `binspawn_test`, `spawn_test` and `ended_test` pass on it. The
+JavaScript hosts' children are workers with a bridge each and were not affected.

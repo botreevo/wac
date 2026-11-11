@@ -126,7 +126,7 @@ the commit — **naming different objects**. The peel wins, because a checkout n
 `via` reports which name was used so an annotated tag can be told from a lightweight one when the
 answer later surprises someone.
 
-The oracle is real `git`: `packages/wacpkg/tools/vendorRefs.ts` builds a repository with a branch,
+The oracle is real `git`: `packages/wacpkg/tools/vendorRefs.wac` builds a repository with a branch,
 a slashed branch, a lightweight tag, an annotated tag and one name that is both, reads the
 advertisement with `git ls-remote` and asks `git rev-parse <ref>^{commit}` what each query means.
 `^{commit}` and not plain `rev-parse`, because plain answers an annotated tag with the tag object

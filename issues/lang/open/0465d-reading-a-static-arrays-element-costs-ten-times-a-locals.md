@@ -1,0 +1,27 @@
+# 0465d — reading an element of a `static` array costs about ten times a local array's
+
+- **Status:** open
+- **Claimed by:** (nobody yet — add yourself before working it)
+- **Reported by:** turbostack (via the agent-coordination session)
+- **Date:** 2026-11-11
+- **Kind:** performance
+- **Symptom:** slow code
+
+## Reproduction
+
+A loop of a million element reads, once from a `static` array and once from a local copy of it:
+
+```wac
+static i32[] TABLE = [1, 2, 3, 4, 5, 6, 7, 8];
+export i32 viaStatic() { i32 s = 0; for (i32 i = 0; i < 1000000; i++) { s = s + TABLE[i & 7]; } return s; }
+export i32 viaLocal() { i32[] t = TABLE; i32 s = 0; for (i32 i = 0; i < 1000000; i++) { s = s + t[i & 7]; } return s; }
+```
+
+Reported: about 10 ns a read through the static against about 1 ns through the local.
+
+## Notes
+
+Not yet looked at. Likely suspects, to be checked against the emitted wasm rather than assumed: the static is read
+through a global (or an initialiser guard) on every access rather than once; the array's reference is re-derived each
+time where a local's is in a register; or a bounds or null check the local form lets the engine hoist. `wac build` of
+the two functions and a look at the loop bodies would say which.

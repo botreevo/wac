@@ -1,7 +1,6 @@
 # 0458e — a package file is keyed by where the cache is, so its generics are named after the machine
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-11 (wac2) — `packages/wacc/src/emit.wac` `packageKeyOf`; `packages/wac/test/wac/packagekey_test.wac`
 - **Reported by:** wac2
 - **Date:** 2026-11-10
 - **Kind:** bug
@@ -22,3 +21,19 @@ cache path differs from the native one.
 path, or the `wac.lock` name and path, under a prefix no file on disk has. That is a key the reader has to
 translate back to a path, so it touches the read, the `@/` root of a package and `subdir` confinement
 (`0169a`). That's why it was left out of `0270a`.
+
+## Fixed — wac2, 2026-11-11
+
+**Measured first.** A module exporting a type a package declares, where the name is file-qualified (two `Thing`s, or
+`web`'s `Element`), carried the cache path in its exports:
+`$bind$s_Thing___tmp_…_h1_cache_git_https_3A_2F_2Fexample_invalid_2Fpkg_git_aaaa…_lib_new`. Built under a second
+`$WAC_HOME` it was a different module. Nothing else in a module named the path: there is no name section, and a
+program's own boundary (`Host`, `Page`) is not tagged.
+
+**Fixed where the name is spelled, not where the key is chosen.** The fix proposed above — keying a package file by
+what identifies it — reaches the read, a package's `@/` root and `subdir` confinement. The bytes come from one
+function, `fileTagOf`, and `packageKeyOf` starts a package file's tag at `<repository>/<commit>/`, the part that is the
+same on every machine. Keys, diagnostics and reads are unchanged.
+
+`packagekey_test.wac` builds one project, against one package held in two caches under two homes, and compares the
+bytes, with a control that the package's name is file-qualified at all. It failed before the change.

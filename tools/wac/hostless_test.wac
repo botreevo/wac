@@ -1,0 +1,133 @@
+// Every wac test that needs nothing from the host, run on a second host and held to the same answer.
+//
+// test-lane: heavy — builds the whole `wac` program for Deno through `build.ts`, then runs 51 test files on two hosts
+//
+// **What `harness/wac/hostless.test.ts` was for, driven from wac.** That file registered these tests with `deno test`
+// so the Deno pass would run them a second time — not for coverage, but because the same wac on a second host should
+// still answer the same — and then the Deno pass put it on its ignore list, so for months it ran nowhere at all. The
+// 2026-11-11 policy is that Deno is a host, or an oracle a wac program invokes; so the check is a wac test now, and
+// Deno is only the second host: the Deno-hosted `wac` command, built the way `commandparity_test.wac` builds it.
+//
+// Each file is run by the native `wac test` and by the Deno-hosted one, and both must pass with the same number of
+// tests. The labels the TypeScript file carried were only Deno's display names and are not needed here. The list
+// stays in `hostless.test.ts` as well while `tools/mutate/profile.ts` reads its calls statically; `issues/system/0161`.
+
+import { T } from "../../packages/wactest/src/assert.wac";
+import { Exec, Stat, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { builtByDeno, wacBinary } from "../../packages/wactest/src/built.wac";
+import { flatten } from "core";
+
+/** The hostless test files: nothing in them needs a capability, so any host must answer them alike. */
+string[] hostless() {
+  return [
+    "packages/bytes/test/wac/bounds_test.wac",
+    "packages/crypto/test/wac/chacha20_test.wac",
+    "packages/crypto/test/wac/crypto_test.wac",
+    "packages/crypto/test/wac/ct_test.wac",
+    "packages/crypto/test/wac/field25519_test.wac",
+    "packages/crypto/test/wac/ghash_test.wac",
+    "packages/crypto/test/wac/layout_test.wac",
+    "packages/crypto/test/wac/traps_test.wac",
+    "packages/gzip/test/wac/crc32_incremental_test.wac",
+    "packages/gzip/test/wac/crc32_test.wac",
+    "packages/gzip/test/wac/inflate_at_test.wac",
+    "packages/json/test/wac/bounds_test.wac",
+    "packages/platform/test/wac/ripple_test.wac",
+    "packages/quic/test/wac/connection_test.wac",
+    "packages/quic/test/wac/short_test.wac",
+    "packages/quic/test/wac/tamper_test.wac",
+    "packages/quic/test/wac/varint_test.wac",
+    "core/test/traps_test.wac",
+    "packages/tls/test/wac/hybrid_traps_test.wac",
+    "packages/tls/test/wac/hybrid_test.wac",
+    "packages/tls/test/wac/record_traps_test.wac",
+    "packages/tls/test/wac/server_traps_test.wac",
+    "packages/tls/test/wac/wire_traps_test.wac",
+    "packages/tls/test/wac/wire_test.wac",
+    "packages/tor/test/wac/cell_test.wac",
+    "packages/tor/test/wac/circuit_test.wac",
+    "packages/tor/test/wac/dirclient_test.wac",
+    "packages/tor/test/wac/fuzz_test.wac",
+    "packages/tor/test/wac/hsintropoint_test.wac",
+    "packages/tor/test/wac/hsrendpoint_test.wac",
+    "packages/tor/test/wac/hsreplay_test.wac",
+    "packages/tor/test/wac/hsupload_test.wac",
+    "packages/tor/test/wac/pathsel_test.wac",
+    "packages/tor/test/wac/pool_test.wac",
+    "packages/tor/test/wac/relay_test.wac",
+    "packages/tor/test/wac/relaycircuit_test.wac",
+    "packages/tor/test/wac/relaylink_test.wac",
+    "packages/tor/test/wac/relayring_test.wac",
+    "packages/tor/test/wac/socks5_test.wac",
+    "packages/wactest/test/wac/itoa64_test.wac",
+    "packages/bignum/test/wac/big_test.wac",
+    "packages/bytes/test/wac/buf_test.wac",
+    "packages/fmt/test/wac/ftoa_test.wac",
+    "packages/fs/test/wac/proc_test.wac",
+    "packages/gzip/test/wac/huffman_test.wac",
+    "packages/json/test/wac/json_test.wac",
+    "core/test/hash_test.wac",
+    "core/test/map_test.wac",
+    "core/test/vec_test.wac",
+    "packages/url/test/wac/url_test.wac",
+    "packages/tor/test/wac/rendrelay_test.wac"
+  ];
+}
+
+/** What a host said: its exit status, and the `N passed, M failed` it ended with, or `""` for none. */
+struct Ran {
+  i32 status;
+  string summary;
+  string out;
+}
+
+/** The last line of `text` that reads `… passed, … failed …`, up to `failed`. */
+string summaryOf(string text) {
+  string found = "";
+  i32 from = 0;
+  for (i32 i = 0; i <= text.len(); i++) {
+    if (i < text.len() && text.slice(i, i + 1) != "\n") { continue; }
+    string line = text.slice(from, i);
+    from = i + 1;
+    i32 p = line.indexOf(" passed, ");
+    i32 f = line.indexOf(" failed");
+    if (p > 0 && f > p) { found = line.slice(0, f + 7); }
+  }
+  return found;
+}
+
+Ran ran(Procs procs, string command, string file) {
+  auto r = flatten(procs.exec(command, ["test", "--allow-read", "--allow-write", "--allow-env", "--allow-run", file],
+                              u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? e = r.ok();
+  if (e is null) { return Ran(0 - 1, "", "the host did not start: " + "\{r.isErr() ? "\{r.err()!}" : ""}"); }
+  string out = string.fromBytes(e!.stdout) + string.fromBytes(e!.stderr);
+  return Ran(e!.status, summaryOf(out), out);
+}
+
+export string test_every_hostless_wac_test_answers_the_same_on_deno(Sys sys) {
+  T t = T.create();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  string native = wacBinary(env);
+  string deno = builtByDeno(env, fs, procs, "packages/wac/src/wac.wac", "wac-deno-cli",
+                            ["--allow-read", "--allow-write", "--allow-run", "--allow-env", "--allow-net"], "deno", false);
+  if (!flatten(fs.stat(deno).wait()).orElse(Stat.of(false, false, false, 0, 0, false, false, 0, 0)).isFile) {
+    t.fail("the Deno-hosted command was not built: " + deno);
+    return t.report();
+  }
+  string[] files = hostless();
+  i32 agreed = 0;
+  for (string f in files) {
+    Ran n = ran(procs, native, f);
+    Ran d = ran(procs, deno, f);
+    t.eqI32(n.status, 0, f + " passes natively: " + n.summary);
+    t.eqI32(d.status, 0, f + " passes on Deno: " + (d.summary != "" ? d.summary : d.out));
+    t.isTrue(n.summary != "", f + " says how many passed natively");
+    t.eqStr(d.summary, n.summary, f + ": the two hosts ran a different set");
+    if (n.status == 0 && d.status == 0 && n.summary != "" && d.summary == n.summary) { agreed = agreed + 1; }
+  }
+  t.eqI32(agreed, files.len(), "every hostless file answered alike on both hosts");
+  return t.report();
+}

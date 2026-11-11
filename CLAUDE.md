@@ -73,7 +73,7 @@ Ethereum's, and `packages/bls/src/fp.wac` is the compiler's heaviest program.
 ## Running things
 
     wac task test                                    the suite
-    wac task docs                                    the doc checks — a wac phase, then Deno's
+    wac task docs                                    the doc checks — `wac test tools/`, no Deno phase
     wac task map --check                             MAP.md is generated; staleness is a failure
     ./bootstrap.sh                                   build the `wac` command and install it
     ./bootstrap.sh --no-install                      ...leaving it in the tree — `wac task seed`

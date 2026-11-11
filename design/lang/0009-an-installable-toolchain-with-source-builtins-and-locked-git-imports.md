@@ -559,7 +559,7 @@ That copy is gone: `packages/wacc/src/path.wac` holds the rule, imports nothing,
 compiler/wacResolve.ts, `harness/wacFiles.ts`, the reference CLI's and
 `site/src/editor/file-store.ts`. *(2026-08-18: three, and the count in the measurement below with
 it — the reference CLI was retired. The pairs it contributed are gone from
-the total rather than newly disagreeing.)* `packages/wacc/test/corpus.ts` now
+the total rather than newly disagreeing.)* packages/wacc/test/corpus.ts (deleted 2026-11-11) now
 uses the harness's, which also fixed it: its own copy claimed in a comment to resolve "the way
 the emitter's linker does" and did not — `from.slice(0, from.lastIndexOf("/"))` drops the last
 *character* when there is no slash, and its `..` popped unconditionally.
@@ -570,7 +570,7 @@ either time.
 
 > **Asked a third time on 2026-08-19, and the answer had changed, because the set had.** Two of the
 > four TypeScript copies were gone by then — the reference CLI's with the CLI, and
-> `packages/wacc/test/corpus.ts`'s, which became the harness's — so the figures above and the
+> packages/wacc/test/corpus.ts (deleted 2026-11-11)'s, which became the harness's — so the figures above and the
 > "8 of 24, 9 of 16" below are about a population that no longer exists. Between the two that were
 > left: **4232 of 4232 real specifiers agree, and 26 of 27 hand-written spellings.** The one
 > disagreement was `..` climbing above an absolute root, where compiler/wacResolve.ts dropped the

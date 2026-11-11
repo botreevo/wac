@@ -1,7 +1,7 @@
 import { waccApi } from "./waccBuild.ts";
 
 // **wacc, at module load, so the helpers below can stay synchronous.** `resolveFrom` and
-// `wacFilesIn` have callers that are not async — `packages/wacc/test/corpus.ts` walks a queue with
+// `wacFilesIn` have callers that are not async — packages/wacc/test/corpus.ts (deleted 2026-11-11) walks a queue with
 // one — and making them async to reach an `await` would ripple. Building wacc costs four seconds
 // once and is cached on disk; every importer of this file already pays it through `wacBind`.
 const api = await waccApi();
@@ -39,7 +39,7 @@ function resolveSpecifier(from: string, spec: string, root: string | undefined, 
 /**
  * `spec` against the directory `fromPath` sits in, `.` and `..` collapsed.
  *
- * Exported because `packages/wacc/test/corpus.ts` had its own copy whose comment claimed it
+ * Exported because packages/wacc/test/corpus.ts (deleted 2026-11-11) had its own copy whose comment claimed it
  * resolved "the way the emitter's linker does" and did not: `from.slice(0, from.lastIndexOf("/"))`
  * drops the last *character* when there is no slash, so `c.wac` + `d.wac` was `c.wa/d.wac`, and its
  * `..` popped unconditionally so a path could climb above the root and come back looking local.

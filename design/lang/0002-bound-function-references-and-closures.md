@@ -207,7 +207,7 @@ error"* — and `spec/tour.wac` says the same twice, at lines 777 and 791. A `§
 compiler/wacSpec.test.ts, which runs against **the reference**, and the reference is bootstrap-bound
 and not to grow this feature. So:
 
-- **`spec/cases` can express a wacc-only rule** — `only: "both" | "wacc"` in `spec/cases/cases.ts`,
+- **`spec/cases` can express a wacc-only rule** — `only: "both" | "wacc"` in spec/cases/cases.ts (deleted 2026-11-11),
   written `// only: wacc`, exists for exactly this and its comment says so. Nothing uses it yet.
 - **A `§tag` cannot.** There is no scoping in `wacSpec.test.ts`, and its tags are also counted by
   `site/src/next/Checked.tsx` and cited from compiler/wacCore.ts.

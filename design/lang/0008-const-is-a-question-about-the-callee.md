@@ -302,7 +302,7 @@ hole, and the corpus is where a compiler is held to it.
 That corpus is not wacc's. compiler/wacCases.test.ts asserts the *reference* meets every case, and
 says why in its header: "a case the reference fails is a case whose expectation is in doubt".
 
-**But it can be told not to ask — corrected 2026-08-14.** `spec/cases/cases.ts` carries
+**But it can be told not to ask — corrected 2026-08-14.** spec/cases/cases.ts (deleted 2026-11-11) carries
 `only: "both" | "wacc"`, written as `// only: wacc` in a case's header, and its comment says exactly
 what it is for: "a feature the reference does not have — the spec targets wacc as of
 design/lang/0003, so those exist on purpose now". No case uses it yet, which is why grepping the

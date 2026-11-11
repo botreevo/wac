@@ -5,7 +5,8 @@
 #     sh tools/fill-cache.sh --list [lock]   # the `<url> <commit>` pairs it would fetch, and nothing else
 #
 # **Because development fetches through a mirror.** Pins name GitHub; `tools/use-mirror.sh` has `git` fetch them
-# from git.voltrevo.com, which has the commits first — a setting `wac update`'s own fetcher does not follow. A checkout already in the cache is left alone,
+# from git.voltrevo.com, which has the commits first — a setting `wac update`'s fetcher follows as well
+# (`packages/wacpkg/src/mirror.wac`), so either fills the cache. A checkout already in the cache is left alone,
 # so running this every time costs a directory lookup per import. The cache is `$WAC_HOME/cache/git`,
 # `$HOME/.wac` by default — where `wac` looks for a locked dependency — one plain checkout per commit, the
 # repository's URL escaped as `packages/wacpkg/src/cache.wac`'s `escapeRepo` does it.

@@ -756,7 +756,7 @@ a worker pool, an injectable `WorkerLike`, and a lifetime rule about when a work
 pool — reaching eighteen files.
 
 **So the obvious question is whether `appRun` still earns its keep — and for its largest consumer it
-plainly does.** `packages/sh/test/differential.test.ts` runs **554 cases** against bash. At 57ms a
+plainly does.** `packages/sh/test/wac/bashlive_test.wac` runs **554 cases** against bash. At 57ms a
 spawn that is about 32 seconds; in process it is six. The optimisation is not marginal there, it is
 the difference between a file somebody runs and one they avoid.
 
@@ -861,7 +861,7 @@ capability option 3 preserves for five files and option 1 extends to all of them
 ## `0282c` is fixed, which opens a second route for the `workerOnly` group
 
 Recorded 2026-08-29. The section above says that group waits on `issues/system/0161` — converting
-`packages/sh/test/differential.test.ts` to wac so it needs no worker bundle. That is still true and
+`packages/sh/test/wac/bashlive_test.wac` to wac so it needs no worker bundle. That is still true and
 is still the better end state, but it is no longer the only way through.
 
 `issues/system/0282c` was *"the reason that file cannot move onto `wac app`"*: a relayed program's

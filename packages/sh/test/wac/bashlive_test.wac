@@ -1,0 +1,575 @@
+// The shell against bash, live — what the captured corpus cannot carry.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/sh/test/wac/bashlive_test.wac
+//
+// `corpus_test.wac` replays 645 scripts against expectations `tools/wac/shvectors.wac` captured from bash once. These
+// ask the live oracle instead, because each is about something a captured string cannot hold: how two streams
+// interleave, what a shell does with its own standard input. They were the live half of `packages/sh/test/
+// differential.test.ts`, which drove the shell from TypeScript; Deno is no part of this — bash is the oracle and the
+// shell is the one this package builds, as an executable, so both are real processes given the same bytes.
+//
+// Every run clears the environment to `LC_ALL=C` and `PATH`, as the TypeScript did: a script whose answer depends on
+// the machine's `$USER` is not a comparison.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+import { trimmed } from "../../../wactest/src/strings.wac";
+import { sameName } from "./shname.wac";
+import { programs } from "./corpus.wac";
+
+/** What a process said: its output, its error output, its status — `status` -1 when it did not start. */
+struct Said {
+  string out;
+  u8[] err;
+  i32 status;
+}
+
+ChildEnv cleared(Env env) {
+  u8[]? path = flatten(env.get("PATH").wait()).orElse(null);
+  return ChildEnv.empty().set("LC_ALL", "C").set("PATH", path is null ? "/usr/bin:/bin" : string.fromBytes(path!));
+}
+
+Said run(Procs procs, ChildEnv e, string cmd, string[] args, string input) { return runIn(procs, e, "", cmd, args, input); }
+
+/** `run` from directory `cwd`. */
+Said runIn(Procs procs, ChildEnv e, string cwd, string cmd, string[] args, string input) {
+  Exec? x = flatten(procs.exec(cmd, args, input.toBytes(), e, Launch(cwd, false, false, false, false)).wait()).ok();
+  if (x is null) { return Said("", u8[](), 0 - 1); }
+  return Said(string.fromBytes(x!.stdout), x!.stderr, x!.status);
+}
+
+/** The shell this package builds, as an executable both a test and bash can start. */
+string wacsh(Sys sys) {
+  return builtApp(sys.env(), sys.files(), sys.procs(), "packages/sh/src/sh.wac", "bashlive-wacsh",
+                  ["--allow-read", "--allow-write", "--allow-env"]);
+}
+
+bool haveBash(Procs procs) { return flatten(procs.exec("bash", ["-c", "exit 0"], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).isOk(); }
+
+/** `text`'s lines, without the last one's newline. */
+string[] linesOf(string text) {
+  string s = text;
+  while (s.len() > 0 && s.slice(s.len() - 1, s.len()) == "\n") { s = s.slice(0, s.len() - 1); }
+  i32 n = 1;
+  for (i32 i = 0; i < s.len(); i++) { if (s.slice(i, i + 1) == "\n") { n = n + 1; } }
+  string[] out = string[].filled(n, "");
+  i32 at = 0;
+  i32 from = 0;
+  for (i32 i = 0; i <= s.len(); i++) {
+    if (i < s.len() && s.slice(i, i + 1) != "\n") { continue; }
+    out[at] = s.slice(from, i);
+    at = at + 1;
+    from = i + 1;
+  }
+  return out;
+}
+
+/** `cmd -c script` with both streams sent to one file by bash, and that file's lines. */
+string[] bothStreams(Sys sys, ChildEnv e, string cmd, string script, string out) {
+  run(sys.procs(), e, "bash", ["-c", "\"$0\" -c \"$1\" >\"$2\" 2>&1", cmd, script, out], "");
+  u8[]? f = flatten(sys.files().readFile(out).wait()).ok();
+  return linesOf(f is null ? "" : string.fromBytes(f!));
+}
+
+i32 complaintAt(string[] lines) {
+  for (i32 i = 0; i < lines.len(); i++) { if (lines[i].indexOf("not found") >= 0) { return i; } }
+  return 0 - 1;
+}
+
+/**
+ * Standard error arrives when it happened, not at the end of the run.
+ *
+ * The two shells word the complaint differently — bash says `bash: line 1: nope: command not found` — so what is
+ * compared is *where* the line lands. Issue 0014: the shell once collected standard error and flushed it at the end,
+ * so `echo one; nope; echo two` put the complaint after both lines of output.
+ */
+export string test_standard_error_interleaves_with_standard_output_as_bash_does(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  t.isTrue(shell != "", "the shell was built");
+  if (shell == "") { return t.report(); }
+  ChildEnv e = cleared(sys.env());
+  string script = "echo one; nope; echo two";
+  // Both streams into one file is the only way to observe their order, and bash does the redirecting.
+  string dir = flatten(sys.env().cwd().wait()).unwrap() + "/.cache/bashlive";
+  sys.files().mkdir(dir, true).wait();
+  string[] theirs = bothStreams(sys, e, "bash", script, dir + "/order-bash");
+  string[] ours = bothStreams(sys, e, shell, script, dir + "/order-ours");
+  t.eqI32(ours.len(), 3, "three lines from ours");
+  t.eqI32(complaintAt(ours), complaintAt(theirs), "the complaint lands where bash's does");
+  t.eqI32(complaintAt(ours), 1, "between the two outputs");
+  if (ours.len() == 3) {
+    t.eqStr(ours[0], "one", "the first line");
+    t.eqStr(ours[2], "two", "the last line");
+  }
+  // A diagnostic naming a file whose bytes are not UTF-8 reaches standard error unchanged.
+  Said odd = run(procs, e, shell, ["-c", "ls $(printf '\\xff\\xfe')"], "");
+  bool ff = false;
+  bool fe = false;
+  for (i32 i = 0; i < odd.err.len(); i++) {
+    if (odd.err[i] == 255 as u8) { ff = true; }
+    if (odd.err[i] == 254 as u8) { fe = true; }
+  }
+  t.isTrue(ff && fe, "the bytes 0xff 0xfe reached standard error unchanged");
+  return t.report();
+}
+
+/**
+ * The shell's own standard input, which the corpus never feeds (issue 0032: `printf x | sh -c 'cat'` printed nothing).
+ * The same bytes to both, compared on output and status. `cat; cat` is not here: in this package `cat` is a wac
+ * function handed a byte array, so it cannot leave the rest for the next one; the spawned case is box's.
+ */
+export string test_the_shell_reads_its_own_standard_input_as_bash_does(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  ChildEnv e = cleared(sys.env());
+  string drain = "while read l; do echo \"$l\"; done";
+  string[][] cases = [
+    [drain, "a b c\nd\n"],
+    ["read x; echo \"[$x]\"; " + drain, "a b c\nd\n"],
+    ["echo hi; " + drain, "kept\n"],
+    ["read x; read y; echo \"[$x][$y]\"", "one\ntwo\nthree\n"],
+    [drain, ""],
+    ["read x; echo \"[$x]\"", ""],
+    ["while read line; do echo \"got $line\"; done", "a\nb\nc\n"],
+    ["echo before; " + drain + "; echo after", "middle\n"]
+  ];
+  for (string[] c in cases) {
+    Said theirs = run(procs, e, "bash", ["-c", c[0]], c[1]);
+    Said ours = run(procs, e, shell, ["-c", c[0]], c[1]);
+    t.eqStr(ours.out, theirs.out, c[0] + " over " + c[1]);
+    t.eqI32(ours.status, theirs.status, c[0] + ": exit status");
+  }
+  // A script *read from* standard input consumes it: a command inside has nothing left.
+  string script = "read x; echo \"[$x]\"\n";
+  t.eqStr(run(procs, e, shell, string[](), script).out, run(procs, e, "bash", string[](), script).out, "a script from stdin");
+  return t.report();
+}
+
+/** A fresh directory under `.cache/bashlive`, emptied first. */
+string freshDir(Sys sys, string name) {
+  string d = flatten(sys.env().cwd().wait()).unwrap() + "/.cache/bashlive/" + name;
+  sys.files().remove(d, true).wait();
+  sys.files().mkdir(d, true).wait();
+  return d;
+}
+
+/**
+ * `HOME` and `OLDPWD`, which every case above runs without — set to directories of the test's own, so the answer is
+ * still the shell's and not the machine's. `~` is here for the same reason: with `HOME` unset bash reads the password
+ * file, and `echo ~` would be the container's answer.
+ */
+export string test_home_and_oldpwd_reach_cd_and_tilde_as_they_do_in_bash(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  string home = freshDir(sys, "home");
+  string old = freshDir(sys, "old");
+  string from = freshDir(sys, "from");
+  ChildEnv e = cleared(sys.env()).set("HOME", home).set("OLDPWD", old);
+  string[] cases = [
+    "cd; pwd", "cd -", "cd \"\"; pwd", "cd; cd -; pwd", "HOME=; cd; pwd", "cd nowhere; pwd", "cd; echo st=$?",
+    "echo ~", "echo ~/x", "echo \"~\"", "echo \\~", "echo a~", "echo ~a", "echo ~/x ~", "echo ~:~", "echo ~:x",
+    "echo ~=x", "echo ~/a:~/b", "echo \"a~\"~", "x=~/a; echo $x", "y=/u:~/b; echo $y", "v=~:~; echo $v",
+    "z=~; echo $z/y", "cd ~; pwd", "echo hi > ~/f; ls ~/f"
+  ];
+  for (string c in cases) {
+    Said theirs = runIn(procs, e, from, "bash", ["-c", c], "");
+    Said ours = runIn(procs, e, from, shell, ["-c", c], "");
+    t.eqStr(ours.out, theirs.out, c + ": output");
+    t.eqI32(ours.status, theirs.status, c + ": exit status");
+  }
+  return t.report();
+}
+
+/** A file that cannot be read is reported in GNU's own words — `ls`'s, the one builtin this binary has for it. */
+export string test_a_file_that_cannot_be_read_is_reported_in_gnus_own_words(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  string dir = freshDir(sys, "unread");
+  ChildEnv e = cleared(sys.env());
+  for (string c in ["ls nosuchthing"]) {
+    string theirs = trimmed(string.fromBytes(runIn(procs, e, dir, "bash", ["-c", c], "").err));
+    string ours = trimmed(string.fromBytes(runIn(procs, e, dir, shell, ["-c", c], "").err));
+    t.eqStr(ours, theirs, c);
+  }
+  return t.report();
+}
+
+/**
+ * `cd`'s diagnostics, the shell's own and still `strerror`'s words. bash names itself and the line, ours names itself:
+ * **mapped rather than stripped** (`sameName`), so this still checks that a builtin's error carries `sh: `.
+ */
+export string test_cd_fails_in_strerrors_words_as_bashs_does(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  ChildEnv e = cleared(sys.env());
+  for (string c in ["cd /nosuchdir", "cd /etc/passwd", "cd /nosuchdir; echo st=$?"]) {
+    Said theirs = run(procs, e, "bash", ["-c", c], "");
+    Said ours = run(procs, e, shell, ["-c", c], "");
+    t.eqStr(trimmed(sameName(string.fromBytes(ours.err))), trimmed(sameName(string.fromBytes(theirs.err))), c + ": stderr");
+    t.eqStr(ours.out, theirs.out, c + ": output");
+  }
+  return t.report();
+}
+
+/** After the last `: `, which is the reason a person reads; a prefix may differ in shape, the reason may not. */
+string reasonOf(string line) {
+  i32 last = 0 - 1;
+  for (i32 i = 0; i + 1 < line.len(); i++) { if (line.slice(i, i + 2) == ": ") { last = i; } }
+  return last < 0 ? line : line.slice(last + 2, line.len());
+}
+
+/** `mkdir` and `rm`, the builtins GNU also ships as programs, say GNU's reason when they fail. */
+export string test_mkdir_and_rm_say_what_gnu_says_when_they_fail(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  string dir = freshDir(sys, "diag");
+  sys.files().mkdir(dir + "/full/inner", true).wait();
+  sys.files().mkdir(dir + "/taken", true).wait();
+  ChildEnv e = cleared(sys.env());
+  for (string c in ["mkdir taken", "rm nosuchthing", "rm full"]) {
+    string theirs = trimmed(string.fromBytes(runIn(procs, e, dir, "bash", ["-c", c], "").err));
+    string ours = trimmed(string.fromBytes(runIn(procs, e, dir, shell, ["-c", c], "").err));
+    t.eqStr(reasonOf(ours), reasonOf(theirs), c + " — ours: " + ours + " — theirs: " + theirs);
+  }
+  return t.report();
+}
+
+/**
+ * `kill`, against bash: ending the shell and the status for each signal (`128 + n`), a loop the signal has to reach,
+ * the signals ignored by default, the probe, and every way of getting it wrong.
+ */
+export string test_kill_says_and_does_what_bashs_does(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  ChildEnv e = cleared(sys.env());
+  string[] cases = [
+    "kill $$; echo not-reached", "kill -TERM $$; echo no", "kill -INT $$", "kill -9 $$", "kill -HUP $$",
+    "kill -s TERM $$; echo no", "echo a; kill -INT $$; echo b",
+    "i=0; while true; do i=$((i+1)); if [ $i = 3 ]; then kill -INT $$; fi; done; echo no",
+    "for x in 1 2 3; do echo $x; kill -TERM $$; done; echo no",
+    "kill -CHLD $$; echo alive=$?", "kill -WINCH $$; echo alive=$?",
+    "kill -0 $$; echo probe=$?", "kill -0 999999; echo st=$?", "kill 999999; echo st=$?", "kill; echo st=$?",
+    "kill -QQ 1; echo st=$?", "kill abc; echo st=$?", "kill -l 9", "kill -l TERM", "kill -l INT KILL 15"
+  ];
+  // **Through a wrapper, for the status.** bash really is killed by the signal, and a signalled process has no exit
+  // code — `exec` answers -1 and carries no signal number. A parent shell's `$?` is `128 + n` for it, so each shell is
+  // run under `sh -c '"$0" -c "$1"; exit $?'`, which turns either ending into the number bash's own `$?` would show.
+  string wrap = "\"$0\" -c \"$1\"; exit $?";
+  // The wrapper says `Terminated` itself when its child dies by a signal, so what each shell printed comes from a
+  // direct run, and only the status from the wrapped one.
+  for (string c in cases) {
+    Said theirs = run(procs, e, "bash", ["-c", c], "");
+    Said ours = run(procs, e, shell, ["-c", c], "");
+    t.eqStr(ours.out, theirs.out, c + ": output");
+    t.eqStr(trimmed(sameName(string.fromBytes(ours.err))), trimmed(sameName(string.fromBytes(theirs.err))), c + ": stderr");
+    i32 theirStatus = run(procs, e, "/bin/sh", ["-c", wrap, "bash", c], "").status;
+    i32 ourStatus = run(procs, e, "/bin/sh", ["-c", wrap, shell, c], "").status;
+    t.eqI32(ourStatus, theirStatus, c + ": status");
+  }
+  return t.report();
+}
+
+/** The first `n` lines of `text`, joined back with newlines. */
+string headLines(string text, i32 n) {
+  string[] ls = linesOf(text);
+  string out = "";
+  for (i32 i = 0; i < ls.len() && i < n; i++) { out = out + (i == 0 ? "" : "\n") + ls[i]; }
+  return out;
+}
+
+/**
+ * `kill -l` names the signals bash names. **The first six rows**: bash goes on to the real-time signals, `SIGRTMIN+n`,
+ * which `proc.wac`'s table stops short of and says so; rows 1–6 are every named Linux signal, compared byte for byte.
+ */
+export string test_kill_l_names_the_signals_bash_names(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  ChildEnv e = cleared(sys.env());
+  string theirs = headLines(run(procs, e, "bash", ["-c", "kill -l"], "").out, 6);
+  string ours = headLines(run(procs, e, shell, ["-c", "kill -l"], "").out, 6);
+  t.eqStr(ours, theirs, "the first six rows of the signal table");
+  t.isTrue(theirs.indexOf("15) SIGTERM") >= 0, "bash did list the signals, so the rows above are not two empties");
+  return t.report();
+}
+
+bool allDigits(string s) {
+  if (s == "" || s.slice(0, 1) == "0") { return false; }
+  for (i32 i = 0; i < s.len(); i++) { if ("0123456789".indexOf(s.slice(i, i + 1)) < 0) { return false; } }
+  return true;
+}
+
+/**
+ * `$$` is this shell's pid and a subshell does not get a new one — bash's rule, the one that makes `kill $$` inside
+ * `( … )` reach the shell that will notice. Not compared with bash's number; two shells have two pids.
+ */
+export string test_dollar_dollar_is_this_shells_pid_and_a_subshell_keeps_it(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  ChildEnv e = cleared(sys.env());
+  string pid = trimmed(run(procs, e, shell, ["-c", "echo $$"], "").out);
+  t.isTrue(allDigits(pid), "`$$` is a pid: " + pid);
+  t.eqStr(trimmed(run(procs, e, shell, ["-c", "( echo $$ )"], "").out), pid, "a subshell reports its parent's");
+  t.eqStr(trimmed(run(procs, e, shell, ["-c", "echo $$; echo $$"], "").out), pid + "\n" + pid, "the pid does not change");
+  t.eqStr(trimmed(run(procs, e, shell, ["-c", "echo ${$-unset}"], "").out), pid, "`$$` is set, so `${$-x}` does not substitute");
+  return t.report();
+}
+
+/** Whether `script` names one of `programs` as a command — `test/corpus.ts`'s `needsProgram`, by name. */
+bool namesProgram(string script, string[] programs) {
+  string before = "|;&(`$ \t\n{";
+  string word = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+  for (string p in programs) {
+    i32 at = script.indexOf(p);
+    while (at >= 0) {
+      bool startOk = at == 0 || before.indexOf(script.slice(at - 1, at)) >= 0;
+      i32 end = at + p.len();
+      bool endOk = end == script.len() || word.indexOf(script.slice(end, end + 1)) < 0;
+      if (startOk && endOk) { return true; }
+      i32 next = script.slice(at + 1, script.len()).indexOf(p);
+      at = next < 0 ? next : at + 1 + next;
+    }
+  }
+  return false;
+}
+
+string withDir(string script, string dir) {
+  string out = "";
+  i32 at = script.indexOf("@G@");
+  string rest = script;
+  while (at >= 0) {
+    out = out + rest.slice(0, at) + dir;
+    rest = rest.slice(at + 3, rest.len());
+    at = rest.indexOf("@G@");
+  }
+  return out + rest;
+}
+
+/** Globbing, against a directory of the test's own; a quoted pattern must not glob. */
+string[] globCases() { return [
+    "echo @G@/*.txt",
+    "echo @G@/*",
+    "echo @G@/?.log",
+    "echo @G@/*.log",
+    "echo @G@/nomatch*",
+    "echo @G@/sub/*",
+    "echo @G@/a?txt",
+    "echo @G@/*.t?t",
+    "echo @G@/sub/x.*",
+    "echo \"@G@/*.txt\"",
+    "echo '@G@/*.txt'",
+    "echo @G@/\"*\".txt",
+    "x=\"@G@/*.txt\"; echo \"$x\""
+  ]; }
+
+/** `cd`, `pwd` and `ls` — moving, then doing something that has to notice where it is. */
+string[] cdCases() { return [
+    "cd @G@; pwd",
+    "cd @G@; cd sub; pwd",
+    "cd @G@/sub; cd ..; pwd",
+    "cd @G@; cd ./sub/../sub; pwd",
+    "cd /; pwd",
+    "cd /; cd ..; pwd",
+    "cd @G@; ls",
+    "cd @G@; ls sub",
+    "cd @G@; ls -a | sort",
+    "cd @G@; ls nosuchthing; echo status=$?",
+    "cd @G@; cat sub/x.txt; echo read=$?",
+    "cd @G@/sub; cat ../a.txt; echo read=$?",
+    "cd @G@; echo @G@/*.txt | tr \" \" \"\\n\" | wc -l",
+    "cd @G@; echo *.txt",
+    "cd @G@/sub; echo *.txt",
+    "cd nosuchdir; echo status=$?",
+    "cd @G@; cd nosuchdir; pwd",
+    "cd @G@; OLDPWD=; cd sub; cd - >/dev/null; pwd"
+  ]; }
+
+/** `mkdir`, `rm`, `test`'s file operators, file operands and redirections — each in a fresh directory of its own. */
+string[] workCases() { return [
+    "mkdir one; ls",
+    "mkdir -p one/two/three; ls one/two",
+    "mkdir one; mkdir one; echo status=$?",
+    "mkdir -p one; mkdir -p one; echo status=$?",
+    "mkdir one; echo hi > one/f; cat one/f",
+    "mkdir one; cd one; pwd",
+    "mkdir one; echo x > one/f; rm -r one; ls; echo status=$?",
+    "rm nothing; echo status=$?",
+    "rm -f nothing; echo status=$?",
+    "mkdir one; rm one; echo status=$?",
+    "echo x > f; test -f f && echo isfile",
+    "echo x > f; test -d f || echo notdir",
+    "mkdir one; test -d one && echo isdir",
+    "mkdir one; test -f one || echo notfile",
+    "echo x > f; test -e f && echo exists",
+    "test -e nothing || echo absent",
+    "test -f nothing; echo status=$?",
+    "echo x > f; [ -f f ] && echo bracket",
+    "echo x > f; test ! -f f; echo status=$?",
+    "test ! -f nothing && echo missing",
+    "echo x > f; test -s f && echo nonempty",
+    ": > empty; test -s empty; echo status=$?",
+    "test -s nothing; echo status=$?",
+    "echo x > f; test -h f; echo status=$?",
+    "test -q f; echo status=$?",
+    "printf 'a\\nb\\n' > f; wc -l f",
+    "printf 'a\\nb\\n' > f; wc f",
+    "seq 1 20000 > f; wc f",
+    "seq 1 20000 > f; wc -l f",
+    "seq 1 20000 > f1; echo x > f2; wc f1 f2",
+    "seq 1 20000 > f1; echo x > f2; wc -lw f1 f2",
+    "printf 'a\\nb\\n' > f; wc -l < f",
+    "printf 'a\\nb\\n' > f; wc -l - < f",
+    "printf 'a\\nb\\n' > f; head -1 f",
+    "printf 'a\\nb\\n' > f; tail -1 f",
+    "printf 'b\\na\\n' > f; sort f",
+    "printf 'a\\na\\n' > f; uniq f",
+    "printf 'ab\\n' > f; rev f",
+    "printf 'a\\nb\\n' > f; nl f",
+    "printf 'a\\nb\\n' > f; cat f - < f",
+    "seq 1 3 > f; cat f",
+    "seq 1 3 > f; seq 4 5 > f; cat f",
+    "seq 1 5 | head -2 > f; cat f",
+    "x=$(seq 1 3 > f); echo \"[$x]\"; cat f",
+    ": > f; seq 1 3 >> f; seq 4 5 >> f; cat f",
+    "printf '' > f; wc -c < f",
+    "cat missing > f; echo status=$?; wc -c < f",
+    "seq 1 3 > sub/f; echo status=$?",
+    "echo one > f; echo two > f; wc -l < f",
+    "printf 'ab\\n' > f1; printf 'cd\\n' > f2; rev f1 f2",
+    "printf 'ab\\n' > f; rev f missing; echo status=$?",
+    "printf 'a\\nb\\n' > f; nl f missing; echo status=$?",
+    "printf 'a\\n\\nb\\n' > f1; printf '\\nc\\n' > f2; nl f1 f2",
+    "printf 'a\\na\\n' > f; uniq f",
+    "printf 'b\\na\\n' > f1; printf 'z\\n' > f2; sort f1 f2",
+    "printf 'b\\na\\n' > f; sort - f < f",
+    "printf 'a\\nb\\n' > f; cat missing f; echo status=$?",
+    "printf 'a\\nb\\n' > f; cat f missing; echo status=$?",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; cat f1 missing f2; echo status=$?",
+    "printf 'a\\nb\\n' > f; cat -n f; echo status=$?",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; cat -n f1 f2",
+    "printf 'a\\n\\n' > f1; printf '\\nc\\n' > f2; cat -s f1 f2",
+    "printf 'a\\nb\\n' > f; cat -n f - < f",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; wc -l f1 f2",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; wc f1 f2",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; wc -c f1 f1",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; head -1 f1 f2",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; tail -n 1 f1 f2",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; nl f1 f2",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; sort f1 f2",
+    "printf 'ab\\n' > f1; printf 'c\\n' > f2; rev f1 f2",
+    "printf 'a\\nb\\n' > f; grep a f",
+    "printf 'a\\nb\\n' > f; grep -c a f",
+    "printf 'a\\nb\\n' > f; grep -n a f",
+    "printf 'a\\nb\\n' > f; grep -v a f",
+    "printf 'a\\nb\\n' > f; grep -cv a f",
+    "printf 'Apple\\nbanana\\napple\\n' > f; grep -i apple f",
+    "printf 'Apple\\nbanana\\napple\\n' > f; grep -in a f",
+    "printf 'Apple\\napple\\n' > f; grep -x apple f",
+    "printf 'a\\nb\\n' > f; grep -q a f; echo status=$?",
+    "printf 'a\\nb\\n' > f; grep -q z f; echo status=$?",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; grep a f1 f2",
+    "printf 'a\\nb\\n' > f1; printf 'c\\n' > f2; grep -c a f1 f2",
+    "grep a missing; echo status=$?",
+    "wc -l missing; echo status=$?",
+    "head -1 missing; echo status=$?",
+    "tail -1 missing; echo status=$?",
+    "sort missing; echo status=$?",
+    "uniq missing; echo status=$?",
+    "rev missing; echo status=$?",
+    "nl missing; echo status=$?",
+    "wc -l missing1 missing2; echo status=$?",
+    "printf 'c\\n' > f2; nl missing f2; echo status=$?",
+    "printf 'c\\n' > f2; rev missing f2; echo status=$?",
+    "printf 'c\\n' > f2; sort missing f2; echo status=$?",
+    "printf 'c\\n' > f2; grep c missing f2; echo status=$?",
+    "printf 'a\\nb\\n' > f; wc -l f missing; echo status=$?",
+    "printf 'a\\nb\\n' > f; head -1 f missing; echo status=$?",
+    "echo x | wc -Z; echo status=$?",
+    "echo x | sort -Z; echo status=$?",
+    "echo x | grep -Y x; echo status=$?",
+    "echo x | uniq -Z; echo status=$?",
+    "echo x | head -Z; echo status=$?",
+    "echo x | tail -Z; echo status=$?",
+    "echo x | nl -Z; echo status=$?",
+    "echo x | rev -Z; echo status=$?"
+  ]; }
+
+/**
+ * **The generated cases, which ran nowhere for a while.** `differential.test.ts` built these against directories of
+ * its own and pushed them onto a list that, once the corpus moved to captured vectors, nothing read — so globbing,
+ * `cd` and the writing cases stopped being compared with bash without anything failing. Restored here, live, because
+ * each needs a directory the capture cannot carry; those naming a program this package has given up are left to box.
+ */
+export string test_globbing_cd_and_the_writing_cases_agree_with_bash(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) { return t.report(); }
+  string shell = wacsh(sys);
+  if (shell == "") { t.fail("the shell was not built"); return t.report(); }
+  string[] gone = programs();
+  ChildEnv e = cleared(sys.env());
+  string g = freshDir(sys, "glob");
+  for (string n in ["a.txt", "b.txt", "c.log", ".hidden"]) { sys.files().writeFile(g + "/" + n, u8[]()).wait(); }
+  sys.files().mkdir(g + "/sub", true).wait();
+  sys.files().writeFile(g + "/sub/x.txt", u8[]()).wait();
+  i32 compared = 0;
+  string here = freshDir(sys, "glob-cwd");
+  for (string raw in globCases()) {
+    string c = withDir(raw, g);
+    Said theirs = runIn(procs, e, here, "bash", ["-c", c], "");
+    Said ours = runIn(procs, e, here, shell, ["-c", c], "");
+    t.eqStr(ours.out, theirs.out, raw + ": output");
+    t.eqI32(ours.status, theirs.status, raw + ": status");
+    compared = compared + 1;
+  }
+  for (string raw in cdCases()) {
+    if (namesProgram(raw, gone)) { continue; }
+    string c = withDir(raw, g);
+    Said theirs = runIn(procs, e, here, "bash", ["-c", c], "");
+    Said ours = runIn(procs, e, here, shell, ["-c", c], "");
+    t.eqStr(ours.out, theirs.out, raw + ": output");
+    t.eqI32(ours.status, theirs.status, raw + ": status");
+    compared = compared + 1;
+  }
+  // **One directory, emptied between the two halves**, so a case that prints a path prints the same one from both and
+  // neither shell sees the other's leftovers.
+  for (string raw in workCases()) {
+    if (namesProgram(raw, gone)) { continue; }
+    string dir = freshDir(sys, "work");
+    Said theirs = runIn(procs, e, dir, "bash", ["-c", "cd " + dir + "; " + raw], "");
+    dir = freshDir(sys, "work");
+    Said ours = runIn(procs, e, dir, shell, ["-c", "cd " + dir + "; " + raw], "");
+    t.eqStr(ours.out, theirs.out, raw + ": output");
+    t.eqI32(ours.status, theirs.status, raw + ": status");
+    compared = compared + 1;
+  }
+  t.isTrue(compared > 30, "only \{compared} generated cases were compared");
+  return t.report();
+}

@@ -19,7 +19,7 @@ import "../../../harness/spawnRetry.ts";
 // table is allowed to be a memory of what was true when it was written.
 //
 // The behavioural half is deliberately small: a handful of spawns to prove the sentences reach a caller.
-// `packages/sh/test/gaps.test.ts` explains why a per-option sweep is not worth 350 processes, and the
+// `packages/sh/test/wac/gaps_test.wac` explains why a per-option sweep is not worth 350 processes, and the
 // property it would check is the one the table check above already establishes.
 
 /** Local, because this repo has no third-party dependencies. */

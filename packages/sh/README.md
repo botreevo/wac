@@ -20,10 +20,11 @@ Three sections carry most of what a reader wants: [What it does](#what-it-does) 
 
 ## The oracle is bash
 
-`test/corpus.ts` holds **946** scripts. `test/differential.test.ts` runs the **645** of them that
-name no program this package has given up — plus thirteen globbing cases it builds against a
-directory of its own — through GNU bash and through this, and requires the same standard output
-*and* the same exit status. `packages/box/test/wac/corpus_test.wac` runs the other **301**, the ones
+`test/corpus.ts` holds **946** scripts. `test/wac/corpus_test.wac` replays the **645** of them that
+name no program this package has given up against bash's answers, captured once by `tools/wac/shvectors.wac`, and
+requires the same standard output *and* the same exit status. `test/wac/bashlive_test.wac` asks bash live about what a
+capture cannot hold — stream order, the shell's own input, `cd` and `~`, `kill` — and runs the generated cases that need
+a directory: thirteen globbing patterns, fourteen `cd` cases and twenty-four writing ones. `packages/box/test/wac/corpus_test.wac` runs the other **301**, the ones
 naming one of the eleven programs that moved to `packages/box` (0103), through a shell built with
 those applets. Between them every script in the corpus is compared with bash. The three counts are
 read out of this paragraph and checked against `corpus.ts` by `tools/wac/designclaims_test.wac`, because
@@ -223,7 +224,7 @@ naming an external program run in `packages/box`, against a shell that has them.
 `grep` was on that list until it was used by hand. It matched **substrings**, and the comment above it
 said so — "`packages/regex` is the obvious next step and is not wired" — which helped nobody: `grep '^h'`
 answered *nothing matched*, silently, and so did every other metacharacter a person types. That is the
-worst of the three answers this shell ranks in `test/gaps.test.ts`, and it was being given by the one
+worst of the three answers this shell ranks in `test/wac/gaps_test.wac`, and it was being given by the one
 program most likely to be handed a pattern. `packages/regex` is not `packages/box`, so there was never
 anything in the way of importing it. It is wired now, `-i` and `-x` fold into the compiled pattern, a
 pattern that will not compile is a usage error rather than "no lines matched", and the engine giving up
@@ -276,7 +277,7 @@ So the two messages are two different facts. A letter GNU has not got either kee
 `wc: invalid option -- 'Z'`. A letter GNU has and this does not says so: `wc: -m is not implemented`,
 `grep: -E is not implemented`, `test: -r is not implemented`, `sh: redirecting fd 2 is not
 implemented`. `gnuHas` in `program.wac` holds the letters, read out of the tools' own `--help`, and
-`test/gaps.test.ts` asserts the property against the installed coreutils: **no option GNU has is ever
+`test/wac/gaps_test.wac` asserts the property against the installed coreutils: **no option GNU has is ever
 called invalid.** It fails if the table drifts, and it fails if a new refusal picks the wrong wording.
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
@@ -453,7 +454,7 @@ foreground is the builtin and behind `&` it is `box`'s applet. They agree today,
 stop, this is why.
 
 Both of those said `No such file or directory` until 2026-08-11 — a name this shell has, reported as
-a name that is not there. `packages/sh/test/gaps.test.ts` holds the property: nothing in that table
+a name that is not there. `packages/sh/test/wac/gaps_test.wac` holds the property: nothing in that table
 may answer with that sentence.
 [0135](../../issues/system/open/0135-a-background-job-runs-the-name-as-an-external-program-so-no-builtin-can-be-backgrounded.md)
 is open for the gap itself, and records why the obvious fix — spawn `sh -c` — is not one: in
@@ -633,7 +634,7 @@ Saying so was the *only* thing it did right. `echo hi 2>/dev/null` printed that 
 **swallowed `hi` and exited 0**: `writeTo` answered true for a descriptor it cannot write, which told
 both of its callers that the output had gone to a file, so it went nowhere. A comment directly above it
 read "said, not silently skipped" while the code silently skipped it. It answers false now, the output
-goes where it would have gone, and `test/gaps.test.ts` fails if it stops doing so.
+goes where it would have gone, and `test/wac/gaps_test.wac` fails if it stops doing so.
 
 That was the state when the *refusal* was the whole feature. `ls missing 2> err` writes the
 diagnostic to `err` today, and `ls missing 2>&1 | cat` pipes it.

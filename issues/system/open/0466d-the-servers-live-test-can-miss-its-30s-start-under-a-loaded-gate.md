@@ -35,3 +35,10 @@ is another (that would usually log an error, though). Nobody has told them apart
 
 Also on the porting list: `serve.ts` is a TypeScript server the policy of 2026-11-11 would have be wac, which would
 remove the cold Deno start from this path altogether.
+
+## Again, 2026-11-11, in another package
+
+The gate for bd9165da8 failed `packages/http/test/wac/interop_test.wac`'s `test_wac_client_to_wac_server_the_loop_closes`
+the same way — *"the wac server never listened: "*, the log empty — and the file passed alone, 5 of 5. Earlier the same
+day it had failed once more and passed on a rerun. Two packages, one shape: a server started from a test that prints
+nothing before the test gives up, under a loaded gate. The fix is likely shared.

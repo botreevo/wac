@@ -26,21 +26,36 @@ function assertEquals<T>(a: T, b: T, msg?: string): void {
  * frame — an opaque origin, as reckon's app loader is.
  */
 function serve(dir: string): { port: number; stop(): Promise<void> } {
+  const hung: ReturnType<typeof setTimeout>[] = [];
   const server = Deno.serve({ port: 0, onListen: () => {} }, async (req) => {
     const url = new URL(req.url);
     const name = url.pathname.replace(/^\/+/, "");
     if (name === "frame.html") {
       const page = url.searchParams.get("page") ?? "";
-      return new Response(`<!doctype html><iframe id="app" sandbox="allow-scripts" src="/${page}?a=one"></iframe>`,
+      const query = url.searchParams.get("q") ?? "a=one";
+      return new Response(`<!doctype html><iframe id="app" sandbox="allow-scripts" src="/${page}?${query}"></iframe>`,
         { headers: { "content-type": "text/html; charset=utf-8" } });
     }
+    // For `wac.http` from the frame, whose origin is opaque: a cross-origin request, so the answer says it may be read.
+    const cors = { "access-control-allow-origin": "*" };
+    if (name === "ok") return new Response("hello", { headers: cors });
+    if (name === "hang") {
+      // Longer than any deadline here, and short enough to let the server stop.
+      await new Promise((r) => hung.push(setTimeout(r, 3000)));
+      return new Response("late", { headers: cors });
+    }
+    const type = name.endsWith(".js") ? "text/javascript" : name.endsWith(".wasm") ? "application/wasm"
+      : name.endsWith(".json") ? "application/json" : "text/html; charset=utf-8";
     try {
-      return new Response(await Deno.readFile(`${dir}/${name}`), { headers: { "content-type": "text/html; charset=utf-8" } });
+      return new Response(await Deno.readFile(`${dir}/${name}`), { headers: { "content-type": type, ...cors } });
     } catch {
       return new Response("no", { status: 404 });
     }
   });
-  return { port: (server.addr as Deno.NetAddr).port, stop: () => server.shutdown() };
+  return {
+    port: (server.addr as Deno.NetAddr).port,
+    stop: async () => { for (const h of hung) clearTimeout(h); await server.shutdown(); },
+  };
 }
 
 Deno.test({
@@ -81,6 +96,36 @@ Deno.test({
       await waitInPage(frame, "(document.getElementById('out')?.textContent ?? '') !== ''", null, { timeout: 30_000 });
       const said = await frame.evaluate("document.getElementById('out').textContent") as string;
       if (!said.includes("only an `async` main runs without waiting")) throw new Error(`a sync main, unisolated: ${said}`);
+
+      // **`wac.http` with a deadline** (`issues/system/0461e`): answered, timed out at its deadline, and a blocking
+      // request refused rather than left waiting for ever.
+      await buildApp("packages/platform/example/unwaitingget.wac", `${dir}/get.html`, { net: true }, "browser");
+      const q = encodeURIComponent(`a=${encodeURIComponent(`http://127.0.0.1:${port}/ok`)}` +
+        `&a=${encodeURIComponent(`http://127.0.0.1:${port}/hang`)}`);
+      await page.goto(`http://127.0.0.1:${port}/frame.html?page=get.html&q=${q}`, { waitUntil: "load" });
+      const getFrame = page.frames()[1];
+      await waitInPage(getFrame, "(document.getElementById('out')?.textContent ?? '').includes('[exit')", null,
+        { timeout: 30_000 });
+      const got = (await getFrame.evaluate("document.getElementById('out').textContent") as string).split("\n");
+      assertEquals(got[0], "status 200 hello", "wac.http, answered");
+      assertEquals(got[1], `err 127.0.0.1: timed out after 500ms`, "wac.http, past its deadline");
+      if (!got[2].startsWith("sync err ")) throw new Error(`a blocking request on a host that cannot wait: ${got[2]}`);
+      assertEquals(got[3], "[exit 0]", "and the program finished");
+
+      // **`--layout files` in the same frame**: the page loads its worker by URL rather than from its own source.
+      await buildApp("packages/platform/example/unwaiting.wac", `${dir}/files`, {}, "browser", false, { layout: "files" });
+      await page.goto(`http://127.0.0.1:${port}/frame.html?page=files/index.html`, { waitUntil: "load" });
+      const filesFrame = page.frames()[1];
+      await waitInPage(filesFrame, "(document.getElementById('out')?.textContent ?? '').includes('[exit')", null,
+        { timeout: 30_000 }).catch(async (e: Error) => {
+          throw new Error(`${e.message}\n--layout files in an opaque frame shows: ` +
+            JSON.stringify(await filesFrame.evaluate("document.getElementById('out')?.textContent ?? document.body.innerHTML")));
+        });
+      assertEquals(
+        await filesFrame.evaluate("document.getElementById('out').textContent"),
+        "args: 1 one\nwaited without blocking\n[exit 3]\n",
+        "--layout files in an opaque frame",
+      );
     } finally {
       await browser?.close();
       await http?.stop();

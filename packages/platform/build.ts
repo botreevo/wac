@@ -676,7 +676,10 @@ async function produceApp(
         "worker",
         `import { runAsWorkerBrowser } from "${browserRuntime}";\n` +
           `runAsWorkerBrowser(async () => {\n` +
-          `  const res = await fetch(new URL("app.wasm", import.meta.url));\n` +
+          // **\`__wacBase\`, where the page said the worker really is**: started from a \`data:\` URL in an opaque frame
+          // (\`entryBrowser.ts\` \`runInPageAsync\`), \`import.meta.url\` is that URL and resolves nothing beside it.
+          `  const base = (globalThis as unknown as { __wacBase?: string }).__wacBase ?? import.meta.url;\n` +
+          `  const res = await fetch(new URL("app.wasm", base));\n` +
           `  if (!res.ok) throw new Error("app.wasm: " + res.status);\n` +
           `  (globalThis as unknown as { __wacWasm: Uint8Array }).__wacWasm = new Uint8Array(await res.arrayBuffer());\n` +
           `  return await import("${modPath}") as unknown as Parameters<Parameters<typeof runAsWorkerBrowser>[0]>[0];\n` +

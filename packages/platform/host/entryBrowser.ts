@@ -34,6 +34,8 @@ type StartAsync = {
   http?: boolean;
   cwd?: string;
   has: { write: boolean; writeErr: boolean; warn: boolean; closeOutput: boolean };
+  /** Where the worker's file really is, when it was started from its source instead (an opaque frame). */
+  base?: string;
 };
 /** What an async worker sends the page besides its result. */
 type Said = { said: "write" | "writeErr"; bytes: Uint8Array } | { said: "warn"; line: string } | { said: "close"; toErr: boolean };
@@ -83,6 +85,7 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
 /** The worker half without shared memory: the program and its host in this worker (`asynchost.ts`). */
 function runAsyncWorker(start: StartAsync, load: () => Promise<AppModule>, post: (m: unknown) => void): void {
   const say = (m: Said) => post(m);
+  if (start.base !== undefined) (globalThis as unknown as { __wacBase?: string }).__wacBase = start.base;
   void (async () => {
     try {
       const app = await load() as unknown as Record<string, unknown>;
@@ -175,14 +178,24 @@ async function runInPageAsync(opts: PageOptions): Promise<number> {
   if (opts.workerSource === undefined && opts.workerUrl === undefined) {
     throw new Error("runInPage: neither a worker's source nor where it is");
   }
-  // **An opaque origin refuses a module worker from a `blob:` URL** and takes one from a `data:` URL — measured in
-  // Chromium in a `sandbox="allow-scripts"` frame, which is the frame this path exists for.
+  // **An opaque origin refuses a module worker from a `blob:` URL, and one by URL from any server**, which is another
+  // origin to it — and takes one from a `data:` URL. Measured in Chromium in a `sandbox="allow-scripts"` frame, which
+  // is the frame this path exists for. So there a worker beside the page (`--layout files`) is fetched — a CORS read
+  // the server allows or refuses — and started from its source, told where it really is so it finds `app.wasm`.
   const opaque = (globalThis as unknown as { origin?: string }).origin === "null";
-  const url = opts.workerSource === undefined
+  let source = opts.workerSource;
+  let base: string | undefined = undefined;
+  if (source === undefined && opaque) {
+    base = String(new URL(String(opts.workerUrl), location.href));
+    const res = await fetch(base);
+    if (!res.ok) throw new Error(`${base}: ${res.status}`);
+    source = await res.text();
+  }
+  const url = source === undefined
     ? String(opts.workerUrl)
     : opaque
-    ? "data:text/javascript;base64," + base64(new TextEncoder().encode(opts.workerSource))
-    : URL.createObjectURL(new Blob([opts.workerSource], { type: "text/javascript" }));
+    ? "data:text/javascript;base64," + base64(new TextEncoder().encode(source))
+    : URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
   const worker = new Worker(url, { type: "module" });
   try {
     return await new Promise<number>((resolve, reject) => {
@@ -211,6 +224,7 @@ async function runInPageAsync(opts: PageOptions): Promise<number> {
         http: opts.http === true,
         cwd: opts.cwd,
         has: { write: !!opts.write, writeErr: !!opts.writeErr, warn: !!opts.warn, closeOutput: !!opts.closeOutput },
+        base,
       };
       worker.postMessage(start);
     });

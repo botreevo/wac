@@ -1,0 +1,79 @@
+// What the applets say when they fail, through a shell, against bash.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/programs_test.wac
+//
+// `packages/sh`'s differential had a case list called "a file that cannot be read is reported in GNU's own words",
+// and most of it is about *programs* rather than the shell: `rev missing`, `nl missing`, `sort missing`. As
+// `packages/sh` gave its own copies up (wac-mono 0103), those cases landed somewhere that still has the commands —
+// this, through `src/bin/sh.wac`, which is the shell with these applets wired in.
+//
+// Where the message is *derivable* — GNU words it and we can word it the same — it is compared to the byte. Where
+// it is ours, because this is a gap GNU does not have, it is not comparable and is not here. bash, with the system's
+// own tools, is the oracle, run live; the shell is the one this package builds, as an executable. It was box's
+// TypeScript `programs.test.ts`, which drove both from Deno.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { freshDir, scratch } from "../../../wactest/src/host.wac";
+import { Exec, ChildEnv, Env, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+/** What a process said: its output, its error output, its status — `status` -1 when it did not start. */
+struct Said {
+  string out;
+  string err;
+  i32 status;
+}
+
+Said run(Procs procs, ChildEnv e, string dir, string cmd, string script) {
+  Exec? x = flatten(procs.exec(cmd, ["-c", script], u8[](), e, Launch(dir, false, false, false, false)).wait()).ok();
+  if (x is null) { return Said("", "", 0 - 1); }
+  return Said(string.fromBytes(x!.stdout), string.fromBytes(x!.stderr), x!.status);
+}
+
+bool haveBash(Procs procs) { return flatten(procs.exec("bash", ["-c", "exit 0"], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).isOk(); }
+
+export string test_a_file_that_cannot_be_read_is_reported_in_gnus_own_words(Sys sys) {
+  T t = T.create();
+  Env env = sys.env();
+  Procs procs = sys.procs();
+  if (!haveBash(procs)) {
+    sys.stderr().line("programs_test: skipped — no bash to compare with");
+    return t.report();
+  }
+  string built = builtApp(env, sys.files(), procs, "packages/box/src/bin/sh.wac", "programs-sh",
+                          ["--allow-read", "--allow-write", "--allow-net", "--allow-env"]);
+  string dir = scratch(env, "box-programs");
+  u8[]? path = flatten(env.get("PATH").wait()).orElse(null);
+  ChildEnv e = ChildEnv.empty().set("LC_ALL", "C").set("PATH", path is null ? "/usr/bin:/bin" : string.fromBytes(path!))
+                               .set("HOME", dir);
+
+  // Each names a file that is not there, and every tool words its complaint differently: `head` says "cannot open
+  // 'x' for reading", `sort` says "cannot read: x", `rev` says "cannot open x". The prefix is as much of the answer
+  // as the reason is.
+  string[] cases = [
+    "rev missing", "nl missing", "cat missing", "wc -l missing", "head -1 missing", "tail -1 missing",
+    "sort missing", "uniq missing", "grep x missing",
+    // …and with one operand readable, so the complaint has to land in the right place relative to the output rather
+    // than merely be produced.
+    "printf 'ab\\n' > f; rev f missing; echo status=$?",
+    "printf 'a\\nb\\n' > f; nl f missing; echo status=$?",
+    "printf 'c\\n' > f2; nl missing f2; echo status=$?",
+    "printf 'c\\n' > f2; rev missing f2; echo status=$?",
+  ];
+  for (string script in cases) {
+    // A fresh directory per case: several write `f` and `f2`, and a case that found the previous one's file would
+    // pass on the order they happened to run in.
+    t.eqStr(freshDir(sys.files(), dir), "", "a fresh directory");
+    Said want = run(procs, e, dir, "bash", script);
+    // The oracle ran and complained: two empty answers agree perfectly and test nothing.
+    t.isTrue(want.err != "", "bash said nothing on its error output for: \{script}");
+    t.eqStr(freshDir(sys.files(), dir), "", "a fresh directory");
+    Said got = run(procs, e, dir, built, script);
+    t.isTrue(want.out == got.out && want.err == got.err && want.status == got.status,
+             "script: \{script}\n  bash: out \{want.out} err \{want.err} exit \{want.status}\n" +
+             "  ours: out \{got.out} err \{got.err} exit \{got.status}");
+  }
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}

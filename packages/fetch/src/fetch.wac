@@ -24,10 +24,10 @@ import { Clock, Env, Files, Net, Random, Socket } from "std";
 import { Buf, Result, flatten } from "core";
 import { slice } from "../../bytes/src/slice.wac";
 import { Headers } from "../../http/src/headers.wac";
-import { HostHttp, HostResponse, hostHttpOf, hostRequest } from "../../http/src/hosthttp.wac";
-import { Deadline, deadlineAfter, passed, timedOut, waitFor } from "../../http/src/deadline.wac";
+import { HostHttp, HostResponse, hostHttpOf, hostRequestAsync } from "../../http/src/hosthttp.wac";
+import { Deadline, deadlineAfter, passed, settled, timedOut, waitForAsync } from "../../http/src/deadline.wac";
 import { ParsedResponse, parseResponse } from "../../http/src/incoming.wac";
-import { ProxyAt, Tunnel, connectThrough, parseProxy, proxyFor } from "../../http/src/proxy.wac";
+import { ProxyAt, Tunnel, connectThroughAsync, parseProxy, proxyFor } from "../../http/src/proxy.wac";
 import { Store, pemBundle } from "../../tls/src/roots.wac";
 import { recordsReady } from "../../tls/src/record.wac";
 import { ClientStep, clientStep, tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose,
@@ -148,7 +148,16 @@ string hostField(Target t) {
  * is refused. A `User-Agent` is sent unless the caller sends one.
  */
 export Result<Fetched, string> fetch(Caps caps, string method, string url, string[] headers, u8[] body) {
-  return fetchWithin(caps, method, url, headers, body, 0 - 1);
+  return settled(fetchWithinAsync(caps, method, url, headers, body, 0 - 1));
+}
+
+/**
+ * `fetch`, for an `async` caller (`issues/system/0461e`): the same request, awaited at each step, so several can be in
+ * flight — raced with `Ticket.any`, the losers cancelled — and a host that cannot wait (a page that is not
+ * cross-origin isolated) can run it. `fetch` is this, waited for.
+ */
+export async Result<Fetched, string> fetchAsync(Caps caps, string method, string url, string[] headers, u8[] body) {
+  return await fetchWithinAsync(caps, method, url, headers, body, 0 - 1);
 }
 
 /**
@@ -161,6 +170,12 @@ export Result<Fetched, string> fetch(Caps caps, string method, string url, strin
  */
 export Result<Fetched, string> fetchWithin(Caps caps, string method, string url, string[] headers, u8[] body,
                                            i32 timeoutMs) {
+  return settled(fetchWithinAsync(caps, method, url, headers, body, timeoutMs));
+}
+
+/** `fetchWithin`, awaited — `fetchAsync`'s reasons. */
+export async Result<Fetched, string> fetchWithinAsync(Caps caps, string method, string url, string[] headers, u8[] body,
+                                                     i32 timeoutMs) {
   Deadline d = deadlineAfter(caps.clock, timeoutMs);
   Target? parsed = parseTarget(url);
   if (parsed is null) { return Result.Err("not an http or https URL: \{url}"); }
@@ -180,7 +195,7 @@ export Result<Fetched, string> fetchWithin(Caps caps, string method, string url,
   // proxies and the trust store itself, so none of what follows applies, and what comes back is what it exposes.
   HostHttp? viaHost = hostHttpOf(caps.net);
   if (viaHost is not null) {
-    auto answered = hostRequest(viaHost!, method, url, headers, body, timeoutMs);
+    auto answered = await hostRequestAsync(viaHost!, method, url, headers, body, timeoutMs);
     if (answered.isErr()) { return Result.Err("\{t.host}: \{answered.err()!}"); }
     HostResponse r = answered.unwrap();
     return Result.Ok(Fetched(r.status, r.headers, r.body));
@@ -206,7 +221,7 @@ export Result<Fetched, string> fetchWithin(Caps caps, string method, string url,
   head.pushAll(body);
   u8[] request = head.take();
 
-  Result<u8[], string> raw = t.tls ? overTls(caps, d, t, proxy, request) : plain(caps, d, t, proxy, request);
+  Result<u8[], string> raw = t.tls ? await overTls(caps, d, t, proxy, request) : await plain(caps, d, t, proxy, request);
   if (raw.isErr()) { return Result.Err(raw.err()!); }
   u8[] got = raw.unwrap();
   if (got.len() == 0) { return Result.Err("\{t.host} closed the connection without answering"); }
@@ -218,13 +233,13 @@ export Result<Fetched, string> fetchWithin(Caps caps, string method, string url,
 }
 
 /** Every byte the socket gives until it ends. */
-Result<u8[], string> plain(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[] request) {
+async Result<u8[], string> plain(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[] request) {
   string dialHost = proxy is null ? t.host : proxy!.host;
   i32 dialPort = proxy is null ? t.port : proxy!.port;
-  auto connected = waitFor(d, caps.net.connect(dialHost, dialPort));
+  auto connected = await waitForAsync(d, caps.net.connect(dialHost, dialPort));
   if (connected.isErr()) { return Result.Err("\{dialHost}:\{dialPort}: \{connected.err()!}"); }
   Socket s = connected.unwrap();
-  if (waitFor(d, s.send(request)).isErr()) {
+  if ((await waitForAsync(d, s.send(request))).isErr()) {
     s.close();
     if (passed(d)) { return Result.Err("\{dialHost}:\{dialPort}: \{timedOut(d)}"); }
     return Result.Err("\{dialHost}:\{dialPort}: cannot send the request");
@@ -232,7 +247,7 @@ Result<u8[], string> plain(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[]
   Buf all = Buf.create();
   while (true) {
     bool done = false;
-    match (waitFor(d, s.recv())) {
+    match (await waitForAsync(d, s.recv())) {
       Ok(r): {
         match (r) {
           Data(bytes): { all.pushAll(bytes); }
@@ -253,18 +268,18 @@ Result<u8[], string> plain(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[]
  * records the three things that are easy to get wrong in it: the tunnel's leftover is fed first,
  * `tlsClientInit` takes seconds, and phase 4 after a body is a `close_notify` rather than a failure.
  */
-Result<u8[], string> overTls(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[] request) {
+async Result<u8[], string> overTls(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[] request) {
   Store store = trustStore(caps.env, caps.files);
   if (store.offsets.len() == 0) { return Result.Err("no trust store, so \{t.host} cannot be verified"); }
 
   Socket? conn = null;
   u8[] buffered = u8[]();
   if (proxy is null) {
-    auto direct = waitFor(d, caps.net.connect(t.host, t.port));
+    auto direct = await waitForAsync(d, caps.net.connect(t.host, t.port));
     if (direct.isErr()) { return Result.Err("\{t.host}:\{t.port}: \{direct.err()!}"); }
     conn = direct.unwrap();
   } else {
-    match (connectThrough(caps.net, proxy!.host, proxy!.port, t.host, t.port)) {
+    match (await connectThroughAsync(caps.net, proxy!.host, proxy!.port, t.host, t.port)) {
       Ok(open): { conn = open.socket; buffered = open.leftover; }
       Err(e): { return Result.Err(e); }
     }
@@ -273,12 +288,12 @@ Result<u8[], string> overTls(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8
 
   ClientStep s = clientStep(tlsClientInit(
     t.host.toBytes(), store.der, store.offsets,
-    flatten(caps.random.bytes(32).wait()).unwrap(),
-    flatten(caps.random.bytes(32).wait()).unwrap(),
-    flatten(caps.random.bytes(64).wait()).unwrap(),
-    flatten(caps.random.bytes(32).wait()).unwrap(),
-    flatten(caps.clock.nowMillis().wait()).unwrap() / 1000));
-  if (waitFor(d, sock.send(s.toSend)).isErr()) {
+    (await caps.random.bytes(32)).unwrap(),
+    (await caps.random.bytes(32)).unwrap(),
+    (await caps.random.bytes(64)).unwrap(),
+    (await caps.random.bytes(32)).unwrap(),
+    (await caps.clock.nowMillis()).unwrap() / 1000));
+  if ((await waitForAsync(d, sock.send(s.toSend))).isErr()) {
     sock.close();
     if (passed(d)) { return Result.Err("\{t.host}: \{timedOut(d)}"); }
     return Result.Err("\{t.host}: cannot send the client hello");
@@ -296,7 +311,7 @@ Result<u8[], string> overTls(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8
     if (phase == 3 && !requested) {
       ClientStep out = clientStep(tlsClientSend(s.state, request));
       s = ClientStep(out.state, out.toSend, u8[]());
-      if (waitFor(d, sock.send(s.toSend)).isErr()) { break; }
+      if ((await waitForAsync(d, sock.send(s.toSend))).isErr()) { break; }
       requested = true;
     }
     i32 ready = recordsReady(buffered);
@@ -304,12 +319,12 @@ Result<u8[], string> overTls(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8
       ClientStep step = clientStep(tlsClientFeed(s.state, slice(buffered, 0, ready)));
       buffered = slice(buffered, ready, buffered.len());
       s = step;
-      if (s.toSend.len() > 0 && waitFor(d, sock.send(s.toSend)).isErr()) { break; }
+      if (s.toSend.len() > 0 && (await waitForAsync(d, sock.send(s.toSend))).isErr()) { break; }
       if (s.appData.len() > 0) { got.pushAll(s.appData); }
       continue;
     }
     bool closed = false;
-    match (waitFor(d, sock.recv())) {
+    match (await waitForAsync(d, sock.recv())) {
       Ok(r): {
         match (r) {
           Data(bytes): {

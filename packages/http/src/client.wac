@@ -15,9 +15,9 @@
 // wants a connection object with state, which is a different shape from this function.
 
 import { Clock, Net, Socket } from "std";
-import { Deadline, deadlineAfter, passed, timedOut, waitFor } from "./deadline.wac";
+import { Deadline, deadlineAfter, passed, settled, timedOut, waitForAsync } from "./deadline.wac";
 import { Incoming, ParsedResponse, parseResponse } from "./incoming.wac";
-import { HostHttp, HostResponse, hostHttpOf, hostRequest } from "./hosthttp.wac";
+import { HostHttp, HostResponse, hostHttpOf, hostRequestAsync } from "./hosthttp.wac";
 import { Result, flatten } from "core";
 
 /**
@@ -29,7 +29,17 @@ import { Result, flatten } from "core";
  * kind of detail a server is entitled to reject.
  */
 export Result<Incoming, string> request(Net net, u8[] method, string host, i32 port, string path, u8[] body, string contentType) {
-  return exchange(net, null, method, host, port, path, body, contentType);
+  return settled(requestAsync(net, method, host, port, path, body, contentType));
+}
+
+/**
+ * `request`, for an `async` caller (`issues/system/0461e`): the same request, awaited at each step rather than waited
+ * for, so several can be in flight at once — raced with `Ticket.any`, the losers cancelled — and a host that cannot
+ * wait (a page that is not cross-origin isolated) can run it. `request` is this, waited for.
+ */
+export async Result<Incoming, string> requestAsync(Net net, u8[] method, string host, i32 port, string path, u8[] body,
+                                                  string contentType) {
+  return await exchange(net, null, method, host, port, path, body, contentType);
 }
 
 /**
@@ -38,23 +48,29 @@ export Result<Incoming, string> request(Net net, u8[] method, string host, i32 p
  */
 export Result<Incoming, string> requestWithin(Net net, Clock clock, u8[] method, string host, i32 port, string path,
                                              u8[] body, string contentType, i32 timeoutMs) {
-  return exchange(net, deadlineAfter(clock, timeoutMs), method, host, port, path, body, contentType);
+  return settled(requestWithinAsync(net, clock, method, host, port, path, body, contentType, timeoutMs));
 }
 
-Result<Incoming, string> exchange(Net net, Deadline? d, u8[] method, string host, i32 port, string path, u8[] body,
+/** `requestWithin`, awaited — `requestAsync`'s reasons. */
+export async Result<Incoming, string> requestWithinAsync(Net net, Clock clock, u8[] method, string host, i32 port,
+                                                        string path, u8[] body, string contentType, i32 timeoutMs) {
+  return await exchange(net, deadlineAfter(clock, timeoutMs), method, host, port, path, body, contentType);
+}
+
+async Result<Incoming, string> exchange(Net net, Deadline? d, u8[] method, string host, i32 port, string path, u8[] body,
                                   string contentType) {
   // **The host's HTTP, where it has one** (`hosthttp.wac`): a page has no sockets, and its `fetch` is the HTTP.
   HostHttp? viaHost = hostHttpOf(net);
   if (viaHost is not null) {
     string[] fields = body.len() > 0 ? ["Content-Type: \{contentType}"] : string[]();
-    auto answered = hostRequest(viaHost!, string.fromBytes(method), "http://\{host}:\{port}\{path}", fields, body,
+    auto answered = await hostRequestAsync(viaHost!, string.fromBytes(method), "http://\{host}:\{port}\{path}", fields, body,
                                 d is null ? 0 - 1 : d!.ms);
     if (answered.isErr()) { return Result.Err("\{host}: \{answered.err()!}"); }
     HostResponse r = answered.unwrap();
     // No status line and no raw stream: the host parsed both, so there is no reason phrase and nothing consumed.
     return Result.Ok(Incoming(r.status, 1, u8[](), r.headers, r.body, 0, false));
   }
-  auto connected = waitFor(d, net.connect(host, port));
+  auto connected = await waitForAsync(d, net.connect(host, port));
   if (connected.isErr()) { return Result.Err("\{host}: \{connected.err()!}"); }
   Socket s = connected.unwrap();
 
@@ -73,7 +89,7 @@ Result<Incoming, string> exchange(Net net, Deadline? d, u8[] method, string host
   out.copyFrom(headBytes, 0, 0, headBytes.len());
   out.copyFrom(body, 0, headBytes.len(), body.len());
 
-  auto sent = waitFor(d, s.send(out));
+  auto sent = await waitForAsync(d, s.send(out));
   if (sent.isErr()) {
     s.close();
     if (d is not null && passed(d!)) { return Result.Err("\{host}: \{timedOut(d!)}"); }
@@ -84,7 +100,7 @@ Result<Incoming, string> exchange(Net net, Deadline? d, u8[] method, string host
   bool reading = true;
   string why = "";
   while (reading) {
-    match (waitFor(d, s.recv())) {
+    match (await waitForAsync(d, s.recv())) {
       Ok(r): {
         match (r) {
           Data(bytes): { all = append(all, bytes); }

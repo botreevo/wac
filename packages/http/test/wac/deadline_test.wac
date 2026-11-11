@@ -5,11 +5,13 @@
 import { T } from "../../../wactest/src/assert.wac";
 import { contains } from "../../../wactest/src/strings.wac";
 import { Clock, Listener, Net, Sys } from "std";
+import { Result, Ticket } from "core";
 import { flatten } from "core";
 // Through each package's `lib.wac`, which the root re-exports whole (`export * as http`): a name left out of
 // one is a name no dependent can reach (`from "wac"`), and importing from `client.wac` directly never noticed.
 // Not through the root `lib.wac` itself, which is outside the `packages/` corpus `corpuscheck_test` checks.
-import { requestWithin } from "../../src/lib.wac";
+import { requestAsync, requestWithin, requestWithinAsync } from "../../src/lib.wac";
+import { Incoming } from "../../src/incoming.wac";
 import { Caps, fetchWithin } from "../../../fetch/src/lib.wac";
 
 i64 now(Clock c) { return flatten(c.nowMillis().wait()).orElse(0 as i64); }
@@ -48,5 +50,36 @@ export string test_fetch_keeps_the_same_deadline(Sys sys) {
   t.isTrue(got.isErr(), "a fetch nobody answered came back Ok");
   if (got.isErr()) { t.isTrue(contains(got.err()!, "timed out after 300ms"), "the words: \{got.err()!}"); }
   t.isTrue(took >= 250 as i64 && took < 5000 as i64, "gave up after \{took}ms, not near 300");
+  return t.report();
+}
+
+/**
+ * **Two requests at once, and the first answer wins** (`issues/system/0461e`): `requestAsync` hands back a ticket
+ * rather than waiting, so a caller can hold several — mirrors, say — race them with `Ticket.any` and cancel the
+ * losers. Neither server here answers; the one with a 200ms deadline gives up first, while the other is still in
+ * flight, and is cancelled. Waited for one after the other, the deadline could not come first.
+ */
+export async string test_two_requests_race_and_the_loser_is_cancelled(Sys sys) {
+  T t = T.create();
+  Net net = sys.net();
+  Clock clock = sys.clock();
+  auto bound = flatten(net.listen("127.0.0.1", 0).wait());
+  if (bound.isErr()) { t.fail("could not listen: \{bound.err()!}"); return t.report(); }
+  Listener l = bound.unwrap();
+
+  i64 began = now(clock);
+  Ticket<Result<Incoming, string>> slow = requestAsync(net, "GET".toBytes(), "127.0.0.1", l.port, "/slow", u8[](), "");
+  Ticket<Result<Incoming, string>> quick = requestWithinAsync(net, clock, "GET".toBytes(), "127.0.0.1", l.port, "/quick",
+                                                              u8[](), "", 200);
+  await Ticket.any(slow, quick);
+  i64 took = now(clock) - began;
+  t.isTrue(quick.settled(), "the deadline answered first");
+  t.isFalse(slow.settled(), "the other request was still in flight");
+  if (quick.settled()) {
+    Result<Incoming, string> r = quick.value();
+    t.isTrue(r.isErr() && contains(r.err()!, "timed out after 200ms"), "the winner's answer is its timeout");
+  }
+  slow.cancel();
+  t.isTrue(took >= 150 as i64 && took < 5000 as i64, "decided after \{took}ms, not near 200");
   return t.report();
 }

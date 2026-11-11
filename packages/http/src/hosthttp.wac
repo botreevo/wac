@@ -12,6 +12,7 @@
 import { Answer, Capability, FAULT_NONE, Net } from "std";
 import { Buf, Result, flatten } from "core";
 import { Headers } from "./headers.wac";
+import { settled } from "./deadline.wac";
 
 /** `wac.http` on a `Net`'s host, as `capability` answered it: its requests are `cap.base` and the two after. */
 export struct HostHttp {
@@ -44,6 +45,12 @@ export struct HostResponse {
  */
 export Result<HostResponse, string> hostRequest(HostHttp h, string method, string url, string[] headers, u8[] body,
                                                i32 timeoutMs) {
+  return settled(hostRequestAsync(h, method, url, headers, body, timeoutMs));
+}
+
+/** `hostRequest`, awaited: what a host that cannot wait runs, and what a caller racing several holds. */
+export async Result<HostResponse, string> hostRequestAsync(HostHttp h, string method, string url, string[] headers,
+                                                         u8[] body, i32 timeoutMs) {
   Buf req = Buf.create();
   for (string line in headers) {
     if (line.indexOf("\r") >= 0 || line.indexOf("\n") >= 0) { return Result.Err("a header field holds a line break"); }
@@ -53,19 +60,12 @@ export Result<HostResponse, string> hostRequest(HostHttp h, string method, strin
   req.pushStr("\r\n");
   req.pushAll(body);
   // The deadline rides in `b` (`hosthttp.ts`): the host aborts its `fetch` at it, body reads included. -1 is none.
-  auto opened = h.net.ask(h.cap.base, 0 as i64, timeoutMs as i64, "\{method} \{url}", req.take()).wait();
-  if (opened.isErr()) { return Result.Err("wac.http: the request was not answered"); }
-  Answer a = opened.unwrap();
+  Answer a = await h.net.ask(h.cap.base, 0 as i64, timeoutMs as i64, "\{method} \{url}", req.take());
   if (a.fault != FAULT_NONE()) { return Result.Err(a.text); }
   i64 handle = a.n;
   Buf got = Buf.create();
   while (true) {
-    auto read = h.net.ask(h.cap.base + 1, handle, 0 as i64, "", u8[]()).wait();
-    if (read.isErr()) {
-      h.net.ask(h.cap.base + 2, handle, 0 as i64, "", u8[]());
-      return Result.Err("wac.http: a read of the body was not answered");
-    }
-    Answer r = read.unwrap();
+    Answer r = await h.net.ask(h.cap.base + 1, handle, 0 as i64, "", u8[]());
     if (r.fault != FAULT_NONE()) { return Result.Err(r.text); }
     if ((r.flags & 1) != 0) { break; }
     got.pushAll(r.bytes);

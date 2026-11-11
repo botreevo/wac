@@ -420,7 +420,7 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
   // Listed here with that argument rather than left to be rediscovered. Checked, not assumed: gutting
   // `tenths` fails the live test, which is where the ratio it formats is now asserted against the two
   // lengths that test already knows. What would remove these entries is a way to run one test file with
-  // blanket permissions from inside a sweep — the lane machinery in `harness/testLane.ts` is the obvious
+  // blanket permissions from inside a sweep — the lane machinery in harness/testLane.ts (deleted 2026-11-11) is the obvious
   // place for it, and it is not built.
   {
     name: "extreme/box/example/hash/page",

@@ -22,8 +22,9 @@ export WAC_SUITE_RUNNING=1
 # and does not type-check. That is why the table this writes had gone stale: the instrument stopped
 # running at all, silently, and nothing re-ran it to notice (issues/system 0142).
 #
-# The lane list comes from `harness/testLane.ts`, which is where `runTests.wac` gets it, so a file that
-# declares itself exclusive leaves this measurement the same day. `site` is named because a
+# The lane list comes from `runTests.wac declared` — the runner's own discovery, so a file that declares itself
+# exclusive leaves this measurement the same day. (It was the deleted harness/testLane.ts's declaredLaneFiles, a TypeScript copy
+# of that walk which had drifted: it never walked `bootstrap/`.) `site` is named because a
 # command-line `--ignore` *replaces* the config's exclude rather than adding to it.
 #
 # **Both lanes, and the second one is why this comment now says "lanes".** When the heavy lane was
@@ -32,7 +33,7 @@ export WAC_SUITE_RUNNING=1
 # `DENO_JOBS` from. Taking the list from `testLane.ts` was supposed to stop exactly that, and did
 # not, because it asked for one lane by name. It now asks for every declared file, so a *third* lane
 # would be picked up without anyone remembering this line exists.
-IGNORE=$(deno eval --ext=ts 'import { declaredLaneFiles } from "./harness/testLane.ts"; console.log(["site", ...(await declaredLaneFiles())].join(","));')
+IGNORE=$( { echo site; ./native/v8/target/release/wac run --allow-read --allow-env tools/runTests.wac -- declared; } | paste -sd, -)
 if [ -z "$IGNORE" ]; then
   echo "ABORT: could not work out which files the parallel pass runs."
   exit 1

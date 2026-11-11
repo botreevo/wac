@@ -1,0 +1,214 @@
+// `packages/box/src/bin/sh.wac` — the shell with every applet in this package as a command, each run as a spawned
+// child: its own instance, its own grants, its own two streams.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/spawnshell_test.wac
+//
+// The three things that can go wrong with that are all here — the program has to be able to be its own applets, the
+// child has to stand where the shell stands, and a child's error output must not arrive in the pipe — and with them
+// the streaming that a spawned stage makes possible. Compared against bash where the answer is bash's; `packages/sh`
+// has the language, this is the *wiring*. It was box's TypeScript `shell.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains, trimmed } from "../../../wactest/src/strings.wac";
+import { ChildEnv, Exec, Launch, Sys, TimedOut } from "std";
+import { flatten } from "core";
+
+struct Said {
+  string out;
+  string err;
+  i32 status;
+  bool hung;
+}
+
+struct Rig {
+  string shell;
+  string dir;
+}
+
+Rig rig(Sys sys, string name) {
+  string dir = scratch(sys.env(), "box-shell-\{name}");
+  freshDir(sys.files(), dir);
+  return Rig(builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sh.wac", "spawnshell-sh",
+                      ["--allow-read", "--allow-write", "--allow-env"]), dir);
+}
+
+/** `cmd args`, given `input`, in `cwd`, given at most `ms` — a run that never returns is a result, not a wedge. */
+async Said execIn(Sys sys, string cmd, string[] args, string input, string cwd, i32 ms) {
+  auto got = await sys.clock().within(sys.procs().exec(cmd, args, input.toBytes(), ChildEnv.inherited(),
+                                                       Launch(cwd, false, false, false, false)), ms);
+  if (got.isErr()) { return Said("", "\{got.err()!}", 0 - 1, got.err()! is TimedOut); }
+  Exec x = got.unwrap();
+  return Said(string.fromBytes(x.stdout), string.fromBytes(x.stderr), x.status, false);
+}
+
+async Said sh(Sys sys, Rig r, string script, string input) { return await execIn(sys, r.shell, ["-c", script], input, r.dir, 60000); }
+async Said bash(Sys sys, Rig r, string script, string input) { return await execIn(sys, "bash", ["-c", script], input, r.dir, 60000); }
+
+string lastLine(string s) {
+  string x = trimmed(s);
+  i32 at = -1;
+  for (i32 i = 0; i < x.len(); i++) { if (x.slice(i, i + 1) == "\n") { at = i; } }
+  return x.slice(at + 1, x.len());
+}
+
+export async string test_the_shells_applets_are_programs_of_its_own_spawned(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "applets");
+  // The multi-call entry, used directly: this binary *is* its applets, which is what lets `spawnSelf` run them.
+  Said direct = await execIn(sys, r.shell, ["sort", "-n"], "10\n2\n33\n", r.dir, 60000);
+  t.eqStr(direct.out, "2\n10\n33\n", direct.err);
+  // And through the shell, which is the same bundle spawned again with different arguments.
+  Said piped = await sh(sys, r, "printf '10\\n2\\n33\\n' | sort -n | head -2", "");
+  t.eqStr(piped.out, "2\n10\n", piped.err);
+  t.eqI32(piped.status, 0, piped.err);
+  return t.report();
+}
+
+/** The shell's `cd` has to reach its children, or `cd sub; cat f` reads the wrong file. */
+export async string test_a_spawned_applet_stands_where_the_shell_stands(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "cwd");
+  t.eqStr(putFile(sys.files(), "\{r.dir}/sub/f.txt", "hello from sub\n"), "", "the fixture");
+  Said ours = await sh(sys, r, "cd sub; cat f.txt; pwd", "");
+  t.eqStr(ours.out, "hello from sub\n\{r.dir}/sub\n", ours.err);
+  t.eqStr(ours.out, (await bash(sys, r, "cd sub; cat f.txt; pwd", "")).out, "and bash agrees");
+  return t.report();
+}
+
+/** A child had one stream back to its parent, so `cat nosuch | wc -c` counted the complaint. It has two now. */
+export async string test_a_spawned_applets_error_output_stays_out_of_the_pipe(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "stderr");
+  Said piped = await sh(sys, r, "cat nosuchfile | wc -c", "");
+  t.eqStr(trimmed(piped.out), "0", "the pipe carried the complaint: \{piped.out}");
+  t.isTrue(contains(piped.err, "nosuchfile"), piped.err);
+  Said alone = await sh(sys, r, "cat nosuchfile", "");
+  t.eqStr(alone.out, "", "it went to standard output");
+  t.isTrue(contains(alone.err, "nosuchfile"), alone.err);
+  t.eqI32(alone.status, 1, alone.err);
+  t.eqStr(trimmed((await bash(sys, r, "cat nosuchfile | wc -c", "")).out), trimmed(piped.out), "bash counts nothing either");
+  // …and a redirection of standard error takes it, through a spawned applet whose error stream crosses the bridge.
+  Said dropped = await sh(sys, r, "cat nosuchfile 2>/dev/null; echo st=$?", "");
+  t.eqStr(dropped.err, "", "the complaint should have gone nowhere");
+  t.eqStr(dropped.out, "st=1\n", dropped.err);
+  t.eqStr(trimmed((await sh(sys, r, "cat nosuchfile 2>&1 | wc -l", "")).out), "1", "the complaint goes down the pipe");
+  return t.report();
+}
+
+/**
+ * An endless producer stops at the cap rather than filling memory (issues 0038, 0115), and the input a parent *sends*
+ * is never dropped however much there is — the first cap applied to a child's input too and lost 8 MiB in silence.
+ */
+export async string test_an_endless_producer_stops_at_the_cap_rather_than_filling_memory(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "cap");
+  Said y = await sh(sys, r, "yes | head -1; echo status=$?", "");
+  t.eqStr(y.out, "y\nstatus=0\n", y.err);
+  t.eqStr(trimmed((await sh(sys, r, "seq 1 50000 | tail -1", "")).out), "50000", "a large payload crosses intact");
+  return t.report();
+}
+
+/**
+ * …and an endless producer in a pipeline that cannot stream does not kill the shell (issue 0127). The status is the
+ * refusal's — a deliberate deviation from bash, whose rule (the last stage's) agreed here only by luck and gave
+ * `n=$(seq 1 1500000 | wc -c)` a plausible 0 with status 0.
+ */
+export async string test_an_endless_producer_in_a_pipeline_that_cannot_stream_does_not_kill_the_shell(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "nostream");
+  for (string script in ["yes | nosuchcmd; echo after=$?", "yes | x=1 cat | head -1; echo after=$?"]) {
+    Said got = await sh(sys, r, script, "");
+    t.isTrue(contains(got.out, "after="), "\{script}: the shell did not survive its own pipeline: \{got.out}\{got.err}");
+    t.isTrue(contains(got.err, "exceeded what this shell can hold"), "\{script}: nothing said the output had been cut: \{got.err}");
+  }
+  Said status = await sh(sys, r, "yes | nosuchcmd; echo after=$?", "");
+  t.eqStr(trimmed(status.out), "after=1", status.out);
+  // A pipeline the shell *can* run keeps bash's rule exactly: the last stage answers.
+  t.eqStr(lastLine((await sh(sys, r, "nosuchcmd | wc -l; echo after=$?", "")).out), "after=0", "the last stage answers");
+  // Under the cap, a pipeline that cannot stream is unaffected — the case a cap set too low would break silently.
+  t.eqStr(trimmed((await sh(sys, r, "seq 1 200000 | x=1 wc -l", "")).out), "200000", "under the cap");
+  return t.report();
+}
+
+/**
+ * A pipeline runs its stages at once, so a consumer can end a producer: `seq 1 200000 | head -1` took 11.8 s when
+ * every stage ran to completion (issue 0038). Bounded rather than timed: producing half a million lines costs well
+ * over thirty seconds and not producing them costs nothing, so fifteen tells the two apart under load.
+ */
+export async string test_a_pipeline_runs_its_stages_at_once_so_a_consumer_can_end_a_producer(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "stream");
+  Said got = await execIn(sys, r.shell, ["-c", "seq 1 500000 | head -1"], "", r.dir, 15000);
+  t.isFalse(got.hung, "a pipeline that gathers would still be producing lines at 15 s");
+  t.eqStr(got.out, "1\n", got.err);
+  return t.report();
+}
+
+/** …and every stage still gets its whole input, in order: served one chunk, `seq 1 5 | sort -r` printed `1`. */
+export async string test_and_every_stage_still_gets_its_whole_input_in_order(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "whole");
+  string[] scripts = ["seq 1 5 | sort -r", "seq 1 5 | tac", "seq 1 5 | sort -r | head -2", "seq 1 5 | wc -l",
+                      "printf 'b\\na\\nb\\n' | sort | uniq", "seq 1 1000 | tail -1", "seq 1 100 | sort -n | tail -1"];
+  string[] wants = ["5\n4\n3\n2\n1\n", "5\n4\n3\n2\n1\n", "5\n4\n", "5\n", "a\nb\n", "1000\n", "100\n"];
+  for (i32 i = 0; i < scripts.len(); i++) {
+    Said got = await sh(sys, r, scripts[i], "");
+    t.eqStr(got.out, wants[i], "\{scripts[i]}: \{got.err}");
+  }
+  // And against bash, which is the only opinion that matters about what a pipeline means.
+  for (string script in ["seq 1 20 | sort -r | head -3", "seq 1 50 | tac | tail -2"]) {
+    t.eqStr((await sh(sys, r, script, "")).out, (await bash(sys, r, script, "")).out, script);
+  }
+  return t.report();
+}
+
+/**
+ * A spawned command is handed the shell's own standard input, not a copy: `cat; cat` prints the input once, because
+ * both read the *same* stream (issue 0042). A command that ignores its input leaves it for the next.
+ */
+export async string test_a_spawned_command_is_handed_the_shells_own_standard_input_not_a_copy(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "stdin");
+  Said twice = await sh(sys, r, "cat; cat", "once\ntwice\n");
+  t.eqStr(twice.out, "once\ntwice\n", twice.err);
+  t.eqStr(twice.out, (await bash(sys, r, "cat; cat", "once\ntwice\n")).out, "and bash agrees");
+  t.eqStr((await sh(sys, r, "seq 1 2; cat", "kept\n")).out, "1\n2\nkept\n", "an ignoring command leaves it");
+  // `read` — a builtin, run *in* the shell — still takes one line and leaves the rest.
+  t.eqStr((await sh(sys, r, "read x; echo \"[$x]\"; cat", "one\ntwo\n")).out, "[one]\ntwo\n", "read, then cat");
+  return t.report();
+}
+
+/**
+ * …and an inherited input streams rather than being read into memory first: feeding a child used to mean having all
+ * of the input, unbounded for a pipe that never ends. GNU `yes` as the producer, plumbed by bash.
+ */
+export async string test_and_an_inherited_input_streams_rather_than_being_read_into_memory_first(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "endless");
+  Said got = await execIn(sys, "bash", ["-c", "yes | \"$0\" -c 'head -1'", r.shell], "", r.dir, 15000);
+  t.isFalse(got.hung, "reading all of an endless input would never finish");
+  t.eqStr(got.out, "y\n", got.err);
+  return t.report();
+}
+
+/**
+ * A spawned command gets what the shell has left of its input, not the process's — 0066: a here-document on an
+ * *enclosing compound* filled the shell's input without touching the flag that says the process's stream is drained,
+ * so the child inherited an empty descriptor and reported success. bash is the oracle for every case.
+ */
+export async string test_a_spawned_command_gets_what_the_shell_has_left_of_its_input(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "left");
+  string[] scripts = ["{ read a; cat; } <<EOF\none\ntwo\nthree\nEOF", "{ cat; } <<EOF\nheld\nEOF", "cat <<EOF\nonly\nEOF",
+                      "printf 'a\\nb\\nc\\n' | { read x; cat; }", "printf 'p\\nq\\n' > in.txt; { read a; cat; } < in.txt",
+                      "{ cat; } <<EOF\nEOF"];
+  for (string script in scripts) {
+    t.eqStr((await sh(sys, r, script, "")).out, (await bash(sys, r, script, "")).out, script);
+  }
+  // And the inheriting cases still inherit: one descriptor, not a copy (issue 0042).
+  t.eqStr((await sh(sys, r, "cat; cat", "one\ntwo\n")).out, "one\ntwo\n", "cat; cat");
+  t.eqStr((await sh(sys, r, "cat", "through\n")).out, "through\n", "cat");
+  return t.report();
+}

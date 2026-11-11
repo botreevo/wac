@@ -694,7 +694,7 @@ does any work under `box` or `sh`, `.test.ts` included.
 - **Deleted, because nothing runs them:** `harness/reap.ts` with its test, whose ssh callers are now
   wac, and `tools/_spawncmp.ts`.
 - **Waits for step 5:** `harness/testLane.ts` duplicates `runTests.wac`'s lanes, and only
-  `tools/lane.test.ts` and `tools/jobsSweep.sh` keep it alive. Its guards (a dated cost on each heavy
+  tools/lane.test.ts (deleted 2026-11-11) and `tools/jobsSweep.sh` keep it alive. Its guards (a dated cost on each heavy
   marker, the two lane caps, no file in both lanes) need a home in `tools/wac/lanemarkers_test.wac`
   first, and agent-a is editing that file.
 - **In role:** the CI site scripts. `syncWacc.ts`, `syncBootstrap.ts`, `tsc` and `vite` build the React

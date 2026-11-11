@@ -20,7 +20,7 @@
 // every push for a second of work. The lane's criterion is residency rather than duration — "heavy means
 // resident, not slow", `docs/development.md` — and the files that belong there say how many megabytes
 // they hold. This one holds a shell and eight sessions, measured again at 1s on 2026-08-18, so it runs
-// with everything else. `tools/lane.test.ts` caps the lane at twelve exclusions, and a slot spent on a
+// with everything else. `tools/wac/lanerules_test.wac` caps the lane at twelve exclusions, and a slot spent on a
 // second of work is a slot not available to something that needs one.
 
 // One builder, because there is one kind of application: `wac app`'s. The self-contained

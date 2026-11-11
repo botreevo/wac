@@ -479,7 +479,7 @@ time, after the parallel pass. Three files declare it, all in `packages/ssh`.
 the removal of a flake whose cause was never established, and it would have removed it whichever of the two
 candidates was right, because both are consequences of concurrency rather than of ssh.
 
-Kept honest by `tools/lane.test.ts`: every declaration must give a reason, the lane's membership is printed
+Kept honest by tools/lane.test.ts (deleted 2026-11-11): every declaration must give a reason, the lane's membership is printed
 on every green run, and more than six files in it fails the suite — because "run it alone" is an easier
 answer than fixing a test, and a lane with twenty files in it is a sequential suite wearing a lane.
 

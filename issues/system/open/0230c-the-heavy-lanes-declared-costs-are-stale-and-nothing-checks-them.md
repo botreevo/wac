@@ -52,7 +52,7 @@ longer hold:
 
 1. **Re-measure the six**, and write the date beside the number. A declaration that says
    `140s, measured 2026-08-04` ages visibly; one that says `140s, measured` does not.
-2. **Make the guard check currency, not just presence.** `tools/lane.test.ts` requires the reason to
+2. **Make the guard check currency, not just presence.** tools/lane.test.ts (deleted 2026-11-11) requires the reason to
    name a number — that is what stopped "this is slow" being the whole justification — but nothing
    compares it to anything. The runner already measures every chunk and prints the three longest; the
    cheap version of this is to fail, or warn, when a declared file's own run exceeds its declaration
@@ -261,7 +261,7 @@ workers. Sampling the process tree is what tells them apart, and nobody has.
 
 ### The guard checks currency now — step 2
 
-`tools/lane.test.ts` required the reason to name a number, and every one of these satisfied it the
+tools/lane.test.ts (deleted 2026-11-11) required the reason to name a number, and every one of these satisfied it the
 whole time. It now also requires `measured YYYY-MM-DD`. A date does not make a figure true; it lets a
 reader see that nobody has checked it since before the corpus grew, which is the question they have.
 

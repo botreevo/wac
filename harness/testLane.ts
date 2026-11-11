@@ -18,7 +18,7 @@
 //
 // **Declared in the file, not listed here**, for the same reason the dead-export check reads imports
 // rather than a table of package names: a list is wrong the first time somebody writes a server test
-// somewhere new, and wrong silently. `tools/lane.test.ts` checks that every declaration gives a reason.
+// somewhere new, and wrong silently. `tools/wac/lanerules_test.wac` checks that every declaration gives a reason.
 
 /** `// test-lane: exclusive — why`, at the start of a line. */
 export const LANE = /^\/\/\s*test-lane:\s*exclusive\b\s*(?:[—-]\s*)?(.*)$/m;
@@ -42,7 +42,7 @@ export const LANE = /^\/\/\s*test-lane:\s*exclusive\b\s*(?:[—-]\s*)?(.*)$/m;
  *
  * **The reason must name a cost, and say when it was measured.** "This is slow" is what every test
  * would say if asked; a number — megabytes resident, seconds, cores held — is what lets the next
- * person judge whether it is still true. `tools/lane.test.ts` requires both, and the date is there
+ * person judge whether it is still true. `tools/wac/lanerules_test.wac` requires both, and the date is there
  * because the number alone could not go stale *visibly*: `issues/system/0230c` found this file's own
  * lane declaring 140s where a run alone reached 1,166 seconds and had not finished, and two
  * corpus-sized files out by the same factor. Every one of them named a number the whole time.
@@ -97,7 +97,7 @@ export const isWacTest = (file: string): boolean => file.endsWith("_test.wac");
  *
  * **One list, because two of them desynchronised the day there was a second root.** `core/` became a
  * source tree with tests in `design/lang/0009` step 3 and is deliberately not under `packages/` — it
- * ships inside the compiler. `tools/runTests.wac` was taught to walk it and `tools/lane.test.ts`, the
+ * ships inside the compiler. `tools/runTests.wac` was taught to walk it and `tools/wac/lanerules_test.wac`, the
  * guard that checks nothing is registered outside the lane, still said `packages` — so the guard
  * failed on a file the lane *did* run. That is the same shape as this module's note about
  * `jobsSweep.sh`: a consumer that assembles the list rather than asking for it.

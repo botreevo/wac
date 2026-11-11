@@ -430,11 +430,30 @@ void checkYield(C c, Stmt s, Expr? value) {
   }
 }
 
-/** Whether `t` is what a `schedule` statement takes: one `Continuation` in, nothing out. */
-bool isScheduleTarget(string t) {
+/**
+ * Whether `t` is what a `schedule` statement takes: one of **core's** `Continuation` in, nothing out.
+ *
+ * Matched by the declaration, not the spelling (`issues/lang/0365a`). A file declaring its own `struct Continuation`
+ * holds that name itself, and core's is renamed `Continuation#<n>` in it; accepting either spelling let
+ * `schedule pending.push` through for a `Vec` of the file's own type, and the lowering — which hands the target
+ * core's — built a module the engine refused.
+ */
+bool isScheduleTarget(C c, string t) {
   if (!startsWithFn(t) || funcrefReturn(t) != "void" || funcrefParamCount(t) != 1) { return false; }
   string p = funcrefParamAt(t, 0);
-  return p == "Continuation" || startsWith(p, "Continuation#");
+  if (p == "Continuation") { return !continuationRenamed(c); }
+  return startsWith(p, "Continuation#");
+}
+
+/**
+ * Whether core's `Continuation` goes by `Continuation#<n>` here — which it does exactly when another file this one
+ * reaches declares the name too (`api.wac`'s renames), leaving the bare spelling to that file's own type.
+ */
+bool continuationRenamed(C c) {
+  for (i32 i = 0; i < c.structCount; i++) {
+    if (startsWith(c.structNames[i], "Continuation#")) { return true; }
+  }
+  return false;
 }
 
 /** What `for (… in e)` binds each time round: `e`'s element type, or `typeNone` when it has none. */
@@ -12349,10 +12368,12 @@ void checkMethodCall(C c, Expr call, Expr callee, Expr obj, string name, Expr[] 
       if (ty != typeNone()) {
         recv = ty;
       } else if (c.isStruct(n)) {
-        recv = n;
+        // **The declaration the name is, not its spelling** (`issues/lang/0421c`): `isStruct` sees through an alias,
+        // and every lookup below is keyed by the declared name, so an alias spelled `@"$q"` found no `make`.
+        recv = c.canon(n);
         isStatic = true;
       } else if (c.isEnum(n)) {
-        recv = n;
+        recv = c.canon(n);
         isStatic = true;
       } else if (checkBuiltinCall(c, call, obj, n, name, args)) {
         // A primitive type name as the receiver — a builtin static. A local of that name would have
@@ -13899,8 +13920,10 @@ void checkStmtOnly(C c, Stmt s, Ty want) {
     Schedule(target): {
       checkExpr(c, target);
       string tt = typeOfExpr(c, target);
-      if (tt != typeNone() && tt != "" && !isScheduleTarget(tt)) {
-        c.reportWith(errScheduleTarget(), target.line, target.col, expectedFound("fn<void(Continuation)>", tt));
+      if (tt != typeNone() && tt != "" && !isScheduleTarget(c, tt)) {
+        // A file's own `Continuation` is not core's, and saying so is the difference between this and a plain mismatch.
+        string own = continuationRenamed(c) ? " — the `Continuation` declared here is not core's" : "";
+        c.reportWith(errScheduleTarget(), target.line, target.col, expectedFound("fn<void(Continuation)>", tt) + own);
       }
     }
     ExprStmt(expr): {

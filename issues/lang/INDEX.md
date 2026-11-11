@@ -12,7 +12,7 @@ has been fixed and why.
 | [0446e](closed/0446e-an-integer-literal-above-i64-skips-the-member-check.md) | `9223372036854775808.nofield` checks clean and the build cannot emit it (*member of an unknown type*); every literal up to `i64`'s maximum is refused with *no such field*, and so is the same value in a typed slot — a literal with no `i64` type is left untyped as a receiver, up to and past 2^64 | bug | accepted program |
 | [0438d](closed/0438d-a-generic-call-named-only-inside-a-lambda-argument-is-not-instantiated.md) | A generic function called only in the bodies of lambdas handed to a constructor (`std`'s `RandomFile(…)` calling `hostAsk<U>`) is never instantiated: *a call to `hostAsk` … not in the program* | bug | emit failure |
 | [0436d](closed/0436d-a-type-reached-only-through-std-has-no-members-to-the-checker.md) | `c.nowMillis().wait()` in a file that never imported `Ticket` has no type: the checker's reach over imported signatures skips `std`, so a `core` type `std` hands on has no members, and a mismatch after it passes the check and stops the build | bug | accepted program |
-| [0421c](open/0421c-a-static-method-through-a-verbatim-import-alias-is-not-found.md) | `import { P as @"$q" }` then `@"$q".make(1)` is *no such static method*, where `import { P as Q }` and `Q.make(1)` check; the verbatim alias resolves as a type but not as a static's receiver | bug | compile error |
+| [0421c](closed/0421c-a-static-method-through-a-verbatim-import-alias-is-not-found.md) | `import { P as @"$q" }` then `@"$q".make(1)` is *no such static method*, where `import { P as Q }` and `Q.make(1)` check; the verbatim alias resolves as a type but not as a static's receiver | bug | compile error |
 | [0420c](closed/0420c-a-for-in-variable-in-an-async-function-collides-with-a-later-local-of-its-name.md) | `for (string g in given) { … await … }` followed by `i32[] g = …` in an `async` function gives a module the engine rejects; the index-loop form with a block-local `g` is fine | bug | invalid wasm |
 | [0419a](closed/0419a-an-await-on-the-right-of-and-can-yield-the-wrong-value-under-load.md) | `bool fromOut = reading && (await Ticket.first(parts)) == 0;` in `sh`'s `drain` loop picked an unsettled ticket in 10 of 30 loaded runs; awaiting on its own line, never. No small reproduction yet | bug | wrong answer |
 | [0418a](open/0418a-a-std-type-used-as-an-expression-needs-no-import.md) | `Launch.plain()` or `Launch(…)` in a file that never imported `Launch` checks clean on the whole graph; a written `Launch l` is refused, and a file checked alone refuses both | bug | accepted program |
@@ -61,7 +61,7 @@ has been fixed and why.
 | [0368a](closed/0368a-a-left-out-error-type-checks-and-cannot-emit.md) | `Result<T>` with its error type left out passes check and then cannot be built | bug | check clean, build exit 1 |
 | [0367a](closed/0367a-a-tuple-literal-of-unannotated-numbers-checks-and-cannot-emit.md) | A tuple literal whose members are bare numeric literals passes check and stops the emitter | bug | check clean, build exit 1 |
 | [0366a](closed/0366a-a-variant-name-binds-in-matches-only-with-its-payload.md) | `Circle c matches s` is refused for an enum variant, though every variant is a type | bug | compile error |
-| [0365a](open/0365a-a-program-declaring-continuation-gets-an-invalid-module.md) | A file that declares its own `struct Continuation` and does async work compiles to a module the engine rejects | bug | invalid wasm |
+| [0365a](closed/0365a-a-program-declaring-continuation-gets-an-invalid-module.md) | A file that declares its own `struct Continuation` and does async work compiles to a module the engine rejects | bug | invalid wasm |
 | [0364a](closed/0364a-a-name-bound-by-matches-is-lost-across-an-await.md) | A name bound by `matches` in a `while` head and used after an `await` in the body passes check and stops the emitter | bug | check clean, build exit 1 |
 | [0363a](closed/0363a-an-await-inside-a-match-arm-traps.md) | `await` inside an arm of a value-giving `match` compiles, and traps when the function is called on an unsettled ticket | bug | trap |
 | [0362a](closed/0362a-an-async-continue-from-a-match-arm-hangs.md) | In an `async` function, `continue` from an arm of a value-giving `match` inside a `for` loop never finishes | bug | hang |
@@ -148,7 +148,7 @@ has been fixed and why.
 
 ## Closed
 
-368 issues, 331 closed.
+368 issues, 333 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

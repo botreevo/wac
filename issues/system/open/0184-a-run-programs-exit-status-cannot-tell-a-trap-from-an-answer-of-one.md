@@ -225,3 +225,10 @@ That does not settle the decision, and it is not an argument for 70 — it is an
 decision is already being made by default, in one host, and that whatever is chosen has to land in
 both. Found while measuring `issues/system/0197`'s conversion; the *stdout* half of the same
 comparison was a plain defect and is fixed.
+
+## 2026-11-11 — half answered
+
+A program that **spawns** one can tell now: `Child.ended()` answers `Exited(code)`, `Trapped(kind, message)` or
+`HostLimit(why)` on every host (spec ch44 `§wac-std-child-ended-q2v8mtf`), and `exit()` answers `Err` for a trap rather
+than a status. The command's own exit status — what a shell sees from `wac prog.wasm` — is still 1 for all three facts
+above, so this stays open for that half.

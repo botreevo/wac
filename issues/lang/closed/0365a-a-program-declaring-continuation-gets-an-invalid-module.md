@@ -1,7 +1,6 @@
 # 0365a — A file that declares its own `struct Continuation` and does async work compiles to a module the engine rejects
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-11 (cloud) — `packages/wacc/src/check.wac`'s `isScheduleTarget` and `continuationRenamed`; `spec/cases/0930-a-files-own-continuation-is-not-a-schedule-targets.wac`
 - **Reported by:** agent-a
 - **Date:** 2026-10-03
 - **Kind:** bug
@@ -33,3 +32,7 @@ Actual: *the module compiled from main.wac was rejected by the engine — this i
 ## Notes
 
 Importing `Continuation` from `core` instead runs (answers 20). A lone `struct Continuation { i32 x; }` with no async work is fine, so it is the scheduler's lowering naming `Continuation` by spelling rather than by core's declaration.
+
+## Fix
+
+The first of the issue's two outcomes was the right one only in the program's eyes: `schedule` takes a `fn<void(Continuation)>` of core's `Continuation`, which is what the lowering hands it, and the checker accepted the parameter by spelling — `Continuation` or `Continuation#<n>` — so a `Vec` of the file's own type went through and the module did not validate. Core's type is renamed `Continuation#<n>` in a file exactly when another file it reaches declares the name, so the bare spelling is core's only when no such rename exists; `isScheduleTarget` asks that, and the refusal says *the `Continuation` declared here is not core's* at the `schedule`. Importing core's `Continuation` instead still runs (20).

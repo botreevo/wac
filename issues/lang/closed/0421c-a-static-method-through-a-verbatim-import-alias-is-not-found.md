@@ -1,7 +1,6 @@
 # 0421c — a static method through a verbatim import alias is not found
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-11 (cloud) — `packages/wacc/src/check.wac`'s `checkMethodCall`; `spec/cases/0931-a-static-is-called-through-a-verbatim-alias.wac`
 - **Reported by:** agent-c
 - **Date:** 2026-10-29
 - **Kind:** bug
@@ -29,3 +28,7 @@ Actual: `h` is refused with *"no such static method"* at `@"$q".make`. The same 
 Met while the program adapter learned to import std's `Host` and `Sys` under names of its own (`@"$wacHost"`,
 `@"$wacSys"`), so a program declaring its own `Host` cannot clash with them. The adapter calls two free functions
 instead, `__wacHostOf` and `__wacSysOn` in `std/platform.wac`, which go once this is fixed.
+
+## Fix
+
+`isStruct` and `isEnum` answer through an alias, but the receiver kept the alias's spelling, and every lookup after it — `ownMethodAt`, `methodAt` — is keyed by the declared name. Why `Q` already worked was not traced; `@"$q"` reached the lookups under its own spelling. The receiver is `c.canon(n)` now. The program adapter's `__wacHostOf` and `__wacSysOn` in std can now become `@"$wacHost"` and `@"$wacSys"` statics; left as they are in this change.

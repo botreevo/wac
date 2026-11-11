@@ -1,0 +1,90 @@
+// An abandoned read on the JavaScript hosts — Deno and Node — which `lostbytes_test.wac` covers on the two native ones.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env --allow-net packages/platform/test/wac/lostbytes_js_test.wac
+//
+// `design/system/0001` D9 is that a wac program must not depend on its host, and this shape caught a fix landing on
+// one host and not the other. It was packages/platform/test/lostbytes_js.test.ts (deleted 2026-11-11), which ran the program through
+// `harness/appRun.ts` from TypeScript; the program is built for each JavaScript host here and run as that host runs it.
+//
+// ## What this does not assert, and why that matters
+//
+// A caller can give up **before** the bytes arrive, or **after** the answer has already landed. Only the first is
+// asserted: the second loses the bytes on the JavaScript host (`issues/system/0311b`, filed and measured), and a red
+// test in the shared suite for a written-down bug helps nobody. **So this passing does not mean the JavaScript host
+// keeps an abandoned read's bytes** — it means the ordering that works still works.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtByDeno } from "../../../wactest/src/built.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { Exec, ChildEnv, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+/** The parent gives up on a read, then asks again; the child answers late either way. */
+static string PROGRAM =
+  "import { Authority, Child, Input, Launch, Output, Sys } from \"std\";\n" +
+  "import { Read, flatten } from \"core\";\n" +
+  "\n" +
+  "export i32 main(Sys sys) {\n" +
+  "  Output out = sys.stdout();\n" +
+  "  string[] args = sys.args();\n" +
+  "  string mode = args.len() > 0 ? args[0] : \"\";\n" +
+  "  if (mode == \"child\") {\n" +
+  "    sys.clock().sleepMillis(400).wait();\n" +
+  "    out.write(\"PAYLOAD\".toBytes()).wait();\n" +
+  "    return 0;\n" +
+  "  }\n" +
+  "  Authority all = Authority(sys.files(), sys.net(), sys.env(), sys.procs());\n" +
+  "  auto started = flatten(sys.procs().spawnSelf([\"child\"], all, Launch.plain()).wait());\n" +
+  "  if (started.isErr()) { sys.log(\"no child: \\{started.err()!}\"); return 1; }\n" +
+  "  Child kid = started.unwrap();\n" +
+  "  Input from = kid.output();\n" +
+  "  if (mode != \"control\") {\n" +
+  "    auto first = from.chunk();\n" +
+  "    sys.drainFor(50);\n" +
+  "    first.cancel();\n" +
+  "  }\n" +
+  "  string got = \"\";\n" +
+  "  bool reading = true;\n" +
+  "  while (reading) {\n" +
+  "    auto r = flatten(from.chunk().wait());\n" +
+  "    if (r.isErr()) { reading = false; continue; }\n" +
+  "    match (r.unwrap()) {\n" +
+  "      Data(b): { got = got + string.fromBytes(b); }\n" +
+  "      End: { reading = false; }\n" +
+  "      Failed(why): { reading = false; }\n" +
+  "    }\n" +
+  "  }\n" +
+  "  sys.log(got == \"PAYLOAD\" ? \"VERDICT kept\" : \"VERDICT lost\");\n" +
+  "  return 0;\n" +
+  "}\n";
+
+/** Five, because one run of a race is a coin — `issues/system/0307b` cost three fixes. */
+static i32 TRIES = 5;
+
+string said(Procs procs, string runtime, string built, string mode) {
+  string[] args = runtime == "deno" ? ["run", "-A", built] : [built];
+  if (mode != "") { args = runtime == "deno" ? ["run", "-A", built, mode] : [built, mode]; }
+  Exec? x = flatten(procs.exec(runtime, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+  return x is null ? "(" + runtime + " did not start)" : string.fromBytes(x!.stdout) + string.fromBytes(x!.stderr);
+}
+
+export string test_a_read_abandoned_before_its_bytes_arrive_keeps_them_on_deno_and_node(Sys sys) {
+  T t = T.create();
+  string dir = flatten(sys.env().cwd().wait()).unwrap() + "/.cache/lostbytes";
+  sys.files().mkdir(dir, true).wait();
+  string entry = ".cache/lostbytes/jsprobe.wac";
+  sys.files().writeFile(entry, PROGRAM.toBytes()).wait();
+  string[] grants = ["--allow-read", "--allow-write", "--allow-net", "--allow-run", "--allow-env"];
+  for (string runtime in ["deno", "node"]) {
+    string built = builtByDeno(sys.env(), sys.files(), sys.procs(), entry, "lostbytes-js-" + runtime, grants, runtime, false);
+    if (built == "") { t.fail(runtime + ": the probe was not built"); continue; }
+    // The control keeps the payload, so the case below can fail.
+    string control = said(sys.procs(), runtime, built, "control");
+    t.isTrue(contains(control, "VERDICT kept"), runtime + ": the control lost it, so nothing here means anything — " + control);
+    for (i32 i = 0; i < TRIES; i++) {
+      string got = said(sys.procs(), runtime, built, "");
+      t.isTrue(contains(got, "VERDICT kept"), runtime + ": run \{i + 1} of \{TRIES}: the abandoned read took the bytes — " + got);
+    }
+  }
+  return t.report();
+}

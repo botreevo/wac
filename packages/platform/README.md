@@ -366,7 +366,7 @@ So a call stopped holding a slot while the host works on it. What the 128 now bo
 messages can be crossing at once, and nothing waits on that: requests are read as the host sees
 them, answers are drained whenever the worker waits. `test/fanout.test.ts` holds the bridge to four
 rings' worth of calls the host never answers, with further calls answered and deadlines kept, and
-`test/fanout_js.test.ts` holds a server to hundreds of idle connections.
+`test/wac/fanout_js_test.wac` holds a server to hundreds of idle connections.
 
 **What paid for 128 slots is that a slot no longer owns a buffer.** Sixteen slots × 128KiB was
 2MiB of shared memory per bridge whether a program made one call or none, and the natural way to

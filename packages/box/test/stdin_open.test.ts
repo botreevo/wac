@@ -6,7 +6,7 @@ import { buildApp } from "../../../harness/buildApp.ts";
 // A shell whose standard input is **still open** — the shape a terminal has, and the one no other
 // harness in this repo gives a shell.
 //
-// wac-mono 0110, and it lived in `packages/sh/test/spawn.test.ts` until that package's own programs were
+// wac-mono 0110, and it lived in packages/sh/test/spawn.test.ts (deleted 2026-11-11) until that package's own programs were
 // deleted (0103). The cases need a first stage that *ignores its input* and a later stage that stops
 // early, and `seq`, `cat` and `head` are the shortest way to write both — they are applets now, so this
 // is where the test can run. The bug it guards is in `packages/sh`'s `exec.wac` either way: this shell

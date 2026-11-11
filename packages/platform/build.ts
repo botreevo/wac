@@ -13,7 +13,7 @@
 // across twelve files in `packages/box/test/`; those tests build an application in order to test
 // **box**, so they get one from `wac app` instead — which is better, because it exercises the
 // command that ships rather than a second builder standing beside it. And
-// `packages/box/test/node_shell.test.ts` exists to test the *Node-hosted path*, so it follows that
+// `packages/box/test/wac/nodeshell_test.wac` exists to test the *Node-hosted path*, so it follows that
 // path to wherever `bootstrap.sh --host nodejs` puts it. A test is not a reason to keep the thing
 // it tests.
 //

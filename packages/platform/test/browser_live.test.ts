@@ -520,7 +520,7 @@ Deno.test({
         true,
         `a spawned \`cat\` could not read /dev/null: ${JSON.stringify(devnull)}`,
       );
-      // Derived from the dispatcher's own list, the way `packages/box/test/bin.test.ts` does it: a
+      // Derived from the dispatcher's own list, the way `packages/box/test/wac/bin_test.wac` does it: a
       // number typed here would be a number to update every time an applet is added.
       const boxSrc = await Deno.readTextFile("packages/box/src/box.wac");
       const listed = boxSrc.match(/string\[\] appletNames\(\) \{[\s\S]*?\n\}/)?.[0] ?? "";

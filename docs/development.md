@@ -62,7 +62,7 @@ around a gigabyte each against a suite that already peaks at 7.5 GB on a machine
 prints how many it skipped and when the lane last passed, because a saving nobody is told about is
 indistinguishable from a suite that quietly stopped testing something.
 
-Two declarations came out on 2026-08-18 after being measured: `packages/box/test/bin.test.ts` at 1s and
+Two declarations came out on 2026-08-18 after being measured: box's `bin.test.ts` (now `packages/box/test/wac/binspawn_test.wac`) at 1s and
 `packages/wacc/test/wac/lambda_test.wac` at 7s. Both claimed a duration and neither claimed memory, and
 the criterion here is residency — so between them they were excluding two areas from every push for eight
 seconds of work, while holding two of the twelve slots the lane is capped at.

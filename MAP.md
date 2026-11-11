@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `wac task map` after adding a package or an entry point; `wac task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-34 packages, 183,376 lines of wac, 2892 tests,
-81 command-line programs and 13 browser pages.
+34 packages, 183,581 lines of wac, 2893 tests,
+83 command-line programs and 13 browser pages.
 
 ## Packages
 
@@ -17,35 +17,35 @@ In dependency order: nothing here imports anything below it.
 | [`bytes`](packages/bytes/) | Byte-array helpers — `slice`, `clamped`, `equal`. | 83 | 40 | — |
 | [`codec`](packages/codec/) | Base16, base32 and base64, from RFC 4648. | 465 | 10 | — |
 | [`datetime`](packages/datetime/) | The proleptic Gregorian calendar, and RFC 3339 timestamps. | 272 | 5 | — |
-| [`fmt`](packages/fmt/) | Numbers to and from text. | 1,177 | 10 | — |
 | [`gzip`](packages/gzip/) | gzip (RFC 1952) and DEFLATE (RFC 1951) written in wac. | 2,172 | 132 | — |
 | [`regex`](packages/regex/) | A backtracking regular expression engine, with JavaScript's semantics — and the two POSIX dialects `grep` reads, translated into them rather than… | 1,550 | 9 | — |
 | [`tty`](packages/tty/) | What a terminal does to your keystrokes before a program sees them: echo, erase, kill, word erase, `^C`, `^D`. | 499 | 9 | — |
 | [`unicode`](packages/unicode/) | UTF-8 as code points, simple case mapping, and whether a code point is printable. | 251 | 4 | — |
-| [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,229 | 10 | — |
 | [`zstd`](packages/zstd/) | Zstandard (RFC 8878) in wac. | 3,364 | 77 | — |
 | [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 1,597 | 51 | `bytes` `codec` |
-| [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac — and JSON5, as a second entry point. | 1,640 | 44 | `fmt` |
 | [`raster`](packages/raster/) | A pixel buffer and the three things a desktop draws into one: rectangles, a one-pixel frame, and text in a fixed cell. | 1,113 | 28 | `unicode` |
 | [`stream`](packages/stream/) | Run a wac transform as a `ReadableStream`/`WritableStream` pair, so it consumes input as it arrives instead of taking the whole thing at once. | 97 | 14 | `unicode` |
 | [`ts`](packages/ts/) | TypeScript to JavaScript, in wac. | 2,534 | 43 | `gzip` |
-| [`server`](packages/server/) | An HTTP server written in wac. | 328 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,177 | 55 | `crypto` |
 | [`box`](packages/box/) | 66 applets in one program, chosen by the first argument — 65 tools and `help`, which prints the list. | 8,650 | 88 | `bytes` `codec` `crypto` `datetime` `fmt` `fs` `gzip` `http` `json` `platform` `raster` `regex` `server` `sh` `tls` `unicode` `url` `zstd` |
 | [`crypto`](packages/crypto/) | The hashes, AEADs, curves and one KEM the rest of this repo is built on — written in wac, calling nothing. | 7,381 | 316 | `bignum` `codec` `wactest` |
 | [`fetch`](packages/fetch/) | One HTTP request to a URL — `http://` or `https://` — and the whole response back. | 343 | 2 | `bytes` `http` `tls` |
+| [`fmt`](packages/fmt/) | Numbers to and from text. | 1,287 | 10 | `wactest` |
 | [`fs`](packages/fs/) | What a system needs around a filesystem that is its own: the trees that exist only when read (`/dev`, `/proc`, `/bin`), an image to keep a… | 1,269 | 14 | `gzip` `platform` |
 | [`git`](packages/git/) | git in wac: the object database, a working tree, and a client that clones a real repository over its own TLS. | 5,781 | 60 | `bytes` `codec` `crypto` `gzip` `http` `tls` |
+| [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac — and JSON5, as a second entry point. | 1,640 | 44 | `fmt` |
 | [`platform`](packages/platform/) | The hosts a wac program runs on, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell the time… | 3,806 | 290 | `fs` `http` `json` `wacc` |
 | [`quic`](packages/quic/) | QUIC version 1 — RFC 9000 and RFC 9001 — in wac. | 5,726 | 104 | `crypto` `tls` |
+| [`server`](packages/server/) | An HTTP server written in wac. | 328 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`sh`](packages/sh/) | A shell, in wac, whose definition of *correct* is GNU bash: a corpus of scripts runs through both and the two must agree on standard output… | 7,417 | 43 | `codec` `fmt` `fs` `platform` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 4,212 | 58 | `box` `bytes` `codec` `crypto` `fs` `sh` `tty` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 4,541 | 204 | `bytes` `codec` `crypto` |
 | [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 17,801 | 326 | `bytes` `codec` `crypto` `datetime` `http` `json` `tls` `wactest` |
+| [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,318 | 10 | `wactest` |
 | [`wac`](packages/wac/) | The command. | 6,077 | 94 | `box` `fmt` `fs` `json` `sh` `wacc` `wacpkg` |
-| [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 77,815 | 520 | `codec` `crypto` `fmt` `json` `sh` `wactest` |
+| [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 77,815 | 521 | `codec` `crypto` `fmt` `json` `sh` `wactest` |
 | [`wacpkg`](packages/wacpkg/) | Where a wac project says its dependencies come from: `wac.json5`, read and checked. | 1,979 | 60 | `codec` `git` `json` `tls` `wacc` |
-| [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 2,789 | 41 | `crypto` `fmt` `json` `wacpkg` |
+| [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 2,795 | 41 | `crypto` `fmt` `json` `wacpkg` |
 | [`webrtc`](packages/webrtc/) | WebRTC in wac — the data channel half, following `design/system/0008`. | 4,578 | 86 | `crypto` `gzip` `tls` |
 
 ## Programs
@@ -63,8 +63,6 @@ reach — see `packages/platform/README.md`.
 |---|---|
 | `packages/tty/example/ttycat.wac` | A terminal and a `cat` behind it, so the line discipline can be compared with the kernel's. |
 | `packages/http/example/tunnel.wac` | `tunnel <host> <port>` — open a `CONNECT` tunnel through the proxy in `$HTTP_PROXY` and say so. |
-| `packages/json/bench/lookup.wac` | Both lookup paths, exposed separately so the threshold in `JsonObject.INDEX_MIN` is a |
-| `packages/json/bench/throughput.wac` | Throughput by document shape, so a slow path can be attributed rather than guessed at. |
 | `packages/raster/example/deskshot.wac` | The desktop, drawn and written out as a PPM — the same program on every host. |
 | `packages/ts/src/main.wac` | `ts` as a command: read TypeScript, write JavaScript. |
 | `packages/box/example/boxsh.wac` | `box` and the shell in one command-line program — the twin of `term.wac`, without a browser. |
@@ -79,6 +77,7 @@ reach — see `packages/platform/README.md`.
 | `packages/crypto/tools/bench.wac` | Regenerate the per-operation timings this package's README quotes. |
 | `packages/crypto/tools/capture-hkdfcap.wac` | HKDF at its 255-block cap, answered by WebCrypto. |
 | `packages/crypto/tools/ct.wac` | Regenerate the side-channel table in README.md. |
+| `packages/fmt/tools/sweep.wac` | `wac task verify:fmt` — `ftoa` and `atof` over a large random sweep, with JavaScript's `Number` as the oracle. |
 | `packages/fs/example/ops.wac` | The same filesystem operations against memory or against the host, so the two can be compared. |
 | `packages/git/example/gitci.wac` | `git commit -a`, in wac. |
 | `packages/git/example/gitclone.wac` | `gitclone <https-url> <dir> [depth]` — a clone, as one program. |
@@ -88,6 +87,8 @@ reach — see `packages/platform/README.md`.
 | `packages/git/example/gitpull.wac` | `gitpull` — an incremental fetch: ask for what we lack, and repair the thin pack that comes back. |
 | `packages/git/example/gitpush.wac` | `gitpush <repo-dir> <advertisement-file> <ref>` — the request half of a push, on standard output. |
 | `packages/git/example/gitst.wac` | `gitst <repo-dir>` — how the working tree differs from the index, in `git status --porcelain`'s words. |
+| `packages/json/bench/lookup.wac` | Both lookup paths, exposed separately so the threshold in `JsonObject.INDEX_MIN` is a |
+| `packages/json/bench/throughput.wac` | Throughput by document shape, so a slow path can be attributed rather than guessed at. |
 | `packages/platform/example/clocks.wac` | What a clock promises, asked of whichever host is running this. |
 | `packages/platform/example/crowd.wac` | How many host calls a program may have in flight, measured rather than quoted. |
 | `packages/platform/example/echod.wac` | A datagram echo server — one socket, many peers. |
@@ -137,6 +138,7 @@ reach — see `packages/platform/README.md`.
 | `packages/tor/tools/capture-hspub.wac` | Pin publication against a real HSDir: tor's own descriptor cache. The wac half of |
 | `packages/tor/tools/capture-ntor.wac` | Re-record the ntor vectors from tor's own `test-ntor-cl server1`. |
 | `packages/tor/tools/capture-relaycert.wac` | Capture a relay's ed25519 certificates from a running chutney network. The wac half of |
+| `packages/url/tools/diff.wac` | Print wac's parse of one input beside the host's `new URL`. The development loop for this package. |
 | `packages/wac/src/wac.wac` | `wac` — the command, as a program. |
 | `packages/wacc/tools/specstatus.wac` | Writes the status of every example in the specification: `spec/_status/STATUS.md`, and the list of |
 | `packages/wacpkg/example/plan.wac` | What a project's dependencies are, and what an ordinary build would have to fetch. |

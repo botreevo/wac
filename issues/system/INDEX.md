@@ -5,7 +5,6 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0466d](open/0466d-the-servers-live-test-can-miss-its-30s-start-under-a-loaded-gate.md) | `packages/server/test/wac/live_test.wac`'s Deno server printed nothing for 30 s in a loaded gate and the test failed; alone it passes 9/9 in 28 s — not yet told apart: a cold `deno run` start or a port race | flaky test | a red gate a rerun turns green |
 | [0464d](open/0464d-the-gate-reaches-the-npm-registry-for-one-differential.md) | `tools/push.sh` runs `npm ci` in `site/` for one test — `packages/ts/test/stripDifferential.test.ts`, which loads `typescript` to compare the stripper — so the gate needs the npm registry, and the comparison is a TS test driving an oracle | missing feature | a gate that cannot run offline |
 | [0460e](closed/0460e-a-page-does-not-serve-child-ended.md) | `Child.exit()` is answered from the new op `CHILD_ENDED` (74) since `71bc06729`, and wac-web's page host does not serve it, so a page that starts a process and awaits its exit gets *a page does not serve request 74* (`browser_live.test.ts`'s `procs`: status wanted `17`). Unnoticed because the live browser tests had not run since (`0452e`) | bug | a page's child cannot be waited for |
 | [0454e](closed/0454e-two-browser-builds-of-one-program-differ-by-a-staging-directory-name.md) | two `--target browser` builds of one program differed only in the staging directory's name, which the bundler wrote into `launcher.js` and `worker.js` as a comment and a module key — random without a cache key, the key with one; `bundle` replaces it with `wac-app` | bug | a build that is not byte-reproducible |
@@ -144,7 +143,7 @@ own roadmap lives in its README. This tracker is for what crosses those lines.
 
 ## Closed
 
-364 issues, 286 closed.
+364 issues, 287 closed.
 
 The count is checked against the directory by `tools/wac/issuecounts_test.wac`, which reads both
 trackers. It was `compiler/wacSpec.test.ts` until that file went with the TypeScript compiler on

@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `wac task map` after adding a package or an entry point; `wac task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-34 packages, 183,827 lines of wac, 2888 tests,
-85 command-line programs and 13 browser pages.
+34 packages, 184,004 lines of wac, 2888 tests,
+86 command-line programs and 13 browser pages.
 
 ## Packages
 
@@ -36,7 +36,7 @@ In dependency order: nothing here imports anything below it.
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac — and JSON5, as a second entry point. | 1,640 | 44 | `fmt` |
 | [`platform`](packages/platform/) | The hosts a wac program runs on, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell the time… | 3,806 | 292 | `fs` `http` `json` `wacc` |
 | [`quic`](packages/quic/) | QUIC version 1 — RFC 9000 and RFC 9001 — in wac. | 5,726 | 104 | `crypto` `tls` |
-| [`server`](packages/server/) | An HTTP server written in wac. | 328 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
+| [`server`](packages/server/) | An HTTP server written in wac. | 505 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`sh`](packages/sh/) | A shell, in wac, whose definition of *correct* is GNU bash: a corpus of scripts runs through both and the two must agree on standard output… | 7,417 | 36 | `codec` `fmt` `fs` `platform` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 4,212 | 58 | `box` `bytes` `codec` `crypto` `fs` `sh` `tty` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 4,541 | 204 | `bytes` `codec` `crypto` |
@@ -120,6 +120,7 @@ reach — see `packages/platform/README.md`.
 | `packages/platform/example/whichever.wac` | Wait on two sockets and report whichever speaks first. |
 | `packages/platform/example/writeread.wac` | Can a socket be written to while a read on it is still outstanding? |
 | `packages/quic/example/handshake.wac` | A QUIC handshake, run by a wac program against a real server. |
+| `packages/server/src/main.wac` | The accept loop, in wac. |
 | `packages/sh/src/sh.wac` | `sh` — the shell as a program, entire, in wac. |
 | `packages/ssh/src/ssh.wac` | `ssh` — the client as a program, entire. There is no TypeScript in this package's `src/`. |
 | `packages/ssh/src/sshd.wac` | `sshd` — an SSH server, entire, in wac. |

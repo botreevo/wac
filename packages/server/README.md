@@ -25,20 +25,20 @@ module, not the library. Nothing in the type system says so.
 
 ## Shape: the server is a pure function
 
-wasm has no sockets and no clock, so the host owns both and hands the results in. Everything else
-is in wac:
+Every decision is one function, from bytes to bytes:
 
 ```wac
 Served serve(u8[] input, i64 nowMillis)
 // → ready?  the response bytes  how many input bytes it used  keep the connection?
 ```
 
-`host/serve.ts` is the whole of the host side — an accept loop, a buffer, and `writeAll`. It makes
-no decisions. That split is why the server is testable by *calling* it: `test/wac/serve_test.wac` drives
+`src/main.wac` is the whole of the socket side — an accept loop, a buffer, and the limits. It makes
+no decisions. (It was packages/server/host/serve.ts (deleted 2026-11-11), which bound `serve` from
+TypeScript; `issues/system/0466d` is why it moved.) That split is why the server is testable by *calling* it: `test/wac/serve_test.wac` drives
 every case including pipelining and truncation with no socket in sight, and
 `test/wac/live_test.wac` then checks the answers survive real clients.
 
-`consumed` is what makes keep-alive work, and the host keeping the remainder rather than clearing
+`consumed` is what makes keep-alive work, and the loop keeping the remainder rather than clearing
 the buffer is what makes pipelining work — a client may have sent the next request already and it
 is sitting in the tail.
 
@@ -79,7 +79,8 @@ The socket cases are why the file exists. Keep-alive and pipelining are properti
 
 ## Limits
 
-In the host, because they are about time and connections and wac can see neither:
+In the accept loop, `src/main.wac`, and on its command line (`--request-ms`, `--idle-ms`,
+`--max-connections`):
 
 | limit | default | what it stops |
 |---|---|---|

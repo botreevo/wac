@@ -3,7 +3,8 @@
 // The socket and the randomness live here because this file is TypeScript, **not because wasm has
 // neither** — `std/platform.wac` has `Cli.listen`/`accept` and `Core.randomBytes`, and
 // `packages/ssh`'s `sshd` uses both. The old sentence was true when written; the same dated claim in
-// `packages/server/host/serve.ts` is corrected there at more length.
+// packages/server/host/serve.ts (deleted 2026-11-11) was acted on: that server's accept loop is
+// `packages/server/src/main.wac` now.
 //
 // What holds regardless is the split: everything else — what a record means, what to answer, when the
 // handshake is done — is decided in wac by `tlsServerFeed`, a pure function from (state, bytes) to

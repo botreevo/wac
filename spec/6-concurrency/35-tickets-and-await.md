@@ -430,8 +430,11 @@ export async void main(Sys sys) {
 }
 ```
 
-`[§wac-drain-cs2v9rf]` `sys.drain()` resumes queued continuations in order until none remain, awaiting each one's ticket
-first. Two unawaited calls that suspend interleave.
+`[§wac-drain-cs2v9rf]` `sys.drain()` resumes queued continuations until none remain. Each round it runs every queued
+continuation whose ticket has settled, in the order they were queued, and passes over one whose ticket has not — so a
+continuation waiting on an unsettled ticket delays none queued behind it. Two unawaited calls that suspend interleave as
+their tickets settle: settled alternately, they run alternately. The order in which a host settles its tickets — two
+timers on a loaded machine, say — is the host's, and not promised.
 
 A program does not end while work it started remains ([07](../1-programs/07-programs.md)).
 

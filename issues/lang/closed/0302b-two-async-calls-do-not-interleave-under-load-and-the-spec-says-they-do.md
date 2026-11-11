@@ -1,7 +1,6 @@
 # 0302 — two async calls do not interleave under load, and `[§wac-async-drain-7cvj4bn]` says they do
 
-- **Status:** open
-- **Claimed by:** (nobody)
+- **Status:** closed 2026-11-11 (cloud) — the scheduler was already fair; the claim and the test were overstated. `spec/6-concurrency/35-tickets-and-await.md` `§wac-drain-cs2v9rf`; `packages/platform/test/wac/asyncsyntax_test.wac`
 - **Reported by:** agent-b
 - **Date:** 2026-08-30
 - **Kind:** bug — a spec claim that does not hold, surfacing as a flaky gate
@@ -63,3 +62,11 @@ The test enumerated the logs it accepted — `1212 || 2121` — and there are **
 `1221` and `2112` failed it while satisfying the property. That was widening the flake for no reason
 and is corrected to exclude the two serial logs instead, with the observed value in the message. It
 does not fix the flake, which is the subject above.
+
+## Fix
+
+**The mechanism this issue blamed is not the one that runs.** Every host's `waitAny` delivers *every* settled answer, not the first — wasmtime's `wait_any` in `native/src/main.rs`, V8's `wait_and_deliver` (*deliver every one that has*), the JavaScript provider's `deliverReady` — and `Sys.__wacDrain` runs each round every queued continuation whose ticket has settled, in queue order, putting the rest aside. So a blocked continuation never delays a ready one, and ties are broken by queue order: option (b), the operator's choice, was already the behaviour.
+
+What made the timer test serial under load is the readiness order itself: each `sleepMillis` is settled by a host timer thread, and on a loaded box a later-registered timer can settle first. Then one machine is the only ready one two rounds running, and `1122` is a correct run of a fair scheduler.
+
+So the rule now says exactly that — every settled continuation each round, in queue order, an unsettled one delaying none behind it, interleaving as tickets settle, and the host's settle order not promised — and three deterministic tests hold it with tickets the test settles itself: a blocked earlier continuation does not delay a ready later one; ready ones run in queue order whatever order they settled; two machines settled alternately run `1212`. The timer test asks only that both machines finish, two steps each.

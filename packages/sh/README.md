@@ -687,7 +687,7 @@ the menu**: two were reached sideways, through a pipeline stage, which is a fork
 spelled differently. `&&`/`||` and `case` were absent too.
 
 The third is the one that makes the point. It appeared the moment `( … )` was added, from the fixed
-seeds `packages/box/test/fuzz.test.ts` has been running all along — the scripts those seeds produce
+seeds `packages/box/test/wac/fuzz_test.wac` has been running all along — the scripts those seeds produce
 changed, and one of them walked straight into a compound that collected its output and let its
 errors go elsewhere. That is the argument for reading a generator's productions rather than its
 score: a clean sweep is a statement about the grammar, and what it cannot produce is exactly where

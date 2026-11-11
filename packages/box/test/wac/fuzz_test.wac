@@ -16,15 +16,19 @@
 // seed. The scripts do not change and neither does the answer, so the answers are captured once into
 // `fuzz-vectors.txt` (11 KB) and replayed here in process.
 //
-// What is *not* here is the second stdin shape, which is what 0113 needed: a `Frame`'s standard input is a
-// byte array, so empty means end of input, and "open but silent" has no spelling. `fuzz.test.ts` spawns
-// for that one — `issues/system/0195`.
+// The second stdin shape, which is what 0113 needed, cannot be replayed in process: a `Frame`'s standard input is a
+// byte array, so empty means end of input, and "open but silent" has no spelling. So the last test here spawns the
+// built shell for it, with its input held open and never written (`openinput.wac`) — `issues/system/0195`. It was
+// box's TypeScript `fuzz.test.ts`.
 
 import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
 import { T } from "../../../wactest/src/assert.wac";
 import { Answer, Rand, askOurs, combined, fixtures, normalise, perSeed, script, seeds, show,
          vectorsPath } from "../../../../tools/wac/shfuzz.wac";
 import { flatten } from "core";
+import { builtProgram } from "../../../wactest/src/built.wac";
+import { Authority } from "std";
+import { Ran, openInputIn } from "./openinput.wac";
 
 /** One captured answer: the script, and what bash said about it. */
 struct Vector {
@@ -235,4 +239,56 @@ Loaded load(Files fs) {
     n = n + 1;
   }
   return Loaded(items, n, oracle, "");
+}
+
+/**
+ * **The generated scripts again, with standard input open and silent** — a terminal's shape, the one that found
+ * wac-mono 0113: a pipeline whose first stage produced no bytes hung under it, because one condition could not tell
+ * an empty held input from no input at all. bash's answers are the captured ones, and they do not depend on the
+ * stdin shape (measured on 2026-08-18: all 120 both ways, 0 differed), since nothing `script()` generates reads
+ * standard input. The shape is about ours. Each run is bounded, and a bound that fired is reported as that rather
+ * than as a difference.
+ */
+export async string test_the_generated_scripts_answer_the_same_with_standard_input_open_and_silent(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  T t = T.create();
+  Loaded v = load(fs);
+  t.isTrue(v.error == "", v.error);
+  if (v.error != "") { return t.report(); }
+  // `packages/box`'s shell, because bash has a `cat`: `packages/sh`'s answers "command not found", which is not bash's.
+  string path = builtProgram(env, fs, sys.procs(), "packages/box/src/bin/sh.wac", "fuzz-open-sh",
+                             ["--allow-read", "--allow-write", "--allow-env"]);
+  u8[] wasm = flatten(fs.readFile(path).wait()).orElse(u8[]());
+  t.isTrue(wasm.len() > 0, "the shell built");
+  string dir = caseDir(env) + "-open";
+  i32 differ = 0;
+  i32 hung = 0;
+  string detail = "";
+  for (i32 i = 0; i < v.n; i++) {
+    Vector vec = v.items[i];
+    fs.remove(dir, true).wait();
+    if (!fixtures(fs, dir)) {
+      t.isTrue(false, "cannot make the fixtures in \{dir}");
+      return t.report();
+    }
+    Ran got = await openInputIn(sys, wasm, ["-c", vec.script], Authority(fs, null, env, null), 10000, dir);
+    if (got.hung) {
+      hung = hung + 1;
+      detail = detail + "\n  \{show(vec.script)} did not finish in 10s";
+      continue;
+    }
+    string text = normalise(combined(got.out, got.err));
+    if (text != vec.text || got.status != vec.status) {
+      differ = differ + 1;
+      if (differ <= 5) {
+        detail = detail + "\n  \{show(vec.script)}\n    bash \{show(vec.text)} (\{vec.status})" +
+                 "\n    ours \{show(text)} (\{got.status})";
+      }
+    }
+  }
+  fs.remove(dir, true).wait();
+  t.isTrue(v.n > 0, "the vectors parsed to nothing");
+  t.eqI32(differ + hung, 0, "\{differ} of \{v.n} differ and \{hung} hung, with the input open (\{v.oracle})\{detail}");
+  return t.report();
 }

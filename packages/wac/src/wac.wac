@@ -49,7 +49,7 @@ import { cellAt, cells, hollowWhy, manifestIn, withManifestSection } from "../..
 import { grantAfterEntry, grantsBefore, programArgs, runModule, spawnWith }
          from "./runprog.wac";
 import { appRun, writeApp } from "./app.wac";
-import { aggregatePath, aggregateSource, beside, flagValue, importable, noTrailingSlash, runTests,
+import { aggregatePath, aggregateSource, beside, flagValue, importable, noTrailingSlash, ownPid, runTests,
          sigsWithCounters,
          commonDir, isDirAt, onlyList, testTargets, withoutIgnored } from "./testrun.wac";
 import { renderDiagnostics } from "../../wacc/src/render.wac";
@@ -453,6 +453,9 @@ string usage() {
        // `sh-child` is named because the dispatcher accepts it, as the comment further down says every
        // command must be: it is what `wac sh` starts, holding only what was granted, and not for typing.
        + "       wac sh-child [-c script]       the shell itself, as `wac sh` runs it in a sealed child\n"
+       // Named for the same reason as `sh-child`: the dispatcher accepts it. It is what `wac run` starts to compile
+       // in, so that the program it then runs does not share a process with the compiler's memory.
+       + "       wac run-child <out> run …      `wac run`'s compile, writing the module to <out>\n"
        + "       wac update [project]           resolve and fetch what wac.lock does not cover,\n"
        + "                and write the lock — the only command that reaches the network\n"
        // Printed by the host until 2026-08-26, appended after this block because the command lived
@@ -900,6 +903,31 @@ export async i32 main(Sys sys) {
     return 2;
   }
   string cmd = argv[0];
+
+  // **`run` compiles in a child and runs what it built from here**, on every host, so the program does not share an
+  // instance with the compile's high-water mark. `run` used to compile in this one and then wait here for the
+  // program; on the Node host the memory a compile grew stays resident in the instance that did it, so a server
+  // started with `wac run` held ~500 MB there for its whole life. `runApart` starts `run-child` — this dispatcher
+  // again, with the same line and a path to write the module to — and only the bytes come back. No host answers
+  // `run` before this program sees it, so the native hosts take the same path; the measured gain is Node's.
+  //
+  // The child is an ordinary `run` in every respect but the last step: flags, grants, the build cache and the
+  // manifest are decided exactly where they were, and `runOut` turns the spawn into a write.
+  string runOut = "";
+  if (cmd == "run-child") {
+    if (argc < 3 || argv[2] != "run") {
+      err.line("usage: wac run-child <module-out> run [flags…] <entry.wac> [args…] — what `wac run` starts");
+      return 2;
+    }
+    runOut = argv[1];
+    string[] asRun = string[].filled(argc - 2, "");
+    for (i32 i = 2; i < argc; i++) { asRun[i - 2] = argv[i]; }
+    argv = asRun;
+    argc = argc - 2;
+    cmd = "run";
+  } else if (cmd == "run") {
+    return await runApart(argv, argc, err, clock, env, fs, procs, held);
+  }
 
   // **Asking for help is not an error.** The native binary used to translate this on the way out —
   // it ran the program for its usage block and then exited 0 if the caller had said `--help`, because
@@ -1563,11 +1591,11 @@ export async i32 main(Sys sys) {
                    : buildCachePath(argv, env, argc, cmd, entry, paths, texts, outStem(argv, argc), target);
   if (cachePath != "") {
     u8[]? hit = (await fs.readFile(cachePath)).ok();
-    // **A cached `run` is spawned, not written.** Like `test`'s hit and for the same reason: the module
-    // carries its own manifest, so there is nothing to reconstruct and no file the caller asked for.
-    // The grants passed to `spawn` are read from the command line rather than from the module, because
-    // they are a *ceiling* intersected with what this process holds — the cached bytes only have to be
-    // the same program, and the key already says they are.
+    // **A cached `run` is handed over as it is.** Like `test`'s hit and for the same reason: the module
+    // carries its own manifest, so there is nothing to reconstruct. `runApart` spawns it with the grants
+    // read from the command line rather than from the module, because they are a *ceiling* intersected
+    // with what that process holds — the cached bytes only have to be the same program, and the key
+    // already says they are.
     if ((hit is not null) && hit!.len() > 8 && cmd == "run") {
       string badFlagRun = unknownFlagFor(argv, argc, "run");
       if (badFlagRun != "") {
@@ -1580,7 +1608,7 @@ export async i32 main(Sys sys) {
                   + "it before \{entry}, or after `--` if the program wants the string");
         return 2;
       }
-      return await spawnWith(err, held, grantsBefore(argv, argc, entry), hit!, programArgs(argv, argc, entry), entry);
+      return await handOver(err, fs, runOut, hit!);
     }
     if ((hit is not null) && hit!.len() > 8 && cmd == "test") {
       // **A cached test module is run, not written.** `build`'s hit ends in a file because the file is
@@ -1896,9 +1924,8 @@ export async i32 main(Sys sys) {
   // capability rather than an error — the same rule as every other spawn, and the reason a host cannot
   // widen what a program may do.
   //
-  // The native binary still answers `run` in Rust, before this program sees it, and that is deliberate
-  // for now: `commandparity_test.wac` compares the two, and agreement measured is what has to come
-  // before deleting either. Step 4 of that issue's order.
+  // **Only `run-child` gets here**, `runApart` having taken every `run` at the top: the module is written to
+  // `runOut`, and the process that started this one spawns it once this one has gone.
   if (cmd == "run") {
     string badFlag = unknownFlagFor(argv, argc, "run");
     if (badFlag != "") {
@@ -1919,15 +1946,11 @@ export async i32 main(Sys sys) {
       wasm, manifestWire(wasm, types, sigsWithCounters(sigs, covered || traced), key,
                          "\{baseName(stem(entry))}.wasm", grants));
 
-    // `true` for the input, so the program reads the terminal or the pipe this command was given —
-    // which is what the native `run` does by instantiating in its own process. `false` for the
-    // filesystem channel: this is not a program that answers `Fs.overParent` questions.
-    // Stored before the spawn rather than after: the wait below does not return until the child is
-    // done, and a program that runs for a minute should not have to finish before the next run gets
-    // a hit.
+    // Stored before the hand-over, which is also before the program starts: a program that runs for a
+    // minute should not have to finish before the next run gets a hit.
     rememberBuild(env, fs, cachePath, whole, entry);
 
-    return await spawnWith(err, held, grants, whole, programArgs(argv, argc, entry), entry);
+    return await handOver(err, fs, runOut, whole);
   }
 
   // **`app` is `build` with a different thing written**, and it goes here for that reason: the shared
@@ -2530,6 +2553,64 @@ string diagnosticCount(string wire) {
   if (warnings == 0) { return "\{errors} error(s)"; }
   if (errors == 0) { return "\{warnings} warning(s)"; }
   return "\{errors} error(s), \{warnings} warning(s)";
+}
+
+/**
+ * `wac run`: the compile in a child, `run-child`, and the program spawned from here once it has gone.
+ *
+ * **What this instance holds while the program runs is the command and the module's bytes; the compile ran in
+ * another.** The child decides everything a `run` decides — flags, grants, the cache, the manifest — and reports it
+ * the way it always did, on the output streams it inherits; its status is the answer whenever it did not write a
+ * module, which covers a refused flag (2), a program that does not compile (1) and `--help` (2 with the usage, as
+ * it always was). **Its input is not inherited**: the compile reads none, and the program that follows is the only
+ * reader the caller's pipe should have.
+ *
+ * **The module goes under `$WAC_HOME/cache/run/`**, beside the build cache, and under `.cache/` in the working
+ * directory only when there is no home or it cannot be written. The first version used `.cache/` always, so `wac run`
+ * from a read-only directory failed where it had always worked, and every other directory it ran in kept a `.cache/`
+ * afterwards (`packages/wac/test/wac/runcwd_test.wac`).
+ *
+ * Measured, resident after a server is up, three runs each: Node host 543/500/358 MB before, 384/249/384 after;
+ * the native host ~100–170 MB either way. It does not reach a prebuilt module's figure on either host: a child that
+ * has ended does not hand all of its memory back to the process — a plain Node worker that grew to 610 MB leaves
+ * 514 MB behind after `terminate()` — so only a separate OS process for the compile would.
+ */
+async i32 runApart(string[] argv, i32 argc, Output err, Clock clock, Env env, Files fs, Procs procs, Authority held) {
+  // Named like the aggregate `test` writes, for the same reason: two runs at once must not write one path.
+  string dir = ".cache";
+  string home = homeOf(env, argv, argc);
+  if (home != "" && (await fs.mkdir("\{home}/cache/run", true)).isOk()) { dir = "\{home}/cache/run"; }
+  else { await fs.mkdir(dir, true); }
+  string built = "\{dir}/wac-run-\{ownPid(fs)}-\{flatten(clock.monotonicNanos().wait()).unwrap()}.wasm";
+  string[] childArgs = string[].filled(argc + 2, "");
+  childArgs[0] = "run-child";
+  childArgs[1] = built;
+  for (i32 i = 0; i < argc; i++) { childArgs[i + 2] = argv[i]; }
+  i32 status = 1;
+  match (await procs.spawnSelf(childArgs, held, Launch("", false, true, false, false))) {
+    Ok(kid): { status = (await kid.exit()).orElse(1); }
+    Err(e): {
+      err.line("wac: the compiler would not start — \{e}");
+      return 1;
+    }
+  }
+  u8[]? wasm = (await fs.readFile(built)).ok();
+  if (wasm is not null) { await fs.remove(built, false); }
+  if (status != 0 || wasm is null) { return status; }
+  string entry = normalisePath(positionals(argv, argc)[0]);
+  // `true` for the input, so the program reads the terminal or the pipe this command was given. `spawnWith` says
+  // why the streams are inherited rather than relayed.
+  return await spawnWith(err, held, grantsBefore(argv, argc, entry), wasm!, programArgs(argv, argc, entry), entry);
+}
+
+/** `run-child`'s answer: the module, written where `runApart` will read it. */
+async i32 handOver(Output err, Files fs, string path, u8[] wasm) {
+  auto wrote = await fs.writeFile(path, wasm);
+  if (wrote.isErr()) {
+    err.line("wac: cannot write \{path} — \{wrote.err()!}");
+    return 1;
+  }
+  return 0;
 }
 
 /**

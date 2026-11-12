@@ -1,0 +1,87 @@
+// `wac run` leaves the directory it was run from as it found it — and runs from one it cannot write.
+//
+// `run` compiles in a child and hands the module back through a file (`runApart` in `src/wac.wac`). The first version
+// put that file under `.cache/` in the working directory, so a run from a read-only directory failed with "cannot
+// write .cache/wac-run-….wasm" where it had always worked, and every other directory a program was run from kept a
+// `.cache/` it had not had. The file goes beside the build cache, under `$WAC_HOME/cache/run/`, now.
+//
+// Both halves are asked of the real binary from a directory of the test's own, with the program elsewhere: the
+// working directory is the thing under test, so nothing about it may be the repository's.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath, freshDir } from "../../../wactest/src/host.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+static string PROGRAM = "import { Sys } from \"std\";\n"
+  + "export async i32 main(Sys sys) {\n"
+  + "  u8[] all = (await sys.stdin().readAll()).orElse(u8[]());\n"
+  + "  await sys.stdout().line(\"read \\{all.len()}\");\n"
+  + "  return 7;\n"
+  + "}\n";
+
+string root(Env env) { return flatten(env.cwd().wait()).unwrap(); }
+
+/** The program, written outside the directories it is run from. */
+string program(T t, Env env, Files fs) {
+  string dir = "\{root(env)}/.cache/runcwd-program";
+  string fresh = freshDir(fs, dir);
+  t.eqStr(fresh, "", "a directory for the program");
+  string path = "\{dir}/echoin.wac";
+  t.isTrue(flatten(fs.writeFile(path, PROGRAM.toBytes()).wait()).isOk(), "wrote \{path}");
+  return path;
+}
+
+/** `wac run <entry>` from `cwd`, with three bytes on its input. */
+Exec runFrom(Env env, Procs procs, string cwd, string entry) {
+  Exec? x = flatten(procs.exec(binaryPath(env), ["run", entry], "abc".toBytes(), ChildEnv.inherited(),
+                               Launch(cwd, false, false, false, false)).wait()).ok();
+  return x is null ? Exec(0 - 1, u8[](), "the binary did not start".toBytes(), "did not start") : x!;
+}
+
+string[] entries(Files fs, string dir) { return flatten(fs.readDir(dir).wait()).orElse(string[]()); }
+
+string listed(string[] names) {
+  string out = "";
+  for (string n in names) { out = out + (out == "" ? "" : " ") + n; }
+  return out;
+}
+
+export string test_a_run_from_an_empty_directory_leaves_it_empty(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  T t = T.create();
+  string entry = program(t, env, fs);
+  string dir = "\{root(env)}/.cache/runcwd-empty";
+  t.eqStr(freshDir(fs, dir), "", "an empty directory to run from");
+  Exec r = runFrom(env, sys.procs(), dir, entry);
+  t.eqI32(r.status, 7, "the program's own status — \{string.fromBytes(r.stderr)}");
+  t.eqStr(string.fromBytes(r.stdout), "read 3\n", "and its input reached it, not the compile");
+  t.eqStr(listed(entries(fs, dir)), "", "what the run left in the directory it was run from");
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+export string test_a_run_from_a_read_only_directory_runs(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string entry = program(t, env, fs);
+  string dir = "\{root(env)}/.cache/runcwd-readonly";
+  t.eqStr(freshDir(fs, dir), "", "a directory to run from");
+  procs.exec("chmod", ["555", dir], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  // Root writes anywhere, and then this would prove nothing: say so rather than pass.
+  bool readOnly = flatten(fs.writeFile("\{dir}/probe", u8[]()).wait()).isErr();
+  if (!readOnly) {
+    fs.remove("\{dir}/probe", false).wait();
+    t.isTrue(false, "\{dir} is still writable after chmod 555 — is this running as root?");
+  }
+  Exec r = runFrom(env, procs, dir, entry);
+  t.eqI32(r.status, 7, "the program's own status — \{string.fromBytes(r.stderr)}");
+  t.eqStr(string.fromBytes(r.stdout), "read 3\n", "and its input reached it");
+  t.eqStr(listed(entries(fs, dir)), "", "what the run left in the directory it was run from");
+  procs.exec("chmod", ["755", dir], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  fs.remove(dir, true).wait();
+  return t.report();
+}

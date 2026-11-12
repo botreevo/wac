@@ -11,11 +11,11 @@
 // out, with no staging. So a write to a buffer that work already encoded uses waits for that work first, as WebGPU's
 // queue ordering would make it.
 //
-// **Freed buffers are used again**, once the GPU has finished with them, for the next buffer of the same length. A
-// buffer the GPU has not touched before costs it more than twice as long to write the first time (2.1 ms against 0.85
-// for 12 MB on the Mac this was written on), and every kernel's output is a new buffer, so without the pool a model
-// spent most of its time on fresh memory. A reused buffer is not cleared: wac-tensor writes every buffer whole before it
-// reads it (`GPU_BUFFER` in `src/gpu/line.wac`).
+// **Freed buffers are used again**, once the GPU has finished with them, for the next buffer of the same size class
+// (`sizeClass`). A buffer the GPU has not touched before costs it more than twice as long to write the first time (2.1
+// ms against 0.85 for 12 MB on the Mac this was written on), and every kernel's output is a new buffer, so without the
+// pool a model spent most of its time on fresh memory. A reused buffer is not cleared: wac-tensor writes every buffer
+// whole before it reads it (`GPU_BUFFER` in `src/gpu/line.wac`).
 //
 // **A batch is encoded as it arrives and committed at its end**, so the GPU works while the program builds the next.
 // A read waits for everything committed, then answers — with the fault of anything that went wrong since the last read,
@@ -90,6 +90,16 @@ func ints(_ s: ArraySlice<UInt8>) -> [Int] {
     i += 4
   }
   return out
+}
+
+/// The length a buffer of `length` bytes is made with, which a freed one must have to be used again: 256 bytes at a time
+/// up to 4 KB, then a quarter of a power of two at a time, so at most a quarter over. With exact lengths, a program whose
+/// batches vary in size made fresh buffers for almost every batch — thousands of them, at the GPU's cost for fresh
+/// memory, which tripled the time of every batch whose size it had not seen.
+func sizeClass(_ length: Int) -> Int {
+  if length <= 4096 { return (length + 255) / 256 * 256 }
+  let step = 1 << (Int.bitWidth - (length - 1).leadingZeroBitCount - 3)
+  return (length + step - 1) / step * step
 }
 
 /// Three 16-bit counts from the top of `b`, as `groups(x, y, z)` packs them.
@@ -170,7 +180,7 @@ final class Session {
   }
 
   func allocate(_ length: Int) -> MTLBuffer? {
-    let size = (length + 255) / 256 * 256
+    let size = sizeClass(length)
     if pool[size]?.isEmpty ?? true { reclaim() }
     if let b = pool[size]?.popLast() { return b }
     return device.makeBuffer(length: size, options: .storageModeShared)
@@ -246,19 +256,30 @@ final class Session {
     compute?.endEncoding()
     compute = nil
     if commands == nil { commands = queue.makeCommandBuffer()! }
-    let key = "\(m) \(k) \(n) \(ta) \(tb)"
-    let product = products[key] ?? MPSMatrixMultiplication(
-      device: device, transposeLeft: ta, transposeRight: tb, resultRows: m, resultColumns: n, interiorColumns: k,
-      alpha: 1, beta: 0)
-    products[key] = product
-    let da = MPSMatrixDescriptor(rows: ta ? k : m, columns: ta ? m : k, rowBytes: (ta ? m : k) * 4, dataType: .float32)
+    // **The result's rows go in power-of-two blocks**, each by a kernel made for that many rows. Making a kernel for a
+    // new number of rows costs about 4 ms, and a program whose batches vary — self-play, whose every step values a
+    // different number of boards — would otherwise make several for every batch. Blocks bound the kernels made to a
+    // couple of dozen for each shape; MPS refuses a kernel made for more rows than the matrices it is given have.
     let db = MPSMatrixDescriptor(rows: tb ? n : k, columns: tb ? k : n, rowBytes: (tb ? k : n) * 4, dataType: .float32)
-    let dc = MPSMatrixDescriptor(rows: m, columns: n, rowBytes: n * 4, dataType: .float32)
-    for q in 0..<batch {
-      product.encode(commandBuffer: commands!,
-                     leftMatrix: MPSMatrix(buffer: A, offset: q * aStride * 4, descriptor: da),
-                     rightMatrix: MPSMatrix(buffer: B, offset: q * bStride * 4, descriptor: db),
-                     resultMatrix: MPSMatrix(buffer: C, offset: q * m * n * 4, descriptor: dc))
+    var start = 0
+    for bit in stride(from: Int.bitWidth - 2, through: 0, by: -1) where m & (1 << bit) != 0 {
+      let rows = 1 << bit
+      let key = "\(rows) \(k) \(n) \(ta) \(tb)"
+      let product = products[key] ?? MPSMatrixMultiplication(
+        device: device, transposeLeft: ta, transposeRight: tb, resultRows: rows, resultColumns: n, interiorColumns: k,
+        alpha: 1, beta: 0)
+      products[key] = product
+      // A transposed left side is k rows of m: the block is `rows` of its columns, so its rows keep their full length.
+      let da = MPSMatrixDescriptor(rows: ta ? k : rows, columns: ta ? rows : k, rowBytes: (ta ? m : k) * 4,
+                                   dataType: .float32)
+      let dc = MPSMatrixDescriptor(rows: rows, columns: n, rowBytes: n * 4, dataType: .float32)
+      for q in 0..<batch {
+        product.encode(commandBuffer: commands!,
+                       leftMatrix: MPSMatrix(buffer: A, offset: (q * aStride + start * (ta ? 1 : k)) * 4, descriptor: da),
+                       rightMatrix: MPSMatrix(buffer: B, offset: q * bStride * 4, descriptor: db),
+                       resultMatrix: MPSMatrix(buffer: C, offset: (q * m + start) * n * 4, descriptor: dc))
+      }
+      start += rows
     }
     busy.formUnion([f[0], f[1], f[2]])
     if profiling { timed("// mps \(m)x\(k)x\(n)\(ta ? " ta" : "")\(tb ? " tb" : "") ×\(batch)") }

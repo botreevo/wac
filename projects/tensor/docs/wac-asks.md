@@ -44,3 +44,32 @@ call (need 3, got 2)*. Found when the backend interface gained a `DType` paramet
 had the old one, and only the GPU check page — not `wac check` — would have said so.
 
 **Here:** nothing to work around; the overrides were brought up to date. It is the check that is missing.
+
+## `x = (await f()) - y` does not emit when `f` is a function-typed parameter
+
+```wac
+async f64 use(fn<Ticket<f64>()> now) {
+  f64 x = 0.0;
+  x = (await now()) - 0.5;
+  return x;
+}
+```
+
+`wac check` is clean; building says *cannot emit — a value whose type this emitter could not work out*, with no
+position. The same with `f64 t = await now(); x = t - 0.5;` emits, as does the expression with a named async function
+in place of the parameter. Found by bisecting `example/workloads.wac`.
+
+**Here:** `timeIt` binds each reading of the clock to a local first.
+
+## An `async` lambda written as an argument emits a module that will not load
+
+```wac
+async f64 use(fn<Ticket<f64>()> now) { f64 a = await now(); return a; }
+export async i32 main(Sys sys) { f64 y = await use(async () => 2.0); return 0; }
+```
+
+`wac check` is clean; running it says *Compiling function "$lambda$0" failed: type error in return[0] (expected (ref
+null 44), got f64)* — the lambda returns its value where its type says a ticket. Assigned to a local of type
+`fn<Ticket<f64>()>` first and passed by name, the same lambda works.
+
+**Here:** `bench.wac` and `metalbench.wac` name their clock in a local before handing it to `run`.

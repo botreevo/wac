@@ -12,6 +12,9 @@ README.md says what this is and where it stands; read it first.
   after `wac task gpucheck:build`. Headless Chromium gets WebGPU from `--enable-unsafe-webgpu --use-angle=swiftshader`
   on a page served from localhost (not `about:blank`, which is not a secure context). `wac task shaders` compiles every
   WGSL program, in both element types, the same way (`tools/shadercheck.js`).
+- **A kernel is written twice, in WGSL (`src/gpu/wgsl.wac`) and MSL (`src/metal/msl.wac`)**, and `GpuBackend` runs
+  either. The Metal check needs a Mac: `wac task metal:server`, start `dist/wac-tensor-metal`, then `wac task
+  metal:check`. `WAC_METAL_PROFILE=1` on the server prints the GPU's time for each program when a run ends.
 - **Every kernel has an `F16` path, and the GPU check runs every case in both types.** A new kernel reads its inputs
   through `L_<name>` and, if elementwise, is a `value(i)` that `elementwise` wraps (`src/gpu/wgsl.wac`); one that
   writes anything else writes `F32` and the backend `settle`s it. On the CPU, `made` does the rounding.

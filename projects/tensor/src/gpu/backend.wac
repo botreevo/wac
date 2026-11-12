@@ -1,4 +1,5 @@
-// The WebGPU backend: each kernel a WGSL program run over GPU buffers, through `wac.gpu`.
+// The GPU backend: each kernel a program run over GPU buffers, through a `GpuLine` — WGSL over `wac.gpu` in a browser,
+// or MSL over a socket to a Metal server (`../metal/`).
 //
 // **Nothing waits but a read.** A kernel makes its output buffer, writes its parameters and runs its program — three
 // operations held in the line and sent with the rest of the step — and answers the output's storage at once. So a
@@ -17,10 +18,8 @@ import { halfBits, halfValue } from "../half.wac";
 import { Device } from "../tensor.wac";
 import { sizeOf } from "../shape.wac";
 import { GpuLine } from "./line.wac";
-import {
-  PARAMS, argReduceShader, binaryShader, castShader, col2imShader, fillShader, gatherShader, im2colShader,
-  matmulShader, padShader, reduceShader, scatterAddShader, selectShader, takeShader, typesKey, unaryShader,
-} from "./wgsl.wac";
+import { Shaders } from "./shaders.wac";
+import { PARAMS, Wgsl, typesKey } from "./wgsl.wac";
 
 export struct GpuStorage : Storage {
   i32 handle;
@@ -48,14 +47,24 @@ export async Result<Device, string> gpuDevice(Host host, fn<void(string)> warn) 
 export struct GpuBackend : Backend {
   GpuLine line;
   fn<void(string)> warn;
+  string label;
+  Shaders shaders;
+  /** Whether the line answers `GPU_MATMUL`, which an `F32` matrix product then goes to instead of a shader. */
+  bool nativeMatmul;
   Map<string, i32> programs;
   i32 lastHandle = 0;
 
-  GpuBackend over(GpuLine line, fn<void(string)> warn) {
-    return GpuBackend { line: line, warn: warn, programs: Map.create(hashString, stringEq) };
+  /** WebGPU through `line`. */
+  GpuBackend over(GpuLine line, fn<void(string)> warn) { return GpuBackend.speaking(line, warn, "webgpu", Wgsl(), false); }
+
+  GpuBackend speaking(GpuLine line, fn<void(string)> warn, string label, Shaders shaders, bool nativeMatmul) {
+    return GpuBackend {
+      line: line, warn: warn, label: label, shaders: shaders, nativeMatmul: nativeMatmul,
+      programs: Map.create(hashString, stringEq),
+    };
   }
 
-  override string name(const this) { return "webgpu"; }
+  override string name(const this) { return this.label; }
 
   i32 handle(this) {
     this.lastHandle++;
@@ -75,12 +84,13 @@ export struct GpuBackend : Backend {
     return GpuStorage { size: n, dtype: t, handle: h };
   }
 
-  /** The program `name`, compiled from `source` the first time it is asked for. */
-  i32 program(this, string name, fn<string()> source) {
+  /** The program `name`, compiled from `source` the first time it is asked for; `tx` by `ty` invocations a workgroup. */
+  i32 program(this, string name, fn<string()> source, i32 tx, i32 ty) {
     i32? had = this.programs.get(name);
     if (had is not null) { return had!; }
     i32 h = this.handle();
-    this.line.program(h, source());
+    // Named in a comment, which both languages allow, so a host can say which program a fault or a time belongs to.
+    this.line.program(h, "// \{name}\n" + source(), tx, ty);
     this.programs.set(name, h);
     return h;
   }
@@ -170,7 +180,7 @@ export struct GpuBackend : Backend {
 
   override Storage fill(this, i32 n, f32 value, DType dtype) {
     GpuStorage out = this.alloc(n, dtype);
-    i32 prog = this.program("fill/" + typesKey(DType[](), dtype), () => fillShader(dtype));
+    i32 prog = this.program("fill/" + typesKey(DType[](), dtype), () => this.shaders.fill(dtype), 64, 1);
     this.spread(prog, [n, bitsOf(value)], [out.handle], n, dtype);
     return out;
   }
@@ -178,7 +188,7 @@ export struct GpuBackend : Backend {
   override Storage cast(this, Storage x, DType to) {
     GpuStorage out = this.alloc(x.size, to);
     DType from = x.dtype;
-    i32 prog = this.program("cast/" + typesKey([from], to), () => castShader(from, to));
+    i32 prog = this.program("cast/" + typesKey([from], to), () => this.shaders.cast(from, to), 64, 1);
     this.spread(prog, [x.size], [this.of(x), out.handle], x.size, to);
     return out;
   }
@@ -186,7 +196,7 @@ export struct GpuBackend : Backend {
   override Storage unary(this, Unary op, Storage x) {
     DType t = x.dtype;
     GpuStorage out = this.alloc(x.size, t);
-    i32 prog = this.program("unary/\{unaryName(op)}/" + typesKey([t], t), () => unaryShader(op, t));
+    i32 prog = this.program("unary/\{unaryName(op)}/" + typesKey([t], t), () => this.shaders.unary(op, t), 64, 1);
     this.spread(prog, [x.size], [this.of(x), out.handle], x.size, t);
     return out;
   }
@@ -195,7 +205,7 @@ export struct GpuBackend : Backend {
     i32 n = sizeOf(out);
     DType t = a.dtype;
     GpuStorage o = this.alloc(n, t);
-    i32 prog = this.program("binary/\{binaryName(op)}/" + typesKey([t, t], t), () => binaryShader(op, t));
+    i32 prog = this.program("binary/\{binaryName(op)}/" + typesKey([t, t], t), () => this.shaders.binary(op, t), 64, 1);
     this.spread(prog, stridedParams(n, out, [sa, sb]), [this.of(a), this.of(b), o.handle], n, t);
     return o;
   }
@@ -205,7 +215,7 @@ export struct GpuBackend : Backend {
     DType ct = c.dtype;
     DType t = a.dtype;
     GpuStorage o = this.alloc(n, t);
-    i32 prog = this.program("select/" + typesKey([ct, t, t], t), () => selectShader(ct, t));
+    i32 prog = this.program("select/" + typesKey([ct, t, t], t), () => this.shaders.select(ct, t), 64, 1);
     this.spread(prog, stridedParams(n, out, [sc, sa, sb]), [this.of(c), this.of(a), this.of(b), o.handle], n, t);
     return o;
   }
@@ -213,7 +223,7 @@ export struct GpuBackend : Backend {
   override Storage reduce(this, Reduce op, Storage x, i32 outer, i32 inner) {
     DType t = x.dtype;
     GpuStorage o = this.alloc(outer, DType.F32);
-    i32 prog = this.program("reduce/\{reduceName(op)}/" + typesKey([t], DType.F32), () => reduceShader(op, t));
+    i32 prog = this.program("reduce/\{reduceName(op)}/" + typesKey([t], DType.F32), () => this.shaders.reduce(op, t), 64, 1);
     this.perRow(prog, [outer, inner], [this.of(x), o.handle], outer);
     return this.settle(o, t);
   }
@@ -221,7 +231,8 @@ export struct GpuBackend : Backend {
   override Storage argReduce(this, bool max, Storage x, i32 outer, i32 inner) {
     DType t = x.dtype;
     GpuStorage o = this.alloc(outer, DType.F32);
-    i32 prog = this.program((max ? "argmax/" : "argmin/") + typesKey([t], DType.F32), () => argReduceShader(max, t));
+    string name = (max ? "argmax/" : "argmin/") + typesKey([t], DType.F32);
+    i32 prog = this.program(name, () => this.shaders.argReduce(max, t), 64, 1);
     this.perRow(prog, [outer, inner], [this.of(x), o.handle], outer);
     return o;
   }
@@ -231,7 +242,11 @@ export struct GpuBackend : Backend {
     DType t = a.dtype;
     GpuStorage o = this.alloc(batch * m * n, DType.F32);
     if (batch * m * n == 0) { return this.settle(o, t); }
-    i32 prog = this.program("matmul/" + typesKey([t, t], DType.F32), () => matmulShader(t));
+    if (this.nativeMatmul && !isHalf(t)) {
+      this.line.matmul([this.of(a), this.of(b), o.handle, batch, m, k, n, ta ? 1 : 0, tb ? 1 : 0, aStride, bStride]);
+      return o;
+    }
+    i32 prog = this.program("matmul/" + typesKey([t, t], DType.F32), () => this.shaders.matmul(t), 16, 16);
     this.run(prog, [batch, m, k, n, ta ? 1 : 0, tb ? 1 : 0, aStride, bStride], [this.of(a), this.of(b), o.handle],
              (n + 15) / 16, (m + 15) / 16, batch);
     return this.settle(o, t);
@@ -241,7 +256,7 @@ export struct GpuBackend : Backend {
     i32 n = sizeOf(out);
     DType t = x.dtype;
     GpuStorage o = this.alloc(n, t);
-    i32 prog = this.program("gather/" + typesKey([t], t), () => gatherShader(t));
+    i32 prog = this.program("gather/" + typesKey([t], t), () => this.shaders.gather(t), 64, 1);
     i32[] p = stridedParams(n, out, [strides]);
     i32[] withOffset = i32[].filled(p.len() + 1, offset);
     withOffset.copyFrom(p, 0, 0, p.len());
@@ -253,7 +268,7 @@ export struct GpuBackend : Backend {
     i32 n = sizeOf(out);
     DType t = x.dtype;
     GpuStorage o = this.alloc(n, t);
-    i32 prog = this.program("pad/" + typesKey([t], t), () => padShader(t));
+    i32 prog = this.program("pad/" + typesKey([t], t), () => this.shaders.pad(t), 64, 1);
     i32 r = out.len();
     i32[] p = i32[].filled(3 + 3 * r, 0);
     p[0] = n;
@@ -272,7 +287,7 @@ export struct GpuBackend : Backend {
     i32 n = c.rows() * c.cols();
     DType t = x.dtype;
     GpuStorage o = this.alloc(n, t);
-    i32 prog = this.program("im2col/" + typesKey([t], t), () => im2colShader(t));
+    i32 prog = this.program("im2col/" + typesKey([t], t), () => this.shaders.im2col(t), 64, 1);
     i32[] p = convParams(n, c);
     p[15] = bitsOf(padValue);
     this.spread(prog, p, [this.of(x), o.handle], n, t);
@@ -283,7 +298,7 @@ export struct GpuBackend : Backend {
     i32 n = c.n * c.h * c.w * c.c;
     DType t = cols.dtype;
     GpuStorage o = this.alloc(n, t);
-    i32 prog = this.program("col2im/" + typesKey([t], t), () => col2imShader(t));
+    i32 prog = this.program("col2im/" + typesKey([t], t), () => this.shaders.col2im(t), 64, 1);
     this.spread(prog, convParams(n, c), [this.of(cols), o.handle], n, t);
     return o;
   }
@@ -292,7 +307,7 @@ export struct GpuBackend : Backend {
     DType t = table.dtype;
     DType it = indices.dtype;
     GpuStorage o = this.alloc(n * width, t);
-    i32 prog = this.program("take/" + typesKey([t, it], t), () => takeShader(t, it));
+    i32 prog = this.program("take/" + typesKey([t, it], t), () => this.shaders.take(t, it), 64, 1);
     this.spread(prog, [n * width, width, table.size / width], [this.of(table), this.of(indices), o.handle], n * width, t);
     return o;
   }
@@ -301,7 +316,7 @@ export struct GpuBackend : Backend {
     DType t = values.dtype;
     DType it = indices.dtype;
     GpuStorage o = this.alloc(rows * width, t);
-    i32 prog = this.program("scatteradd/" + typesKey([t, it], t), () => scatterAddShader(t, it));
+    i32 prog = this.program("scatteradd/" + typesKey([t, it], t), () => this.shaders.scatterAdd(t, it), 64, 1);
     this.spread(prog, [rows * width, width, n], [this.of(values), this.of(indices), o.handle], rows * width, t);
     return o;
   }

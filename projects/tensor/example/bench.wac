@@ -1,91 +1,11 @@
-// CPU against GPU, in this browser: the same work timed on wac-tensor's CPU backend and on WebGPU, side by side.
-//
-// Each benchmark runs once to warm up — the GPU compiles its shaders then — and then as often as fits in about half a
-// second, timing to the moment its result has been read back, so a GPU's queued work is counted, not just its
-// submission. Served beside `mnist.weights`, which the digit model loads; without them it still times everything but
-// the digit model, which then runs with random weights (the time is the same).
+// CPU against GPU, in this browser: the same work timed on wac-tensor's CPU backend and on WebGPU, side by side. The
+// workloads and their timing are `workloads.wac`'s. Served beside `mnist.weights`, which the digit model loads.
 
 import { Page, Site, Element, ElementEvent, Listen } from "web";
-import { Result } from "core";
-import { Device, Tensor, loadWeights } from "../src/lib.wac";
+import { Result, Ticket } from "core";
+import { Device } from "../src/lib.wac";
 import { gpuDevice } from "../src/gpu/backend.wac";
-import { Layer, Sequential, sparseSoftmaxCrossEntropy } from "../src/nn.wac";
-import { Adam } from "../src/optim.wac";
-import { digitModel } from "./mnist/mnist.wac";
-import { Gpt, GptConfig } from "./gpt/model.wac";
-
-struct Bench {
-  string name;
-  /** What one run does, for the throughput column: how many of `unit` it handles. */
-  f64 amount;
-  string unit;
-}
-
-/** Milliseconds per run of `f`, read back each time: once to warm up, then until half a second has passed. */
-async f64 timeIt(Page page, Device d, fn<Tensor()> f) {
-  Tensor w = d.tidy(f);
-  await w.values();
-  w.dispose();
-  i32 reps = 0;
-  f64 t0 = page.now();
-  while (reps < 3 || (page.now() - t0 < 500.0 && reps < 200)) {
-    Tensor r = d.tidy(f);
-    await r.values();
-    r.dispose();
-    reps++;
-  }
-  return (page.now() - t0) / (reps as f64);
-}
-
-f64 round1(f64 v) { return (v * 10.0).round() / 10.0; }
-
-string fmtMs(f64 ms) { return ms < 10.0 ? "\{(ms * 100.0).round() / 100.0} ms" : "\{round1(ms)} ms"; }
-
-string fmtRate(f64 perSecond, string unit) {
-  if (perSecond >= 1000000000.0) { return "\{round1(perSecond / 1000000000.0)} G\{unit}/s"; }
-  if (perSecond >= 1000000.0) { return "\{round1(perSecond / 1000000.0)} M\{unit}/s"; }
-  if (perSecond >= 1000.0) { return "\{round1(perSecond / 1000.0)} k\{unit}/s"; }
-  return "\{round1(perSecond)} \{unit}/s";
-}
-
-/** One benchmark on one device, as milliseconds per run. */
-async f64 run(Page page, Device d, i32 which, u8[] weights) {
-  if (which == 0 || which == 1) {
-    i32 n = which == 0 ? 256 : 1024;
-    Tensor a = d.uniform([n, n], -1.0, 1.0);
-    Tensor b = d.uniform([n, n], -1.0, 1.0);
-    f64 ms = await timeIt(page, d, () => a.matmul(b).sum([], false));
-    a.dispose();
-    b.dispose();
-    return ms;
-  }
-  Sequential m = digitModel(d);
-  if (weights.len() > 0) { loadWeights(m.params(), weights); }
-  if (which == 2 || which == 3) {
-    i32 batch = which == 2 ? 1 : 500;
-    Tensor x = d.uniform([batch, 28, 28, 1], 0.0, 1.0);
-    f64 ms = await timeIt(page, d, () => m.apply(x, false).softmax(-1));
-    x.dispose();
-    for (Tensor v in m.params()) { v.dispose(); }
-    return ms;
-  }
-  if (which == 4) {
-    Tensor x = d.uniform([64, 28, 28, 1], 0.0, 1.0);
-    Tensor y = d.vector(f32[].filled(64, 3.0));
-    Adam opt = Adam.create(0.001);
-    f64 ms = await timeIt(page, d, () => opt.minimize(() => sparseSoftmaxCrossEntropy(m.apply(x, true), y), m.params()));
-    x.dispose();
-    y.dispose();
-    for (Tensor v in m.params()) { v.dispose(); }
-    return ms;
-  }
-  for (Tensor v in m.params()) { v.dispose(); }
-  Gpt g = Gpt.create(d, GptConfig(27, 16, 64, 4, 2, 0.0));
-  Tensor idx = d.fill([1, 16], 3.0);
-  f64 ms = await timeIt(page, d, () => g.apply(idx, false));
-  for (Tensor v in g.params()) { v.dispose(); }
-  return ms;
-}
+import { Bench, fmtMs, fmtRate, round1, run, workloads } from "./workloads.wac";
 
 export async i32 main(Page page) {
   page.title("wac-tensor: CPU vs GPU");
@@ -123,14 +43,7 @@ export async i32 main(Page page) {
     th.text(heads[k]);
     if (k > 0) { th.attr("class", "n"); }
   }
-  Bench[] benches = [
-    Bench("Matrix product, 256 × 256", 2.0 * 256.0 * 256.0 * 256.0, "FLOP"),
-    Bench("Matrix product, 1024 × 1024", 2.0 * 1024.0 * 1024.0 * 1024.0, "FLOP"),
-    Bench("Digit model, one image", 1.0, "images"),
-    Bench("Digit model, batch of 500", 500.0, "images"),
-    Bench("Digit model, training step of 64", 64.0, "images"),
-    Bench("Tiny GPT, one forward pass of 16", 16.0, "tokens"),
-  ];
+  Bench[] benches = workloads();
   Element[] cpuCells = Element[].filled(benches.len(), table);
   Element[] gpuCells = Element[].filled(benches.len(), table);
   Element[] ratioCells = Element[].filled(benches.len(), table);
@@ -156,17 +69,19 @@ export async i32 main(Page page) {
   start.on("click", Listen.none(), (ElementEvent e) => { go = true; });
   while (!go) { await page.nextFrame(); }
   start.attr("disabled", "");
+  // Through a local: an `async` lambda written straight into the call emits a module that will not load (`docs/wac-asks.md`).
+  fn<Ticket<f64>()> now = async () => page.now();
   string summary = "";
   for (i32 k = 0; k < benches.len(); k++) {
     cpuCells[k].text("running…");
     await page.nextFrame();
-    f64 c = await run(page, cpu, k, weights);
+    f64 c = await run(now, cpu, k, weights);
     cpuCells[k].text(fmtMs(c) + " · " + fmtRate(benches[k].amount * 1000.0 / c, benches[k].unit));
     summary += " | \{benches[k].name}: cpu \{fmtMs(c)}";
     if (hasGpu) {
       gpuCells[k].text("running…");
       await page.nextFrame();
-      f64 g = await run(page, opened.ok()!, k, weights);
+      f64 g = await run(now, opened.ok()!, k, weights);
       gpuCells[k].text(fmtMs(g) + " · " + fmtRate(benches[k].amount * 1000.0 / g, benches[k].unit));
       f64 ratio = c / g;
       ratioCells[k].text(ratio >= 1.0 ? "\{round1(ratio)}× faster on GPU" : "\{round1(1.0 / ratio)}× faster on CPU");

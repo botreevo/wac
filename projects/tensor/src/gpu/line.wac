@@ -15,6 +15,11 @@
 // way (a shader that does not compile, a buffer too large) are kept by the host and answered as the next read's fault.
 //
 // Each operation's fields, in `a`, `b`, `text` and `bytes`; two `i32`s in one field are `pair(high, low)`.
+//
+// **The batching is the line's; carrying a batch or a read is a `Wire`'s.** A browser host carries them as
+// capability requests (`HostWire`); `src/metal/` carries the same operations over a socket to a server outside wac,
+// which compiles MSL rather than WGSL — so `GPU_PROGRAM` carries a program's threadgroup size too, which WGSL writes in
+// the shader and Metal asks for at each dispatch.
 
 import { Answer, Capability, Host, ask, capability } from "std";
 import { Buf, Result, Ticket } from "core";
@@ -22,13 +27,19 @@ import { Buf, Result, Ticket } from "core";
 export string GPU_CAPABILITY() { return "wac.gpu"; }
 export string GPU_VERSIONS() { return "^1"; }
 
-/** `a` handle, `b` size in bytes: a storage buffer, zeroed. */
+/**
+ * `a` handle, `b` size in bytes: a storage buffer. A WebGPU host's are zeroed; a Metal server hands out buffers freed
+ * before without clearing them, because `GpuBackend` writes every buffer whole before anything reads it.
+ */
 export static i32 GPU_BUFFER = 0;
 /** `a` handle, `b` offset in bytes, `bytes` what to write there. */
 export static i32 GPU_WRITE = 1;
 /** `a` handle: a buffer or program given back, once every run before it has finished with it. */
 export static i32 GPU_FREE = 2;
-/** `a` handle, `text` WGSL with a `@compute` entry point `main`. */
+/**
+ * `a` handle, `b` the threadgroup size as `groups(x, y, z)`, `text` the program: WGSL with a `@compute` entry point
+ * `main`, whose own `@workgroup_size` a WebGPU host goes by, or MSL with a kernel `k` for a Metal one.
+ */
 export static i32 GPU_PROGRAM = 3;
 /**
  * `a` a program's handle, `b` the workgroup counts as three 16-bit fields x, y, z from the top, `bytes` the buffers'
@@ -39,7 +50,13 @@ export static i32 GPU_RUN = 4;
 export static i32 GPU_READ = 5;
 /** `a` how many operations, `bytes` each one — its number as a byte, `a` and `b` as eight bytes each, then `text` and `bytes` each as a four-byte length and that many bytes, all little-endian. */
 export static i32 GPU_BATCH = 6;
-export static i32 GPU_COUNT = 7;
+/**
+ * A Metal server's only operation beyond WebGPU's: `bytes` eleven little-endian `i32`s — the two operands' handles and
+ * the output's, then batch, m, k, n, ta, tb and the two strides of `Backend.matmul` — computed with Metal Performance
+ * Shaders, `F32` only. A browser host has nothing that answers it, and the WebGPU backend never sends it.
+ */
+export static i32 GPU_MATMUL = 7;
+export static i32 GPU_COUNT = 8;
 
 /** How many operations are held before they are sent without waiting for a read: a bound on what a long run holds. */
 static i32 HOLD_AT = 256;
@@ -54,20 +71,43 @@ void putI64(Buf b, i64 v) {
   b.pushU32((v >> 32) as@ u32);
 }
 
-/** The program's end of `wac.gpu`: the host, where the capability's numbers start, and the operations held. */
-export struct GpuLine {
+/**
+ * What carries the line's two requests to a GPU: a batch of operations, which is never answered, and a read, which is.
+ * Reads are answered in the order they were asked, after every batch sent before them.
+ */
+export struct Wire {
+  virtual void send(this, i32 count, u8[] batch) { trap; }
+  virtual Ticket<Answer> read(this, i32 handle, i32 offset, i32 length) { trap; }
+}
+
+/** `wac.gpu` as capability requests to a host: a browser's, which answers them with WebGPU. */
+export struct HostWire : Wire {
   Host host;
+  /** Where the capability's numbers start. */
   i32 base;
-  /** The version of `wac.gpu` the host speaks. */
-  string version;
+
+  override void send(this, i32 count, u8[] batch) {
+    ask(this.host, this.base + GPU_BATCH, count as i64, 0 as i64, "", batch);
+  }
+
+  override Ticket<Answer> read(this, i32 handle, i32 offset, i32 length) {
+    return ask(this.host, this.base + GPU_READ, handle as i64, pair(offset, length), "", u8[]());
+  }
+}
+
+/** The program's end of a GPU: the wire to it, and the operations held. */
+export struct GpuLine {
+  Wire wire;
   Buf held;
   i32 count;
+
+  GpuLine over(Wire wire) { return GpuLine(wire, Buf.create(), 0); }
 
   /** `wac.gpu` from `host`, or why there is none. */
   async Result<GpuLine, string> open(Host host) {
     Result<Capability, string> found = await capability(host, GPU_CAPABILITY(), GPU_VERSIONS());
     match (found) {
-      Ok(c): { return Result.Ok(GpuLine(host, c.base, c.version, Buf.create(), 0)); }
+      Ok(c): { return Result.Ok(GpuLine.over(HostWire { host: host, base: c.base })); }
       Err(why): { return Result.Err(why); }
     }
   }
@@ -92,25 +132,34 @@ export struct GpuLine {
     i32 n = this.count;
     this.held = Buf.create();
     this.count = 0;
-    ask(this.host, this.base + GPU_BATCH, n as i64, 0 as i64, "", bytes);
+    this.wire.send(n, bytes);
   }
 
   void buffer(this, i32 handle, i32 size) { this.tell(GPU_BUFFER, handle as i64, size as i64, "", u8[]()); }
   void write(this, i32 handle, i32 offset, u8[] bytes) { this.tell(GPU_WRITE, handle as i64, offset as i64, "", bytes); }
   void free(this, i32 handle) { this.tell(GPU_FREE, handle as i64, 0 as i64, "", u8[]()); }
-  void program(this, i32 handle, string wgsl) { this.tell(GPU_PROGRAM, handle as i64, 0 as i64, wgsl, u8[]()); }
+  void program(this, i32 handle, string source, i32 tx, i32 ty) {
+    this.tell(GPU_PROGRAM, handle as i64, groups(tx, ty, 1), source, u8[]());
+  }
 
   void run(this, i32 program, i32 x, i32 y, i32 z, i32[] buffers) {
-    u8[] b = u8[].filled(buffers.len() * 4, 0 as u8);
-    for (i32 i = 0; i < buffers.len(); i++) {
-      for (i32 k = 0; k < 4; k++) { b[i * 4 + k] = ((buffers[i] >> (8 * k)) & 255) as~ u8; }
-    }
-    this.tell(GPU_RUN, program as i64, groups(x, y, z), "", b);
+    this.tell(GPU_RUN, program as i64, groups(x, y, z), "", littleEndian(buffers));
   }
+
+  void matmul(this, i32[] fields) { this.tell(GPU_MATMUL, 0 as i64, 0 as i64, "", littleEndian(fields)); }
 
   /** What `handle` holds, `length` bytes from `offset` — after everything held is sent. */
   Ticket<Answer> read(this, i32 handle, i32 offset, i32 length) {
     this.flush();
-    return ask(this.host, this.base + GPU_READ, handle as i64, pair(offset, length), "", u8[]());
+    return this.wire.read(handle, offset, length);
   }
+}
+
+/** `values` as little-endian `i32`s. */
+export u8[] littleEndian(i32[] values) {
+  u8[] b = u8[].filled(values.len() * 4, 0 as u8);
+  for (i32 i = 0; i < values.len(); i++) {
+    for (i32 k = 0; k < 4; k++) { b[i * 4 + k] = ((values[i] >> (8 * k)) & 255) as~ u8; }
+  }
+  return b;
 }

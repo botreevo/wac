@@ -165,6 +165,39 @@ export async i32 main(Page page) {
 The host side is in wac-web (`tools/build.wac`, `wac.gpu` in `programSide`), and this repository's `wac.json5` pins a
 master commit that has it.
 
+**Metal** (`src/metal/`) is the same `GpuBackend` for a program run by `wac` on a Mac, where there is no browser to
+answer `wac.gpu`. Its kernels are the WGSL ones written again in MSL (`src/metal/msl.wac`), over the same buffers and
+parameters (`src/gpu/shaders.wac` is what the two languages share), and the line carries them over a socket to a small
+server outside wac (`metal/server.swift`) instead of to a host. The server knows nothing about tensors: it compiles the
+programs it is sent, keeps buffers, runs and reads them — `wac.gpu`'s five operations — and answers one more, a matrix
+product by Metal Performance Shaders, which every `F32` product goes to. Nothing in `wac` changes; the program needs
+only `--allow-net`.
+
+```sh
+wac task metal:server && dist/wac-tensor-metal &   # swiftc, then listen on 127.0.0.1:7787
+wac task metal:check                                # devicecheck.wac's checks against the CPU: PASS 128
+wac task metal:bench                                # the six benchmarks, CPU against Metal
+```
+
+```wac
+Device d = (await metalDevice(sys.net(), "127.0.0.1", METAL_PORT, (string s) => { sys.log(s); })).ok()!;
+```
+
+On a Mac in a virtual machine (Apple M4 Pro, paravirtualised; the same machine and Chrome for each column):
+
+| Benchmark | CPU (wac, native) | WebGPU (Chrome) | Metal |
+|---|---|---|---|
+| Matrix product, 256 × 256 | 6.0 ms | 1.1 ms | 0.6–1.0 ms |
+| Matrix product, 1024 × 1024 | 372 ms | 8.4 ms | 3.9–4.6 ms |
+| Digit model, one image | 0.26 ms | 5.2 ms | 0.58 ms |
+| Digit model, batch of 500 | 122 ms | 16–25 ms | 7.8 ms |
+| Digit model, training step of 64 | 43 ms | 49 ms | 3.0 ms |
+| Tiny GPT, one forward pass of 16 | 0.90 ms | 28 ms | 1.1 ms |
+
+Most of the difference on the small workloads is the round trip — about 0.3 ms to the server and back, where Chrome’s
+is closer to 0.7 ms and Deno's WebGPU 20 — and the rest is the server's pool of freed buffers: a buffer the GPU has not
+written before costs it more than twice as long the first time, and every kernel's output is a new one.
+
 ## Checking it
 
 ```sh
@@ -172,17 +205,19 @@ wac task test             # 39 tests, about a second: every op, every gradient, 
 wac task gpucheck:build   # the GPU check as a page
 wac task gpucheck         # ...run in headless Chromium: PASS 128
 wac task shaders          # every WGSL program, in both types, compiled in Chromium: 100 of them
+wac task metal:check      # the same checks on Metal, with `dist/wac-tensor-metal` running: PASS 128
 ```
 
 - **Gradients against finite differences.** Every backward rule — 21 unary, 10 binary with broadcasting, 9 reductions,
   10 shape operations, 6 matrix products, 6 convolutions and pools — is checked against central differences
   (`test/grad_test.wac`). It needs no second implementation to agree with.
-- **The GPU against the CPU.** `example/gpucheck.wac` runs 63 cases — every kernel and every unary and binary
+- **The GPU against the CPU.** `example/devicecheck.wac` runs 63 cases — every kernel and every unary and binary
   operation, large and awkward shapes (more rows than a dispatch grid is wide, matrices that do not divide into
   tiles), gradients through convolution, gather and pooling — in `F32` and again in `F16`, on both backends from the
   same numbers; then 200 steps of training compared step for step, and a model in halves trained on the GPU. A
-  mutation in one shader turns it red, as does swapping the two halves of a packed word. Run on SwiftShader,
-  Chromium's software Vulkan, it needs no GPU.
+  mutation in one shader turns it red, as does swapping the two halves of a packed word. `gpucheck.wac` runs them on
+  WebGPU as a page — on SwiftShader, Chromium's software Vulkan, it needs no GPU — and `metalcheck.wac` on Metal, where
+  a mutation in an MSL kernel or in the server's matrix product turns them red too.
 - **Halves bit for bit.** The conversions agree with IEEE 754 (and NumPy) at the edges — ties to even, the largest
   finite half, overflow to infinity, the subnormals — and every one of the 65536 halves survives the round trip.
 - **Optimizers exactly.** Each optimizer's first one or two steps are compared with the numbers worked by hand.
@@ -196,6 +231,8 @@ wac task shaders          # every WGSL program, in both types, compiled in Chrom
   page offers what it trained as a download yet — a GPT trained in a tab is still gone when it closes.
 - Speed on the CPU. It is a reference. On the GPU the matrix product is tiled and the rest is one pass per kernel,
   with no fusion of elementwise chains.
+- A pool of buffers in wac-web's browser host. It makes a new `GPUBuffer` for every kernel's output, as the Metal
+  server did until a pool made its training step five times faster; WebGPU likely pays the same, unmeasured.
 - GPU scatter-add is a gather over every index per output element — WGSL has no float atomics — so an embedding's
   gradient costs rows × width × indices.
 - Shape errors trap rather than explain: wac has no exceptions, and a `Result` from every operation would make

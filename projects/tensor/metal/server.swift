@@ -19,8 +19,8 @@
 //
 // **A batch is encoded as it arrives and committed at its end**, so the GPU works while the program builds the next.
 // A read waits for everything committed, then answers — with the fault of anything that went wrong since the last read,
-// if anything did, since a read is the one place the program listens. One connection at a time; its buffers go when it
-// does.
+// if anything did, since a read is the one place the program listens. Each connection is served on a thread of its own,
+// with its own queue and buffers, which go when it does: several programs — self-play workers, say — share one GPU.
 //
 // **`WAC_METAL_PROFILE=1`** runs every dispatch in a command buffer of its own and waits for it, which is slow, and
 // prints the GPU's time for each program when the connection closes — named by the comment wac-tensor puts first.
@@ -335,6 +335,8 @@ while true {
   let fd = accept(listener, nil, nil)
   if fd < 0 { continue }
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
-  serve(Conn(fd), device)
-  close(fd)
+  Thread {
+    serve(Conn(fd), device)
+    close(fd)
+  }.start()
 }

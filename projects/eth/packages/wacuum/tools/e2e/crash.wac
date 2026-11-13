@@ -64,12 +64,17 @@ async Proc start(Sys sys, string app, string dir, string data, i32 port, bool st
                    "--datadir", data, store ? "--store" : "--snapshot-every", store ? "--flush-every" : "1000000", store ? "\{flush}" : "--public-rpc"];
   Proc p = await Proc.start(sys, argv, data + ".log");
   await p.says(sys, "Engine API on", 300000);
+  // Answering, and this process rather than one before it: anything the test asks next is about this one.
+  Rpc u = Rpc.at(sys, port);
+  for (i32 i = 0; i < 100 && (await u.text("eth_blockNumber", "[]")) == ""; i++) { await sys.sleepMillis(100); }
   return p;
 }
 
 /** The process and everything under it, killed at once with no chance to finish anything. */
 async void killHard(Sys sys, string pid) {
-  await shell(sys, "k() { for c in $(pgrep -P $1); do k $c; done; kill -9 $1 2>/dev/null; }; k \{pid}");
+  // And gone, before anything starts on its port: a restart that raced it for the port would not listen.
+  await shell(sys, "k() { for c in $(pgrep -P $1); do k $c; done; kill -9 $1 2>/dev/null; }; k \{pid}; " +
+                   "while kill -0 \{pid} 2>/dev/null && ! grep -q '^State:.*Z' /proc/\{pid}/status 2>/dev/null; do sleep 0.05; done");
 }
 
 export async i32 main(Sys sys) {
@@ -129,7 +134,7 @@ export async i32 main(Sys sys) {
   t.that(chain.len() == blocks, "the first node built \{chain.len()} blocks");
 
   // The same chain into a wacuum on a store, killed at random as it goes.
-  i32 portB = await somePort(sys, 19851, 500);
+  i32 portB = await somePort(sys, 20251, 500);
   string dataB = dir + "/b";
   Proc b = await start(sys, app, dir, dataB, portB, true, flush);
   Rpc ub = Rpc.at(sys, portB);
@@ -163,6 +168,11 @@ export async i32 main(Sys sys) {
       restarts++;
       // Given again from where it says it is.
       string n = await ub.text("eth_blockNumber", "[]");
+      if (n == "") {
+        t.that(false, "the node answers after kill \{killed}; it said:\n\{await b.output(sys)}");
+        stuck = true;
+        break;
+      }
       // Where the kill fell, by what the store says it holds as it starts: the block being imported (number
       // next + 1) committed or not. The head moves only with the next forkchoiceUpdated, which a killed import
       // never got, so it is given again from the head either way.

@@ -20,7 +20,7 @@ import { Message, small, numOf } from "./wire.wac";
 import { Store, Change, compareKeys, CHUNK } from "../store/tree.wac";
 import { emptyCodeHash } from "../state/world.wac";
 import { emptyRoot, hexPrefixOf } from "../trie/trie.wac";
-import { PathTrie, nodeKey, subtreeRanges } from "../trie/pathtrie.wac";
+import { PathTrie, nodeKey, subtreeRanges, entryKey, isEntry, entryHash, entries } from "../trie/pathtrie.wac";
 import { StackTrie } from "../trie/stacktrie.wac";
 import { verifyRange, Range } from "../trie/rangeproof.wac";
 
@@ -91,12 +91,6 @@ u8[] key(u8 kind, u8[] a, u8[] b) {
   return out;
 }
 
-u8[] tail(u8[] k, i32 from) {
-  u8[] out = u8[].filled(k.len() - from, 0);
-  out.copyFrom(k, from, 0, out.len());
-  return out;
-}
-
 /** The key just after `k` (32 bytes), or null after the last one. */
 export u8[]? nextKey(u8[] k) {
   u8[] out = u8[].filled(32, 0);
@@ -149,12 +143,12 @@ export async Message answerAccountRange(Store store, u8[] stateRoot, Item body) 
   if (!same(root, stateRoot) || origin.len() != 32 || limit.len() != 32) {
     return Message(ACCOUNT_RANGE, Item.List([small(id), Item.List(none()), Item.List(none())]));
   }
-  Vec<Change> got = await store.range(key(0, origin, u8[].filled(0, 0)), [1], 4096);
+  Vec<Change> got = await entries(store, u8[].filled(0, 0), origin, 4096);
   Vec<Item> accounts = Vec.create();
   u64 size = 0;
   u8[] last = origin;
   for (i32 i = 0; i < got.len() && size < budget; i++) {
-    u8[] h = tail(got.get(i).key, 1);
+    u8[] h = got.get(i).key;
     // One past the limit is allowed, as snap's servers do: it proves where the run ends.
     accounts.push(Item.List([bytes32(h), slimAccount(got.get(i).value!)]));
     size += 32 + ((got.get(i).value!.len() as@ u32) as u64);
@@ -197,20 +191,18 @@ export async Message answerStorageRanges(Store store, u8[] stateRoot, Item body)
   for (i32 a = 0; a < accounts.len() && size < budget; a++) {
     u8[] owner = bytesOf(accounts[a]);
     u8[] from = a == 0 ? origin : u8[].filled(32, 0);
-    u8[] prefix = key(1, owner, u8[].filled(0, 0));
-    u8[] end = key(1, owner, maxKey());
-    Vec<Change> got = await store.range(key(1, owner, from), u8[].filled(0, 0), 0x7fffffff);
+    // No more than the budget left could take, each slot being at least 33 bytes of it.
+    Vec<Change> got = await entries(store, owner, from, (((budget - size) / 33 + 1) as! i32));
     Vec<Item> mine = Vec.create();
     u8[] last = from;
     bool cut = false;
     for (i32 i = 0; i < got.len(); i++) {
       Change c = got.get(i);
-      if (compareKeys(c.key, prefix) < 0 || c.key.len() != 65 || !startsWith(c.key, prefix)) { break; }
       if (size >= budget) {
         cut = true;
         break;
       }
-      u8[] h = tail(c.key, 33);
+      u8[] h = c.key;
       mine.push(Item.List([bytes32(h), Item.Bytes(c.value!)]));
       size += 32 + ((c.value!.len() as@ u32) as u64);
       last = h;
@@ -232,14 +224,6 @@ export async Message answerStorageRanges(Store store, u8[] stateRoot, Item body)
     }
   }
   return Message(STORAGE_RANGES, Item.List([small(id), list(slots), list(proof)]));
-}
-
-bool startsWith(u8[] k, u8[] p) {
-  if (k.len() < p.len()) { return false; }
-  for (i32 i = 0; i < p.len(); i++) {
-    if (k[i] != p[i]) { return false; }
-  }
-  return true;
 }
 
 /** ByteCodes for a GetByteCodes: each code the store has, in the order asked, while they fit. */
@@ -363,7 +347,7 @@ async string accounts(Asker peer, Shared s, u8[] from, u8[] to) {
       // Past this slice's end is the next slice's: proved here, kept there.
       if (compareKeys(keys[i], to) > 0) { continue; }
       s.f.accounts++;
-      out.push(Change(key(0, keys[i], u8[].filled(0, 0)), vals[i]));
+      out.push(Change(entryKey(u8[].filled(0, 0), keys[i]), vals[i]));
       Item[] acct = itemsOf(decode(vals[i]).item);
       u8[] sr = bytesOf(acct[2]);
       if (!same(sr, emptyRoot())) {
@@ -419,7 +403,7 @@ async string storages(Asker peer, Shared s) {
         break;
       }
       Vec<Change> out = Vec.create();
-      for (i32 i = 0; i < keys.len(); i++) { out.push(Change(key(1, owner, keys[i]), vals[i])); }
+      for (i32 i = 0; i < keys.len(); i++) { out.push(Change(entryKey(owner, keys[i]), vals[i])); }
       s.f.slots += keys.len();
       string bad = await commitLocked(s, out.toArray());
       if (bad != "") { return bad; }
@@ -500,14 +484,8 @@ async string buildTries(Store store, Fetched f, Vec<u8[]> owners, Vec<u8[]> root
     u8[] owner = owners.get(a);
     Vec<Change> nodes = Vec.create();
     StackTrie st = StackTrie.create((u8[] path, u8[] enc) => { nodes.push(Change(nodeKey(owner, path), enc)); });
-    u8[] from = key(1, owner, u8[].filled(0, 0));
-    u8[] to = key(1, owner, maxKey());
-    Vec<Change> slots = await store.range(from, u8[].filled(0, 0), 0x7fffffff);
-    for (i32 i = 0; i < slots.len(); i++) {
-      Change c = slots.get(i);
-      if (!startsWith(c.key, key(1, owner, u8[].filled(0, 0)))) { break; }
-      st.add(tail(c.key, 33), c.value!);
-    }
+    Vec<Change> slots = await entries(store, owner, u8[].filled(32, 0), 0x7fffffff);
+    for (i32 i = 0; i < slots.len(); i++) { st.add(slots.get(i).key, slots.get(i).value!); }
     u8[] r = st.finish();
     if (!same(r, roots.get(a)) && !moved) { return "a storage trie does not come to its account's root"; }
     f.nodes += nodes.len();
@@ -521,8 +499,13 @@ async string buildTries(Store store, Fetched f, Vec<u8[]> owners, Vec<u8[]> root
 async u8[]? buildAccountTrie(Store store, Fetched f) {
   Vec<Change> nodes = Vec.create();
   StackTrie st = StackTrie.create((u8[] path, u8[] enc) => { nodes.push(Change(nodeKey(u8[].filled(0, 0), path), enc)); });
-  Vec<Change> accounts = await store.range([0], [1], 0x7fffffff);
-  for (i32 i = 0; i < accounts.len(); i++) { st.add(tail(accounts.get(i).key, 1), accounts.get(i).value!); }
+  // A chunk of accounts at a time, not all of them in memory at once.
+  u8[]? from = u8[].filled(32, 0);
+  while (from is not null) {
+    Vec<Change> accounts = await entries(store, u8[].filled(0, 0), from!, 4096);
+    for (i32 i = 0; i < accounts.len(); i++) { st.add(accounts.get(i).key, accounts.get(i).value!); }
+    from = accounts.len() < 4096 ? null : nextKey(accounts.get(accounts.len() - 1).key);
+  }
   u8[] r = st.finish();
   f.nodes += nodes.len();
   if ((await store.commit(nodes.toArray(), u8[].filled(0, 0))) != "") { return null; }
@@ -693,13 +676,6 @@ async string heal(Asker[] peers, Store store, u8[] root, Fetched f) {
   return await healCodes(peers, store, f);
 }
 
-/** The flat entries' keys under a trie path: accounts, or an owner's slots. */
-(u8[], u8[]) flatRange(u8[] owner, u8[] path) {
-  u8[] lo = owner.len() == 0 ? key(0, packed(path, 0), u8[].filled(0, 0)) : key(1, owner, packed(path, 0));
-  u8[] hi = owner.len() == 0 ? key(0, packed(path, 15), [0 as u8]) : key(1, owner, cat(packed(path, 15), [0 as u8]));
-  return (lo, hi);
-}
-
 u8[] cat(u8[] a, u8[] b) {
   u8[] out = u8[].filled(a.len() + b.len(), 0);
   out.copyFrom(a, 0, 0, a.len());
@@ -709,30 +685,22 @@ u8[] cat(u8[] a, u8[] b) {
 
 /** Everything the store has under `path` of the trie — its nodes and its entries, and gone accounts' storage — deleted, but for `keep`. */
 async void clearUnder(Store store, u8[] owner, u8[] path, u8[]? keep, Vec<Change> out) {
+  // The entries under the path are among its nodes, in the depth-first range: one pass deletes both.
   u8[] np = nodeKey(owner, path);
   Vec<u8[]> ranges = subtreeRanges(owner, path);
   for (i32 r = 0; r < ranges.len(); r += 2) {
-    Vec<Change> nodes = await store.range(ranges.get(r), ranges.get(r + 1), 0x7fffffff);
-    for (i32 i = 0; i < nodes.len(); i++) {
-      // The node at the path itself is rewritten by the caller; those below it go.
-      if (!same(nodes.get(i).key, np)) { out.push(Change(nodes.get(i).key, null)); }
-    }
-  }
-  (u8[] lo, u8[] hi) = flatRange(owner, path);
-  Vec<Change> entries = await store.range(lo, hi, 0x7fffffff);
-  for (i32 i = 0; i < entries.len(); i++) {
-    u8[] k = entries.get(i).key;
-    if (keep is not null && same(k, keep!)) { continue; }
-    out.push(Change(k, null));
-    if (owner.len() == 0) {
-      // An account gone takes its storage, slots and trie, with it.
-      u8[] h = tail(k, 1);
-      u8[] sp = key(1, h, u8[].filled(0, 0));
-      Vec<Change> slots = await store.range(sp, bump(sp), 0x7fffffff);
-      for (i32 s = 0; s < slots.len(); s++) { out.push(Change(slots.get(s).key, null)); }
-      u8[] tp = key(4, h, u8[].filled(0, 0));
-      Vec<Change> tn = await store.range(tp, bump(tp), 0x7fffffff);
-      for (i32 s = 0; s < tn.len(); s++) { out.push(Change(tn.get(s).key, null)); }
+    Vec<Change> under = await store.range(ranges.get(r), ranges.get(r + 1), 0x7fffffff);
+    for (i32 i = 0; i < under.len(); i++) {
+      u8[] k = under.get(i).key;
+      // The node at the path itself is rewritten by the caller, and `keep` is the entry it writes.
+      if (same(k, np) || keep is not null && same(k, keep!)) { continue; }
+      out.push(Change(k, null));
+      if (owner.len() == 0 && isEntry(k)) {
+        // An account gone takes its storage, slots and trie, with it: all under one prefix.
+        u8[] tp = key(4, entryHash(k), u8[].filled(0, 0));
+        Vec<Change> tn = await store.range(tp, bump(tp), 0x7fffffff);
+        for (i32 s = 0; s < tn.len(); s++) { out.push(Change(tn.get(s).key, null)); }
+      }
     }
   }
 }
@@ -787,7 +755,7 @@ async string apply(Store store, Fetched f, Need n, Item it, bool stored, Vec<Cha
   }
   // A leaf: its entry, and nothing else under its path.
   u8[] k = packed(full, 0);
-  u8[] flat = n.owner.len() == 0 ? key(0, k, u8[].filled(0, 0)) : key(1, n.owner, k);
+  u8[] flat = entryKey(n.owner, k);
   await clearUnder(store, n.owner, n.path, flat, out);
   u8[] value = bytesOf(fs[1]);
   out.push(Change(flat, value));
@@ -797,10 +765,7 @@ async string apply(Store store, Fetched f, Need n, Item it, bool stored, Vec<Cha
     u8[] sr = bytesOf(acct[2]);
     if (!same(sr, emptyRoot())) { todo.push(Need(k, u8[].filled(0, 0), Item.Bytes(sr))); }
     else {
-      // No storage: none left over from a state before.
-      u8[] sp = key(1, k, u8[].filled(0, 0));
-      Vec<Change> slots = await store.range(sp, bump(sp), 0x7fffffff);
-      for (i32 s = 0; s < slots.len(); s++) { out.push(Change(slots.get(s).key, null)); }
+      // No storage: none left over from a state before, slots or nodes.
       u8[] tp = key(4, k, u8[].filled(0, 0));
       Vec<Change> tn = await store.range(tp, bump(tp), 0x7fffffff);
       for (i32 s = 0; s < tn.len(); s++) { out.push(Change(tn.get(s).key, null)); }
@@ -819,15 +784,20 @@ u8[] slice(u8[] b, i32 from, i32 to) {
 
 /** Every code an account in the store names and the store has not got, fetched. */
 async string healCodes(Asker[] peers, Store store, Fetched f) {
-  Vec<Change> accounts = await store.range([0], [1], 0x7fffffff);
   Vec<u8[]> missing = Vec.create();
   Map<string, bool> seenCode = Map.create(hashText, textEq);
-  for (i32 i = 0; i < accounts.len(); i++) {
-    u8[] ch = bytesOf(itemsOf(decode(accounts.get(i).value!).item)[3]);
-    if (same(ch, emptyCodeHash().toBytes()) || seenCode.has(text(ch))) { continue; }
-    seenCode.set(text(ch), true);
-    u8[] base = key(2, ch, u8[].filled(0, 0));
-    if ((await store.range(base, bump(base), 1)).len() == 0) { missing.push(ch); }
+  // A chunk of accounts at a time, not all of them in memory at once.
+  u8[]? from = u8[].filled(32, 0);
+  while (from is not null) {
+    Vec<Change> accounts = await entries(store, u8[].filled(0, 0), from!, 4096);
+    for (i32 i = 0; i < accounts.len(); i++) {
+      u8[] ch = bytesOf(itemsOf(decode(accounts.get(i).value!).item)[3]);
+      if (same(ch, emptyCodeHash().toBytes()) || seenCode.has(text(ch))) { continue; }
+      seenCode.set(text(ch), true);
+      u8[] base = key(2, ch, u8[].filled(0, 0));
+      if ((await store.range(base, bump(base), 1)).len() == 0) { missing.push(ch); }
+    }
+    from = accounts.len() < 4096 ? null : nextKey(accounts.get(accounts.len() - 1).key);
   }
   return await fetchCodes(peers, store, f, missing);
 }

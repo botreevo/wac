@@ -7,9 +7,10 @@
 //     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/soak.wac [BLOCKS]
 //
 // BLOCKS defaults to 1200: some 600 000 slots. The store's cache of entries is held to 32 MB, which the
-// first third of the run fills. Resident memory is sampled every 50 blocks, and the highest sample of the
-// last third may be above the highest of the middle third by a margin and no more: V8 grows its heap ahead
-// of collecting, so two single samples can differ by its slack, but a leak keeps raising the peaks. (Before 2026-11-13 it grew ~0.75 MB a block: the node kept every slot it had read, decoded,
+// first third of the run fills. Resident memory is sampled every 50 blocks, and the samples of the last third
+// may average above those of the middle third by a margin and no more: V8 grows its heap ahead of collecting,
+// so single samples swing by 50–100 MB, but a leak raises the average. Measured: +29 MB with the history held
+// to 64 blocks, +63 MB with all of it kept (it is in memory), +300 MB with the leaks fixed on 2026-11-13. (Before 2026-11-13 it grew ~0.75 MB a block: the node kept every slot it had read, decoded,
 // and the store every leaf it had written.)
 
 import { Sys } from "std";
@@ -23,7 +24,7 @@ static string ZERO = "0x00000000000000000000000000000000000000000000000000000000
 /** New slots each call writes: two calls a block, each at its own offset. */
 static i32 SLOTS = 250;
 static i64 CACHE_MB = 32;
-static i64 MARGIN_MB = 48;
+static i64 MARGIN_MB = 40;
 
 struct Chain {
   Rpc engine;
@@ -113,8 +114,10 @@ export async i32 main(Sys sys) {
   t.that(await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + code, "with its code");
 
   u64 nonce = 1;
-  i64 middlePeak = 0;
-  i64 lastPeak = 0;
+  i64 middleSum = 0;
+  i64 middleN = 0;
+  i64 lastSum = 0;
+  i64 lastN = 0;
   i64 earlyFile = 0;
   i64 i0 = await sys.monotonicNanos();
   bool ok = true;
@@ -135,16 +138,23 @@ export async i32 main(Sys sys) {
       i64 secs = (await sys.monotonicNanos() - i0) / 1000000000;
       sys.log("  block \{b}: \{rss} MB resident, store \{file} MB, \{secs} s");
       if (b <= blocks / 3) { earlyFile = file; }
-      else if (b <= 2 * blocks / 3) { middlePeak = rss > middlePeak ? rss : middlePeak; }
-      else { lastPeak = rss > lastPeak ? rss : lastPeak; }
+      else if (b <= 2 * blocks / 3) {
+        middleSum += rss;
+        middleN++;
+      } else {
+        lastSum += rss;
+        lastN++;
+      }
     }
   }
   t.that(ok, "wacuum built and imported \{blocks} blocks");
   string slotAt = "[\"\{contract}\",\"\{U256.ofU64(((blocks as@ u32) as u64) * 2 * ((SLOTS as@ u32) as u64) + 1).toHex()}\",\"latest\"]";
   t.that(await user.text("eth_getStorageAt", slotAt) == bytesToHex(U256.ofU64((blocks as@ u32) as u64).toBytes()), "and the last block's slots are there");
   i64 lateFile = await fileMb(sys, dir + "/data/state.db");
-  t.that(lastPeak - middlePeak <= MARGIN_MB,
-         "resident memory at its highest: \{middlePeak} MB in the middle third, \{lastPeak} MB in the last, while the store went \{earlyFile} → \{lateFile} MB: within \{MARGIN_MB} MB");
+  i64 middle = middleN == 0 ? 0 : middleSum / middleN;
+  i64 last = lastN == 0 ? 0 : lastSum / lastN;
+  t.that(middleN > 0 && lastN > 0 && last - middle <= MARGIN_MB,
+         "resident memory on average: \{middle} MB in the middle third, \{last} MB in the last, while the store went \{earlyFile} → \{lateFile} MB: within \{MARGIN_MB} MB");
 
   await proc.stop(sys);
   await removeDir(sys, dir);

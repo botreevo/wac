@@ -61,6 +61,16 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   1.24 s), the commit six times slower (2.8 s against 0.48 s, 15 506 page reads against 2 964), 42 Mgas/s against
   104 — a commit rewrites a leaf for nearly every key it touches, and on a big store those leaves are cold and
   apart. That is ~0.57 s a block, well inside a slot; it is the number to watch at Hoodi's size.
+
+  Where a probe block's time goes at 5 GB (500 accounts written, one commit, file in the page cache): its reads
+  ~50 ms; staging (the tries' new nodes and the root) ~125 ms, 1 229 leaf reads of which the host's part is ~26 ms
+  and the rest hashing and encoding; the store's commit only 185 leaf reads but 2 171 page writes and two syncs.
+  The host (`tools/measure/inflight.wac`, this VM's virtio disk): a 16 KB read from the page cache is ~21 us
+  however many are in flight; from the disk, 448 us one at a time and 218 us with 256 in flight; a write 86 us
+  alone and 25 us with 64 in flight; a sync ~85–90 ms whatever came before it. So a commit now sends its writes 64
+  at a time and reads the leaves it will need 64 ahead (`Store.inFlight`, `Store.prefetch`): the commit went from
+  311–339 ms to 262–264 ms, and what is left is mostly its two syncs — which batching (`--flush-every 64`, the
+  default) pays once per 64 blocks rather than every block.
 - **Crashes** (`tools/e2e/crash.wac`): a store node killed with SIGKILL at random points while importing — 110
   kills over three runs, 47 before the block's commit was whole and 63 after — always came back to the uncrashed
   node's head, state root, slots and balances; and with commits batched, 40 kills flushing every 8 blocks and 40
@@ -103,8 +113,9 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
   leaves the kernel's page cache intact.
 - **Store format**: new, and changed once already (64 KB → 16 KB pages); there is no migration, and none is
   needed while no store exists anywhere that matters.
-- **wac workarounds**: a field-table limit in the checker (wac 0468d; `Engine`'s new fields grouped into one) and
-  the deno-only oracle tests (abi, mpt, ssz) not runnable in this container.
+- **wac**: pinned at 424e0273b, which fixes the checker's field-table limit (0468d) that `Engine`'s new fields
+  first ran into; they stay grouped in `Persisting`, which reads well as it is. The deno-only oracle tests (abi,
+  mpt, ssz) are not runnable in this container.
 
 ## Not tested at all
 

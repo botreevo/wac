@@ -5,7 +5,7 @@
 // at each step: the file's size, how fast it filled, a probe block's reads and commit, the leaf reads they took,
 // and the process's resident memory. The trend is what is wanted, before mainnet's hundreds of GB.
 //
-//     wac --max-heap 2g run --allow-read --allow-write tools/measure/scale.wac -- PATH MAX_MB [STEP_MB] [FLUSH]
+//     wac --max-heap 2g run --allow-read --allow-write tools/measure/scale.wac -- PATH MAX_MB [STEP_MB] [FLUSH] [PREFETCH]
 //
 // PATH is created (or grown, if it holds a store this wrote). STEP_MB defaults to 500. MAX_MB 0 only probes what
 // is there: under a small --max-heap, whether a store of that size works in it.
@@ -16,7 +16,7 @@ import { U256 } from "../../src/u256.wac";
 import { AccountState, emptyCodeHash, hashU256, eqU256, slotMap } from "../../src/state/world.wac";
 import { Store } from "../../src/store/tree.wac";
 import { fileDisk } from "../../src/store/file.wac";
-import { StateDb } from "../../src/store/state.wac";
+import { StateDb, Staged } from "../../src/store/state.wac";
 
 static i32 ACCOUNTS = 20000;
 static i32 CONTRACT_SLOTS = 20000;
@@ -64,6 +64,11 @@ export async i32 main(Sys sys) {
   StateDb db = StateDb.over(store);
   // Batches as snap writes them, a commit each, unless FLUSH says to stage them.
   db.flushEvery = a.len() > 3 ? (parse(a[3]) as! i32) : 1;
+  // How many leaves a commit reads ahead, all at once (0: each read when it is reached).
+  if (a.len() > 4) {
+    store.prefetch = parse(a[4]) as! i32;
+    store.inFlight = store.prefetch > 0 ? store.prefetch : 1;
+  }
   // Where a previous run got to: its batches are numbered in the commit's own bytes.
   i64 batch = 0;
   u8[] user = store.committed().user;
@@ -72,7 +77,7 @@ export async i32 main(Sys sys) {
   }
   Rng r = Rng(0x2545f4914f6cdd1d);
   i64 nextProbe = ((await sizeOf(store)) / (1024 * 1024) / stepMb + 1) * stepMb;
-  sys.log("size MB | batches | fill MB/s | probe: reads ms, commit ms, leaf reads | resident MB");
+  sys.log("size MB | batches | fill MB/s | probe: reads ms, stage ms, commit ms, leaf reads (in stage, in commit) | resident MB");
   i64 t0 = await sys.monotonicNanos();
   i64 mb0 = (await sizeOf(store)) / (1024 * 1024);
   // MAX_MB 0: no filling, the probes alone — under a tight --max-heap, what the store needs to work at its size.
@@ -115,8 +120,12 @@ export async i32 main(Sys sys) {
     f64 rate = ((mb - mb0) as~ f64) / ((((t1 - t0) / 1000000) as~ f64) / 1000.0);
     // Probe blocks, three: cold reads of what is there, then a block's writes committed alone.
     i64 readNs = 0;
+    i64 stageNs = 0;
     i64 commitNs = 0;
     i32 reads0 = store.reads;
+    i32 commitReads = 0;
+    i32 commitWrites = 0;
+    i32 stageReads = 0;
     for (i32 p = 0; p < 3; p++) {
       StateDb probe = StateDb.over(store);
       i64 p0 = await sys.monotonicNanos();
@@ -132,15 +141,26 @@ export async i32 main(Sys sys) {
         }
       }
       i64 p1 = await sys.monotonicNanos();
-      if ((await probe.write(touched, after, Map.create(hashU256, eqU256), mark, why)) is null) {
-        sys.warn("probe: \{why[0]}");
+      i32 r1 = store.reads;
+      // The tries' new nodes and the state root (reading the nodes on the way), then the store's commit, apart.
+      Staged? st = await probe.stage(touched, after, Map.create(hashU256, eqU256), why);
+      i64 p2 = await sys.monotonicNanos();
+      i32 r2 = store.reads;
+      i32 w2 = store.writes;
+      string bad = st is null ? why[0] : await probe.commitStaged(st!, mark);
+      if (bad != "") {
+        sys.warn("probe: \{bad}");
         return 1;
       }
-      i64 p2 = await sys.monotonicNanos();
+      i64 p3 = await sys.monotonicNanos();
       readNs += p1 - p0;
-      commitNs += p2 - p1;
+      stageNs += p2 - p1;
+      commitNs += p3 - p2;
+      commitReads += store.reads - r2;
+      commitWrites += store.writes - w2;
+      stageReads += r2 - r1;
     }
-    sys.log("\{mb} | \{batch} | \{(rate * 10.0) as~ i64 / 10} | \{readNs / 3 / 1000000}, \{commitNs / 3 / 1000000}, \{(store.reads - reads0) / 3} | \{await rssMb(sys)}");
+    sys.log("\{mb} | \{batch} | \{(rate * 10.0) as~ i64 / 10} | \{readNs / 3 / 1000000}, \{stageNs / 3 / 1000000}, \{commitNs / 3 / 1000000}, \{(store.reads - reads0) / 3} (stage \{stageReads / 3}, commit \{commitReads / 3}, writes \{commitWrites / 3}) | \{await rssMb(sys)}");
     nextProbe = (mb / stepMb + 1) * stepMb;
     t0 = await sys.monotonicNanos();
     mb0 = mb;

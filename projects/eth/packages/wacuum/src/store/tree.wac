@@ -41,6 +41,8 @@ export static i32 CHUNK = 12288;
  */
 export static i64 LEAF_BYTES = 64 * 1024 * 1024;
 export static i32 LEAVES = (LEAF_BYTES / (PAGE as i64)) as! i32;
+/** Leaves a commit reads ahead of itself, and disk requests it has in flight (`Store.prefetch`, `inFlight`). */
+static i32 PREFETCH = 64;
 /** The entry cache's budget by default, in MB. */
 export static i64 CACHE_MB = 256;
 /** "WACUMDB" and the format: 3 since 16 KB pages (2026-11-13). 2 was the same with 64 KB pages. */
@@ -235,6 +237,16 @@ export struct Store {
   Vec<u8[]> writtenKeys;
   /** Requests to the disk, for whoever is measuring. */
   i32 reads;
+  /**
+   * How many leaves a commit reads ahead of itself, all at once (`prefetch`): on a big store nearly every key it
+   * touches is in a leaf not in memory, and those reads one after another were most of its time. 0 reads each
+   * only when it is reached.
+   */
+  i32 prefetch;
+  /** Disk requests a commit has in flight at once, at most: its reads ahead (`prefetch`) and its writes. */
+  i32 inFlight;
+  /** Writes sent to the disk, for whoever is measuring. */
+  i32 writes;
   /** Readers holding the committed state still (`hold`), and whether a commit is under way or waiting. */
   i32 readers;
   bool writing;
@@ -257,7 +269,7 @@ export struct Store {
 
   /** The store in `disk`: the last commit, or an empty one for an empty file. */
   async Result<Store, string> open(Disk disk) {
-    Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), 0, LEAVES, Vec.create(), Vec.create(), 0, 0, false, 0, Vec.create(), null,
+    Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), 0, LEAVES, Vec.create(), Vec.create(), 0, PREFETCH, PREFETCH, 0, 0, false, 0, Vec.create(), null,
                     EntryCache.create(CACHE_MB * 1024 * 1024), Overlay.create());
     i64 size = match (await disk.size()) {
       Ok(n): n,
@@ -667,13 +679,73 @@ export struct Store {
     return "";
   }
 
+  /**
+   * The leaves `changes` from `from` on will need and memory lacks, up to `window` of them, read with every read
+   * in flight at once, then put in their places; returns the first change past those leaves. The interior is all
+   * in memory, so which leaf a key needs, and its page, is known without reading. Nothing moves meanwhile: a
+   * commit is under way, so no other commit, and `streamLeaves` waits for this before it changes anything.
+   */
+  async i32 prefetchLeaves(this, Vec<Change> changes, i32 from, i32 window) {
+    Vec<Ticket<Result<u8[], string>>> asked = Vec.create();
+    Vec<i64> pages = Vec.create();
+    Vec<u8[]> keys = Vec.create();
+    i32 c = from;
+    while (c < changes.len()) {
+      u8[] key = changes.get(c).key;
+      Node n = this.root;
+      i64 page = -1;
+      while (!n.leaf) {
+        i32 i = childFor(n.keys, key);
+        Node? k = n.kids.get(i);
+        if (k is null) {
+          page = n.kidPages.get(i);
+          break;
+        }
+        n = k!;
+      }
+      if (page >= 0 && (pages.len() == 0 || pages.get(pages.len() - 1) != page)) {
+        if (pages.len() == window) { break; }
+        pages.push(page);
+        keys.push(key);
+        asked.push(this.disk.read(page * (PAGE as i64), PAGE));
+      }
+      c++;
+    }
+    for (i32 j = 0; j < asked.len(); j++) {
+      Result<u8[], string> got = await asked.get(j);
+      this.reads++;
+      // A read that failed is left to `leafFor`, which reads it again when it is reached and says why.
+      if (!got.isOk()) { continue; }
+      Node? leaf = decode(got.unwrap(), pages.get(j));
+      if (leaf is null) { continue; }
+      // Its place again, from its key: the same as when it was asked for, nothing having moved.
+      Node n = this.root;
+      while (true) {
+        i32 i = childFor(n.keys, keys.get(j));
+        Node? k = n.kids.get(i);
+        if (k is null) {
+          if (n.kidPages.get(i) == pages.get(j)) {
+            this.held(n, n.keys.get(i));
+            n.kids.set(i, leaf);
+          }
+          break;
+        }
+        if (k!.leaf) { break; }
+        n = k!;
+      }
+    }
+    return c;
+  }
+
   /** `changes`, in key order, applied a leaf at a time: each leaf fixed, placed, written and let go in turn. */
   async string streamLeaves(this, Vec<Change> changes, Vec<Out> outs) {
     Vec<Node> parents = Vec.create();
     Vec<u8[]> firsts = Vec.create();
     i64 pending = 0;
     i32 c = 0;
+    i32 ahead = 0;
     while (c < changes.len()) {
+      if (this.prefetch > 0 && c >= ahead) { ahead = await this.prefetchLeaves(changes, c, this.prefetch); }
       Vec<Node> path = Vec.create();
       Node? found = await this.leafFor(changes.get(c).key, path);
       if (found is null) { return "a page on the way to a key does not decode"; }
@@ -840,17 +912,30 @@ export struct Store {
   /** The pages, sorted, with runs of neighbours written in one request each (up to 64 pages). */
   async string writeAll(this, Vec<Out> outs) {
     outs.sort((Out a, Out b) => a.page < b.page ? -1 : a.page > b.page ? 1 : 0);
+    // Runs of adjacent pages as one write each, and up to `inFlight` of them sent before any is awaited: the
+    // pages are distinct and nothing reads them before the sync that follows, so their order does not matter,
+    // and a commit's pages, taken from the free list, are scattered — one at a time, they were most of its time.
+    Vec<Ticket<Result<void, string>>> sent = Vec.create();
     i32 i = 0;
     while (i < outs.len()) {
       i32 j = i + 1;
       while (j < outs.len() && j - i < 64 && outs.get(j).page == outs.get(j - 1).page + 1) { j++; }
       u8[] run = u8[].filled((j - i) * PAGE, 0);
       for (i32 k = i; k < j; k++) { run.copyFrom(outs.get(k).bytes, 0, (k - i) * PAGE, PAGE); }
-      match (await this.disk.write(outs.get(i).page * (PAGE as i64), run)) {
-        Ok(v): {}
-        Err(e): { return e; }
-      }
+      sent.push(this.disk.write(outs.get(i).page * (PAGE as i64), run));
+      this.writes++;
       i = j;
+      if (sent.len() >= this.inFlight || i >= outs.len()) {
+        string bad = "";
+        for (i32 k = 0; k < sent.len(); k++) {
+          match (await sent.get(k)) {
+            Ok(v): {}
+            Err(e): { if (bad == "") { bad = e; } }
+          }
+        }
+        sent.clear();
+        if (bad != "") { return bad; }
+      }
     }
     return "";
   }

@@ -1,17 +1,16 @@
 // Memory over a long run on the store: wacuum, with --store on a fresh chain, is made to build and import
 // block after block — as a consensus client would, through the Engine API — each one writing a few hundred
-// new slots and funding a new account, so the state grows all the while. Its resident memory is sampled as
-// it goes, and must stop growing: what it keeps in memory between blocks is bounded (the store's leaves and
-// its cache), not a copy of all the state it has seen. The state on disk keeps growing; the process must not.
+// new slots and funding a new account, so the state on disk grows all the while. The node runs under a tight
+// heap (`wac --max-heap`), so what it keeps in memory between blocks must be bounded — the store's leaves and
+// cache, the history it holds — or it runs out and the next block is not made: a leak fails the run outright.
+// Resident memory is printed as it goes, for whoever reads the log.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/soak.wac [BLOCKS]
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/soak.wac [BLOCKS] [HEAP]
 //
-// BLOCKS defaults to 1200: some 600 000 slots. The store's cache of entries is held to 32 MB, which the
-// first third of the run fills. Resident memory is sampled every 50 blocks, and the samples of the last third
-// may average above those of the middle third by a margin and no more: V8 grows its heap ahead of collecting,
-// so single samples swing by 50–100 MB, but a leak raises the average. Measured: +29 MB with the history held
-// to 64 blocks, +63 MB with all of it kept (it is in memory), +300 MB with the leaks fixed on 2026-11-13. (Before 2026-11-13 it grew ~0.75 MB a block: the node kept every slot it had read, decoded,
-// and the store every leaf it had written.)
+// BLOCKS defaults to 2400 (about 1.2 million slots), HEAP to 256m, and the store's cache is held to 32 MB.
+// Before 2026-11-13 the node grew ~0.75 MB a block (it kept every slot it had read, decoded, and the store
+// every leaf it had written, and every payload built): under this cap it would stop within a few hundred.
+// Needs the `wac` on PATH to be one that takes --max-heap (wac 78121eefb or later, on the V8 host).
 
 import { Sys } from "std";
 import { json.JsonValue, json.stringify } from "wac";
@@ -24,7 +23,6 @@ static string ZERO = "0x00000000000000000000000000000000000000000000000000000000
 /** New slots each call writes: two calls a block, each at its own offset. */
 static i32 SLOTS = 250;
 static i64 CACHE_MB = 32;
-static i64 MARGIN_MB = 40;
 
 struct Chain {
   Rpc engine;
@@ -82,7 +80,8 @@ i64 parse(string s) {
 
 export async i32 main(Sys sys) {
   string[] args = sys.args();
-  i32 blocks = args.len() > 0 ? (parse(args[0]) as! i32) : 1200;
+  i32 blocks = args.len() > 0 ? (parse(args[0]) as! i32) : 2400;
+  string heap = args.len() > 1 ? args[1] : "256m";
   Check t = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-soak");
   u8[] key = u8[].filled(32, 0x11);
@@ -94,7 +93,7 @@ export async i32 main(Sys sys) {
   u8[] secret = (await sys.random().bytes(32)).ok()!;
   await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
   i32 port = await somePort(sys, 19651, 1000);
-  Proc proc = await Proc.start(sys, ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+  Proc proc = await Proc.start(sys, ["wac", "--max-heap", heap, "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
                                      "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
                                      "--port", "\{port}", "--datadir", dir + "/data", "--store", "--cache-mb", "\{CACHE_MB}"], dir + "/wacuum.log");
   if (!t.that(await proc.says(sys, "Engine API on", 600000), "wacuum starts on a store")) {
@@ -114,11 +113,7 @@ export async i32 main(Sys sys) {
   t.that(await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + code, "with its code");
 
   u64 nonce = 1;
-  i64 middleSum = 0;
-  i64 middleN = 0;
-  i64 lastSum = 0;
-  i64 lastN = 0;
-  i64 earlyFile = 0;
+  i64 peak = 0;
   i64 i0 = await sys.monotonicNanos();
   bool ok = true;
   for (i32 b = 1; b <= blocks && ok; b++) {
@@ -137,25 +132,16 @@ export async i32 main(Sys sys) {
       i64 file = await fileMb(sys, dir + "/data/state.db");
       i64 secs = (await sys.monotonicNanos() - i0) / 1000000000;
       sys.log("  block \{b}: \{rss} MB resident, store \{file} MB, \{secs} s");
-      if (b <= blocks / 3) { earlyFile = file; }
-      else if (b <= 2 * blocks / 3) {
-        middleSum += rss;
-        middleN++;
-      } else {
-        lastSum += rss;
-        lastN++;
-      }
+      peak = rss > peak ? rss : peak;
     }
   }
-  t.that(ok, "wacuum built and imported \{blocks} blocks");
+  t.that(ok, "wacuum built and imported \{blocks} blocks under a heap of \{heap}");
+  // What the node said last: "ran out of memory" if it was the heap.
+  if (!ok) { sys.warn(trim(await shell(sys, "tail -5 \{dir}/wacuum.log"))); }
   string slotAt = "[\"\{contract}\",\"\{U256.ofU64(((blocks as@ u32) as u64) * 2 * ((SLOTS as@ u32) as u64) + 1).toHex()}\",\"latest\"]";
   t.that(await user.text("eth_getStorageAt", slotAt) == bytesToHex(U256.ofU64((blocks as@ u32) as u64).toBytes()), "and the last block's slots are there");
   i64 lateFile = await fileMb(sys, dir + "/data/state.db");
-  i64 middle = middleN == 0 ? 0 : middleSum / middleN;
-  i64 last = lastN == 0 ? 0 : lastSum / lastN;
-  t.that(middleN > 0 && lastN > 0 && last - middle <= MARGIN_MB,
-         "resident memory on average: \{middle} MB in the middle third, \{last} MB in the last, while the store went \{earlyFile} → \{lateFile} MB: within \{MARGIN_MB} MB");
-
+  sys.log("  store \{lateFile} MB at the end; resident memory at most \{peak} MB");
   await proc.stop(sys);
   await removeDir(sys, dir);
   return t.done();

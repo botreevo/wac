@@ -30,7 +30,7 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
 - **Fixtures, every fork** (execution-spec-tests v5.4.0), in memory: Cancun, Prague and Osaka — state, block,
   engine and block-building suites — and the six fork transitions to BPO4: 0 failures (Cancun state 16 847,
   Osaka engine 21 577, …; `dist/all-fixtures.txt`). On the store (`COLD=1`, every account and slot read from a
-  store, the engine moving the store across invalid payloads): running as this is written; the next commit gives the numbers.
+  store, the engine moving the store across invalid payloads): 0 failures too — Cancun block and engine 17 685 each, Prague 20 859 and 20 878, Osaka 21 558 and 21 577.
 - **Unit tests**, 24 files, among them: the store against a map across commits and reopenings; a commit cut at
   every one of its writes, with none, all and six random subsets of the unsynced writes kept, coming back as
   exactly the state before or after; a leaf rewritten by a commit not let go before its page is written (a gated

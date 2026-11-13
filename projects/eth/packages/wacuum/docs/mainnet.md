@@ -40,7 +40,7 @@ today). Two asks beyond it, both cheap:
 | p2p | RLPx, discv4, eth/69 with EIP-2124 fork ids; dials and accepts peers, serves headers, bodies and receipts, gossips transactions; talks to geth (`tools/e2e/devnet.wac`) | snap/1 as a client, to fetch a state; discv5 is optional |
 | following the head | the Engine API, V1–V5, with JWT: a consensus client (Lighthouse, Teku, …) drives it as it would geth | the same — this part is done |
 | correctness | execution-spec-tests v5.4.0: every state, blockchain and engine test for Cancun, Prague and Osaka (and the transitions to BPO4); **and, measured here, real mainnet blocks match their headers** | the same, on every mainnet block — which the shadow checks |
-| execution speed | **measured** 120–175 Mgas/s on recent mainnet blocks (below) | ~5 Mgas/s to keep up with a 60 M gas limit; much more to catch up |
+| execution speed | **measured** 216 Mgas/s on five recent mainnet blocks, senders recovered (below) | ~5 Mgas/s to keep up with a 60 M gas limit; much more to catch up |
 
 ## Measurements
 
@@ -58,10 +58,13 @@ roots, on wac's native V8 host, one thread of this container's Xeon (2.1 GHz).
 | blocks | transactions | gas | senders recovered | senders known | checks |
 | --- | ---: | ---: | ---: | ---: | --- |
 | 26,404,000 (2026-11-13, under BPO2) | 211 | 40.4 M | 327 ms — **123 Mgas/s** | 232 ms — **173 Mgas/s** | all match but the state root |
+| 26,404,100–26,404,104 (20–21 blobs each, one block at the 60 M limit) | 1131 | 178.9 M | 825 ms — **216 Mgas/s** | 674 ms — **265 Mgas/s** | all match but the state root |
 
-Fetching that block's state took 56 rounds against a hosted endpoint's free tier, learning a few slots a
-round (a read that comes back empty makes a transaction take another path); seeding from access lists cuts
-that, and a node of one's own with `prestateTracer` needs one round.
+Fetching the first block's state took 56 rounds against a hosted endpoint's free tier, learning a few slots
+a round (a read that comes back empty makes a transaction take another path). For the five, the access
+lists named 2669 accounts and 10 330 slots up front, and 111 more rounds found the last ~2% — about an
+hour, most of it the rate limit. A node of one's own with `prestateTracer` names everything in one round.
+The first figure is lower because one block is too short to time well: the five are the better number.
 
 So the interpreter, the precompiles and the transaction rules agree with mainnet on the traffic it has
 today, and execution is not what stands between wacuum and the head: a block arrives every 12 s and
@@ -100,7 +103,7 @@ has to live on disk.
 | Prague → now | 4.1 M | 1.1×10¹⁴ | 1.11 B | 26.3 M |
 | **total** | **26.4 M** | **3.2×10¹⁴** | **3.8 B** | |
 
-Executing all of it at the in-memory speed measured above (~120 Mgas/s) would take **31 days** of
+Executing all of it at the in-memory speed measured above (~200 Mgas/s) would take **19 days** of
 execution alone; at a disk-bound 30–50 Mgas/s, which is where clients with mature databases land on old
 blocks, **75–125 days**. Recovering 3.8 billion senders at 150 µs each is 6.6 days of it, on one core.
 Pre-merge bodies are also no longer served by most peers since history expiry (2025), so a sync from

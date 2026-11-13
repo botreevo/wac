@@ -1,0 +1,85 @@
+// The store's cache of entries: what it answers, what it lets go, and that a store behind it answers the
+// same as one without it through commits, deletions and a reopening.
+
+import { Vec } from "core";
+import { EntryCache, Cached, ENTRY_OVERHEAD, MAX_CACHED } from "../src/store/cache.wac";
+import { Store, Change } from "../src/store/tree.wac";
+import { MemDisk } from "../src/store/disk.wac";
+import { Check } from "./check.wac";
+
+u8[] k(i32 i) { return [1 as u8, ((i >> 16) & 255) as! u8, ((i >> 8) & 255) as! u8, (i & 255) as! u8]; }
+u8[] v(i32 i) { return [((i * 7) & 255) as! u8, 9 as u8]; }
+
+export string test_the_cache_answers_and_knows_absence() {
+  Check t = Check.create();
+  EntryCache c = EntryCache.create(1 << 20);
+  t.ok(!c.get(k(1)).known, "an empty cache knows nothing");
+  c.put(k(1), v(1));
+  c.put(k(2), null);
+  Cached a = c.get(k(1));
+  t.ok(a.known && a.value is not null && a.value![0] == v(1)[0], "a value put is answered");
+  Cached b = c.get(k(2));
+  t.ok(b.known && b.value is null, "and an absence is known as one");
+  c.put(k(1), u8[].filled(MAX_CACHED + 1, 1));
+  t.ok(!c.get(k(1)).known, "a value too large to keep forgets the key rather than keeping the old one");
+  return t.report();
+}
+
+export string test_the_cache_stays_within_its_budget_and_keeps_what_is_used() {
+  Check t = Check.create();
+  i64 each = (4 + 2 + ENTRY_OVERHEAD) as i64;
+  EntryCache c = EntryCache.create(each * 100);
+  for (i32 i = 0; i < 100; i++) { c.put(k(i), v(i)); }
+  // Clear every bit, as the hand would on its way round, then use the first ten again.
+  for (i32 i = 0; i < 100; i++) { c.get(k(i)); }
+  c.evictOne();
+  for (i32 i = 0; i < 10; i++) { c.get(k(i)); }
+  for (i32 i = 100; i < 300; i++) { c.put(k(i), v(i)); }
+  t.ok(c.bytes <= c.budget, "within its budget: \{c.bytes} of \{c.budget}");
+  t.ok(c.index.len() >= 90 && c.index.len() <= 100, "holding what fits: \{c.index.len()}");
+  t.ok(c.get(k(299)).known, "the newest is kept");
+  return t.report();
+}
+
+async string throughStore() {
+  Check t = Check.create();
+  MemDisk d = MemDisk.create();
+  Store s = (await Store.open(d.disk())).unwrap();
+  Store bare = (await Store.open(MemDisk.create().disk())).unwrap();
+  bare.cache = EntryCache.create(0);
+  // A small cache, so that it lets go as it goes.
+  s.cache = EntryCache.create(64 * 1024);
+  u64 x = 88172645463325252;
+  for (i32 round = 0; round < 30; round++) {
+    Vec<Change> ch = Vec.create();
+    for (i32 i = 0; i < 400; i++) {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      i32 key = ((x % 3000) as! i32);
+      bool del = (x >> 20) % 5 == 0;
+      ch.push(Change(k(key), del ? null : v(key + round)));
+    }
+    t.eqStr(await s.commit(ch.toArray(), u8[].filled(0, 0)), "", "commit \{round}");
+    await bare.commit(ch.toArray(), u8[].filled(0, 0));
+    i32 differ = 0;
+    for (i32 i = 0; i < 3000; i += 7) {
+      u8[]? a = round % 2 == 0 ? await s.get(k(i)) : s.getNow(k(i));
+      u8[]? b = await bare.get(k(i));
+      if ((a is null) != (b is null) || (a is not null && (a![0] != b![0] || a![1] != b![1]))) { differ++; }
+    }
+    t.ok(differ == 0, "round \{round}: every read the same as a store without a cache (\{differ} differ)");
+  }
+  t.ok(s.cache.hits > 0 && s.cache.bytes <= s.cache.budget, "it was used (\{s.cache.hits} hits) and stayed within its budget");
+  Store again = (await Store.open(d.disk())).unwrap();
+  i32 differ = 0;
+  for (i32 i = 0; i < 3000; i += 7) {
+    u8[]? a = await again.get(k(i));
+    u8[]? b = await bare.get(k(i));
+    if ((a is null) != (b is null)) { differ++; }
+  }
+  t.ok(differ == 0, "and the file holds the same, opened again");
+  return t.report();
+}
+
+export string test_a_store_with_a_cache_reads_as_one_without() { return throughStore().wait().orElse("it never finished"); }

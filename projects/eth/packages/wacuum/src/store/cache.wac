@@ -1,0 +1,138 @@
+// The store's cache of entries: keys and their values as stored, or the fact that a key has none, kept
+// between blocks so that what a block reads again — most of it, measured on mainnet (docs/state-cache.md) —
+// is not read from the file. Bounded by bytes, each entry charged its key and value and a fixed overhead,
+// and let go by CLOCK: the entries sit in a ring with a bit each, set when one is used; to make room, a hand
+// goes round clearing set bits and lets go the first entry whose bit is already clear. A hit only sets a bit.
+
+import { Map, Vec } from "core";
+
+/** What each entry costs beyond its key and value: measured at ~290 bytes for an account's (73 of them). */
+export static i32 ENTRY_OVERHEAD = 220;
+/** Larger values are not kept: codes and receipts, read by range, and churning the cache for nothing. */
+export static i32 MAX_CACHED = 1024;
+
+struct Entry {
+  u8[] key;
+  u8[]? value;
+  bool used;
+  bool live;
+}
+
+/** What a lookup found: whether the cache knows, and if so the value (null: the store has none). */
+export struct Cached {
+  bool known;
+  u8[]? value;
+}
+
+i32 hashBytes(u8[] b) {
+  i32 h = -2128831035;
+  for (i32 i = 0; i < b.len(); i++) { h = (h ^ (b[i] as i32)) * 16777619; }
+  return h;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+export struct EntryCache {
+  Map<u8[], i32> index;
+  Vec<Entry> ring;
+  Vec<i32> holes;
+  i32 hand;
+  i64 bytes;
+  i64 budget;
+  i64 hits;
+  i64 misses;
+
+  EntryCache create(i64 budget) {
+    return EntryCache(Map.create(hashBytes, sameBytes), Vec.create(), Vec.create(), 0, 0, budget, 0, 0);
+  }
+
+  Cached get(this, u8[] key) {
+    i32? at = this.index.get(key);
+    if (at is null) {
+      this.misses++;
+      return Cached(false, null);
+    }
+    Entry e = this.ring.get(at!);
+    e.used = true;
+    this.hits++;
+    return Cached(true, e.value);
+  }
+
+  /** `key`'s value as the store now has it (null: none), kept if it is small enough, else forgotten. */
+  void put(this, u8[] key, u8[]? value) {
+    if (this.budget <= 0) { return; }
+    if (value is not null && value!.len() > MAX_CACHED) {
+      this.forget(key);
+      return;
+    }
+    i32? at = this.index.get(key);
+    if (at is not null) {
+      Entry e = this.ring.get(at!);
+      this.bytes += (value is null ? 0 : value!.len() as i64) - (e.value is null ? 0 : e.value!.len() as i64);
+      e.value = value;
+      e.used = true;
+    } else {
+      Entry e = Entry(key, value, true, true);
+      i32 slot = this.ring.len();
+      if (this.holes.len() > 0) {
+        slot = this.holes.pop()!;
+        this.ring.set(slot, e);
+      } else {
+        this.ring.push(e);
+      }
+      this.index.set(key, slot);
+      this.bytes += cost(key, value);
+    }
+    while (this.bytes > this.budget && this.index.len() > 1) { this.evictOne(); }
+  }
+
+  void forget(this, u8[] key) {
+    i32? at = this.index.get(key);
+    if (at is null) { return; }
+    this.drop(at!);
+  }
+
+  void drop(this, i32 at) {
+    Entry e = this.ring.get(at);
+    this.index.remove(e.key);
+    this.bytes -= cost(e.key, e.value);
+    e.live = false;
+    e.value = null;
+    this.holes.push(at);
+  }
+
+  /** The hand goes round: a used entry gets another turn, the first unused one goes. */
+  void evictOne(this) {
+    i32 n = this.ring.len();
+    for (i32 step = 0; step < 2 * n + 1; step++) {
+      if (this.hand >= n) { this.hand = 0; }
+      Entry e = this.ring.get(this.hand);
+      i32 at = this.hand;
+      this.hand++;
+      if (!e.live) { continue; }
+      if (e.used) {
+        e.used = false;
+        continue;
+      }
+      this.drop(at);
+      return;
+    }
+  }
+
+  /** Everything forgotten: after a commit that failed, the store in memory is not the one on disk. */
+  void clear(this) {
+    this.index = Map.create(hashBytes, sameBytes);
+    this.ring = Vec.create();
+    this.holes = Vec.create();
+    this.hand = 0;
+    this.bytes = 0;
+  }
+}
+
+i64 cost(u8[] key, u8[]? value) { return (key.len() + (value is null ? 0 : value!.len()) + ENTRY_OVERHEAD) as i64; }

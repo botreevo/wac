@@ -1,0 +1,206 @@
+// Crashes during commits: a wacuum on a store is killed (SIGKILL, the whole process tree) at random moments while
+// it imports blocks — most often in the middle of a block's commit, which is most of the time an import takes —
+// then started again, and must come back to the same chain and state as a node that was never killed.
+//
+// A wacuum in memory first builds the chain: blocks that each write hundreds of new slots and fund a new account,
+// their payloads kept. A second wacuum, on a store, is then given those payloads as a consensus client gives them
+// (newPayload, then forkchoiceUpdated), and killed 0–300 ms into one in BLOCKS/KILLS of them (an import takes
+// ~120–250 ms here, so the kills fall before, in and after commits — the count of each is printed); each
+// restart goes on from its store and its block log, and the payloads are given again from the head it reports.
+// Every payload it accepts is checked against its header's state root, so a store left wrong by a crash shows at
+// the next block. At the end its head, and slots and balances across the whole chain, must be the first node's.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/crash.wac [BLOCKS] [KILLS]
+//
+// BLOCKS defaults to 200, KILLS to 40. A kill is not a power cut: what the process wrote, the kernel keeps.
+// Torn and reordered writes are the store's own tests' (`test/store_test.wac`, a commit cut short anywhere).
+
+import { Sys } from "std";
+import { Vec, Ticket } from "core";
+import { json.JsonValue, json.stringify } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { systemContracts } from "../../src/chain/dev.wac";
+import { Check, Proc, Rpc, Reply, shell, tempDir, removeDir, somePort, addressOf, createAddress, type2, field, quantity, trim } from "./kit.wac";
+
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+static i32 SLOTS = 150;
+
+/** A block as a consensus client hands it over: newPayloadV4's parameters, and its hash. */
+struct Given {
+  string params;
+  string hash;
+}
+
+string runtime() {
+  string k = bytesToHex([((SLOTS >> 8) & 255) as! u8, (SLOTS & 255) as! u8]).slice(2, 6);
+  string k2 = bytesToHex([(((2 * SLOTS) >> 8) & 255) as! u8, ((2 * SLOTS) & 255) as! u8]).slice(2, 6);
+  return "61" + k + "5b" + "80" + "15" + "61001e" + "57" + "43" + "81" + "600035" + "01" + "43" + "61" + k2 + "02" + "01" + "55" +
+         "600190" + "03" + "600356" + "5b00";
+}
+
+u8[] hexBytes(string h) {
+  u8[] out = u8[].filled(h.len() / 2, 0);
+  u8[] d = h.toBytes();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ((nibble(d[2 * i]) << 4) | nibble(d[2 * i + 1])) as! u8; }
+  return out;
+}
+
+i32 nibble(u8 c) { return c >= 97 ? (c as i32) - 87 : (c as i32) - 48; }
+
+i32 parse(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + ((b[i] as i32) - 48); }
+  return n;
+}
+
+string fc(string h) { return "{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{h}\"}"; }
+
+async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store) {
+  string[] argv = [app, "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc", "--port", "\{port}",
+                   "--datadir", data, store ? "--store" : "--snapshot-every", store ? "--store" : "1000000"];
+  Proc p = await Proc.start(sys, argv, data + ".log");
+  await p.says(sys, "Engine API on", 300000);
+  return p;
+}
+
+/** The process and everything under it, killed at once with no chance to finish anything. */
+async void killHard(Sys sys, string pid) {
+  await shell(sys, "k() { for c in $(pgrep -P $1); do k $c; done; kill -9 $1 2>/dev/null; }; k \{pid}");
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  i32 blocks = args.len() > 0 ? parse(args[0]) : 200;
+  i32 kills = args.len() > 1 ? parse(args[1]) : 40;
+  Check t = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-crash");
+  string app = dir + "/wacuum";
+  await shell(sys, "wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o \{app} > /dev/null 2>&1");
+  u8[] key = u8[].filled(32, 0x11);
+  string me = addressOf(key);
+  await sys.writeFile(dir + "/genesis.json", ("{\"config\":{\"chainId\":1337,\"cancunTime\":0,\"pragueTime\":0},\"gasLimit\":\"0x2faf080\"," +
+    "\"baseFeePerGas\":\"0x3b9aca00\",\"timestamp\":\"0x0\",\"alloc\":{\"\{me}\":{\"balance\":\"0xd3c21bcecceda1000000\"}," + systemContracts() + "}}").toBytes());
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+
+  // The chain, built by a wacuum in memory.
+  i32 portA = await somePort(sys, 19751, 500);
+  Proc a = await start(sys, app, dir, dir + "/a", portA, false);
+  Rpc ua = Rpc.at(sys, portA);
+  Rpc ea = Rpc.authed(sys, portA, secret);
+  string head = field(await ua.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash");
+  u64 time = 12;
+  Vec<Given> chain = Vec.create();
+  string code = runtime();
+  string len = bytesToHex([((code.len() / 2) & 255) as! u8]).slice(2, 4);
+  u64 nonce = 0;
+  string contract = createAddress(me, 0);
+  for (i32 b = 0; b < blocks; b++) {
+    if (b == 0) {
+      await ua.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, "", U256.zero(), hexBytes("60" + len + "600c60003960" + len + "6000f3" + code), 200000)}\"]");
+      nonce++;
+    } else {
+      for (i32 k = 0; k < 2; k++) {
+        await ua.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, contract, U256.zero(), U256.ofU64(((k * SLOTS) as@ u32) as u64).toBytes(), 5000000)}\"]");
+        nonce++;
+      }
+      string fresh = bytesToHex(U256.ofU64(0x7000000 + ((b as@ u32) as u64)).toBytes()).slice(26, 66);
+      await ua.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, "0x" + fresh, U256.ofU64(((b as@ u32) as u64) + 1), u8[].filled(0, 0), 21000)}\"]");
+      nonce++;
+    }
+    string attrs = "{\"timestamp\":\"\{U256.ofU64(time).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                   "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fe\",\"withdrawals\":[],\"parentBeaconBlockRoot\":\"\{ZERO}\"}";
+    time += 12;
+    string id = field(await ea.get("engine_forkchoiceUpdatedV3", "[\{fc(head)},\{attrs}]"), "payloadId");
+    JsonValue? p = (await ea.call("engine_getPayloadV4", "[\"\{id}\"]")).result();
+    if (p is null) { break; }
+    string params = "[\{string.fromBytes(stringify(p!.member("executionPayload")!))},[],\"\{ZERO}\",\{string.fromBytes(stringify(p!.member("executionRequests")!))}]";
+    string h = field(p!.member("executionPayload"), "blockHash");
+    if (field(await ea.get("engine_newPayloadV4", params), "status") != "VALID") { break; }
+    await ea.get("engine_forkchoiceUpdatedV3", "[\{fc(h)},null]");
+    chain.push(Given(params, h));
+    head = h;
+  }
+  t.that(chain.len() == blocks, "the first node built \{chain.len()} blocks");
+
+  // The same chain into a wacuum on a store, killed at random as it goes.
+  i32 portB = await somePort(sys, 19851, 500);
+  string dataB = dir + "/b";
+  Proc b = await start(sys, app, dir, dataB, portB, true);
+  Rpc ub = Rpc.at(sys, portB);
+  Rpc eb = Rpc.authed(sys, portB, secret);
+  i32 killed = 0;
+  i32 restarts = 0;
+  i32 lost = 0;
+  i32 kept = 0;
+  i32 next = 0;
+  bool stuck = false;
+  i32 tries = 0;
+  while (next < chain.len() && !stuck) {
+    tries++;
+    if (tries > blocks * 4) {
+      stuck = true;
+      break;
+    }
+    Given g = chain.get(next);
+    u8[] rnd = (await sys.random().bytes(2)).ok()!;
+    bool kill = killed < kills && ((rnd[0] as i32) * blocks) < 256 * kills;
+    if (kill) {
+      // The payload sent, and the node killed a random few milliseconds into importing it.
+      Ticket<Reply> sent = eb.call("engine_newPayloadV4", g.params);
+      u8[] more = (await sys.random().bytes(2)).ok()!;
+      await sys.sleepMillis(((rnd[1] as i32) * 256 + (more[0] as i32)) % 300);
+      await killHard(sys, b.pid);
+      killed++;
+      b = await start(sys, app, dir, dataB, portB, true);
+      restarts++;
+      // Given again from where it says it is.
+      string n = await ub.text("eth_blockNumber", "[]");
+      // Where the kill fell, by what the store says it holds as it starts: the block being imported (number
+      // next + 1) committed or not. The head moves only with the next forkchoiceUpdated, which a killed import
+      // never got, so it is given again from the head either way.
+      string said = await b.output(sys);
+      i32 mark = said.indexOf("the store holds the state of block ");
+      i32 holds = -1;
+      if (mark >= 0) {
+        u8[] rest = said.slice(mark + 35, said.len()).toBytes();
+        holds = 0;
+        for (i32 e = 0; e < rest.len() && rest[e] >= 48 && rest[e] <= 57; e++) { holds = holds * 10 + ((rest[e] as i32) - 48); }
+      }
+      if (holds > next) { kept++; } else { lost++; }
+      next = quantity(n) as! i32;
+      continue;
+    }
+    string st = field(await eb.get("engine_newPayloadV4", g.params), "status");
+    if (st != "VALID") {
+      t.that(false, "block \{next + 1} after \{killed} kills: \{st}");
+      stuck = true;
+      break;
+    }
+    await eb.get("engine_forkchoiceUpdatedV3", "[\{fc(g.hash)},null]");
+    next++;
+  }
+  t.that(!stuck, "every block went in, \{killed} kills and restarts along the way (\{lost} with the block being imported lost, \{kept} with it kept)");
+  // Once more, cleanly, from the store alone.
+  await b.stop(sys);
+  b = await start(sys, app, dir, dataB, portB, true);
+  JsonValue? hb = await ub.get("eth_getBlockByNumber", "[\"latest\",false]");
+  JsonValue? ha = await ua.get("eth_getBlockByNumber", "[\"latest\",false]");
+  t.that(field(hb, "hash") == field(ha, "hash") && field(hb, "stateRoot") == field(ha, "stateRoot"),
+         "the same head and state root as the node never killed: \{quantity(field(hb, "number"))} \{field(hb, "stateRoot")}");
+  i32 differ = 0;
+  for (i32 n = 1; n < blocks; n += 7) {
+    string slot = "[\"\{contract}\",\"\{U256.ofU64(((n as@ u32) as u64) * 2 * ((SLOTS as@ u32) as u64) + 3).toHex()}\",\"latest\"]";
+    if (await ub.text("eth_getStorageAt", slot) != await ua.text("eth_getStorageAt", slot)) { differ++; }
+    string fresh = "0x" + bytesToHex(U256.ofU64(0x7000000 + ((n as@ u32) as u64)).toBytes()).slice(26, 66);
+    string bal = "[\"\{fresh}\",\"latest\"]";
+    if (await ub.text("eth_getBalance", bal) != await ua.text("eth_getBalance", bal)) { differ++; }
+  }
+  t.that(differ == 0, "slots and balances across the chain the same: \{differ} differ");
+  await b.stop(sys);
+  await a.stop(sys);
+  await removeDir(sys, dir);
+  return t.done();
+}

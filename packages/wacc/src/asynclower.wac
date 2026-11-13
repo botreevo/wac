@@ -970,17 +970,35 @@ Stmt subStmtIn(Ctx c, Stmt s, bool inLambda, i32 brkTo, i32 contTo) {
     Var(type, nameTok, init, isConst): {
       // **A declaration with no initialiser gives its default each time it runs** — `i32? seen;` in a
       // loop is `null` on every pass. The cell holds its default only until the first write, so a
-      // nullable's declaration writes `null` again: `seen[0] = null;` (`issues/lang/0445d`). Any other
-      // type is assigned before it is read — definite assignment sees to that — so it needs nothing.
+      // nullable's declaration writes `null` again: `seen[0] = null;` (`issues/lang/0445d`).
+      //
+      // **And so does every other type: `D d;` is a construction**, not a name waiting for a value. This
+      // wrote nothing for a non-nullable type, on the reasoning that definite assignment writes it before
+      // any read — true of an `i32`, false of a struct with defaults or a `Ticket`, which are made by the
+      // declaration itself. So each pass of a loop got the object the cell was made with: two `D`s pushed
+      // were one `D`, and a wait queue's `Ticket<bool> t;` was the last pass's ticket, settled already
+      // (`issues/lang/0474w`). The lowering does not resolve types, so it writes a fresh default for every
+      // written type name, built the way the cell itself was: `d[0] = D[].defaulted(1)[0];` — for an enum,
+      // which definite assignment covers, that only replaces a placeholder nothing reads.
       if (init is null) {
         if (!inLambda && isHoisted(c, nameTok)) {
           Ty el = subTy(c, type);
           bool nullable = false;
+          bool named = false;
           match (type.kind) {
             Nullable(inner): { nullable = true; }
+            Named(tok, args): { named = true; }
             default: { }
           }
-          Stmt set = nullable ? sCellSet(c, nameTok, Expr(ExprKind.NullLit, c.line, c.col)) : sBlock(c, Stmt[]());
+          // **A written name only** — a struct, a `Ticket`, an enum. The lowering's own temporaries are declared
+          // `typeof(e) t;` and assigned on every path that follows, and building `typeof(e)[]` for them registered
+          // an array type after the emitter had sized its type section (spec case 0534). A named type's array is
+          // the cell's own type, registered with it.
+          Stmt set = sBlock(c, Stmt[]());
+          if (nullable) { set = sCellSet(c, nameTok, Expr(ExprKind.NullLit, c.line, c.col)); }
+          if (named) {
+            set = sCellSet(c, nameTok, eIx(c, Expr(ExprKind.ArrNew(el, eInt(c, 1), null, Expr[]()), c.line, c.col), eInt(c, 0)));
+          }
           c.copy.decl(set, nameTok, el);
           return set;
         }

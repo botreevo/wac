@@ -5,7 +5,6 @@ has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0474w](open/0474w-a-local-declared-in-an-async-loop-is-one-object-for-every-pass.md) | `D d;` (a struct with defaults, or a `Ticket<bool>`) declared inside a loop of an `async` function is one object for every pass once the loop body awaits: the second pass sees the first's; a wait queue built that way awaits an already-settled ticket and spins or traps | bug | wrong answer |
 | [0465d](open/0465d-reading-a-static-arrays-element-costs-ten-times-a-locals.md) | reading an element of a `static` array costs about 10 ns against about 1 ns for a local array (a million reads in a loop) — a global load, a guard or a bounds check not hoisted on each read | performance | slow code |
 | [0458e](closed/0458e-a-package-file-is-keyed-by-where-the-cache-is.md) | a package file is keyed by its absolute path under `$WAC_HOME` (`/root/.wac/cache/git/…/src/page.wac`), so a generic a package declares, instantiated over a type the project declares, is named after where this machine keeps its cache, and two machines with different caches build different modules from one source. `0270a` made the project's own keys root-relative and left these | bug | wrong answer |
 | [0449e](closed/0449e-wait-on-an-async-call-has-no-type-without-a-ticket-import.md) | `async i32 one()` then `i32 x = one().wait();` in a file that imports nothing checks clean and emits an invalid module; with any `std` or `core` import it is *expected i32, found Result<i32, Stuck>* — `wait()` has no type when `Ticket` was reached only through an `async` result. wac1's area | bug | accepted program |
@@ -150,7 +149,7 @@ has been fixed and why.
 
 ## Closed
 
-370 issues, 335 closed.
+370 issues, 336 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

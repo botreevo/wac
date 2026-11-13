@@ -71,9 +71,17 @@ export struct Network {
    * that speaks snap/1 and the chain is begun again there (`snapTo`).
    */
   bool snap;
+  /** A pause before each snap request, in milliseconds: for tests that need a sync to outlive its pivot. */
+  i32 snapThrottle;
+  /**
+   * For tests: after this many snap requests (0 for never), the next answer about a pivot older than the
+   * newest head named is taken as empty — what a peer that no longer keeps that state answers — so that the
+   * sync moves on and heals, whatever the peer keeps.
+   */
+  i32 snapRepivot;
 
   Network create(Engine e, u8[] nodeKey, U256 genesis, u64[] forkBlocks, u64[] forkTimes) {
-    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero(), 0, 10, Deadlines.create(), false, false);
+    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero(), 0, 10, Deadlines.create(), false, false, 0, 0);
   }
 
   StatusMsg ourStatus(this) {
@@ -519,6 +527,8 @@ struct Pivots {
   Network n;
   Peer p;
   Vec<Vec<Header>> seen;
+  i32 asked;
+  bool moved;
 
   /** The newest head the consensus client has named, fetched as headers if it is newer than the last pivot. */
   async void refresh(this) {
@@ -574,15 +584,24 @@ async bool snapTo(Sys sys, Network n, Peer p, U256 target) {
   Peer peer = p;
   // The head moves while the state is fetched, and peers keep only recent states: when this one stops
   // answering about the pivot, the newest head the consensus client has named becomes the pivot.
-  Pivots pivots = Pivots(sys, n, p, Vec.create());
+  Pivots pivots = Pivots(sys, n, p, Vec.create(), 0, false);
   Vec<Header> start = Vec.create();
   for (i32 i = 0; i < headers.len(); i++) { start.push(headers[i]); }
   pivots.seen.push(start);
   Asker asker = Asker(async (Message m) => {
+    if (net.snapThrottle > 0) { await sys.sleepMillis(net.snapThrottle); }
     // A newer head named meanwhile is fetched first, so that the sync can move to it if it must.
     await pivots.refresh();
     u64 rid = numOf(itemsOf(m.body)[0]).low();
-    return await request(sys, peer, rid, m);
+    Item[]? got = await request(sys, peer, rid, m);
+    pivots.asked++;
+    if (net.snapRepivot > 0 && pivots.asked > net.snapRepivot && pivots.seen.len() > 1 && !pivots.moved && got is not null &&
+        (m.code == GET_ACCOUNT_RANGE || m.code == GET_STORAGE_RANGES)) {
+      // As a peer that has dropped the pivot's state answers: nothing.
+      pivots.moved = true;
+      return [Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0))))];
+    }
+    return got;
   }, n.nextId, SOFT_BYTES, () => pivots.newest());
   // Ids from a range of their own, so as not to meet this node's other requests.
   asker.nextId = n.nextId + 1000000;

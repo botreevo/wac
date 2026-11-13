@@ -3,7 +3,13 @@
 // the state at that head over snap/1 rather than run the blocks, agree with geth account by account, then
 // take geth's next blocks the ordinary way, and after a restart go on from its store.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/snap.wac -- path/to/geth
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/snap.wac -- path/to/geth [--heal]
+//
+// With --heal, wacuum's snap requests are slowed (--snap-throttle) while geth keeps making blocks and wacuum
+// is told of each; after eight requests wacuum takes an answer about its pivot as empty (--snap-repivot), as
+// if geth had dropped that state — geth 1.17 here went on serving a pivot 300 blocks old, so it never ages
+// out on its own — moves to the newest head, and heals its patchwork state to it by GetTrieNodes from geth;
+// which must then agree with geth's as before.
 
 import { Sys } from "std";
 import { Vec } from "core";
@@ -52,6 +58,7 @@ export async i32 main(Sys sys) {
     return 2;
   }
   string geth = args[0];
+  bool heal = args.len() > 1 && args[1] == "--heal";
   Check c = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-snap");
   u8[] key = u8[].filled(32, 0x11);
@@ -87,7 +94,8 @@ export async i32 main(Sys sys) {
   Proc? wacProc = null;
   string[] wacArgs = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
                       "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/wacuum",
-                      "--public-rpc", "--port", "\{wacPort}", "--p2p-port", "\{wacP2p}", "--store", "--snap", "--peer", ""];
+                      "--public-rpc", "--port", "\{wacPort}", "--p2p-port", "\{wacP2p}", "--store", "--snap",
+                      "--snap-throttle", heal ? "1500" : "0", "--snap-repivot", heal ? "8" : "0", "--peer", ""];
 
   bool up = false;
   for (i32 t = 0; t < 60000 && !up; t += 200) {
@@ -106,6 +114,33 @@ export async i32 main(Sys sys) {
     // Told of geth's head, wacuum fetches the state there rather than the blocks before it.
     string gh = field(gethHead, "hash");
     c.that(await choose(wac, gh) == "SYNCING", "wacuum is SYNCING to geth's head");
+    if (heal) {
+      // geth goes on making blocks, and wacuum is told of each, until its slowed sync is done.
+      i32 made = 0;
+      while (made < 300 && (await wacProc!.output(sys)).indexOf("snap sync done") < 0) {
+        JsonValue? h = await makeBlocks(sys, gethAuth, gethRpc, key, 1);
+        if (h is null) { break; }
+        gh = field(h, "hash");
+        await choose(wac, gh);
+        made++;
+      }
+      c.that(made > 3, "geth made \{made} blocks while wacuum synced");
+      string log = await wacProc!.output(sys);
+      // What the sync said, for whoever reads this test's output.
+      i32 p = log.indexOf("p2p: snap");
+      while (p >= 0) {
+        i32 e = p;
+        while (e < log.len() && log.slice(e, e + 1) != "\n") { e++; }
+        sys.log("  wacuum: " + log.slice(p, e));
+        i32 next = log.slice(e, log.len()).indexOf("p2p: snap");
+        p = next < 0 ? -1 : e + next;
+      }
+      i32 at = log.indexOf(" healed, ");
+      i32 from = at;
+      while (from > 0 && log.slice(from - 1, from) != " ") { from--; }
+      string n = at > 0 ? log.slice(from, at) : "0";
+      c.that(at > 0 && n != "0", "the pivot aged out and the state was healed: \{n} nodes");
+    }
     c.that(await chosen(sys, wac, gh, 300000), "and then has it");
     string said = await wacProc!.output(sys);
     c.that(said.indexOf("snap sync done") >= 0, "by snap sync");

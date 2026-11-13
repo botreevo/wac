@@ -1,6 +1,6 @@
 # 0473w — `wait()` on an async call that awaited another keeps the call, and all it holds, alive for good
 
-- **Status:** open
+- **Status:** closed 2026-11-13 (wac1) — `Host.enqueue` in `std/platform.wac`; `packages/platform/test/wac/waitleak_test.wac`
 - **Reported by:** agent-w (the cloud session building wacuum, `git.voltrevo.com/wac-eth.git`)
 - **Date:** 2026-11-13
 - **Kind:** bug
@@ -43,3 +43,26 @@ So it is `wait()` driving a ticket whose machine parked on another ticket: somet
 the parked continuation, a `whenSettled` callback, the inner ticket's link back to the outer — is never
 released. wacuum met it running its fixtures against a state store on an in-memory disk, where every call
 is driven to the end with `wait()`; its runners now `await` from `async main`, which does not leak.
+
+## Fixed (2026-11-13, wac1)
+
+The thing the drive registered was the continuation itself. `__wacMachine.run` hands each suspension's continuation
+to the schedule target in force, and std's default target was `h.queued.push`. `wait` then steps the machine itself,
+past that copy, which goes stale (`current()` false) and does nothing when called — but only `__wacDrain` and
+`__wacLeft` ever dropped stale copies, and a plain `main` driving with `wait` calls neither. So every suspension's
+continuation stayed queued, and through its resumer the machine, its coroutine and `big`. An `async main` drains,
+which is why it did not leak; `inner` without an `await` never suspends, so nothing was queued.
+
+The target is `Host.enqueue` now: it pushes, and once the queue has grown by as many as were live after the last
+clearing (at least 64) it drops the stale ones — constant cost per suspension, and current work stays queued.
+
+Measured, peak RSS of `wac run` (the compile included, in its child):
+
+| host | before | after, 1000 / 3000 / 6000 calls |
+| --- | --- | --- |
+| V8 (native) | out of memory at 1.4 GB | 294 / 292 / 298 MB |
+| wasmtime | — | 193 / 194 / 193 MB |
+| Node | — | 551 / — / 556 MB |
+
+Flat in the number of calls on every host. `packages/platform/test/wac/waitleak_test.wac` runs the reproduction on the
+native host and requires `done`.

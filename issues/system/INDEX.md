@@ -5,7 +5,6 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0473w](open/0473w-wait-keeps-every-async-call-that-awaited-alive.md) | `inner(i).wait()` on an async function that itself `await`s another keeps every call and all it allocated alive: 3000 calls holding 1 MB each run out of heap, where the same without the inner `await`, or awaited from `async main`, stays small | bug | out of memory from unreachable calls |
 | [0472w](open/0472w-the-v8-host-heap-stops-at-1-4-gb-with-no-way-to-raise-it.md) | The V8 host's heap stops at ~1.4 GB with 15 GB free, and nothing sets or forwards a heap limit; asks a flag up to V8's 4 GB cage | missing feature | out of memory at 1384 MB |
 | [0471w](open/0471w-a-host-file-request-costs-55us-whatever-it-carries.md) | A `RandomFile.readAt` costs ~55 µs fixed plus ~1 µs a KB from the page cache on the V8 host, and 64 in flight are no faster than one at a time; asks a cheaper request or a vectored read | performance | 54 µs for 16 bytes |
 | [0467d](open/0467d-packages-test-borrows-wac-home-for-the-whole-deno-test-process.md) | `packages/platform/test/packages.test.ts` sets `WAC_HOME` with `Deno.env.set` and deletes it; the suite's other files inherit it in the same process | bug (test isolation) | unrelated Deno tests fail to write under a deleted home; leftover `wac-pinned%25-*` dirs |
@@ -149,7 +148,7 @@ own roadmap lives in its README. This tracker is for what crosses those lines.
 
 ## Closed
 
-370 issues, 289 closed.
+370 issues, 290 closed.
 
 The count is checked against the directory by `tools/wac/issuecounts_test.wac`, which reads both
 trackers. It was `compiler/wacSpec.test.ts` until that file went with the TypeScript compiler on

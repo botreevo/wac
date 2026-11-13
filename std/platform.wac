@@ -4188,6 +4188,9 @@ export struct Host {
   private Vec<i32> parentRanges;
   /** Each request sent to the parent rather than the host, by id, so a wait or a drop reaches it there. */
   private Map<i32, Ticket<Answer>> routed;
+  /** Continuations queued since `queued` was last cleared of the ones a `wait` ran past, and how many more trigger it. */
+  private i32 sinceTrim;
+  private i32 trimAt;
 
   /**
    * The host's four calls, as the program adapter's `__wacHost` is handed them — and the schedule target, set
@@ -4197,9 +4200,27 @@ export struct Host {
                fn<bool()> interrupted) {
     Queue<Continuation> queued;
     Host h = Host(request, waitAny, exitWith, interrupted, Map.create(hashI32, i32Eq), 0, false, queued, null, Vec.create(),
-                  Map.create(hashI32, i32Eq));
-    if (__wacScheduleTarget() is null) { __wacSetScheduleTarget(h.queued.push); }
+                  Map.create(hashI32, i32Eq), 0, 64);
+    if (__wacScheduleTarget() is null) { __wacSetScheduleTarget(h.enqueue); }
     return h;
+  }
+
+  /**
+   * The schedule target: queue `k`, and every so often drop the queued continuations a `wait` ran past.
+   *
+   * **Only `drain` used to drop them**, so a program that drives its calls with `wait` and never drains — a plain
+   * `main` — kept every suspension's continuation, and through it the whole machine and everything its body held,
+   * for the rest of its life (`issues/system/0473w`: 3000 calls of 1 MB that each awaited once ran out of heap).
+   * Cleared once the queue has grown by as many as were live after the last clearing (at least 64), so the cost is
+   * constant per suspension and what is still current — work nobody has run — stays queued.
+   */
+  private void enqueue(this, Continuation k) {
+    this.queued.push(k);
+    this.sinceTrim = this.sinceTrim + 1;
+    if (this.sinceTrim < this.trimAt) { return; }
+    i32 live = this.liveQueued();
+    this.sinceTrim = 0;
+    this.trimAt = live < 64 ? 64 : live;
   }
 
   /**

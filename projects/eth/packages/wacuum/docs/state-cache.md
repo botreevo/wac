@@ -109,14 +109,19 @@ writes, as `docs/state-on-disk.md` assumed.
    the interior (~100 MB at mainnet's size), the diff layers and the node. CLOCK — a ring of entries with a
    referenced bit, the hand clearing bits until it finds one clear — rather than an exact LRU, because a hit
    then only sets a bit; the curve above is LRU's and CLOCK is known to sit close to it.
-5. **`Store` keeps few leaves**: `maxLeaves` from 4096 to 64 — enough for a commit's own path and a range
-   read in progress. The interior stays in memory, as before.
+5. **`Store` keeps leaves by a byte budget, 64 MB** (`LEAF_BYTES`; 4096 leaves of 16 KB). It was set to 64
+   leaves first, on the reasoning that reads are the cache's; but a commit rewrites whole leaves, and with 64
+   it re-read the leaves of the keys it wrote: on the five-block replay, 7216 page reads against 455 and
+   70 Mgas/s against 100. The interior stays in memory, as before. While a commit is writing, no leaf is let
+   go (one it has rewritten is clean before its page is written; `store_test`'s gated test shows the loss).
 6. **`StateDb` stops keeping state across blocks**: its maps are the current block's (as the replay's cold
    `StateDb` is), dropped at commit; what it read is in the store's cache. The account trie it keeps open
    stays, its nodes now reread from the cache when needed rather than held as objects.
-7. **Pages: stay at 64 KB until the cheaper host call lands, then measure 16 KB.** With a call at ~5 µs, a
-   16 KB page reads in ~25 µs against ~80 µs, and the interior grows to ~400 MB at mainnet's size — which
-   needs `--max-heap`. Both are coming in wac; deciding before they land would be guessing.
+7. **Pages of 16 KB** (store format 3; a 64 KB store is refused, not overwritten). Measured once wac's
+   cheaper call landed (819ab1af6: ~10 µs a call and ~1 µs a KB here): a 16 KB page reads in ~25 µs against
+   ~75 µs for 64 KB, and on the five-block replay with the same memory for leaves (4 MB) 16 KB ran at 90
+   Mgas/s against 70 for 64 KB. The interior grows to ~400 MB at mainnet's size, which `--max-heap` now
+   allows. Values over `CHUNK` (12 KB: codes, receipts, blocks) are stored in chunks.
 
 What this does not decide: the diff layers' flush interval (`docs/state-on-disk.md` says 128 finalized
 blocks; the commit figures above support batching, and the cache makes the layers' own lookups cheaper but

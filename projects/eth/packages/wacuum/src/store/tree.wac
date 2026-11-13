@@ -1,7 +1,9 @@
-// The state store: one file, a copy-on-write B+tree of byte keys and byte values, with 64 KB pages, the
+// The state store: one file, a copy-on-write B+tree of byte keys and byte values, with 16 KB pages, the
 // interior always in memory, and commits that are atomic across a crash. `docs/state-on-disk.md` says why
-// each of those; in short, a host request costs ~55 µs whatever it carries, so a lookup is exactly one
-// request (a leaf, its interior already in memory) and a page is big enough to make that request worth it.
+// each of those: a lookup is exactly one request (a leaf, its interior already in memory). The pages were
+// 64 KB while a host request cost ~70 µs whatever it carried; at ~10 µs and ~1 µs a KB (wac 0471w), a 16 KB
+// leaf reads in ~25 µs against ~75 µs, and at equal memory for leaves blocks ran ~30% faster on it
+// (docs/state-cache.md).
 //
 // ## The file
 //
@@ -27,18 +29,25 @@ import { keccak256 } from "../crypto/keccak.wac";
 import { Disk } from "./disk.wac";
 import { EntryCache, Cached } from "./cache.wac";
 
-export static i32 PAGE = 65536;
+export static i32 PAGE = 16384;
 /** A value larger than this is refused: a leaf must hold at least one entry, with room for its key. */
-export static i32 MAX_VALUE = 60000;
+export static i32 MAX_VALUE = 15000;
+/** Larger values (codes, receipts, blocks) are stored in chunks of this size, each its own entry. */
+export static i32 CHUNK = 12288;
 /**
- * Leaves kept in memory once read or written: few, since what is read again is kept as entries
- * (`cache.wac`), at a fifth of the memory a leaf costs for what it holds that anyone wants
- * (docs/state-cache.md). Enough for a commit's paths and a range read under way.
+ * Leaves kept in memory once read or written, by their size on disk: 64 MB. What is read again is kept as
+ * entries (`cache.wac`), at a fraction of the memory a leaf costs for what anyone wants of it; the leaves are
+ * for what writes need, since a commit rewrites whole leaves, and 64 of them proved too few (docs/state-cache.md).
  */
-export static i32 LEAVES = 64;
+export static i64 LEAF_BYTES = 64 * 1024 * 1024;
+export static i32 LEAVES = (LEAF_BYTES / (PAGE as i64)) as! i32;
 /** The entry cache's budget by default, in MB. */
 export static i64 CACHE_MB = 256;
-static u64 MAGIC = 0x4244554d55434157;
+/** "WACUMDB" and the format: 3 since 16 KB pages (2026-11-13). 2 was the same with 64 KB pages. */
+static u64 MAGIC = 0x3344554d55434157;
+static u64 MAGIC_64K = 0x4244554d55434157;
+/** The free list's pages the meta can name: what a page holds after the meta's fixed fields and its user bytes. */
+static i32 MAX_LISTS = (PAGE - 44 - 4 - 3900 - 32) / 8;
 
 /** A node, decoded. A leaf's `vals` hold its values; an interior's `kids` hold its children once loaded. */
 struct Node {
@@ -247,9 +256,18 @@ export struct Store {
       Err(e): return Result.Err(e),
     };
     if (size == 0) { return Result.Ok(s); }
+    // A store of the format before (64 KB pages) is refused, not taken for an empty one and written over.
+    match (await disk.read(0, 8)) {
+      Ok(head): {
+        if (head.len() == 8 && get64(head, 0) == (MAGIC_64K as@ i64)) {
+          return Result.Err("a store of 64 KB pages, from before 2026-11-13: this one has 16 KB pages; remove it and sync again");
+        }
+      }
+      Err(e): { return Result.Err(e); }
+    }
     Meta? best = null;
     for (i32 slot = 0; slot < 2; slot++) {
-      u8[] b = match (await disk.read((slot as i64) * (PAGE as i64), 8192)) {
+      u8[] b = match (await disk.read((slot as i64) * (PAGE as i64), PAGE)) {
         Ok(x): x,
         Err(e): return Result.Err(e),
       };
@@ -553,7 +571,7 @@ export struct Store {
     for (i32 i = 0; i < this.free.len(); i++) { nextFree.push(this.free.get(i)); }
     for (i32 i = 0; i < this.freed.len(); i++) { nextFree.push(this.freed.get(i)); }
     for (i32 i = 0; i < this.listPages.len(); i++) { nextFree.push(this.listPages[i]); }
-    if (listCount > 400) { return "a free list of \{listCount} pages is more than the meta can name"; }
+    if (listCount > MAX_LISTS) { return "a free list of \{listCount} pages is more than the meta can name"; }
     for (i32 p = 0; p < listCount; p++) {
       u8[] b = u8[].filled(PAGE, 0);
       for (i32 i = 0; i < perPage && p * perPage + i < nextFree.len(); i++) { put64(b, i * 8, nextFree.get(p * perPage + i)); }

@@ -62,7 +62,7 @@ async string run_the_store_agrees_with_a_map_across_commits_and_reopening(i32 le
       bool del = keys.len() > 0 && r.below(10) < 3;
       u8[] k = del ? keys.get(r.below(keys.len())) : r.bytes(1 + r.below(40));
       if (!del) { keys.push(k); }
-      u8[]? v = del ? null : r.bytes(r.below(50) == 0 ? 20000 : r.below(120));
+      u8[]? v = del ? null : r.bytes(r.below(50) == 0 ? 5000 : r.below(120));
       cs.push(Change(k, v));
       if (v is null) { m.remove(bytesToHex(k)); } else { m.set(bytesToHex(k), v!); }
     }
@@ -99,12 +99,12 @@ async string run_a_tall_tree_with_big_keys() {
   Store s = (await Store.open(md.disk())).unwrap();
   Map<string, u8[]> m = model();
   Vec<u8[]> keys = Vec.create();
-  // 1000-byte keys and 20 KB values: three entries a leaf, sixty-odd children an interior node.
+  // 1000-byte keys and 5 KB values: three entries a leaf, some sixteen children an interior node.
   for (i32 round = 0; round < 6; round++) {
     Vec<Change> cs = Vec.create();
     for (i32 i = 0; i < 60; i++) {
       u8[] k = r.bytes(1000);
-      u8[] v = r.bytes(20000);
+      u8[] v = r.bytes(5000);
       keys.push(k);
       cs.push(Change(k, v));
       m.set(bytesToHex(k), v);
@@ -261,64 +261,81 @@ async string run_rewriting_the_same_keys_does_not_grow_the_file() {
 
 export string test_rewriting_the_same_keys_does_not_grow_the_file() { return run_rewriting_the_same_keys_does_not_grow_the_file().wait().orElse("it never finished"); }
 
-/** `m`'s disk, every read and write waiting a turn of the host first, as a file's do. */
-Disk slowly(MemDisk m, Sys sys) {
+async bool committed(Store s, Change[] ch) { return (await s.commit(ch, u8[].filled(0, 0))) == ""; }
+
+/** Writes held back until `open`: a test can stop a commit at its first write and look at the store meanwhile. */
+struct Gate {
+  bool closed;
+  bool waiting;
+  Vec<Ticket<bool>> held;
+
+  Ticket<bool> wait(this) {
+    Ticket<bool> t;
+    this.held.push(t);
+    this.waiting = true;
+    return t;
+  }
+
+  void open(this) {
+    this.closed = false;
+    while (this.held.len() > 0) { this.held.remove(0).resolve(true); }
+  }
+}
+
+Disk gated(MemDisk m, Gate g) {
   Disk d = m.disk();
-  return Disk(async (i64 at, i32 n) => {
-    await sys.sleepMillis(0);
-    return await d.read(at, n);
-  }, d.readNow, async (i64 at, u8[] b) => {
-    await sys.sleepMillis(0);
+  return Disk(d.read, d.readNow, async (i64 at, u8[] b) => {
+    if (g.closed) { await g.wait(); }
     return await d.write(at, b);
   }, d.sync, d.size);
 }
 
-async bool committed(Store s, Change[] ch) { return (await s.commit(ch, u8[].filled(0, 0))) == ""; }
-
 /**
- * Reads while a commit is writing, on a store keeping one leaf, over a disk whose every request waits a turn: what
- * the commits wrote is what the store and the file then hold. The node reads during commits since old blocks are
- * answered from the store (an RPC, a peer). Letting leaves go during a commit broke the snap e2e with --heal
- * (blocks after the pivot stopped going in) and is no longer done; this test passes either way — the e2e is
- * what showed it.
+ * A leaf a commit has rewritten — clean, with its new page — let go by a read while the commit waits on the disk,
+ * and read back before its page is written: from a page that does not hold it yet. The store keeps one leaf; the
+ * commit is held at its first write while a read of another leaf loads it (letting the rewritten one go, as it
+ * did), and a read of the rewritten key then reads it again. Since old blocks are answered from the store, the
+ * node reads during commits, and this broke the snap e2e's import after a moved pivot.
  */
-export async string test_reads_during_a_commit_let_go_nothing_it_is_writing(Sys sys) {
+export async string test_a_leaf_a_commit_rewrote_is_not_let_go_before_its_page_is_written(Sys sys) {
   Check t = Check.create();
   MemDisk md = MemDisk.create();
-  Store s = (await Store.open(md.disk())).unwrap();
+  Gate g = Gate(false, false, Vec.create());
+  Store s = (await Store.open(gated(md, g))).unwrap();
   Vec<Change> cs = Vec.create();
   for (i32 i = 0; i < 3000; i++) { cs.push(Change(key(i), u8[].filled(100, 1))); }
   t.ok(await committed(s, cs.toArray()), "a tree of several leaves");
-  s = (await Store.open(slowly(md, sys))).unwrap();
+  s = (await Store.open(gated(md, g))).unwrap();
   s.cache = EntryCache.create(0);
   s.maxLeaves = 1;
-  for (i32 round = 0; round < 12; round++) {
-    // Every leaf read first, so each is queued to be let go; then a commit to all of them, and reads meanwhile.
-    for (i32 i = 0; i < 3000; i += 50) { s.getNow(key(i)); }
-    Vec<Change> ch = Vec.create();
-    for (i32 i = 0; i < 1500; i += 25) { ch.push(Change(key(i), u8[].filled(100, (round + 2) as! u8))); }
-    Ticket<bool> c = committed(s, ch.toArray());
-    // Reads of the other half, which load leaves and so let others go, and of the very keys being written,
-    // whose leaves are then read back while the commit writes them.
-    for (i32 k = 0; k < 120; k++) {
-      s.getNow(key(1500 + ((k * 37 + round * 101) % 1500)));
-      s.getNow(key(((k * 7 + round) % 60) * 25));
-      await sys.sleepMillis(0);
-    }
-    t.ok(await c, "commit \{round}");
-    i32 stale = 0;
-    for (i32 i = 0; i < 1500; i += 25) {
-      u8[]? v = s.getNow(key(i));
-      if (v is null || v![0] != ((round + 2) as! u8)) { stale++; }
-    }
-    t.ok(stale == 0, "after commit \{round}, the store reads what it wrote: \{stale} wrong");
-  }
-  Store again = (await Store.open(md.disk())).unwrap();
-  i32 wrong = 0;
-  for (i32 i = 0; i < 1500; i += 25) {
-    u8[]? v = await again.get(key(i));
-    if (v is null || v![0] != 13) { wrong++; }
-  }
-  t.ok(wrong == 0, "every key the commits wrote is in the file: \{wrong} wrong");
+  s.getNow(key(10));
+  g.closed = true;
+  Ticket<bool> c = committed(s, [Change(key(10), u8[].filled(100, 2))]);
+  for (i32 i = 0; i < 100 && !g.waiting; i++) { await sys.sleepMillis(0); }
+  t.ok(g.waiting, "the commit is waiting on its first write");
+  s.getNow(key(2900));
+  u8[]? during = s.getNow(key(10));
+  t.ok(during is not null && (during![0] == 1 || during![0] == 2), "a read during the commit finds the key, old or new");
+  g.open();
+  t.ok(await c, "the commit finishes");
+  u8[]? after = s.getNow(key(10));
+  t.ok(after is not null && after![0] == 2, "and the store then reads what it wrote");
+  u8[]? reopened = await (await Store.open(md.disk())).unwrap().get(key(10));
+  t.ok(reopened is not null && reopened![0] == 2, "as does the file, opened again");
   return t.report();
 }
+
+/** A store of the format before 16 KB pages is refused, not taken for an empty one and written over. */
+async string run_a_store_of_64_kb_pages_is_refused() {
+  MemDisk md = MemDisk.create();
+  Disk d = md.disk();
+  // The old magic, as its meta began: "WACUMUDB", little-endian.
+  await d.write(0, "WACUMUDB".toBytes());
+  await d.sync();
+  match (await Store.open(d)) {
+    Ok(s): { return "opened as a store"; }
+    Err(why): { return why.indexOf("64 KB pages") >= 0 ? "" : "refused, but saying: \{why}"; }
+  }
+}
+
+export string test_a_store_of_64_kb_pages_is_refused() { return run_a_store_of_64_kb_pages_is_refused().wait().orElse("it never finished"); }

@@ -1,6 +1,6 @@
 // wac-tensor's Metal server: the GPU end of `src/metal/metal.wac`, for a program run by `wac` on a Mac.
 //
-//     swiftc -O metal/server.swift -o dist/wac-tensor-metal && dist/wac-tensor-metal [port]     (7787 by default)
+//     swiftc -O metal/server.swift metal/frames.swift -o dist/wac-tensor-metal && dist/wac-tensor-metal [port]   (7787 by default)
 //
 // It knows nothing about tensors. The kernels are MSL that wac-tensor writes (`src/metal/msl.wac`) and sends as
 // programs; this compiles them, makes buffers, runs programs over them and reads them back — the five operations of
@@ -24,6 +24,13 @@
 //
 // **`WAC_METAL_PROFILE=1`** runs every dispatch in a command buffer of its own and waits for it, which is slow, and
 // prints the GPU's time for each program when the connection closes — named by the comment wac-tensor puts first.
+//
+// **It trusts nothing a connection sends** (`frames.swift`, checked by `frames-check.swift`): it listens on 127.0.0.1
+// only, without authentication, so any local process can connect. A malformed batch, a buffer too large, a write or a
+// read outside its buffer, a product whose operands are too short: each is a fault on the next read, and the rest of a
+// malformed batch is dropped. A frame longer than `MAX_FRAME` closes the connection. Nothing a client sends crashes the
+// server or touches memory outside a buffer through these operations — though a program is MSL that runs on the GPU,
+// and Metal does not bound a shader's own accesses, so a local client can still read or write through a shader it sends.
 
 import Foundation
 import Metal
@@ -64,49 +71,13 @@ final class Conn {
 
 func le32(_ v: Int) -> [UInt8] { [UInt8(v & 255), UInt8((v >> 8) & 255), UInt8((v >> 16) & 255), UInt8((v >> 24) & 255)] }
 
-/// Reads the fields of one operation out of a batch.
-struct Cursor {
-  let bytes: [UInt8]
-  var at = 0
-  mutating func u8() -> UInt8 { at += 1; return bytes[at - 1] }
-  mutating func u32() -> Int {
-    let v = Int(bytes[at]) | Int(bytes[at + 1]) << 8 | Int(bytes[at + 2]) << 16 | Int(bytes[at + 3]) << 24
-    at += 4
-    return v
-  }
-  mutating func i64() -> Int64 {
-    let lo = UInt64(UInt32(truncatingIfNeeded: u32())), hi = UInt64(UInt32(truncatingIfNeeded: u32()))
-    return Int64(bitPattern: lo | hi << 32)
-  }
-  mutating func take(_ n: Int) -> ArraySlice<UInt8> { at += n; return bytes[(at - n)..<at] }
-}
-
-/// Little-endian `i32`s.
-func ints(_ s: ArraySlice<UInt8>) -> [Int] {
-  var out: [Int] = []
-  var i = s.startIndex
-  while i + 3 < s.endIndex {
-    out.append(Int(Int32(bitPattern: UInt32(s[i]) | UInt32(s[i + 1]) << 8 | UInt32(s[i + 2]) << 16 | UInt32(s[i + 3]) << 24)))
-    i += 4
-  }
-  return out
-}
-
-/// The length a buffer of `length` bytes is made with, which a freed one must have to be used again: 256 bytes at a time
-/// up to 4 KB, then a quarter of a power of two at a time, so at most a quarter over. With exact lengths, a program whose
-/// batches vary in size made fresh buffers for almost every batch — thousands of them, at the GPU's cost for fresh
-/// memory, which tripled the time of every batch whose size it had not seen.
-func sizeClass(_ length: Int) -> Int {
-  if length <= 4096 { return (length + 255) / 256 * 256 }
-  let step = 1 << (Int.bitWidth - (length - 1).leadingZeroBitCount - 3)
-  return (length + step - 1) / step * step
-}
-
 /// Three 16-bit counts from the top of `b`, as `groups(x, y, z)` packs them.
 func size3(_ b: Int64) -> MTLSize {
   let u = UInt64(bitPattern: b)
   return MTLSize(width: Int((u >> 48) & 0xffff), height: Int((u >> 32) & 0xffff), depth: Int((u >> 16) & 0xffff))
 }
+
+func volume(_ s: MTLSize) -> Int { s.width * s.height * s.depth }
 
 final class Session {
   let device: MTLDevice
@@ -202,17 +173,21 @@ final class Session {
   func batch(_ count: Int, _ bytes: [UInt8]) {
     var c = Cursor(bytes: bytes)
     for _ in 0..<count {
-      let op = c.u8(), a = c.i64(), b = c.i64()
-      let text = c.take(c.u32()), data = c.take(c.u32())
-      let h = Int(a)
+      guard let o = c.operation() else { fault("a batch that ends partway through an operation"); break }
+      let (op, b, text, data) = (o.op, o.b, o.text, o.data)
+      let h = Int(o.a)
       switch op {
       case BUFFER:
+        guard bufferLengthOK(b, limit: device.maxBufferLength) else { fault("no buffer of \(b) bytes"); continue }
         guard let buf = allocate(max(Int(b), 4)) else { fault("no buffer of \(b) bytes"); continue }
+        if let old = buffers[h] { freed.append(old) }
         buffers[h] = buf
       case WRITE:
         guard let buf = buffer(h) else { continue }
+        guard rangeFits(offset: b, count: data.count, length: buf.length) else {
+          fault("a write outside buffer \(h): \(data.count) bytes at \(b)"); continue
+        }
         if busy.contains(h) { wait() }
-        if Int(b) + data.count > buf.length { fault("a write past the end of buffer \(h)"); continue }
         if !data.isEmpty { _ = data.withUnsafeBytes { memcpy(buf.contents() + Int(b), $0.baseAddress!, data.count) } }
       case FREE:
         if let buf = buffers.removeValue(forKey: h) { freed.append(buf) }
@@ -220,21 +195,30 @@ final class Session {
       case PROGRAM:
         do {
           let lib = try device.makeLibrary(source: String(decoding: text, as: UTF8.self), options: options)
-          let pipe = try device.makeComputePipelineState(function: lib.makeFunction(name: "k")!)
-          programs[h] = (pipe, size3(b))
+          guard let k = lib.makeFunction(name: "k") else { fault("a program with no kernel named k"); continue }
+          let pipe = try device.makeComputePipelineState(function: k)
+          let threads = size3(b)
+          guard volume(threads) > 0, volume(threads) <= pipe.maxTotalThreadsPerThreadgroup else {
+            fault("a program's workgroup of \(threads.width)×\(threads.height)×\(threads.depth) threads, where at most "
+                  + "\(pipe.maxTotalThreadsPerThreadgroup) run together"); continue
+          }
+          programs[h] = (pipe, threads)
           names[h] = String(decoding: text.prefix(while: { $0 != 10 }), as: UTF8.self)
         } catch {
           fault("a program did not compile: \(error)")
         }
       case RUN:
         guard let (pipe, threads) = programs[h] else { fault("program \(h) is not there"); continue }
+        let bound = ints(data)
+        guard bound.count <= MAX_BINDINGS else { fault("a run binding \(bound.count) buffers"); continue }
+        var bufs: [MTLBuffer] = []
+        for bh in bound { if let buf = buffer(bh) { bufs.append(buf) } }
+        // A run missing a buffer would read whatever its slot last held: it is not run at all.
+        guard bufs.count == bound.count else { continue }
         let e = encoder()
         e.setComputePipelineState(pipe)
-        for (i, bh) in ints(data).enumerated() {
-          guard let buf = buffer(bh) else { continue }
-          e.setBuffer(buf, offset: 0, index: i)
-          busy.insert(bh)
-        }
+        for (i, buf) in bufs.enumerated() { e.setBuffer(buf, offset: 0, index: i) }
+        busy.formUnion(bound)
         e.dispatchThreadgroups(size3(b), threadsPerThreadgroup: threads)
         if profiling { timed(names[h] ?? "?") }
       case MATMUL:
@@ -246,24 +230,41 @@ final class Session {
     commit()
   }
 
-  /// `Backend.matmul` in `F32`: [a, b, out, batch, m, k, n, ta, tb, aStride, bStride].
+  /// `Backend.matmul` in `F32`: [a, b, out, batch, m, k, n, ta, tb, aStride, bStride] (`MatmulShape`).
   func matmul(_ f: [Int]) {
-    guard let A = buffer(f[0]), let B = buffer(f[1]), let C = buffer(f[2]) else { return }
-    var (batch, m) = (f[3], f[4])
-    let (k, n, ta, tb, aStride, bStride) = (f[5], f[6], f[7] != 0, f[8] != 0, f[9], f[10])
-    // A stack of left matrices against one shared right one is one tall product.
-    if batch > 1 && !ta && bStride == 0 && aStride == m * k { m *= batch; batch = 1 }
+    guard let shape = MatmulShape(f) else { fault("a matrix product with \(f.count) fields, or a negative one"); return }
+    guard let A = buffer(shape.a), let B = buffer(shape.b), let C = buffer(shape.out) else { return }
+    guard let need = shape.needs(), need.a <= A.length, need.b <= B.length, need.out <= C.length else {
+      fault("a matrix product \(shape.m)×\(shape.k)×\(shape.n) ×\(shape.batch) whose buffers are too short"); return
+    }
+    var (batch, m) = (shape.batch, shape.m)
+    let (k, n, ta, tb, aStride, bStride) = (shape.k, shape.n, shape.ta, shape.tb, shape.aStride, shape.bStride)
+    if batch == 0 || m == 0 || n == 0 { return }
     compute?.endEncoding()
     compute = nil
     if commands == nil { commands = queue.makeCommandBuffer()! }
+    busy.formUnion([shape.a, shape.b, shape.out])
+    // With nothing to sum, the product is zeros. MPS is not asked: a kernel with no interior columns may leave its
+    // result unwritten, and a reused buffer holds whatever it held before.
+    if k == 0 {
+      let blit = commands!.makeBlitCommandEncoder()!
+      blit.fill(buffer: C, range: 0..<need.out, value: 0)
+      blit.endEncoding()
+      return
+    }
+    // A stack of left matrices against one shared right one is one tall product.
+    if batch > 1 && !ta && bStride == 0 && aStride == m * k { m *= batch; batch = 1 }
     // **The result's rows go in power-of-two blocks**, each by a kernel made for that many rows. Making a kernel for a
     // new number of rows costs about 4 ms, and a program whose batches vary — self-play, whose every step values a
     // different number of boards — would otherwise make several for every batch. Blocks bound the kernels made to a
     // couple of dozen for each shape; MPS refuses a kernel made for more rows than the matrices it is given have.
     let db = MPSMatrixDescriptor(rows: tb ? n : k, columns: tb ? k : n, rowBytes: (tb ? k : n) * 4, dataType: .float32)
     var start = 0
-    for bit in stride(from: Int.bitWidth - 2, through: 0, by: -1) where m & (1 << bit) != 0 {
-      let rows = 1 << bit
+    // A transposed left side is k rows of m: a block of its columns that does not start at the first would end, by the
+    // descriptor's count of whole rows, past A's last byte. Its m is a weight's width, the same at every step, so it
+    // gets one kernel of all m rows and no blocks.
+    let blocks = ta ? [m] : stride(from: Int.bitWidth - 2, through: 0, by: -1).filter { m & (1 << $0) != 0 }.map { 1 << $0 }
+    for rows in blocks {
       let key = "\(rows) \(k) \(n) \(ta) \(tb)"
       let product = products[key] ?? MPSMatrixMultiplication(
         device: device, transposeLeft: ta, transposeRight: tb, resultRows: rows, resultColumns: n, interiorColumns: k,
@@ -281,7 +282,6 @@ final class Session {
       }
       start += rows
     }
-    busy.formUnion([f[0], f[1], f[2]])
     if profiling { timed("// mps \(m)x\(k)x\(n)\(ta ? " ta" : "")\(tb ? " tb" : "") ×\(batch)") }
   }
 
@@ -308,7 +308,7 @@ final class Session {
     wait()
     var bytes: [UInt8] = []
     if let buf = buffer(h) {
-      if offset + length > buf.length { fault("a read past the end of buffer \(h)") }
+      if !rangeFits(offset: Int64(offset), count: length, length: buf.length) { fault("a read outside buffer \(h)") }
       else { bytes = [UInt8](UnsafeRawBufferPointer(start: buf.contents() + offset, count: length)) }
     }
     if !errors.isEmpty {
@@ -328,7 +328,9 @@ func serve(_ conn: Conn, _ device: MTLDevice) {
   // drain them: without a pool per request, every command buffer — and every buffer it used — would live forever.
   while let kind = conn.read(1) {
     if kind[0] == 0 {
-      guard let count = conn.u32(), let length = conn.u32(), let bytes = conn.read(length) else { break }
+      guard let count = conn.u32(), let length = conn.u32(), length <= MAX_FRAME, let bytes = conn.read(length) else {
+        break
+      }
       autoreleasepool { s.batch(count, bytes) }
     } else {
       guard let h = conn.u32(), let offset = conn.u32(), let length = conn.u32() else { break }
@@ -338,26 +340,35 @@ func serve(_ conn: Conn, _ device: MTLDevice) {
   s.report()
 }
 
-let port = CommandLine.arguments.count > 1 ? UInt16(CommandLine.arguments[1])! : 7787
-guard let device = MTLCreateSystemDefaultDevice() else { fatalError("this Mac has no Metal device") }
-let listener = socket(AF_INET, SOCK_STREAM, 0)
-var yes: Int32 = 1
-setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-var addr = sockaddr_in()
-addr.sin_family = sa_family_t(AF_INET)
-addr.sin_port = port.bigEndian
-addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-let bound = withUnsafePointer(to: &addr) {
-  $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
-}
-if bound != 0 || listen(listener, 4) != 0 { fatalError("cannot listen on 127.0.0.1:\(port)") }
-FileHandle.standardError.write("wac-tensor-metal: \(device.name), listening on 127.0.0.1:\(port)\n".data(using: .utf8)!)
-while true {
-  let fd = accept(listener, nil, nil)
-  if fd < 0 { continue }
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
-  Thread {
-    serve(Conn(fd), device)
-    close(fd)
-  }.start()
+/// The server's own start: built from two files (`frames.swift` beside it), it has no top-level code.
+@main
+struct Server {
+  static func main() {
+    guard let port = portArgument(CommandLine.arguments) else {
+      FileHandle.standardError.write("usage: wac-tensor-metal [port]   (7787 by default)\n".data(using: .utf8)!)
+      exit(2)
+    }
+    guard let device = MTLCreateSystemDefaultDevice() else { fatalError("this Mac has no Metal device") }
+    let listener = socket(AF_INET, SOCK_STREAM, 0)
+    var yes: Int32 = 1
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = port.bigEndian
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+    let bound = withUnsafePointer(to: &addr) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+    }
+    if bound != 0 || listen(listener, 4) != 0 { fatalError("cannot listen on 127.0.0.1:\(port)") }
+    FileHandle.standardError.write("wac-tensor-metal: \(device.name), listening on 127.0.0.1:\(port)\n".data(using: .utf8)!)
+    while true {
+      let fd = accept(listener, nil, nil)
+      if fd < 0 { continue }
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
+      Thread {
+        serve(Conn(fd), device)
+        close(fd)
+      }.start()
+    }
+  }
 }

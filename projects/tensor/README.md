@@ -173,9 +173,16 @@ programs it is sent, keeps buffers, runs and reads them — `wac.gpu`'s five ope
 product by Metal Performance Shaders, which every `F32` product goes to. Nothing in `wac` changes; the program needs
 only `--allow-net`.
 
+The server listens on 127.0.0.1 only and has **no authentication**: any process on the Mac can connect. It checks
+everything a connection sends (`metal/frames.swift`): a malformed batch, a write or read outside a buffer, or a product
+whose operands are too short is a fault on the next read, not a crash or a write outside a buffer. A program is still
+MSL run on the GPU, though, and Metal does not bound a shader's accesses, so run it only on a machine whose local
+users you trust.
+
 ```sh
 wac task metal:server && dist/wac-tensor-metal &   # swiftc, then listen on 127.0.0.1:7787
 wac task metal:check                                # devicecheck.wac's checks against the CPU: PASS 128
+wac task metal:frames                               # the server's bounds checks, without Metal
 wac task metal:bench                                # the six benchmarks, CPU against Metal
 ```
 

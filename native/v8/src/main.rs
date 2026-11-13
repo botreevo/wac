@@ -304,6 +304,91 @@ const OP_OPEN_FILE: i32 = 61;
 thread_local! {
     /// How the program on this thread ended, when it trapped — `(how, kind, text)` for `Child.ended()`; read once.
     static ENDING: std::cell::RefCell<Option<(i32, i32, String)>> = const { std::cell::RefCell::new(None) };
+    /// The heap limit this thread's isolate reached, in bytes, once `near_heap_limit` has stopped it; 0 until then.
+    static OUT_OF_HEAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// **How large a program's heap may grow** — `issues/system/0472w`.
+///
+/// A wac value is a WasmGC object, so it lives in V8's own heap, not in the module's linear memory, and every isolate
+/// here was made with `CreateParams::default()`: V8's default old-space ceiling, about 1.4 GB whatever the machine has.
+/// wacuum held a million accounts and died at 1384 MB with 15 GB free. **Half of physical memory** by default now, or
+/// `WAC_MAX_HEAP` (`8g`, `512m`, a number of bytes) — which `wac --max-heap <size>` sets for itself and everything it
+/// starts, so a child isolate on another thread and a child process both see it. This build has pointer compression off
+/// (the `v8` crate's feature is not enabled), so the 4 GB cage of a compressed heap does not apply.
+fn heap_max_bytes() -> usize {
+    if let Ok(v) = std::env::var("WAC_MAX_HEAP") {
+        if let Some(n) = parse_size(v.trim()) {
+            return n;
+        }
+        eprintln!("wac: WAC_MAX_HEAP={v:?} is not a size (like 8g, 512m, or a number of bytes) — using the default");
+    }
+    // SAFETY: `sysconf` reads a system constant and has no preconditions.
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    if pages <= 0 || page <= 0 {
+        return 0;
+    }
+    (pages as u64 * page as u64 / 2) as usize
+}
+
+/// `8g`, `512m`, `64k`, `1t` or a plain number of bytes; `None` for anything else, zero included.
+fn parse_size(s: &str) -> Option<usize> {
+    let s = s.to_ascii_lowercase();
+    let (digits, unit): (&str, usize) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1 << 10),
+        'm' => (&s[..s.len() - 1], 1 << 20),
+        'g' => (&s[..s.len() - 1], 1 << 30),
+        't' => (&s[..s.len() - 1], 1 << 40),
+        _ => (&s[..], 1),
+    };
+    let n: usize = digits.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    n.checked_mul(unit)
+}
+
+/// An isolate's parameters: the heap limit above, or V8's own when the machine would not say how much memory it has.
+fn create_params() -> v8::CreateParams {
+    let max = heap_max_bytes();
+    if max == 0 { v8::CreateParams::default() } else { v8::CreateParams::default().heap_limits(0, max) }
+}
+
+/// **Out of heap is the program's ending, not V8's abort.** Called by V8 when the heap nears its limit and collecting has
+/// not helped: stop the program, and give the heap room to unwind in, so the run reports `HostLimit` with a sentence
+/// naming the setting rather than "Fatal JavaScript out of memory" and a page of addresses.
+unsafe extern "C" fn near_heap_limit(data: *mut std::ffi::c_void, current: usize, _initial: usize) -> usize {
+    // SAFETY: `data` is the `IsolateHandle` leaked for this isolate in `run_as_with`, which lives as long as the process.
+    let handle = unsafe { &*(data as *const v8::IsolateHandle) };
+    handle.terminate_execution();
+    // **Room to unwind in, once.** A termination lands at the program's next call into the host, not inside a loop of
+    // allocations, so headroom granted on every call let a program held at 8 GB reach 10 before it stopped. The second
+    // time this is asked, the limit stands, and `out_of_heap` is what reports it.
+    if OUT_OF_HEAP.with(|o| o.get()) != 0 {
+        return current;
+    }
+    OUT_OF_HEAP.with(|o| o.set(current));
+    current + current / 16 + (64 << 20)
+}
+
+/// The sentence a program that ran out of heap ends with: the configured limit, and how to raise it.
+fn out_of_heap_text(reached: usize) -> String {
+    // The limit as configured, which is the number the reader set or can set — V8's own figure leaves out the young
+    // generation, so `256m` read back as 232.
+    let limit = match heap_max_bytes() { 0 => reached, n => n };
+    format!(
+        "ran out of memory: its heap reached the limit of {} MB — raise it with `wac --max-heap <size>` or WAC_MAX_HEAP (like 8g)",
+        limit >> 20
+    )
+}
+
+/// **When the heap is full before the program could be stopped**, V8 ends the process; this says why first, in the same
+/// words a stopped program gets, instead of "Fatal JavaScript out of memory" and a page of addresses. The process goes
+/// with it — a child here is a thread, so its parent does too — with the status a host limit reports (-1, 255).
+unsafe extern "C" fn out_of_heap(_location: *const std::ffi::c_char, _details: &v8::OomDetails) {
+    let reached = OUT_OF_HEAP.with(|o| o.get());
+    eprintln!("wac: the program {}", out_of_heap_text(reached));
+    std::process::exit(255);
 }
 
 /// How a child ended, waited for by every `Child.ended()` that asks.
@@ -847,6 +932,31 @@ fn compiler_id() -> String {
 /// pretending to be a `wac` command, because there is no program in it to be one.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // **`wac --max-heap <size> …`** — the heap limit for this command and everything it starts (`heap_max_bytes`).
+    // Taken here, first on the line only so that a program's own `--max-heap` is never eaten, and turned into
+    // `WAC_MAX_HEAP` before re-running this binary without it: every argument after this point is read again in a
+    // dozen places, and an environment variable reaches child isolates and child processes with no plumbing at all.
+    if let Some(first) = args.get(1) {
+        let given = if first == "--max-heap" {
+            Some((args.get(2).cloned().unwrap_or_default(), 3))
+        } else {
+            first.strip_prefix("--max-heap=").map(|v| (v.to_string(), 2))
+        };
+        if let Some((size, skip)) = given {
+            if parse_size(size.trim()).is_none() {
+                eprintln!("wac: --max-heap wants a size, like 8g, 512m or a number of bytes — got {size:?}");
+                std::process::exit(2);
+            }
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new("/proc/self/exe")
+                .arg0(&args[0])
+                .args(&args[skip.min(args.len())..])
+                .env("WAC_MAX_HEAP", size.trim())
+                .exec();
+            eprintln!("wac: --max-heap: could not re-run this binary — {err}");
+            std::process::exit(1);
+        }
+    }
     // **Every payload can ask which compiler is running it.** Set before V8 starts, and set
     // unconditionally so that a program reading it never has to distinguish "no compiler" from "not
     // told". Reading it needs the `env` grant the program already holds. `issues/system/0204`.
@@ -1000,7 +1110,7 @@ fn validate_modules(paths: &[String], quiet: bool) -> i32 {
         return 2;
     }
     start_v8();
-    let isolate = &mut v8::Isolate::new(Default::default());
+    let isolate = &mut v8::Isolate::new(create_params());
     v8::scope!(let handle_scope, isolate);
     let context = v8::Context::new(handle_scope, Default::default());
     let scope = &mut v8::ContextScope::new(handle_scope, context);
@@ -1055,7 +1165,12 @@ fn run_as_with(m: &Manifest, wasm: &[u8], manifest_text: &str, as_child: AsChild
     // Kept because a module with no `main` names the export to call in its first argument, and
     // that decision is made below where the manifest is known — see `call_named`.
     let argv = as_child.argv.clone();
-    let isolate = &mut v8::Isolate::new(Default::default());
+    let isolate = &mut v8::Isolate::new(create_params());
+    // Leaked, sixteen bytes a program: V8 holds the pointer for the isolate's life, and nothing frees it sooner.
+    let heap_handle: &'static v8::IsolateHandle = Box::leak(Box::new(isolate.thread_safe_handle()));
+    isolate.add_near_heap_limit_callback(near_heap_limit, heap_handle as *const v8::IsolateHandle as *mut std::ffi::c_void);
+    isolate.set_oom_error_handler(out_of_heap);
+    OUT_OF_HEAP.with(|o| o.set(0));
     v8::scope!(let handle_scope, isolate);
     let context = v8::Context::new(handle_scope, Default::default());
     let scope = &mut v8::ContextScope::new(handle_scope, context);
@@ -1299,6 +1414,13 @@ fn run_as_with(m: &Manifest, wasm: &[u8], manifest_text: &str, as_child: AsChild
     let (called, why) = called;
     if let Some(code) = EXIT_REQUEST.with(|e| e.take()) {
         return code;
+    }
+    let reached = OUT_OF_HEAP.with(|o| o.get());
+    if called.is_none() && reached > 0 {
+        let text = out_of_heap_text(reached);
+        eprintln!("wac: {} {text}", m.entry);
+        ENDING.with(|e| *e.borrow_mut() = Some((2, 0, text)));
+        return 1;
     }
     let r = match called {
         Some(v) => v,

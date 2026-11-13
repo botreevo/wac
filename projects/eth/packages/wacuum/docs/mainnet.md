@@ -168,6 +168,9 @@ live traffic, while B is built. `deploy/mainnet/` installs it. *Probability it r
 
 ## Runbook
 
+(This is the mainnet shadow's. **Hoodi comes first** — wacuum on its own store, snap-synced, driven by
+Lighthouse beside a geth reference: `docs/hoodi.md` and `deploy/hoodi/`.)
+
 1. `sh deploy/mainnet/install.sh` as root — about 15 minutes, most of it building wac from source.
 2. `sh deploy/mainnet/reference.sh RETH_VERSION LIGHTHOUSE_VERSION` with the current releases. Lighthouse
    checkpoint-syncs in minutes; reth's full sync takes one to three days on this disk. Progress:

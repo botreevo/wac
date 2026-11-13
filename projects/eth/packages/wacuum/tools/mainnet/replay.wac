@@ -27,6 +27,7 @@ import { hexToBytes, bytesToHex } from "../../src/hex.wac";
 import { World, Account, AccountState, ChangeSet, StateSource, emptyCodeHash, slotMap, hashU256, eqU256 } from "../../src/state/world.wac";
 import { Store } from "../../src/store/tree.wac";
 import { fileDisk } from "../../src/store/file.wac";
+import { Disk } from "../../src/store/disk.wac";
 import { StateDb } from "../../src/store/state.wac";
 import { executeFrom, Steps } from "../../src/store/exec.wac";
 import { Header, Block, Withdrawal, Body, executeBlock, executeBody } from "../../src/chain/block.wac";
@@ -275,9 +276,11 @@ export async i32 main(Sys sys) {
   string[] args = sys.args();
   string dir = "";
   string storePath = "";
+  string keysPath = "";
   for (i32 i = 0; i + 1 < args.len(); i++) {
     if (args[i] == "--dir") { dir = args[i + 1]; }
     if (args[i] == "--store") { storePath = args[i + 1]; }
+    if (args[i] == "--keys") { keysPath = args[i + 1]; }
   }
   string[] why = [""];
   u8[]? blocksText = (await sys.readFile(dir + "/blocks.txt")).ok();
@@ -383,7 +386,7 @@ export async i32 main(Sys sys) {
     sys.log("\{range.len()} blocks from \{from}, \{r.txs} transactions, \{r.gas / 1000000} Mgas in \{us / 1000} ms \{how}: \{mgas} Mgas/s");
   }
   sys.log(bad == 0 ? "every block matches its header but for the state root" : "\{bad} block(s) differ from their headers");
-  if (storePath != "") { await onStore(sys, storePath, cache, g.config, range, first!, copyOf(hashes)); }
+  if (storePath != "") { await onStore(sys, storePath, keysPath, cache, g.config, range, first!, copyOf(hashes)); }
   return bad == 0 ? 0 : 1;
 }
 
@@ -394,7 +397,7 @@ export async i32 main(Sys sys) {
  * the commit apart. The root is not the header's — the store holds only what the blocks touch — so it is
  * the cost being measured, not the answer.
  */
-async void onStore(Sys sys, string path, Cache cache, ChainConfig config, Block[] range, Header first, Map<U256, U256> hashes) {
+async void onStore(Sys sys, string path, string keysPath, Cache cache, ChainConfig config, Block[] range, Header first, Map<U256, U256> hashes) {
   auto file = await fileDisk(sys, path);
   if (!file.isOk()) {
     sys.log("cannot open \{path}");
@@ -436,6 +439,13 @@ async void onStore(Sys sys, string path, Cache cache, ChainConfig config, Block[
   // Opened again from the file, so that nothing it wrote is still in memory: every leaf is read.
   auto again = await fileDisk(sys, path);
   store = (await Store.open(again.unwrap())).unwrap();
+  // With --keys, what each block asks of the store and commits to it, for `tools/measure/cache.wac`.
+  Disk? keys = null;
+  i64 keysAt = 0;
+  if (keysPath != "") {
+    keys = (await fileDisk(sys, keysPath)).ok();
+    store.trace = Vec<u8[]>.create();
+  }
 
   Header parent = first;
   i64 exec = 0;
@@ -464,10 +474,38 @@ async void onStore(Sys sys, string path, Cache cache, ChainConfig config, Block[
     gas += b.header.gasUsed.low() as@ i64;
     hashes.set(b.header.number, b.header.hash);
     parent = b.header;
+    if (keys is not null) {
+      keysAt = await writeTrace(keys!, keysAt, b.header.number.low(), store.trace!);
+      store.trace = Vec<u8[]>.create();
+    }
+  }
+  if (keys is not null) {
+    await keys!.sync();
+    sys.log("keys: \{keysAt} bytes of trace in \{keysPath}");
   }
   i64 us = (exec + commit) / 1000;
   sys.log("on the store: \{range.len()} blocks, \{gas / 1000000} Mgas: executing \{exec / 1000000} ms (\{steps.steps} steps, \{steps.reruns} again), " +
           "committing \{commit / 1000000} ms, \{store.reads - reads0} page reads: \{us == 0 ? 0 : gas / us} Mgas/s");
+}
+
+/** A block's trace appended at `at`: `B`, 8, its number; then each entry as its kind, its key's length, the key. */
+async i64 writeTrace(Disk d, i64 at, u64 number, Vec<u8[]> trace) {
+  i32 n = 10;
+  for (i32 i = 0; i < trace.len(); i++) { n += trace.get(i).len() + 1; }
+  u8[] out = u8[].filled(n, 0);
+  out[0] = 66;
+  out[1] = 8;
+  for (i32 k = 0; k < 8; k++) { out[2 + k] = ((number >> ((56 - 8 * k) as! u64)) & 255) as! u8; }
+  i32 w = 10;
+  for (i32 i = 0; i < trace.len(); i++) {
+    u8[] t = trace.get(i);
+    out[w] = t[0];
+    out[w + 1] = (t.len() - 1) as! u8;
+    out.copyFrom(t, 1, w + 2, t.len() - 1);
+    w += t.len() + 1;
+  }
+  await d.write(at, out);
+  return at + (n as i64);
 }
 
 Map<U256, U256> copyOf(Map<U256, U256> m) {

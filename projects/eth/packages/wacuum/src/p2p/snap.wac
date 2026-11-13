@@ -1,0 +1,467 @@
+// snap/1: a state fetched as ranges of its tries' leaves rather than block by block. A client asks a peer
+// for runs of accounts, of each account's slots, and for codes, checks each run against the state root it
+// asked about with the run's range proof (`src/trie/rangeproof.wac`), and writes it into the store as it
+// is; then builds the tries from the store in one sorted pass (`src/trie/stacktrie.wac`), and the root
+// must be the one it asked for. The store's keys are snap's — keccak of the address, keccak of the slot —
+// and a stored account is the trie's leaf, so what arrives goes in as it came.
+//
+// The messages follow eth/69's when both peers have both: capabilities are numbered in name order after
+// the base protocol's sixteen codes, and eth/69 takes eighteen, so snap/1 starts at 0x22.
+//
+// This node also answers snap requests from its store, which is how the client is tested against a
+// server with no network between them; healing a state whose root moved while it was fetched is not here
+// yet — the pivot is held still.
+
+import { Map, Vec, Ticket } from "core";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.itemsOf, rlp.bytesOf, rlp.isList } from "@/lib.wac";
+import { keccak256 } from "../crypto/keccak.wac";
+import { U256 } from "../u256.wac";
+import { Message, small, numOf } from "./wire.wac";
+import { Store, Change, compareKeys } from "../store/tree.wac";
+import { emptyCodeHash } from "../state/world.wac";
+import { emptyRoot } from "../trie/trie.wac";
+import { PathTrie } from "../trie/pathtrie.wac";
+import { StackTrie } from "../trie/stacktrie.wac";
+import { verifyRange, Range } from "../trie/rangeproof.wac";
+
+export static i32 SNAP = 0x22;
+export static i32 GET_ACCOUNT_RANGE = 0x22;
+export static i32 ACCOUNT_RANGE = 0x23;
+export static i32 GET_STORAGE_RANGES = 0x24;
+export static i32 STORAGE_RANGES = 0x25;
+export static i32 GET_BYTE_CODES = 0x26;
+export static i32 BYTE_CODES = 0x27;
+export static i32 GET_TRIE_NODES = 0x28;
+export static i32 TRIE_NODES = 0x29;
+
+/** How much an answer may carry, as snap's requests name it: what geth asks for. */
+export static u64 SOFT_BYTES = 512 * 1024;
+
+Item bytes32(u8[] b) { return Item.Bytes(b); }
+Item list(Vec<Item> v) { return Item.List(v.toArray()); }
+Item[] none() { return Item[].filled(0, Item.Bytes(u8[].filled(0, 0))); }
+
+export Message getAccountRange(u64 id, u8[] root, u8[] origin, u8[] limit, u64 bytes) {
+  return Message(GET_ACCOUNT_RANGE, Item.List([small(id), bytes32(root), bytes32(origin), bytes32(limit), small(bytes)]));
+}
+
+export Message getStorageRanges(u64 id, u8[] root, u8[][] accounts, u8[] origin, u8[] limit, u64 bytes) {
+  Item[] owners = Item[].filled(accounts.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < accounts.len(); i++) { owners[i] = bytes32(accounts[i]); }
+  return Message(GET_STORAGE_RANGES, Item.List([small(id), bytes32(root), Item.List(owners), bytes32(origin), bytes32(limit), small(bytes)]));
+}
+
+export Message getByteCodes(u64 id, u8[][] hashes, u64 bytes) {
+  Item[] hs = Item[].filled(hashes.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < hashes.len(); i++) { hs[i] = bytes32(hashes[i]); }
+  return Message(GET_BYTE_CODES, Item.List([small(id), Item.List(hs), small(bytes)]));
+}
+
+/** An account as snap sends it — empty for the empty storage root and the empty code's hash — as the trie's leaf. */
+export u8[]? fullAccount(Item slim) {
+  if (!isList(slim) || itemsOf(slim).len() != 4) { return null; }
+  Item[] f = itemsOf(slim);
+  u8[] root = bytesOf(f[2]);
+  u8[] code = bytesOf(f[3]);
+  return encode(Item.List([f[0], f[1], Item.Bytes(root.len() == 0 ? emptyRoot() : root),
+                           Item.Bytes(code.len() == 0 ? emptyCodeHash().toBytes() : code)]));
+}
+
+/** The trie's leaf as snap sends it. */
+Item slimAccount(u8[] full) {
+  Item[] f = itemsOf(decode(full).item);
+  u8[] root = bytesOf(f[2]);
+  u8[] code = bytesOf(f[3]);
+  return Item.List([f[0], f[1], Item.Bytes(same(root, emptyRoot()) ? u8[].filled(0, 0) : root),
+                    Item.Bytes(same(code, emptyCodeHash().toBytes()) ? u8[].filled(0, 0) : code)]);
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+u8[] key(u8 kind, u8[] a, u8[] b) {
+  u8[] out = u8[].filled(1 + a.len() + b.len(), kind);
+  out.copyFrom(a, 0, 1, a.len());
+  out.copyFrom(b, 0, 1 + a.len(), b.len());
+  return out;
+}
+
+u8[] tail(u8[] k, i32 from) {
+  u8[] out = u8[].filled(k.len() - from, 0);
+  out.copyFrom(k, from, 0, out.len());
+  return out;
+}
+
+/** The key just after `k` (32 bytes), or null after the last one. */
+export u8[]? nextKey(u8[] k) {
+  u8[] out = u8[].filled(32, 0);
+  out.copyFrom(k, 0, 0, 32);
+  i32 i = 31;
+  while (i >= 0 && out[i] == 255) {
+    out[i] = 0;
+    i--;
+  }
+  if (i < 0) { return null; }
+  out[i] = out[i] + 1;
+  return out;
+}
+
+/** The last key there is. */
+u8[] maxKey() { return u8[].filled(32, 255); }
+
+// ── Answering, from the store ────────────────────────────────────────────────
+
+/**
+ * An AccountRange for a GetAccountRange, from a store holding the state of `root`'s block (a request
+ * about another root gets an empty answer, as snap says).
+ */
+export async Message answerAccountRange(Store store, u8[] stateRoot, Item body) {
+  Item[] q = itemsOf(body);
+  u64 id = numOf(q[0]).low();
+  u8[] root = bytesOf(q[1]);
+  u8[] origin = bytesOf(q[2]);
+  u8[] limit = bytesOf(q[3]);
+  u64 budget = numOf(q[4]).low() < SOFT_BYTES ? numOf(q[4]).low() : SOFT_BYTES;
+  if (!same(root, stateRoot) || origin.len() != 32 || limit.len() != 32) {
+    return Message(ACCOUNT_RANGE, Item.List([small(id), Item.List(none()), Item.List(none())]));
+  }
+  Vec<Change> got = await store.range(key(0, origin, u8[].filled(0, 0)), [1], 4096);
+  Vec<Item> accounts = Vec.create();
+  u64 size = 0;
+  u8[] last = origin;
+  for (i32 i = 0; i < got.len() && size < budget; i++) {
+    u8[] h = tail(got.get(i).key, 1);
+    // One past the limit is allowed, as snap's servers do: it proves where the run ends.
+    accounts.push(Item.List([bytes32(h), slimAccount(got.get(i).value!)]));
+    size += 32 + ((got.get(i).value!.len() as@ u32) as u64);
+    last = h;
+    if (compareKeys(h, limit) >= 0) { break; }
+  }
+  PathTrie t = PathTrie.of(store, u8[].filled(0, 0));
+  await t.open();
+  Vec<Item> proof = Vec.create();
+  u8[][] a = await t.prove(origin);
+  for (i32 i = 0; i < a.len(); i++) { proof.push(Item.Bytes(a[i])); }
+  if (accounts.len() > 0) {
+    u8[][] b = await t.prove(last);
+    for (i32 i = 0; i < b.len(); i++) {
+      if (!seen(proof, b[i])) { proof.push(Item.Bytes(b[i])); }
+    }
+  }
+  return Message(ACCOUNT_RANGE, Item.List([small(id), list(accounts), list(proof)]));
+}
+
+bool seen(Vec<Item> v, u8[] b) {
+  for (i32 i = 0; i < v.len(); i++) {
+    if (same(bytesOf(v.get(i)), b)) { return true; }
+  }
+  return false;
+}
+
+/** StorageRanges for a GetStorageRanges: whole storages while they fit, the last cut short with a proof. */
+export async Message answerStorageRanges(Store store, u8[] stateRoot, Item body) {
+  Item[] q = itemsOf(body);
+  u64 id = numOf(q[0]).low();
+  u8[] root = bytesOf(q[1]);
+  Item[] accounts = isList(q[2]) ? itemsOf(q[2]) : none();
+  u8[] origin = bytesOf(q[3]).len() == 32 ? bytesOf(q[3]) : u8[].filled(32, 0);
+  u64 budget = numOf(q[5]).low() < SOFT_BYTES ? numOf(q[5]).low() : SOFT_BYTES;
+  Vec<Item> slots = Vec.create();
+  Vec<Item> proof = Vec.create();
+  if (!same(root, stateRoot)) { return Message(STORAGE_RANGES, Item.List([small(id), list(slots), list(proof)])); }
+  u64 size = 0;
+  for (i32 a = 0; a < accounts.len() && size < budget; a++) {
+    u8[] owner = bytesOf(accounts[a]);
+    u8[] from = a == 0 ? origin : u8[].filled(32, 0);
+    u8[] prefix = key(1, owner, u8[].filled(0, 0));
+    u8[] end = key(1, owner, maxKey());
+    Vec<Change> got = await store.range(key(1, owner, from), u8[].filled(0, 0), 0x7fffffff);
+    Vec<Item> mine = Vec.create();
+    u8[] last = from;
+    bool cut = false;
+    for (i32 i = 0; i < got.len(); i++) {
+      Change c = got.get(i);
+      if (compareKeys(c.key, prefix) < 0 || c.key.len() != 65 || !startsWith(c.key, prefix)) { break; }
+      if (size >= budget) {
+        cut = true;
+        break;
+      }
+      u8[] h = tail(c.key, 33);
+      mine.push(Item.List([bytes32(h), Item.Bytes(c.value!)]));
+      size += 32 + ((c.value!.len() as@ u32) as u64);
+      last = h;
+    }
+    slots.push(list(mine));
+    // A storage given whole needs no proof; one cut short, or one started past its beginning, does.
+    if (cut || a == 0 && !same(origin, u8[].filled(32, 0))) {
+      PathTrie t = PathTrie.of(store, owner);
+      await t.open();
+      u8[][] pa = await t.prove(from);
+      for (i32 i = 0; i < pa.len(); i++) { proof.push(Item.Bytes(pa[i])); }
+      if (mine.len() > 0) {
+        u8[][] pb = await t.prove(last);
+        for (i32 i = 0; i < pb.len(); i++) {
+          if (!seen(proof, pb[i])) { proof.push(Item.Bytes(pb[i])); }
+        }
+      }
+      break;
+    }
+  }
+  return Message(STORAGE_RANGES, Item.List([small(id), list(slots), list(proof)]));
+}
+
+bool startsWith(u8[] k, u8[] p) {
+  if (k.len() < p.len()) { return false; }
+  for (i32 i = 0; i < p.len(); i++) {
+    if (k[i] != p[i]) { return false; }
+  }
+  return true;
+}
+
+/** ByteCodes for a GetByteCodes: each code the store has, in the order asked, while they fit. */
+export async Message answerByteCodes(Store store, Item body) {
+  Item[] q = itemsOf(body);
+  u64 id = numOf(q[0]).low();
+  Item[] hashes = isList(q[1]) ? itemsOf(q[1]) : none();
+  Vec<Item> codes = Vec.create();
+  u64 size = 0;
+  u64 budget = numOf(q[2]).low() < SOFT_BYTES ? numOf(q[2]).low() : SOFT_BYTES;
+  for (i32 i = 0; i < hashes.len() && (i == 0 || size < budget); i++) {
+    u8[] base = key(2, bytesOf(hashes[i]), u8[].filled(0, 0));
+    u8[] end = key(2, bytesOf(hashes[i]), [255 as u8, 255 as u8, 255 as u8]);
+    Vec<Change> parts = await store.range(base, end, 0x7fffffff);
+    if (parts.len() == 0) { continue; }
+    i32 n = 0;
+    for (i32 k = 0; k < parts.len(); k++) { n += parts.get(k).value!.len(); }
+    u8[] code = u8[].filled(n, 0);
+    i32 at = 0;
+    for (i32 k = 0; k < parts.len(); k++) {
+      code.copyFrom(parts.get(k).value!, 0, at, parts.get(k).value!.len());
+      at += parts.get(k).value!.len();
+    }
+    codes.push(Item.Bytes(code));
+    size += (n as@ u32) as u64;
+  }
+  return Message(BYTE_CODES, Item.List([small(id), list(codes)]));
+}
+
+// ── Fetching ─────────────────────────────────────────────────────────────────
+
+/**
+ * A peer, as the sync sees it: a request sent, and the items of its answer after the request id, or null
+ * when it did not answer. Over the network this is `node.wac`'s `request`; in a test, a server in memory.
+ */
+export struct Asker {
+  fn<Ticket<Item[]?>(Message)> ask;
+  u64 nextId;
+  /** How much each answer may carry: `SOFT_BYTES` normally, less to make a test ask more often. */
+  u64 bytes;
+}
+
+/** What a sync did, for whoever is watching it. */
+export struct Fetched {
+  i32 accounts;
+  i32 slots;
+  i32 codes;
+  i32 nodes;
+  i32 requests;
+  string error;
+}
+
+/**
+ * The state of `root` fetched from `peer` into `store`, which must not hold another state: every account,
+ * every slot and every code, each run checked against `root`; then the tries built from what was fetched,
+ * and the root they come to checked; committed with `user` beside it. `fetched.error` is "" when done.
+ */
+export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
+  Fetched f = Fetched(0, 0, 0, 0, 0, "");
+  Vec<u8[]> withStorage = Vec.create();
+  Vec<u8[]> storageRoots = Vec.create();
+  Map<string, bool> codes = Map.create(hashText, textEq);
+  Vec<u8[]> codeList = Vec.create();
+
+  // Accounts, a run at a time from the start of the key space.
+  u8[]? origin = u8[].filled(32, 0);
+  while (origin is not null) {
+    u64 id = peer.nextId;
+    peer.nextId++;
+    f.requests++;
+    Item[]? got = await peer.ask(getAccountRange(id, root, origin!, maxKey(), peer.bytes));
+    if (got is null || got!.len() < 2) { return failedWith(f, "a peer did not answer for accounts"); }
+    Item[] run = itemsOf(got![0]);
+    u8[][] keys = u8[][].defaulted(run.len());
+    u8[][] vals = u8[][].defaulted(run.len());
+    for (i32 i = 0; i < run.len(); i++) {
+      Item[] pair = itemsOf(run[i]);
+      keys[i] = bytesOf(pair[0]);
+      u8[]? full = fullAccount(pair[1]);
+      if (full is null) { return failedWith(f, "an account does not decode"); }
+      vals[i] = full!;
+    }
+    Range r = verifyRange(root, origin!, keys, vals, proofOf(got![1]));
+    if (!r.ok) { return failedWith(f, "an account range does not prove: \{r.why}"); }
+    Vec<Change> out = Vec.create();
+    for (i32 i = 0; i < keys.len(); i++) {
+      out.push(Change(key(0, keys[i], u8[].filled(0, 0)), vals[i]));
+      Item[] acct = itemsOf(decode(vals[i]).item);
+      u8[] sr = bytesOf(acct[2]);
+      if (!same(sr, emptyRoot())) {
+        withStorage.push(keys[i]);
+        storageRoots.push(sr);
+      }
+      u8[] ch = bytesOf(acct[3]);
+      if (!same(ch, emptyCodeHash().toBytes()) && !codes.has(text(ch))) {
+        codes.set(text(ch), true);
+        codeList.push(ch);
+      }
+    }
+    f.accounts += keys.len();
+    string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
+    if (bad != "") { return failedWith(f, bad); }
+    origin = r.more && keys.len() > 0 ? nextKey(keys[keys.len() - 1]) : null;
+  }
+
+  // Each account's storage: its own runs, each checked against its own root.
+  for (i32 a = 0; a < withStorage.len(); a++) {
+    u8[] owner = withStorage.get(a);
+    u8[]? from = u8[].filled(32, 0);
+    while (from is not null) {
+      u64 id = peer.nextId;
+      peer.nextId++;
+      f.requests++;
+      Item[]? got = await peer.ask(getStorageRanges(id, root, [owner], from!, maxKey(), peer.bytes));
+      if (got is null || got!.len() < 2 || itemsOf(got![0]).len() < 1) { return failedWith(f, "a peer did not answer for storage"); }
+      Item[] run = itemsOf(itemsOf(got![0])[0]);
+      u8[][] keys = u8[][].defaulted(run.len());
+      u8[][] vals = u8[][].defaulted(run.len());
+      for (i32 i = 0; i < run.len(); i++) {
+        keys[i] = bytesOf(itemsOf(run[i])[0]);
+        vals[i] = bytesOf(itemsOf(run[i])[1]);
+      }
+      Range r = verifyRange(storageRoots.get(a), from!, keys, vals, proofOf(got![1]));
+      if (!r.ok) { return failedWith(f, "a storage range does not prove: \{r.why}"); }
+      Vec<Change> out = Vec.create();
+      for (i32 i = 0; i < keys.len(); i++) { out.push(Change(key(1, owner, keys[i]), vals[i])); }
+      f.slots += keys.len();
+      string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
+      if (bad != "") { return failedWith(f, bad); }
+      from = r.more && keys.len() > 0 ? nextKey(keys[keys.len() - 1]) : null;
+    }
+  }
+
+  // Codes, by hash, each checked against its hash.
+  i32 at = 0;
+  while (at < codeList.len()) {
+    i32 n = codeList.len() - at < 64 ? codeList.len() - at : 64;
+    u8[][] ask = u8[][].defaulted(n);
+    for (i32 i = 0; i < n; i++) { ask[i] = codeList.get(at + i); }
+    u64 id = peer.nextId;
+    peer.nextId++;
+    f.requests++;
+    Item[]? got = await peer.ask(getByteCodes(id, ask, peer.bytes));
+    if (got is null || got!.len() < 1) { return failedWith(f, "a peer did not answer for codes"); }
+    Item[] cs = itemsOf(got![0]);
+    if (cs.len() == 0) { return failedWith(f, "a peer has none of the codes asked for"); }
+    Vec<Change> out = Vec.create();
+    // Answers come in the order asked, skipping what the peer has not got: each is matched by its hash.
+    i32 matched = 0;
+    for (i32 i = 0; i < cs.len(); i++) {
+      u8[] code = bytesOf(cs[i]);
+      u8[] h = keccak256(code);
+      if (!codes.has(text(h))) { return failedWith(f, "a code that was not asked for"); }
+      i32 k = 0;
+      for (i32 c = 0; c < code.len(); c += 32768) {
+        i32 len = code.len() - c < 32768 ? code.len() - c : 32768;
+        u8[] part = u8[].filled(len, 0);
+        part.copyFrom(code, c, 0, len);
+        out.push(Change(key(2, h, [(k >> 8) as! u8, (k & 255) as! u8]), part));
+        k++;
+      }
+      matched++;
+    }
+    string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
+    if (bad != "") { return failedWith(f, bad); }
+    f.codes += matched;
+    // The rest of the batch again, if the answer was cut short.
+    at += matched;
+  }
+
+  // The tries, from what was fetched: each storage trie, then the account trie, in the store's order.
+  string bad = await buildTries(store, f, withStorage, storageRoots);
+  if (bad != "") { return failedWith(f, bad); }
+  string built = await buildAccountTrie(store, f, root, user);
+  if (built != "") { return failedWith(f, built); }
+  return f;
+}
+
+/** Each storage trie built from its slots and checked against the account's storage root. */
+async string buildTries(Store store, Fetched f, Vec<u8[]> owners, Vec<u8[]> roots) {
+  for (i32 a = 0; a < owners.len(); a++) {
+    u8[] owner = owners.get(a);
+    Vec<Change> nodes = Vec.create();
+    StackTrie st = StackTrie.create((u8[] path, u8[] enc) => { nodes.push(Change(key(4, owner, path), enc)); });
+    u8[] from = key(1, owner, u8[].filled(0, 0));
+    u8[] to = key(1, owner, maxKey());
+    Vec<Change> slots = await store.range(from, u8[].filled(0, 0), 0x7fffffff);
+    for (i32 i = 0; i < slots.len(); i++) {
+      Change c = slots.get(i);
+      if (!startsWith(c.key, key(1, owner, u8[].filled(0, 0)))) { break; }
+      st.add(tail(c.key, 33), c.value!);
+    }
+    u8[] r = st.finish();
+    if (!same(r, roots.get(a))) { return "a storage trie does not come to its account's root"; }
+    f.nodes += nodes.len();
+    string bad = await store.commit(nodes.toArray(), u8[].filled(0, 0));
+    if (bad != "") { return bad; }
+  }
+  return "";
+}
+
+/** The account trie built from the accounts, checked against `root`, and committed with `user`. */
+async string buildAccountTrie(Store store, Fetched f, u8[] root, u8[] user) {
+  Vec<Change> nodes = Vec.create();
+  StackTrie st = StackTrie.create((u8[] path, u8[] enc) => { nodes.push(Change(key(3, path, u8[].filled(0, 0)), enc)); });
+  Vec<Change> accounts = await store.range([0], [1], 0x7fffffff);
+  for (i32 i = 0; i < accounts.len(); i++) { st.add(tail(accounts.get(i).key, 1), accounts.get(i).value!); }
+  u8[] r = st.finish();
+  if (!same(r, root)) { return "the account trie comes to another root"; }
+  f.nodes += nodes.len();
+  return await store.commit(nodes.toArray(), user);
+}
+
+Fetched failedWith(Fetched f, string why) {
+  f.error = why;
+  return f;
+}
+
+u8[][] proofOf(Item p) {
+  if (!isList(p)) { return u8[][].defaulted(0); }
+  Item[] ns = itemsOf(p);
+  u8[][] out = u8[][].defaulted(ns.len());
+  for (i32 i = 0; i < ns.len(); i++) { out[i] = bytesOf(ns[i]); }
+  return out;
+}
+
+string text(u8[] b) {
+  u8[] d = "0123456789abcdef".toBytes();
+  u8[] out = u8[].filled(b.len() * 2, 0);
+  for (i32 i = 0; i < b.len(); i++) {
+    out[2 * i] = d[(b[i] >> 4) as i32];
+    out[2 * i + 1] = d[(b[i] & 15) as i32];
+  }
+  return string.fromBytes(out);
+}
+
+i32 hashText(string s) {
+  u8[] b = s.toBytes();
+  i32 h = 0;
+  for (i32 i = 0; i < b.len(); i++) { h = h * 31 + (b[i] as i32); }
+  return h;
+}
+
+bool textEq(string a, string b) { return a == b; }

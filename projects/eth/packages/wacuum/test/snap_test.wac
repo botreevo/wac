@@ -1,0 +1,106 @@
+// snap sync between two stores in memory: a server answering from one, a client fetching into the other a
+// few kilobytes at a time, so that every account run and every cut-short storage run is proved. The client
+// must end with the server's state root, built from what it fetched; and a server that leaves out an
+// account, or answers about the wrong root, must be caught.
+
+import { Map, Vec, Ticket } from "core";
+import { rlp.Item, rlp.itemsOf } from "@/lib.wac";
+import { U256 } from "../src/u256.wac";
+import { World, Account } from "../src/state/world.wac";
+import { Store } from "../src/store/tree.wac";
+import { MemDisk } from "../src/store/disk.wac";
+import { StateDb, rootOf } from "../src/store/state.wac";
+import { Message } from "../src/p2p/wire.wac";
+import { Asker, Fetched, snapSync, answerAccountRange, answerStorageRanges, answerByteCodes,
+         GET_ACCOUNT_RANGE, GET_STORAGE_RANGES, GET_BYTE_CODES } from "../src/p2p/snap.wac";
+import { bytesToHex } from "../src/hex.wac";
+import { PathTrie } from "../src/trie/pathtrie.wac";
+import { Check } from "./check.wac";
+
+/** A state: accounts with balances, some with code, some with a few slots, one with many. */
+World state() {
+  World w = World.create();
+  for (i32 i = 1; i <= 300; i++) {
+    U256 addr = U256.ofU64(((i * 7919) as@ u32) as u64);
+    w.setBalance(addr, U256.ofU64(((i * 13) as@ u32) as u64));
+    w.setNonce(addr, ((i % 5) as@ u32) as u64);
+    if (i % 17 == 0) { w.setCode(addr, [0x60 as u8, (i & 255) as! u8, 0x00]); }
+    if (i % 23 == 0) {
+      for (i32 k = 0; k < 5; k++) { w.setStorage(addr, U256.ofU64(((k * 31 + i) as@ u32) as u64), U256.ofU64(((k + 1) as@ u32) as u64)); }
+    }
+  }
+  U256 big = U256.ofU64(424242);
+  for (i32 k = 0; k < 2000; k++) { w.setStorage(big, U256.ofU64(((k + 1) as@ u32) as u64), U256.ofU64(((k * 3 + 1) as@ u32) as u64)); }
+  w.endTransaction();
+  return w;
+}
+
+/** A server over `s`, as an Asker: a request answered from the store, the answer's items after its id. */
+Asker serverOf(Store s, u8[] root, u64 bytes, fn<Item[](Item[])> tamper) {
+  return Asker(async (Message m) => {
+    Message a = m;
+    if (m.code == GET_ACCOUNT_RANGE) { a = await answerAccountRange(s, root, m.body); }
+    else if (m.code == GET_STORAGE_RANGES) { a = await answerStorageRanges(s, root, m.body); }
+    else if (m.code == GET_BYTE_CODES) { a = await answerByteCodes(s, m.body); }
+    else { return null; }
+    Item[] all = itemsOf(a.body);
+    Item[] rest = Item[].filled(all.len() - 1, all[0]);
+    for (i32 i = 1; i < all.len(); i++) { rest[i - 1] = all[i]; }
+    return tamper(rest);
+  }, 1, bytes);
+}
+
+async string run() {
+  Check t = Check.create();
+  MemDisk sd = MemDisk.create();
+  Store server = (await Store.open(sd.disk())).unwrap();
+  string[] why = [""];
+  u8[] root = (await StateDb.over(server).seed(state(), u8[].filled(0, 0), why))!;
+
+  // Honest, a few kilobytes at a time.
+  MemDisk cd = MemDisk.create();
+  Store client = (await Store.open(cd.disk())).unwrap();
+  Fetched f = await snapSync(serverOf(server, root, 4096, (Item[] x) => x), client, root, "pivot".toBytes());
+  t.eqStr(f.error, "", "the sync finishes");
+  t.ok(f.accounts == 301 && f.slots == 2000 + 13 * 5 && f.codes == 17, "every account, slot and code: \{f.accounts}, \{f.slots}, \{f.codes}");
+  t.ok(f.requests > 20, "in many runs: \{f.requests} requests");
+  t.eqStr(bytesToHex(await rootOf(client)), bytesToHex(root), "the client's entries come to the server's root");
+  t.eqStr(string.fromBytes(client.committed().user), "pivot", "and its last commit says so");
+  // The tries it built are the ones block processing goes on from: read back, the same root and nodes.
+  PathTrie back = PathTrie.of(client, u8[].filled(0, 0));
+  await back.open();
+  t.eqStr(bytesToHex(back.hash()), bytesToHex(root), "the stored account trie's root");
+  PathTrie theirs = PathTrie.of(server, u8[].filled(0, 0));
+  await theirs.open();
+  t.ok((await back.storedNodes()) == (await theirs.storedNodes()), "as many account trie nodes as the server's");
+
+  // A server that drops an account from the middle of a run.
+  MemDisk cd2 = MemDisk.create();
+  Store client2 = (await Store.open(cd2.disk())).unwrap();
+  Fetched f2 = await snapSync(serverOf(server, root, 4096, (Item[] x) => dropOne(x)), client2, root, u8[].filled(0, 0));
+  t.ok(f2.error.indexOf("does not prove") >= 0, "a run with an account left out is refused: \{f2.error}");
+
+  // A server whose state is another: it answers nothing about this root.
+  MemDisk cd3 = MemDisk.create();
+  Store client3 = (await Store.open(cd3.disk())).unwrap();
+  Fetched f3 = await snapSync(serverOf(server, u8[].filled(32, 7), 4096, (Item[] x) => x), client3, root, u8[].filled(0, 0));
+  t.ok(f3.error != "", "a peer without the state does not pass for one: \{f3.error}");
+  return t.report();
+}
+
+/** The answer with the third account of its run taken out, when the run has that many. */
+Item[] dropOne(Item[] x) {
+  Item[] run = itemsOf(x[0]);
+  if (run.len() < 4 || itemsOf(run[0]).len() != 2) { return x; }
+  Item[] fewer = Item[].filled(run.len() - 1, run[0]);
+  i32 j = 0;
+  for (i32 i = 0; i < run.len(); i++) {
+    if (i != 2) {
+      fewer[j] = run[i];
+      j++;
+    }
+  }
+  return [Item.List(fewer), x[1]];
+}
+
+export string test_snap_sync_between_two_stores() { return run().wait().orElse("it never finished"); }

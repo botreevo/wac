@@ -3,7 +3,10 @@
 // the state at that head over snap/1 rather than run the blocks, agree with geth account by account, then
 // take geth's next blocks the ordinary way, and after a restart go on from its store.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/snap.wac -- path/to/geth [--heal]
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/snap.wac -- path/to/geth [--heal] [--peers N]
+//
+// With --peers N, N geths serve the state: the first makes the chain and the others follow it, told of its
+// head as a consensus client would tell them; wacuum is given all of them, and splits the state among them.
 //
 // With --heal, wacuum's snap requests are slowed (--snap-throttle) while geth keeps making blocks and wacuum
 // is told of each; after eight requests wacuum takes an answer about its pivot as empty (--snap-repivot), as
@@ -58,7 +61,12 @@ export async i32 main(Sys sys) {
     return 2;
   }
   string geth = args[0];
-  bool heal = args.len() > 1 && args[1] == "--heal";
+  bool heal = false;
+  i32 count = 1;
+  for (i32 i = 1; i < args.len(); i++) {
+    if (args[i] == "--heal") { heal = true; }
+    if (args[i] == "--peers" && i + 1 < args.len()) { count = parseInt(args[i + 1]); }
+  }
   Check c = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-snap");
   u8[] key = u8[].filled(32, 0x11);
@@ -82,6 +90,10 @@ export async i32 main(Sys sys) {
   i32 gethRpcPort = base + 2;
   i32 wacP2p = base + 3;
   i32 wacPort = base + 4;
+  // The other geths: p2p, auth and RPC ports from base + 10 on, three each.
+  Vec<Proc> others = Vec.create();
+  Vec<Rpc> otherAuth = Vec.create();
+  Vec<Rpc> otherRpc = Vec.create();
 
   await shell(sys, "\{quote(geth)} --datadir \{quote(dir + "/geth")} init \{quote(dir + "/genesis.json")} > /dev/null 2>&1");
   Proc gethProc = await Proc.start(sys, [geth, "--datadir", dir + "/geth", "--networkid", "1337", "--nodiscover",
@@ -92,10 +104,12 @@ export async i32 main(Sys sys) {
   Rpc gethAuth = Rpc.authed(sys, gethAuthPort, secret);
   Rpc wac = Rpc.authed(sys, wacPort, secret);
   Proc? wacProc = null;
-  string[] wacArgs = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
-                      "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/wacuum",
-                      "--public-rpc", "--port", "\{wacPort}", "--p2p-port", "\{wacP2p}", "--store", "--snap",
-                      "--snap-throttle", heal ? "1500" : "0", "--snap-repivot", heal ? "8" : "0", "--peer", ""];
+  Vec<string> wacArgv = Vec.create();
+  string[] fixed = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                    "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/wacuum",
+                    "--public-rpc", "--port", "\{wacPort}", "--p2p-port", "\{wacP2p}", "--store", "--snap",
+                    "--snap-throttle", heal ? "1500" : "0", "--snap-repivot", heal ? "8" : "0"];
+  for (i32 i = 0; i < fixed.len(); i++) { wacArgv.push(fixed[i]); }
 
   bool up = false;
   for (i32 t = 0; t < 60000 && !up; t += 200) {
@@ -104,12 +118,51 @@ export async i32 main(Sys sys) {
   }
   if (c.that(up, "geth is up")) {
     string enode = field(await gethRpc.get("admin_nodeInfo", "[]"), "enode");
-    wacArgs[wacArgs.len() - 1] = enode;
+    wacArgv.push("--peer");
+    wacArgv.push(enode);
     JsonValue? gethHead = await makeBlocks(sys, gethAuth, gethRpc, key, 5);
     c.that(quantity(field(gethHead, "number")) == 5, "geth made five blocks");
 
+    // The others follow the first: peered with it, and told of its head.
+    for (i32 k = 1; k < count; k++) {
+      string d = dir + "/geth\{k}";
+      i32 at = base + 10 + 3 * k;
+      await shell(sys, "\{quote(geth)} --datadir \{quote(d)} init \{quote(dir + "/genesis.json")} > /dev/null 2>&1");
+      others.push(await Proc.start(sys, [geth, "--datadir", d, "--networkid", "1337", "--nodiscover",
+                                         "--port", "\{at}", "--authrpc.port", "\{at + 1}", "--authrpc.jwtsecret", dir + "/jwt.hex",
+                                         "--http", "--http.port", "\{at + 2}", "--http.api", "eth,admin,net", "--syncmode", "full"],
+                                   d + ".log"));
+      Rpc r = Rpc.at(sys, at + 2);
+      bool there = false;
+      for (i32 t = 0; t < 60000 && !there; t += 200) {
+        there = (await r.call("eth_chainId", "[]")).result() is not null;
+        if (!there) { await sys.sleepMillis(200); }
+      }
+      await r.get("admin_addPeer", "[\"\{enode}\"]");
+      Rpc a = Rpc.authed(sys, at + 1, secret);
+      otherAuth.push(a);
+      otherRpc.push(r);
+      string head = field(gethHead, "hash");
+      bool synced = false;
+      for (i32 t = 0; t < 120000 && !synced; t += 500) {
+        await choose(a, head);
+        synced = field(await r.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash") == head;
+        if (!synced) { await sys.sleepMillis(500); }
+      }
+      c.that(synced, "geth \{k + 1} followed the first to its head");
+      wacArgv.push("--peer");
+      wacArgv.push(field(await r.get("admin_nodeInfo", "[]"), "enode"));
+    }
+    string[] wacArgs = wacArgv.toArray();
+
     wacProc = await Proc.start(sys, wacArgs, dir + "/wacuum.log");
     c.that(await wacProc!.says(sys, "serving blocks", 300000), "wacuum and geth agreed on the chain");
+    bool all = false;
+    for (i32 t = 0; t < 60000 && !all; t += 200) {
+      all = occurrences(await wacProc!.output(sys), "serving blocks") >= count;
+      if (!all) { await sys.sleepMillis(200); }
+    }
+    c.that(all, "with all \{count} geths");
 
     // Told of geth's head, wacuum fetches the state there rather than the blocks before it.
     string gh = field(gethHead, "hash");
@@ -121,6 +174,7 @@ export async i32 main(Sys sys) {
         JsonValue? h = await makeBlocks(sys, gethAuth, gethRpc, key, 1);
         if (h is null) { break; }
         gh = field(h, "hash");
+        for (i32 k = 0; k < otherAuth.len(); k++) { await choose(otherAuth.get(k), gh); }
         await choose(wac, gh);
         made++;
       }
@@ -144,6 +198,10 @@ export async i32 main(Sys sys) {
     c.that(await chosen(sys, wac, gh, 300000), "and then has it");
     string said = await wacProc!.output(sys);
     c.that(said.indexOf("snap sync done") >= 0, "by snap sync");
+    i32 per = said.indexOf("snap requests per peer: ");
+    string split = per < 0 ? "" : said.slice(per + 24, per + 24 + said.slice(per + 24, said.len()).indexOf("\n"));
+    c.that(said.indexOf("snap sync from \{count} peer(s)") >= 0 && split.indexOf(" 0") < 0 && split.indexOf("0,") != 0,
+           "from \{count} peer(s) at once, each asked: \{split}");
     i32 mismatched = 0;
     for (i32 i = 0; i < 430; i += 7) {
       string a = account(i);
@@ -185,7 +243,26 @@ export async i32 main(Sys sys) {
   }
 
   if (wacProc is not null) { await wacProc!.stop(sys); }
+  for (i32 k = 0; k < others.len(); k++) { await others.get(k).stop(sys); }
   await gethProc.stop(sys);
   await removeDir(sys, dir);
   return c.done();
+}
+
+i32 occurrences(string s, string of) {
+  i32 n = 0;
+  i32 at = s.indexOf(of);
+  while (at >= 0) {
+    n++;
+    i32 next = s.slice(at + of.len(), s.len()).indexOf(of);
+    at = next < 0 ? -1 : at + of.len() + next;
+  }
+  return n;
+}
+
+i32 parseInt(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + ((b[i] as i32) - 48); }
+  return n;
 }

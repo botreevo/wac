@@ -276,6 +276,61 @@ export struct Store {
   /** What the last commit recorded beside the tree. */
   Committed committed(this) { return Committed(this.seq, this.user); }
 
+  Node? loadNow(this, i64 page) {
+    this.reads++;
+    match (this.disk.readNow(page * (PAGE as i64), PAGE)) {
+      Ok(b): { return decode(b, page); }
+      Err(e): { return null; }
+    }
+  }
+
+  /** `get`, read where it is asked (`Disk.readNow`): for the synchronous EVM. */
+  u8[]? getNow(this, const u8[] key) {
+    Node n = this.root;
+    while (!n.leaf) {
+      i32 i = childFor(n.keys, key);
+      Node? k = n.kids.get(i);
+      if (k is null) {
+        k = this.loadNow(n.kidPages.get(i));
+        if (k is null) { return null; }
+        n.kids.set(i, k);
+        this.held(n, n.keys.get(i));
+      }
+      n = k!;
+    }
+    (i32 at, bool found) = find(n.keys, key);
+    return found ? n.vals.get(at) : null;
+  }
+
+  /** `range`, read where it is asked. */
+  Vec<Change> rangeNow(this, u8[] from, u8[] to, i32 limit) {
+    Vec<Change> out = Vec.create();
+    this.walkNow(this.root, from, to, limit, out);
+    return out;
+  }
+
+  void walkNow(this, Node n, u8[] from, u8[] to, i32 limit, Vec<Change> out) {
+    if (n.leaf) {
+      (i32 at, bool found) = find(n.keys, from);
+      for (i32 i = at; i < n.keys.len() && out.len() < limit; i++) {
+        if (to.len() > 0 && compareKeys(n.keys.get(i), to) >= 0) { return; }
+        out.push(Change(n.keys.get(i), n.vals.get(i)));
+      }
+      return;
+    }
+    for (i32 i = childFor(n.keys, from); i < n.kids.len() && out.len() < limit; i++) {
+      if (to.len() > 0 && compareKeys(n.keys.get(i), to) >= 0) { return; }
+      Node? k = n.kids.get(i);
+      if (k is null) {
+        k = this.loadNow(n.kidPages.get(i));
+        if (k is null) { return; }
+        n.kids.set(i, k);
+        this.held(n, n.keys.get(i));
+      }
+      this.walkNow(k!, from, to, limit, out);
+    }
+  }
+
   /** The value at `key`, or null. One disk request at most: the leaf. */
   async u8[]? get(this, const u8[] key) {
     Node? leaf = await this.leafFor(key, null);

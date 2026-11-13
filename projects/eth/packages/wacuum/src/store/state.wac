@@ -115,10 +115,38 @@ export struct StateDb {
   i32 misses;
   /** The account trie, kept between commits so its upper nodes stay read. */
   PathTrie? accountTrie;
+  /**
+   * Whether a miss is read from the store where it happens (`Store.getNow`) rather than noted for `fetch`:
+   * then nothing is ever missed and no step runs twice. Measured on mainnet blocks it is several times
+   * faster than learning the misses by running again (docs/state-on-disk.md).
+   */
+  bool readsNow;
 
   StateDb over(Store store) {
     return StateDb(store, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                   Map.create(hashU256, eqU256), 0, null);
+                   Map.create(hashU256, eqU256), 0, null, true);
+  }
+
+  /** The account as stored, read where it is asked; null if there is none. */
+  Known? readNow(this, U256 addr) {
+    u8[]? raw = this.store.getNow(accountKey(addr));
+    if (raw is null) { return null; }
+    Item[] f = itemsOf(decode(raw!).item);
+    U256 codeHash = U256.fromBytes(bytesOf(f[3]), 0, 32);
+    u8[] code = u8[].filled(0, 0);
+    if (!codeHash.eq(emptyCodeHash())) {
+      u8[] base = codeKey(codeHash);
+      Vec<Change> parts = this.store.rangeNow(base, after(base), 0x7fffffff);
+      i32 n = 0;
+      for (i32 i = 0; i < parts.len(); i++) { n += parts.get(i).value!.len(); }
+      code = u8[].filled(n, 0);
+      i32 at = 0;
+      for (i32 i = 0; i < parts.len(); i++) {
+        code.copyFrom(parts.get(i).value!, 0, at, parts.get(i).value!.len());
+        at += parts.get(i).value!.len();
+      }
+    }
+    return Known(intOf(f[0]).low(), intOf(f[1]), U256.fromBytes(bytesOf(f[2]), 0, 32), codeHash, code);
   }
 
   /** What a `World` backed by this asks: answered from memory, a miss noted and answered as empty. */
@@ -128,6 +156,7 @@ export struct StateDb {
   }
 
   Account? account(this, U256 addr) {
+    if (!this.accounts.has(addr) && this.readsNow) { this.accounts.set(addr, this.readNow(addr)); }
     if (!this.accounts.has(addr)) {
       this.wantAccounts.set(addr, true);
       this.misses++;
@@ -142,6 +171,17 @@ export struct StateDb {
     Map<U256, U256>? m = this.slots.get(addr);
     U256? v = m?.get(key);
     if (v is not null) { return v!; }
+    if (this.readsNow) {
+      u8[]? raw = this.store.getNow(slotKey(addr, key));
+      U256 got = raw is null ? U256.zero() : intOf(decode(raw!).item);
+      if (m is null) {
+        Map<U256, U256> fresh = Map.create(hashU256, eqU256);
+        this.slots.set(addr, fresh);
+        m = fresh;
+      }
+      m!.set(key, got);
+      return got;
+    }
     Map<U256, bool>? w = this.wantSlots.get(addr);
     if (w is null) {
       Map<U256, bool> fresh = Map.create(hashU256, eqU256);

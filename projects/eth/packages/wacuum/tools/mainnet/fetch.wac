@@ -12,7 +12,7 @@
 // order the answer's ids count. It is two programs rather than one because a program holding both `fetch`
 // and the client's block types does not compile at this pin of wac (`docs/wac-asks.md`).
 
-import { Sys } from "std";
+import { Sys, RandomFile } from "std";
 import { Vec, Map } from "core";
 import { hashString, stringEq } from "core";
 import { fetch.fetch, fetch.Caps } from "wac";
@@ -95,6 +95,37 @@ async string ask(Sys sys, string url, string[] requests, string[] why) {
 }
 
 /** Appends to a file by rewriting it: these are megabytes at most. */
+/** Each line's text up to its first tab, read 4 MB at a time. */
+async Vec<string> tagsOf(Sys sys, string path) {
+  Vec<string> out = Vec.create();
+  auto opened = await sys.files().openRandom(path, false);
+  if (!opened.isOk()) { return out; }
+  RandomFile f = opened.unwrap();
+  i64 size = (await f.size()).orElse(0);
+  Vec<u8> head = Vec.create();
+  bool inHead = true;
+  i64 at = 0;
+  while (at < size) {
+    u8[] b = (await f.readAt(at, 4 << 20)).orElse(u8[].filled(0, 0));
+    if (b.len() == 0) { break; }
+    at += b.len() as i64;
+    for (i32 i = 0; i < b.len(); i++) {
+      u8 c = b[i];
+      if (c == 10) {
+        inHead = true;
+        head = Vec.create();
+      } else if (inHead && c == 9) {
+        out.push(string.fromBytes(head.toArray()));
+        inHead = false;
+      } else if (inHead) {
+        head.push(c);
+      }
+    }
+  }
+  await f.close();
+  return out;
+}
+
 async bool append(Sys sys, string path, Vec<string> lines) {
   string old = "";
   match (await sys.readFile(path)) {
@@ -249,16 +280,16 @@ export async i32 main(Sys sys) {
   string[] wanted = linesOf(want);
   for (i32 i = 0; i < wanted.len(); i++) { ws.push(wanted[i]); }
   Map<string, bool> seen = Map.create(hashString, stringEq);
-  u8[] held = (await sys.readFile(dir + "/state.txt")).orElse(u8[].filled(0, 0));
-  string[] heldLines = linesOf(held);
-  for (i32 i = 0; i < heldLines.len(); i++) {
-    string l = heldLines[i];
-    i32 tab = l.indexOf("\t");
+  // What state.txt holds already, from each line's tag alone: the file is read a piece at a time, since a
+  // long range's answers (hundreds of MB) do not fit in the heap as one string.
+  Vec<string> heads = await tagsOf(sys, dir + "/state.txt");
+  for (i32 i = 0; i < heads.len(); i++) {
+    string l = heads.get(i);
     i32 sp = l.indexOf(" ");
-    if (tab < 0 || sp < 0 || sp > tab) { continue; }
+    if (sp < 0) { continue; }
     string kind = l.slice(0, sp);
     if (kind != "proofs" && kind != "slots") { continue; }
-    string[] names = cutAt(l.slice(sp + 1, tab), 44);
+    string[] names = cutAt(l.slice(sp + 1, l.len()), 44);
     for (i32 k = 0; k < names.len(); k++) {
       if (kind == "proofs") {
         seen.set("A " + names[k], true);

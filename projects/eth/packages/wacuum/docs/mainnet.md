@@ -194,3 +194,29 @@ live traffic, while B is built. `deploy/mainnet/` installs it. *Probability it r
 - [ ] Choice of reference clients: reth + Lighthouse is assumed (reth serves the `debug_` tracers the
       shadow uses); geth + Lighthouse works as well.
 - [ ] Whether the machine may also run wacuum's own p2p (port 30304) once B begins.
+
+## Machine request (2026-11-13, after path B's store and snap sync)
+
+**Hoodi first, then mainnet, on one box.** All sizes below are estimates unless marked.
+
+**Minimum for Hoodi alone:** 4 cores, 16 GB RAM, 1 TB NVMe, 25 Mbit/s, Ubuntu 24.04 x86_64, root SSH; inbound
+30303 tcp/udp (execution p2p), 9000 tcp/udp (consensus p2p); outbound HTTPS (GitHub, rustup, crates.io, a
+checkpoint-sync URL). Software installed by `deploy/mainnet/install.sh`/`reference.sh`: wac at the pin,
+wac-eth, Lighthouse (Hoodi, checkpoint-synced), and one reference execution client that serves snap/1
+(geth or reth) for wacuum to snap-sync from and be checked against. Hoodi's state is small (tens of GB in
+geth; wacuum's store perhaps twice that with its 64 KB pages and path-scheme tries), so a Hoodi stack —
+reference EL + CL + wacuum — is a few hundred GB.
+
+**The EIP-7870 box (4 TB NVMe, 32 GB, 4c/8t, 50/15 Mbit/s) covers all three, in turn:**
+
+| use | disk (estimated) | notes |
+| --- | ---: | --- |
+| Hoodi: reference EL + Lighthouse + wacuum `--store --snap` | ~0.3–0.5 TB | the first test of snap and healing on a public chain |
+| shadow mode C on mainnet: reth/geth + Lighthouse | ~1.5 TB | as `deploy/mainnet/` sets it up |
+| mainnet wacuum on the store, beside the reference | ~0.4–0.6 TB | flat state ~150 GB, tries and page overhead on top |
+| **together** | **~2.5 TB of 4** | Hoodi can be removed before mainnet if room is short |
+
+RAM: 32 GB is ample — wacuum's heap is capped at ~1.4 GB today (4 GB once wac's `--max-heap` lands), the
+reference EL wants ~8–16 GB, Lighthouse ~4–8 GB. CPU: wacuum executes on one core. Nothing above EIP-7870 is
+needed; 8 TB rather than 4 would only matter for keeping Hoodi, a mainnet reference and wacuum's mainnet
+store side by side for long.

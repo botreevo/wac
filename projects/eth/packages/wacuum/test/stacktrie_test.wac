@@ -1,0 +1,88 @@
+// The stack trie against two oracles: its root against the from-scratch builder, and every node it emits
+// against the nodes the path trie stores for the same keys — the two must agree path for path, since snap
+// sync builds with the one what block processing then updates with the other.
+
+import { Map, Vec } from "core";
+import { hashString, stringEq } from "core";
+import { bytesToHex } from "../src/hex.wac";
+import { StackTrie } from "../src/trie/stacktrie.wac";
+import { PathTrie } from "../src/trie/pathtrie.wac";
+import { trieRoot, emptyRoot } from "../src/trie/trie.wac";
+import { Store, Change, compareKeys } from "../src/store/tree.wac";
+import { MemDisk } from "../src/store/disk.wac";
+import { Check } from "./check.wac";
+
+struct Rng {
+  u64 x;
+
+  u64 next(this) {
+    this.x = this.x ^ (this.x << 13);
+    this.x = this.x ^ (this.x >> 7);
+    this.x = this.x ^ (this.x << 17);
+    return this.x;
+  }
+  i32 below(this, i32 n) { return (this.next() % ((n as@ u32) as u64)) as! i32; }
+  u8[] bytes(this, i32 n) {
+    u8[] b = u8[].filled(n, 0);
+    for (i32 i = 0; i < n; i++) { b[i] = (this.next() & 255) as! u8; }
+    return b;
+  }
+}
+
+async string run(u64 seed, i32 n) {
+  Check t = Check.create();
+  Rng r = Rng(seed);
+  Vec<u8[]> keys = Vec.create();
+  for (i32 i = 0; i < n; i++) {
+    u8[] k = r.bytes(32);
+    // Neighbours sharing long prefixes, so that extensions and deep branches occur.
+    if (i > 0 && r.below(4) == 0) {
+      k = u8[].filled(32, 0);
+      k.copyFrom(keys.get(i - 1), 0, 0, 32);
+      k[31 - r.below(3)] = (r.next() & 255) as! u8;
+    }
+    keys.push(k);
+  }
+  keys.sort((u8[] a, u8[] b) => compareKeys(a, b));
+  // Duplicates out: keys are unique in a trie.
+  Vec<u8[]> uniq = Vec.create();
+  for (i32 i = 0; i < keys.len(); i++) {
+    if (uniq.len() == 0 || compareKeys(uniq.get(uniq.len() - 1), keys.get(i)) != 0) { uniq.push(keys.get(i)); }
+  }
+  u8[][] ks = uniq.toArray();
+  u8[][] vs = u8[][].defaulted(ks.len());
+  for (i32 i = 0; i < ks.len(); i++) { vs[i] = r.bytes(r.below(6) == 0 ? 1 + r.below(2) : 1 + r.below(70)); }
+
+  Map<string, string> emitted = Map.create(hashString, stringEq);
+  StackTrie st = StackTrie.create((u8[] path, u8[] enc) => { emitted.set(bytesToHex(path), bytesToHex(enc)); });
+  for (i32 i = 0; i < ks.len(); i++) { st.add(ks[i], vs[i]); }
+  u8[] root = st.finish();
+  t.eqStr(st.error, "", "no error");
+  t.eqStr(bytesToHex(root), bytesToHex(ks.len() == 0 ? emptyRoot() : trieRoot(ks, vs)), "the root of \{ks.len()} keys");
+
+  // The path trie's nodes for the same keys.
+  MemDisk md = MemDisk.create();
+  Store s = (await Store.open(md.disk())).unwrap();
+  PathTrie pt = PathTrie.of(s, u8[].filled(0, 0));
+  await pt.open();
+  for (i32 i = 0; i < ks.len(); i++) { await pt.set(ks[i], vs[i]); }
+  Change[] nodes = pt.changes();
+  t.ok(nodes.len() == emitted.len(), "as many nodes as the path trie stores: \{emitted.len()} and \{nodes.len()}");
+  i32 differ = 0;
+  for (i32 i = 0; i < nodes.len(); i++) {
+    // The path trie's key is 0x03 and the path; the stack trie's is the path.
+    u8[] path = u8[].filled(nodes[i].key.len() - 1, 0);
+    path.copyFrom(nodes[i].key, 1, 0, path.len());
+    string? mine = emitted.get(bytesToHex(path));
+    if (mine is null || mine! != bytesToHex(nodes[i].value!)) { differ++; }
+  }
+  t.ok(differ == 0, "every node the same, at the same path: \{differ} differ");
+  return t.report();
+}
+
+export string test_the_stack_trie_agrees_with_the_builder_and_the_path_trie() {
+  string a = run(99, 2000).wait().orElse("never finished");
+  string b = run(7, 1).wait().orElse("never finished");
+  string c = run(12, 2).wait().orElse("never finished");
+  return a + b + c;
+}

@@ -1450,7 +1450,8 @@ i32 declarationsIn(u8[] src, Lexed lexed, Program prog) {
       }
       EnumDecl(nameTok, variants, exported, methods, typeParams): {
         n = n + variants.len() * 2 + methods.len() * 2 + typeParams.len();
-        for (i32 v = 0; v < variants.len(); v++) { n = n + variants[v].fields.len(); }
+        // Twice: a payload's fields are declared under the bare variant and again under `Enum.Variant`.
+        for (i32 v = 0; v < variants.len(); v++) { n = n + variants[v].fields.len() * 2; }
         for (i32 m = 0; m < methods.len(); m++) { n = n + methods[m].params.len(); }
       }
       Func(nameTok, returnType, params, body, exported, typeParams, isAsync): {
@@ -1475,21 +1476,44 @@ string corePath() { return " core"; }
  */
 string keyOf(string resolved) { return resolved == "core" ? corePath() : resolved; }
 
-/** Every named type mentioned anywhere in a `Ty`, appended to `out` with `n[0]` as the count. */
-void tyNames(u8[] src, Lexed lx, Ty t, string[] out, i32[] n) {
+/**
+ * A list of names that grows as it is added to — what `tyNames` appends to.
+ *
+ * **It was a fixed 64, and the 65th name was dropped without a word** (`issues/lang/0468d`). wacuum's `Engine` has 41
+ * fields, most of them `Map<U256, …>` — three names each — so its signature filled the list before the method return
+ * types were reached; `Answer`, which `call` returns, was never declared in a file that imported `Engine`, and there
+ * the bare name was std's own `Answer`, whose fields are not wacuum's: *"no such field"* about `.result`, two files away
+ * from anything that had changed.
+ */
+struct TyNameList {
+  string[] items;
+  i32 n;
+}
+
+TyNameList tyNameList() { return TyNameList(string[].defaulted(16), 0); }
+
+void addTyName(TyNameList l, string name) {
+  if (l.n >= l.items.len()) {
+    string[] grown = string[].defaulted(l.items.len() * 2 + 16);
+    for (i32 i = 0; i < l.n; i++) { grown[i] = l.items[i]; }
+    l.items = grown;
+  }
+  l.items[l.n] = name;
+  l.n = l.n + 1;
+}
+
+/** Every named type mentioned anywhere in a `Ty`, appended to `out`. */
+void tyNames(u8[] src, Lexed lx, Ty t, TyNameList out) {
   match (t.kind) {
     Named(tok, typeArgs): {
-      if (n[0] < out.len()) {
-        out[n[0]] = tokenTextOf(src, lx, tok);
-        n[0] = n[0] + 1;
-      }
-      for (i32 i = 0; i < typeArgs.len(); i++) { tyNames(src, lx, typeArgs[i], out, n); }
+      addTyName(out, tokenTextOf(src, lx, tok));
+      for (i32 i = 0; i < typeArgs.len(); i++) { tyNames(src, lx, typeArgs[i], out); }
     }
-    Arr(elem): { tyNames(src, lx, elem, out, n); }
-    Nullable(inner): { tyNames(src, lx, inner, out, n); }
+    Arr(elem): { tyNames(src, lx, elem, out); }
+    Nullable(inner): { tyNames(src, lx, inner, out); }
     Funcref(ret, params): {
-      tyNames(src, lx, ret, out, n);
-      for (i32 i = 0; i < params.len(); i++) { tyNames(src, lx, params[i], out, n); }
+      tyNames(src, lx, ret, out);
+      for (i32 i = 0; i < params.len(); i++) { tyNames(src, lx, params[i], out); }
     }
     default: { }
   }
@@ -1590,7 +1614,7 @@ bool listHas(string[] list, i32 n, string name) {
  * The extras are returned after the originals so the caller can tell them apart: they are declared
  * for their members and must not enter the entry's scope as names.
  */
-string[] closeOverSignatures(u8[] src, Lexed lx, Program prog, string[] only) {
+export string[] closeOverSignatures(u8[] src, Lexed lx, Program prog, string[] only) {
   i32 cap = only.len();
   for (i32 d = 0; d < prog.decls.len(); d++) { cap = cap + 1; }
   string[] want = string[].filled(cap, "");
@@ -1630,22 +1654,18 @@ string[] closeOverSignatures(u8[] src, Lexed lx, Program prog, string[] only) {
   while (grew) {
     grew = false;
     for (i32 d = 0; d < prog.decls.len(); d++) {
-      string[] found = string[].filled(64, "");
-      i32[] seen = i32[].filled(1, 0);
+      TyNameList found = tyNameList();
       match (prog.decls[d].kind) {
         StructDecl(nameTok, parentTok, fields, methods, exported, isConst, typeParams): {
           if (!listHas(want, n, tokenTextOf(src, lx, nameTok))) { continue; }
           // **A parent is reached too**: its fields are the subtype's, and a default construction
           // of `Ticket<i32>` asks whether `TicketBase`'s fields all have defaults.
-          if (parentTok >= 0) {
-            found[seen[0]] = tokenTextOf(src, lx, parentTok);
-            seen[0] = seen[0] + 1;
-          }
-          for (i32 i = 0; i < fields.len(); i++) { tyNames(src, lx, fields[i].type, found, seen); }
+          if (parentTok >= 0) { addTyName(found, tokenTextOf(src, lx, parentTok)); }
+          for (i32 i = 0; i < fields.len(); i++) { tyNames(src, lx, fields[i].type, found); }
           for (i32 i = 0; i < methods.len(); i++) {
-            tyNames(src, lx, methods[i].returnType, found, seen);
+            tyNames(src, lx, methods[i].returnType, found);
             for (i32 p = 0; p < methods[i].params.len(); p++) {
-              tyNames(src, lx, methods[i].params[p].type, found, seen);
+              tyNames(src, lx, methods[i].params[p].type, found);
             }
           }
         }
@@ -1653,13 +1673,13 @@ string[] closeOverSignatures(u8[] src, Lexed lx, Program prog, string[] only) {
           if (!listHas(want, n, tokenTextOf(src, lx, nameTok))) { continue; }
           for (i32 v = 0; v < variants.len(); v++) {
             for (i32 i = 0; i < variants[v].fields.len(); i++) {
-              tyNames(src, lx, variants[v].fields[i].type, found, seen);
+              tyNames(src, lx, variants[v].fields[i].type, found);
             }
           }
           for (i32 i = 0; i < methods.len(); i++) {
-            tyNames(src, lx, methods[i].returnType, found, seen);
+            tyNames(src, lx, methods[i].returnType, found);
             for (i32 p = 0; p < methods[i].params.len(); p++) {
-              tyNames(src, lx, methods[i].params[p].type, found, seen);
+              tyNames(src, lx, methods[i].params[p].type, found);
             }
           }
         }
@@ -1668,29 +1688,29 @@ string[] closeOverSignatures(u8[] src, Lexed lx, Program prog, string[] only) {
         // missing from the first version of the fix, and the silence it left was identical.
         Func(nameTok, returnType, params, body, exported, typeParams, isAsync): {
           if (!listHas(want, n, tokenTextOf(src, lx, nameTok))) { continue; }
-          tyNames(src, lx, returnType, found, seen);
+          tyNames(src, lx, returnType, found);
           for (i32 p = 0; p < params.len(); p++) {
-            tyNames(src, lx, params[p].type, found, seen);
+            tyNames(src, lx, params[p].type, found);
           }
         }
         // A module-level `const`'s type, for the same reason and by the same reach.
         StaticDecl(nameTok, type, init, exported): {
           if (!listHas(want, n, tokenTextOf(src, lx, nameTok))) { continue; }
-          tyNames(src, lx, type, found, seen);
+          tyNames(src, lx, type, found);
         }
         // **An alias reaches what it names**: `SpawnFault` is `union<NotGranted, Unsupported, Other>`, and a file
         // that imported the alias alone had none of the three, so the union converted to no text (case 0855).
         TypeDecl(nameTok, typeParams, alias, body, exported): {
           if (!listHas(want, n, tokenTextOf(src, lx, nameTok))) { continue; }
-          if (alias is not null) { tyNames(src, lx, alias!, found, seen); }
+          if (alias is not null) { tyNames(src, lx, alias!, found); }
         }
         default: { continue; }
       }
-      for (i32 i = 0; i < seen[0]; i++) {
-        if (!listHas(mine, mn, found[i])) { continue; }
-        if (listHas(want, n, found[i])) { continue; }
+      for (i32 i = 0; i < found.n; i++) {
+        if (!listHas(mine, mn, found.items[i])) { continue; }
+        if (listHas(want, n, found.items[i])) { continue; }
         if (n >= cap) { continue; }
-        want[n] = found[i];
+        want[n] = found.items[i];
         n = n + 1;
         grew = true;
       }
@@ -1718,10 +1738,18 @@ string[] closeOverSignatures(u8[] src, Lexed lx, Program prog, string[] only) {
  */
 string[] namesReachedThroughImports(u8[] src, Lexed lx, Program prog, string[] reach, const Res res,
                                     string[] paths, string fromPath) {
-  // What this file imports, by the name it gave, the name the other file gave, and which file.
-  string[] local = string[].filled(256, "");
-  string[] orig = string[].filled(256, "");
-  string[] from = string[].filled(256, "");
+  // What this file imports, by the name it gave, the name the other file gave, and which file — sized by counting
+  // them, where it was a fixed 256 that dropped the rest without a word (`issues/lang/0468d`).
+  i32 imported = 0;
+  for (i32 d = 0; d < prog.decls.len(); d++) {
+    match (prog.decls[d].kind) {
+      Import(pathTok, prefixTok, items): { imported = imported + items.len(); }
+      default: { }
+    }
+  }
+  string[] local = string[].filled(imported, "");
+  string[] orig = string[].filled(imported, "");
+  string[] from = string[].filled(imported, "");
   i32 ln = 0;
   for (i32 d = 0; d < prog.decls.len(); d++) {
     match (prog.decls[d].kind) {
@@ -1742,35 +1770,34 @@ string[] namesReachedThroughImports(u8[] src, Lexed lx, Program prog, string[] r
       default: { }
     }
   }
-  string[] found = string[].filled(256, "");
-  i32[] seen = i32[].filled(1, 0);
+  TyNameList found = tyNameList();
   bool anyAsync = false;
   for (i32 d = 0; d < prog.decls.len(); d++) {
     match (prog.decls[d].kind) {
       Func(nameTok, returnType, params, body, exported, typeParams, isAsync): {
         if (!listHas(reach, reach.len(), tokenTextOf(src, lx, nameTok))) { continue; }
         if (isAsync) { anyAsync = true; }
-        tyNames(src, lx, returnType, found, seen);
-        for (i32 p = 0; p < params.len(); p++) { tyNames(src, lx, params[p].type, found, seen); }
+        tyNames(src, lx, returnType, found);
+        for (i32 p = 0; p < params.len(); p++) { tyNames(src, lx, params[p].type, found); }
       }
       StructDecl(nameTok, parentTok, fields, methods, exported, isConst, typeParams): {
         if (!listHas(reach, reach.len(), tokenTextOf(src, lx, nameTok))) { continue; }
-        for (i32 i = 0; i < fields.len(); i++) { tyNames(src, lx, fields[i].type, found, seen); }
+        for (i32 i = 0; i < fields.len(); i++) { tyNames(src, lx, fields[i].type, found); }
         for (i32 i = 0; i < methods.len(); i++) {
           if (methods[i].isAsync) { anyAsync = true; }
-          tyNames(src, lx, methods[i].returnType, found, seen);
-          for (i32 p = 0; p < methods[i].params.len(); p++) { tyNames(src, lx, methods[i].params[p].type, found, seen); }
+          tyNames(src, lx, methods[i].returnType, found);
+          for (i32 p = 0; p < methods[i].params.len(); p++) { tyNames(src, lx, methods[i].params[p].type, found); }
         }
       }
       default: { }
     }
   }
-  string[] out = string[].filled(seen[0] + 1, "");
+  string[] out = string[].filled(found.n + 1, "");
   i32 n = 0;
-  for (i32 i = 0; i < seen[0]; i++) {
+  for (i32 i = 0; i < found.n; i++) {
     for (i32 k = 0; k < ln; k++) {
       string entry = from[k] + "\t" + orig[k];
-      if (local[k] == found[i] && !listHas(out, n, entry)) {
+      if (local[k] == found.items[i] && !listHas(out, n, entry)) {
         out[n] = entry;
         n = n + 1;
       }
@@ -4484,11 +4511,10 @@ export string capReachFiles(const string[] paths, const string[] sources) {
 
 /** `tyNames`, tab-delimited and tab-terminated, so a search cannot match a prefix. */
 string tyNamesJoined(u8[] src, Lexed lx, Ty t) {
-  string[] found = string[].filled(64, "");
-  i32[] seen = i32[].filled(1, 0);
-  tyNames(src, lx, t, found, seen);
+  TyNameList found = tyNameList();
+  tyNames(src, lx, t, found);
   string out = "";
-  for (i32 i = 0; i < seen[0]; i++) { out = out + found[i] + "\t"; }
+  for (i32 i = 0; i < found.n; i++) { out = out + found.items[i] + "\t"; }
   return out;
 }
 

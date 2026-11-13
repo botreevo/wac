@@ -149,7 +149,7 @@ has been fixed and why.
 
 ## Closed
 
-370 issues, 336 closed.
+371 issues, 337 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

@@ -8,10 +8,12 @@ import { json.JsonValue, json.parse } from "wac";
 import { U256 } from "../../src/u256.wac";
 import { bytesToHex } from "../../src/hex.wac";
 import { systemContracts } from "../../src/chain/dev.wac";
-import { Proc, Rpc, shell, quote, type2, field, quantity, trim, ZERO } from "./kit.wac";
+import { Proc, Rpc, shell, quote, type2, field, quantity, trim, ZERO, addressOf, zeroBlobTx } from "./kit.wac";
 import { writeKeystores } from "./keystores.wac";
 
 export static i32 VALIDATORS = 64;
+/** The key blob transactions are sent from, funded in the genesis. */
+export u8[] blobKey() { return u8[].filled(32, 0x22); }
 
 export string config() {
   return "CONFIG_NAME: 'wacuum-devnet'\nPRESET_BASE: 'mainnet'\nTERMINAL_TOTAL_DIFFICULTY: 0\n" +
@@ -30,7 +32,7 @@ export string config() {
  * block with geth's own code for the beacon state — so every block-numbered fork must be here, and the blob schedule
  * (without London, that code leaves the base fee out of the header, and the hash is not the one either client makes).
  */
-export string elGenesis(string funded) {
+export string elGenesis(string funded, string blobber) {
   return "{\"config\":{\"chainId\":1337,\"homesteadBlock\":0,\"eip150Block\":0,\"eip155Block\":0,\"eip158Block\":0,\"byzantiumBlock\":0," +
          "\"constantinopleBlock\":0,\"petersburgBlock\":0,\"istanbulBlock\":0,\"berlinBlock\":0,\"londonBlock\":0,\"mergeNetsplitBlock\":0," +
          "\"terminalTotalDifficulty\":0,\"shanghaiTime\":0,\"cancunTime\":0,\"pragueTime\":0,\"osakaTime\":0," +
@@ -39,7 +41,7 @@ export string elGenesis(string funded) {
          "\"difficulty\":\"0x0\",\"nonce\":\"0x0\"," +
          "\"mixHash\":\"\{ZERO}\",\"parentHash\":\"\{ZERO}\",\"coinbase\":\"0x0000000000000000000000000000000000000000\",\"extraData\":\"0x\"," +
          "\"excessBlobGas\":\"0x0\",\"blobGasUsed\":\"0x0\",\"gasLimit\":\"0x2faf080\",\"baseFeePerGas\":\"0x3b9aca00\",\"timestamp\":\"0x0\"," +
-         "\"alloc\":{\"\{funded}\":{\"balance\":\"0xd3c21bcecceda1000000\"}," + systemContracts() + "}}";
+         "\"alloc\":{\"\{funded}\":{\"balance\":\"0xd3c21bcecceda1000000\"},\"\{blobber}\":{\"balance\":\"0xd3c21bcecceda1000000\"}," + systemContracts() + "}}";
 }
 
 /** A beacon node's REST answer at `path`, or null. */
@@ -99,8 +101,9 @@ export async bool growTo(Sys sys, Rpc watch, Rpc wac, u64 n, i32 millis, u8[] ke
  * validators' wallet: "" or what went wrong.
  */
 export async string prepare(Sys sys, string dir, string bin, string funded, i32 delay) {
+  // Blob transactions from an account of their own: geth keeps an account's blob and other transactions apart.
   await sys.writeFile(dir + "/config.yml", config().toBytes());
-  await sys.writeFile(dir + "/el-in.json", elGenesis(funded).toBytes());
+  await sys.writeFile(dir + "/el-in.json", elGenesis(funded, addressOf(blobKey())).toBytes());
   string made = await shell(sys, "cd \{quote(dir)} && \{quote(bin + "/prysmctl")} testnet generate-genesis --fork fulu --num-validators \{VALIDATORS} " +
                                  "--genesis-time-delay \{delay} --chain-config-file config.yml --geth-genesis-json-in el-in.json --geth-genesis-json-out el.json " +
                                  "--output-ssz genesis.ssz 2>&1 | grep -i fatal");
@@ -158,4 +161,27 @@ export u64 decimal(string s) {
   u8[] d = s.toBytes();
   for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as u64); }
   return n;
+}
+
+/**
+ * Blob transactions — the zero blob, whose commitment and cell proofs are the point at infinity, so none is computed
+ * — sent to `to` until one lands in a block of `watch`'s chain: that block's number, or 0 if none in `millis`.
+ */
+export async u64 blobBlock(Sys sys, Rpc to, Rpc watch, i32 millis) {
+  u64 n = quantity(await to.text("eth_getTransactionCount", "[\"\{addressOf(blobKey())}\",\"pending\"]"));
+  u64 from = quantity(await watch.text("eth_blockNumber", "[]"));
+  for (i32 i = 0; i < 3; i++) {
+    await to.text("eth_sendRawTransaction", "[\"\{zeroBlobTx(blobKey(), 1337, n, "0x3333333333333333333333333333333333333333")}\"]");
+    n++;
+  }
+  for (i32 t = 0; t < millis; t += 1000) {
+    u64 head = quantity(await watch.text("eth_blockNumber", "[]"));
+    for (u64 b = from + 1; b <= head; b++) {
+      JsonValue? blk = await watch.get("eth_getBlockByNumber", "[\"\{U256.ofU64(b).toHex()}\",false]");
+      if (quantity(field(blk, "blobGasUsed")) > 0) { return b; }
+    }
+    from = head;
+    await sys.sleepMillis(1000);
+  }
+  return 0;
 }

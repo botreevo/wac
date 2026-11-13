@@ -1,0 +1,125 @@
+// A node on a store, stopped after a block's commit and before the chain log got the block: the store is a block
+// ahead of the log. The crash e2e found it (a kill in that window, at --flush-every 1, left the node answering
+// SYNCING to every payload for good); this is the same window, without processes.
+
+import { Sys } from "std";
+import { json.JsonValue, json.JsonObject, json.JsonArray, json.parse } from "wac";
+import { U256 } from "../src/u256.wac";
+import { Engine, Answer, Replayed } from "../src/engine/engine.wac";
+import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
+import { systemContracts } from "../src/chain/dev.wac";
+import { Store } from "../src/store/tree.wac";
+import { MemDisk } from "../src/store/disk.wac";
+import { StateDb } from "../src/store/state.wac";
+import { str, one } from "./chainkit.wac";
+import { Check } from "./check.wac";
+
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+static string RECIPIENT = "0x3333333333333333333333333333333333333333";
+
+Genesis genesis() {
+  string g = "{\"config\": {\"chainId\": 1, \"cancunTime\": 0, \"pragueTime\": 0}, \"gasLimit\": \"0x1c9c380\", \"baseFeePerGas\": \"0x3b9aca00\", " +
+             "\"alloc\": {\"0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A\": {\"balance\": \"0x56bc75e2d63100000\"}, " + systemContracts() + "}}";
+  string[] why = [""];
+  return genesisFrom(parse(g.toBytes()).ok()!, why)!;
+}
+
+/** A call as the node makes one on a store: prepared first (`Engine.prepare`), then answered. */
+async Answer call(Engine e, string method, JsonValue params) {
+  await e.prepare(method, params);
+  return e.call(method, params);
+}
+
+JsonValue choice(U256 head, JsonValue attrs) {
+  JsonObject st = JsonObject.create();
+  st.push("headBlockHash".toBytes(), str(head.toHex()));
+  st.push("safeBlockHash".toBytes(), str(head.toHex()));
+  st.push("finalizedBlockHash".toBytes(), str(ZERO));
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Object(st));
+  ps.push(attrs);
+  return JsonValue.Array(ps);
+}
+
+/** A block built on the head, as a payload's newPayload params; null if none was built. */
+async JsonValue? build(Engine e, i32 time) {
+  JsonObject attrs = JsonObject.create();
+  attrs.push("timestamp".toBytes(), str(U256.ofI32(time).toHex()));
+  attrs.push("prevRandao".toBytes(), str(ZERO));
+  attrs.push("suggestedFeeRecipient".toBytes(), str(RECIPIENT));
+  attrs.push("withdrawals".toBytes(), JsonValue.Array(JsonArray.create()));
+  attrs.push("parentBeaconBlockRoot".toBytes(), str(ZERO));
+  Answer f = await call(e, "engine_forkchoiceUpdatedV3", choice(e.head, JsonValue.Object(attrs)));
+  JsonValue? id = f.result?.member("payloadId");
+  if (id is null || id!.isNull()) { return null; }
+  Answer g = await call(e, "engine_getPayloadV4", one(id!));
+  JsonArray np = JsonArray.create();
+  np.push(g.result!.member("executionPayload")!);
+  np.push(JsonValue.Array(JsonArray.create()));
+  np.push(str(ZERO));
+  np.push(g.result!.member("executionRequests")!);
+  return JsonValue.Array(np);
+}
+
+U256 hashOf(JsonValue payload) { return U256.fromHex(payload.array()!.get(0).member("blockHash")!.text()!)!; }
+
+/** A newPayload's status, or a forkchoiceUpdated's (inside its payloadStatus). */
+string statusOf(Answer a) { return a.result?.member("status")?.text() ?? a.result?.member("payloadStatus")?.member("status")?.text() ?? a.message; }
+
+/** The records so far as one log. */
+u8[] logOf(Engine e, i32 count) {
+  i32 total = 0;
+  for (i32 i = 0; i < count; i++) { total += e.records.get(i).len(); }
+  u8[] log = u8[].filled(total, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < count; i++) {
+    u8[] r = e.records.get(i);
+    log.copyFrom(r, 0, at, r.len());
+    at += r.len();
+  }
+  return log;
+}
+
+async string run() {
+  Check t = Check.create();
+  Genesis gen = genesis();
+  MemDisk md = MemDisk.create();
+  StateDb db = StateDb.over((await Store.open(md.disk())).unwrap());
+  string[] why = [""];
+  u8[] at = u8[].filled(40, 0);
+  at.copyFrom(gen.header.hash.toBytes(), 0, 0, 32);
+  t.ok((await db.seed(gen.world, at, why)) is not null, "the genesis into the store");
+  Engine e = Engine.onStore(gen.config, gen.header, db);
+
+  // Two blocks, each imported and made the head; then a third imported — its commit made — and the node stopped
+  // before the log got it: the log is the records from before the third's newPayload.
+  for (i32 i = 1; i <= 2; i++) {
+    JsonValue? p = await build(e, 12 * i);
+    t.ok(p is not null, "block \{i} built");
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p!)), "VALID", "block \{i} imports");
+    t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(p!), JsonValue.Null))), "VALID", "and is the head");
+  }
+  JsonValue third = (await build(e, 36))!;
+  i32 logged = e.records.len();
+  t.eqStr(statusOf(await call(e, "engine_newPayloadV4", third)), "VALID", "block 3 imports, its state committed");
+  u8[] log = logOf(e, logged);
+
+  // Started again: the store holds block 3, the log ends at block 2.
+  StateDb again = StateDb.over((await Store.open(md.disk())).unwrap());
+  Engine r = Engine.onStore(gen.config, gen.header, again);
+  t.ok(r.resumeFromStore() && r.restoredNumber.eq(U256.ofI32(3)), "the store holds block 3: \{r.restoredNumber.toDecimal()}");
+  Replayed rp = await r.replay(log);
+  t.eqStr(rp.error, "", "the log replays");
+  t.ok(await r.adoptStored(), "block 3, not in the log, is taken from the store");
+  // As the consensus client goes on: block 3 given again, made the head, and a block built on it.
+  t.eqStr(statusOf(await call(r, "engine_newPayloadV4", third)), "VALID", "block 3 given again is VALID, not SYNCING");
+  t.eqStr(statusOf(await call(r, "engine_forkchoiceUpdatedV3", choice(hashOf(third), JsonValue.Null))), "VALID", "and is the head");
+  JsonValue? fourth = await build(r, 48);
+  t.ok(fourth is not null, "block 4 built on it");
+  t.eqStr(statusOf(await call(r, "engine_newPayloadV4", fourth!)), "VALID", "and imported");
+  // The next start has block 3 in its log.
+  t.ok(r.records.len() > 0, "block 3 recorded for the log");
+  return t.report();
+}
+
+export async string test_a_store_a_block_ahead_of_the_log(Sys sys) { return await run(); }

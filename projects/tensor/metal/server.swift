@@ -1,5 +1,15 @@
 // wac-tensor's Metal server: the GPU end of `src/metal/metal.wac`, for a program run by `wac` on a Mac.
 //
+// **UNTESTED: not compiled or run on a Mac.** The bounds checks of 3bd2ff6 (`frames.swift`, and their use here) were
+// written where there is no Swift and no Metal. Before relying on them, on a Mac:
+//
+//     wac task metal:server && dist/wac-tensor-metal &    # it must compile, and listen on 127.0.0.1:7787
+//     wac task metal:frames                               # the bounds checks on their own: PASS <n>
+//     wac task metal:check                                # every kernel against the CPU: PASS 130
+//
+// metal:check includes the two products 3bd2ff6 changed: "matmul, nothing to sum" (k = 0, filled with zeros rather
+// than left to MPS) and "matmul, aᵀ·b" (a transposed left side of 17 rows, now one block). Then delete this note.
+//
 //     swiftc -O metal/server.swift metal/frames.swift -o dist/wac-tensor-metal && dist/wac-tensor-metal [port]   (7787 by default)
 //
 // It knows nothing about tensors. The kernels are MSL that wac-tensor writes (`src/metal/msl.wac`) and sends as

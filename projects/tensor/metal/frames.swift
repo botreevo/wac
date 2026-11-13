@@ -1,3 +1,6 @@
+// **UNTESTED: not compiled or run.** Written where there is no Swift; `wac task metal:frames` must pass on a Mac (or
+// any machine with Swift) before this is relied on. See the note at the top of `server.swift`.
+//
 // What the Metal server (`server.swift`) reads from a connection, and every check on it before anything touches memory
 // or the GPU. Nothing here uses Metal, so `frames-check.swift` tests it on any machine with Swift:
 //

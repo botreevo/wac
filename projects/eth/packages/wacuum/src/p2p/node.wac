@@ -14,14 +14,16 @@ import { keccak256 } from "../crypto/keccak.wac";
 import { U256 } from "../u256.wac";
 import { bytesToHex, hexToBytes } from "../hex.wac";
 import { hashU256, eqU256 } from "../state/world.wac";
-import { Header, headerItem, decodeBlock, BlockDecode, blockTimestamp } from "../chain/block.wac";
+import { Header, headerItem, headerOf, timestampOf, decodeBlock, BlockDecode, blockTimestamp } from "../chain/block.wac";
 import { Spec } from "../evm/spec.wac";
 import { Engine, Answer, rawOf } from "../engine/engine.wac";
 import { blockFormOf } from "../engine/blobs.wac";
 import { publicKey } from "./secp.wac";
 import { Conn } from "./peer.wac";
 import { Deadlines, Watched, enforce } from "../net/deadlines.wac";
-import { Message, HelloMsg, StatusMsg, Response, ForkId, hello, readHello, status, readStatus, forkId, disconnect,
+import { Asker, Fetched, snapSync, answerAccountRange, answerStorageRanges, answerByteCodes, SOFT_BYTES,
+         GET_ACCOUNT_RANGE, ACCOUNT_RANGE, GET_STORAGE_RANGES, STORAGE_RANGES, GET_BYTE_CODES, BYTE_CODES, TRIE_NODES } from "./snap.wac";
+import { Message, HelloMsg, StatusMsg, Response, ForkId, hello, helloWith, readHello, status, readStatus, forkId, disconnect,
          disconnectReason, getHeadersByHash, getBodies, readResponse, blockRange, numOf, small, HELLO, DISCONNECT, PING, PONG,
          STATUS, TRANSACTIONS, GET_BLOCK_HEADERS, BLOCK_HEADERS, GET_BLOCK_BODIES, BLOCK_BODIES,
          NEW_POOLED_TRANSACTION_HASHES, GET_POOLED_TRANSACTIONS, POOLED_TRANSACTIONS, GET_RECEIPTS, RECEIPTS,
@@ -36,6 +38,8 @@ export struct Peer {
   /** The hash of the peer's latest block, from its Status and then its BlockRangeUpdates. */
   U256 latestHash;
   bool alive;
+  /** Whether it speaks snap/1 as well, so that a state can be fetched from it. */
+  bool snap;
 }
 
 export struct Network {
@@ -61,9 +65,15 @@ export struct Network {
    * is right for a devnet whose blocks one node makes, and for nothing else.
    */
   bool follow;
+  /**
+   * Whether to fetch the state by snap sync rather than run every block: once, when the engine on a store
+   * has only its genesis and is told of a head it has not got, the state at that head is fetched from a peer
+   * that speaks snap/1 and the chain is begun again there (`snapTo`).
+   */
+  bool snap;
 
   Network create(Engine e, u8[] nodeKey, U256 genesis, u64[] forkBlocks, u64[] forkTimes) {
-    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero(), 0, 10, Deadlines.create(), false);
+    return Network(e, nodeKey, genesis, forkBlocks, forkTimes, Vec.create(), 1, U256.zero(), 0, 10, Deadlines.create(), false, false);
   }
 
   StatusMsg ourStatus(this) {
@@ -115,7 +125,7 @@ Item emptyList() { return Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0
 
 /** Hello and Status, both ways, on a connection whose handshake is done. Null when the peer will not do. */
 async Peer? greet(Sys sys, Network n, Conn c, string name) {
-  if (!(await c.send(hello("wacuum/v0.1.0", publicKey(n.nodeKey))))) { return null; }
+  if (!(await c.send(helloWith("wacuum/v0.1.0", publicKey(n.nodeKey), n.e.db is not null)))) { return null; }
   Message? hm = await c.receive();
   if (hm is null || hm!.code != HELLO) {
     sys.warn("p2p: \{name}: no Hello: \{hm is null ? c.error : disconnectReason(hm!.body)}");
@@ -143,7 +153,11 @@ async Peer? greet(Sys sys, Network n, Conn c, string name) {
     return null;
   }
   sys.log("p2p: \{name}: \{h.client}, serving blocks \{st.earliest}-\{st.latest}");
-  Peer p = Peer(c, name, Map.create(hashU256, eqU256), st.latest, st.latestHash, true);
+  bool snap = false;
+  for (i32 i = 0; i < h.caps.len(); i++) { snap = snap || h.caps[i] == "snap/1"; }
+  // snap's codes follow eth/69's only when both sides offered it.
+  snap = snap && n.e.db is not null;
+  Peer p = Peer(c, name, Map.create(hashU256, eqU256), st.latest, st.latestHash, true, snap);
   n.peers.push(p);
   return p;
 }
@@ -265,6 +279,22 @@ async void run(Sys sys, Network n, Peer p) {
         }
         if (code == POOLED_TRANSACTIONS) { takeTransactions(n, r!.items); }
       }
+    } else if (p.snap && (code == ACCOUNT_RANGE || code == STORAGE_RANGES || code == BYTE_CODES || code == TRIE_NODES)) {
+      // Its items after the id are the answer.
+      if (isList(body) && itemsOf(body).len() >= 2) {
+        Item[] all = itemsOf(body);
+        u64 id = numOf(all[0]).low();
+        Ticket<Item[]>? t = p.pending.get(U256.ofU64(id));
+        if (t is not null) {
+          p.pending.remove(U256.ofU64(id));
+          Item[] rest = Item[].filled(all.len() - 1, all[0]);
+          for (i32 i = 1; i < all.len(); i++) { rest[i - 1] = all[i]; }
+          t!.resolve(rest);
+        }
+      }
+    } else if (p.snap && (code == GET_ACCOUNT_RANGE || code == GET_STORAGE_RANGES || code == GET_BYTE_CODES)) {
+      // Answered from the store when it holds the head's state; otherwise as a node without it, empty.
+      await p.c.send(await answerSnap(n, code, body));
     } else if (code == TRANSACTIONS) {
       if (isList(body)) { takeTransactions(n, itemsOf(body)); }
     } else if (code == NEW_POOLED_TRANSACTION_HASHES) {
@@ -473,6 +503,65 @@ async bool syncOnce(Sys sys, Network n, Peer p, U256 target) {
   return true;
 }
 
+/** A snap request answered from the store, about the state of the block the engine is at. */
+async Message answerSnap(Network n, i32 code, Item body) {
+  Engine e = n.e;
+  u8[] root = e.blocks.get(e.at)!.header.stateRoot.toBytes();
+  if (code == GET_ACCOUNT_RANGE) { return await answerAccountRange(e.db!.store, root, body); }
+  if (code == GET_STORAGE_RANGES) { return await answerStorageRanges(e.db!.store, root, body); }
+  return await answerByteCodes(e.db!.store, body);
+}
+
+/**
+ * The state at `target` fetched from `p` by snap sync into the engine's store, and the chain begun again
+ * there with its 256 ancestors' headers for BLOCKHASH. True when it worked; the blocks after it come the
+ * ordinary way.
+ */
+async bool snapTo(Sys sys, Network n, Peer p, U256 target) {
+  u64 id = n.nextId;
+  n.nextId++;
+  Item[]? hs = await request(sys, p, id, getHeadersByHash(id, target, 257, 0, true));
+  if (hs is null || hs!.len() == 0) {
+    sys.warn("p2p: \{p.name} has no header for the snap target");
+    return false;
+  }
+  Header[] headers = Header[].filled(hs!.len(), n.e.headHeader());
+  for (i32 i = 0; i < hs!.len(); i++) {
+    string[] why = [""];
+    Header? h = headerOf(n.e.config.specAt(timestampOf(hs![i])), hs![i], why);
+    if (h is null || (i > 0 && !h!.hash.eq(headers[i - 1].parentHash))) {
+      sys.warn("p2p: \{p.name}'s headers before the snap target do not chain");
+      return false;
+    }
+    headers[i] = h!;
+  }
+  Header pivot = headers[0];
+  if (!pivot.hash.eq(target)) { return false; }
+  sys.log("p2p: snap sync from \{p.name} at block \{pivot.number.toDecimal()}, state root \{pivot.stateRoot.toHex()}");
+  Network net = n;
+  Peer peer = p;
+  Asker asker = Asker(async (Message m) => {
+    u64 rid = numOf(itemsOf(m.body)[0]).low();
+    return await request(sys, peer, rid, m);
+  }, n.nextId, SOFT_BYTES);
+  // Ids from a range of their own, so as not to meet this node's other requests.
+  asker.nextId = n.nextId + 1000000;
+  u8[] user = u8[].filled(40, 0);
+  user.copyFrom(pivot.hash.toBytes(), 0, 0, 32);
+  user.copyFrom(U256.ofU64(pivot.number.low()).toBytes(), 24, 32, 8);
+  Fetched f = await snapSync(asker, n.e.db!.store, pivot.stateRoot.toBytes(), user);
+  if (f.error != "") {
+    sys.warn("p2p: snap sync from \{p.name} failed: \{f.error}");
+    return false;
+  }
+  sys.log("p2p: snap sync done: \{f.accounts} accounts, \{f.slots} slots, \{f.codes} codes, \{f.nodes} trie nodes, \{f.requests} requests");
+  Header[] ancestors = Header[].filled(headers.len() - 1, pivot);
+  for (i32 i = 1; i < headers.len(); i++) { ancestors[i - 1] = headers[i]; }
+  n.e.db!.discard();
+  n.e.rebase(pivot, ancestors);
+  return true;
+}
+
 /**
  * The network's housekeeping, twice a second: sync when the consensus client is ahead, tell peers of new
  * transactions, and of the head when it moves.
@@ -502,7 +591,16 @@ export async void tend(Sys sys, Network n, fn<Ticket<void>()> flush) {
       if (n.e.has(target!)) {
         await n.e.adoptOrphansAsync();
       } else if (from is not null) {
-        await syncOnce(sys, n, from!, target!);
+        // A store with nothing but its genesis, told of a head it has not got: fetch the state there instead.
+        Peer? snapPeer = null;
+        for (i32 i = 0; i < n.peers.len(); i++) {
+          if (n.peers.get(i).alive && n.peers.get(i).snap) { snapPeer = n.peers.get(i); }
+        }
+        if (n.snap && n.e.db is not null && n.e.blocks.len() == 1 && snapPeer is not null) {
+          if (await snapTo(sys, n, snapPeer!, target!)) { await flush(); }
+        } else {
+          await syncOnce(sys, n, from!, target!);
+        }
       }
       await flush();
     }

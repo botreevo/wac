@@ -31,7 +31,7 @@ import { Outcome } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
 import { blobGasPrice } from "../tx/process.wac";
 import { Spec, ChainConfig } from "../evm/spec.wac";
-import { Header, Block, Withdrawal, Receipt, Body, executeBlock, applyBlock, encodeBlock, decodeBlock, BlockDecode, blockTimestamp, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
+import { Header, Block, Withdrawal, Receipt, Body, timestampOf, headerOf, executeBlock, applyBlock, encodeBlock, decodeBlock, BlockDecode, blockTimestamp, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
          indexedRoot } from "../chain/block.wac";
 import { decodeTransaction, decodeWith, DecodedTx, SenderCache } from "../tx/decode.wac";
 import { Attributes, Built, buildBlock } from "../chain/build.wac";
@@ -95,6 +95,8 @@ struct TxAt {
 /** The log's two kinds of record, each `rlp([kind, ...])`: a block's RLP, and a fork choice's three hashes. */
 static u8 RECORD_BLOCK = 1;
 static u8 RECORD_CHOICE = 2;
+/** The chain rebased onto a snap-synced block: its header and its 256 ancestors' (`rebase`). */
+static u8 RECORD_BASE = 3;
 
 /** What replaying a log came to: how many bytes of it were whole records, and how many blocks. */
 export struct Replayed {
@@ -539,6 +541,48 @@ export struct Engine {
     this.restoredNumber = U256.fromBytes(user, 32, 8);
     this.snapshotNumber = this.restoredNumber;
     return true;
+  }
+
+  /**
+   * The chain begun again at `pivot`, a block whose state the store now holds (fetched by snap sync), with
+   * its ancestors (newest first, 256 for BLOCKHASH) known only as headers: what came before is not run, and
+   * the blocks after it are imported as usual. Recorded, so a restart rebases the same way.
+   */
+  void rebase(this, Header pivot, Header[] ancestors) {
+    this.blocks = Map.create(hashU256, eqU256);
+    this.canonical = Map.create(hashU256, eqU256);
+    this.archive = Map.create(hashU256, eqU256);
+    this.orphans = Map.create(hashU256, eqU256);
+    Vec<u8[]> raws = Vec.create();
+    raws.push(encode(headerItem(this.config.specAt(pivot.timestamp), pivot)));
+    // Newest first in the record, as `ancestors` are.
+    for (i32 i = 0; i < ancestors.len(); i++) { raws.push(encode(headerItem(this.config.specAt(ancestors[i].timestamp), ancestors[i]))); }
+    for (i32 i = ancestors.len() - 1; i >= -1; i--) {
+      Header h = i < 0 ? pivot : ancestors[i];
+      this.blocks.set(h.hash, Node(h, null));
+      this.canonical.set(h.number, h.hash);
+      this.archive.set(h.hash, Archived(h, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
+                                        Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
+                                        Vec<Receipt>.create().toArray(), 0));
+    }
+    this.head = pivot.hash;
+    this.safe = pivot.hash;
+    this.finalized = pivot.hash;
+    this.forgottenAt = pivot.hash;
+    this.at = pivot.hash;
+    this.keptFrom = ancestors.len() > 0 ? ancestors[ancestors.len() - 1].number.low() : pivot.number.low();
+    // Replayed after a restart, the store may already be past the pivot: the later of the two is where
+    // the log's blocks start running again.
+    if (this.restoredAt is null || this.restoredNumber.lt(pivot.number)) {
+      this.restoredAt = pivot.hash;
+      this.restoredNumber = pivot.number;
+      this.snapshotNumber = pivot.number;
+    }
+    if (this.syncTarget is not null && this.syncTarget!.eq(pivot.hash)) { this.syncTarget = null; }
+    if (this.db is not null) { this.freshWorld(); }
+    Item[] rec = Item[].filled(raws.len() + 1, Item.Bytes([RECORD_BASE]));
+    for (i32 i = 0; i < raws.len(); i++) { rec[i + 1] = Item.Bytes(raws.get(i)); }
+    this.records.push(encode(Item.List(rec)));
   }
 
   /** A fresh cache over the store: after the store moves, what the old one held may be stale. */
@@ -1111,6 +1155,18 @@ export struct Engine {
           if (st == "INVALID") { return Replayed(at, blocks, "block at byte \{at} is \{st} on replay"); }
           if (st == "VALID") { blocks++; }
         }
+      } else if (kind.len() == 1 && kind[0] == RECORD_BASE && f.len() >= 2) {
+        Header[] hs = Header[].filled(f.len() - 1, this.headHeader());
+        for (i32 k = 1; k < f.len(); k++) {
+          string[] why = [""];
+          u8[] raw = bytesOf(f[k]);
+          Header? h = headerOf(this.config.specAt(timestampOf(decode(raw).item)), decode(raw).item, why);
+          if (h is null) { return Replayed(at, blocks, "a base record's header at byte \{at}: \{why[0]}"); }
+          hs[k - 1] = h!;
+        }
+        Header[] ancestors = Header[].filled(hs.len() - 1, hs[0]);
+        for (i32 k = 1; k < hs.len(); k++) { ancestors[k - 1] = hs[k]; }
+        this.rebase(hs[0], ancestors);
       } else if (kind.len() == 1 && kind[0] == RECORD_CHOICE && f.len() == 4) {
         U256 head = U256.fromBytes(bytesOf(f[1]), 0, 32);
         if (this.db is not null && this.blocks.has(head)) { await this.moveToAsync(head); }

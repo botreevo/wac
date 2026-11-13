@@ -1,0 +1,143 @@
+// wacuum snap-syncs geth: a chain with a state worth fetching (hundreds of accounts, contracts with code
+// and storage) made by geth, and a wacuum on a store, started with --snap and told of geth's head, must fetch
+// the state at that head over snap/1 rather than run the blocks, agree with geth account by account, then
+// take geth's next blocks the ordinary way, and after a restart go on from its store.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/snap.wac -- path/to/geth
+
+import { Sys } from "std";
+import { Vec } from "core";
+import { json.JsonValue } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { systemContracts } from "../../src/chain/dev.wac";
+import { Check, Proc, Rpc, shell, quote, tempDir, removeDir, somePort, addressOf, field, quantity, choose, chosen, makeBlocks,
+         TO, ZERO } from "./kit.wac";
+
+/** The address of the `i`th account of the alloc: spread over the key space once hashed. */
+string account(i32 i) {
+  string hex = U256.ofU64(((i as@ u32) as u64) * 104729 + 0x1000).toHex();
+  string digits = hex.slice(2, hex.len());
+  while (digits.len() < 40) { digits = "0" + digits; }
+  return "0x" + digits;
+}
+
+/** `v` as 0x and 64 hex digits. */
+string word(u64 v) { return bytesToHex(U256.ofU64(v).toBytes()); }
+
+/** Four hundred funded accounts, and thirty contracts with a little code and twenty slots each. */
+string alloc() {
+  Vec<string> parts = Vec.create();
+  for (i32 i = 0; i < 400; i++) { parts.push("\"\{account(i)}\":{\"balance\":\"\{U256.ofU64(((i as@ u32) as u64) * 1000 + 1).toHex()}\",\"nonce\":\"0x\{i % 7}\"}"); }
+  for (i32 i = 400; i < 430; i++) {
+    string slots = "";
+    // geth reads genesis slots as 32-byte hashes, keys and values both.
+    for (i32 k = 0; k < 20; k++) { slots += (k > 0 ? "," : "") + "\"\{word(((k + i) as@ u32) as u64)}\":\"\{word(((k * i + 1) as@ u32) as u64)}\""; }
+    parts.push("\"\{account(i)}\":{\"balance\":\"0x1\",\"code\":\"0x60\{bytesToHex([(i & 255) as! u8]).slice(2, 4)}00\",\"storage\":{\{slots}}}");
+  }
+  string out = "";
+  for (i32 i = 0; i < parts.len(); i++) { out += parts.get(i) + ","; }
+  return out;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 1) {
+    sys.warn("usage: tools/e2e/snap.wac PATH-TO-GETH");
+    return 2;
+  }
+  string geth = args[0];
+  Check c = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-snap");
+  u8[] key = u8[].filled(32, 0x11);
+  string genesis = "{\"config\":{\"chainId\":1337,\"homesteadBlock\":0,\"eip150Block\":0,\"eip155Block\":0,\"eip158Block\":0," +
+    "\"byzantiumBlock\":0,\"constantinopleBlock\":0,\"petersburgBlock\":0,\"istanbulBlock\":0,\"berlinBlock\":0,\"londonBlock\":0," +
+    "\"mergeNetsplitBlock\":0,\"terminalTotalDifficulty\":0,\"shanghaiTime\":0,\"cancunTime\":0,\"pragueTime\":0,\"osakaTime\":0," +
+    "\"depositContractAddress\":\"0x0000000000000000000000000000000000000000\",\"blobSchedule\":{" +
+    "\"cancun\":{\"target\":3,\"max\":6,\"baseFeeUpdateFraction\":3338477}," +
+    "\"prague\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716}," +
+    "\"osaka\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716}}}," +
+    "\"nonce\":\"0x0\",\"timestamp\":\"0x0\",\"extraData\":\"0x\",\"gasLimit\":\"0x1c9c380\",\"difficulty\":\"0x0\"," +
+    "\"mixHash\":\"\{ZERO}\",\"coinbase\":\"0x0000000000000000000000000000000000000000\",\"number\":\"0x0\",\"gasUsed\":\"0x0\"," +
+    "\"parentHash\":\"\{ZERO}\",\"baseFeePerGas\":\"0x3b9aca00\",\"excessBlobGas\":\"0x0\",\"blobGasUsed\":\"0x0\"," +
+    "\"alloc\":{\"\{addressOf(key)}\":{\"balance\":\"0x56bc75e2d63100000\"}," + alloc() + systemContracts() + "}}";
+  await sys.writeFile(dir + "/genesis.json", genesis.toBytes());
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+  i32 base = await somePort(sys, 21000, 20000);
+  i32 gethP2p = base;
+  i32 gethAuthPort = base + 1;
+  i32 gethRpcPort = base + 2;
+  i32 wacP2p = base + 3;
+  i32 wacPort = base + 4;
+
+  await shell(sys, "\{quote(geth)} --datadir \{quote(dir + "/geth")} init \{quote(dir + "/genesis.json")} > /dev/null 2>&1");
+  Proc gethProc = await Proc.start(sys, [geth, "--datadir", dir + "/geth", "--networkid", "1337", "--nodiscover",
+                                         "--port", "\{gethP2p}", "--authrpc.port", "\{gethAuthPort}", "--authrpc.jwtsecret", dir + "/jwt.hex",
+                                         "--http", "--http.port", "\{gethRpcPort}", "--http.api", "eth,admin,net", "--syncmode", "full"],
+                                   dir + "/geth.log");
+  Rpc gethRpc = Rpc.at(sys, gethRpcPort);
+  Rpc gethAuth = Rpc.authed(sys, gethAuthPort, secret);
+  Rpc wac = Rpc.authed(sys, wacPort, secret);
+  Proc? wacProc = null;
+  string[] wacArgs = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                      "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/wacuum",
+                      "--public-rpc", "--port", "\{wacPort}", "--p2p-port", "\{wacP2p}", "--store", "--snap", "--peer", ""];
+
+  bool up = false;
+  for (i32 t = 0; t < 60000 && !up; t += 200) {
+    up = (await gethRpc.call("eth_chainId", "[]")).result() is not null;
+    if (!up) { await sys.sleepMillis(200); }
+  }
+  if (c.that(up, "geth is up")) {
+    string enode = field(await gethRpc.get("admin_nodeInfo", "[]"), "enode");
+    wacArgs[wacArgs.len() - 1] = enode;
+    JsonValue? gethHead = await makeBlocks(sys, gethAuth, gethRpc, key, 5);
+    c.that(quantity(field(gethHead, "number")) == 5, "geth made five blocks");
+
+    wacProc = await Proc.start(sys, wacArgs, dir + "/wacuum.log");
+    c.that(await wacProc!.says(sys, "serving blocks", 300000), "wacuum and geth agreed on the chain");
+
+    // Told of geth's head, wacuum fetches the state there rather than the blocks before it.
+    string gh = field(gethHead, "hash");
+    c.that(await choose(wac, gh) == "SYNCING", "wacuum is SYNCING to geth's head");
+    c.that(await chosen(sys, wac, gh, 300000), "and then has it");
+    string said = await wacProc!.output(sys);
+    c.that(said.indexOf("snap sync done") >= 0, "by snap sync");
+    i32 mismatched = 0;
+    for (i32 i = 0; i < 430; i += 7) {
+      string a = account(i);
+      string at = "[\"\{a}\",\"latest\"]";
+      if (await wac.text("eth_getBalance", at) != await gethRpc.text("eth_getBalance", at) ||
+          await wac.text("eth_getTransactionCount", at) != await gethRpc.text("eth_getTransactionCount", at) ||
+          await wac.text("eth_getCode", at) != await gethRpc.text("eth_getCode", at)) {
+        mismatched++;
+      }
+      if (i >= 400) {
+        string slot = "[\"\{a}\",\"\{U256.ofU64(((i + 3) as@ u32) as u64).toHex()}\",\"latest\"]";
+        if (await wac.text("eth_getStorageAt", slot) != await gethRpc.text("eth_getStorageAt", slot)) { mismatched++; }
+      }
+    }
+    c.that(mismatched == 0, "every account checked agrees with geth: \{mismatched} differ");
+
+    // geth's next blocks, the ordinary way, on the state snap fetched.
+    JsonValue? next = await makeBlocks(sys, gethAuth, gethRpc, key, 2);
+    string nh = field(next, "hash");
+    c.that(await chosen(sys, wac, nh, 120000), "wacuum takes geth's next two blocks");
+    c.that(await wac.text("eth_getBalance", "[\"\{TO}\",\"latest\"]") == await gethRpc.text("eth_getBalance", "[\"\{TO}\",\"latest\"]"),
+           "and their transfers");
+
+    // Restarted, it goes on from its store.
+    await wacProc!.stop(sys);
+    wacProc = await Proc.start(sys, wacArgs, dir + "/wacuum.log");
+    if (!c.that(await wacProc!.says(sys, "Engine API on", 300000), "wacuum starts again")) { sys.warn(await wacProc!.output(sys)); }
+    c.that(field(await wac.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash") == nh, "at the same head");
+    c.that(await wac.text("eth_getBalance", "[\"\{TO}\",\"latest\"]") == await gethRpc.text("eth_getBalance", "[\"\{TO}\",\"latest\"]"),
+           "with the same state");
+  }
+
+  if (wacProc is not null) { await wacProc!.stop(sys); }
+  await gethProc.stop(sys);
+  await removeDir(sys, dir);
+  return c.done();
+}

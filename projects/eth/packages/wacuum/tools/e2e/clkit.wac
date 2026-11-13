@@ -1,0 +1,161 @@
+// What the consensus-client end-to-end tests share (`cl.wac`, `clfollow.wac`): a Prysm devnet's genesis — the beacon
+// state and the execution genesis, made by prysmctl — the validators' wallet, and the nodes: beacon nodes, a
+// validator client, geth and wacuum.
+
+import { Sys } from "std";
+import { Vec } from "core";
+import { json.JsonValue, json.parse } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { systemContracts } from "../../src/chain/dev.wac";
+import { Proc, Rpc, shell, quote, type2, field, quantity, trim, ZERO } from "./kit.wac";
+import { writeKeystores } from "./keystores.wac";
+
+export static i32 VALIDATORS = 64;
+
+export string config() {
+  return "CONFIG_NAME: 'wacuum-devnet'\nPRESET_BASE: 'mainnet'\nTERMINAL_TOTAL_DIFFICULTY: 0\n" +
+         "MIN_GENESIS_ACTIVE_VALIDATOR_COUNT: \{VALIDATORS}\nMIN_GENESIS_TIME: 0\nGENESIS_DELAY: 0\n" +
+         "GENESIS_FORK_VERSION: 0x20000089\nALTAIR_FORK_VERSION: 0x20000090\nALTAIR_FORK_EPOCH: 0\n" +
+         "BELLATRIX_FORK_VERSION: 0x20000091\nBELLATRIX_FORK_EPOCH: 0\nCAPELLA_FORK_VERSION: 0x20000092\nCAPELLA_FORK_EPOCH: 0\n" +
+         "DENEB_FORK_VERSION: 0x20000093\nDENEB_FORK_EPOCH: 0\nELECTRA_FORK_VERSION: 0x20000094\nELECTRA_FORK_EPOCH: 0\n" +
+         "FULU_FORK_VERSION: 0x20000095\nFULU_FORK_EPOCH: 0\nGLOAS_FORK_VERSION: 0x20000096\nGLOAS_FORK_EPOCH: 18446744073709551615\n" +
+         "SECONDS_PER_SLOT: 2\nSLOT_DURATION_MS: 2000\nSECONDS_PER_ETH1_BLOCK: 2\nETH1_FOLLOW_DISTANCE: 1\n" +
+         "DEPOSIT_CHAIN_ID: 1337\nDEPOSIT_NETWORK_ID: 1337\nDEPOSIT_CONTRACT_ADDRESS: 0x4242424242424242424242424242424242424242\n" +
+         "BLOB_SCHEDULE:\n  - EPOCH: 0\n    MAX_BLOBS_PER_BLOCK: 9\n";
+}
+
+/**
+ * The execution genesis prysmctl starts from: it sets the timestamp and the time-based forks, and hashes the genesis
+ * block with geth's own code for the beacon state — so every block-numbered fork must be here, and the blob schedule
+ * (without London, that code leaves the base fee out of the header, and the hash is not the one either client makes).
+ */
+export string elGenesis(string funded) {
+  return "{\"config\":{\"chainId\":1337,\"homesteadBlock\":0,\"eip150Block\":0,\"eip155Block\":0,\"eip158Block\":0,\"byzantiumBlock\":0," +
+         "\"constantinopleBlock\":0,\"petersburgBlock\":0,\"istanbulBlock\":0,\"berlinBlock\":0,\"londonBlock\":0,\"mergeNetsplitBlock\":0," +
+         "\"terminalTotalDifficulty\":0,\"shanghaiTime\":0,\"cancunTime\":0,\"pragueTime\":0,\"osakaTime\":0," +
+         "\"blobSchedule\":{\"cancun\":{\"target\":3,\"max\":6,\"baseFeeUpdateFraction\":3338477}," +
+         "\"prague\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716},\"osaka\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716}}}," +
+         "\"difficulty\":\"0x0\",\"nonce\":\"0x0\"," +
+         "\"mixHash\":\"\{ZERO}\",\"parentHash\":\"\{ZERO}\",\"coinbase\":\"0x0000000000000000000000000000000000000000\",\"extraData\":\"0x\"," +
+         "\"excessBlobGas\":\"0x0\",\"blobGasUsed\":\"0x0\",\"gasLimit\":\"0x2faf080\",\"baseFeePerGas\":\"0x3b9aca00\",\"timestamp\":\"0x0\"," +
+         "\"alloc\":{\"\{funded}\":{\"balance\":\"0xd3c21bcecceda1000000\"}," + systemContracts() + "}}";
+}
+
+/** A beacon node's REST answer at `path`, or null. */
+export async JsonValue? beacon(Sys sys, i32 port, string path) {
+  string out = await shell(sys, "curl -s --max-time 5 http://127.0.0.1:\{port}\{path}");
+  return parse(out.toBytes()).ok();
+}
+
+/** A Prysm beacon node `name` on ports from `base`, driving the execution client at `elPort`; `extra` added to its flags. */
+export async Proc beaconNode(Sys sys, string bin, string dir, string name, i32 base, i32 elPort, string[] extra) {
+  string[] argv = [bin + "/beacon-chain", "--datadir", dir + "/" + name, "--force-clear-db", "--accept-terms-of-use",
+                   "--genesis-state", dir + "/genesis.ssz", "--chain-config-file", dir + "/config.yml", "--chain-id", "1337",
+                   "--execution-endpoint", "http://127.0.0.1:\{elPort}", "--jwt-secret", dir + "/jwt.hex",
+                   "--min-sync-peers", "0", "--no-discovery", "--minimum-peers-per-subnet", "0", "--contract-deployment-block", "0",
+                   "--rpc-port", "\{base}", "--http-port", "\{base + 1}", "--p2p-tcp-port", "\{base + 2}", "--p2p-udp-port", "\{base + 3}",
+                   "--p2p-quic-port", "\{base + 4}", "--monitoring-port", "\{base + 5}", "--p2p-local-ip", "127.0.0.1",
+                   "--suggested-fee-recipient", "0x00000000000000000000000000000000000000fe", "--supernode"];
+  Vec<string> all = Vec.create();
+  for (i32 i = 0; i < argv.len(); i++) { all.push(argv[i]); }
+  for (i32 i = 0; i < extra.len(); i++) { all.push(extra[i]); }
+  argv = all.toArray();
+  return await Proc.start(sys, argv, dir + "/" + name + ".log");
+}
+
+/** wacuum on a store in `dir/name`, its Engine API and JSON-RPC on `port`; `extra` added to its flags. */
+export async Proc wacuumNode(Sys sys, string app, string dir, string name, i32 port, string[] extra) {
+  Vec<string> argv = Vec.create();
+  string[] fixed = [app, "--genesis", dir + "/el.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/" + name,
+                    "--store", "--port", "\{port}", "--public-rpc"];
+  for (i32 i = 0; i < fixed.len(); i++) { argv.push(fixed[i]); }
+  for (i32 i = 0; i < extra.len(); i++) { argv.push(extra[i]); }
+  Proc p = await Proc.start(sys, argv.toArray(), dir + "/" + name + ".log");
+  await p.says(sys, "Engine API on", 120000);
+  return p;
+}
+
+/** The block at `number` on an execution client, as its hash, or "". */
+export async string hashAt(Rpc rpc, u64 number) { return field(await rpc.get("eth_getBlockByNumber", "[\"\{U256.ofU64(number).toHex()}\",false]"), "hash"); }
+
+/**
+ * Wait until `watch`'s head is at least `n`, sending a transfer to `send` (the client building the blocks) every 2 s;
+ * false if `millis` pass first.
+ */
+export async bool growTo(Sys sys, Rpc watch, Rpc wac, u64 n, i32 millis, u8[] key, u64[] nonce) {
+  for (i32 t = 0; t < millis; t += 2000) {
+    if (quantity(await watch.text("eth_blockNumber", "[]")) >= n) { return true; }
+    string to = "0x" + bytesToHex(U256.ofU64(0x9000000 + nonce[0]).toBytes()).slice(26, 66);
+    string sent = await wac.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce[0], to, U256.ofU64(nonce[0] + 1), u8[].filled(0, 0), 21000)}\"]");
+    if (sent != "") { nonce[0] = nonce[0] + 1; }
+    await sys.sleepMillis(2000);
+  }
+  return false;
+}
+
+/**
+ * The genesis in `dir` — config.yml, el.json (the execution genesis), genesis.ssz, `delay` seconds from now — and the
+ * validators' wallet: "" or what went wrong.
+ */
+export async string prepare(Sys sys, string dir, string bin, string funded, i32 delay) {
+  await sys.writeFile(dir + "/config.yml", config().toBytes());
+  await sys.writeFile(dir + "/el-in.json", elGenesis(funded).toBytes());
+  string made = await shell(sys, "cd \{quote(dir)} && \{quote(bin + "/prysmctl")} testnet generate-genesis --fork fulu --num-validators \{VALIDATORS} " +
+                                 "--genesis-time-delay \{delay} --chain-config-file config.yml --geth-genesis-json-in el-in.json --geth-genesis-json-out el.json " +
+                                 "--output-ssz genesis.ssz 2>&1 | grep -i fatal");
+  if (trim(made) != "") { return "prysmctl: \{trim(made)}"; }
+  await sys.files().mkdir(dir + "/keys", true);
+  await writeKeystores(sys, dir + "/keys", VALIDATORS, "interop-password");
+  await sys.writeFile(dir + "/key.pw", "interop-password".toBytes());
+  await sys.writeFile(dir + "/wallet.pw", "wallet-password-123".toBytes());
+  string imported = await shell(sys, "\{quote(bin + "/validator")} accounts import --keys-dir \{quote(dir + "/keys")} --wallet-dir \{quote(dir + "/wallet")} " +
+                                     "--wallet-password-file \{quote(dir + "/wallet.pw")} --account-password-file \{quote(dir + "/key.pw")} --accept-terms-of-use 2>&1 | grep -c 'Successfully imported'");
+  return trim(imported) == "1" ? "" : "the validator did not import the keys";
+}
+
+/** geth on ports from `base` (p2p, auth, http), its admin API open for its enode. */
+export async Proc gethNode(Sys sys, string geth, string dir, i32 base) {
+  await shell(sys, "\{quote(geth)} --datadir \{quote(dir + "/geth")} init \{quote(dir + "/el.json")} > \{quote(dir + "/geth-init.log")} 2>&1");
+  Proc g = await Proc.start(sys, [geth, "--datadir", dir + "/geth", "--networkid", "1337", "--nodiscover", "--port", "\{base}",
+                                  "--authrpc.port", "\{base + 1}", "--authrpc.jwtsecret", dir + "/jwt.hex",
+                                  "--http", "--http.port", "\{base + 2}", "--http.api", "eth,net,admin", "--syncmode", "full"], dir + "/geth.log");
+  Rpc gr = Rpc.at(sys, base + 2);
+  for (i32 i = 0; i < 60 && (await gr.text("eth_blockNumber", "[]")) == ""; i++) { await sys.sleepMillis(500); }
+  return g;
+}
+
+/** The validator client, with the wallet `prepare` made, on the beacon node whose RPC port is `rpc`. */
+export async Proc validatorNode(Sys sys, string bin, string dir, i32 rpc, i32 monitoring) {
+  return await Proc.start(sys, [bin + "/validator", "--datadir", dir + "/validator", "--accept-terms-of-use", "--force-clear-db",
+                                "--chain-config-file", dir + "/config.yml", "--beacon-rpc-provider", "127.0.0.1:\{rpc}",
+                                "--wallet-dir", dir + "/wallet", "--wallet-password-file", dir + "/wallet.pw", "--monitoring-port", "\{monitoring}",
+                                "--suggested-fee-recipient", "0x00000000000000000000000000000000000000fe"], dir + "/validator.log");
+}
+
+/**
+ * A beacon node's TCP address for another to dial, from its own log: without discovery it has no ENR, and the
+ * identity endpoint answers only an error. "" if it has not said within two minutes.
+ */
+export async string peerAddress(Sys sys, Proc beaconProc) {
+  for (i32 i = 0; i < 120; i++) {
+    string said = await beaconProc.output(sys);
+    i32 at = said.indexOf("/ip4/127.0.0.1/tcp/");
+    if (at >= 0) {
+      u8[] b = said.toBytes();
+      i32 end = at;
+      while (end < b.len() && (b[end] == 47 || b[end] == 46 || (b[end] >= 48 && b[end] <= 57) || (b[end] >= 65 && b[end] <= 90) || (b[end] >= 97 && b[end] <= 122))) { end++; }
+      if (said.slice(at, end).indexOf("/p2p/") > 0) { return said.slice(at, end); }
+    }
+    await sys.sleepMillis(1000);
+  }
+  return "";
+}
+
+/** A number a beacon node's REST answer gives as a decimal string. */
+export u64 decimal(string s) {
+  u64 n = 0;
+  u8[] d = s.toBytes();
+  for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as u64); }
+  return n;
+}

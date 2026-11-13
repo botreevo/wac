@@ -1,14 +1,16 @@
-// Ethereum's state in the store: accounts, slots and code under snap's hashed keys, read into memory for a
-// `World` as it needs them, and a block's changes written back as one commit.
+// Ethereum's state in the store: accounts, slots and code under snap's hashed keys, and the account trie and
+// every storage trie by path beside them, so that the state root is the store's own. A `World` reads it as
+// it needs to, and a block's changes are written back, tries and all, as one commit.
 //
-//     account  0x00 ‖ keccak(address)                      rlp([nonce, balance, codeHash])
-//     slot     0x01 ‖ keccak(address) ‖ keccak(slot)        rlp(value), absent for zero
-//     code     0x02 ‖ codeHash ‖ u16 chunk                 the code, 32 KB a chunk (one for any code mainnet allows)
+//     account       0x00 ‖ keccak(address)                  rlp([nonce, balance, storageRoot, codeHash])
+//     slot          0x01 ‖ keccak(address) ‖ keccak(slot)    rlp(value), absent for zero
+//     code          0x02 ‖ codeHash ‖ u16 chunk             the code, 32 KB a chunk (one for any code mainnet allows)
+//     account trie  0x03 ‖ path                             (src/trie/pathtrie.wac)
+//     storage trie  0x04 ‖ keccak(address) ‖ path
 //
-// Reads are asynchronous and a `World` is not, so a `StateDb` answers a `World`'s `StateSource` from what
-// it has read already and notes what it has not; `fetch` then reads those, and the caller runs again (the
-// speculation of `docs/state-on-disk.md`). The account's storage root is not kept yet: the trie by path is
-// the next piece, and until then `rootOf` computes the root from every entry, which is for tests.
+// Reads are asynchronous and a `World` is not, so a `StateDb` answers a `World`'s `StateSource` from what it
+// has read already and notes what it has not; `fetch` then reads those and the caller runs again (the
+// speculation of `docs/state-on-disk.md`).
 
 import { Map, Vec } from "core";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.itemsOf, rlp.bytesOf } from "@/lib.wac";
@@ -18,11 +20,32 @@ import { World, Account, StateSource, ChangeSet, AccountState, slotMap, hashU256
 import { u256Bytes } from "../state/root.wac";
 import { addressBytes, minimalBytes } from "../evm/evm.wac";
 import { trieRoot, emptyRoot } from "../trie/trie.wac";
+import { PathTrie } from "../trie/pathtrie.wac";
 import { Store, Change, compareKeys } from "./tree.wac";
 
 export u8[] accountKey(U256 addr) { return prefixed(0, keccak256(addressBytes(addr)), u8[].filled(0, 0)); }
 export u8[] slotKey(U256 addr, U256 slot) { return prefixed(1, keccak256(addressBytes(addr)), keccak256(slot.toBytes())); }
 export u8[] codeKey(U256 codeHash) { return prefixed(2, codeHash.toBytes(), u8[].filled(0, 0)); }
+
+u8[] prefixed(u8 kind, u8[] a, u8[] b) {
+  u8[] out = u8[].filled(1 + a.len() + b.len(), kind);
+  out.copyFrom(a, 0, 1, a.len());
+  out.copyFrom(b, 0, 1 + a.len(), b.len());
+  return out;
+}
+
+/** The first key after every key that starts with `p`, for a range's end. */
+u8[] after(u8[] p) {
+  u8[] out = u8[].filled(p.len(), 0);
+  out.copyFrom(p, 0, 0, p.len());
+  i32 i = p.len() - 1;
+  while (i >= 0 && out[i] == 255) {
+    out[i] = 0;
+    i--;
+  }
+  if (i >= 0) { out[i] = out[i] + 1; }
+  return out;
+}
 
 static i32 CHUNK = 32768;
 
@@ -55,33 +78,23 @@ async u8[]? getCode(Store store, U256 codeHash) {
   return code;
 }
 
-u8[] prefixed(u8 kind, u8[] a, u8[] b) {
-  u8[] out = u8[].filled(1 + a.len() + b.len(), kind);
-  out.copyFrom(a, 0, 1, a.len());
-  out.copyFrom(b, 0, 1 + a.len(), b.len());
-  return out;
+U256 intOf(Item it) {
+  u8[] b = bytesOf(it);
+  return U256.fromBytes(b, 0, b.len());
 }
 
-/** The first key after every key that starts with `p`, for a range's end. */
-u8[] after(u8[] p) {
-  u8[] out = u8[].filled(p.len(), 0);
-  out.copyFrom(p, 0, 0, p.len());
-  i32 i = p.len() - 1;
-  while (i >= 0 && out[i] == 255) {
-    out[i] = 0;
-    i--;
-  }
-  if (i >= 0) { out[i] = out[i] + 1; }
-  return out;
-}
-
-/** An account as the store has it, with whether any slot of it is stored. */
+/** An account as the store has it. */
 struct Known {
   u64 nonce;
   U256 balance;
+  U256 storageRoot;
   U256 codeHash;
   u8[] code;
-  bool hasStorage;
+}
+
+u8[] accountValue(u64 nonce, U256 balance, U256 storageRoot, U256 codeHash) {
+  return encode(Item.List([Item.Bytes(minimalBytes(nonce)), Item.Bytes(u256Bytes(balance)), Item.Bytes(storageRoot.toBytes()),
+                           Item.Bytes(codeHash.toBytes())]));
 }
 
 export struct StateDb {
@@ -94,10 +107,12 @@ export struct StateDb {
   Map<U256, Map<U256, bool>> wantSlots;
   /** Reads a run asked for that were not in memory: the run must go again once `fetch` has read them. */
   i32 misses;
+  /** The account trie, kept between commits so its upper nodes stay read. */
+  PathTrie? accountTrie;
 
   StateDb over(Store store) {
     return StateDb(store, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                   Map.create(hashU256, eqU256), 0);
+                   Map.create(hashU256, eqU256), 0, null);
   }
 
   /** What a `World` backed by this asks: answered from memory, a miss noted and answered as empty. */
@@ -132,32 +147,30 @@ export struct StateDb {
     return U256.zero();
   }
 
+  /** Whether the account's storage holds anything: its storage root is not the empty trie's. */
   bool hasStorage(this, U256 addr) {
     Known? k = this.accounts.get(addr) ?? null;
-    return k is not null && k!.hasStorage;
+    return k is not null && !k!.storageRoot.eq(U256.fromBytes(emptyRoot(), 0, 32));
+  }
+
+  /** The account as stored, or null; not cached. */
+  async Known? read(this, U256 addr) {
+    u8[]? raw = await this.store.get(accountKey(addr));
+    if (raw is null) { return null; }
+    Item[] f = itemsOf(decode(raw!).item);
+    U256 codeHash = U256.fromBytes(bytesOf(f[3]), 0, 32);
+    u8[] code = u8[].filled(0, 0);
+    if (!codeHash.eq(emptyCodeHash())) { code = (await getCode(this.store, codeHash)) ?? u8[].filled(0, 0); }
+    return Known(intOf(f[0]).low(), intOf(f[1]), U256.fromBytes(bytesOf(f[2]), 0, 32), codeHash, code);
   }
 
   /** Read everything the last run missed. "" or why not. */
   async string fetch(this) {
     U256[] addrs = this.wantAccounts.keys();
     for (i32 i = 0; i < addrs.len(); i++) {
-      u8[]? raw = await this.store.get(accountKey(addrs[i]));
-      if (raw is null) {
-        this.accounts.set(addrs[i], null);
-        continue;
-      }
-      Item[] f = itemsOf(decode(raw!).item);
-      U256 codeHash = U256.fromBytes(bytesOf(f[2]), 0, 32);
-      u8[] code = u8[].filled(0, 0);
-      if (!codeHash.eq(emptyCodeHash())) {
-        u8[]? c = await getCode(this.store, codeHash);
-        if (c is null) { return "the code of \{codeHash.toHex()} is not stored"; }
-        code = c!;
-      }
-      u8[] prefix = prefixed(1, keccak256(addressBytes(addrs[i])), u8[].filled(0, 0));
-      Vec<Change> any = await this.store.range(prefix, after(prefix), 1);
-      this.accounts.set(addrs[i], Known(U256.fromBytes(bytesOf(f[0]), 0, bytesOf(f[0]).len()).low(), U256.fromBytes(bytesOf(f[1]), 0, bytesOf(f[1]).len()),
-                                        codeHash, code, any.len() > 0));
+      Known? k = await this.read(addrs[i]);
+      if (k is not null && !k!.codeHash.eq(emptyCodeHash()) && k!.code.len() == 0) { return "the code of \{k!.codeHash.toHex()} is not stored"; }
+      this.accounts.set(addrs[i], k);
     }
     this.wantAccounts = Map.create(hashU256, eqU256);
     U256[] holders = this.wantSlots.keys();
@@ -171,77 +184,139 @@ export struct StateDb {
       }
       for (i32 k = 0; k < keys.len(); k++) {
         u8[]? raw = await this.store.get(slotKey(holders[i], keys[k]));
-        U256 v = U256.zero();
-        if (raw is not null) {
-          u8[] b = bytesOf(decode(raw!).item);
-          v = U256.fromBytes(b, 0, b.len());
-        }
-        m!.set(keys[k], v);
+        m!.set(keys[k], raw is null ? U256.zero() : intOf(decode(raw!).item));
       }
     }
     this.wantSlots = Map.create(hashU256, eqU256);
     return "";
   }
 
+  async PathTrie trie(this) {
+    if (this.accountTrie is null) {
+      PathTrie t = PathTrie.of(this.store, u8[].filled(0, 0));
+      await t.open();
+      this.accountTrie = t;
+    }
+    return this.accountTrie!;
+  }
+
   /**
-   * A block's changes, as `World.seal` recorded them, committed with `user` beside them; what was read
-   * into memory is forgotten for the accounts and slots it changed, so the next read sees the store.
+   * Accounts and slots — each account's new state, or null for gone, and the slots that changed under it —
+   * written with the tries that commit to them, as one commit with `user` beside it. The new state root, or
+   * null with `why[0]` saying why. What was read into memory is forgotten for what changed.
    */
-  async string flush(this, ChangeSet cs, u8[] user) {
+  async u8[]? write(this, U256[] addrs, AccountState?[] states, Map<U256, Map<U256, U256>> slotsOf, u8[] user, string[] why) {
     Vec<Change> out = Vec.create();
-    U256[] addrs = cs.after.keys();
-    for (i32 i = 0; i < addrs.len(); i++) {
-      AccountState a = cs.after.get(addrs[i])!;
-      if (!a.exists) {
-        out.push(Change(accountKey(addrs[i]), null));
-        // Gone, so its storage with it.
-        u8[] prefix = prefixed(1, keccak256(addressBytes(addrs[i])), u8[].filled(0, 0));
-        Vec<Change> slots = await this.store.range(prefix, after(prefix), 0x7fffffff);
-        for (i32 k = 0; k < slots.len(); k++) { out.push(Change(slots.get(k).key, null)); }
+    PathTrie accounts = await this.trie();
+    // Every account with changed slots, or changed itself.
+    Map<U256, bool> touched = Map.create(hashU256, eqU256);
+    for (i32 i = 0; i < addrs.len(); i++) { touched.set(addrs[i], true); }
+    U256[] holders = slotsOf.keys();
+    for (i32 i = 0; i < holders.len(); i++) { touched.set(holders[i], true); }
+    Map<U256, AccountState?> stateOf = Map.create(hashU256, eqU256);
+    for (i32 i = 0; i < addrs.len(); i++) { stateOf.set(addrs[i], states[i]); }
+    U256[] all = touched.keys();
+    for (i32 i = 0; i < all.len(); i++) {
+      U256 addr = all[i];
+      u8[] owner = keccak256(addressBytes(addr));
+      Known? before = await this.read(addr);
+      // Its state now: as written, or as stored when only its slots changed.
+      bool written = stateOf.has(addr);
+      AccountState? now = written ? stateOf.get(addr)! : null;
+      bool exists = written ? now is not null && now!.exists : before is not null;
+      if (!exists) {
+        // Gone, and its storage with it: every slot and every node of its trie.
+        u8[] sp = prefixed(1, owner, u8[].filled(0, 0));
+        Vec<Change> gone = await this.store.range(sp, after(sp), 0x7fffffff);
+        for (i32 k = 0; k < gone.len(); k++) { out.push(Change(gone.get(k).key, null)); }
+        u8[] tp = prefixed(4, owner, u8[].filled(0, 0));
+        Vec<Change> nodes = await this.store.range(tp, after(tp), 0x7fffffff);
+        for (i32 k = 0; k < nodes.len(); k++) { out.push(Change(nodes.get(k).key, null)); }
+        if (before is not null) {
+          out.push(Change(accountKey(addr), null));
+          await accounts.delete(owner);
+        }
       } else {
-        out.push(Change(accountKey(addrs[i]), accountValue(a.nonce, a.balance, a.codeHash)));
-        if (a.code.len() > 0) { putCode(out, a.codeHash, a.code); }
+        U256 root = before is null ? U256.fromBytes(emptyRoot(), 0, 32) : before!.storageRoot;
+        Map<U256, U256>? slots = slotsOf.get(addr);
+        if (slots is not null) {
+          PathTrie st = PathTrie.of(this.store, owner);
+          await st.open();
+          U256[] keys = slots!.keys();
+          for (i32 k = 0; k < keys.len(); k++) {
+            U256 v = slots!.get(keys[k])!;
+            u8[] hk = keccak256(keys[k].toBytes());
+            if (v.isZero()) {
+              out.push(Change(slotKey(addr, keys[k]), null));
+              await st.delete(hk);
+            } else {
+              u8[] enc = encode(Item.Bytes(u256Bytes(v)));
+              out.push(Change(slotKey(addr, keys[k]), enc));
+              await st.set(hk, enc);
+            }
+          }
+          if (st.error != "") {
+            why[0] = st.error;
+            return null;
+          }
+          root = U256.fromBytes(st.hash(), 0, 32);
+          Change[] nodes = st.changes();
+          for (i32 k = 0; k < nodes.len(); k++) { out.push(nodes[k]); }
+        }
+        u64 nonce = written ? now!.nonce : before!.nonce;
+        U256 balance = written ? now!.balance : before!.balance;
+        U256 codeHash = written ? now!.codeHash : before!.codeHash;
+        if (written && now!.code.len() > 0 && (before is null || !before!.codeHash.eq(codeHash))) { putCode(out, codeHash, now!.code); }
+        u8[] value = accountValue(nonce, balance, root, codeHash);
+        out.push(Change(accountKey(addr), value));
+        await accounts.set(owner, value);
       }
-      this.accounts.remove(addrs[i]);
-      this.slots.remove(addrs[i]);
+      this.accounts.remove(addr);
+      this.slots.remove(addr);
     }
-    U256[] holders = cs.slotsAfter.keys();
-    for (i32 i = 0; i < holders.len(); i++) {
-      Map<U256, U256> m = cs.slotsAfter.get(holders[i])!;
-      U256[] keys = m.keys();
-      for (i32 k = 0; k < keys.len(); k++) {
-        U256 v = m.get(keys[k])!;
-        out.push(Change(slotKey(holders[i], keys[k]), v.isZero() ? null : encode(Item.Bytes(u256Bytes(v)))));
-      }
-      this.slots.remove(holders[i]);
+    if (accounts.error != "") {
+      why[0] = accounts.error;
+      return null;
     }
-    return await this.store.commit(out.toArray(), user);
+    u8[] root = accounts.hash();
+    Change[] nodes = accounts.changes();
+    for (i32 k = 0; k < nodes.len(); k++) { out.push(nodes[k]); }
+    string bad = await this.store.commit(out.toArray(), user);
+    if (bad != "") {
+      why[0] = bad;
+      // The trie in memory is ahead of the store now; read it again next time.
+      this.accountTrie = null;
+      return null;
+    }
+    return root;
   }
-}
 
-u8[] accountValue(u64 nonce, U256 balance, U256 codeHash) {
-  return encode(Item.List([Item.Bytes(minimalBytes(nonce)), Item.Bytes(u256Bytes(balance)), Item.Bytes(codeHash.toBytes())]));
-}
-
-/** Every account and slot of `w` (with code), as one commit's changes: a genesis or a test's pre-state. */
-export Change[] changesOf(World w) {
-  Vec<Change> out = Vec.create();
-  U256[] addrs = w.accounts.keys();
-  for (i32 i = 0; i < addrs.len(); i++) {
-    Account a = w.accounts.get(addrs[i])!;
-    out.push(Change(accountKey(addrs[i]), accountValue(a.nonce, a.balance, a.codeHash)));
-    if (a.code.len() > 0) { putCode(out, a.codeHash, a.code); }
-    U256[] keys = a.storage.keys();
-    for (i32 k = 0; k < keys.len(); k++) {
-      out.push(Change(slotKey(addrs[i], keys[k]), encode(Item.Bytes(u256Bytes(a.storage.get(keys[k])!)))));
-    }
+  /** A block's changes, as `World.seal` recorded them, written with `write`. */
+  async u8[]? flush(this, ChangeSet cs, u8[] user, string[] why) {
+    U256[] addrs = cs.after.keys();
+    AccountState?[] states = AccountState?[].defaulted(addrs.len());
+    for (i32 i = 0; i < addrs.len(); i++) { states[i] = cs.after.get(addrs[i])!; }
+    return await this.write(addrs, states, cs.slotsAfter, user, why);
   }
-  return out.toArray();
+
+  /** Every account and slot of `w`, with code: a genesis, or a test's pre-state. */
+  async u8[]? seed(this, World w, u8[] user, string[] why) {
+    U256[] addrs = w.accounts.keys();
+    AccountState?[] states = AccountState?[].defaulted(addrs.len());
+    Map<U256, Map<U256, U256>> slots = Map.create(hashU256, eqU256);
+    for (i32 i = 0; i < addrs.len(); i++) {
+      Account a = w.accounts.get(addrs[i])!;
+      states[i] = AccountState(true, a.nonce, a.balance, a.code, a.codeHash);
+      if (a.storage.len() > 0) { slots.set(addrs[i], a.storage); }
+    }
+    return await this.write(addrs, states, slots, user, why);
+  }
 }
 
 /**
- * The state root of everything in the store, built from scratch: each account's storage root from its
- * slots, then the account trie. For tests and small states — the trie by path replaces it.
+ * The state root of everything in the store, built from scratch from the flat entries alone — each
+ * account's storage root from its slots, then the account trie — ignoring the tries the store keeps. The
+ * oracle the tries are checked against, for tests and small states.
  */
 export async u8[] rootOf(Store store) {
   Vec<Change> accounts = await store.range([0], [1], 0x7fffffff);
@@ -263,7 +338,7 @@ export async u8[] rootOf(Store store) {
     }
     Item[] f = itemsOf(decode(c.value!).item);
     keys[i] = hashed;
-    vals[i] = encode(Item.List([f[0], f[1], Item.Bytes(slots.len() == 0 ? emptyRoot() : trieRoot(sk, sv)), f[2]]));
+    vals[i] = encode(Item.List([f[0], f[1], Item.Bytes(slots.len() == 0 ? emptyRoot() : trieRoot(sk, sv)), f[3]]));
   }
   return accounts.len() == 0 ? emptyRoot() : trieRoot(keys, vals);
 }

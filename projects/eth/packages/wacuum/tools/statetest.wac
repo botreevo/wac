@@ -23,7 +23,7 @@ import { BlockEnv } from "../src/evm/evm.wac";
 import { Spec } from "../src/evm/spec.wac";
 import { Store } from "../src/store/tree.wac";
 import { MemDisk } from "../src/store/disk.wac";
-import { StateDb, changesOf, rootOf } from "../src/store/state.wac";
+import { StateDb, rootOf } from "../src/store/state.wac";
 import { Transaction, AccessEntry, Authorization, Processed, processTransaction, blobGasPrice } from "../src/tx/process.wac";
 
 struct Tally {
@@ -108,15 +108,16 @@ Transaction txFrom(JsonValue t, JsonValue indexes) {
  * computed from what the store then holds. `pre` is the world `worldFrom` built, before the transaction
  * ran on it — the transaction above ran on a copy, so this takes the state before it from the fixture's
  * pre-state through `changesOf`. What the plain run checks, this checks through the store's reads and
- * writes. (The wait is on a disk that never waits, so it is immediate.)
+ * writes. Awaited from `main` rather than driven with `wait()`, which keeps every call alive (wac 0473w).
  */
-(Processed, string) coldCase(Tally tally, World ran, Spec spec, BlockEnv block, Transaction tx, i64 gl) {
+async (Processed, string) coldCase(Tally tally, World ran, Spec spec, BlockEnv block, Transaction tx, i64 gl) {
   World pre = tally.pre!;
   MemDisk md = MemDisk.create();
-  Store s = Store.open(md.disk()).wait()!.unwrap();
-  string seeded = s.commit(changesOf(pre), u8[].filled(0, 0)).wait()!;
-  if (seeded != "") { return (processTransaction(spec, World.create(), block, tx, gl, spec.maxBlobGasPerBlock, null), "the pre-state did not commit: \{seeded}"); }
+  Store s = (await Store.open(md.disk())).unwrap();
   StateDb db = StateDb.over(s);
+  string[] why = [""];
+  u8[]? seeded = (await db.seed(pre, u8[].filled(0, 0), why));
+  if (seeded is null) { return (processTransaction(spec, World.create(), block, tx, gl, spec.maxBlobGasPerBlock, null), "the pre-state did not commit: \{why[0]}"); }
   World w = World.create();
   Processed? p = null;
   for (i32 round = 0; round < 1000; round++) {
@@ -127,15 +128,18 @@ Transaction txFrom(JsonValue t, JsonValue indexes) {
     p = processTransaction(spec, w, block, tx, gl, spec.maxBlobGasPerBlock, null);
     tally.rounds++;
     if (db.misses == 0) { break; }
-    db.fetch().wait()!;
+    (await db.fetch());
   }
-  string bad = db.flush(w.seal(), u8[].filled(0, 0)).wait()!;
-  if (bad != "") { return (p!, "the flush failed: \{bad}"); }
-  return (p!, bytesToHex(rootOf(s).wait()!));
+  u8[]? root = (await db.flush(w.seal(), u8[].filled(0, 0), why));
+  if (root is null) { return (p!, "the flush failed: \{why[0]}"); }
+  // The tries the store keeps against the flat entries alone.
+  string scratch = bytesToHex(await rootOf(s));
+  if (scratch != bytesToHex(root!)) { return (p!, "the stored tries say \{bytesToHex(root!)}, the entries \{scratch}"); }
+  return (p!, bytesToHex(root!));
 }
 
 /** One case: true when it matches the fixture. */
-bool runCase(Sys sys, Tally tally, string name, JsonValue test, JsonValue post, i32 idx) {
+async bool runCase(Sys sys, Tally tally, string name, JsonValue test, JsonValue post, i32 idx) {
   World w = worldFrom(test.member("pre")!);
   if (tally.cold) { tally.pre = worldFrom(test.member("pre")!); }
   JsonValue? config = test.member("config");
@@ -151,7 +155,7 @@ bool runCase(Sys sys, Tally tally, string name, JsonValue test, JsonValue post, 
   Processed p = processTransaction(spec, w, block, tx, gl, spec.maxBlobGasPerBlock, tracer);
   string coldRoot = "";
   if (tally.cold) {
-    (Processed cp, string r) = coldCase(tally, w, spec, block, tx, gl);
+    (Processed cp, string r) = await coldCase(tally, w, spec, block, tx, gl);
     p = cp;
     coldRoot = r;
   }
@@ -191,7 +195,7 @@ export async i32 main(Sys sys) {
       Ok(src): {
         match (parse(src)) {
           Err(e): { sys.log("FAIL \{arg}: not JSON"); tally.failed++; }
-          Ok(doc): { runFile(sys, tally, doc); }
+          Ok(doc): { await runFile(sys, tally, doc); }
         }
       }
     }
@@ -200,7 +204,7 @@ export async i32 main(Sys sys) {
   return tally.failed == 0 ? 0 : 1;
 }
 
-void runFile(Sys sys, Tally tally, JsonValue doc) {
+async void runFile(Sys sys, Tally tally, JsonValue doc) {
   JsonObject tests = doc.object()!;
   for (i32 i = 0; i < tests.len(); i++) {
     string name = tests.at(i).keyStr();
@@ -210,7 +214,7 @@ void runFile(Sys sys, Tally tally, JsonValue doc) {
     if (posts is null) { continue; }
     JsonArray cases = posts!.array()!;
     for (i32 c = 0; c < cases.len(); c++) {
-      if (runCase(sys, tally, name, test, cases.get(c), c)) { tally.passed++; } else { tally.failed++; }
+      if (await runCase(sys, tally, name, test, cases.get(c), c)) { tally.passed++; } else { tally.failed++; }
     }
   }
 }

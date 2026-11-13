@@ -1,0 +1,398 @@
+// The fetching half of `replay.sh`: asks a JSON-RPC node (`WACUUM_RPC`, an `https://` URL kept out of the
+// repository) for what `replay.wac` needs, and appends the answers to files in `--dir`, as they came.
+//
+//     fetch.wac --from N --count K --dir D [--prestate]
+//     fetch.wac --head          # the node's head block number, for follow.sh
+//
+// The first time, the blocks: the 256 headers before `from` (BLOCKHASH and the parent), then the K blocks
+// and their raw transactions. Each time after, what `D/want.txt` names — the accounts and slots the last
+// replay read and did not have — at block `from - 1`, the state the range starts from.
+//
+// Each line it writes is a tag, a tab, and one batch answer, untouched: the tag says what was asked, in the
+// order the answer's ids count. It is two programs rather than one because a program holding both `fetch`
+// and the client's block types does not compile at this pin of wac (`docs/wac-asks.md`).
+
+import { Sys } from "std";
+import { Vec, Map } from "core";
+import { hashString, stringEq } from "core";
+import { fetch.fetch, fetch.Caps } from "wac";
+import { json.parse, json.JsonValue, json.JsonArray, json.JsonObject } from "wac";
+
+/** The text of a batch of `requests`, each `"method":…,"params":…`, numbered from 0. */
+string batchOf(string[] requests) {
+  Vec<string> parts = Vec.create();
+  for (i32 i = 0; i < requests.len(); i++) {
+    string sep = i == 0 ? "[" : ",";
+    parts.push("\{sep}{\"jsonrpc\":\"2.0\",\"id\":\{i},\{requests[i]}}");
+  }
+  parts.push("]");
+  return join(parts);
+}
+
+string join(Vec<string> parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts.get(i).toBytes().len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    u8[] b = parts.get(i).toBytes();
+    for (i32 k = 0; k < b.len(); k++) { out[at + k] = b[k]; }
+    at += b.len();
+  }
+  return string.fromBytes(out);
+}
+
+/**
+ * One batch, retried on a rate limit (HTTP 429, or a 429 inside the answer) with a growing pause. The answer
+ * as it came, or "" with `why[0]` saying why not.
+ */
+async string ask(Sys sys, string url, string[] requests, string[] why) {
+  u8[] body = batchOf(requests).toBytes();
+  for (i32 attempt = 0; attempt < 10; attempt++) {
+    match (fetch(Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files()), "POST", url,
+                 ["Content-Type: application/json"], body)) {
+      Ok(r): {
+        if (r.status == 429) {
+          await sys.sleepMillis(1000 * (attempt + 1));
+          continue;
+        }
+        if (r.status != 200) {
+          why[0] = "HTTP \{r.status}";
+          return "";
+        }
+        JsonArray? answers = parse(r.body).ok()?.array();
+        if (answers is null || answers!.len() != requests.len()) {
+          why[0] = "not one answer for each request: \{string.fromBytes(r.body)}";
+          return "";
+        }
+        bool limited = false;
+        for (i32 i = 0; i < answers!.len(); i++) {
+          JsonValue? err = answers!.get(i).member("error");
+          if (err is null || err!.isNull()) { continue; }
+          if ((err!.member("code")?.number() ?? 0.0) == 429.0) {
+            limited = true;
+          } else {
+            why[0] = err!.member("message")?.text() ?? "an error";
+            return "";
+          }
+        }
+        if (limited) {
+          await sys.sleepMillis(1000 * (attempt + 1));
+          continue;
+        }
+        return string.fromBytes(r.body);
+      }
+      Err(e): {
+        why[0] = e;
+        await sys.sleepMillis(1000 * (attempt + 1));
+      }
+    }
+  }
+  return "";
+}
+
+/** Appends to a file by rewriting it: these are megabytes at most. */
+async bool append(Sys sys, string path, Vec<string> lines) {
+  string old = "";
+  match (await sys.readFile(path)) {
+    Ok(b): { old = string.fromBytes(b); }
+    Err(e): {}
+  }
+  Vec<string> all = Vec.create();
+  all.push(old);
+  for (i32 i = 0; i < lines.len(); i++) {
+    all.push(lines.get(i));
+    all.push("\n");
+  }
+  return (await sys.writeFile(path, join(all).toBytes())).isOk();
+}
+
+string quantity(u64 n) {
+  // Hex without leading zeros, as JSON-RPC quantities are.
+  if (n == 0) { return "0x0"; }
+  string digits = "0123456789abcdef";
+  u8[] d = digits.toBytes();
+  u8[] out = u8[].filled(16, 0);
+  i32 at = 16;
+  u64 v = n;
+  while (v > 0) {
+    at--;
+    out[at] = d[(v & 15) as! i32];
+    v = v >> 4;
+  }
+  u8[] t = u8[].filled(16 - at, 0);
+  for (i32 i = 0; i < t.len(); i++) { t[i] = out[at + i]; }
+  return "0x" + string.fromBytes(t);
+}
+
+u64 num(string s) {
+  u64 n = 0;
+  u8[] d = s.toBytes();
+  for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as u64); }
+  return n;
+}
+
+/** The lines of a text, without empty ones. */
+string[] linesOf(u8[] b) {
+  Vec<string> out = Vec.create();
+  i32 start = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == 10) {
+      if (i > start) {
+        u8[] l = u8[].filled(i - start, 0);
+        for (i32 k = 0; k < l.len(); k++) { l[k] = b[start + k]; }
+        out.push(string.fromBytes(l));
+      }
+      start = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  u64 from = 0;
+  u64 count = 1;
+  string dir = "";
+  for (i32 i = 0; i + 1 < args.len(); i++) {
+    if (args[i] == "--from") { from = num(args[i + 1]); }
+    if (args[i] == "--count") { count = num(args[i + 1]); }
+    if (args[i] == "--dir") { dir = args[i + 1]; }
+  }
+  bool prestate = false;
+  for (i32 i = 0; i < args.len(); i++) { prestate = prestate || args[i] == "--prestate"; }
+  auto env = await sys.env().get("WACUUM_RPC");
+  u8[]? raw = env.isOk() ? env.unwrap() : null;
+  string url = raw is null ? "" : string.fromBytes(raw!);
+  string[] why0 = [""];
+  for (i32 i = 0; i < args.len(); i++) {
+    if (args[i] != "--head" || url == "") { continue; }
+    // The node's head block number, in decimal on stdout: what `follow.sh` polls.
+    string got = await ask(sys, url, ["\"method\":\"eth_blockNumber\",\"params\":[]"], why0);
+    if (got == "") { sys.log("eth_blockNumber: \{why0[0]}"); return 1; }
+    string hex = parse(got.toBytes()).ok()!.array()!.get(0).member("result")!.text()!;
+    await sys.stdout().write((decimalOf(hex) + "\n").toBytes());
+    return 0;
+  }
+  if (url == "" || dir == "" || from < 300) {
+    sys.log("usage: WACUUM_RPC=https://... fetch.wac --from BLOCK --count N --dir DIR");
+    return 2;
+  }
+  string[] why = [""];
+  i32 calls = 0;
+
+  // What to fetch: the first time, what each transaction's access list names, which is most of what the
+  // range reads and saves replay.wac learning it a few slots a round; after that, what the last replay
+  // missed. As `A addr` and `S addr key` lines.
+  Vec<string> ws = Vec.create();
+  if (!(await sys.readFile(dir + "/blocks.txt")).isOk()) {
+    Vec<string> lines = Vec.create();
+    for (u64 n = from; n < from + count; n++) {
+      bool ok = prestate ? await seedFromTrace(sys, url, n, ws, why) : await seed(sys, url, n, quantity(from - 1), ws, why);
+      if (!ok) { sys.log("block \{n} access lists: \{why[0]}"); return 1; }
+      calls++;
+    }
+    for (u64 n = from - 256; n < from + count; n += 50) {
+      u64 end = n + 50 < from + count ? n + 50 : from + count;
+      string[] reqs = string[].filled((end - n) as! i32, "");
+      for (u64 k = n; k < end; k++) { reqs[(k - n) as! i32] = "\"method\":\"eth_getBlockByNumber\",\"params\":[\"\{quantity(k)}\",false]"; }
+      string got = await ask(sys, url, reqs, why);
+      calls++;
+      if (got == "") { sys.log("blocks from \{n}: \{why[0]}"); return 1; }
+      lines.push("blocks \{n}\t\{got}");
+      // The raw transactions of the blocks in the range, a batch per block.
+      JsonArray answers = parse(got.toBytes()).ok()!.array()!;
+      for (i32 i = 0; i < answers.len(); i++) {
+        JsonValue b = answers.get(i).member("result")!;
+        u64 number = num(decimalOf(b.member("number")!.text()!));
+        if (number < from) { continue; }
+        JsonArray hs = b.member("transactions")?.array() ?? JsonArray.create();
+        for (i32 at = 0; at < hs.len(); at += 100) {
+          i32 m = hs.len() - at < 100 ? hs.len() - at : 100;
+          string[] tx = string[].filled(m, "");
+          for (i32 j = 0; j < m; j++) { tx[j] = "\"method\":\"eth_getRawTransactionByHash\",\"params\":[\"\{hs.get(at + j).text()!}\"]"; }
+          string t = await ask(sys, url, tx, why);
+          calls++;
+          if (t == "") { sys.log("block \{number} transactions: \{why[0]}"); return 1; }
+          lines.push("txs \{number} \{at}\t\{t}");
+        }
+      }
+    }
+    if (!(await append(sys, dir + "/blocks.txt", lines))) { sys.log("cannot write \{dir}/blocks.txt"); return 1; }
+  }
+
+  u8[] want = (await sys.readFile(dir + "/want.txt")).orElse(u8[].filled(0, 0));
+  string[] wanted = linesOf(want);
+  for (i32 i = 0; i < wanted.len(); i++) { ws.push(wanted[i]); }
+  Map<string, bool> seen = Map.create(hashString, stringEq);
+  Vec<string> accounts = Vec.create();
+  Vec<string> slots = Vec.create();
+  for (i32 i = 0; i < ws.len(); i++) {
+    string w = ws.get(i);
+    if (seen.has(w)) { continue; }
+    seen.set(w, true);
+    if (w.indexOf("A ") == 0) { accounts.push(w.slice(2, w.len())); }
+    if (w.indexOf("S ") == 0) { slots.push(w.slice(2, w.len())); }
+  }
+  string at = quantity(from - 1);
+  Vec<string> out = Vec.create();
+  for (i32 i = 0; i < accounts.len(); i += 50) {
+    i32 m = accounts.len() - i < 50 ? accounts.len() - i : 50;
+    string[] proofs = string[].filled(m, "");
+    string[] codes = string[].filled(m, "");
+    Vec<string> names = Vec.create();
+    for (i32 k = 0; k < m; k++) {
+      string a = accounts.get(i + k);
+      proofs[k] = "\"method\":\"eth_getProof\",\"params\":[\"\{a}\",[],\"\{at}\"]";
+      codes[k] = "\"method\":\"eth_getCode\",\"params\":[\"\{a}\",\"\{at}\"]";
+      names.push(k == 0 ? a : "," + a);
+    }
+    string p = await ask(sys, url, proofs, why);
+    string c = p == "" ? "" : await ask(sys, url, codes, why);
+    calls += 2;
+    if (c == "") { sys.log("accounts: \{why[0]}"); return 1; }
+    out.push("proofs \{join(names)}\t\{p}");
+    out.push("codes \{join(names)}\t\{c}");
+  }
+  for (i32 i = 0; i < slots.len(); i += 100) {
+    i32 m = slots.len() - i < 100 ? slots.len() - i : 100;
+    string[] reqs = string[].filled(m, "");
+    Vec<string> names = Vec.create();
+    for (i32 k = 0; k < m; k++) {
+      string s = slots.get(i + k);
+      i32 sp = s.indexOf(" ");
+      reqs[k] = "\"method\":\"eth_getStorageAt\",\"params\":[\"\{s.slice(0, sp)}\",\"\{s.slice(sp + 1, s.len())}\",\"\{at}\"]";
+      names.push((k == 0 ? "" : ",") + s.slice(0, sp) + ":" + s.slice(sp + 1, s.len()));
+    }
+    string got = await ask(sys, url, reqs, why);
+    calls++;
+    if (got == "") { sys.log("slots: \{why[0]}"); return 1; }
+    out.push("slots \{join(names)}\t\{got}");
+  }
+  if (out.len() > 0 && !(await append(sys, dir + "/state.txt", out))) { sys.log("cannot write \{dir}/state.txt"); return 1; }
+  sys.log("fetched \{accounts.len()} accounts and \{slots.len()} slots in \{calls} requests");
+  return 0;
+}
+
+/**
+ * Block `n`'s transactions run through `eth_createAccessList` on the state before the range, each alone: the
+ * accounts and slots that names, with each sender, recipient and the fee recipient, as `A`/`S` lines into
+ * `out`. Not exact — a transaction runs here after those before it — which the replay's rounds make up.
+ */
+async bool seed(Sys sys, string url, u64 n, string at, Vec<string> out, string[] why) {
+  string got = await ask(sys, url, ["\"method\":\"eth_getBlockByNumber\",\"params\":[\"\{quantity(n)}\",true]"], why);
+  if (got == "") { return false; }
+  JsonValue b = parse(got.toBytes()).ok()!.array()!.get(0).member("result")!;
+  out.push("A " + b.member("miner")!.text()!);
+  JsonArray txs = b.member("transactions")?.array() ?? JsonArray.create();
+  // Ten at a time, with a pause: an access list costs a hosted node's rate limit several reads' worth.
+  for (i32 i = 0; i < txs.len(); i += 10) {
+    i32 m = txs.len() - i < 10 ? txs.len() - i : 10;
+    await sys.sleepMillis(300);
+    string[] reqs = string[].filled(m, "");
+    for (i32 k = 0; k < m; k++) {
+      JsonValue t = txs.get(i + k);
+      string from = t.member("from")!.text()!;
+      out.push("A " + from);
+      Vec<string> f = Vec.create();
+      f.push("{\"from\":\"\{from}\"");
+      string? to = t.member("to")?.text();
+      if (to is not null) {
+        f.push(",\"to\":\"\{to!}\"");
+        out.push("A " + to!);
+      }
+      f.push(",\"gas\":\"\{t.member("gas")!.text()!}\",\"value\":\"\{t.member("value")!.text()!}\",\"data\":\"\{t.member("input")!.text()!}\"");
+      string? max = t.member("maxFeePerGas")?.text();
+      if (max is not null) {
+        f.push(",\"maxFeePerGas\":\"\{max!}\",\"maxPriorityFeePerGas\":\"\{t.member("maxPriorityFeePerGas")!.text()!}\"");
+      } else {
+        f.push(",\"gasPrice\":\"\{t.member("gasPrice")!.text()!}\"");
+      }
+      f.push("}");
+      reqs[k] = "\"method\":\"eth_createAccessList\",\"params\":[\{join(f)},\"\{at}\"]";
+    }
+    // A transaction the node cannot run alone (one that needs an earlier one's effects) answers with an
+    // error, which costs nothing here: the replay learns what it reads.
+    string lists = await askLenient(sys, url, reqs, why);
+    if (lists == "") { return false; }
+    JsonArray answers = parse(lists.toBytes()).ok()!.array()!;
+    for (i32 k = 0; k < answers.len(); k++) {
+      JsonArray entries = answers.get(k).member("result")?.member("accessList")?.array() ?? JsonArray.create();
+      for (i32 e = 0; e < entries.len(); e++) {
+        string addr = entries.get(e).member("address")!.text()!;
+        out.push("A " + addr);
+        JsonArray keys = entries.get(e).member("storageKeys")?.array() ?? JsonArray.create();
+        for (i32 j = 0; j < keys.len(); j++) { out.push("S " + addr + " " + keys.get(j).text()!); }
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Block `n`'s reads exactly, from `debug_traceBlockByNumber` with geth's `prestateTracer`: every account and
+ * slot each transaction touched. Only the names are kept — a value there is before its transaction, not
+ * before the range — so the values are still fetched at the range's start. Needs a node that serves
+ * `debug_` (a local geth or reth does; hosted free tiers do not).
+ */
+async bool seedFromTrace(Sys sys, string url, u64 n, Vec<string> out, string[] why) {
+  string got = await ask(sys, url, ["\"method\":\"debug_traceBlockByNumber\",\"params\":[\"\{quantity(n)}\",{\"tracer\":\"prestateTracer\"}]"], why);
+  if (got == "") { return false; }
+  JsonArray traces = parse(got.toBytes()).ok()!.array()!.get(0).member("result")?.array() ?? JsonArray.create();
+  for (i32 t = 0; t < traces.len(); t++) {
+    JsonObject? pre = traces.get(t).member("result")?.object();
+    if (pre is null) { continue; }
+    for (i32 a = 0; a < pre!.len(); a++) {
+      string addr = pre!.at(a).keyStr();
+      out.push("A " + addr);
+      JsonObject? st = pre!.at(a).value.member("storage")?.object();
+      if (st is null) { continue; }
+      for (i32 k = 0; k < st!.len(); k++) { out.push("S " + addr + " " + st!.at(k).keyStr()); }
+    }
+  }
+  return true;
+}
+
+/** `ask`, but an error in one answer is that answer's business: only the transport has to work. */
+async string askLenient(Sys sys, string url, string[] requests, string[] why) {
+  u8[] body = batchOf(requests).toBytes();
+  for (i32 attempt = 0; attempt < 10; attempt++) {
+    match (fetch(Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files()), "POST", url,
+                 ["Content-Type: application/json"], body)) {
+      Ok(r): {
+        JsonArray? got = r.status == 200 ? parse(r.body).ok()?.array() : null;
+        bool limited = false;
+        for (i32 i = 0; got is not null && i < got!.len(); i++) {
+          limited = limited || (got!.get(i).member("error")?.member("code")?.number() ?? 0.0) == 429.0;
+        }
+        if (got is not null && !limited) { return string.fromBytes(r.body); }
+        why[0] = "HTTP \{r.status}";
+      }
+      Err(e): { why[0] = e; }
+    }
+    await sys.sleepMillis(1000 * (attempt + 1));
+  }
+  return "";
+}
+
+/** A hex quantity's value in decimal digits, for `num`. */
+string decimalOf(string hex) {
+  u64 v = 0;
+  u8[] d = hex.toBytes();
+  for (i32 i = 2; i < d.len(); i++) {
+    u8 c = d[i];
+    u64 x = c >= 97 ? ((c - 87) as u64) : c >= 65 ? ((c - 55) as u64) : ((c - 48) as u64);
+    v = v * 16 + x;
+  }
+  if (v == 0) { return "0"; }
+  u8[] out = u8[].filled(20, 0);
+  i32 at = 20;
+  while (v > 0) {
+    at--;
+    out[at] = ((v % 10) as! u8) + 48;
+    v = v / 10;
+  }
+  u8[] t = u8[].filled(20 - at, 0);
+  for (i32 i = 0; i < t.len(); i++) { t[i] = out[at + i]; }
+  return string.fromBytes(t);
+}

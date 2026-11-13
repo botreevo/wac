@@ -1,0 +1,388 @@
+// Mainnet blocks run here against the state a JSON-RPC node says they started from: how fast, and whether
+// every commitment but the state root comes out as the block's header says. `replay.sh` drives it:
+//
+//     WACUUM_RPC=https://... sh tools/mainnet/replay.sh FROM COUNT [DIR]
+//
+// `fetch.wac` puts in DIR the blocks, their raw transactions and the 256 hashes before them, and then the
+// accounts and slots the blocks read, all as they were before the first block. That one snapshot serves
+// every block of the range, because what a later block reads and no earlier one wrote is unchanged since.
+//
+// Which accounts and slots a block reads is learnt by running it: this runs the range against what has
+// been fetched (a miss read as empty, a transaction that then fails left out so the rest still run),
+// writes what it missed to DIR/want.txt and exits 3; the script fetches those and runs this again, until a
+// run misses nothing. Then the range is imported as a client would, timed, every check made. The state
+// root cannot match, since the world here holds only what the blocks touched, so "state root does not
+// match" is the one failure that is a pass.
+//
+// The time is an upper bound on what wacuum does with the state in memory: no disk, no trie nodes to read.
+// It is given with every sender recovered, and again with the senders known.
+
+import { Sys } from "std";
+import { Map, Vec } from "core";
+import { json.parse, json.JsonValue, json.JsonArray } from "wac";
+import { rlp.Item } from "@/lib.wac";
+import { keccak256 } from "../../src/crypto/keccak.wac";
+import { U256 } from "../../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../../src/hex.wac";
+import { World, Account, StateSource, emptyCodeHash, slotMap, hashU256, eqU256 } from "../../src/state/world.wac";
+import { Header, Block, Withdrawal, Body, executeBlock, executeBody } from "../../src/chain/block.wac";
+import { BlockEnv } from "../../src/evm/evm.wac";
+import { blobGasPrice } from "../../src/tx/process.wac";
+import { SenderCache } from "../../src/tx/decode.wac";
+import { txItem } from "../../src/engine/engine.wac";
+import { Genesis, genesisFrom } from "../../src/chain/genesis.wac";
+import { ChainConfig, Spec } from "../../src/evm/spec.wac";
+import { emptyRoot } from "../../src/trie/trie.wac";
+
+/**
+ * Mainnet's forks from Cancun, by time, with their blob schedules (EIP-7840's and the BPO forks'): the
+ * config a geth-format genesis would carry, for `genesisFrom` to read.
+ */
+string mainnet() {
+  return "{\"config\":{\"chainId\":1,\"cancunTime\":1710338135,\"pragueTime\":1746612311,\"osakaTime\":1764798551,"
+  + "\"bpo1Time\":1765290071,\"bpo2Time\":1767747671,\"blobSchedule\":{"
+  + "\"cancun\":{\"target\":3,\"max\":6,\"baseFeeUpdateFraction\":3338477},"
+  + "\"prague\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716},"
+  + "\"osaka\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716},"
+  + "\"bpo1\":{\"target\":10,\"max\":15,\"baseFeeUpdateFraction\":8346193},"
+  + "\"bpo2\":{\"target\":14,\"max\":21,\"baseFeeUpdateFraction\":11684671}}},"
+  + "\"alloc\":{},\"timestamp\":\"0x65f1b057\"}";
+}
+
+/** An account as the node reported it before the range. */
+struct Known {
+  bool exists;
+  u64 nonce;
+  U256 balance;
+  U256 codeHash;
+  u8[] code;
+  bool hasStorage;
+}
+
+/** What has been fetched, and what the last run wanted that had not been. */
+struct Cache {
+  Map<U256, Known> accounts;
+  Map<U256, Map<U256, U256>> slots;
+  Map<U256, bool> wantAccounts;
+  Map<U256, Map<U256, bool>> wantSlots;
+  i32 misses;
+
+  Cache create() {
+    return Cache(Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
+                 Map.create(hashU256, eqU256), 0);
+  }
+
+  StateSource source(this) {
+    Cache c = this;
+    return StateSource((U256 addr) => c.account(addr), (U256 addr, U256 key) => c.slot(addr, key),
+                       (U256 addr) => c.storageOf(addr));
+  }
+
+  Account? account(this, U256 addr) {
+    Known? k = this.accounts.get(addr);
+    if (k is null) {
+      this.wantAccounts.set(addr, true);
+      this.misses++;
+      return null;
+    }
+    if (!k!.exists) { return null; }
+    return Account(k!.nonce, k!.balance, k!.code, k!.codeHash, slotMap(), null, Map.create(hashU256, eqU256));
+  }
+
+  U256 slot(this, U256 addr, U256 key) {
+    Map<U256, U256>? m = this.slots.get(addr);
+    U256? v = m?.get(key);
+    if (v is not null) { return v!; }
+    Map<U256, bool>? w = this.wantSlots.get(addr);
+    if (w is null) {
+      Map<U256, bool> fresh = Map.create(hashU256, eqU256);
+      this.wantSlots.set(addr, fresh);
+      w = fresh;
+    }
+    w!.set(key, true);
+    this.misses++;
+    return U256.zero();
+  }
+
+  bool storageOf(this, U256 addr) {
+    Known? k = this.accounts.get(addr);
+    return k is not null && k!.hasStorage;
+  }
+
+  void putSlot(this, U256 addr, U256 key, U256 v) {
+    Map<U256, U256>? m = this.slots.get(addr);
+    if (m is null) {
+      Map<U256, U256> fresh = Map.create(hashU256, eqU256);
+      this.slots.set(addr, fresh);
+      m = fresh;
+    }
+    m!.set(key, v);
+  }
+}
+
+U256 hexU256(JsonValue? v) { return U256.fromHex(v?.text() ?? "0x0") ?? U256.zero(); }
+u8[] hexBytes(JsonValue? v) { return hexToBytes(v?.text() ?? "0x") ?? u8[].filled(0, 0); }
+
+/** A block's header as `eth_getBlockByNumber` spells it. */
+Header headerOf(JsonValue b) {
+  u8[] nonce = hexBytes(b.member("nonce"));
+  return Header(hexU256(b.member("parentHash")), hexU256(b.member("sha3Uncles")), hexU256(b.member("miner")),
+                hexU256(b.member("stateRoot")), hexU256(b.member("transactionsRoot")), hexU256(b.member("receiptsRoot")),
+                hexBytes(b.member("logsBloom")), hexU256(b.member("difficulty")), hexU256(b.member("number")),
+                hexU256(b.member("gasLimit")), hexU256(b.member("gasUsed")), hexU256(b.member("timestamp")),
+                hexBytes(b.member("extraData")), hexU256(b.member("mixHash")), nonce.len() == 8 ? nonce : u8[].filled(8, 0),
+                hexU256(b.member("baseFeePerGas")), hexU256(b.member("withdrawalsRoot")), hexU256(b.member("blobGasUsed")),
+                hexU256(b.member("excessBlobGas")), hexU256(b.member("parentBeaconBlockRoot")), hexU256(b.member("requestsHash")),
+                hexU256(b.member("hash")));
+}
+
+Withdrawal[] withdrawalsOf(JsonValue b) {
+  JsonArray a = b.member("withdrawals")?.array() ?? JsonArray.create();
+  Withdrawal[] out = Withdrawal[].filled(a.len(), Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero()));
+  for (i32 i = 0; i < a.len(); i++) {
+    JsonValue w = a.get(i);
+    out[i] = Withdrawal(hexU256(w.member("index")), hexU256(w.member("validatorIndex")), hexU256(w.member("address")),
+                        hexU256(w.member("amount")));
+  }
+  return out;
+}
+
+/** What one run of the range came to. */
+struct Run {
+  string[] errors;
+  i64 gas;
+  i32 txs;
+  i64 nanos;
+}
+
+/**
+ * The range on a fresh world backed by `cache`. Learning, a transaction that cannot be included is left out
+ * so that the rest still run and say what they read; otherwise each block is imported as a client would.
+ */
+async Run runRange(Sys sys, Cache cache, ChainConfig config, Block[] blocks, Header first, Map<U256, U256> hashes, bool learning,
+                   SenderCache? senders) {
+  World w = World.create();
+  w.backBy(cache.source());
+  Header parent = first;
+  string[] errors = string[].filled(blocks.len(), "");
+  i64 gas = 0;
+  i32 txs = 0;
+  i64 t0 = await sys.monotonicNanos();
+  for (i32 i = 0; i < blocks.len(); i++) {
+    Block b = blocks[i];
+    Spec spec = config.specAt(b.header.timestamp);
+    if (learning) {
+      Header h = b.header;
+      BlockEnv env = BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee,
+                              blobGasPrice(spec, h.excessBlobGas), config.chainId, hashes);
+      executeBody(spec, w, env, h, b.txs, b.withdrawals, true, senders);
+    } else {
+      Body r = executeBlock(spec, w, b, parent, config.chainId, hashes, senders);
+      errors[i] = r.error;
+      gas += b.header.gasUsed.low() as@ i64;
+      txs += b.txs.len();
+    }
+    hashes.set(b.header.number, b.header.hash);
+    parent = b.header;
+  }
+  return Run(errors, gas, txs, (await sys.monotonicNanos()) - t0);
+}
+
+/** An address as 0x and forty hex digits. */
+string addrHex(U256 a) {
+  u8[] b = a.toBytes();
+  u8[] out = u8[].filled(20, 0);
+  for (i32 i = 0; i < 20; i++) { out[i] = b[12 + i]; }
+  return bytesToHex(out);
+}
+
+u64 num(string s) {
+  u64 n = 0;
+  u8[] d = s.toBytes();
+  for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as u64); }
+  return n;
+}
+
+/** `s` cut at every `sep` byte. */
+string[] cut(string s, u8 sep) {
+  Vec<string> out = Vec.create();
+  u8[] b = s.toBytes();
+  i32 start = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == sep) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+/** A batch answer's results, in the order of their ids. */
+JsonValue[] results(string json) {
+  JsonArray a = parse(json.toBytes()).ok()!.array()!;
+  JsonValue[] out = JsonValue[].filled(a.len(), JsonValue.Bool(false));
+  for (i32 i = 0; i < a.len(); i++) {
+    JsonValue v = a.get(i);
+    i32 id = (v.member("id")!.number() ?? 0.0) as! i32;
+    out[id] = v.member("result") ?? JsonValue.Bool(false);
+  }
+  return out;
+}
+
+/** What `fetch.wac` wrote to DIR/state.txt, into the cache; false with `why[0]` if it does not add up. */
+bool load(Cache cache, u8[] text, string[] why) {
+  string[] lines = cut(string.fromBytes(text), 10);
+  for (i32 l = 0; l < lines.len(); l++) {
+    string line = lines[l];
+    i32 tab = line.indexOf("\t");
+    if (tab < 0) { continue; }
+    string[] tag = cut(line.slice(0, tab), 32);
+    JsonValue[] rs = results(line.slice(tab + 1, line.len()));
+    string[] names = cut(tag[1], 44);
+    for (i32 i = 0; i < names.len(); i++) {
+      if (tag[0] == "proofs") {
+        JsonValue p = rs[i];
+        U256 codeHash = hexU256(p.member("codeHash"));
+        U256 balance = hexU256(p.member("balance"));
+        u64 nonce = hexU256(p.member("nonce")).low();
+        bool noCode = codeHash.isZero() || codeHash.eq(emptyCodeHash());
+        U256 sh = hexU256(p.member("storageHash"));
+        bool storage = !sh.isZero() && !sh.eq(U256.fromBytes(emptyRoot(), 0, 32));
+        bool exists = nonce != 0 || !balance.isZero() || !noCode;
+        cache.accounts.set(U256.fromHex(names[i])!, Known(exists, nonce, balance, noCode ? emptyCodeHash() : codeHash,
+                                                         u8[].filled(0, 0), storage));
+      } else if (tag[0] == "codes") {
+        Known k = cache.accounts.get(U256.fromHex(names[i])!)!;
+        k.code = hexBytes(rs[i]);
+        if (!U256.fromBytes(keccak256(k.code), 0, 32).eq(k.codeHash)) {
+          why[0] = "the code of \{names[i]} does not hash to its code hash";
+          return false;
+        }
+      } else if (tag[0] == "slots") {
+        string[] ak = cut(names[i], 58);
+        cache.putSlot(U256.fromHex(ak[0])!, U256.fromHex(ak[1])!, hexU256(rs[i]));
+      }
+    }
+  }
+  return true;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  string dir = "";
+  for (i32 i = 0; i + 1 < args.len(); i++) {
+    if (args[i] == "--dir") { dir = args[i + 1]; }
+  }
+  string[] why = [""];
+  u8[]? blocksText = (await sys.readFile(dir + "/blocks.txt")).ok();
+  if (dir == "" || blocksText is null) {
+    sys.log("usage: replay.wac --dir DIR, where fetch.wac has written DIR/blocks.txt");
+    return 2;
+  }
+  Genesis g = genesisFrom(parse(mainnet().toBytes()).ok()!, why)!;
+
+  // The headers: the 256 before the range, then the range's blocks with their transactions.
+  Map<U256, U256> hashes = Map.create(hashU256, eqU256);
+  Vec<JsonValue> inRange = Vec.create();
+  Map<U256, Vec<Item>> txsOf = Map.create(hashU256, eqU256);
+  Header? first = null;
+  u64 from = 0;
+  string[] lines = cut(string.fromBytes(blocksText!), 10);
+  for (i32 l = 0; l < lines.len(); l++) {
+    string line = lines[l];
+    i32 tab = line.indexOf("\t");
+    if (tab < 0) { continue; }
+    string[] tag = cut(line.slice(0, tab), 32);
+    JsonValue[] rs = results(line.slice(tab + 1, line.len()));
+    if (tag[0] == "blocks") {
+      if (from == 0) { from = num(tag[1]) + 256; }
+      for (i32 i = 0; i < rs.len(); i++) {
+        Header h = headerOf(rs[i]);
+        if (h.number.low() < from) {
+          hashes.set(h.number, h.hash);
+          if (h.number.low() == from - 1) { first = h; }
+        } else {
+          inRange.push(rs[i]);
+        }
+      }
+    } else if (tag[0] == "txs") {
+      U256 n = U256.ofU64(num(tag[1]));
+      Vec<Item>? v = txsOf.get(n);
+      if (v is null) {
+        Vec<Item> fresh = Vec.create();
+        txsOf.set(n, fresh);
+        v = fresh;
+      }
+      for (i32 i = 0; i < rs.len(); i++) {
+        Item? it = txItem(hexBytes(rs[i]));
+        if (it is null) {
+          sys.log("block \{tag[1]}: a transaction does not decode");
+          return 1;
+        }
+        v!.push(it!);
+      }
+    }
+  }
+  Block[] range = Block[].filled(inRange.len(), Block(first!, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))), false,
+                                                       Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero()))));
+  for (i32 i = 0; i < range.len(); i++) {
+    JsonValue b = inRange.get(i);
+    Header h = headerOf(b);
+    Vec<Item>? txs = txsOf.get(h.number);
+    range[i] = Block(h, txs is null ? Item[].filled(0, Item.Bytes(u8[].filled(0, 0))) : txs!.toArray(), false, withdrawalsOf(b));
+  }
+
+  Cache cache = Cache.create();
+  u8[]? stateText = (await sys.readFile(dir + "/state.txt")).ok();
+  if (stateText is not null && !load(cache, stateText!, why)) {
+    sys.log("state: \{why[0]}");
+    return 1;
+  }
+
+  // A run that learns: anything it reads and the cache has not got is written down for fetch.wac.
+  await runRange(sys, cache, g.config, range, first!, copyOf(hashes), true, null);
+  if (cache.misses > 0) {
+    Vec<string> want = Vec.create();
+    U256[] accts = cache.wantAccounts.keys();
+    for (i32 i = 0; i < accts.len(); i++) { want.push("A \{addrHex(accts[i])}\n"); }
+    U256[] holders = cache.wantSlots.keys();
+    for (i32 i = 0; i < holders.len(); i++) {
+      U256[] keys = cache.wantSlots.get(holders[i])!.keys();
+      for (i32 k = 0; k < keys.len(); k++) { want.push("S \{addrHex(holders[i])} \{keys[k].toHex()}\n"); }
+    }
+    string text = "";
+    for (i32 i = 0; i < want.len(); i++) { text = text + want.get(i); }
+    await sys.writeFile(dir + "/want.txt", text.toBytes());
+    sys.log("\{accts.len()} accounts and the slots of \{holders.len()} more to fetch (\{cache.accounts.len()} accounts known)");
+    return 3;
+  }
+  await sys.writeFile(dir + "/want.txt", u8[].filled(0, 0));
+
+  // Imported as a client would, with every check; timed, first recovering every sender, then with them known.
+  SenderCache senders = SenderCache.create();
+  await runRange(sys, cache, g.config, range, first!, copyOf(hashes), false, senders);
+  i32 bad = 0;
+  for (i32 pass = 0; pass < 2; pass++) {
+    Run r = await runRange(sys, cache, g.config, range, first!, copyOf(hashes), false, pass == 0 ? null : senders);
+    for (i32 i = 0; pass == 0 && i < range.len(); i++) {
+      string e = r.errors[i];
+      if (e != "" && e != "state root does not match") {
+        bad++;
+        sys.log("block \{range[i].header.number.toDecimal()}: \{e}");
+      }
+    }
+    i64 us = r.nanos / 1000;
+    i64 mgas = us == 0 ? 0 : r.gas / us;
+    string how = pass == 0 ? "recovering every sender" : "with the senders known";
+    sys.log("\{range.len()} blocks from \{from}, \{r.txs} transactions, \{r.gas / 1000000} Mgas in \{us / 1000} ms \{how}: \{mgas} Mgas/s");
+  }
+  sys.log(bad == 0 ? "every block matches its header but for the state root" : "\{bad} block(s) differ from their headers");
+  return bad == 0 ? 0 : 1;
+}
+
+Map<U256, U256> copyOf(Map<U256, U256> m) {
+  Map<U256, U256> out = Map.create(hashU256, eqU256);
+  U256[] ks = m.keys();
+  for (i32 i = 0; i < ks.len(); i++) { out.set(ks[i], m.get(ks[i])!); }
+  return out;
+}

@@ -2,6 +2,20 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
+## A program holding `fetch` and the client's block types fails to emit (wac `7f559349c`)
+
+`tools/mainnet/` was one program: it asked a node over `fetch` and ran blocks. Built, it stopped at
+`wacc: cannot emit tools/mainnet/replay.wac — a constant whose value is not a constant expression`, with no
+name and no line; `wac check` on the same file finds nothing. Bisected: it needs a struct of this file's
+that holds a `fetch.Caps` *or* has a method calling `fetch`, together with any use of `Header` from
+`src/chain/block.wac` (a local `Header h = g.header;` is enough), with `genesis.wac` in the program. Each of
+those alone builds, and so does a small file with all three, so there is no paste-sized reproduction yet —
+the 0374a family (a static declined inside a method instance) is the likeliest. Worked around by splitting
+the tool: `fetch.wac` talks to the node and never sees a block type, `replay.wac` runs blocks and never
+sees `fetch`, and `replay.sh` alternates them. wac master has `6f6b1d657` (types matched by declaration,
+not spelling), which may be the fix; check on the next pin move, and if not, the message should name the
+constant.
+
 ## The static evaluator: no `switch`, and one step budget for a whole file (wac `issues/lang/0422w`)
 
 Two things met while moving bn254's and secp256k1's constants to compile time:

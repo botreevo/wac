@@ -118,6 +118,30 @@ export struct ChangeSet {
   }
 }
 
+/**
+ * Where state that is not in memory comes from, asked on a miss: today `tools/mainnet/replay.wac`, which
+ * fills it from a node over JSON-RPC, and the shape a store on disk would take. Asked once for each account
+ * and each slot; what it answers is the state before anything here changed it, so a world it backs runs
+ * as though it had held all of it.
+ */
+export struct StateSource {
+  /** The account without its storage, which `slot` answers; null for one that does not exist. */
+  fn<Account?(U256)> account;
+  /** A slot of an account `account` answered, zero for an empty one. */
+  fn<U256(U256, U256)> slot;
+  /** Whether that account's storage holds anything: CREATE's collision rule asks without naming a slot. */
+  fn<bool(U256)> hasStorage;
+}
+
+/** What a world has asked its source already, so that each answer is asked for once and a deletion sticks. */
+struct Backing {
+  StateSource source;
+  Map<U256, bool> asked;
+  /** The accounts the source had, whose slots it can answer. */
+  Map<U256, bool> held;
+  Map<U256, Map<U256, bool>> slotsAsked;
+}
+
 export struct Snapshot {
   i32 journal;
   i32 logs;
@@ -155,41 +179,91 @@ export struct World {
    * Bounded: past ten thousand codes it starts again.
    */
   Map<U256, bool[]> jumpdests;
+  /** Where accounts and slots not in `accounts` come from, or null when `accounts` is the whole state. */
+  Backing? backing;
 
   World create() {
     return World(Map.create(hashU256, eqU256), Vec.create(), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                  Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                  Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0, Vec.create(), null,
-                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256));
+                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), null);
+  }
+
+  /** Back this world by `source`: what it does not hold is asked of the source once, then held. */
+  void backBy(this, StateSource source) {
+    this.backing = Backing(source, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256));
+  }
+
+  /** The account, from memory or else from the source. */
+  Account? find(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    if (a is not null || this.backing is null) { return a; }
+    Backing b = this.backing!;
+    if (b.asked.has(addr)) { return null; }
+    b.asked.set(addr, true);
+    Account? got = b.source.account(addr);
+    if (got is not null) {
+      this.accounts.set(addr, got!);
+      b.held.set(addr, true);
+    }
+    return got;
+  }
+
+  /** A slot of `a` (which is `addr`), from memory or else from the source. */
+  U256 slotOf(this, U256 addr, Account a, U256 key) {
+    U256? v = a.storage.get(key);
+    if (v is not null) { return v!; }
+    if (this.backing is null) { return U256.zero(); }
+    Backing b = this.backing!;
+    if (!b.held.has(addr)) { return U256.zero(); }
+    Map<U256, bool>? asked = b.slotsAsked.get(addr);
+    if (asked is null) {
+      Map<U256, bool> fresh = Map.create(hashU256, eqU256);
+      b.slotsAsked.set(addr, fresh);
+      asked = fresh;
+    }
+    if (asked!.has(key)) { return U256.zero(); }
+    asked!.set(key, true);
+    U256 got = b.source.slot(addr, key);
+    if (!got.isZero()) { a.storage.set(key, got); }
+    return got;
+  }
+
+  /** Whether the account's storage holds anything, counting what the source has and memory has not asked for. */
+  bool hasStorage(this, U256 addr) {
+    Account? a = this.find(addr);
+    if (a is null) { return false; }
+    if (a!.storage.len() > 0) { return true; }
+    return this.backing is not null && this.backing!.held.has(addr) && this.backing!.source.hasStorage(addr);
   }
 
   // ── Reading ─────────────────────────────────────────────────────────────────
 
-  Account? get(this, U256 addr) { return this.accounts.get(addr); }
-  bool exists(this, U256 addr) { return this.accounts.has(addr); }
+  Account? get(this, U256 addr) { return this.find(addr); }
+  bool exists(this, U256 addr) { return this.find(addr) is not null; }
 
   /** Absent, or present and empty — what the gas rules call "dead". */
   bool isDead(this, U256 addr) {
-    Account? a = this.accounts.get(addr);
+    Account? a = this.find(addr);
     return a is null || a!.isEmpty();
   }
 
   U256 balance(this, U256 addr) {
-    Account? a = this.accounts.get(addr);
+    Account? a = this.find(addr);
     return a is null ? U256.zero() : a!.balance;
   }
   u64 nonce(this, U256 addr) {
-    Account? a = this.accounts.get(addr);
+    Account? a = this.find(addr);
     return a is null ? 0 : a!.nonce;
   }
   u8[] code(this, U256 addr) {
-    Account? a = this.accounts.get(addr);
+    Account? a = this.find(addr);
     return a is null ? u8[].filled(0, 0) : a!.code;
   }
   U256 storage(this, U256 addr, U256 key) {
-    Account? a = this.accounts.get(addr);
+    Account? a = this.find(addr);
     if (a is null) { return U256.zero(); }
-    return a!.storage.getOr(key, U256.zero());
+    return this.slotOf(addr, a!, key);
   }
   /** What the slot held when the transaction began. */
   U256 originalStorage(this, U256 addr, U256 key) {
@@ -209,7 +283,7 @@ export struct World {
 
   /** The account, created empty (and journaled) if it does not exist. */
   Account touch(this, U256 addr) {
-    Account? a = this.accounts.get(addr);
+    Account? a = this.find(addr);
     if (a is not null) { return a!; }
     this.noteAccount(addr);
     Account n = Account.empty();
@@ -267,7 +341,7 @@ export struct World {
     this.noteAccount(addr);
     this.noteSlot(addr, key);
     Account a = this.touch(addr);
-    U256 prev = a.storage.getOr(key, U256.zero());
+    U256 prev = this.slotOf(addr, a, key);
     Map<U256, U256>? o = this.original.get(addr);
     if (o is null) {
       Map<U256, U256> fresh = slotMap();
@@ -422,6 +496,7 @@ export struct World {
     U256[] keys = a!.storage.keys();
     for (i32 k = 0; k < keys.len(); k++) { this.noteSlot(addr, keys[k]); }
     this.accounts.remove(addr);
+    if (this.backing is not null) { this.backing!.held.remove(addr); }
     this.changed(addr);
   }
 

@@ -24,7 +24,11 @@ import { rlp.Item } from "@/lib.wac";
 import { keccak256 } from "../../src/crypto/keccak.wac";
 import { U256 } from "../../src/u256.wac";
 import { hexToBytes, bytesToHex } from "../../src/hex.wac";
-import { World, Account, StateSource, emptyCodeHash, slotMap, hashU256, eqU256 } from "../../src/state/world.wac";
+import { World, Account, AccountState, ChangeSet, StateSource, emptyCodeHash, slotMap, hashU256, eqU256 } from "../../src/state/world.wac";
+import { Store } from "../../src/store/tree.wac";
+import { fileDisk } from "../../src/store/file.wac";
+import { StateDb } from "../../src/store/state.wac";
+import { executeFrom, Steps } from "../../src/store/exec.wac";
 import { Header, Block, Withdrawal, Body, executeBlock, executeBody } from "../../src/chain/block.wac";
 import { BlockEnv } from "../../src/evm/evm.wac";
 import { blobGasPrice } from "../../src/tx/process.wac";
@@ -270,8 +274,10 @@ bool load(Cache cache, u8[] text, string[] why) {
 export async i32 main(Sys sys) {
   string[] args = sys.args();
   string dir = "";
+  string storePath = "";
   for (i32 i = 0; i + 1 < args.len(); i++) {
     if (args[i] == "--dir") { dir = args[i + 1]; }
+    if (args[i] == "--store") { storePath = args[i + 1]; }
   }
   string[] why = [""];
   u8[]? blocksText = (await sys.readFile(dir + "/blocks.txt")).ok();
@@ -377,7 +383,88 @@ export async i32 main(Sys sys) {
     sys.log("\{range.len()} blocks from \{from}, \{r.txs} transactions, \{r.gas / 1000000} Mgas in \{us / 1000} ms \{how}: \{mgas} Mgas/s");
   }
   sys.log(bad == 0 ? "every block matches its header but for the state root" : "\{bad} block(s) differ from their headers");
+  if (storePath != "") { await onStore(sys, storePath, cache, g.config, range, first!, copyOf(hashes)); }
   return bad == 0 ? 0 : 1;
+}
+
+/**
+ * The range again on a store in a file, as the node on a store imports: the fetched state written into it
+ * first, then each block run a step at a time against it from cold (a step that missed undone, read and
+ * run again), its root computed from the stored tries and its changes committed. Timed, the execution and
+ * the commit apart. The root is not the header's — the store holds only what the blocks touch — so it is
+ * the cost being measured, not the answer.
+ */
+async void onStore(Sys sys, string path, Cache cache, ChainConfig config, Block[] range, Header first, Map<U256, U256> hashes) {
+  auto file = await fileDisk(sys, path);
+  if (!file.isOk()) {
+    sys.log("cannot open \{path}");
+    return;
+  }
+  Store store = (await Store.open(file.unwrap())).unwrap();
+  StateDb seedDb = StateDb.over(store);
+  U256[] addrs = cache.accounts.keys();
+  Vec<U256> live = Vec.create();
+  Vec<AccountState?> states = Vec.create();
+  for (i32 i = 0; i < addrs.len(); i++) {
+    Known k = cache.accounts.get(addrs[i])!;
+    if (!k.exists) { continue; }
+    live.push(addrs[i]);
+    states.push(AccountState(true, k.nonce, k.balance, k.code, k.codeHash));
+  }
+  Map<U256, Map<U256, U256>> slots = Map.create(hashU256, eqU256);
+  U256[] holders = cache.slots.keys();
+  for (i32 i = 0; i < holders.len(); i++) {
+    Map<U256, U256> nonzero = slotMap();
+    Map<U256, U256> m = cache.slots.get(holders[i])!;
+    U256[] ks = m.keys();
+    for (i32 k = 0; k < ks.len(); k++) {
+      if (!m.get(ks[k])!.isZero()) { nonzero.set(ks[k], m.get(ks[k])!); }
+    }
+    if (nonzero.len() > 0) { slots.set(holders[i], nonzero); }
+  }
+  AccountState?[] st = AccountState?[].defaulted(states.len());
+  for (i32 i = 0; i < st.len(); i++) { st[i] = states.get(i); }
+  string[] why = [""];
+  i64 s0 = await sys.monotonicNanos();
+  u8[]? seeded = await seedDb.write(live.toArray(), st, slots, u8[].filled(0, 0), why);
+  i64 s1 = await sys.monotonicNanos();
+  if (seeded is null) {
+    sys.log("seeding the store failed: \{why[0]}");
+    return;
+  }
+  sys.log("store: \{live.len()} accounts and \{slots.len()} storages written in \{(s1 - s0) / 1000000} ms");
+
+  Header parent = first;
+  i64 exec = 0;
+  i64 commit = 0;
+  i64 gas = 0;
+  i32 reads0 = store.reads;
+  Steps steps = Steps(0, 0);
+  for (i32 i = 0; i < range.len(); i++) {
+    Block b = range[i];
+    Spec spec = config.specAt(b.header.timestamp);
+    // Cold: a fresh cache over the store for every block, as after a restart.
+    StateDb db = StateDb.over(store);
+    World w = World.create();
+    w.backBy(db.source());
+    w.record();
+    i64 t0 = await sys.monotonicNanos();
+    Body body = await executeFrom(db, w, spec, b, parent, config.chainId, hashes, null, steps);
+    ChangeSet cs = w.seal();
+    i64 t1 = await sys.monotonicNanos();
+    u8[]? root = await db.flush(cs, u8[].filled(0, 0), why);
+    i64 t2 = await sys.monotonicNanos();
+    if (body.error != "") { sys.log("block \{b.header.number.toDecimal()} on the store: \{body.error}"); }
+    if (root is null) { sys.log("block \{b.header.number.toDecimal()}: the commit failed: \{why[0]}"); }
+    exec += t1 - t0;
+    commit += t2 - t1;
+    gas += b.header.gasUsed.low() as@ i64;
+    hashes.set(b.header.number, b.header.hash);
+    parent = b.header;
+  }
+  i64 us = (exec + commit) / 1000;
+  sys.log("on the store: \{range.len()} blocks, \{gas / 1000000} Mgas: executing \{exec / 1000000} ms (\{steps.steps} steps, \{steps.reruns} again), " +
+          "committing \{commit / 1000000} ms, \{store.reads - reads0} page reads: \{us == 0 ? 0 : gas / us} Mgas/s");
 }
 
 Map<U256, U256> copyOf(Map<U256, U256> m) {

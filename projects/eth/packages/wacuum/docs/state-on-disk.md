@@ -167,6 +167,28 @@ The engine stays synchronous — its JSON-RPC handlers, tests and fixture runner
 part (moving the store to the right block, running a payload with step retries and computing its root from
 the tries, reading what a state query will read), so that `call` finds everything in memory.
 
+### Measured: mainnet blocks on the store (2026-11-13)
+
+`tools/mainnet/replay.sh` then `replay.wac --store FILE` on blocks 26,404,100–104 (1131 transactions, 178 Mgas):
+the state they read (2827 accounts, 1080 storages) written into a store in a file, then each block imported
+as the node imports it — a fresh cache over the store, a step at a time, the root from the stored tries, a
+commit a block:
+
+| | time | Mgas/s |
+| --- | ---: | ---: |
+| all in memory, senders recovered | 869 ms | 205 |
+| on the store: executing | 10,494 ms | |
+| on the store: committing (roots and writes) | 407 ms | |
+| on the store, together | 10,901 ms | 16 |
+
+Committing is cheap. Executing is not, and the steps say why: 9784 steps, 8643 of them run again — about
+7.6 reruns a transaction, because a transaction whose reads depend on what it read (a swap reading a pool,
+then the slots the pool names) finds its misses one layer at a time, and each layer is a rerun from the
+transaction's start. 16 Mgas/s follows a head that needs ~5; catching up at it would take months. The
+third layer of reads above — the interpreter stopping at the opcode that misses and resuming after the read
+— makes each miss one read rather than a rerun: by these numbers ~0.9 s of execution and ~0.5 s of reads
+(~9000 at ~55 µs) for the five blocks, ~130 Mgas/s. That is the next piece of work for speed.
+
 ## Decisions for Andrew
 
 - **wac host asks** (filed when this starts): the per-call cost of host I/O (~55 µs), a vectored read, and

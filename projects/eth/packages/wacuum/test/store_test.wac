@@ -339,3 +339,88 @@ async string run_a_store_of_64_kb_pages_is_refused() {
 }
 
 export string test_a_store_of_64_kb_pages_is_refused() { return run_a_store_of_64_kb_pages_is_refused().wait().orElse("it never finished"); }
+
+/** The map's entries in `[from, to)`, as hex keys in order, for comparing with a range read. */
+string modelRange(Map<string, u8[]> m, Vec<u8[]> keys, u8[] from, u8[] to) {
+  Vec<Change> in = Vec.create();
+  Map<string, bool> seen = Map.create(hashString, stringEq);
+  for (i32 i = 0; i < keys.len(); i++) {
+    u8[] k = keys.get(i);
+    string h = bytesToHex(k);
+    if (seen.has(h) || !m.has(h)) { continue; }
+    seen.set(h, true);
+    if (compareKeys(k, from) < 0 || compareKeys(k, to) >= 0) { continue; }
+    in.push(Change(k, m.get(h)!));
+  }
+  // In key order, by selection: small.
+  string out = "";
+  while (in.len() > 0) {
+    i32 best = 0;
+    for (i32 i = 1; i < in.len(); i++) {
+      if (compareKeys(in.get(i).key, in.get(best).key) < 0) { best = i; }
+    }
+    out += bytesToHex(in.get(best).key) + ";";
+    in.remove(best);
+  }
+  return out;
+}
+
+string rangeText(Vec<Change> got) {
+  string out = "";
+  for (i32 i = 0; i < got.len(); i++) { out += bytesToHex(got.get(i).key) + ";"; }
+  return out;
+}
+
+/**
+ * Commits staged and flushed in batches: what the store reads — keys and ranges, before and after each flush — is
+ * a map's, and the file opened again holds exactly what was last flushed, whatever was staged after it.
+ */
+async string run_staged_commits_read_as_committed_and_a_crash_loses_only_what_is_staged() {
+  Check t = Check.create();
+  Rng r = Rng(4242);
+  MemDisk md = MemDisk.create();
+  Store s = (await Store.open(md.disk())).unwrap();
+  s.maxLeaves = 2;
+  Map<string, u8[]> m = model();
+  Map<string, u8[]> flushedModel = model();
+  Vec<u8[]> keys = Vec.create();
+  for (i32 round = 0; round < 40; round++) {
+    Vec<Change> cs = Vec.create();
+    for (i32 i = 0; i < 60; i++) {
+      bool del = keys.len() > 0 && r.below(10) < 3;
+      u8[] k = del ? keys.get(r.below(keys.len())) : r.bytes(1 + r.below(6));
+      if (!del) { keys.push(k); }
+      u8[]? v = del ? null : r.bytes(1 + r.below(80));
+      cs.push(Change(k, v));
+      if (v is null) { m.remove(bytesToHex(k)); } else { m.set(bytesToHex(k), v!); }
+    }
+    await s.stage(cs.toArray(), "round \{round}".toBytes());
+    t.eqStr(await differs(s, m, keys), "", "staged round \{round}: reads as committed");
+    u8[] from = r.bytes(1);
+    u8[] to = r.bytes(1);
+    if (compareKeys(from, to) > 0) {
+      u8[] x = from;
+      from = to;
+      to = x;
+    }
+    t.eqStr(rangeText(await s.range(from, to, 0x7fffffff)), modelRange(m, keys, from, to), "staged round \{round}: a range");
+    t.eqStr(rangeText(s.rangeNow(from, to, 0x7fffffff)), modelRange(m, keys, from, to), "staged round \{round}: a range read where asked");
+    if (round % 5 == 4) {
+      t.eqStr(await s.flush(), "", "flush after round \{round}");
+      flushedModel = model();
+      for (i32 i = 0; i < keys.len(); i++) {
+        string h = bytesToHex(keys.get(i));
+        if (m.has(h)) { flushedModel.set(h, m.get(h)!); }
+      }
+      t.eqStr(string.fromBytes(s.committed().user), "round \{round}", "the flush records the last staged bytes");
+    }
+    // A crash here: the file holds the last flush, not what is staged since.
+    Store again = (await Store.open(md.disk())).unwrap();
+    t.eqStr(await differs(again, flushedModel, keys), "", "reopened after round \{round}: exactly the last flush");
+  }
+  return t.report();
+}
+
+export string test_staged_commits_read_as_committed_and_a_crash_loses_only_what_is_staged() {
+  return run_staged_commits_read_as_committed_and_a_crash_loses_only_what_is_staged().wait().orElse("it never finished");
+}

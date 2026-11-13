@@ -248,11 +248,17 @@ export struct Store {
   Vec<u8[]>? trace;
   /** Entries read and committed, kept between blocks (`cache.wac`); `cacheMb` sets its budget. */
   EntryCache cache;
+  /**
+   * Changes staged and not yet committed (`stage`, `flush`): every read looks here first, so the store reads as
+   * if they were committed, and they go to the file together. Lost in a crash — the file is then at the last
+   * flush, whose own bytes name the block it holds, and the block log replays what came after.
+   */
+  Overlay overlay;
 
   /** The store in `disk`: the last commit, or an empty one for an empty file. */
   async Result<Store, string> open(Disk disk) {
     Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), 0, LEAVES, Vec.create(), Vec.create(), 0, 0, false, 0, Vec.create(), null,
-                    EntryCache.create(CACHE_MB * 1024 * 1024));
+                    EntryCache.create(CACHE_MB * 1024 * 1024), Overlay.create());
     i64 size = match (await disk.size()) {
       Ok(n): n,
       Err(e): return Result.Err(e),
@@ -382,6 +388,8 @@ export struct Store {
   u8[]? getNow(this, const u8[] key) {
     this.traced(82, key);
     u8[] k0 = plain(key);
+    Pend? staged = this.overlay.entries.get(k0);
+    if (staged is not null) { return staged!.value; }
     Cached c = this.cache.get(k0);
     if (c.known) { return c.value; }
     Node n = this.root;
@@ -407,9 +415,10 @@ export struct Store {
 
   /** `range`, read where it is asked. */
   Vec<Change> rangeNow(this, u8[] from, u8[] to, i32 limit) {
+    Vec<Change> staged = this.overlay.within(from, to);
     Vec<Change> out = Vec.create();
-    this.walkNow(this.root, from, to, limit, out);
-    return out;
+    this.walkNow(this.root, from, to, more(limit, staged.len()), out);
+    return merged(out, staged, limit);
   }
 
   void walkNow(this, Node n, u8[] from, u8[] to, i32 limit, Vec<Change> out) {
@@ -440,6 +449,8 @@ export struct Store {
   async u8[]? get(this, const u8[] key) {
     this.traced(82, key);
     u8[] k0 = plain(key);
+    Pend? staged = this.overlay.entries.get(k0);
+    if (staged is not null) { return staged!.value; }
     Cached c = this.cache.get(k0);
     if (c.known) { return c.value; }
     Node? leaf = await this.leafFor(key, null);
@@ -781,9 +792,61 @@ export struct Store {
 
   /** Every key and value from `from` (inclusive) to `to` (exclusive; empty for the end), in order. */
   async Vec<Change> range(this, u8[] from, u8[] to, i32 limit) {
+    Vec<Change> staged = this.overlay.within(from, to);
     Vec<Change> out = Vec.create();
-    await this.walk(this.root, from, to, limit, out);
-    return out;
+    await this.walk(this.root, from, to, more(limit, staged.len()), out);
+    return merged(out, staged, limit);
+  }
+
+  /** A value stored in chunks under `base` (`base` and a u16 each, as `CHUNK` cuts them), read chunk by chunk. */
+  async u8[]? chunks(this, u8[] base) {
+    Vec<u8[]> parts = Vec.create();
+    for (i32 k = 0; k < 65536; k++) {
+      u8[]? part = await this.get(chunkKey(base, k));
+      if (part is null) { break; }
+      parts.push(part!);
+    }
+    return parts.len() == 0 ? null : concat(parts);
+  }
+
+  /** `chunks`, read where it is asked: point lookups, which see what is staged as a range would at more cost. */
+  u8[]? chunksNow(this, u8[] base) {
+    Vec<u8[]> parts = Vec.create();
+    for (i32 k = 0; k < 65536; k++) {
+      u8[]? part = this.getNow(chunkKey(base, k));
+      if (part is null) { break; }
+      parts.push(part!);
+    }
+    return parts.len() == 0 ? null : concat(parts);
+  }
+
+  /**
+   * `changes` staged with `user` beside them, as a commit would record them but kept in memory: every read sees
+   * them at once; `flush` writes them. Through the same gate as a commit, so a reader holding the store sees one
+   * state throughout.
+   */
+  async void stage(this, Change[] changes, u8[] user) {
+    this.wantWrite++;
+    while (this.writing || this.readers > 0) { await this.parked(); }
+    this.wantWrite--;
+    for (i32 i = 0; i < changes.len(); i++) {
+      this.traced(87, changes[i].key);
+      this.overlay.put(changes[i].key, changes[i].value);
+      this.cache.put(changes[i].key, changes[i].value);
+    }
+    this.overlay.user = user;
+    this.overlay.staged++;
+    this.wake();
+  }
+
+  /** What is staged, committed as one commit with the last staged bytes beside it. "" or why not. */
+  async string flush(this) {
+    if (this.overlay.staged == 0) { return ""; }
+    Change[] all = this.overlay.changes();
+    u8[] user = this.overlay.user;
+    string bad = await this.commit(all, user);
+    if (bad == "") { this.overlay = Overlay.create(); }
+    return bad;
   }
 
   async void walk(this, Node n, u8[] from, u8[] to, i32 limit, Vec<Change> out) {
@@ -809,6 +872,130 @@ export struct Store {
       await this.walk(k!, from, to, limit, out);
     }
   }
+}
+
+/** A staged value, or `null` for a key staged as deleted. */
+struct Pend {
+  u8[]? value;
+}
+
+/** What `Store.stage` holds until `flush`: the latest change to each key, the bytes to record, how many stagings. */
+export struct Overlay {
+  Map<u8[], Pend> entries;
+  u8[] user;
+  i32 staged;
+  /** The keys and values' bytes, for a caller deciding when to flush. */
+  i64 bytes;
+
+  Overlay create() { return Overlay(Map.create(overlayHash, overlaySame), u8[].filled(0, 0), 0, 0); }
+
+  void put(this, u8[] key, u8[]? value) {
+    Pend? old = this.entries.get(key);
+    if (old is null) { this.bytes += key.len() as i64; }
+    else if (old!.value is not null) { this.bytes -= old!.value!.len() as i64; }
+    if (value is not null) { this.bytes += value!.len() as i64; }
+    this.entries.set(key, Pend(value));
+  }
+
+  /** Every staged key in `[from, to)` (to empty: no end), in order: a deletion as a change with no value. */
+  Vec<Change> within(this, u8[] from, u8[] to) {
+    Vec<Change> out = Vec.create();
+    if (this.entries.len() == 0) { return out; }
+    u8[][] ks = this.entries.keys();
+    for (i32 i = 0; i < ks.len(); i++) {
+      if (compareKeys(ks[i], from) < 0) { continue; }
+      if (to.len() > 0 && compareKeys(ks[i], to) >= 0) { continue; }
+      out.push(Change(ks[i], this.entries.get(ks[i])!.value));
+    }
+    return sortedChanges(out);
+  }
+
+  Change[] changes(this) {
+    u8[][] ks = this.entries.keys();
+    Change[] out = Change[].filled(ks.len(), Change(u8[].filled(0, 0), null));
+    for (i32 i = 0; i < ks.len(); i++) { out[i] = Change(ks[i], this.entries.get(ks[i])!.value); }
+    return out;
+  }
+}
+
+i32 overlayHash(u8[] b) {
+  i32 h = -2128831035 ^ b.len();
+  for (i32 i = 0; i < b.len(); i++) { h = (h ^ (b[i] as i32)) * 16777619; }
+  return h;
+}
+
+bool overlaySame(u8[] a, u8[] b) { return compareKeys(a, b) == 0; }
+
+/** A limit raised by `n`, for a walk whose results staged deletions may remove, without overflowing. */
+i32 more(i32 limit, i32 n) { return limit > 0x7fffffff - n ? 0x7fffffff : limit + n; }
+
+/** The tree's run and the staged changes in its range merged, both in key order: a staged key wins. */
+Vec<Change> merged(Vec<Change> tree, Vec<Change> staged, i32 limit) {
+  if (staged.len() == 0) {
+    while (tree.len() > limit) { tree.pop(); }
+    return tree;
+  }
+  Vec<Change> out = Vec.create();
+  i32 i = 0;
+  i32 j = 0;
+  while ((i < tree.len() || j < staged.len()) && out.len() < limit) {
+    i32 c = i >= tree.len() ? 1 : (j >= staged.len() ? -1 : compareKeys(tree.get(i).key, staged.get(j).key));
+    if (c < 0) {
+      out.push(tree.get(i));
+      i++;
+      continue;
+    }
+    if (c == 0) { i++; }
+    Change st = staged.get(j);
+    j++;
+    if (st.value is not null) { out.push(st); }
+  }
+  return out;
+}
+
+/** Changes in key order (a merge sort). */
+Vec<Change> sortedChanges(Vec<Change> v) {
+  if (v.len() < 2) { return v; }
+  Vec<Change> a = Vec.create();
+  Vec<Change> b = Vec.create();
+  for (i32 i = 0; i < v.len(); i++) {
+    if (i < v.len() / 2) { a.push(v.get(i)); } else { b.push(v.get(i)); }
+  }
+  a = sortedChanges(a);
+  b = sortedChanges(b);
+  Vec<Change> out = Vec.create();
+  i32 i = 0;
+  i32 j = 0;
+  while (i < a.len() || j < b.len()) {
+    if (j >= b.len() || (i < a.len() && compareKeys(a.get(i).key, b.get(j).key) <= 0)) {
+      out.push(a.get(i));
+      i++;
+    } else {
+      out.push(b.get(j));
+      j++;
+    }
+  }
+  return out;
+}
+
+export u8[] chunkKey(u8[] base, i32 k) {
+  u8[] key = u8[].filled(base.len() + 2, 0);
+  key.copyFrom(base, 0, 0, base.len());
+  key[base.len()] = ((k >> 8) & 255) as! u8;
+  key[base.len() + 1] = (k & 255) as! u8;
+  return key;
+}
+
+u8[] concat(Vec<u8[]> parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts.get(i).len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    out.copyFrom(parts.get(i), 0, at, parts.get(i).len());
+    at += parts.get(i).len();
+  }
+  return out;
 }
 
 /** A child `k` put at `i` of interior `n`, keyed by its first key. */

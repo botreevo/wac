@@ -46,7 +46,8 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   block.
 - **Crashes** (`tools/e2e/crash.wac`): a store node killed with SIGKILL at random points while importing — 110
   kills over three runs, 47 before the block's commit was whole and 63 after — always came back to the uncrashed
-  node's head, state root, slots and balances.
+  node's head, state root, slots and balances; and with commits batched, 40 kills flushing every 8 blocks and 40
+  flushing every 64 (restarts replaying up to 62 blocks from the log), the same.
 - **Mainnet blocks**: five consecutive blocks replayed on the store match their headers but for the state root
   (the store holds only what they read), at ~100 Mgas/s; 64 blocks traced for the cache's design.
 - **Hoodi, without the machine**: wacuum computes Hoodi's genesis hash, geth `--hoodi` accepts its handshake
@@ -78,9 +79,9 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 - **Scale.** The largest store so far is 411 MB; Hoodi's will be tens of GB and mainnet's hundreds. The interior
   is kept in memory (~400 MB estimated at mainnet), and how the cache, the leaf budget and commit cost behave at
   that size is extrapolated from a 64-block trace, not measured.
-- **A commit every block.** The store commits each block as it goes in (~0.1–0.2 s of writes and an fsync); the
-  design's batching of commits over many blocks is not built. Fine for following the head; slow for a long
-  catch-up.
+- **Commits batched over 64 blocks** (built after this note was first written): a stop of any kind replays up to
+  64 blocks from the log on restart (wac programs cannot catch signals, so every stop is a crash); the overlay
+  holding those blocks' changes is ~2 MB a block at mainnet's rate, bounded by a 64 MB flush.
 - **Torn writes on a real power cut** are modelled (any subset of unsynced writes lost), not exercised: SIGKILL
   leaves the kernel's page cache intact.
 - **Store format**: new, and changed once already (64 KB → 16 KB pages); there is no migration, and none is

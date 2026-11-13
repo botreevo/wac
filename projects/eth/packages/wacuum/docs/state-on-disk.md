@@ -157,7 +157,17 @@ across a reorg commits the departing blocks' before-states and the arriving bloc
 engine's change sets already hold. Then there is never state in memory that the store does not have, a
 restart needs only the block log after the block the store's meta names, and the `World` is a cache over
 the store rather than the state. A commit a block (~0.2 s of host requests and an `fsync`) fits a 12 s slot;
-batching commits during a long catch-up is the optimisation, if measurements ask for it. One limit,
+batching commits during a long catch-up is the optimisation, if measurements ask for it.
+
+**Since built** (`Store.stage`, `flush`; `--flush-every`, 64 by default): a block's commit is staged in an
+overlay in the store, which every read looks through first (point reads at once; ranges merged in key order,
+and the hot paths — codes, receipts, blocks — read their chunks point by point instead), and the overlay is
+written as one commit every 64 blocks or 64 MB of keys and values. The store still reads as holding the state of
+the block the engine is at, so nothing above it changed. A crash, or any stop (wac has no signal handlers, so a
+stop is a crash), loses the overlay: the file is at the last flush, whose bytes name its block, and the block
+log replays what came after — up to 64 blocks. `tools/e2e/crash.wac -- 200 40 64`: 40 kills, restarts replaying
+up to 62 blocks each, the same head, root, slots and balances as a node never killed. Writes a block fall from
+~5190 keys to ~1950 at 64 (the 64-block mainnet trace). One limit,
 recorded rather than solved: undoing a block that deleted an account with storage needs every slot it
 had, and only the slots read are noted — after Cancun, SELFDESTRUCT deletes only what the same transaction
 created, so no such block exists on a chain this runs.

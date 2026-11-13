@@ -10,9 +10,11 @@
 // Every payload it accepts is checked against its header's state root, so a store left wrong by a crash shows at
 // the next block. At the end its head, and slots and balances across the whole chain, must be the first node's.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/crash.wac [BLOCKS] [KILLS]
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/crash.wac [BLOCKS] [KILLS] [FLUSH]
 //
-// BLOCKS defaults to 200, KILLS to 40. A kill is not a power cut: what the process wrote, the kernel keeps.
+// BLOCKS defaults to 200, KILLS to 40, FLUSH (the store node's --flush-every) to 1: each block written as it
+// goes. With FLUSH above 1 the store stages blocks and writes them together, so most kills fall between flushes
+// and a restart replays the blocks since the last one from the log; how many is printed. A kill is not a power cut: what the process wrote, the kernel keeps.
 // Torn and reordered writes are the store's own tests' (`test/store_test.wac`, a commit cut short anywhere).
 
 import { Sys } from "std";
@@ -57,9 +59,9 @@ i32 parse(string s) {
 
 string fc(string h) { return "{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{h}\"}"; }
 
-async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store) {
+async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store, i32 flush) {
   string[] argv = [app, "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc", "--port", "\{port}",
-                   "--datadir", data, store ? "--store" : "--snapshot-every", store ? "--store" : "1000000"];
+                   "--datadir", data, store ? "--store" : "--snapshot-every", store ? "--flush-every" : "1000000", store ? "\{flush}" : "--public-rpc"];
   Proc p = await Proc.start(sys, argv, data + ".log");
   await p.says(sys, "Engine API on", 300000);
   return p;
@@ -74,6 +76,7 @@ export async i32 main(Sys sys) {
   string[] args = sys.args();
   i32 blocks = args.len() > 0 ? parse(args[0]) : 200;
   i32 kills = args.len() > 1 ? parse(args[1]) : 40;
+  i32 flush = args.len() > 2 ? parse(args[2]) : 1;
   Check t = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-crash");
   string app = dir + "/wacuum";
@@ -87,7 +90,7 @@ export async i32 main(Sys sys) {
 
   // The chain, built by a wacuum in memory.
   i32 portA = await somePort(sys, 19751, 500);
-  Proc a = await start(sys, app, dir, dir + "/a", portA, false);
+  Proc a = await start(sys, app, dir, dir + "/a", portA, false, 1);
   Rpc ua = Rpc.at(sys, portA);
   Rpc ea = Rpc.authed(sys, portA, secret);
   string head = field(await ua.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash");
@@ -128,13 +131,15 @@ export async i32 main(Sys sys) {
   // The same chain into a wacuum on a store, killed at random as it goes.
   i32 portB = await somePort(sys, 19851, 500);
   string dataB = dir + "/b";
-  Proc b = await start(sys, app, dir, dataB, portB, true);
+  Proc b = await start(sys, app, dir, dataB, portB, true, flush);
   Rpc ub = Rpc.at(sys, portB);
   Rpc eb = Rpc.authed(sys, portB, secret);
   i32 killed = 0;
   i32 restarts = 0;
   i32 lost = 0;
   i32 kept = 0;
+  i32 replayedMost = 0;
+  i32 replayedAll = 0;
   i32 next = 0;
   bool stuck = false;
   i32 tries = 0;
@@ -154,7 +159,7 @@ export async i32 main(Sys sys) {
       await sys.sleepMillis(((rnd[1] as i32) * 256 + (more[0] as i32)) % 300);
       await killHard(sys, b.pid);
       killed++;
-      b = await start(sys, app, dir, dataB, portB, true);
+      b = await start(sys, app, dir, dataB, portB, true, flush);
       restarts++;
       // Given again from where it says it is.
       string n = await ub.text("eth_blockNumber", "[]");
@@ -170,6 +175,10 @@ export async i32 main(Sys sys) {
         for (i32 e = 0; e < rest.len() && rest[e] >= 48 && rest[e] <= 57; e++) { holds = holds * 10 + ((rest[e] as i32) - 48); }
       }
       if (holds > next) { kept++; } else { lost++; }
+      // The blocks the restart replayed from the log: those since the store's last write.
+      i32 replayed = (quantity(n) as! i32) - holds;
+      replayedMost = replayed > replayedMost ? replayed : replayedMost;
+      replayedAll += replayed;
       next = quantity(n) as! i32;
       continue;
     }
@@ -182,10 +191,10 @@ export async i32 main(Sys sys) {
     await eb.get("engine_forkchoiceUpdatedV3", "[\{fc(g.hash)},null]");
     next++;
   }
-  t.that(!stuck, "every block went in, \{killed} kills and restarts along the way (\{lost} with the block being imported lost, \{kept} with it kept)");
+  t.that(!stuck, "every block went in, \{killed} kills and restarts along the way (\{lost} with the block being imported not in the store, \{kept} with it in); flushing every \{flush}, each restart replayed up to \{replayedMost} blocks from the log, \{replayedAll} in all");
   // Once more, cleanly, from the store alone.
   await b.stop(sys);
-  b = await start(sys, app, dir, dataB, portB, true);
+  b = await start(sys, app, dir, dataB, portB, true, flush);
   JsonValue? hb = await ub.get("eth_getBlockByNumber", "[\"latest\",false]");
   JsonValue? ha = await ua.get("eth_getBlockByNumber", "[\"latest\",false]");
   t.that(field(hb, "hash") == field(ha, "hash") && field(hb, "stateRoot") == field(ha, "stateRoot"),

@@ -5,7 +5,8 @@
 //
 //     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/rpc.wac [--store]
 //
-// With --store the node keeps its state on disk: blocks built on it, and the restart from the store.
+// With --store the node keeps its state on disk: blocks built on it, and the restart from the store. It keeps
+// one block of history in memory then, so what is asked about older blocks is answered from disk.
 //
 // It runs the node with the `wac` on PATH, from cmd/wacuum.wac.
 
@@ -36,8 +37,12 @@ async Proc startNode(Sys sys, string dir, i32 port, bool store) {
   string[] base = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
                    "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
                    "--port", "\{port}", "--datadir", dir + "/data", "--snapshot-every", "2"];
-  string[] argv = string[].filled(base.len() + (store ? 1 : 0), "--store");
+  string[] argv = string[].filled(base.len() + (store ? 3 : 0), "--store");
   for (i32 i = 0; i < base.len(); i++) { argv[i] = base[i]; }
+  if (store) {
+    argv[base.len() + 1] = "--history";
+    argv[base.len() + 2] = "1";
+  }
   Proc p = await Proc.start(sys, argv, dir + "/wacuum.log");
   await p.says(sys, "Engine API on", 600000);
   return p;
@@ -132,6 +137,13 @@ export async i32 main(Sys sys) {
   t.that(await user.text("eth_call", "[{\"to\":\"\{contract}\"},\"latest\"]") == "0x", "eth_call");
   t.that(await user.text("eth_blockNumber", "[]") == "0x3", "eth_blockNumber");
   t.that((await user.call("engine_forkchoiceUpdatedV3", "[{},null]")).error() != "", "the Engine API is refused without a token");
+  if (store) {
+    // Block 1 has left the history held in memory: what is asked about it comes from disk.
+    string b1 = field(await user.get("eth_getBlockByNumber", "[\"0x1\",true]"), "hash");
+    t.that(b1 != "" && field(await user.get("eth_getBlockByHash", "[\"\{b1}\",false]"), "number") == "0x1", "block 1 by number and by hash, from disk");
+    t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{sent}\"]"), "status") == "0x1" &&
+           field(await user.get("eth_getTransactionByHash", "[\"\{sent}\"]"), "blockNumber") == "0x1", "and its transaction and receipt");
+  }
 
   // Restarted, it starts from its last snapshot and replays only what came after.
   if (!store) { t.that((await proc.output(sys)).indexOf("snapshot at block 2") >= 0, "a snapshot was taken at block 2"); }
@@ -147,6 +159,11 @@ export async i32 main(Sys sys) {
          await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + runtime, "with the same state");
   t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{called}\"]"), "status") == "0x1",
          store ? "and block 3's receipts, kept in the store" : "and block 3's receipts, which ran again");
+  if (store) {
+    t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{sent}\"]"), "blockNumber") == "0x1" &&
+           ((await user.get("eth_getLogs", "[{\"address\":\"\{contract}\",\"fromBlock\":\"0x0\"}]"))?.array()?.len() ?? -1) == 1,
+           "and block 1's transaction and the logs from disk, after the restart");
+  }
 
   await proc.stop(sys);
   await removeDir(sys, dir);

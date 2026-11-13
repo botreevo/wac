@@ -2,6 +2,14 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
+## A 41st field on `Engine` makes a program that imports it fail to check (wac `7f559349c`)
+
+`Engine` had 38 fields. Adding any three more (`Map<U256, U256>` each, nothing else changed) leaves
+`wac check packages/wacuum/src` clean but makes `wac check packages/wacuum-devnet` report *no such field* at
+`packages/wacuum-devnet/src/explorer.wac:83:45`, on `e.call(method, …).result`, where `Answer.result` is
+there. Two more fields are fine; the types do not matter. Worked around by putting the new state in one
+struct-typed field (`Persisting`, `src/engine/engine.wac`). Reported to the coordinator for wac.
+
 ## A local declared in a loop of an async function is one object for every pass (wac `issues/lang/0474w`)
 
 `Ticket<bool> t;` inside a `while` that then awaits it gets, on its second pass, the first pass's ticket —

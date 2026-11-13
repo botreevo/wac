@@ -595,11 +595,11 @@ export struct Store {
       string bad = await this.streamLeaves(sortedChanges(arrayVec(changes)), outs);
       if (bad != "") { return bad; }
     } else {
-      // A tree that is one leaf: changed in memory, as small as it is.
-      for (i32 c = 0; c < changes.len(); c++) {
-        applyTo(this.root, changes[c]);
-        this.root.dirty = true;
-      }
+      // A tree that is one leaf: the changes merged into it in one pass, however many (the first commit of a
+      // store can be hundreds of thousands, and inserting them one by one was quadratic); then split by `fix`.
+      Vec<Change> sorted = sortedChanges(arrayVec(changes));
+      mergeInto(this.root, sorted, 0, sorted.len());
+      this.root.dirty = true;
     }
 
     // Splits, merges of the empty, a new root or a shorter tree.
@@ -688,10 +688,9 @@ export struct Store {
         i32 i = childFor(n.keys, changes.get(c).key);
         if (i + 1 < n.keys.len()) { bound = n.keys.get(i + 1); }
       }
-      while (c < changes.len() && (bound is null || compareKeys(changes.get(c).key, bound!) < 0)) {
-        applyTo(l, changes.get(c));
-        c++;
-      }
+      i32 from = c;
+      while (c < changes.len() && (bound is null || compareKeys(changes.get(c).key, bound!) < 0)) { c++; }
+      mergeInto(l, changes, from, c);
       l.dirty = true;
       for (i32 p = 0; p < path.len(); p++) {
         Node on = path.get(p);
@@ -772,20 +771,29 @@ export struct Store {
     }
     if (half == 0) { half = 1; }
     Node right = Node.fresh(n.leaf);
-    while (n.keys.len() > half) {
-      u8[] k = n.keys.remove(half);
+    // The upper half copied across in order, then taken off the end: a removal from the middle moved every entry
+    // behind it, which for a node of a big first commit (all of it in one leaf) was quadratic.
+    for (i32 i = half; i < n.keys.len(); i++) {
+      u8[] k = n.keys.get(i);
       right.keys.push(k);
       if (n.leaf) {
-        u8[] v = n.vals.remove(half);
+        u8[] v = n.vals.get(i);
         right.vals.push(v);
         i32 sz = leafEntry(k, v);
         n.bytes -= sz;
         right.bytes += sz;
       } else {
-        right.kids.push(n.kids.remove(half));
-        right.kidPages.push(n.kidPages.remove(half));
+        right.kids.push(n.kids.get(i));
+        right.kidPages.push(n.kidPages.get(i));
         n.bytes -= interiorEntry(k);
         right.bytes += interiorEntry(k);
+      }
+    }
+    while (n.keys.len() > half) {
+      n.keys.pop();
+      if (n.leaf) { n.vals.pop(); } else {
+        n.kids.pop();
+        n.kidPages.pop();
       }
     }
     Node[] a = this.fix(n);
@@ -931,22 +939,39 @@ export struct Store {
   }
 }
 
-/** One change made to the leaf its key belongs in. */
-void applyTo(Node l, Change ch) {
-  (i32 at, bool found) = find(l.keys, ch.key);
-  if (ch.value is null) {
-    if (!found) { return; }
-    l.bytes -= leafEntry(l.keys.get(at), l.vals.get(at));
-    l.keys.remove(at);
-    l.vals.remove(at);
-  } else if (found) {
-    l.bytes += ch.value!.len() - l.vals.get(at).len();
-    l.vals.set(at, ch.value!);
-  } else {
-    l.keys.insert(at, ch.key);
-    l.vals.insert(at, ch.value!);
-    l.bytes += leafEntry(ch.key, ch.value!);
+/**
+ * `changes[from, to)` (in key order; for a key given more than once, the last wins) merged into leaf `l` in one
+ * pass: the leaf's entries and the changes walked together into new lists.
+ */
+void mergeInto(Node l, Vec<Change> changes, i32 from, i32 to) {
+  Vec<u8[]> keys = Vec.create();
+  Vec<u8[]> vals = Vec.create();
+  i32 bytes = 5;
+  i32 i = 0;
+  i32 j = from;
+  while (i < l.keys.len() || j < to) {
+    i32 c = i >= l.keys.len() ? 1 : (j >= to ? -1 : compareKeys(l.keys.get(i), changes.get(j).key));
+    if (c < 0) {
+      keys.push(l.keys.get(i));
+      vals.push(l.vals.get(i));
+      bytes += leafEntry(l.keys.get(i), l.vals.get(i));
+      i++;
+      continue;
+    }
+    if (c == 0) { i++; }
+    // The last change to this key wins.
+    while (j + 1 < to && compareKeys(changes.get(j + 1).key, changes.get(j).key) == 0) { j++; }
+    Change ch = changes.get(j);
+    j++;
+    if (ch.value is not null) {
+      keys.push(ch.key);
+      vals.push(ch.value!);
+      bytes += leafEntry(ch.key, ch.value!);
+    }
   }
+  l.keys = keys;
+  l.vals = vals;
+  l.bytes = bytes;
 }
 
 Vec<Change> arrayVec(Change[] a) {

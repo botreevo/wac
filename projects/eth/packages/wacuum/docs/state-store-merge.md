@@ -71,6 +71,14 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   at a time and reads the leaves it will need 64 ahead (`Store.inFlight`, `Store.prefetch`): the commit went from
   311–339 ms to 262–264 ms, and what is left is mostly its two syncs — which batching (`--flush-every 64`, the
   default) pays once per 64 blocks rather than every block.
+
+  Trie nodes were keyed by their path, depth first, which near the top puts siblings — and a node and its child —
+  whole subtrees apart: a 500-account block wrote 1 + 16 + 219 + 461 leaves for depths 0–3 alone, one for every
+  node. The top five levels are now keyed level by level (store format 4, `pathtrie.wac`'s `nodeKey`): those
+  depths take 1 + 2 + 10 + 178 leaves, all leaves written per block ~1 900 → ~1 660, page writes 2 171 → 1 721,
+  staging 113–150 → 90 ms, the store's commit 262 → 211 ms. Refilled to 5 GB the same way, the five mainnet blocks
+  on top: commit 2.83 → 2.08 s, 42 → 48 Mgas/s. What is left is one leaf per account for its deep nodes (depth 5
+  and below) and one for its entry.
 - **Crashes** (`tools/e2e/crash.wac`): a store node killed with SIGKILL at random points while importing — 110
   kills over three runs, 47 before the block's commit was whole and 63 after — always came back to the uncrashed
   node's head, state root, slots and balances; and with commits batched, 40 kills flushing every 8 blocks and 40

@@ -218,42 +218,48 @@ Three things are written, in this order, and a stop (every stop is a crash) can 
 
 1. **the store's commit** — at `--flush-every 1` in `prepareBlock` as a block imports, and in `moveToAsync` for
    each block a reorg crosses; at 64, those are staged and only every 64th block's (or 64 MB's) is a commit. The
-   commit's own bytes name the block whose state it holds, and the block's RLP and receipts are in the same commit
-   (`Engine.withBlock`);
+   commit's own bytes name the block whose state it holds; the block's RLP, its receipts and its **undo record**
+   (its change set: accounts and slots before and after, `src/store/undo.wac`) are in the same commit
+   (`Engine.withBlock`), so a store that holds a block's state holds all three;
 2. **the chain log's block record** — pushed by `call` after the commit, written before the answer goes out;
 3. **the chain log's fork-choice record** (head, safe, finalized) — the same, for `forkchoiceUpdated`.
 
-Head, safe and finalized live only in the log. Change sets — what lets the store move to a parent's state —
-live only in memory: a restart rebuilds them for the blocks it runs again from the log, and has none for a
-block at or below the store's (`replay` adopts those without running them).
+Head, safe and finalized live only in the log. Change sets live in memory for the blocks a run imported, and in
+the store, as undo records, for every block not yet finalized: a restart adopts the blocks at or below the store's
+without running them and loads each one's undo record (`loadUndo`), so the store can be moved back across them as
+across any other. Before the log runs anything, the store's own block is adopted from the store
+(`adoptFromStore`), and at the first block above it every later block at or below it is adopted (`adoptAhead`):
+the engine then knows where the store is, and every ancestor it may have to cross, whatever order the log has
+them in.
 
 | stop falls | the store holds | the log ends at | on restart | checked by |
 | --- | --- | --- | --- | --- |
 | before (1), any flush | the block before | the block before | replay; the payload is given again and imports | crash.wac, every kill "not in the store" |
-| between (1) and (2), flush 1 | block N | N − 1 | **was stuck**: no block for the store's state, every payload SYNCING. Now `adoptStored` reads N from the store, adopts it and logs it; the payload given again is VALID | `test/resume_test.wac`; crash.wac (6 of 15 runs before the fix) |
-| between (1) and (2), flush 64, at a flush | block N | N − 1 | the same as flush 1 (a flush is a commit at N) | `adoptStored`; crash.wac at 64 has not landed a kill there yet |
+| between (1) and (2), flush 1 | block N | N − 1 | N is read from the store, adopted with its undo record, and recorded for the log (`adoptStored`); the payload given again is VALID. **Was stuck before 5f2e7de**: every payload SYNCING, for good | `test/resume_test.wac` (a store a block ahead of the log); crash.wac, 6 of 15 runs before the fix |
+| between (1) and (2), flush 64, at a flush | block N | N − 1 | the same as flush 1 (a flush is a commit at N) | the same code path; crash.wac at 64 lands few kills there |
 | between (1) and (2), flush 64, not at a flush | the last flush, F < N | N − 1 | replay runs F + 1 … N − 1 from the log; N is given again | crash.wac at 64 (replays of up to 62 blocks) |
 | between (2) and (3), no reorg | N | block N, head N − 1 | head N − 1, the store at N; the fork choice given again moves the head, and the store need not move | crash.wac, every kill "in the store" |
-| between (1) and (3) of a **reorg**, flush 1 | a block X on the way from the old head to the new | the old head | blocks at or below X are adopted with no change set, so the store cannot leave X's chain; the fork choice given again works only when the new head's chain runs through X | **not tested, and not recovered in general** |
+| between (1) and (3) of a **reorg**, any flush | a block X on the way from the old head to the new | the old head | the store's block adopted first, every block it may cross with its undo record; the fork choice given again moves it from X to the new head | `test_a_crash_in_the_middle_of_a_reorg`: a stop at each of the 14 durable points of a 3-back, 4-forward reorg, the store's entries rebuilding to the tip's root every time; crash.wac with side chains |
 | after (3) | the head | the head | — | — |
 
-**And not only crashes: a reorg below the store's block, after any restart.** The same missing change sets mean
-that after a clean restart at flush 1 — the store at the head — a payload whose parent is below the head, a
-one-block reorg, is SYNCING, and stays so: the store cannot go back to the parent's state. Checked by hand
-(three blocks, a clean restart, the sibling of the head: SYNCING; with no restart: VALID). At flush 64 the
-same holds for a reorg whose branch point is below the last flush. One-block reorgs are routine on a live
-chain, so a node restarted at the wrong moment stops following it. This blocks Hoodi as much as the crash did.
+**After any restart, a reorg below the store's block.** Without undo records a restart had no change set for a
+block at or below the store's, and the store could not go back: after a clean restart at flush 1 a one-block
+reorg was SYNCING for good, and at flush 64 so was any reorg branching below the last flush. With them:
+`test_a_one_block_reorg_after_a_restart` (at flush 1, a sibling of the head; at flush 4, a sibling of the last
+flush's block) and `test_a_deep_reorg_after_a_restart` (a side chain of 9 from block 2, at flush 1 and 4), each
+going to the side chain and back, the store's entries rebuilding to the head's root each time. Without
+`loadUndo` all three of these tests are SYNCING.
 
-What would fix it, both keeping "the store reads as the state of the block the engine is at":
+**Pruning.** A block's undo record is deleted once the block is finalized (up to and including the finalized
+block, by one range read of `0x09 ‖ number`, in the next commit), and in any case once it is more than
+`Undo.limit` (1024) blocks below the block committing — if finality stalls that long, a reorg deeper than that
+cannot be followed after a restart, and the node logs a warning once per stall
+(`test_undo_records_go_at_finality_and_past_a_bound`).
 
-- **Commit only finalized blocks**: the overlay holds everything above finality (64–95 blocks on mainnet,
-  ~2 MB a block, so ~130–190 MB; more while finality stalls, bounded by a forced flush that brings the gap
-  back only then), and a restart replays from the finalized block with change sets for every block a reorg can
-  reach. The design this document started from; the overlay has to flush a prefix (up to finality), not all.
-- **Keep undo records in the store**: each block's commit also writes its change set (before and after values)
-  under its hash, pruned once the block is finalized; a restart loads them for the blocks between finality and
-  the store's block, so the store can move back. Costs a block's changed values written a second time (not
-  measured), but no larger overlay and no longer replay.
+**What it costs.** Measured on mainnet blocks (`tools/mainnet/replay.wac`, which now counts both): over 64 blocks,
+10.1 MB of undo records against 53.5 MB of state writes (keys and values, trie nodes included) — 18% more bytes,
+~160 KB a block; over the 5-block set, 27%. Held at most from finality to the head (~64–95 blocks on mainnet,
+so ~10–15 MB in the store).
 
 ## Decisions for Andrew
 

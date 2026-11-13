@@ -25,10 +25,11 @@ import { keccak256 } from "../../src/crypto/keccak.wac";
 import { U256 } from "../../src/u256.wac";
 import { hexToBytes, bytesToHex } from "../../src/hex.wac";
 import { World, Account, AccountState, ChangeSet, StateSource, emptyCodeHash, slotMap, hashU256, eqU256 } from "../../src/state/world.wac";
-import { Store } from "../../src/store/tree.wac";
+import { Store, Change } from "../../src/store/tree.wac";
+import { undoChanges } from "../../src/store/undo.wac";
 import { fileDisk } from "../../src/store/file.wac";
 import { Disk } from "../../src/store/disk.wac";
-import { StateDb } from "../../src/store/state.wac";
+import { StateDb, Staged } from "../../src/store/state.wac";
 import { executeFrom, Steps } from "../../src/store/exec.wac";
 import { Header, Block, Withdrawal, Body, executeBlock, executeBody } from "../../src/chain/block.wac";
 import { BlockEnv } from "../../src/evm/evm.wac";
@@ -459,6 +460,8 @@ async void onStore(Sys sys, string path, string keysPath, Cache cache, ChainConf
   i64 gas = 0;
   i32 reads0 = store.reads;
   Steps steps = Steps(0, 0);
+  i64 stateBytes = 0;
+  i64 undoBytes = 0;
   for (i32 i = 0; i < range.len(); i++) {
     Block b = range[i];
     Spec spec = config.specAt(b.header.timestamp);
@@ -471,7 +474,16 @@ async void onStore(Sys sys, string path, string keysPath, Cache cache, ChainConf
     Body body = await executeFrom(db, w, spec, b, parent, config.chainId, hashes, null, steps);
     ChangeSet cs = w.seal();
     i64 t1 = await sys.monotonicNanos();
-    u8[]? root = await db.flush(cs, u8[].filled(0, 0), why);
+    // Staged and committed apart, to count what the block writes: its state's keys and values, and the undo record
+    // the node writes beside them (`store/undo.wac`) — measured, not committed, as this commits only the state.
+    Staged? st = await db.stageSet(cs, true, why);
+    u8[]? root = null;
+    if (st is not null) {
+      for (i32 k = 0; k < st!.changes.len(); k++) { stateBytes += (st!.changes[k].key.len() + (st!.changes[k].value is null ? 0 : st!.changes[k].value!.len())) as i64; }
+      Change[] u = undoChanges(b.header.number.low(), b.header.hash, cs);
+      for (i32 k = 0; k < u.len(); k++) { undoBytes += (u[k].key.len() + u[k].value!.len()) as i64; }
+      root = (await db.commitStaged(st!, u8[].filled(0, 0))) == "" ? st!.root : null;
+    }
     i64 t2 = await sys.monotonicNanos();
     if (body.error != "") { sys.log("block \{b.header.number.toDecimal()} on the store: \{body.error}"); }
     if (root is null) { sys.log("block \{b.header.number.toDecimal()}: the commit failed: \{why[0]}"); }
@@ -492,6 +504,7 @@ async void onStore(Sys sys, string path, string keysPath, Cache cache, ChainConf
   i64 us = (exec + commit) / 1000;
   sys.log("on the store: \{range.len()} blocks, \{gas / 1000000} Mgas: executing \{exec / 1000000} ms (\{steps.steps} steps, \{steps.reruns} again), " +
           "committing \{commit / 1000000} ms, \{store.reads - reads0} page reads: \{us == 0 ? 0 : gas / us} Mgas/s");
+  sys.log("written: state \{stateBytes / 1024} KB, undo records \{undoBytes / 1024} KB (\{stateBytes == 0 ? 0 : undoBytes * 100 / stateBytes}% more), \{range.len()} blocks");
 }
 
 /** A block's trace appended at `at`: `B`, 8, its number; then each entry as its kind, its key's length, the key. */

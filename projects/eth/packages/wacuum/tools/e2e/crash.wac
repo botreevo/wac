@@ -9,6 +9,9 @@
 // restart goes on from its store and its block log, and the payloads are given again from the head it reports.
 // Every payload it accepts is checked against its header's state root, so a store left wrong by a crash shows at
 // the next block. At the end its head, and slots and balances across the whole chain, must be the first node's.
+// Every tenth block is preceded by a side chain of one or two empty blocks, which the store node is given and made
+// the head of before the next main block takes it back: reorgs, with kills in them too, and restarts that must
+// move the store back across blocks they did not run (their undo records, `src/store/undo.wac`).
 //
 //     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/crash.wac [BLOCKS] [KILLS] [FLUSH]
 //
@@ -32,6 +35,10 @@ static i32 SLOTS = 150;
 struct Given {
   string params;
   string hash;
+  u64 number;
+  bool side;
+  /** The block finalized with it: itself on the main chain; on a side chain, the main block it branches from. */
+  string finalized;
 }
 
 string runtime() {
@@ -57,7 +64,10 @@ i32 parse(string s) {
   return n;
 }
 
-string fc(string h) { return "{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{h}\"}"; }
+string fc(string h) { return fcWith(h, h); }
+
+/** A fork choice whose safe and finalized block is `fin`: a side chain's blocks are never finalized. */
+string fcWith(string h, string fin) { return "{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{fin}\",\"finalizedBlockHash\":\"\{fin}\"}"; }
 
 async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store, i32 flush) {
   string[] argv = [app, "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc", "--port", "\{port}",
@@ -105,7 +115,30 @@ export async i32 main(Sys sys) {
   string len = bytesToHex([((code.len() / 2) & 255) as! u8]).slice(2, 4);
   u64 nonce = 0;
   string contract = createAddress(me, 0);
+  i32 sides = 0;
   for (i32 b = 0; b < blocks; b++) {
+    // Every tenth block, first a side chain of one or two empty blocks on the head, given to the store node and
+    // then left: the next main block takes it back across them — a reorg, which kills land in too.
+    if (b % 10 == 5) {
+      string at = head;
+      for (i32 k = 0; k < 1 + (b / 10) % 2; k++) {
+        string sattrs = "{\"timestamp\":\"\{U256.ofU64(time + 1 + (k as@ u32) as u64).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                        "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fd\",\"withdrawals\":[],\"parentBeaconBlockRoot\":\"\{ZERO}\"}";
+        string sid = field(await ea.get("engine_forkchoiceUpdatedV3", "[\{fcWith(at, head)},\{sattrs}]"), "payloadId");
+        JsonValue? sp = (await ea.call("engine_getPayloadV4", "[\"\{sid}\"]")).result();
+        if (sp is null) { break; }
+        string sparams = "[\{string.fromBytes(stringify(sp!.member("executionPayload")!))},[],\"\{ZERO}\",\{string.fromBytes(stringify(sp!.member("executionRequests")!))}]";
+        string sh = field(sp!.member("executionPayload"), "blockHash");
+        if (field(await ea.get("engine_newPayloadV4", sparams), "status") != "VALID") { break; }
+        await ea.get("engine_forkchoiceUpdatedV3", "[\{fcWith(sh, head)},null]");
+        chain.push(Given(sparams, sh, quantity(field(sp!.member("executionPayload"), "blockNumber")), true, head));
+        sides++;
+        at = sh;
+      }
+      // The first node back on its main chain.
+      await ea.get("engine_forkchoiceUpdatedV3", "[\{fc(head)},null]");
+      time += 4;
+    }
     if (b == 0) {
       await ua.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, "", U256.zero(), hexBytes("60" + len + "600c60003960" + len + "6000f3" + code), 200000)}\"]");
       nonce++;
@@ -128,10 +161,10 @@ export async i32 main(Sys sys) {
     string h = field(p!.member("executionPayload"), "blockHash");
     if (field(await ea.get("engine_newPayloadV4", params), "status") != "VALID") { break; }
     await ea.get("engine_forkchoiceUpdatedV3", "[\{fc(h)},null]");
-    chain.push(Given(params, h));
+    chain.push(Given(params, h, quantity(field(p!.member("executionPayload"), "blockNumber")), false, h));
     head = h;
   }
-  t.that(chain.len() == blocks, "the first node built \{chain.len()} blocks");
+  t.that(chain.len() == blocks + sides, "the first node built \{blocks} blocks, and \{sides} on side chains for the reorgs");
 
   // The same chain into a wacuum on a store, killed at random as it goes.
   i32 portB = await somePort(sys, 20251, 500);
@@ -150,7 +183,7 @@ export async i32 main(Sys sys) {
   i32 tries = 0;
   while (next < chain.len() && !stuck) {
     tries++;
-    if (tries > blocks * 4) {
+    if (tries > chain.len() * 4) {
       stuck = true;
       break;
     }
@@ -184,23 +217,28 @@ export async i32 main(Sys sys) {
         holds = 0;
         for (i32 e = 0; e < rest.len() && rest[e] >= 48 && rest[e] <= 57; e++) { holds = holds * 10 + ((rest[e] as i32) - 48); }
       }
-      if (holds > next) { kept++; } else { lost++; }
+      if (holds >= (g.number as! i32)) { kept++; } else { lost++; }
       // The blocks the restart replayed from the log: those since the store's last write. None when the store is
       // ahead of the head, the killed block committed and its forkchoiceUpdated never sent.
       i32 replayed = (quantity(n) as! i32) - holds;
       if (replayed < 0) { replayed = 0; }
       replayedMost = replayed > replayedMost ? replayed : replayedMost;
       replayedAll += replayed;
-      next = quantity(n) as! i32;
+      // Given again from just after its head, wherever that is in the stream: on a side chain, or the main one.
+      string at = field(await ub.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash");
+      next = 0;
+      for (i32 i = 0; i < chain.len(); i++) {
+        if (chain.get(i).hash == at) { next = i + 1; }
+      }
       continue;
     }
     string st = field(await eb.get("engine_newPayloadV4", g.params), "status");
     if (st != "VALID") {
-      t.that(false, "block \{next + 1} after \{killed} kills: \{st}");
+      t.that(false, "\{g.side ? "side " : ""}block \{g.number} (\{next + 1} of the stream) after \{killed} kills: \{st}");
       stuck = true;
       break;
     }
-    await eb.get("engine_forkchoiceUpdatedV3", "[\{fc(g.hash)},null]");
+    await eb.get("engine_forkchoiceUpdatedV3", "[\{fcWith(g.hash, g.finalized)},null]");
     next++;
   }
   t.that(!stuck, "every block went in, \{killed} kills and restarts along the way (\{lost} with the block being imported not in the store, \{kept} with it in); flushing every \{flush}, each restart replayed up to \{replayedMost} blocks from the log, \{replayedAll} in all");

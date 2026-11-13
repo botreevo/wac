@@ -109,8 +109,12 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 - **Not yet run against the real network.** Snap sync has only met geth on private devnets: never a public peer
   set, rate limits, peers that drop or lie, or a state the size of Hoodi's (tens of GB). Healing has met a pivot
   that ages out by our own simulation, because geth here kept serving old pivots.
-- **No consensus client has driven it.** Every Engine API call in testing came from fixtures or our own test
-  driver. A local Prysm or Lighthouse was blocked in this container; Hoodi will be the first.
+- **One consensus client, on a private chain.** `tools/e2e/cl.wac` (2026-11-13): Prysm 7.3.1 with all 64
+  validators drives wacuum on a store from genesis, every fork through Fulu/Osaka at genesis, 2 s slots; a second
+  Prysm drives geth, which imports every block wacuum builds. 118 blocks in 128 slots with 53 transfers, geth
+  holding the same blocks; wacuum killed at block 22 and started again went on; epoch 2 finalized, the same
+  finalized block in both. Not yet: Lighthouse (Hoodi's deploy uses it), a chain wacuum did not build itself
+  from genesis, blobs, or a real network's latency and peers.
 - **Scale.** The largest store so far is 5 GB, synthetic; Hoodi's will be tens of GB and mainnet's hundreds. The
   interior is kept in memory (~400 MB estimated at mainnet). Commit cost grows with the store (above); beyond 5 GB
   it is extrapolated, not measured.
@@ -127,7 +131,7 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 
 ## Not tested at all
 
-A real consensus client; Hoodi; mainnet's size; days of uptime; a full disk; another client snap-syncing from
+A consensus client other than Prysm; Hoodi; mainnet's size; days of uptime; a full disk; another client snap-syncing from
 wacuum (the server is tested against our own client only); deep reorgs on the store beyond what the fixtures
 contain.
 

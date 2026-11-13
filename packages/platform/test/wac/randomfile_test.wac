@@ -1,7 +1,7 @@
 // std's RandomFile — spec ch44 [§wac-std-file-random-q8v3kxn]: a file read and written at offsets, as a
 // database's pages are, on whichever host runs the test.
 
-import { Sys, Files, RandomFile, HostFault, Unsupported } from "std";
+import { Sys, Files, RandomFile, HostFault, Unsupported, ChildEnv, Exec, Launch } from "std";
 import { Result, flatten } from "core";
 import { T } from "../../../wactest/src/assert.wac";
 
@@ -55,6 +55,43 @@ export async string test_a_random_file_is_read_and_written_in_place(Sys sys) {
   }
   await ro.close();
   t.isTrue((await fs.openRandom(dir + "/missing", false)).isErr(), "opening a missing file to read fails");
+  await fs.remove(dir, true);
+  return t.report();
+}
+
+/**
+ * **A read the page cache does not hold answers the same bytes as one it does** — `issues/system/0471w`. The native hosts
+ * answer a `readAt` at once when `preadv2(RWF_NOWAIT)` finds it cached, and on their file threads when it refuses
+ * (`EAGAIN`) — so the two paths are asked the same questions here, the file evicted first with `dd iflag=nocache`
+ * (GNU), which needs no privilege. Where there is no such `dd` the second pass is still a cached read, and says so.
+ */
+export async string test_a_read_answers_the_same_whether_the_page_cache_holds_it_or_not(Sys sys) {
+  T t = T.create();
+  Files fs = sys.files();
+  string dir = base(sys) + "/cold";
+  await fs.remove(dir, true);
+  t.isTrue((await fs.mkdir(dir, true)).isOk(), "mkdir");
+  string path = dir + "/c.bin";
+  u8[] data = u8[].filled(1 << 20, 0);
+  for (i32 i = 0; i < data.len(); i++) { data[i] = (i % 251) as@ u8; }
+  t.isTrue((await fs.writeFile(path, data)).isOk(), "wrote a megabyte of a known pattern");
+  string[] passes = ["evicted", "cached"];
+  for (string pass in passes) {
+    if (pass == "evicted") {
+      Exec? dd = (await sys.procs().exec("dd", ["if=" + path, "iflag=nocache", "count=0"], u8[](), ChildEnv.inherited(),
+                                          Launch.plain())).ok();
+      if (dd is null || dd!.status != 0) { sys.log("randomfile: no GNU dd here, so the first pass may be cached too"); }
+    }
+    RandomFile f = (await fs.openRandom(path, false)).unwrap();
+    i32 bad = 0;
+    for (i32 k = 0; k < 16; k++) {
+      i32 at = k * 65536 + 13;
+      u8[] got = (await f.readAt(at as i64, 3)).unwrap();
+      if (got.len() != 3 || got[0] != (at % 251) as@ u8 || got[2] != ((at + 2) % 251) as@ u8) { bad = bad + 1; }
+    }
+    t.eqI32(bad, 0, "\{pass}: every read answered the bytes at its offset");
+    t.eqI32((await f.readAt((1 << 20) as i64 - 2, 10)).unwrap().len(), 2, "\{pass}: a read across the end answers what there is");
+  }
   await fs.remove(dir, true);
   return t.report();
 }

@@ -2393,11 +2393,21 @@ fn serve(
             let Some(f) = file else {
                 return now(Kind::Change, Outcome::Change(FAULT_OTHER, "not an open file".into()));
             };
+            // A read the page cache holds is answered now, with no thread at all (`read_at_cached`).
+            if op == OP_READ_AT {
+                let n = bytes.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize).unwrap_or(0);
+                if let Some(read) = read_at_cached(&f, n, b as u64) {
+                    return now(Kind::Change, match read {
+                        Ok(got) => Outcome::FileResult(true, got, String::new(), FAULT_NONE),
+                        Err(e) => Outcome::FileResult(false, Vec::new(), e.to_string(), fault_of(&e)),
+                    });
+                }
+            }
             let offset = b as u64;
             let data = bytes.clone();
             let id = caller.data().tickets.submit();
             let table = caller.data().tickets.clone();
-            std::thread::spawn(move || {
+            on_file_pool(move || {
                 let outcome = match op {
                     OP_READ_AT => {
                         let n = data.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize).unwrap_or(0);
@@ -3131,6 +3141,72 @@ const OP_WRITE_AT: i32 = 70;
 const OP_FILE_SIZE: i32 = 71;
 const OP_TRUNCATE_FILE: i32 = 72;
 const OP_SYNC_FILE: i32 = 73;
+
+/// **`readAt` answered from the page cache, without a thread** — `issues/system/0471w`.
+///
+/// A positioned read used to take a thread of its own, spawned for it: about 55 µs on a 4-vCPU VM, against half a
+/// microsecond for the `pread` itself and five for the round trip to the program — so a 16-byte read cost what a
+/// 64 KB one did, and 64 in flight did not overlap, because the spawns were paid one after another on the program's
+/// thread. `preadv2` with `RWF_NOWAIT` reads only what the page cache already holds and refuses (`EAGAIN`) rather
+/// than wait for the disk, so it can be answered here, at once, without blocking the program on I/O. `None` when it
+/// would have to wait, or the system or the filesystem cannot say: the caller takes the slow path, which reads again
+/// in full on `on_file_pool`.
+#[cfg(target_os = "linux")]
+fn read_at_cached(f: &std::fs::File, n: usize, offset: u64) -> Option<std::io::Result<Vec<u8>>> {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; n];
+    let mut got = 0usize;
+    while got < n {
+        let iov = libc::iovec { iov_base: buf[got..].as_mut_ptr() as *mut libc::c_void, iov_len: n - got };
+        // SAFETY: one iovec over the unfilled tail of a buffer owned here; the descriptor is open for the call.
+        let r = unsafe { libc::preadv2(f.as_raw_fd(), &iov, 1, (offset + got as u64) as libc::off_t, libc::RWF_NOWAIT) };
+        if r > 0 {
+            got += r as usize;
+            continue;
+        }
+        if r == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => return None,
+            _ => return Some(Err(e)),
+        }
+    }
+    buf.truncate(got);
+    Some(Ok(buf))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_at_cached(_f: &std::fs::File, _n: usize, _offset: u64) -> Option<std::io::Result<Vec<u8>>> {
+    None
+}
+
+/// **Standing threads for the file operations that may block** — `issues/system/0471w`: a read the page cache could not
+/// answer, a write, a size, a truncate, a sync. They each spawned a thread, at about 55 µs a spawn; these are started
+/// once, on first use, and a job is a channel send. Eight, so that a few slow syncs do not hold up every read behind
+/// them; shared by every program in the process, children included, which is as many as one machine's disk wants.
+fn on_file_pool(job: impl FnOnce() + Send + 'static) {
+    type Job = Box<dyn FnOnce() + Send>;
+    static POOL: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for _ in 0..8 {
+            let rx = rx.clone();
+            std::thread::spawn(move || loop {
+                let next = rx.lock().unwrap().recv();
+                match next {
+                    Ok(job) => job(),
+                    Err(_) => return,
+                }
+            });
+        }
+        std::sync::Mutex::new(tx)
+    });
+    let _ = pool.lock().unwrap().send(Box::new(job));
+}
 
 /// Up to `n` bytes of `f` from `offset`, fewer only where it ends — `Files.openRandom`'s `readAt`.
 fn read_at(f: &std::fs::File, n: usize, offset: u64) -> std::io::Result<Vec<u8>> {

@@ -325,3 +325,51 @@ export async string test_undo_records_go_at_finality_and_past_a_bound(Sys sys) {
   t.ok(e.undo.bytes > 0 && e.undo.stateBytes > 0, "the bytes counted: \{e.undo.bytes} undo, \{e.undo.stateBytes} state");
   return t.report();
 }
+
+export async string test_a_fork_choice_of_a_side_chain_finality_ruled_out(Sys sys) {
+  // The crash e2e's failure, without processes: a side chain made the head, then the main chain finalized past it
+  // (its undo records, and the main block's below it, deleted with finality). A restart moves the store back to
+  // the log's head; the restart after it must run the side chain's block above the store, cannot, skips it — and
+  // must pass over the fork choice that named it, not refuse the log.
+  Check t = Check.create();
+  MemDisk md = MemDisk.create();
+  Engine e = await started(genesis(), md, 1);
+  Genesis g2 = genesis();
+  Engine m = Engine.create(g2.config, g2.header, g2.world);
+  Vec<JsonValue> main = Vec.create();
+  for (i32 i = 1; i <= 2; i++) {
+    JsonValue? p = await build(m, 12 * i);
+    main.push(p!);
+    await goTo(m, p!);
+    t.eqStr(await goTo(e, p!), "VALID", "main block \{i}");
+  }
+  U256 two = hashOf(main.get(1));
+  Vec<JsonValue> side = Vec.create();
+  for (i32 k = 0; k < 2; k++) {
+    JsonValue? s = await buildFor(m, 12 * (k + 3) + 5, "0x4444444444444444444444444444444444444444", U256.zero());
+    side.push(s!);
+    await goTo(m, s!);
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", s!)), "VALID", "side block \{k + 3}");
+  }
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(side.get(1)), two, JsonValue.Null))), "VALID", "the side chain the head");
+  await call(m, "engine_forkchoiceUpdatedV3", choice(two, JsonValue.Null));
+  for (i32 i = 3; i <= 4; i++) {
+    JsonValue? p = await build(m, 12 * i);
+    main.push(p!);
+    await goTo(m, p!);
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p!)), "VALID", "main block \{i}");
+    if (i == 3) { t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(p!), hashOf(p!), JsonValue.Null))), "VALID", "main block 3 the head, and finalized"); }
+  }
+  u8[] log = logOf(e, e.records.len());
+  Engine r1 = await restarted(genesis(), md, log, 1);
+  t.ok(r1.head.eq(hashOf(main.get(2))), "the first restart: the log's head, main block 3");
+  StateDb db2 = StateDb.over((await Store.open(md.disk())).unwrap());
+  Engine r2 = Engine.onStore(g2.config, g2.header, db2);
+  r2.resumeFromStore();
+  Replayed rp = await r2.replay(log);
+  t.eqStr(rp.error, "", "the second restart replays the log, the side chain's fork choice passed over");
+  await r2.adoptStored();
+  t.eqStr(await goTo(r2, main.get(3)), "VALID", "and goes on: main block 4");
+  t.ok(await storeIsHead(r2), "the store its state");
+  return t.report();
+}

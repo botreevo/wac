@@ -887,16 +887,22 @@ export struct Engine {
     }
     StateDb db = this.db!;
     string[] why = [""];
+    // Each step is a commit (or a staged one), so `at` follows each: if a step fails part way, the engine still
+    // knows the block the store is at, and the next move starts from there rather than from where it set out.
     for (i32 i = 0; i < back.len(); i++) {
       Header to = reached.get(i);
       u8[]? root = await db.writeSet(back.get(i), false, storedAt(to), why);
       if (root is null || !U256.fromBytes(root!, 0, 32).eq(to.stateRoot)) { return false; }
+      this.at = to.hash;
+      this.freshWorld();
     }
     for (i32 i = forward.len() - 1; i >= 0; i--) {
       // The blocks reached going forward, from the meeting point up to the target.
       Header to = i == 0 ? tn!.header : this.headerAbove(tn!.header, i);
       u8[]? root = await db.writeSet(forward.get(i), true, storedAt(to), why);
       if (root is null || !U256.fromBytes(root!, 0, 32).eq(to.stateRoot)) { return false; }
+      this.at = to.hash;
+      this.freshWorld();
     }
     this.at = target;
     this.freshWorld();
@@ -1345,6 +1351,9 @@ export struct Engine {
     i32 at = 0;
     i32 blocks = 0;
     bool lookedAhead = false;
+    // Blocks of the log that could not run: on a fork finality has since ruled out, whose parent state the store
+    // cannot reach (its undo records gone with finality). A fork choice that named one is passed over too.
+    Map<U256, bool> skipped = Map.create(hashU256, eqU256);
     await this.adoptFromStore();
     while (at < log.len()) {
       i32 n = rlpLength(log, at);
@@ -1377,7 +1386,7 @@ export struct Engine {
           // A block on a fork the snapshot's finality ruled out has no parent state to run on, and is
           // skipped as finality would have dropped it; anything else that does not run is a broken log.
           if (st == "INVALID") { return Replayed(at, blocks, "block at byte \{at} is \{st} on replay"); }
-          if (st == "VALID") { blocks++; }
+          if (st == "VALID") { blocks++; } else { skipped.set(b.header.hash, true); }
         }
       } else if (kind.len() == 1 && kind[0] == RECORD_BASE && f.len() >= 2) {
         Header[] hs = Header[].filled(f.len() - 1, this.headHeader());
@@ -1396,6 +1405,10 @@ export struct Engine {
         lookedAhead = false;
       } else if (kind.len() == 1 && kind[0] == RECORD_CHOICE && f.len() == 4) {
         U256 head = U256.fromBytes(bytesOf(f[1]), 0, 32);
+        if (!this.blocks.has(head) && skipped.has(head)) {
+          at += n;
+          continue;
+        }
         if (this.db is not null && this.blocks.has(head)) { await this.moveToAsync(head); }
         if (!this.choose(head, U256.fromBytes(bytesOf(f[2]), 0, 32), U256.fromBytes(bytesOf(f[3]), 0, 32))) {
           return Replayed(at, blocks, "fork choice at byte \{at} names a block the log has not");

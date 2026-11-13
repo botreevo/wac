@@ -5,11 +5,11 @@
 
 import { Map, Vec, Ticket } from "core";
 import { Sys } from "std";
-import { rlp.Item, rlp.itemsOf } from "@/lib.wac";
+import { rlp.Item, rlp.itemsOf, rlp.decode } from "@/lib.wac";
 import { U256 } from "../src/u256.wac";
 import { World, Account, AccountState, slotMap, hashU256, eqU256, emptyCodeHash } from "../src/state/world.wac";
 import { keccak256 } from "../src/crypto/keccak.wac";
-import { Store } from "../src/store/tree.wac";
+import { Store, Change } from "../src/store/tree.wac";
 import { MemDisk, Disk } from "../src/store/disk.wac";
 import { StateDb, rootOf } from "../src/store/state.wac";
 import { Message } from "../src/p2p/wire.wac";
@@ -120,7 +120,7 @@ Item[] dropOne(Item[] x) {
   return [Item.List(fewer), x[1]];
 }
 
-export string test_snap_sync_between_two_stores() { return run().wait().orElse("it never finished"); }
+export async string test_snap_sync_between_two_stores(Sys sys) { return await run(); }
 
 /** A server whose state moves on after `after` requests, as a peer's does while a sync runs: then it answers only about the new root. */
 struct Moving {
@@ -189,14 +189,9 @@ async Item[]? answerMoving(Moving m, Message q) {
   return rest;
 }
 
-async string runMoving(i32 after) {
-  Check t = Check.create();
-  MemDisk sd = MemDisk.create();
-  Store server = (await Store.open(sd.disk())).unwrap();
-  string[] why = [""];
-  u8[] first = (await StateDb.over(server).seed(state(), u8[].filled(0, 0), why))!;
-  Moving m = Moving(server, first, 0, after, false, false, Vec.create());
-  Asker peer = Asker(async (Message q) => {
+/** One asker over the moving server; several share its one state, as peers on one chain do. */
+Asker movingAsker(Moving m) {
+  return Asker(async (Message q) => {
     while (m.busy) { await parked(m); }
     m.busy = true;
     Item[]? out = await answerMoving(m, q);
@@ -204,10 +199,21 @@ async string runMoving(i32 after) {
     if (m.waiting.len() > 0) { m.waiting.remove(0).resolve(true); }
     return out;
   }, 1, 4096, () => m.root);
+}
+
+async string runMoving(i32 after, i32 count) {
+  Check t = Check.create();
+  MemDisk sd = MemDisk.create();
+  Store server = (await Store.open(sd.disk())).unwrap();
+  string[] why = [""];
+  u8[] first = (await StateDb.over(server).seed(state(), u8[].filled(0, 0), why))!;
+  Moving m = Moving(server, first, 0, after, false, false, Vec.create());
+  Asker[] peers = Asker[].filled(count, movingAsker(m));
+  for (i32 i = 1; i < count; i++) { peers[i] = movingAsker(m); }
 
   MemDisk cd = MemDisk.create();
   Store client = (await Store.open(cd.disk())).unwrap();
-  Fetched f = await snapSync([peer], client, first, "pivot".toBytes());
+  Fetched f = await snapSync(peers, client, first, "pivot".toBytes());
   t.eqStr(f.error, "", "the sync finishes though its pivot moved");
   t.ok(m.moved, "the pivot did move, after \{m.after} requests");
   t.ok(f.healed > 0, "and was healed: \{f.healed} nodes");
@@ -221,25 +227,45 @@ async string runMoving(i32 after) {
   i32 ours = await back.storedNodes();
   i32 serverNodes = await theirs.storedNodes();
   t.ok(ours == serverNodes, "with as many nodes as the server's: \{ours} and \{serverNodes}");
-  // Nothing left over: as many entries of each kind as the server.
+  // Nothing left over: as many accounts, slots and trie nodes as the server. Not codes: they are kept by hash
+  // and the server keeps those of accounts gone in the move, which the client fetched only if it saw the
+  // account before the move; instead, every code an account names must be there.
   i32 extra = 0;
   for (i32 kind = 0; kind < 5; kind++) {
+    if (kind == 2) { continue; }
     i32 a = (await client.range([kind as@ u8], [(kind + 1) as@ u8], 0x7fffffff)).len();
     i32 b = (await server.range([kind as@ u8], [(kind + 1) as@ u8], 0x7fffffff)).len();
     if (a != b) { extra++; }
   }
+  Vec<Change> accounts = await client.range([0], [1], 0x7fffffff);
+  i32 missingCode = 0;
+  for (i32 i = 0; i < accounts.len(); i++) {
+    u8[] ch = bytesOf(itemsOf(decode(accounts.get(i).value!).item)[3]);
+    if (bytesToHex(ch) == emptyCodeHash().toHex()) { continue; }
+    u8[] at = u8[].filled(33, 2);
+    at.copyFrom(ch, 0, 1, 32);
+    // A code's chunks are at 2, its hash, and a two-byte index: all before 2, the hash, ff ff ff.
+    u8[] past = u8[].filled(36, 0xff);
+    past[0] = 2;
+    past.copyFrom(ch, 0, 1, 32);
+    if ((await client.range(at, past, 1)).len() == 0) { missingCode++; }
+  }
+  t.ok(missingCode == 0, "every code an account names is there: \{missingCode} missing");
   t.ok(extra == 0, "every kind of entry counted the same as the server's");
   return t.report();
 }
 
-export string test_snap_sync_heals_a_moving_pivot() {
+/** Async, not `wait()`: eight syncs each waited for would all be kept alive (wac 0473w), past the heap. */
+export async string test_snap_sync_heals_a_moving_pivot(Sys sys) {
   // The pivot moving early in the accounts, later in them, in the storage, and near the end (a whole sync
   // is some thirty requests).
   string out = "";
   i32[] when = [3, 8, 15, 22];
   for (i32 i = 0; i < when.len(); i++) {
-    string r = runMoving(when[i]).wait().orElse("it never finished");
-    if (r != "") { out += "moving after \{when[i]}: " + r + "; "; }
+    for (i32 count = 1; count <= 3; count += 2) {
+      string r = await runMoving(when[i], count);
+      if (r != "") { out += "moving after \{when[i]}, from \{count} peer(s): " + r + "; "; }
+    }
   }
   return out;
 }

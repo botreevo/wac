@@ -301,27 +301,6 @@ export struct Fetched {
   u8[] root;
 }
 
-/** One at a time: commits from workers that run at once go through this, since a commit is not re-entrant. */
-struct Lock {
-  bool held;
-  Vec<Ticket<bool>> waiting;
-
-  async void take(this) {
-    if (!this.held) {
-      this.held = true;
-      return;
-    }
-    Ticket<bool> t;
-    this.waiting.push(t);
-    // Handed over by `give`, still held.
-    await t;
-  }
-
-  void give(this) {
-    if (this.waiting.len() > 0) { this.waiting.remove(0).resolve(true); } else { this.held = false; }
-  }
-}
-
 /** What the workers of a sync share: the store, the pivot's root as it moves, and what they have found. */
 struct Shared {
   Store store;
@@ -331,19 +310,14 @@ struct Shared {
   Vec<u8[]> storageRoots;
   Map<string, bool> codes;
   Vec<u8[]> codeList;
-  Lock lock;
   /** The next account whose storage a storage worker takes. */
   i32 nextStorage;
   /** Whether the pivot ever moved, so that storage runs may fail to prove and heal later. */
   bool moved;
 }
 
-async string commitLocked(Shared s, Change[] changes) {
-  await s.lock.take();
-  string bad = await s.store.commit(changes, u8[].filled(0, 0));
-  s.lock.give();
-  return bad;
-}
+/** A worker's commit: the store's gate queues them, one at a time. */
+async string commitLocked(Shared s, Change[] changes) { return await s.store.commit(changes, u8[].filled(0, 0)); }
 
 /** The pivot moved on: the newest root, or "" when there is none newer (the peer has no state for it). */
 string moveOn(Shared s, Asker peer, u8[] asked) {
@@ -460,13 +434,12 @@ async string storages(Asker peer, Shared s) {
  * every slot and every code, each run checked against `root`; then the tries built from what was fetched,
  * and the root they come to checked — healed, if the pivot moved meanwhile; committed with `user` beside it.
  * The account space is split among the peers, two slices each, fetched at once; then each peer takes the
- * next account's storage until there is none. `fetched.error` is "" when done.
+ * next account's storage until there is none, and the next batch of codes; healing asks them all at once
+ * too. `fetched.error` is "" when done.
  */
 export async Fetched snapSync(Asker[] peers, Store store, u8[] root, u8[] user) {
   Fetched f = Fetched(0, 0, 0, 0, 0, "", 0, root);
-  Shared s = Shared(store, root, f, Vec.create(), Vec.create(), Map.create(hashText, textEq), Vec.create(),
-                    Lock(false, Vec.create()), 0, false);
-  Asker peer = peers[0];
+  Shared s = Shared(store, root, f, Vec.create(), Vec.create(), Map.create(hashText, textEq), Vec.create(), 0, false);
 
   // Accounts: the key space in slices by its first byte, the slices among the peers, all at once.
   i32 slices = peers.len() * 2;
@@ -496,42 +469,9 @@ export async Fetched snapSync(Asker[] peers, Store store, u8[] root, u8[] user) 
   Map<string, bool> codes = s.codes;
   Vec<u8[]> codeList = s.codeList;
 
-  // Codes, by hash, each checked against its hash.
-  i32 at = 0;
-  while (at < codeList.len()) {
-    i32 n = codeList.len() - at < 64 ? codeList.len() - at : 64;
-    u8[][] ask = u8[][].defaulted(n);
-    for (i32 i = 0; i < n; i++) { ask[i] = codeList.get(at + i); }
-    u64 id = peer.nextId;
-    peer.nextId++;
-    f.requests++;
-    Item[]? got = await peer.ask(getByteCodes(id, ask, peer.bytes));
-    if (got is null || got!.len() < 1) { return failedWith(f, "a peer did not answer for codes"); }
-    Item[] cs = itemsOf(got![0]);
-    if (cs.len() == 0) { return failedWith(f, "a peer has none of the codes asked for"); }
-    Vec<Change> out = Vec.create();
-    // Answers come in the order asked, skipping what the peer has not got: each is matched by its hash.
-    i32 matched = 0;
-    for (i32 i = 0; i < cs.len(); i++) {
-      u8[] code = bytesOf(cs[i]);
-      u8[] h = keccak256(code);
-      if (!codes.has(text(h))) { return failedWith(f, "a code that was not asked for"); }
-      i32 k = 0;
-      for (i32 c = 0; c < code.len(); c += 32768) {
-        i32 len = code.len() - c < 32768 ? code.len() - c : 32768;
-        u8[] part = u8[].filled(len, 0);
-        part.copyFrom(code, c, 0, len);
-        out.push(Change(key(2, h, [(k >> 8) as! u8, (k & 255) as! u8]), part));
-        k++;
-      }
-      matched++;
-    }
-    string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
-    if (bad != "") { return failedWith(f, bad); }
-    f.codes += matched;
-    // The rest of the batch again, if the answer was cut short.
-    at += matched;
-  }
+  // Codes, by hash, each checked against its hash: every peer takes the next batch until there is none.
+  string codesBad = await fetchCodes(peers, store, f, codeList);
+  if (codesBad != "") { return failedWith(f, codesBad); }
 
   // The tries, from what was fetched: each storage trie, then the account trie, in the store's order.
   bool moved = s.moved;
@@ -543,7 +483,7 @@ export async Fetched snapSync(Asker[] peers, Store store, u8[] root, u8[] user) 
   if (!same(built!, root)) {
     if (!moved) { return failedWith(f, "the account trie comes to another root"); }
     // A patchwork of the states the pivot passed through: healed to the last one.
-    string healed = await heal(peer, store, root, f);
+    string healed = await heal(peers, store, root, f);
     if (healed != "") { return failedWith(f, healed); }
   }
   string done = await store.commit(Change[].filled(0, Change(u8[].filled(0, 0), null)), user);
@@ -664,14 +604,14 @@ u8[] packed(u8[] nibbles, u8 pad) {
  * accounts or slots, and a gone account's storage — deleted. A leaf writes its entry; an account's leaf
  * goes on to its storage trie and its code.
  */
-async string heal(Asker peer, Store store, u8[] root, Fetched f) {
+async string heal(Asker[] peers, Store store, u8[] root, Fetched f) {
   Vec<Need> todo = Vec.create();
   todo.push(Need(u8[].filled(0, 0), u8[].filled(0, 0), Item.Bytes(root)));
   while (todo.len() > 0) {
     // What is already right comes off; the rest is asked for, up to 64 at a time.
     Vec<Need> ask = Vec.create();
     Vec<Need> known = Vec.create();
-    while (todo.len() > 0 && ask.len() < 64) {
+    while (todo.len() > 0 && ask.len() < 64 * peers.len()) {
       Need n = todo.pop()!;
       if (isList(n.ref)) {
         known.push(n);
@@ -689,49 +629,65 @@ async string heal(Asker peer, Store store, u8[] root, Fetched f) {
       if (bad != "") { return bad; }
     }
     if (ask.len() > 0) {
-      Vec<Item> groups = Vec.create();
-      for (i32 i = 0; i < ask.len(); i++) {
-        Need n = ask.get(i);
-        groups.push(n.owner.len() == 0 ? Item.List([compact(n.path)]) : Item.List([bytes32(n.owner), compact(n.path)]));
-      }
-      u64 id = peer.nextId;
-      peer.nextId++;
-      f.requests++;
-      Item[]? got = await peer.ask(getTrieNodes(id, root, groups, peer.bytes));
-      if (got is not null && got!.len() >= 1 && itemsOf(got![0]).len() == 0) {
-        // Nothing about this root: the peer has moved on, so the heal goes on to the newest, from its top.
-        u8[] newer = peer.pivot is null ? u8[].filled(0, 0) : peer.pivot!();
-        if (newer.len() > 0 && !same(newer, root)) {
-          root = newer;
-          f.root = newer;
-          todo = Vec.create();
-          todo.push(Need(u8[].filled(0, 0), u8[].filled(0, 0), Item.Bytes(root)));
-          string done = await store.commit(out.toArray(), u8[].filled(0, 0));
-          if (done != "") { return done; }
-          continue;
+      // The paths shared among the peers, up to 64 each, all asked at once; the answers applied in order after.
+      i32 per = (ask.len() + peers.len() - 1) / peers.len();
+      if (per > 64) { per = 64; }
+      i32 parts = (ask.len() + per - 1) / per;
+      Ticket<Item[]?>[] asked = Ticket<Item[]?>[].filled(parts, noAnswer());
+      for (i32 p = 0; p < parts; p++) {
+        Asker peer = peers[p % peers.len()];
+        Vec<Item> groups = Vec.create();
+        for (i32 i = p * per; i < ask.len() && i < (p + 1) * per; i++) {
+          Need n = ask.get(i);
+          groups.push(n.owner.len() == 0 ? Item.List([compact(n.path)]) : Item.List([bytes32(n.owner), compact(n.path)]));
         }
+        u64 id = peer.nextId;
+        peer.nextId++;
+        f.requests++;
+        asked[p] = peer.ask(getTrieNodes(id, root, groups, peer.bytes));
       }
-      if (got is null || got!.len() < 1 || itemsOf(got![0]).len() == 0) {
-        return "a peer did not answer for trie nodes (\{got is null ? "no answer" : "an empty one"} about root \{text(root)}, \{ask.len()} paths)";
+      bool repivot = false;
+      for (i32 p = 0; p < parts; p++) {
+        Item[]? got = await asked[p];
+        if (repivot) { continue; }
+        if (got is not null && got!.len() >= 1 && itemsOf(got![0]).len() == 0) {
+          // Nothing about this root: the peer has moved on, so the heal goes on to the newest, from its top.
+          u8[] newer = peers[p % peers.len()].pivot is null ? u8[].filled(0, 0) : peers[p % peers.len()].pivot!();
+          if (newer.len() > 0 && !same(newer, root)) {
+            repivot = true;
+            root = newer;
+            f.root = newer;
+            continue;
+          }
+        }
+        if (got is null || got!.len() < 1 || itemsOf(got![0]).len() == 0) {
+          return "a peer did not answer for trie nodes (\{got is null ? "no answer" : "an empty one"} about root \{text(root)}, \{ask.len()} paths)";
+        }
+        Item[] nodes = itemsOf(got![0]);
+        i32 from = p * per;
+        i32 count = ask.len() - from < per ? ask.len() - from : per;
+        for (i32 i = 0; i < nodes.len() && i < count; i++) {
+          u8[] enc = bytesOf(nodes[i]);
+          Need n = ask.get(from + i);
+          if (!same(keccak256(enc), bytesOf(n.ref))) { return "a trie node is not the one asked for"; }
+          f.healed++;
+          string bad = await apply(store, f, n, decode(enc).item, true, out, todo);
+          if (bad != "") { return bad; }
+          out.push(Change(nodeKey(n.owner, n.path), enc));
+        }
+        // What was not answered goes back on the list.
+        for (i32 i = nodes.len(); i < count; i++) { todo.push(ask.get(from + i)); }
       }
-      Item[] nodes = itemsOf(got![0]);
-      for (i32 i = 0; i < nodes.len() && i < ask.len(); i++) {
-        u8[] enc = bytesOf(nodes[i]);
-        Need n = ask.get(i);
-        if (!same(keccak256(enc), bytesOf(n.ref))) { return "a trie node is not the one asked for"; }
-        f.healed++;
-        string bad = await apply(store, f, n, decode(enc).item, true, out, todo);
-        if (bad != "") { return bad; }
-        out.push(Change(nodeKey(n.owner, n.path), enc));
+      if (repivot) {
+        todo = Vec.create();
+        todo.push(Need(u8[].filled(0, 0), u8[].filled(0, 0), Item.Bytes(root)));
       }
-      // What was not answered goes back on the list.
-      for (i32 i = nodes.len(); i < ask.len(); i++) { todo.push(ask.get(i)); }
     }
     string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
     if (bad != "") { return bad; }
   }
   // Codes the healed accounts name and the store has not got.
-  return await healCodes(peer, store, f);
+  return await healCodes(peers, store, f);
 }
 
 u8[] nodeKey(u8[] owner, u8[] path) { return owner.len() == 0 ? key(3, path, u8[].filled(0, 0)) : key(4, owner, path); }
@@ -858,7 +814,7 @@ u8[] slice(u8[] b, i32 from, i32 to) {
 }
 
 /** Every code an account in the store names and the store has not got, fetched. */
-async string healCodes(Asker peer, Store store, Fetched f) {
+async string healCodes(Asker[] peers, Store store, Fetched f) {
   Vec<Change> accounts = await store.range([0], [1], 0x7fffffff);
   Vec<u8[]> missing = Vec.create();
   Map<string, bool> seenCode = Map.create(hashText, textEq);
@@ -869,37 +825,81 @@ async string healCodes(Asker peer, Store store, Fetched f) {
     u8[] base = key(2, ch, u8[].filled(0, 0));
     if ((await store.range(base, bump(base), 1)).len() == 0) { missing.push(ch); }
   }
-  for (i32 at = 0; at < missing.len(); at += 64) {
-    i32 n = missing.len() - at < 64 ? missing.len() - at : 64;
-    u8[][] ask = u8[][].defaulted(n);
-    for (i32 i = 0; i < n; i++) { ask[i] = missing.get(at + i); }
-    u64 id = peer.nextId;
-    peer.nextId++;
-    f.requests++;
-    Item[]? got = await peer.ask(getByteCodes(id, ask, peer.bytes));
-    if (got is null || got!.len() < 1) { return "a peer did not answer for codes"; }
-    Item[] cs = itemsOf(got![0]);
-    Vec<Change> out = Vec.create();
-    for (i32 i = 0; i < cs.len(); i++) {
-      u8[] code = bytesOf(cs[i]);
-      u8[] h = keccak256(code);
-      i32 k = 0;
-      for (i32 c = 0; c < code.len(); c += 32768) {
-        i32 len = code.len() - c < 32768 ? code.len() - c : 32768;
-        u8[] part = u8[].filled(len, 0);
-        part.copyFrom(code, c, 0, len);
-        out.push(Change(key(2, h, [(k >> 8) as! u8, (k & 255) as! u8]), part));
-        k++;
+  return await fetchCodes(peers, store, f, missing);
+}
+
+/** Codes wanted, and the next batch of them a worker takes. */
+struct CodeJob {
+  Vec<u8[]> list;
+  Map<string, bool> wanted;
+  i32 next;
+  i32 peers;
+}
+
+/** The codes with these hashes, from every peer at once, each a batch at a time; each checked against its hash. */
+async string fetchCodes(Asker[] peers, Store store, Fetched f, Vec<u8[]> hashes) {
+  CodeJob job = CodeJob(hashes, Map.create(hashText, textEq), 0, peers.len());
+  for (i32 i = 0; i < hashes.len(); i++) { job.wanted.set(text(hashes.get(i)), true); }
+  Ticket<string>[] work = Ticket<string>[].filled(peers.len(), accountsDone());
+  for (i32 i = 0; i < peers.len(); i++) { work[i] = codesFrom(peers[i], store, f, job); }
+  string why = "";
+  for (i32 i = 0; i < peers.len(); i++) {
+    string w = await work[i];
+    if (why == "") { why = w; }
+  }
+  return why;
+}
+
+async string codesFrom(Asker peer, Store store, Fetched f, CodeJob job) {
+  while (job.next < job.list.len()) {
+    // A share of what is left, so that a few codes still go to every peer; at most 64 a request.
+    i32 left = job.list.len() - job.next;
+    i32 n = (left + job.peers - 1) / job.peers;
+    if (n > 64) { n = 64; }
+    Vec<u8[]> batch = Vec.create();
+    for (i32 i = 0; i < n; i++) { batch.push(job.list.get(job.next + i)); }
+    job.next += n;
+    while (batch.len() > 0) {
+      u64 id = peer.nextId;
+      peer.nextId++;
+      f.requests++;
+      Item[]? got = await peer.ask(getByteCodes(id, batch.toArray(), peer.bytes));
+      if (got is null || got!.len() < 1) { return "a peer did not answer for codes"; }
+      Item[] cs = itemsOf(got![0]);
+      if (cs.len() == 0) { return "a peer has none of the codes asked for"; }
+      Vec<Change> out = Vec.create();
+      Map<string, bool> came = Map.create(hashText, textEq);
+      for (i32 i = 0; i < cs.len(); i++) {
+        u8[] code = bytesOf(cs[i]);
+        u8[] h = keccak256(code);
+        if (!job.wanted.has(text(h))) { return "a code that was not asked for"; }
+        came.set(text(h), true);
+        i32 k = 0;
+        for (i32 c = 0; c < code.len(); c += 32768) {
+          i32 len = code.len() - c < 32768 ? code.len() - c : 32768;
+          u8[] part = u8[].filled(len, 0);
+          part.copyFrom(code, c, 0, len);
+          out.push(Change(key(2, h, [(k >> 8) as! u8, (k & 255) as! u8]), part));
+          k++;
+        }
+        f.codes++;
       }
-      f.codes++;
+      string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
+      if (bad != "") { return bad; }
+      // What the answer left out (it was cut short, or skipped some), asked for again.
+      Vec<u8[]> rest = Vec.create();
+      for (i32 i = 0; i < batch.len(); i++) {
+        if (!came.has(text(batch.get(i)))) { rest.push(batch.get(i)); }
+      }
+      batch = rest;
     }
-    string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
-    if (bad != "") { return bad; }
   }
   return "";
 }
 
 async string accountsDone() { return ""; }
+
+async Item[]? noAnswer() { return null; }
 
 Fetched failedWith(Fetched f, string why) {
   f.error = why;

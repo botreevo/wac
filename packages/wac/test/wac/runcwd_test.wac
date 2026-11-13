@@ -3,7 +3,8 @@
 // `run` compiles in a child and hands the module back through a file (`runApart` in `src/wac.wac`). The first version
 // put that file under `.cache/` in the working directory, so a run from a read-only directory failed with "cannot
 // write .cache/wac-run-….wasm" where it had always worked, and every other directory a program was run from kept a
-// `.cache/` it had not had. The file goes beside the build cache, under `$WAC_HOME/cache/run/`, now.
+// `.cache/` it had not had. The next put it under `$WAC_HOME/cache/run/` first, and a home that went away under a run
+// failed it (`issues/system/0467d`). It goes in the temp directory now, then the home, and the working directory last.
 //
 // Both halves are asked of the real binary from a directory of the test's own, with the program elsewhere: the
 // working directory is the thing under test, so nothing about it may be the repository's.
@@ -33,8 +34,10 @@ string program(T t, Env env, Files fs) {
 }
 
 /** `wac run <entry>` from `cwd`, with three bytes on its input. */
-Exec runFrom(Env env, Procs procs, string cwd, string entry) {
-  Exec? x = flatten(procs.exec(binaryPath(env), ["run", entry], "abc".toBytes(), ChildEnv.inherited(),
+Exec runFrom(Env env, Procs procs, string cwd, string entry) { return runWith(env, procs, cwd, entry, ChildEnv.inherited()); }
+
+Exec runWith(Env env, Procs procs, string cwd, string entry, ChildEnv childEnv) {
+  Exec? x = flatten(procs.exec(binaryPath(env), ["run", entry], "abc".toBytes(), childEnv,
                                Launch(cwd, false, false, false, false)).wait()).ok();
   return x is null ? Exec(0 - 1, u8[](), "the binary did not start".toBytes(), "did not start") : x!;
 }
@@ -82,6 +85,30 @@ export string test_a_run_from_a_read_only_directory_runs(Sys sys) {
   t.eqStr(string.fromBytes(r.stdout), "read 3\n", "and its input reached it");
   t.eqStr(listed(entries(fs, dir)), "", "what the run left in the directory it was run from");
   procs.exec("chmod", ["755", dir], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+export string test_a_home_that_cannot_be_made_does_not_send_the_module_into_the_working_directory(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string entry = program(t, env, fs);
+  // A `WAC_HOME` that cannot exist — under a directory nothing may write — stands for one that was removed while the
+  // run was in flight, which is what `packages/platform/test/packages.test.ts` did to its neighbours (0467d). The run
+  // is not the home's to fail, and the working directory is not where its hand-over goes instead.
+  string locked = "\{root(env)}/.cache/runcwd-lockedhome";
+  t.eqStr(freshDir(fs, locked), "", "a directory to hold the home");
+  procs.exec("chmod", ["555", locked], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  string dir = "\{root(env)}/.cache/runcwd-nohome";
+  t.eqStr(freshDir(fs, dir), "", "an empty directory to run from");
+  Exec r = runWith(env, procs, dir, entry, ChildEnv.inherited().set("WAC_HOME", "\{locked}/home"));
+  t.eqI32(r.status, 7, "the program's own status — \{string.fromBytes(r.stderr)}");
+  t.eqStr(string.fromBytes(r.stdout), "read 3\n", "and its input reached it");
+  t.eqStr(listed(entries(fs, dir)), "", "what the run left in the directory it was run from");
+  procs.exec("chmod", ["755", locked], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  fs.remove(locked, true).wait();
   fs.remove(dir, true).wait();
   return t.report();
 }

@@ -582,33 +582,23 @@ export struct Store {
     this.writtenParents = Vec.create();
     this.writtenKeys = Vec.create();
     if (user.len() > 3900) { return "the commit's own bytes are over 3900"; }
-    // Into the tree in memory, marking every node on each changed path.
     for (i32 c = 0; c < changes.len(); c++) {
       Change ch = changes[c];
       if (ch.value is not null && ch.value!.len() > MAX_VALUE) { return "a value of \{ch.value!.len()} bytes is over the limit"; }
       if (ch.key.len() > 1024) { return "a key of \{ch.key.len()} bytes is over the limit"; }
-      Vec<Node> path = Vec.create();
-      Node? leaf = await this.leafFor(ch.key, path);
-      if (leaf is null) { return "a page on the way to a key does not decode"; }
-      Node l = leaf!;
-      (i32 at, bool found) = find(l.keys, ch.key);
-      if (ch.value is null) {
-        if (!found) { continue; }
-        l.bytes -= leafEntry(l.keys.get(at), l.vals.get(at));
-        l.keys.remove(at);
-        l.vals.remove(at);
-      } else if (found) {
-        l.bytes += ch.value!.len() - l.vals.get(at).len();
-        l.vals.set(at, ch.value!);
-      } else {
-        l.keys.insert(at, ch.key);
-        l.vals.insert(at, ch.value!);
-        l.bytes += leafEntry(ch.key, ch.value!);
-      }
-      l.dirty = true;
-      for (i32 p = 0; p < path.len(); p++) {
-        Node on = path.get(p);
-        on.dirty = true;
+    }
+    Vec<Out> outs = Vec.create();
+    if (this.height > 1) {
+      // Leaf by leaf, in key order, each written as soon as its changes are in and let go once on the disk: a
+      // commit holds one leaf at a time, not every leaf it touches — which for 64 blocks of mainnet would be
+      // a hundred thousand of them.
+      string bad = await this.streamLeaves(sortedChanges(arrayVec(changes)), outs);
+      if (bad != "") { return bad; }
+    } else {
+      // A tree that is one leaf: changed in memory, as small as it is.
+      for (i32 c = 0; c < changes.len(); c++) {
+        applyTo(this.root, changes[c]);
+        this.root.dirty = true;
       }
     }
 
@@ -628,8 +618,7 @@ export struct Store {
       this.height--;
     }
 
-    // Every dirty node to a page of its own, children before parents.
-    Vec<Out> outs = Vec.create();
+    // Every dirty node left to a page of its own, children before parents.
     i64 rootPage = this.place(this.root, outs);
     // The free list for the next commit: what this one did not use, what it freed, and the old list's pages.
     // Its own pages come from what is free now, like any other page; counted before taking them, which
@@ -675,6 +664,74 @@ export struct Store {
     for (i32 i = 0; i < this.writtenParents.len(); i++) { this.held(this.writtenParents.get(i), this.writtenKeys.get(i)); }
     this.writtenParents = Vec.create();
     this.writtenKeys = Vec.create();
+    return "";
+  }
+
+  /** `changes`, in key order, applied a leaf at a time: each leaf fixed, placed, written and let go in turn. */
+  async string streamLeaves(this, Vec<Change> changes, Vec<Out> outs) {
+    Vec<Node> parents = Vec.create();
+    Vec<u8[]> firsts = Vec.create();
+    i64 pending = 0;
+    i32 c = 0;
+    while (c < changes.len()) {
+      Vec<Node> path = Vec.create();
+      Node? found = await this.leafFor(changes.get(c).key, path);
+      if (found is null) { return "a page on the way to a key does not decode"; }
+      Node l = found!;
+      Node parent = path.get(path.len() - 1);
+      // Its place in its parent, from a key it holds, before any change moves its first key.
+      i32 at = childFor(parent.keys, changes.get(c).key);
+      // Where this leaf's keys end: the next separator to the right, at the lowest level that has one.
+      u8[]? bound = null;
+      for (i32 j = path.len() - 1; j >= 0 && bound is null; j--) {
+        Node n = path.get(j);
+        i32 i = childFor(n.keys, changes.get(c).key);
+        if (i + 1 < n.keys.len()) { bound = n.keys.get(i + 1); }
+      }
+      while (c < changes.len() && (bound is null || compareKeys(changes.get(c).key, bound!) < 0)) {
+        applyTo(l, changes.get(c));
+        c++;
+      }
+      l.dirty = true;
+      for (i32 p = 0; p < path.len(); p++) {
+        Node on = path.get(p);
+        on.dirty = true;
+      }
+      // Fixed (split, or gone if empty), put in its parent's place, and given pages now.
+      Node[] parts = this.fix(l);
+      parent.bytes -= interiorEntry(parent.keys.get(at));
+      parent.keys.remove(at);
+      parent.kids.remove(at);
+      parent.kidPages.remove(at);
+      for (i32 p = 0; p < parts.len(); p++) {
+        adopt(parent, at + p, parts[p]);
+        parent.kidPages.set(at + p, this.place(parts[p], outs));
+        parents.push(parent);
+        firsts.push(parts[p].keys.get(0));
+        pending += PAGE as i64;
+      }
+      if (pending >= 4 * 1024 * 1024) {
+        string bad = await this.writeAndLetGo(outs, parents, firsts);
+        if (bad != "") { return bad; }
+        pending = 0;
+      }
+    }
+    return await this.writeAndLetGo(outs, parents, firsts);
+  }
+
+  /** What is queued, written; then the leaves written let go — their pages hold them now. */
+  async string writeAndLetGo(this, Vec<Out> outs, Vec<Node> parents, Vec<u8[]> firsts) {
+    string bad = await this.writeAll(outs);
+    if (bad != "") { return bad; }
+    outs.clear();
+    for (i32 i = 0; i < parents.len(); i++) {
+      Node p = parents.get(i);
+      i32 k = childFor(p.keys, firsts.get(i));
+      Node? leaf = p.kids.get(k);
+      if (leaf is not null && leaf!.leaf && !leaf!.dirty && leaf!.page >= 0) { p.kids.set(k, null); }
+    }
+    parents.clear();
+    firsts.clear();
     return "";
   }
 
@@ -872,6 +929,30 @@ export struct Store {
       await this.walk(k!, from, to, limit, out);
     }
   }
+}
+
+/** One change made to the leaf its key belongs in. */
+void applyTo(Node l, Change ch) {
+  (i32 at, bool found) = find(l.keys, ch.key);
+  if (ch.value is null) {
+    if (!found) { return; }
+    l.bytes -= leafEntry(l.keys.get(at), l.vals.get(at));
+    l.keys.remove(at);
+    l.vals.remove(at);
+  } else if (found) {
+    l.bytes += ch.value!.len() - l.vals.get(at).len();
+    l.vals.set(at, ch.value!);
+  } else {
+    l.keys.insert(at, ch.key);
+    l.vals.insert(at, ch.value!);
+    l.bytes += leafEntry(ch.key, ch.value!);
+  }
+}
+
+Vec<Change> arrayVec(Change[] a) {
+  Vec<Change> v = Vec.create();
+  for (i32 i = 0; i < a.len(); i++) { v.push(a[i]); }
+  return v;
 }
 
 /** A staged value, or `null` for a key staged as deleted. */

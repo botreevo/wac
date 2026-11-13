@@ -521,6 +521,25 @@ async Message answerSnap(Network n, i32 code, Item body) {
   return await answerByteCodes(e.db!.store, body);
 }
 
+/** One peer as a snap sync's asker: its requests (paced, for tests), with ids from `firstId`. */
+Asker askerFor(Sys sys, Network net, Peer peer, Pivots pivots, u64 firstId) {
+  return Asker(async (Message m) => {
+    if (net.snapThrottle > 0) { await sys.sleepMillis(net.snapThrottle); }
+    // A newer head named meanwhile is fetched first, so that the sync can move to it if it must.
+    await pivots.refresh();
+    u64 rid = numOf(itemsOf(m.body)[0]).low();
+    Item[]? got = await request(sys, peer, rid, m);
+    pivots.asked++;
+    if (net.snapRepivot > 0 && pivots.asked > net.snapRepivot && pivots.seen.len() > 1 && !pivots.moved && got is not null &&
+        (m.code == GET_ACCOUNT_RANGE || m.code == GET_STORAGE_RANGES)) {
+      // As a peer that has dropped the pivot's state answers: nothing.
+      pivots.moved = true;
+      return [Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0))))];
+    }
+    return got;
+  }, firstId, SOFT_BYTES, () => pivots.newest());
+}
+
 /** The pivots a snap sync has had, newest last, each a header and its ancestors'. */
 struct Pivots {
   Sys sys;
@@ -588,27 +607,17 @@ async bool snapTo(Sys sys, Network n, Peer p, U256 target) {
   Vec<Header> start = Vec.create();
   for (i32 i = 0; i < headers.len(); i++) { start.push(headers[i]); }
   pivots.seen.push(start);
-  Asker asker = Asker(async (Message m) => {
-    if (net.snapThrottle > 0) { await sys.sleepMillis(net.snapThrottle); }
-    // A newer head named meanwhile is fetched first, so that the sync can move to it if it must.
-    await pivots.refresh();
-    u64 rid = numOf(itemsOf(m.body)[0]).low();
-    Item[]? got = await request(sys, peer, rid, m);
-    pivots.asked++;
-    if (net.snapRepivot > 0 && pivots.asked > net.snapRepivot && pivots.seen.len() > 1 && !pivots.moved && got is not null &&
-        (m.code == GET_ACCOUNT_RANGE || m.code == GET_STORAGE_RANGES)) {
-      // As a peer that has dropped the pivot's state answers: nothing.
-      pivots.moved = true;
-      return [Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0))))];
-    }
-    return got;
-  }, n.nextId, SOFT_BYTES, () => pivots.newest());
-  // Ids from a range of their own, so as not to meet this node's other requests.
-  asker.nextId = n.nextId + 1000000;
+  // Every peer that speaks snap/1 at once: the account space is split among them (`snapSync`).
+  Vec<Asker> askers = Vec.create();
+  for (i32 i = 0; i < n.peers.len(); i++) {
+    Peer q = n.peers.get(i);
+    if (q.alive && q.snap) { askers.push(askerFor(sys, net, q, pivots, n.nextId + 1000000 * ((askers.len() + 1) as@ u32 as u64))); }
+  }
   u8[] user = u8[].filled(40, 0);
   user.copyFrom(pivot.hash.toBytes(), 0, 0, 32);
   user.copyFrom(U256.ofU64(pivot.number.low()).toBytes(), 24, 32, 8);
-  Fetched f = await snapSync(asker, n.e.db!.store, pivot.stateRoot.toBytes(), user);
+  sys.log("p2p: snap sync from \{askers.len()} peer(s)");
+  Fetched f = await snapSync(askers.toArray(), n.e.db!.store, pivot.stateRoot.toBytes(), user);
   if (f.error != "") {
     sys.warn("p2p: snap sync from \{p.name} failed: \{f.error}");
     return false;

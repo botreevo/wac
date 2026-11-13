@@ -282,31 +282,75 @@ export struct Fetched {
   u8[] root;
 }
 
-/**
- * The state of `root` fetched from `peer` into `store`, which must not hold another state: every account,
- * every slot and every code, each run checked against `root`; then the tries built from what was fetched,
- * and the root they come to checked; committed with `user` beside it. `fetched.error` is "" when done.
- */
-export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
-  Fetched f = Fetched(0, 0, 0, 0, 0, "", 0, root);
-  Vec<u8[]> withStorage = Vec.create();
-  Vec<u8[]> storageRoots = Vec.create();
-  Map<string, bool> codes = Map.create(hashText, textEq);
-  Vec<u8[]> codeList = Vec.create();
+/** One at a time: commits from workers that run at once go through this, since a commit is not re-entrant. */
+struct Lock {
+  bool held;
+  Vec<Ticket<bool>> waiting;
 
-  // Accounts, a run at a time from the start of the key space.
-  u8[]? origin = u8[].filled(32, 0);
+  async void take(this) {
+    if (!this.held) {
+      this.held = true;
+      return;
+    }
+    Ticket<bool> t;
+    this.waiting.push(t);
+    // Handed over by `give`, still held.
+    await t;
+  }
+
+  void give(this) {
+    if (this.waiting.len() > 0) { this.waiting.remove(0).resolve(true); } else { this.held = false; }
+  }
+}
+
+/** What the workers of a sync share: the store, the pivot's root as it moves, and what they have found. */
+struct Shared {
+  Store store;
+  u8[] root;
+  Fetched f;
+  Vec<u8[]> withStorage;
+  Vec<u8[]> storageRoots;
+  Map<string, bool> codes;
+  Vec<u8[]> codeList;
+  Lock lock;
+  /** The next account whose storage a storage worker takes. */
+  i32 nextStorage;
+  /** Whether the pivot ever moved, so that storage runs may fail to prove and heal later. */
+  bool moved;
+}
+
+async string commitLocked(Shared s, Change[] changes) {
+  await s.lock.take();
+  string bad = await s.store.commit(changes, u8[].filled(0, 0));
+  s.lock.give();
+  return bad;
+}
+
+/** The pivot moved on: the newest root, or "" when there is none newer (the peer has no state for it). */
+string moveOn(Shared s, Asker peer, u8[] asked) {
+  // Another worker may have moved it already.
+  if (!same(asked, s.root)) { return ""; }
+  u8[] newer = peer.pivot is null ? u8[].filled(0, 0) : peer.pivot!();
+  if (newer.len() == 0 || same(newer, s.root)) { return "a peer has no state for the root asked about"; }
+  s.root = newer;
+  s.moved = true;
+  return "";
+}
+
+/** The accounts from `from` to `to` (inclusive, 32-byte keys), a run at a time, from one peer. */
+async string accounts(Asker peer, Shared s, u8[] from, u8[] to) {
+  u8[]? origin = from;
   while (origin is not null) {
+    u8[] root = s.root;
     u64 id = peer.nextId;
     peer.nextId++;
-    f.requests++;
-    Item[]? got = await peer.ask(getAccountRange(id, root, origin!, maxKey(), peer.bytes));
-    if (got is null || got!.len() < 2) { return failedWith(f, "a peer did not answer for accounts"); }
+    s.f.requests++;
+    Item[]? got = await peer.ask(getAccountRange(id, root, origin!, to, peer.bytes));
+    if (got is null || got!.len() < 2) { return "a peer did not answer for accounts"; }
     if (itemsOf(got![0]).len() == 0 && itemsOf(got![1]).len() == 0) {
       // Nothing about this root: the peer has moved on. On to the newest, where this run left off.
-      u8[] newer = peer.pivot is null ? u8[].filled(0, 0) : peer.pivot!();
-      if (newer.len() == 0 || same(newer, root)) { return failedWith(f, "a peer has no state for the root asked about"); }
-      root = newer;
+      string why = moveOn(s, peer, root);
+      if (why != "") { return why; }
       continue;
     }
     Item[] run = itemsOf(got![0]);
@@ -316,46 +360,55 @@ export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
       Item[] pair = itemsOf(run[i]);
       keys[i] = bytesOf(pair[0]);
       u8[]? full = fullAccount(pair[1]);
-      if (full is null) { return failedWith(f, "an account does not decode"); }
+      if (full is null) { return "an account does not decode"; }
       vals[i] = full!;
     }
     Range r = verifyRange(root, origin!, keys, vals, proofOf(got![1]));
-    if (!r.ok) { return failedWith(f, "an account range does not prove: \{r.why}"); }
+    if (!r.ok) { return "an account range does not prove: \{r.why}"; }
     Vec<Change> out = Vec.create();
     for (i32 i = 0; i < keys.len(); i++) {
+      // Past this slice's end is the next slice's: proved here, kept there.
+      if (compareKeys(keys[i], to) > 0) { continue; }
+      s.f.accounts++;
       out.push(Change(key(0, keys[i], u8[].filled(0, 0)), vals[i]));
       Item[] acct = itemsOf(decode(vals[i]).item);
       u8[] sr = bytesOf(acct[2]);
       if (!same(sr, emptyRoot())) {
-        withStorage.push(keys[i]);
-        storageRoots.push(sr);
+        s.withStorage.push(keys[i]);
+        s.storageRoots.push(sr);
       }
       u8[] ch = bytesOf(acct[3]);
-      if (!same(ch, emptyCodeHash().toBytes()) && !codes.has(text(ch))) {
-        codes.set(text(ch), true);
-        codeList.push(ch);
+      if (!same(ch, emptyCodeHash().toBytes()) && !s.codes.has(text(ch))) {
+        s.codes.set(text(ch), true);
+        s.codeList.push(ch);
       }
     }
-    f.accounts += keys.len();
-    string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
-    if (bad != "") { return failedWith(f, bad); }
-    origin = r.more && keys.len() > 0 ? nextKey(keys[keys.len() - 1]) : null;
+    string bad = await commitLocked(s, out.toArray());
+    if (bad != "") { return bad; }
+    // Done with this slice when the run reached its end, or the trie has nothing after it.
+    bool past = keys.len() > 0 && compareKeys(keys[keys.len() - 1], to) >= 0;
+    origin = r.more && keys.len() > 0 && !past ? nextKey(keys[keys.len() - 1]) : null;
   }
+  return "";
+}
 
-  // Each account's storage: its own runs, each checked against its own root.
-  for (i32 a = 0; a < withStorage.len(); a++) {
-    u8[] owner = withStorage.get(a);
+/** Storage, an account at a time from the shared list, from one peer, until the list is done. */
+async string storages(Asker peer, Shared s) {
+  while (s.nextStorage < s.withStorage.len()) {
+    i32 a = s.nextStorage;
+    s.nextStorage++;
+    u8[] owner = s.withStorage.get(a);
     u8[]? from = u8[].filled(32, 0);
     while (from is not null) {
+      u8[] root = s.root;
       u64 id = peer.nextId;
       peer.nextId++;
-      f.requests++;
+      s.f.requests++;
       Item[]? got = await peer.ask(getStorageRanges(id, root, [owner], from!, maxKey(), peer.bytes));
-      if (got is null || got!.len() < 2) { return failedWith(f, "a peer did not answer for storage"); }
+      if (got is null || got!.len() < 2) { return "a peer did not answer for storage"; }
       if (itemsOf(got![0]).len() < 1) {
-        u8[] newer = peer.pivot is null ? u8[].filled(0, 0) : peer.pivot!();
-        if (newer.len() == 0 || same(newer, root)) { return failedWith(f, "a peer has no state for the root asked about"); }
-        root = newer;
+        string why = moveOn(s, peer, root);
+        if (why != "") { return why; }
         continue;
       }
       Item[] run = itemsOf(itemsOf(got![0])[0]);
@@ -365,21 +418,64 @@ export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
         keys[i] = bytesOf(itemsOf(run[i])[0]);
         vals[i] = bytesOf(itemsOf(run[i])[1]);
       }
-      Range r = verifyRange(storageRoots.get(a), from!, keys, vals, proofOf(got![1]));
+      Range r = verifyRange(s.storageRoots.get(a), from!, keys, vals, proofOf(got![1]));
       if (!r.ok) {
         // Proved against the storage root the account had when it was fetched; one that moved since is
         // healed at the end instead.
-        if (same(root, f.root)) { return failedWith(f, "a storage range does not prove: \{r.why}"); }
+        if (!s.moved) { return "a storage range does not prove: \{r.why}"; }
         break;
       }
       Vec<Change> out = Vec.create();
       for (i32 i = 0; i < keys.len(); i++) { out.push(Change(key(1, owner, keys[i]), vals[i])); }
-      f.slots += keys.len();
-      string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
-      if (bad != "") { return failedWith(f, bad); }
+      s.f.slots += keys.len();
+      string bad = await commitLocked(s, out.toArray());
+      if (bad != "") { return bad; }
       from = r.more && keys.len() > 0 ? nextKey(keys[keys.len() - 1]) : null;
     }
   }
+  return "";
+}
+
+/**
+ * The state of `root` fetched from `peers` into `store`, which must not hold another state: every account,
+ * every slot and every code, each run checked against `root`; then the tries built from what was fetched,
+ * and the root they come to checked — healed, if the pivot moved meanwhile; committed with `user` beside it.
+ * The account space is split among the peers, two slices each, fetched at once; then each peer takes the
+ * next account's storage until there is none. `fetched.error` is "" when done.
+ */
+export async Fetched snapSync(Asker[] peers, Store store, u8[] root, u8[] user) {
+  Fetched f = Fetched(0, 0, 0, 0, 0, "", 0, root);
+  Shared s = Shared(store, root, f, Vec.create(), Vec.create(), Map.create(hashText, textEq), Vec.create(),
+                    Lock(false, Vec.create()), 0, false);
+  Asker peer = peers[0];
+
+  // Accounts: the key space in slices by its first byte, the slices among the peers, all at once.
+  i32 slices = peers.len() * 2;
+  Ticket<string>[] work = Ticket<string>[].filled(slices, accountsDone());
+  for (i32 i = 0; i < slices; i++) {
+    u8[] from = u8[].filled(32, 0);
+    from[0] = ((i * 256) / slices) as! u8;
+    u8[] to = u8[].filled(32, 255);
+    to[0] = (((i + 1) * 256) / slices - 1) as! u8;
+    work[i] = accounts(peers[i % peers.len()], s, from, to);
+  }
+  for (i32 i = 0; i < slices; i++) {
+    string why = await work[i];
+    if (why != "") { return failedWith(f, why); }
+  }
+
+  // Storage: each peer takes the next account until there is none.
+  Ticket<string>[] st = Ticket<string>[].filled(peers.len(), accountsDone());
+  for (i32 i = 0; i < peers.len(); i++) { st[i] = storages(peers[i], s); }
+  for (i32 i = 0; i < peers.len(); i++) {
+    string why = await st[i];
+    if (why != "") { return failedWith(f, why); }
+  }
+  root = s.root;
+  Vec<u8[]> withStorage = s.withStorage;
+  Vec<u8[]> storageRoots = s.storageRoots;
+  Map<string, bool> codes = s.codes;
+  Vec<u8[]> codeList = s.codeList;
 
   // Codes, by hash, each checked against its hash.
   i32 at = 0;
@@ -419,7 +515,7 @@ export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
   }
 
   // The tries, from what was fetched: each storage trie, then the account trie, in the store's order.
-  bool moved = !same(root, f.root);
+  bool moved = s.moved;
   f.root = root;
   string bad = await buildTries(store, f, withStorage, storageRoots, moved);
   if (bad != "") { return failedWith(f, bad); }
@@ -783,6 +879,8 @@ async string healCodes(Asker peer, Store store, Fetched f) {
   }
   return "";
 }
+
+async string accountsDone() { return ""; }
 
 Fetched failedWith(Fetched f, string why) {
   f.error = why;

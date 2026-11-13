@@ -61,7 +61,7 @@ async string run() {
   // Honest, a few kilobytes at a time.
   MemDisk cd = MemDisk.create();
   Store client = (await Store.open(cd.disk())).unwrap();
-  Fetched f = await snapSync(serverOf(server, root, 4096, (Item[] x) => x), client, root, "pivot".toBytes());
+  Fetched f = await snapSync([serverOf(server, root, 4096, (Item[] x) => x)], client, root, "pivot".toBytes());
   t.eqStr(f.error, "", "the sync finishes");
   t.ok(f.accounts == 301 && f.slots == 2000 + 13 * 5 && f.codes == 17, "every account, slot and code: \{f.accounts}, \{f.slots}, \{f.codes}");
   t.ok(f.requests > 20, "in many runs: \{f.requests} requests");
@@ -75,16 +75,29 @@ async string run() {
   await theirs.open();
   t.ok((await back.storedNodes()) == (await theirs.storedNodes()), "as many account trie nodes as the server's");
 
+  // From three peers at once: the same state, in fewer runs each.
+  MemDisk cd4 = MemDisk.create();
+  Store client4 = (await Store.open(cd4.disk())).unwrap();
+  Asker[] three = [serverOf(server, root, 4096, (Item[] x) => x), serverOf(server, root, 4096, (Item[] x) => x),
+                   serverOf(server, root, 4096, (Item[] x) => x)];
+  Fetched f4 = await snapSync(three, client4, root, u8[].filled(0, 0));
+  t.eqStr(f4.error, "", "a sync from three peers finishes");
+  t.ok(f4.accounts == 301 && f4.slots == 2000 + 13 * 5 && f4.codes == 17, "with every account, slot and code: \{f4.accounts}, \{f4.slots}, \{f4.codes}");
+  t.eqStr(bytesToHex(await rootOf(client4)), bytesToHex(root), "to the server's root");
+  i32 asked = 0;
+  for (i32 i = 0; i < 3; i++) { asked += three[i].nextId > 1 ? 1 : 0; }
+  t.ok(asked == 3, "and every peer was asked: \{asked}");
+
   // A server that drops an account from the middle of a run.
   MemDisk cd2 = MemDisk.create();
   Store client2 = (await Store.open(cd2.disk())).unwrap();
-  Fetched f2 = await snapSync(serverOf(server, root, 4096, (Item[] x) => dropOne(x)), client2, root, u8[].filled(0, 0));
+  Fetched f2 = await snapSync([serverOf(server, root, 4096, (Item[] x) => dropOne(x))], client2, root, u8[].filled(0, 0));
   t.ok(f2.error.indexOf("does not prove") >= 0, "a run with an account left out is refused: \{f2.error}");
 
   // A server whose state is another: it answers nothing about this root.
   MemDisk cd3 = MemDisk.create();
   Store client3 = (await Store.open(cd3.disk())).unwrap();
-  Fetched f3 = await snapSync(serverOf(server, u8[].filled(32, 7), 4096, (Item[] x) => x), client3, root, u8[].filled(0, 0));
+  Fetched f3 = await snapSync([serverOf(server, u8[].filled(32, 7), 4096, (Item[] x) => x)], client3, root, u8[].filled(0, 0));
   t.ok(f3.error != "", "a peer without the state does not pass for one: \{f3.error}");
   return t.report();
 }
@@ -113,6 +126,9 @@ struct Moving {
   i32 asked;
   i32 after;
   bool moved;
+  /** One request at a time: a real peer answers from a consistent state, and changes it at once between answers. */
+  bool busy;
+  Vec<Ticket<bool>> waiting;
 }
 
 /** The state the server moves to: balances changed, accounts gone and new, slots changed and gone, a contract made. */
@@ -145,34 +161,47 @@ async u8[] moveOn(Moving m) {
   return r!;
 }
 
+async Item[]? answerMoving(Moving m, Message q) {
+  m.asked++;
+  if (!m.moved && m.asked > m.after) {
+    m.root = await moveOn(m);
+    m.moved = true;
+  }
+  Message a = q;
+  if (q.code == GET_ACCOUNT_RANGE) { a = await answerAccountRange(m.s, m.root, q.body); }
+  else if (q.code == GET_STORAGE_RANGES) { a = await answerStorageRanges(m.s, m.root, q.body); }
+  else if (q.code == GET_BYTE_CODES) { a = await answerByteCodes(m.s, q.body); }
+  else if (q.code == GET_TRIE_NODES) { a = await answerTrieNodes(m.s, m.root, q.body); }
+  else { return null; }
+  Item[] all = itemsOf(a.body);
+  Item[] rest = Item[].filled(all.len() - 1, all[0]);
+  for (i32 i = 1; i < all.len(); i++) { rest[i - 1] = all[i]; }
+  return rest;
+}
+
 async string runMoving(i32 after) {
   Check t = Check.create();
   MemDisk sd = MemDisk.create();
   Store server = (await Store.open(sd.disk())).unwrap();
   string[] why = [""];
   u8[] first = (await StateDb.over(server).seed(state(), u8[].filled(0, 0), why))!;
-  Moving m = Moving(server, first, 0, after, false);
+  Moving m = Moving(server, first, 0, after, false, false, Vec.create());
   Asker peer = Asker(async (Message q) => {
-    m.asked++;
-    if (!m.moved && m.asked > m.after) {
-      m.root = await moveOn(m);
-      m.moved = true;
+    while (m.busy) {
+      Ticket<bool> t;
+      m.waiting.push(t);
+      await t;
     }
-    Message a = q;
-    if (q.code == GET_ACCOUNT_RANGE) { a = await answerAccountRange(m.s, m.root, q.body); }
-    else if (q.code == GET_STORAGE_RANGES) { a = await answerStorageRanges(m.s, m.root, q.body); }
-    else if (q.code == GET_BYTE_CODES) { a = await answerByteCodes(m.s, q.body); }
-    else if (q.code == GET_TRIE_NODES) { a = await answerTrieNodes(m.s, m.root, q.body); }
-    else { return null; }
-    Item[] all = itemsOf(a.body);
-    Item[] rest = Item[].filled(all.len() - 1, all[0]);
-    for (i32 i = 1; i < all.len(); i++) { rest[i - 1] = all[i]; }
-    return rest;
+    m.busy = true;
+    Item[]? out = await answerMoving(m, q);
+    m.busy = false;
+    if (m.waiting.len() > 0) { m.waiting.remove(0).resolve(true); }
+    return out;
   }, 1, 4096, () => m.root);
 
   MemDisk cd = MemDisk.create();
   Store client = (await Store.open(cd.disk())).unwrap();
-  Fetched f = await snapSync(peer, client, first, "pivot".toBytes());
+  Fetched f = await snapSync([peer], client, first, "pivot".toBytes());
   t.eqStr(f.error, "", "the sync finishes though its pivot moved");
   t.ok(m.moved, "the pivot did move, after \{m.after} requests");
   t.ok(f.healed > 0, "and was healed: \{f.healed} nodes");

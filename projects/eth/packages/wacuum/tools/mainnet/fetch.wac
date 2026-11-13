@@ -69,10 +69,13 @@ async string ask(Sys sys, string url, string[] requests, string[] why) {
         for (i32 i = 0; i < answers!.len(); i++) {
           JsonValue? err = answers!.get(i).member("error");
           if (err is null || err!.isNull()) { continue; }
-          if ((err!.member("code")?.number() ?? 0.0) == 429.0) {
+          // A rate limit, or the node's own trouble ("Internal error", -32603), is worth asking again;
+          // anything else is an answer.
+          f64 code = err!.member("code")?.number() ?? 0.0;
+          why[0] = err!.member("message")?.text() ?? "an error";
+          if (code == 429.0 || code == -32603.0 || code == -32000.0) {
             limited = true;
           } else {
-            why[0] = err!.member("message")?.text() ?? "an error";
             return "";
           }
         }
@@ -130,6 +133,20 @@ u64 num(string s) {
   u8[] d = s.toBytes();
   for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as u64); }
   return n;
+}
+
+/** `s` cut at every `sep` byte. */
+string[] cutAt(string s, u8 sep) {
+  Vec<string> out = Vec.create();
+  u8[] b = s.toBytes();
+  i32 start = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == sep) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return out.toArray();
 }
 
 /** The lines of a text, without empty ones. */
@@ -218,6 +235,13 @@ export async i32 main(Sys sys) {
         }
       }
     }
+    // The seed goes to want.txt before blocks.txt exists as finished: a fetch that fails from here on is
+    // resumed by running it again, which reads both.
+    Vec<string> seedLines = Vec.create();
+    for (i32 i = 0; i < ws.len(); i++) { seedLines.push(ws.get(i)); }
+    u8[] before = (await sys.readFile(dir + "/want.txt")).orElse(u8[].filled(0, 0));
+    if (before.len() == 0 && !(await append(sys, dir + "/want.txt", seedLines))) { sys.log("cannot write \{dir}/want.txt"); return 1; }
+    ws = Vec.create();
     if (!(await append(sys, dir + "/blocks.txt", lines))) { sys.log("cannot write \{dir}/blocks.txt"); return 1; }
   }
 
@@ -225,6 +249,25 @@ export async i32 main(Sys sys) {
   string[] wanted = linesOf(want);
   for (i32 i = 0; i < wanted.len(); i++) { ws.push(wanted[i]); }
   Map<string, bool> seen = Map.create(hashString, stringEq);
+  u8[] held = (await sys.readFile(dir + "/state.txt")).orElse(u8[].filled(0, 0));
+  string[] heldLines = linesOf(held);
+  for (i32 i = 0; i < heldLines.len(); i++) {
+    string l = heldLines[i];
+    i32 tab = l.indexOf("\t");
+    i32 sp = l.indexOf(" ");
+    if (tab < 0 || sp < 0 || sp > tab) { continue; }
+    string kind = l.slice(0, sp);
+    if (kind != "proofs" && kind != "slots") { continue; }
+    string[] names = cutAt(l.slice(sp + 1, tab), 44);
+    for (i32 k = 0; k < names.len(); k++) {
+      if (kind == "proofs") {
+        seen.set("A " + names[k], true);
+      } else {
+        string[] ak = cutAt(names[k], 58);
+        seen.set("S " + ak[0] + " " + ak[1], true);
+      }
+    }
+  }
   Vec<string> accounts = Vec.create();
   Vec<string> slots = Vec.create();
   for (i32 i = 0; i < ws.len(); i++) {
@@ -253,6 +296,10 @@ export async i32 main(Sys sys) {
     if (c == "") { sys.log("accounts: \{why[0]}"); return 1; }
     out.push("proofs \{join(names)}\t\{p}");
     out.push("codes \{join(names)}\t\{c}");
+    if (out.len() >= 20) {
+      if (!(await append(sys, dir + "/state.txt", out))) { sys.log("cannot write \{dir}/state.txt"); return 1; }
+      out = Vec.create();
+    }
   }
   for (i32 i = 0; i < slots.len(); i += 100) {
     i32 m = slots.len() - i < 100 ? slots.len() - i : 100;
@@ -268,6 +315,10 @@ export async i32 main(Sys sys) {
     calls++;
     if (got == "") { sys.log("slots: \{why[0]}"); return 1; }
     out.push("slots \{join(names)}\t\{got}");
+    if (out.len() >= 20) {
+      if (!(await append(sys, dir + "/state.txt", out))) { sys.log("cannot write \{dir}/state.txt"); return 1; }
+      out = Vec.create();
+    }
   }
   if (out.len() > 0 && !(await append(sys, dir + "/state.txt", out))) { sys.log("cannot write \{dir}/state.txt"); return 1; }
   sys.log("fetched \{accounts.len()} accounts and \{slots.len()} slots in \{calls} requests");

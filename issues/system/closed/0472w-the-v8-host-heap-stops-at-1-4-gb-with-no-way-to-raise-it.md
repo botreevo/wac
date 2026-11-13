@@ -60,5 +60,17 @@ ceiling applied — about 1.4 GB. **It is an isolate setting**, `CreateParams::h
   printing its GC trace — with the same sentence from the OOM handler, still at the limit plus the one grant (a program
   told 8 GB peaked at 8.6).
 
-**Other hosts.** The wasmtime host keeps its own GC heap sizing and Node its `--max-old-space-size` (through
-`NODE_OPTIONS`); neither reads `WAC_MAX_HEAP` yet.
+**Other hosts (2026-11-13, wac1).**
+
+- **Node.** The program runs in a `worker_threads` Worker, which Node sizes on its own — a 3000 MB program stopped
+  with *"Worker terminated due to reaching memory limit: JS heap out of memory"* on a 16 GB machine. The worker is made
+  with `resourceLimits.maxOldGenerationSizeMb` now (`packages/platform/host/entryNode.ts`, `heapLimitMb`): from
+  `WAC_MAX_HEAP`, written as on every host, or half of `process.constrainedMemory()`, the native host's default. 3000 MB
+  is held under the default; `WAC_MAX_HEAP=256m` stops 600 MB with Node's own sentence, which already says what it is.
+  (`--max-heap` itself is the native binary's; a Node user sets the variable.)
+- **wasmtime.** Its GC heap is a reservation addressed with 32-bit references — 4 GiB, by wasmtime's own default — and
+  the copying collector this host uses keeps two halves of it, so about **2 GiB live is the ceiling, by design**: 3000
+  MB failed with *"GC heap out of memory"* and a wasm backtrace. Raising it is not a setting; what changed is the
+  ending: `native/src/main.rs` (`OUT_OF_GC_HEAP`) says *"ran out of memory: its GC heap is full — this host's holds
+  about 2 GiB live (4 GiB reserved); the native V8 host (`wac` by default) takes `wac --max-heap <size>` or
+  WAC_MAX_HEAP"*, status 255 as a host limit reports, run directly or as a child (which ends `HostLimit`).

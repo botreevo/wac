@@ -833,7 +833,26 @@ fn run(m: Arc<Manifest>, wasm: &[u8], args: Vec<Vec<u8>>) -> Result<i32, wasmtim
 
     let linker = wire(&engine, &module, &m)?;
 
-    enter(&mut store, &module, &linker, &m)
+    match enter(&mut store, &module, &linker, &m) {
+        // The same sentence a child gets (`out_of_gc_heap`), and the status a host limit reports: -1, as 255.
+        Err(e) if is_out_of_gc_heap(&e) => {
+            eprintln!("wac: {} {}", m.entry, OUT_OF_GC_HEAP);
+            Ok(255)
+        }
+        other => other,
+    }
+}
+
+/// **A full GC heap is a host limit, not a bug in the program** — `issues/system/0472w`, the wasmtime half. This host's
+/// GC heap is a reservation addressed with 32-bit references, 4 GiB at most, and the copying collector keeps two halves
+/// of it, so about 2 GiB can be live: a 3000 MB program ended as a trap with a wasm backtrace. It is said, and names the
+/// host that can go further.
+const OUT_OF_GC_HEAP: &str = "ran out of memory: its GC heap is full — this host's holds about 2 GiB live (4 GiB \
+                              reserved); the native V8 host (`wac` by default) takes `wac --max-heap <size>` or \
+                              WAC_MAX_HEAP, up to the machine's memory";
+
+fn is_out_of_gc_heap(e: &wasmtime::Error) -> bool {
+    format!("{}", e.root_cause()).contains("GC heap out of memory")
 }
 
 /// A wac `string` a loaded module returned, read through its own `$bind$str_*` helpers.
@@ -1168,6 +1187,17 @@ fn run_child(
         // terminated worker answers on the JavaScript hosts, and what `packages/sh` reads as "this
         // one has no status of its own to report".
         Err(_) if stop.load(Ordering::Relaxed) => (-1, 2, 0, b"stopped by its parent".to_vec()),
+        // A full GC heap ends as `HostLimit`, in the words `OUT_OF_GC_HEAP` gives it.
+        Err(e) if is_out_of_gc_heap(&e) => {
+            let text = OUT_OF_GC_HEAP;
+            let line = format!("wac: {} {text}\n", m.entry);
+            if inherit_out {
+                eprint!("{line}");
+            } else {
+                let _ = stderr.write(line.as_bytes());
+            }
+            (1, 2, 0, text.as_bytes().to_vec())
+        }
         Err(e) => {
             // **Said as the other hosts say it** — `wac: prog trapped: why` — with the engine's own reason
             // (`wasm trap: call stack exhausted`) rather than a page of backtrace, and the program's message

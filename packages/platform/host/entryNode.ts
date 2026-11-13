@@ -36,8 +36,34 @@ type NodeWorker = {
 };
 type WorkerThreads = {
   parentPort: ParentPort | null;
-  Worker: new (src: string, opts: { eval: boolean }) => NodeWorker;
+  Worker: new (src: string, opts: { eval: boolean; resourceLimits?: { maxOldGenerationSizeMb?: number } }) => NodeWorker;
 };
+
+/** `8g`, `512m`, `64k`, `1t` or a number of bytes, as `WAC_MAX_HEAP` is written on every host; `undefined` otherwise. */
+function sizeOf(text: string): number | undefined {
+  const m = /^(\d+)([kmgt]?)$/i.exec(text.trim());
+  if (m === null) return undefined;
+  const unit = { "": 1, k: 2 ** 10, m: 2 ** 20, g: 2 ** 30, t: 2 ** 40 }[m[2].toLowerCase() as "" | "k" | "m" | "g" | "t"];
+  const n = Number(m[1]) * unit;
+  return n > 0 && Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * **The heap a program's worker may grow to** — `issues/system/0472w`, the Node half. The program runs in a
+ * `worker_threads` Worker, whose old space Node sizes on its own (a 3 GB program stopped with *"Worker terminated due to
+ * reaching memory limit"* on a 16 GB machine); `resourceLimits` is the setting, and `WAC_MAX_HEAP` says what to set it
+ * to, as it does for the native V8 host. Unset, half of what the process may use (`constrainedMemory`, the cgroup's
+ * limit or the machine's), which is the native host's default too; `undefined` leaves Node's own.
+ */
+function heapLimitMb(proc: { env: Record<string, string | undefined>; constrainedMemory?: () => number }): number | undefined {
+  const set = proc.env["WAC_MAX_HEAP"];
+  if (set !== undefined && set !== "") {
+    const n = sizeOf(set);
+    if (n !== undefined) return Math.max(16, Math.floor(n / 2 ** 20));
+  }
+  const total = proc.constrainedMemory?.() ?? 0;
+  return total > 0 ? Math.floor(total / 2 / 2 ** 20) : undefined;
+}
 
 /**
  * A `WorkerLike` from Node's `worker_threads`, for `spawn`.
@@ -47,9 +73,9 @@ type WorkerThreads = {
  * containment already — nothing propagates to the parent thread — so unlike the web worker there is
  * no default to prevent.
  */
-function workerFrom(wt: WorkerThreads): (source: string) => WorkerLike {
+function workerFrom(wt: WorkerThreads, heapMb: number | undefined): (source: string) => WorkerLike {
   return (source: string) => {
-    const w = new wt.Worker(source, { eval: true });
+    const w = new wt.Worker(source, heapMb === undefined ? { eval: true } : { eval: true, resourceLimits: { maxOldGenerationSizeMb: heapMb } });
     return {
       post: (m: unknown) => w.postMessage(m),
       onMessage: (f: (data: unknown) => void) => w.on("message", f as (m: never) => void),
@@ -190,6 +216,8 @@ export async function runLauncherNode(
   proc: {
     argv: string[];
     env: Record<string, string | undefined>;
+    /** Node 19+: the memory this process may use, in bytes (the cgroup's limit, or the machine's). */
+    constrainedMemory?: () => number;
     exit(code: number): never;
     stdin: AsyncIterable<Uint8Array>;
     stdout: { write(b: Uint8Array, cb: (e?: unknown) => void): void; end(cb: () => void): void };
@@ -323,12 +351,13 @@ export async function runLauncherNode(
     // by its own host. `issues/system/0165`.
     run: grants.run === true,
     env: grants.env === true ? (n) => proc.env[n] : undefined,
-    makeWorker: workerFrom(wt),
+    makeWorker: workerFrom(wt, heapLimitMb(proc)),
     selfSource: workerSource,
     ...(moduleEntry === undefined ? {} : { moduleEntry }),
   }));
 
-  const worker = new wt.Worker(workerSource, { eval: true });
+  const heapMb = heapLimitMb(proc);
+  const worker = new wt.Worker(workerSource, heapMb === undefined ? { eval: true } : { eval: true, resourceLimits: { maxOldGenerationSizeMb: heapMb } });
   // Node queues messages on a port until a listener attaches, so unlike the web worker
   // this cannot be posted too early — but it does have to be posted at all.
   worker.postMessage({ sab: bridge.sab } satisfies Start);

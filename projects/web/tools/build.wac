@@ -252,7 +252,7 @@ export string programSide() {
         // numbers the capabilities it provides from — and how many there are: `src/line.wac`'s `PAGE_COUNT`, which
         // a request asked directly rather than sent in a batch is routed by. It stayed at 23 while the changes after
         // that were added, which nobody saw because each of them travels in a batch; `PAGE_ZONE` is asked.
-        const BASE = 4096, COUNT = 36;
+        const BASE = 4096, COUNT = 37;
         const NONE = new Uint8Array(0), dec = new TextDecoder(), enc = new TextEncoder();
         const lo = (v) => Number(BigInt.asIntN(32, v)), hi = (v) => Number(v >> 32n);
         const pair = (high, low) => (BigInt(high) << 32n) | BigInt(low >>> 0);
@@ -272,7 +272,7 @@ export string programSide() {
         // **What the document said that the program has not asked for yet**, and the requests waiting for it.
         // An event or a file is answered later, never inside the request that asked — so each runs the
         // program on in a turn of its own, and renders before the next.
-        const events = [], eventAsks = [], files = [], fileAsks = [], frames = new Map(), values = new Map(), stores = new Map();
+        const events = [], eventAsks = [], files = [], fileAsks = [], frames = new Map(), values = new Map(), stores = new Map(), audios = new Map();
         let at = where, locationAsks = [], lastFrame = 0, lastValue = 0;
         // Whether the page is seen, as the document last said — `""` until it has — and who waits to hear it change.
         let seen = "", seenAsks = [];
@@ -335,6 +335,8 @@ export string programSide() {
             // `localStorage` is the document's alone — a worker has none — so a read goes there and back.
             case 34: { const req = ++lastValue; stores.set(req, id); return send(["stored", req, text]); }
             case 35: return send(["store", text, dec.decode(bytes), a !== 0n]);
+            // The audio is the document's: its state, or a resume, goes there and back (`PAGE_AUDIO`).
+            case 36: { const req = ++lastValue; audios.set(req, id); return send(["audio", req, a !== 0n]); }
             case 23: return send(["sound", lo(a), Number(b), bytes], wacOwn(bytes));
             case 24: {
               // When, by the page's clock, and how far in: two little-endian f64s, when the program gave them.
@@ -631,6 +633,12 @@ export string programSide() {
             case "seen": seen = m[1]; return seenNow();
             case "value": { const id = values.get(m[1]); values.delete(m[1]); if (id !== undefined) answer(id, 0, m[2], NONE, 0n, 0n, 0); return; }
             case "stored": { const id = stores.get(m[1]); stores.delete(m[1]); if (id !== undefined) answer(id, 0, m[2] ?? "", NONE, 0n, 0n, m[2] === null ? 1 : 0); return; }
+            case "audio": {
+              const id = audios.get(m[1]);
+              audios.delete(m[1]);
+              if (id !== undefined) answer(id, 0, m[2], m[3] === null ? NONE : enc.encode(m[3]), 0n, 0n, m[3] === null ? 0 : 1);
+              return;
+            }
             case "timer": { const id = frames.get(m[1]); frames.delete(m[1]); if (id !== undefined) answer(id, 0, "", NONE, 0n, 0n, 0); return; }
           }
         };
@@ -1442,11 +1450,21 @@ export string documentSide() {
           const sy = ch !== undefined && r.height > 0 ? ch / r.height : 1;
           return [Math.round((ev.clientX - r.left) * sx), Math.round((ev.clientY - r.top) * sy)];
         };
-        // **One audio context, made when a page first makes a sound**, with the lowest latency the browser offers:
-        // a game's sound is heard as soon after the key as can be. A browser keeps it suspended until the person
-        // has done something on the page, so the first key or click resumes it.
+        // **One audio context, made when a page first makes a sound or asks about its audio**, with the lowest latency
+        // the browser offers: a game's sound is heard as soon after the key as can be. A browser keeps it suspended
+        // until the person has done something on the page, and may suspend or interrupt it again later — a hidden
+        // tab, a phone call, another app taking the speaker. **Nothing here resumes it on its own**: the program asks
+        // (`Page.resumeAudio`, `PAGE_AUDIO`), from a gesture's handler or when the page is seen again, as a page's own
+        // script would call `AudioContext.resume()`.
         let ctx = null;
         const sounds = new Map(), voices = new Map();
+        // **A sound asked for while the audio is held** is kept until it is resumed, and played then only if it is
+        // still the moment it was for: the tap that resumes it should be heard, the sounds of a minute in a hidden tab
+        // should not all be heard at once. Measured against the *request* to resume, not against when the browser
+        // got round to it, so a slow resume (a Bluetooth speaker waking) does not drop the sound the tap was for. A
+        // loop is not a moment; it plays whenever the audio runs.
+        const STALE_MS = 400;
+        let resumeAsked = null;
         // **Now, once for everything that arrived together** — the page's clock and the audio's both: voices started
         // for one moment are placed by them, and read separately, either clock could move between two voices and start
         // them apart.
@@ -1454,8 +1472,14 @@ export string documentSide() {
         const audio = () => {
           if (ctx) return ctx;
           ctx = new AudioContext({ latencyHint: "interactive" });
-          const resume = () => { if (ctx.state !== "running") ctx.resume(); };
-          for (const kind of ["pointerdown", "keydown", "touchend"]) addEventListener(kind, resume, true);
+          ctx.addEventListener("statechange", () => {
+            if (ctx.state !== "running") return;
+            const asked = resumeAsked ?? performance.now();
+            for (const [voice, v] of voices) {
+              if (v.held !== undefined && asked - v.held > STALE_MS) { voices.delete(voice); v.src.stop(); }
+              else delete v.held;
+            }
+          });
           return ctx;
         };
         // What an element filling the window, where there is no full screen, is styled with: above everything, edge to edge.
@@ -1680,7 +1704,7 @@ export string documentSide() {
             src.connect(gain).connect(ctx.destination);
             src.onended = () => { if (voices.get(voice)?.src === src) voices.delete(voice); };
             voices.get(voice)?.src.stop();
-            voices.set(voice, { src, gain });
+            voices.set(voice, !loop && ctx.state !== "running" ? { src, gain, held: performance.now() } : { src, gain });
             // **The page's clock to the audio's**: both read now, so a time on one is a time on the other. A time
             // already gone is now, from as far in as it would have got by now.
             const ahead = at > 0 ? (at - (batchNow ?? performance.timeOrigin + performance.now())) / 1000 : 0;
@@ -1709,6 +1733,23 @@ export string documentSide() {
           back: () => { history.back(); },
           // The page's store: `localStorage`, which a browser may refuse (storage off, a private window's quota) —
           // then nothing is stored, and a read finds nothing, as it would in a fresh profile.
+          // **The audio, as the program asks about it** (`PAGE_AUDIO`): its state, or a resume — the browser's own
+          // `AudioContext.resume()`, answered when it settles with the state then, or the browser's reason for
+          // refusing. A resume also starts a silent sound, which Safari wants for a context made before any gesture;
+          // either counts only while the person's gesture is recent, which is why a program asks from its handler.
+          audio: (req, resume) => {
+            const c = audio();
+            if (!resume) { queueMicrotask(() => emit(["audio", req, c.state, null])); return; }
+            resumeAsked = performance.now();
+            if (c.state !== "running" && c.state !== "closed") {
+              const s = c.createBufferSource();
+              s.buffer = c.createBuffer(1, 1, c.sampleRate);
+              s.connect(c.destination);
+              s.start();
+            }
+            c.resume().then(() => emit(["audio", req, c.state, null]),
+                            (e) => emit(["audio", req, c.state, String(e?.message ?? e)]));
+          },
           stored: (req, key) => {
             let v = null;
             try { v = localStorage.getItem(key); } catch {}

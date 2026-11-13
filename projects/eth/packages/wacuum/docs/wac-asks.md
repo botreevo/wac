@@ -2,6 +2,15 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
+## A local declared in a loop of an async function is one object for every pass (wac `issues/lang/0474w`)
+
+`Ticket<bool> t;` inside a `while` that then awaits it gets, on its second pass, the first pass's ticket —
+already settled — so a wait queue built that way spins pushing it (to out of memory) or traps resolving it
+twice. Any struct declared with no initialiser does the same (`D d;` pushed twice is one `D`); a synchronous
+function, or a declaration with an initialiser, does not. Found by the store's read/write gate, whose waits
+take their ticket from a synchronous `parked()` instead (`src/store/tree.wac`); the snap test's server does
+the same.
+
 ## An async lambda where wac cannot lower one is sometimes emitted as invalid wasm rather than declined (wac `7f559349c`)
 
 `issues/lang/0294c` says where an `async` lambda is lowered: the initialiser of a `fn<Ticket<…>(…)>`. Given one

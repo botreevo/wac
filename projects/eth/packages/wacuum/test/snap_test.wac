@@ -4,18 +4,21 @@
 // account, or answers about the wrong root, must be caught.
 
 import { Map, Vec, Ticket } from "core";
+import { Sys } from "std";
 import { rlp.Item, rlp.itemsOf } from "@/lib.wac";
 import { U256 } from "../src/u256.wac";
 import { World, Account, AccountState, slotMap, hashU256, eqU256, emptyCodeHash } from "../src/state/world.wac";
 import { keccak256 } from "../src/crypto/keccak.wac";
 import { Store } from "../src/store/tree.wac";
-import { MemDisk } from "../src/store/disk.wac";
+import { MemDisk, Disk } from "../src/store/disk.wac";
 import { StateDb, rootOf } from "../src/store/state.wac";
 import { Message } from "../src/p2p/wire.wac";
-import { Asker, Fetched, snapSync, answerAccountRange, answerStorageRanges, answerByteCodes, answerTrieNodes, GET_TRIE_NODES,
+import { Asker, Fetched, snapSync, answerHeld, getAccountRange, fullAccount, answerAccountRange, answerStorageRanges, answerByteCodes, answerTrieNodes, GET_TRIE_NODES,
          GET_ACCOUNT_RANGE, GET_STORAGE_RANGES, GET_BYTE_CODES } from "../src/p2p/snap.wac";
 import { bytesToHex } from "../src/hex.wac";
 import { PathTrie } from "../src/trie/pathtrie.wac";
+import { verifyRange, Range } from "../src/trie/rangeproof.wac";
+import { rlp.bytesOf } from "@/lib.wac";
 import { Check } from "./check.wac";
 
 /** A state: accounts with balances, some with code, some with a few slots, one with many. */
@@ -161,6 +164,13 @@ async u8[] moveOn(Moving m) {
   return r!;
 }
 
+/** A new ticket each time it is asked for: one declared in the waiting loop would be one for every pass (wac 0474w). */
+Ticket<bool> parked(Moving m) {
+  Ticket<bool> t;
+  m.waiting.push(t);
+  return t;
+}
+
 async Item[]? answerMoving(Moving m, Message q) {
   m.asked++;
   if (!m.moved && m.asked > m.after) {
@@ -187,11 +197,7 @@ async string runMoving(i32 after) {
   u8[] first = (await StateDb.over(server).seed(state(), u8[].filled(0, 0), why))!;
   Moving m = Moving(server, first, 0, after, false, false, Vec.create());
   Asker peer = Asker(async (Message q) => {
-    while (m.busy) {
-      Ticket<bool> t;
-      m.waiting.push(t);
-      await t;
-    }
+    while (m.busy) { await parked(m); }
     m.busy = true;
     Item[]? out = await answerMoving(m, q);
     m.busy = false;
@@ -237,3 +243,99 @@ export string test_snap_sync_heals_a_moving_pivot() {
   }
   return out;
 }
+
+/** Round `r` of blocks committing under a server: balances changed, some accounts gone, some new. */
+async u8[] bump(Store s, i32 r) {
+  Vec<U256> addrs = Vec.create();
+  Vec<AccountState?> states = Vec.create();
+  for (i32 i = 1 + r; i <= 300; i += 5) {
+    addrs.push(U256.ofU64(((i * 7919) as@ u32) as u64));
+    states.push(i % 10 == r ? null : AccountState(true, 3, U256.ofU64(((i * 100 + r) as@ u32) as u64), u8[].filled(0, 0), emptyCodeHash()));
+  }
+  for (i32 i = 0; i < 7; i++) {
+    addrs.push(U256.ofU64(((800000 + r * 100 + i) as@ u32) as u64));
+    states.push(AccountState(true, 1, U256.ofU64(7), u8[].filled(0, 0), emptyCodeHash()));
+  }
+  AccountState?[] st = AccountState?[].defaulted(states.len());
+  for (i32 i = 0; i < st.len(); i++) { st[i] = states.get(i); }
+  string[] why = [""];
+  u8[]? root = await StateDb.over(s).write(addrs.toArray(), st, Map.create(hashU256, eqU256), u8[].filled(0, 0), why);
+  return root ?? u8[].filled(0, 0);
+}
+
+/** Whether an account range answered about `root` from `origin` proves, or is empty (not about that root). */
+string judge(Message a, u8[] root, u8[] origin) {
+  Item[] all = itemsOf(a.body);
+  Item[] run = itemsOf(all[1]);
+  Item[] proof = itemsOf(all[2]);
+  if (run.len() == 0 && proof.len() == 0) { return "empty"; }
+  u8[][] keys = u8[][].defaulted(run.len());
+  u8[][] vals = u8[][].defaulted(run.len());
+  for (i32 i = 0; i < run.len(); i++) {
+    Item[] pair = itemsOf(run[i]);
+    keys[i] = bytesOf(pair[0]);
+    vals[i] = fullAccount(pair[1])!;
+  }
+  u8[][] nodes = u8[][].defaulted(proof.len());
+  for (i32 i = 0; i < proof.len(); i++) { nodes[i] = bytesOf(proof[i]); }
+  Range r = verifyRange(root, origin, keys, vals, nodes);
+  return r.ok ? "proved" : r.why;
+}
+
+/** `m`'s disk, but every read and write waits a turn of the host first, as a file's do. */
+Disk slow(MemDisk m, Sys sys) {
+  Disk d = m.disk();
+  return Disk(async (i64 at, i32 n) => {
+    await sys.sleepMillis(0);
+    return await d.read(at, n);
+  }, d.readNow, async (i64 at, u8[] b) => {
+    await sys.sleepMillis(0);
+    return await d.write(at, b);
+  }, d.sync, d.size);
+}
+
+async string serving(Sys sys, i32 rounds, i32 per) {
+  Check t = Check.create();
+  MemDisk sd = MemDisk.create();
+  Store server = (await Store.open(slow(sd, sys))).unwrap();
+  // Few leaves kept, so that answers go to the disk, and wait there.
+  server.maxLeaves = 2;
+  string[] why = [""];
+  u8[] root = (await StateDb.over(server).seed(state(), u8[].filled(0, 0), why))!;
+  // Opened again, it holds only the interior: the leaves are read as they are needed.
+  server = (await Store.open(slow(sd, sys))).unwrap();
+  server.maxLeaves = 2;
+  Vec<Ticket<Message>> answers = Vec.create();
+  Vec<u8[]> asked = Vec.create();
+  Vec<u8[]> origins = Vec.create();
+  for (i32 r = 0; r < rounds; r++) {
+    // A block on its way to committing, and requests about the state now arriving one after another while it
+    // is: some answered before it, some across it, some after.
+    Ticket<u8[]> block = bump(server, r);
+    for (i32 k = 0; k < per; k++) {
+      u8[] origin = u8[].filled(32, 0);
+      origin[0] = (k * 32) as! u8;
+      u8[] limit = u8[].filled(32, 0xff);
+      answers.push(answerHeld(server, GET_ACCOUNT_RANGE, getAccountRange(((r * per + k) as@ u32) as u64, root, origin, limit, 2048).body));
+      asked.push(root);
+      origins.push(origin);
+      await sys.sleepMillis(0);
+    }
+    root = await block;
+  }
+  i32 proved = 0;
+  i32 empty = 0;
+  string bad = "";
+  for (i32 i = 0; i < answers.len(); i++) {
+    string v = judge(await answers.get(i), asked.get(i), origins.get(i));
+    if (v == "proved") { proved++; }
+    else if (v == "empty") { empty++; }
+    else if (bad == "") { bad = v; }
+  }
+  t.eqStr(bad, "", "no answer mixes two states (\{proved} proved, \{empty} about a state gone)");
+  t.ok(proved >= 6, "and those served before their block are proved: \{proved}");
+  return t.report();
+}
+
+/** Run with a `Sys` (so `wac test --allow-read`): its turns are what interleave the answers and the blocks. */
+export async string test_snap_answers_while_blocks_commit(Sys sys) { return await serving(sys, 6, 8); }

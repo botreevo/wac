@@ -38,7 +38,7 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
 ## Building and testing here
 
     sh ../../tools/deps.sh # the wac the root wac.lock pins, into the package cache with git — once, and after it moves
-    wac test test        # the unit tests, in about a second
+    wac test --allow-read test   # the unit tests, in a few seconds (the grant lets the ones taking a Sys run)
     wac task vectors     # regenerate the U256 cases (needs node)
     wac task fixtures    # execution-spec-tests v5.4.0 into fixtures/
     wac task statetests  # every Cancun state test, about a minute

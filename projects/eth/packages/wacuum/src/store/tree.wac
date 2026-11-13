@@ -206,10 +206,15 @@ export struct Store {
   i32 maxLeaves;
   /** Requests to the disk, for whoever is measuring. */
   i32 reads;
+  /** Readers holding the committed state still (`hold`), and whether a commit is under way or waiting. */
+  i32 readers;
+  bool writing;
+  i32 wantWrite;
+  Vec<Ticket<bool>> waiting;
 
   /** The store in `disk`: the last commit, or an empty one for an empty file. */
   async Result<Store, string> open(Disk disk) {
-    Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), 4096, 0);
+    Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), 4096, 0, 0, false, 0, Vec.create());
     i64 size = match (await disk.size()) {
       Ok(n): n,
       Err(e): return Result.Err(e),
@@ -376,6 +381,50 @@ export struct Store {
    * which case the store in memory is no longer the one on disk, and should be opened again.
    */
   async string commit(this, Change[] changes, u8[] user) {
+    this.wantWrite++;
+    while (this.writing || this.readers > 0) { await this.parked(); }
+    this.wantWrite--;
+    this.writing = true;
+    string out = await this.commitNow(changes, user);
+    this.writing = false;
+    this.wake();
+    return out;
+  }
+
+  /**
+   * The committed state kept as it is until `release`: no commit starts meanwhile, and one waiting goes
+   * before new holders, so a reader that awaits between reads (a snap answer: a range, then proofs) sees one
+   * state throughout, and block import is not starved. A holder must not commit.
+   */
+  async void hold(this) {
+    while (this.writing || this.wantWrite > 0) { await this.parked(); }
+    this.readers++;
+  }
+
+  void release(this) {
+    this.readers--;
+    if (this.readers == 0) { this.wake(); }
+  }
+
+  /**
+   * A new ticket to wait on until the gate changes. Made here, not declared in the waiting loop: a ticket
+   * declared in a loop of an async function is one ticket for every pass (docs/wac-asks.md), and the second
+   * pass would await the first's, already settled.
+   */
+  Ticket<bool> parked(this) {
+    Ticket<bool> t;
+    this.waiting.push(t);
+    return t;
+  }
+
+  /** Everyone waiting for the gate to change: each looks again. */
+  void wake(this) {
+    Vec<Ticket<bool>> all = this.waiting;
+    this.waiting = Vec.create();
+    for (i32 i = 0; i < all.len(); i++) { all.get(i).resolve(true); }
+  }
+
+  async string commitNow(this, Change[] changes, u8[] user) {
     if (user.len() > 3900) { return "the commit's own bytes are over 3900"; }
     // Into the tree in memory, marking every node on each changed path.
     for (i32 c = 0; c < changes.len(); c++) {

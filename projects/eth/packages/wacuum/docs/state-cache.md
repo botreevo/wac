@@ -51,45 +51,47 @@ as a touch — so one pass gives the hit rate of an LRU of every size. Leaves ar
 (30 GB), and a slot's either its contract's (all of a contract's storage in one leaf, the most a leaf cache
 could gain) or its own hash's among ~1.7 M (110 GB; each slot alone, the least).
 
-**Preliminary**: 64 blocks from 26,405,916 (Nov 2026), the first 16 only warming the cache. The range's
-state was still being learnt from a free-tier RPC node when this was run (`--anyway`: the last few hundred
-keys read as empty), so from block 24 some transactions fail and the blocks stop there; the reads per
-block below are low for that reason (a complete five-block trace from 26,404,100 had ~6900 a block, not
-~2600). The hit rates are per read and should hold; they will be replaced with the converged range's.
+64 blocks from 26,405,916 (Nov 2026), the first 16 only warming the cache. The range's state was learnt from a
+free-tier RPC node over 400 rounds of replaying; the last rounds found two or three slots each (a contract
+walking its storage a slot a round), so the trace was taken with those three still missing (`--anyway`, read
+as empty): 56 of the 64 blocks then match their headers exactly, and the other 8 differ only in gas, where the
+missing slots are read. (A first trace, taken with 86 missing, lost transactions from block 24 on; its rates
+agreed with these within a few points.)
 
-| reads a block (distinct) | accounts 334 · slots 842 · account trie nodes 612 · storage trie nodes 815 |
-| --- | --- |
-| writes a block (distinct) | accounts 238 · slots 436 · account trie nodes 627 · storage trie nodes 864 |
+| per block (distinct keys) | accounts | slots | account trie nodes | storage trie nodes |
+| --- | ---: | ---: | ---: | ---: |
+| read | 798 | 2028 | 1452 | 1953 |
+| written | 570 | 1040 | 1488 | 2082 |
 
 Hit rate of the reads after warming, by what is cached:
 
 | cache | memory | all reads | accounts | slots | account trie | storage trie |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| entries, 10 K | 3 MB | 29% | 28% | 18% | 43% | 30% |
-| entries, 30 K | 9 MB | 53% | 50% | 40% | 66% | 57% |
-| entries, 100 K | 29 MB | **68%** | 63% | 54% | 80% | 74% |
-| entries, ever touched in the trace | | 68% | 63% | 54% | 80% | 74% |
-| leaves, 1000 | 64 MB | 13–31% | 5% | 27–88% | 8% | 7% |
-| leaves, 10 000 | 640 MB | 37–58% | 29–35% | 42–93% | 45–51% | 31–39% |
+| entries, 10 K | 3 MB | 26% | 27% | 18% | 39% | 25% |
+| entries, 30 K | 9 MB | 52% | 50% | 39% | 64% | 56% |
+| entries, 100 K | 29 MB | **71%** | 66% | 57% | 83% | 77% |
+| entries, ever touched in the trace | | 72% | 67% | 59% | 84% | 80% |
+| 64 KB leaves, 1000 | 64 MB | 8–28% | 0% | 25–88% | 0% | 0% |
+| 64 KB leaves, 10 000 | 640 MB | 35–57% | 30–35% | 41–93% | 42–48% | 27–36% |
 
-(Leaves: the lower figure with each slot alone, the higher with a contract's storage in one leaf.)
+(Leaves: the lower figure with each slot alone, the higher with a contract's storage in one leaf. With 16 KB
+pages, 64 MB is 4096 leaves — between the two leaf rows, nearer the first.)
 
 What this says:
 
-- **Two-thirds of a block's reads were touched in the last ~50 blocks** (ten minutes), and a cache of 100 K
-  entries — 29 MB — holds all of them. The upper levels of the tries are most of the reuse (80%), then
-  accounts, then slots.
-- **At equal memory, entries catch two to five times what leaves do.** 64 MB of leaves is 1000 of them and
-  catches 13–31%; 64 MB of entries is ~220 K and catches everything this trace can show (68%). Hashed keys
-  scatter, so a leaf is kept for the one key in it someone wanted. Only a contract's storage lies together,
-  and only when the contract is small enough to fit a leaf — the generous end of the range.
-- **What a longer window catches is not known yet.** 64 blocks cannot show reuse over hours; the converged
-  run, and a longer one, will. A cache sized for the measured window is tiny, so the size below is set by
-  the heap rather than by this curve.
+- **Nearly three-quarters of a block's reads were touched in the last ~50 blocks** (ten minutes), and a cache of
+  100 K entries — 29 MB — holds almost all of them. The upper levels of the tries are most of the reuse
+  (83%), then accounts, then slots.
+- **At equal memory, entries catch three to nine times what leaves do.** 64 MB of 64 KB leaves catches 8–28%;
+  64 MB of entries is ~220 K of them and catches everything this trace can show (72%). Hashed keys scatter, so
+  a leaf is kept for the one key in it someone wanted. Only a contract's storage lies together, and only when
+  the contract is small enough to fit a leaf — the generous end of the range.
+- **What a longer window catches is not known.** 64 blocks cannot show reuse over hours. A cache sized for the
+  measured window is tiny, so the size below is set by the heap rather than by this curve.
 
-Commits: flushed every block, a block writes ~2170 keys (and their leaves — nearly one leaf each, since
-the keys scatter); flushed every 4, 16 or 64 blocks, ~1680, ~1250 and ~1040 a block. Batching halves the
-writes, as `docs/state-on-disk.md` assumed.
+Commits: flushed every block, a block writes ~5190 keys (and their leaves — nearly one leaf each, since the
+keys scatter); flushed every 4, 16 or 64 blocks, ~3980, ~2840 and ~1950 a block. Batching cuts the writes by
+more than half, as `docs/state-on-disk.md` assumed.
 
 ## Decisions
 
@@ -137,6 +139,6 @@ does not replace them), and prefetching a block's senders and recipients in one 
 
 ## To measure next
 
-- The converged 64-block range (the fetch is learning its last keys), and then a longer one, for reuse
-  beyond ten minutes and the size where the curve flattens.
+- A longer range, for reuse beyond ten minutes and the size where the curve flattens: from a node that serves
+  `debug_` (a block's reads in one trace call), since learning them from a free-tier node took 400 rounds for 64.
 - The cache in the node, at the head of Hoodi: hit rate, and Mgas/s on the store, against the replay's.

@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0473w](open/0473w-wait-keeps-every-async-call-that-awaited-alive.md) | `inner(i).wait()` on an async function that itself `await`s another keeps every call and all it allocated alive: 3000 calls holding 1 MB each run out of heap, where the same without the inner `await`, or awaited from `async main`, stays small | bug | out of memory from unreachable calls |
 | [0472w](open/0472w-the-v8-host-heap-stops-at-1-4-gb-with-no-way-to-raise-it.md) | The V8 host's heap stops at ~1.4 GB with 15 GB free, and nothing sets or forwards a heap limit; asks a flag up to V8's 4 GB cage | missing feature | out of memory at 1384 MB |
 | [0471w](open/0471w-a-host-file-request-costs-55us-whatever-it-carries.md) | A `RandomFile.readAt` costs ~55 µs fixed plus ~1 µs a KB from the page cache on the V8 host, and 64 in flight are no faster than one at a time; asks a cheaper request or a vectored read | performance | 54 µs for 16 bytes |
 | [0470e](closed/0470e-after-a-child-runs-a-pipeline-the-next-childs-open-input-has-ended.md) | on the V8 host, after a spawned shell runs `seq 1 3 \| cat`, the next child the same program spawns with its input held open reads the end at once (`sh -c cat` exits 0); with `echo hi` first it waits, as it should. A pipeline's first stage inherits the shell's input, and an inheriting child here reads the *process's* `std::io::stdin()` rather than its parent's queue | bug | a child reads the end of an open input |

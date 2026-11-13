@@ -43,6 +43,7 @@ import { executeFrom, Steps } from "../store/exec.wac";
 import { receiptsChanges, receiptsOf, receiptsKey, joined } from "../store/receipts.wac";
 import { blockKey, blockChanges, canonicalKey, txKey, txPlace, placeIndex } from "../store/blocks.wac";
 import { Change } from "../store/tree.wac";
+import { undoKey, undoFrom, undoChanges, decodeChangeSet } from "../store/undo.wac";
 import { Transaction, AccessEntry, Authorization, processTransaction, Processed, intrinsicGas } from "../tx/process.wac";
 
 /**
@@ -53,6 +54,22 @@ import { Transaction, AccessEntry, Authorization, processTransaction, Processed,
 struct Node {
   Header header;
   ChangeSet? changes;
+}
+
+/**
+ * The undo records' bookkeeping (`store/undo.wac`): the number below which they have been deleted, a notice for
+ * the node to log when finality stalls and the oldest are deleted anyway, and the bytes written, for measuring.
+ */
+struct Undo {
+  u64 prunedTo;
+  /** Undo records kept at most this many blocks below the head, finalized or not: a bound while finality stalls. */
+  u64 limit;
+  string notice;
+  bool warned;
+  i64 bytes;
+  i64 stateBytes;
+
+  Undo create() { return Undo(0, 1024, "", false, 0, 0); }
 }
 
 /** A payload `prepare` ran on the store: "" and committed, or why it is invalid. */
@@ -269,6 +286,9 @@ export struct Engine {
    * (`docs/wac-asks.md`).
    */
   Persisting persisting;
+  Undo undo;
+  /** Whether the log has the block the store holds: when not, `adoptStored` records it. */
+  bool restoredLogged;
 
   /** An engine whose chain starts at `genesis`, with `world` its state. */
   Engine create(ChainConfig config, Header genesis, World world) {
@@ -276,7 +296,7 @@ export struct Engine {
                       genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                       null, Map.create(hashU256, eqU256), Vec.create(), null, U256.zero(), U256.zero(), SenderCache.create(), "wacuum".toBytes(), U256.zero(), 0, 1, 0, Vec.create(),
                       null, Map.create(hashU256, eqU256), false, Vec.create(), Vec.create(), Steps(0, 0), null, Map.create(hashText, textEq), Map.create(hashU256, eqU256),
-                      Persisting.create());
+                      Persisting.create(), Undo.create(), false);
     e.blocks.set(genesis.hash, Node(genesis, null));
     e.archive.set(genesis.hash, Archived(genesis, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
                                          Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
@@ -778,7 +798,8 @@ export struct Engine {
       return;
     }
     // The receipts with the state, so that a restart, which does not run this block again, still has them.
-    string bad = await db.commitWith(st!, this.withBlock(h.hash, encodeBlock(spec, b), body.receipts), storedAt(h));
+    Change[] pruned = await this.undoPrunes(h.number.low());
+    string bad = await db.commitWith(st!, this.withBlock(h, encodeBlock(spec, b), body.receipts, cs, pruned, st!.changes), storedAt(h));
     if (bad != "") {
       this.prepared.set(h.hash, Prepared("the state did not commit: \{bad}", cs, body));
       return;
@@ -825,7 +846,8 @@ export struct Engine {
       this.freshWorld();
       return "the block's state did not stage";
     }
-    string bad = await this.db!.commitWith(this.lastStaged!, this.withBlock(b.header.hash, encodeBlock(spec, b), built.body.receipts), storedAt(b.header));
+    Change[] pruned = await this.undoPrunes(b.header.number.low());
+    string bad = await this.db!.commitWith(this.lastStaged!, this.withBlock(b.header, encodeBlock(spec, b), built.body.receipts, cs, pruned, this.lastStaged!.changes), storedAt(b.header));
     this.freshWorld();
     if (bad != "") { return "the block's state did not commit: \{bad}"; }
     U256 hash = b.header.hash;
@@ -1322,6 +1344,8 @@ export struct Engine {
   async Replayed replay(this, u8[] log) {
     i32 at = 0;
     i32 blocks = 0;
+    bool lookedAhead = false;
+    await this.adoptFromStore();
     while (at < log.len()) {
       i32 n = rlpLength(log, at);
       if (n < 0) { break; }
@@ -1337,16 +1361,16 @@ export struct Engine {
         BlockDecode bd = decodeBlock(spec, raw);
         if (bd.block is null) { return Replayed(at, blocks, "block at byte \{at}: \{bd.error}"); }
         Block b = bd.block!;
+        if (this.restoredAt is not null && b.header.hash.eq(this.restoredAt!)) { this.restoredLogged = true; }
         if (this.restoredAt is not null && !b.header.number.gt(this.restoredNumber)) {
-          // At or below the snapshot: the state already includes it, so it is recorded, not run.
-          this.adopt(spec, b);
-          // On a store, its receipts were kept with its state.
-          if (this.db is not null) {
-            u8[]? kept = await this.db!.store.chunks(receiptsKey(b.header.hash));
-            Archived? a = this.archive.get(b.header.hash);
-            if (kept is not null && a is not null) { a!.receipts = receiptsOf(kept!); }
-          }
+          await this.adoptLogged(spec, b);
         } else {
+          // The first block to run: every block at or below the store's that the log has later is adopted first,
+          // so that the store can be moved across them (a side chain imported after the main chain's later blocks).
+          if (this.restoredAt is not null && !lookedAhead) {
+            await this.adoptAhead(log, at + n);
+            lookedAhead = true;
+          }
           if (this.db is not null) { await this.prepareBlock(spec, b); }
           Answer a = this.importBlock(spec, b);
           string st = a.result!.member("status")!.text()!;
@@ -1367,6 +1391,9 @@ export struct Engine {
         Header[] ancestors = Header[].filled(hs.len() - 1, hs[0]);
         for (i32 k = 1; k < hs.len(); k++) { ancestors[k - 1] = hs[k]; }
         this.rebase(hs[0], ancestors);
+        // A rebase forgets every block; the store's own is taken again, and the log looked ahead of again.
+        await this.adoptFromStore();
+        lookedAhead = false;
       } else if (kind.len() == 1 && kind[0] == RECORD_CHOICE && f.len() == 4) {
         U256 head = U256.fromBytes(bytesOf(f[1]), 0, 32);
         if (this.db is not null && this.blocks.has(head)) { await this.moveToAsync(head); }
@@ -1381,6 +1408,45 @@ export struct Engine {
     // What was replayed is already in the log.
     this.records = Vec.create();
     return Replayed(at, blocks, "");
+  }
+
+  /**
+   * A block of the log at or below the store's: the state already includes it, so it is recorded, not run — with
+   * its change set from its undo record, so that a reorg can still take the store back across it, and its
+   * receipts, kept with its state.
+   */
+  async void adoptLogged(this, Spec spec, Block b) {
+    this.adopt(spec, b);
+    await this.loadUndo(b.header);
+    if (this.db is not null) {
+      u8[]? kept = await this.db!.store.chunks(receiptsKey(b.header.hash));
+      Archived? a = this.archive.get(b.header.hash);
+      if (kept is not null && a is not null) { a!.receipts = receiptsOf(kept!); }
+    }
+  }
+
+  /** The log's blocks from `from` on that are at or below the store's, adopted, up to a rebase (which forgets them). */
+  async void adoptAhead(this, u8[] log, i32 from) {
+    i32 at = from;
+    while (at < log.len()) {
+      i32 n = rlpLength(log, at);
+      if (n < 0) { return; }
+      u8[] rec = u8[].filled(n, 0);
+      rec.copyFrom(log, at, 0, n);
+      at += n;
+      Decoded d = decode(rec);
+      if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 2) { return; }
+      Item[] f = itemsOf(d.item);
+      u8[] kind = bytesOf(f[0]);
+      if (kind.len() == 1 && kind[0] == RECORD_BASE) { return; }
+      if (kind.len() != 1 || kind[0] != RECORD_BLOCK) { continue; }
+      u8[] raw = bytesOf(f[1]);
+      Spec spec = this.config.specAt(blockTimestamp(raw));
+      BlockDecode bd = decodeBlock(spec, raw);
+      if (bd.block is null || bd.block!.header.number.gt(this.restoredNumber)) { continue; }
+      if (bd.block!.header.hash.eq(this.restoredAt!)) { this.restoredLogged = true; }
+      await this.adoptLogged(spec, bd.block!);
+    }
   }
 
   /** The block a JSON-RPC block parameter names: a tag, a number on the canonical chain, or `{blockHash}`. */
@@ -1663,15 +1729,59 @@ export struct Engine {
    * history are. Taken here, so the next commit does not carry them again; if this one fails the store is
    * opened again and they are lost with it, which costs only answers about blocks that old.
    */
-  Change[] withBlock(this, U256 hash, u8[] rlp, Receipt[] receipts) {
-    Change[] r = receiptsChanges(hash, receipts);
-    Change[] k = blockChanges(hash, rlp);
-    Change[] out = Change[].filled(r.len() + k.len() + this.persisting.keys.len(), r[0]);
-    for (i32 i = 0; i < r.len(); i++) { out[i] = r[i]; }
-    for (i32 i = 0; i < k.len(); i++) { out[r.len() + i] = k[i]; }
-    for (i32 i = 0; i < this.persisting.keys.len(); i++) { out[r.len() + k.len() + i] = Change(this.persisting.keys.get(i), this.persisting.values.get(i)); }
+  Change[] withBlock(this, Header h, u8[] rlp, Receipt[] receipts, ChangeSet cs, Change[] pruned, Change[] state) {
+    Vec<Change> out = Vec.create();
+    Change[] r = receiptsChanges(h.hash, receipts);
+    for (i32 i = 0; i < r.len(); i++) { out.push(r[i]); }
+    Change[] k = blockChanges(h.hash, rlp);
+    for (i32 i = 0; i < k.len(); i++) { out.push(k[i]); }
+    // Its undo record, in the same commit as its state, so that a store holding one holds the other.
+    Change[] u = undoChanges(h.number.low(), h.hash, cs);
+    for (i32 i = 0; i < u.len(); i++) {
+      out.push(u[i]);
+      this.undo.bytes += (u[i].key.len() + u[i].value!.len()) as i64;
+    }
+    for (i32 i = 0; i < state.len(); i++) { this.undo.stateBytes += (state[i].key.len() + (state[i].value is null ? 0 : state[i].value!.len())) as i64; }
+    for (i32 i = 0; i < pruned.len(); i++) { out.push(pruned[i]); }
+    for (i32 i = 0; i < this.persisting.keys.len(); i++) { out.push(Change(this.persisting.keys.get(i), this.persisting.values.get(i))); }
     this.persisting = Persisting.create();
+    return out.toArray();
+  }
+
+  /**
+   * Deletes for the undo records no reorg can need any more: those of finalized blocks, and past `this.undo.limit`
+   * below `number` (the block about to commit) whatever finality says — then a reorg that deep cannot be undone
+   * after a restart, and the notice says so.
+   */
+  async Change[] undoPrunes(this, u64 number) {
+    // Up to and including the finalized block: no reorg takes the store below it.
+    Header? f = this.headerByHash(this.finalized);
+    u64 upTo = f is null ? 0 : f!.number.low() + 1;
+    // Finality caught up again: the next stall is told of too.
+    if (number <= this.undo.limit || number - this.undo.limit <= upTo) { this.undo.warned = false; }
+    if (number > this.undo.limit && number - this.undo.limit > upTo) {
+      upTo = number - this.undo.limit;
+      if (!this.undo.warned) {
+        this.undo.warned = true;
+        this.undo.notice = "finality is more than \{this.undo.limit} blocks behind: undo records below block \{upTo} deleted; a reorg that deep cannot be followed after a restart";
+      }
+    }
+    if (upTo <= this.undo.prunedTo) { return Change[].filled(0, Change(u8[].filled(0, 0), null)); }
+    Vec<Change> old = await this.db!.store.range(undoFrom(this.undo.prunedTo), undoFrom(upTo), 0x7fffffff);
+    Change[] out = Change[].filled(old.len(), Change(u8[].filled(0, 0), null));
+    for (i32 i = 0; i < old.len(); i++) { out[i] = Change(old.get(i).key, null); }
+    this.undo.prunedTo = upTo;
     return out;
+  }
+
+  /** A block adopted without running (at or below the store's): its change set from its undo record, if kept. */
+  async void loadUndo(this, Header h) {
+    Node? n = this.blocks.get(h.hash);
+    if (this.db is null || n is null || n!.changes is not null) { return; }
+    u8[]? raw = await this.db!.store.chunks(undoKey(h.number.low(), h.hash));
+    if (raw is null) { return; }
+    Node node = n!;
+    node.changes = decodeChangeSet(raw!);
   }
 
   /** A block by hash: held in memory, or on a store read from it (`blocks.wac`), or null. */
@@ -1755,26 +1865,41 @@ export struct Engine {
   }
 
   /**
-   * After the log's replay, the block whose state the store holds, when the log never got it: a stop after the
-   * store's commit and before the log's write. The store keeps every block it commits, in the same commit
-   * (`withBlock`), so it is read from there and adopted as a block of the log's would be, with its receipts,
-   * and recorded so the log has it from now on. Without this the engine had no block for the state it was at:
-   * the payload given again was SYNCING, its parent's state gone, and so was every one after it — for good.
-   * True when it adopted one.
+   * The block whose state the store holds, read from the store — its commit kept the block, its receipts and its
+   * undo record (`withBlock`) — and adopted, before the log's replay runs anything: the engine is then where the
+   * store is from the start. Without it, a block of the log above the store's that came before the store's own
+   * block in the log (a side chain imported after the main chain's later blocks, then a reorg to it stopped
+   * part way) ran on a store the engine thought was elsewhere, failed, and the chain after it was lost. Its
+   * parent may not be known yet; the log adopts the ancestors before anything moves across them.
    */
-  async bool adoptStored(this) {
+  async bool adoptFromStore(this) {
     if (this.db is null || this.restoredAt is null || this.blocks.has(this.restoredAt!)) { return false; }
     u8[]? raw = await this.db!.store.chunks(blockKey(this.restoredAt!));
     if (raw is null) { return false; }
     Spec spec = this.config.specAt(blockTimestamp(raw!));
     BlockDecode bd = decodeBlock(spec, raw!);
-    if (bd.block is null || !this.blocks.has(bd.block!.header.parentHash)) { return false; }
+    if (bd.block is null || !bd.block!.header.hash.eq(this.restoredAt!)) { return false; }
     Block b = bd.block!;
     this.adopt(spec, b);
+    await this.loadUndo(b.header);
     u8[]? kept = await this.db!.store.chunks(receiptsKey(b.header.hash));
     Archived? a = this.archive.get(b.header.hash);
     if (kept is not null && a is not null) { a!.receipts = receiptsOf(kept!); }
+    return true;
+  }
+
+  /**
+   * After the log's replay: the store's block recorded for the log when the log never got it — a stop after the
+   * store's commit and before the log's write. Without it the engine had no block for the state it was at, and
+   * the payload given again was SYNCING for good. True when it was missing.
+   */
+  async bool adoptStored(this) {
+    await this.adoptFromStore();
+    if (this.restoredAt is null || this.restoredLogged || !this.blocks.has(this.restoredAt!)) { return false; }
+    u8[]? raw = await this.db!.store.chunks(blockKey(this.restoredAt!));
+    if (raw is null) { return false; }
     this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(raw!)])));
+    this.restoredLogged = true;
     return true;
   }
 

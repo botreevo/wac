@@ -144,6 +144,29 @@ calls), and ~1.5 billion keccaks for the trie (~1 µs each in wac: ~25 minutes).
 6. **Hoodi end to end**, then mainnet. Hoodi is young and its state is small; it needs a machine with p2p
    (this container has HTTPS out only), so the provisioned node is wanted from step 5 on.
 
+## The node on the store (as built, superseding "diff layers" above where they differ)
+
+What was built first, in order, each with the cold fixture runs as its check: the B+tree (`src/store/tree.wac`),
+the state in it under snap's keys (`src/store/state.wac`), the tries by path (`src/trie/pathtrie.wac`), and a
+block run a step at a time with only a step that missed run again (`BodyRun`, `src/store/exec.wac`) — the
+second layer of reads above; the third (stopping at the opcode) waits until measurements say it is needed.
+
+For the engine, a simpler arrangement than flushing only finalized blocks: **the store holds the state of
+the block the engine is at.** A block imported is committed as soon as its root matches its header; moving
+across a reorg commits the departing blocks' before-states and the arriving blocks' after-states, which the
+engine's change sets already hold. Then there is never state in memory that the store does not have, a
+restart needs only the block log after the block the store's meta names, and the `World` is a cache over
+the store rather than the state. A commit a block (~0.2 s of host requests and an `fsync`) fits a 12 s slot;
+batching commits during a long catch-up is the optimisation, if measurements ask for it. One limit,
+recorded rather than solved: undoing a block that deleted an account with storage needs every slot it
+had, and only the slots read are noted — after Cancun, SELFDESTRUCT deletes only what the same transaction
+created, so no such block exists on a chain this runs.
+
+The engine stays synchronous — its JSON-RPC handlers, tests and fixture runners call it so — and gains
+`prepare(method, params)`, which the server awaits before `call`: in store mode it does the asynchronous
+part (moving the store to the right block, running a payload with step retries and computing its root from
+the tries, reading what a state query will read), so that `call` finds everything in memory.
+
 ## Decisions for Andrew
 
 - **wac host asks** (filed when this starts): the per-call cost of host I/O (~55 µs), a vectored read, and

@@ -1,0 +1,107 @@
+// A block's receipts, as the store keeps them beside the state it commits with the block, so that the
+// eth_ methods still have them after a restart (blocks the store already holds are not run again):
+//
+//     receipts      0x05 ‖ block hash ‖ u16 chunk     rlp([receipt…]), every field the eth_ methods answer with,
+//                                                 32 KB a chunk (a log's data can be megabytes)
+
+import { Vec } from "core";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.itemsOf, rlp.bytesOf, rlp.isList } from "@/lib.wac";
+import { U256 } from "../u256.wac";
+import { Log } from "../state/world.wac";
+import { Receipt } from "../chain/block.wac";
+import { Change } from "./tree.wac";
+
+export u8[] receiptsKey(U256 blockHash) {
+  u8[] out = u8[].filled(33, 5);
+  out.copyFrom(blockHash.toBytes(), 0, 1, 32);
+  return out;
+}
+
+Item int(U256 v) {
+  u8[] b = v.toBytes();
+  i32 skip = 0;
+  while (skip < 32 && b[skip] == 0) { skip++; }
+  u8[] out = u8[].filled(32 - skip, 0);
+  out.copyFrom(b, skip, 0, out.len());
+  return Item.Bytes(out);
+}
+
+Item small(i64 v) { return int(U256.ofU64(v as@ u64)); }
+Item maybe(U256? v) { return Item.Bytes(v is null ? u8[].filled(0, 0) : v!.toBytes()); }
+U256 num(Item it) { return U256.fromBytes(bytesOf(it), 0, bytesOf(it).len()); }
+U256? maybeOf(Item it) { return bytesOf(it).len() == 0 ? null : U256.fromBytes(bytesOf(it), 0, 32); }
+
+/** The store's changes that keep `receipts` for the block `hash`, a chunk each. */
+export Change[] receiptsChanges(U256 hash, Receipt[] receipts) {
+  u8[] all = encodeReceipts(receipts);
+  Vec<Change> out = Vec.create();
+  u8[] base = receiptsKey(hash);
+  i32 k = 0;
+  for (i32 at = 0; at < all.len() || k == 0; at += 32768) {
+    i32 n = all.len() - at < 32768 ? all.len() - at : 32768;
+    u8[] part = u8[].filled(n, 0);
+    part.copyFrom(all, at, 0, n);
+    u8[] key = u8[].filled(35, 0);
+    key.copyFrom(base, 0, 0, 33);
+    key[33] = (k >> 8) as! u8;
+    key[34] = (k & 255) as! u8;
+    out.push(Change(key, part));
+    k++;
+  }
+  return out.toArray();
+}
+
+/** The chunks back together, from what a range read of `receiptsKey` gave. */
+export u8[] joined(Vec<Change> parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts.get(i).value!.len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    out.copyFrom(parts.get(i).value!, 0, at, parts.get(i).value!.len());
+    at += parts.get(i).value!.len();
+  }
+  return out;
+}
+
+u8[] encodeReceipts(Receipt[] receipts) {
+  Item[] rs = Item[].filled(receipts.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < receipts.len(); i++) {
+    Receipt r = receipts[i];
+    Item[] logs = Item[].filled(r.logs.len(), Item.Bytes(u8[].filled(0, 0)));
+    for (i32 l = 0; l < logs.len(); l++) {
+      Item[] topics = Item[].filled(r.logs[l].topics.len(), Item.Bytes(u8[].filled(0, 0)));
+      for (i32 t = 0; t < topics.len(); t++) { topics[t] = Item.Bytes(r.logs[l].topics[t].toBytes()); }
+      logs[l] = Item.List([Item.Bytes(r.logs[l].address.toBytes()), Item.List(topics), Item.Bytes(r.logs[l].data)]);
+    }
+    rs[i] = Item.List([Item.Bytes(r.txHash.toBytes()), small(r.txType as i64), Item.Bytes(r.from.toBytes()), maybe(r.to),
+                       small(r.success ? 1 : 0), small(r.gasUsed), small(r.cumulativeGasUsed), int(r.effectiveGasPrice),
+                       small(r.blobGasUsed), int(r.blobGasPrice), maybe(r.contractAddress), Item.List(logs), Item.Bytes(r.bloom)]);
+  }
+  return encode(Item.List(rs));
+}
+
+/** Receipts back from what `receiptsChange` kept; empty if they do not decode. */
+export Receipt[] receiptsOf(u8[] raw) {
+  Vec<Receipt> out = Vec.create();
+  Item top = decode(raw).item;
+  if (!isList(top)) { return out.toArray(); }
+  Item[] rs = itemsOf(top);
+  for (i32 i = 0; i < rs.len(); i++) {
+    Item[] f = itemsOf(rs[i]);
+    if (f.len() != 13) { return Vec<Receipt>.create().toArray(); }
+    Item[] ls = itemsOf(f[11]);
+    Log[] logs = Log[].filled(ls.len(), Log(U256.zero(), U256[].filled(0, U256.zero()), u8[].filled(0, 0)));
+    for (i32 l = 0; l < ls.len(); l++) {
+      Item[] lf = itemsOf(ls[l]);
+      Item[] ts = itemsOf(lf[1]);
+      U256[] topics = U256[].filled(ts.len(), U256.zero());
+      for (i32 t = 0; t < ts.len(); t++) { topics[t] = U256.fromBytes(bytesOf(ts[t]), 0, 32); }
+      logs[l] = Log(U256.fromBytes(bytesOf(lf[0]), 0, 32), topics, bytesOf(lf[2]));
+    }
+    out.push(Receipt(U256.fromBytes(bytesOf(f[0]), 0, 32), num(f[1]).low() as! i32, U256.fromBytes(bytesOf(f[2]), 0, 32), maybeOf(f[3]),
+                     !num(f[4]).isZero(), num(f[5]).low() as@ i64, num(f[6]).low() as@ i64, num(f[7]), num(f[8]).low() as@ i64, num(f[9]),
+                     maybeOf(f[10]), logs, bytesOf(f[12])));
+  }
+  return out.toArray();
+}

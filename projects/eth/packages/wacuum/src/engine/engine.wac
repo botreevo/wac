@@ -40,6 +40,8 @@ import { blockJson, txJson, receiptJson, logJson, firstLogIndex } from "./eth.wa
 import { Log } from "../state/world.wac";
 import { StateDb, Staged } from "../store/state.wac";
 import { executeFrom, Steps } from "../store/exec.wac";
+import { receiptsChanges, receiptsOf, receiptsKey, joined } from "../store/receipts.wac";
+import { Change } from "../store/tree.wac";
 import { Transaction, AccessEntry, Authorization, processTransaction, Processed, intrinsicGas } from "../tx/process.wac";
 
 /**
@@ -720,7 +722,8 @@ export struct Engine {
       this.prepared.set(h.hash, Prepared("state root does not match", cs, body));
       return;
     }
-    string bad = await db.commitStaged(st!, storedAt(h));
+    // The receipts with the state, so that a restart, which does not run this block again, still has them.
+    string bad = await db.commitWith(st!, receiptsChanges(h.hash, body.receipts), storedAt(h));
     if (bad != "") {
       this.prepared.set(h.hash, Prepared("the state did not commit: \{bad}", cs, body));
       return;
@@ -767,7 +770,7 @@ export struct Engine {
       this.freshWorld();
       return "the block's state did not stage";
     }
-    string bad = await this.db!.commitStaged(this.lastStaged!, storedAt(b.header));
+    string bad = await this.db!.commitWith(this.lastStaged!, receiptsChanges(b.header.hash, built.body.receipts), storedAt(b.header));
     this.freshWorld();
     if (bad != "") { return "the block's state did not commit: \{bad}"; }
     U256 hash = b.header.hash;
@@ -1261,6 +1264,16 @@ export struct Engine {
         if (this.restoredAt is not null && !b.header.number.gt(this.restoredNumber)) {
           // At or below the snapshot: the state already includes it, so it is recorded, not run.
           this.adopt(spec, b);
+          // On a store, its receipts were kept with its state.
+          if (this.db is not null) {
+            u8[] rk = receiptsKey(b.header.hash);
+            // Past every chunk: a chunk's key is the block's and two bytes.
+            u8[] end = u8[].filled(rk.len() + 3, 255);
+            end.copyFrom(rk, 0, 0, rk.len());
+            Vec<Change> kept = await this.db!.store.range(rk, end, 0x7fffffff);
+            Archived? a = this.archive.get(b.header.hash);
+            if (kept.len() > 0 && a is not null) { a!.receipts = receiptsOf(joined(kept)); }
+          }
         } else {
           if (this.db is not null) { await this.prepareBlock(spec, b); }
           Answer a = this.importBlock(spec, b);

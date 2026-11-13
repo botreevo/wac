@@ -212,6 +212,49 @@ ones — to be measured on the machine). Every cold fixture suite passes with it
 miss-and-rerun path (`fetch`, `BodyRun.clean`, `World.unask`/`forgetSince`) is now unused by default, and
 goes once it is clear no host needs it.
 
+## Crash windows: the store, the chain log and fork choice (2026-11-13)
+
+Three things are written, in this order, and a stop (every stop is a crash) can fall between any two:
+
+1. **the store's commit** — at `--flush-every 1` in `prepareBlock` as a block imports, and in `moveToAsync` for
+   each block a reorg crosses; at 64, those are staged and only every 64th block's (or 64 MB's) is a commit. The
+   commit's own bytes name the block whose state it holds, and the block's RLP and receipts are in the same commit
+   (`Engine.withBlock`);
+2. **the chain log's block record** — pushed by `call` after the commit, written before the answer goes out;
+3. **the chain log's fork-choice record** (head, safe, finalized) — the same, for `forkchoiceUpdated`.
+
+Head, safe and finalized live only in the log. Change sets — what lets the store move to a parent's state —
+live only in memory: a restart rebuilds them for the blocks it runs again from the log, and has none for a
+block at or below the store's (`replay` adopts those without running them).
+
+| stop falls | the store holds | the log ends at | on restart | checked by |
+| --- | --- | --- | --- | --- |
+| before (1), any flush | the block before | the block before | replay; the payload is given again and imports | crash.wac, every kill "not in the store" |
+| between (1) and (2), flush 1 | block N | N − 1 | **was stuck**: no block for the store's state, every payload SYNCING. Now `adoptStored` reads N from the store, adopts it and logs it; the payload given again is VALID | `test/resume_test.wac`; crash.wac (6 of 15 runs before the fix) |
+| between (1) and (2), flush 64, at a flush | block N | N − 1 | the same as flush 1 (a flush is a commit at N) | `adoptStored`; crash.wac at 64 has not landed a kill there yet |
+| between (1) and (2), flush 64, not at a flush | the last flush, F < N | N − 1 | replay runs F + 1 … N − 1 from the log; N is given again | crash.wac at 64 (replays of up to 62 blocks) |
+| between (2) and (3), no reorg | N | block N, head N − 1 | head N − 1, the store at N; the fork choice given again moves the head, and the store need not move | crash.wac, every kill "in the store" |
+| between (1) and (3) of a **reorg**, flush 1 | a block X on the way from the old head to the new | the old head | blocks at or below X are adopted with no change set, so the store cannot leave X's chain; the fork choice given again works only when the new head's chain runs through X | **not tested, and not recovered in general** |
+| after (3) | the head | the head | — | — |
+
+**And not only crashes: a reorg below the store's block, after any restart.** The same missing change sets mean
+that after a clean restart at flush 1 — the store at the head — a payload whose parent is below the head, a
+one-block reorg, is SYNCING, and stays so: the store cannot go back to the parent's state. Checked by hand
+(three blocks, a clean restart, the sibling of the head: SYNCING; with no restart: VALID). At flush 64 the
+same holds for a reorg whose branch point is below the last flush. One-block reorgs are routine on a live
+chain, so a node restarted at the wrong moment stops following it. This blocks Hoodi as much as the crash did.
+
+What would fix it, both keeping "the store reads as the state of the block the engine is at":
+
+- **Commit only finalized blocks**: the overlay holds everything above finality (64–95 blocks on mainnet,
+  ~2 MB a block, so ~130–190 MB; more while finality stalls, bounded by a forced flush that brings the gap
+  back only then), and a restart replays from the finalized block with change sets for every block a reorg can
+  reach. The design this document started from; the overlay has to flush a prefix (up to finality), not all.
+- **Keep undo records in the store**: each block's commit also writes its change set (before and after values)
+  under its hash, pruned once the block is finalized; a restart loads them for the blocks between finality and
+  the store's block, so the store can move back. Costs a block's changed values written a second time (not
+  measured), but no larger overlay and no longer replay.
+
 ## Decisions for Andrew
 
 - **wac host asks** (filed when this starts): the per-call cost of host I/O (~55 µs), a vectored read, and

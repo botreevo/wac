@@ -21,6 +21,7 @@ import { Spec, ChainConfig } from "../src/evm/spec.wac";
 import { Store } from "../src/store/tree.wac";
 import { MemDisk } from "../src/store/disk.wac";
 import { StateDb, rootOf } from "../src/store/state.wac";
+import { executeFrom, Steps } from "../src/store/exec.wac";
 import { Header, Block, BlockDecode, Body, headerOf, decodeBlock, applyBlock, executeBlock, blockTimestamp, timestampOf } from "../src/chain/block.wac";
 import { num, bytes, worldFrom, diffState, configOf } from "./fixture.wac";
 
@@ -32,7 +33,7 @@ struct Tally {
   string filter;
   /** Every account and slot read from a store rather than held: see `runCold`. */
   bool cold;
-  i32 rounds;
+  Steps steps;
 }
 
 /** One test; "" when it passes, otherwise why not. */
@@ -85,7 +86,8 @@ string runTest(Sys sys, Tally tally, ChainConfig chain, JsonValue test) {
 
 /**
  * The test with its state in a store (on a disk in memory) and nothing held: each block run on a world
- * backed by the store, again until a run reads nothing new; a block valid but for the state root (which a
+ * backed by the store a step at a time, a step that missed something undone and run again once it is read
+ * (`executeFrom`); a block valid but for the state root (which a
  * world holding part of the state cannot compute) has its changes committed and the root computed from the
  * store, and is refused, the store put back, if that is not the header's. Awaited from `main` rather than
  * driven with `wait()`, which keeps every call alive (wac 0473w).
@@ -118,18 +120,10 @@ async string runCold(Tally tally, ChainConfig chain, JsonValue test) {
       Block blk = d.block!;
       StateDb db = StateDb.over(s);
       World w = World.create();
-      Body? r = null;
-      for (i32 round = 0; round < 1000; round++) {
-        w = World.create();
-        w.backBy(db.source());
-        w.record();
-        db.misses = 0;
-        r = executeBlock(spec, w, blk, head, chainId, hashes, null);
-        tally.rounds++;
-        if (db.misses == 0) { break; }
-        string bad = (await db.fetch());
-        if (bad != "") { return "block \{i + 1}: reading the store: \{bad}"; }
-      }
+      w.backBy(db.source());
+      w.record();
+      Body r0 = await executeFrom(db, w, spec, blk, head, chainId, hashes, null, tally.steps);
+      Body? r = r0;
       err = r!.error;
       if (err == "" || err == "state root does not match") {
         MemDisk before = md.copy();
@@ -159,7 +153,7 @@ async string runCold(Tally tally, ChainConfig chain, JsonValue test) {
 
 export async i32 main(Sys sys) {
   string[] args = sys.args();
-  Tally tally = Tally(0, 0, false, "Cancun", "", false, 0);
+  Tally tally = Tally(0, 0, false, "Cancun", "", false, Steps(0, 0));
   for (i32 a = 0; a < args.len(); a++) {
     string arg = args[a];
     if (arg == "--verbose") { tally.verbose = true; continue; }
@@ -193,6 +187,6 @@ export async i32 main(Sys sys) {
       }
     }
   }
-  sys.log("\{tally.passed} passed, \{tally.failed} failed" + (tally.cold ? ", cold, in \{tally.rounds} runs" : ""));
+  sys.log("\{tally.passed} passed, \{tally.failed} failed" + (tally.cold ? ", cold, \{tally.steps.steps} steps of which \{tally.steps.reruns} again" : ""));
   return tally.failed == 0 ? 0 : 1;
 }

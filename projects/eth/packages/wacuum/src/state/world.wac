@@ -142,6 +142,13 @@ struct Backing {
   Map<U256, Map<U256, bool>> slotsAsked;
 }
 
+/** A note a recording took: an account's state, or with `key` one of its slots. */
+struct Noted {
+  ChangeSet cs;
+  U256 addr;
+  U256? key;
+}
+
 export struct Snapshot {
   i32 journal;
   i32 logs;
@@ -181,12 +188,17 @@ export struct World {
   Map<U256, bool[]> jumpdests;
   /** Where accounts and slots not in `accounts` come from, or null when `accounts` is the whole state. */
   Backing? backing;
+  /**
+   * With a backing, every note a recording took, in order: what `forgetSince` takes back when a step that
+   * read something missing is undone, so the recordings around it keep no trace of it.
+   */
+  Vec<Noted> notes;
 
   World create() {
     return World(Map.create(hashU256, eqU256), Vec.create(), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                  Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                  Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0, Vec.create(), null,
-                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), null);
+                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), null, Vec.create());
   }
 
   /** Back this world by `source`: what it does not hold is asked of the source once, then held. */
@@ -227,6 +239,32 @@ export struct World {
     U256 got = b.source.slot(addr, key);
     if (!got.isZero()) { a.storage.set(key, got); }
     return got;
+  }
+
+  /**
+   * Forget that these accounts and slots were asked for and found missing, so the next read asks again — for
+   * a step that missed them, once it is undone and the source has them. Every recording forgets what it
+   * noted of them too: what it noted was the empty answer, not the state.
+   */
+  void unask(this, U256[] addrs, Map<U256, Map<U256, bool>> slots) {
+    if (this.backing is null) { return; }
+    Backing b = this.backing!;
+    for (i32 i = 0; i < addrs.len(); i++) {
+      b.asked.remove(addrs[i]);
+      for (i32 r = 0; r < this.recording.len(); r++) { this.recording.get(r).before.remove(addrs[i]); }
+    }
+    U256[] holders = slots.keys();
+    for (i32 i = 0; i < holders.len(); i++) {
+      Map<U256, bool>? asked = b.slotsAsked.get(holders[i]);
+      U256[] keys = slots.get(holders[i])!.keys();
+      for (i32 k = 0; k < keys.len(); k++) {
+        if (asked is not null) { asked!.remove(keys[k]); }
+        for (i32 r = 0; r < this.recording.len(); r++) {
+          Map<U256, U256>? m = this.recording.get(r).slotsBefore.get(holders[i]);
+          if (m is not null) { m!.remove(keys[k]); }
+        }
+      }
+    }
   }
 
   /** Whether the account's storage holds anything, counting what the source has and memory has not asked for. */
@@ -528,7 +566,10 @@ export struct World {
   void noteAccount(this, U256 addr) {
     for (i32 i = 0; i < this.recording.len(); i++) {
       ChangeSet cs = this.recording.get(i);
-      if (!cs.before.has(addr)) { cs.before.set(addr, this.stateOf(addr)); }
+      if (!cs.before.has(addr)) {
+        cs.before.set(addr, this.stateOf(addr));
+        if (this.backing is not null) { this.notes.push(Noted(cs, addr, null)); }
+      }
     }
   }
 
@@ -541,7 +582,26 @@ export struct World {
         cs.slotsBefore.set(addr, fresh);
         m = fresh;
       }
-      if (!m!.has(key)) { m!.set(key, this.storage(addr, key)); }
+      if (!m!.has(key)) {
+        m!.set(key, this.storage(addr, key));
+        if (this.backing is not null) { this.notes.push(Noted(cs, addr, key)); }
+      }
+    }
+  }
+
+  /** Where the notes are now, for `forgetSince`. */
+  i32 notesMark(this) { return this.notes.len(); }
+
+  /** Every note taken since `mark` taken back, from whichever recording took it. */
+  void forgetSince(this, i32 mark) {
+    while (this.notes.len() > mark) {
+      Noted n = this.notes.pop()!;
+      if (n.key is null) {
+        n.cs.before.remove(n.addr);
+      } else {
+        Map<U256, U256>? m = n.cs.slotsBefore.get(n.addr);
+        if (m is not null) { m!.remove(n.key!); }
+      }
     }
   }
 

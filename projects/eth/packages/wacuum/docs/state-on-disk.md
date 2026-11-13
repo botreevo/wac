@@ -184,10 +184,23 @@ commit a block:
 Committing is cheap. Executing is not, and the steps say why: 9784 steps, 8643 of them run again — about
 7.6 reruns a transaction, because a transaction whose reads depend on what it read (a swap reading a pool,
 then the slots the pool names) finds its misses one layer at a time, and each layer is a rerun from the
-transaction's start. 16 Mgas/s follows a head that needs ~5; catching up at it would take months. The
-third layer of reads above — the interpreter stopping at the opcode that misses and resuming after the read
-— makes each miss one read rather than a rerun: by these numbers ~0.9 s of execution and ~0.5 s of reads
-(~9000 at ~55 µs) for the five blocks, ~130 Mgas/s. That is the next piece of work for speed.
+transaction's start. 16 Mgas/s follows a head that needs ~5; catching up at it would take months.
+
+**Then: reads waited for where they are asked.** A host ticket can be waited on synchronously — `wait()`
+drives the host's own ticket to its answer (no `async` frame around it, so 0473w's leak does not apply;
+30,000 such reads of 64 KB stayed at 63 MB) — at ~63 µs a call plus ~4 µs a KB. So a miss is read from the
+store at the opcode that misses (`Disk.readNow`, `Store.getNow`, `StateDb.readsNow`), the EVM never misses,
+and no step runs twice — the third layer, without making the interpreter resumable:
+
+| the same five blocks | time | Mgas/s |
+| --- | ---: | ---: |
+| on the store, misses read where they happen, every leaf read from the file | 1123 ms executing, 376 ms committing | **119** |
+
+1141 steps, none again; 455 leaf reads (this state is small: at mainnet scale expect a leaf read for most
+keys a block touches, ~0.3 ms each at 64 KB, so nearer 40–50 Mgas/s until a leaf cache catches the hot
+ones — to be measured on the machine). Every cold fixture suite passes with it; the asynchronous
+miss-and-rerun path (`fetch`, `BodyRun.clean`, `World.unask`/`forgetSince`) is now unused by default, and
+goes once it is clear no host needs it.
 
 ## Decisions for Andrew
 

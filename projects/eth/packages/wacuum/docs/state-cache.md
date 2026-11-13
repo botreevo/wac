@@ -123,6 +123,13 @@ writes, as `docs/state-on-disk.md` assumed.
    Mgas/s against 70 for 64 KB. The interior grows to ~400 MB at mainnet's size, which `--max-heap` now
    allows. Values over `CHUNK` (12 KB: codes, receipts, blocks) are stored in chunks.
 
+**The five-block replay, reconciled** (2026-11-13, back to back, nothing else running): e38c79b — the commit
+that first measured 119 Mgas/s on the store — runs at 105–114 today on its own pin (wac 7f559349c), so 119
+was the good end of the run-to-run spread; this design as built (16 KB pages, 64 MB of leaves, the cache, wac
+819ab1af6) runs at 101–104. The 65–70 measured on the way was the 64-leaf bound (and other work running at
+the same time); the leaf budget removed it. With everything in memory either way, what remains is the cache's
+own cost per read, a few percent.
+
 What this does not decide: the diff layers' flush interval (`docs/state-on-disk.md` says 128 finalized
 blocks; the commit figures above support batching, and the cache makes the layers' own lookups cheaper but
 does not replace them), and prefetching a block's senders and recipients in one sorted pass (layer 1 of

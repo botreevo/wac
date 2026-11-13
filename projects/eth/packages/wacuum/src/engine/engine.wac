@@ -236,15 +236,19 @@ export struct Engine {
   Vec<Spec> collectedSpecs;
   /** How the backed runs went, for whoever is measuring. */
   Steps steps;
+  /** What `settleRoot` last staged, for `produceAsync` to commit. */
+  Staged? lastStaged;
   /** Answers `prepare` worked out whole (a proof, from the store's tries), for the call that follows. */
   Map<string, JsonValue> answered;
+  /** On a store, what each built payload changed, by payload id: its state root is the store's to work out. */
+  Map<U256, ChangeSet> builtChanges;
 
   /** An engine whose chain starts at `genesis`, with `world` its state. */
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
                       genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                       null, Map.create(hashU256, eqU256), Vec.create(), null, U256.zero(), U256.zero(), SenderCache.create(), "wacuum".toBytes(), U256.zero(), 0, 1, 0, Vec.create(),
-                      null, Map.create(hashU256, eqU256), false, Vec.create(), Vec.create(), Steps(0, 0), Map.create(hashText, textEq));
+                      null, Map.create(hashU256, eqU256), false, Vec.create(), Vec.create(), Steps(0, 0), null, Map.create(hashText, textEq), Map.create(hashU256, eqU256));
     e.blocks.set(genesis.hash, Node(genesis, null));
     e.archive.set(genesis.hash, Archived(genesis, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
                                          Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
@@ -635,6 +639,20 @@ export struct Engine {
       if (this.blocks.has(head)) { await this.moveToAsync(head); }
       return;
     }
+    if (method.indexOf("engine_getPayload") == 0) {
+      // The built block's state root, from what it changed staged on the store at its parent, and its hash.
+      if (ps!.len() < 1) { return; }
+      U256 id = hexU256(ps!.get(0));
+      ChangeSet? cs = this.builtChanges.get(id);
+      Built? b = this.payloads.get(id);
+      if (cs is null || b is null) { return; }
+      this.builtChanges.remove(id);
+      Header h = b!.block.header;
+      if (!this.at.eq(h.parentHash)) { await this.moveToAsync(h.parentHash); }
+      await this.settleRoot(b!.block, cs!);
+      this.db!.discard();
+      return;
+    }
     if (method == "eth_getProof") {
       // Of the head's state, from the store's tries; the call then answers it.
       if (!this.at.eq(this.head) && this.blocks.has(this.head)) { await this.moveToAsync(this.head); }
@@ -709,6 +727,57 @@ export struct Engine {
     }
     this.at = h.hash;
     this.prepared.set(h.hash, Prepared("", cs, body));
+  }
+
+  /** A block built on a world over the store: its state root (and so its hash) from its changes staged on the store. */
+  async bool settleRoot(this, Block b, ChangeSet cs) {
+    string[] why = [""];
+    Staged? st = await this.db!.stageSet(cs, true, why);
+    if (st is null) { return false; }
+    b.header.stateRoot = U256.fromBytes(st!.root, 0, 32);
+    b.header.hash = U256.fromBytes(keccak256(encode(headerItem(this.config.specAt(b.header.timestamp), b.header))), 0, 32);
+    this.lastStaged = st;
+    return true;
+  }
+
+  /**
+   * `produce` on the store: built on the head as there, its root from its changes staged on the store,
+   * committed, and made the head. "" or why not.
+   */
+  async string produceAsync(this, U256 timestamp, U256 feeRecipient) {
+    if (this.db is null) { return this.produce(timestamp, feeRecipient); }
+    if (!(await this.moveToAsync(this.head))) { return "the store cannot reach the head"; }
+    Header parent = this.blocks.get(this.head)!.header;
+    if (!timestamp.gt(parent.timestamp)) { timestamp = parent.timestamp.add(U256.one()); }
+    U256 randao = U256.fromBytes(keccak256(parent.hash.toBytes()), 0, 32);
+    Attributes attrs = Attributes(timestamp, randao, feeRecipient,
+                                  Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())), U256.zero());
+    Spec spec = this.config.specAt(timestamp);
+    this.freshWorld();
+    this.world.record();
+    Built built = buildBlock(spec, this.world, parent, attrs, this.candidates(spec), this.chainId,
+                             this.ancestorHashes(parent), this.extraData, this.senders);
+    ChangeSet cs = this.world.seal();
+    if (built.body.error != "") {
+      this.freshWorld();
+      return built.body.error;
+    }
+    Block b = built.block;
+    if (!(await this.settleRoot(b, cs))) {
+      this.freshWorld();
+      return "the block's state did not stage";
+    }
+    string bad = await this.db!.commitStaged(this.lastStaged!, storedAt(b.header));
+    this.freshWorld();
+    if (bad != "") { return "the block's state did not commit: \{bad}"; }
+    U256 hash = b.header.hash;
+    this.blocks.set(hash, Node(b.header, cs));
+    this.at = hash;
+    u8[] rlp = encodeBlock(spec, b);
+    this.archive.set(hash, Archived(b.header, b.txs, b.withdrawals, built.body.receipts, rlp.len()));
+    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(rlp)])));
+    this.choose(hash, hash, hash);
+    return "";
   }
 
   /** `moveTo` on the store: each block left and each reached committed, the root checked against its header. */
@@ -803,13 +872,16 @@ export struct Engine {
       this.world.record();
       Built built = buildBlock(spec, this.world, parent, attrs, this.candidates(spec), this.chainId,
                                this.ancestorHashes(parent), this.extraData, this.senders);
-      this.world.undo(this.world.seal());
+      ChangeSet builtCs = this.world.seal();
+      this.world.undo(builtCs);
       // A body that fails is a chain this client cannot extend at all — a system contract missing or
       // broken — and not something to hand out as an empty block.
       if (built.body.error != "") { return Answer.error(-32603, "cannot build on this head: " + built.body.error); }
       U256 id = U256.ofU64(this.nextPayloadId);
       this.nextPayloadId++;
       this.payloads.set(id, built);
+      // On a store the world holds only what the build read, so the header's root waits for getPayload's prepare.
+      if (this.db is not null) { this.builtChanges.set(id, builtCs); }
       payloadId = str(hex8(id));
     }
     JsonObject o = JsonObject.create();

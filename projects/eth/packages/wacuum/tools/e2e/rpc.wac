@@ -3,7 +3,9 @@
 // forkchoiceUpdated), and send a transfer, deploy a contract, call it, estimate gas, read receipts, blocks,
 // logs and fees. Then stop it, start it again from its snapshot, and check it is where it was.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/rpc.wac
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/rpc.wac [--store]
+//
+// With --store the node keeps its state on disk: blocks built on it, and the restart from the store.
 //
 // It runs the node with the `wac` on PATH, from cmd/wacuum.wac.
 
@@ -30,11 +32,13 @@ struct Node {
   u64 time;
 }
 
-async Proc startNode(Sys sys, string dir, i32 port) {
-  Proc p = await Proc.start(sys, ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
-                                  "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
-                                  "--port", "\{port}", "--datadir", dir + "/data", "--snapshot-every", "2"],
-                            dir + "/wacuum.log");
+async Proc startNode(Sys sys, string dir, i32 port, bool store) {
+  string[] base = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                   "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
+                   "--port", "\{port}", "--datadir", dir + "/data", "--snapshot-every", "2"];
+  string[] argv = string[].filled(base.len() + (store ? 1 : 0), "--store");
+  for (i32 i = 0; i < base.len(); i++) { argv[i] = base[i]; }
+  Proc p = await Proc.start(sys, argv, dir + "/wacuum.log");
   await p.says(sys, "Engine API on", 600000);
   return p;
 }
@@ -63,6 +67,9 @@ async JsonValue? makeBlock(Node n) {
 u8[] stringifyOf(JsonValue v) { return stringify(v); }
 
 export async i32 main(Sys sys) {
+  bool store = false;
+  string[] args = sys.args();
+  for (i32 i = 0; i < args.len(); i++) { store = store || args[i] == "--store"; }
   Check t = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-rpc");
   u8[] key = u8[].filled(32, 0x11);
@@ -75,7 +82,7 @@ export async i32 main(Sys sys) {
   await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
   i32 port = await somePort(sys, 19551, 1000);
 
-  Proc proc = await startNode(sys, dir, port);
+  Proc proc = await startNode(sys, dir, port, store);
   Rpc user = Rpc.at(sys, port);
   Node n = Node(sys, dir, port, proc, Rpc.authed(sys, port, secret), user, field(await user.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash"), 12);
 
@@ -127,14 +134,23 @@ export async i32 main(Sys sys) {
   t.that((await user.call("engine_forkchoiceUpdatedV3", "[{},null]")).error() != "", "the Engine API is refused without a token");
 
   // Restarted, it starts from its last snapshot and replays only what came after.
-  t.that((await proc.output(sys)).indexOf("snapshot at block 2") >= 0, "a snapshot was taken at block 2");
+  if (!store) { t.that((await proc.output(sys)).indexOf("snapshot at block 2") >= 0, "a snapshot was taken at block 2"); }
   await proc.stop(sys);
-  proc = await startNode(sys, dir, port);
-  t.that((await proc.output(sys)).indexOf("starting from the snapshot at block 2") >= 0, "restarted from the snapshot");
+  proc = await startNode(sys, dir, port, store);
+  if (store) {
+    t.that((await proc.output(sys)).indexOf("the store holds the state of block") >= 0, "restarted from the store");
+  } else {
+    t.that((await proc.output(sys)).indexOf("starting from the snapshot at block 2") >= 0, "restarted from the snapshot");
+  }
   t.that(await user.text("eth_blockNumber", "[]") == "0x3", "at the same head");
   t.that(quantity(await user.text("eth_getBalance", "[\"\{TO}\",\"latest\"]")) == 12345 &&
          await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + runtime, "with the same state");
-  t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{called}\"]"), "status") == "0x1", "and block 3's receipts, which ran again");
+  if (store) {
+    // On the store nothing before its block runs again, so receipts from before a restart are not kept yet.
+    t.that(await user.get("eth_getTransactionByHash", "[\"\{called}\"]") is not null, "and block 3's transactions, if not its receipts");
+  } else {
+    t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{called}\"]"), "status") == "0x1", "and block 3's receipts, which ran again");
+  }
 
   await proc.stop(sys);
   await removeDir(sys, dir);

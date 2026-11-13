@@ -19,7 +19,7 @@ import { U256 } from "../u256.wac";
 import { Message, small, numOf } from "./wire.wac";
 import { Store, Change, compareKeys } from "../store/tree.wac";
 import { emptyCodeHash } from "../state/world.wac";
-import { emptyRoot } from "../trie/trie.wac";
+import { emptyRoot, hexPrefixOf } from "../trie/trie.wac";
 import { PathTrie } from "../trie/pathtrie.wac";
 import { StackTrie } from "../trie/stacktrie.wac";
 import { verifyRange, Range } from "../trie/rangeproof.wac";
@@ -261,6 +261,12 @@ export struct Asker {
   u64 nextId;
   /** How much each answer may carry: `SOFT_BYTES` normally, less to make a test ask more often. */
   u64 bytes;
+  /**
+   * The newest state root to fetch, asked when a peer answers nothing about the current one (peers keep
+   * only recent states, and the head moves while a sync runs); empty when there is none newer. Synchronous,
+   * from what the asker has found out already: an async lambda here is compiled wrong at this pin of wac.
+   */
+  fn<u8[]()>? pivot;
 }
 
 /** What a sync did, for whoever is watching it. */
@@ -271,6 +277,9 @@ export struct Fetched {
   i32 nodes;
   i32 requests;
   string error;
+  /** Trie nodes fetched by healing, and the root the store ends at. */
+  i32 healed;
+  u8[] root;
 }
 
 /**
@@ -279,7 +288,7 @@ export struct Fetched {
  * and the root they come to checked; committed with `user` beside it. `fetched.error` is "" when done.
  */
 export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
-  Fetched f = Fetched(0, 0, 0, 0, 0, "");
+  Fetched f = Fetched(0, 0, 0, 0, 0, "", 0, root);
   Vec<u8[]> withStorage = Vec.create();
   Vec<u8[]> storageRoots = Vec.create();
   Map<string, bool> codes = Map.create(hashText, textEq);
@@ -293,6 +302,13 @@ export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
     f.requests++;
     Item[]? got = await peer.ask(getAccountRange(id, root, origin!, maxKey(), peer.bytes));
     if (got is null || got!.len() < 2) { return failedWith(f, "a peer did not answer for accounts"); }
+    if (itemsOf(got![0]).len() == 0 && itemsOf(got![1]).len() == 0) {
+      // Nothing about this root: the peer has moved on. On to the newest, where this run left off.
+      u8[] newer = peer.pivot is null ? u8[].filled(0, 0) : peer.pivot!();
+      if (newer.len() == 0 || same(newer, root)) { return failedWith(f, "a peer has no state for the root asked about"); }
+      root = newer;
+      continue;
+    }
     Item[] run = itemsOf(got![0]);
     u8[][] keys = u8[][].defaulted(run.len());
     u8[][] vals = u8[][].defaulted(run.len());
@@ -335,7 +351,13 @@ export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
       peer.nextId++;
       f.requests++;
       Item[]? got = await peer.ask(getStorageRanges(id, root, [owner], from!, maxKey(), peer.bytes));
-      if (got is null || got!.len() < 2 || itemsOf(got![0]).len() < 1) { return failedWith(f, "a peer did not answer for storage"); }
+      if (got is null || got!.len() < 2) { return failedWith(f, "a peer did not answer for storage"); }
+      if (itemsOf(got![0]).len() < 1) {
+        u8[] newer = peer.pivot is null ? u8[].filled(0, 0) : peer.pivot!();
+        if (newer.len() == 0 || same(newer, root)) { return failedWith(f, "a peer has no state for the root asked about"); }
+        root = newer;
+        continue;
+      }
       Item[] run = itemsOf(itemsOf(got![0])[0]);
       u8[][] keys = u8[][].defaulted(run.len());
       u8[][] vals = u8[][].defaulted(run.len());
@@ -344,7 +366,12 @@ export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
         vals[i] = bytesOf(itemsOf(run[i])[1]);
       }
       Range r = verifyRange(storageRoots.get(a), from!, keys, vals, proofOf(got![1]));
-      if (!r.ok) { return failedWith(f, "a storage range does not prove: \{r.why}"); }
+      if (!r.ok) {
+        // Proved against the storage root the account had when it was fetched; one that moved since is
+        // healed at the end instead.
+        if (same(root, f.root)) { return failedWith(f, "a storage range does not prove: \{r.why}"); }
+        break;
+      }
       Vec<Change> out = Vec.create();
       for (i32 i = 0; i < keys.len(); i++) { out.push(Change(key(1, owner, keys[i]), vals[i])); }
       f.slots += keys.len();
@@ -392,15 +419,25 @@ export async Fetched snapSync(Asker peer, Store store, u8[] root, u8[] user) {
   }
 
   // The tries, from what was fetched: each storage trie, then the account trie, in the store's order.
-  string bad = await buildTries(store, f, withStorage, storageRoots);
+  bool moved = !same(root, f.root);
+  f.root = root;
+  string bad = await buildTries(store, f, withStorage, storageRoots, moved);
   if (bad != "") { return failedWith(f, bad); }
-  string built = await buildAccountTrie(store, f, root, user);
-  if (built != "") { return failedWith(f, built); }
+  u8[]? built = await buildAccountTrie(store, f);
+  if (built is null) { return failedWith(f, "the account trie did not build"); }
+  if (!same(built!, root)) {
+    if (!moved) { return failedWith(f, "the account trie comes to another root"); }
+    // A patchwork of the states the pivot passed through: healed to the last one.
+    string healed = await heal(peer, store, root, f);
+    if (healed != "") { return failedWith(f, healed); }
+  }
+  string done = await store.commit(Change[].filled(0, Change(u8[].filled(0, 0), null)), user);
+  if (done != "") { return failedWith(f, done); }
   return f;
 }
 
-/** Each storage trie built from its slots and checked against the account's storage root. */
-async string buildTries(Store store, Fetched f, Vec<u8[]> owners, Vec<u8[]> roots) {
+/** Each storage trie built from its slots and checked against the account's storage root (unless the pivot moved). */
+async string buildTries(Store store, Fetched f, Vec<u8[]> owners, Vec<u8[]> roots, bool moved) {
   for (i32 a = 0; a < owners.len(); a++) {
     u8[] owner = owners.get(a);
     Vec<Change> nodes = Vec.create();
@@ -414,7 +451,7 @@ async string buildTries(Store store, Fetched f, Vec<u8[]> owners, Vec<u8[]> root
       st.add(tail(c.key, 33), c.value!);
     }
     u8[] r = st.finish();
-    if (!same(r, roots.get(a))) { return "a storage trie does not come to its account's root"; }
+    if (!same(r, roots.get(a)) && !moved) { return "a storage trie does not come to its account's root"; }
     f.nodes += nodes.len();
     string bad = await store.commit(nodes.toArray(), u8[].filled(0, 0));
     if (bad != "") { return bad; }
@@ -422,16 +459,314 @@ async string buildTries(Store store, Fetched f, Vec<u8[]> owners, Vec<u8[]> root
   return "";
 }
 
-/** The account trie built from the accounts, checked against `root`, and committed with `user`. */
-async string buildAccountTrie(Store store, Fetched f, u8[] root, u8[] user) {
+/** The account trie built from the accounts and committed; its root, or null. */
+async u8[]? buildAccountTrie(Store store, Fetched f) {
   Vec<Change> nodes = Vec.create();
   StackTrie st = StackTrie.create((u8[] path, u8[] enc) => { nodes.push(Change(key(3, path, u8[].filled(0, 0)), enc)); });
   Vec<Change> accounts = await store.range([0], [1], 0x7fffffff);
   for (i32 i = 0; i < accounts.len(); i++) { st.add(tail(accounts.get(i).key, 1), accounts.get(i).value!); }
   u8[] r = st.finish();
-  if (!same(r, root)) { return "the account trie comes to another root"; }
   f.nodes += nodes.len();
-  return await store.commit(nodes.toArray(), user);
+  if ((await store.commit(nodes.toArray(), u8[].filled(0, 0))) != "") { return null; }
+  return r;
+}
+
+// ── Healing ──────────────────────────────────────────────────────────────────
+
+/** GetTrieNodes: each group an account trie path, or an account's hash and paths in its storage trie. */
+export Message getTrieNodes(u64 id, u8[] root, Vec<Item> groups, u64 bytes) {
+  return Message(GET_TRIE_NODES, Item.List([small(id), bytes32(root), list(groups), small(bytes)]));
+}
+
+/** A trie path as snap names it: hex-prefix encoded, as an extension's. */
+Item compact(u8[] nibbles) { return Item.Bytes(hexPrefixOf(nibbles, false)); }
+
+/** A hex-prefix path back to nibbles. */
+u8[] uncompact(u8[] b) {
+  if (b.len() == 0) { return u8[].filled(0, 0); }
+  bool odd = ((b[0] >> 4) & 1) == 1;
+  u8[] n = u8[].filled(b.len() * 2 - (odd ? 1 : 2), 0);
+  i32 at = 0;
+  if (odd) {
+    n[0] = b[0] & 15;
+    at = 1;
+  }
+  for (i32 i = 1; i < b.len(); i++) {
+    n[at] = b[i] >> 4;
+    n[at + 1] = b[i] & 15;
+    at += 2;
+  }
+  return n;
+}
+
+/** TrieNodes for a GetTrieNodes, from a store holding the state of `stateRoot`: each node asked, in order, while there are any. */
+export async Message answerTrieNodes(Store store, u8[] stateRoot, Item body) {
+  Item[] q = itemsOf(body);
+  u64 id = numOf(q[0]).low();
+  Vec<Item> nodes = Vec.create();
+  if (!same(bytesOf(q[1]), stateRoot) || !isList(q[2])) { return Message(TRIE_NODES, Item.List([small(id), list(nodes)])); }
+  Item[] groups = itemsOf(q[2]);
+  for (i32 g = 0; g < groups.len(); g++) {
+    Item[] paths = itemsOf(groups[g]);
+    if (paths.len() == 1) {
+      u8[]? enc = await store.get(key(3, uncompact(bytesOf(paths[0])), u8[].filled(0, 0)));
+      if (enc is null) { return Message(TRIE_NODES, Item.List([small(id), list(nodes)])); }
+      nodes.push(Item.Bytes(enc!));
+    } else {
+      u8[] owner = bytesOf(paths[0]);
+      for (i32 k = 1; k < paths.len(); k++) {
+        u8[]? enc = await store.get(key(4, owner, uncompact(bytesOf(paths[k]))));
+        if (enc is null) { return Message(TRIE_NODES, Item.List([small(id), list(nodes)])); }
+        nodes.push(Item.Bytes(enc!));
+      }
+    }
+  }
+  return Message(TRIE_NODES, Item.List([small(id), list(nodes)]));
+}
+
+/** A node the heal must make right: in the account trie (owner empty) or an account's storage trie. */
+struct Need {
+  u8[] owner;
+  u8[] path;
+  /** What the parent says it is: its hash, or itself when under 32 bytes. */
+  Item ref;
+}
+
+/** The nibbles packed into bytes, padded with `pad` to 32. */
+u8[] packed(u8[] nibbles, u8 pad) {
+  u8[] out = u8[].filled(32, 0);
+  for (i32 i = 0; i < 64; i++) {
+    u8 v = i < nibbles.len() ? nibbles[i] : pad;
+    if (i % 2 == 0) { out[i / 2] = v << 4; } else { out[i / 2] = out[i / 2] | v; }
+  }
+  return out;
+}
+
+/**
+ * The store's trie made the trie of `root`, fetched node by node from the root down where it differs: a
+ * stored node with the hash its parent names is a subtree already right, and is left; any other is fetched,
+ * checked against that hash, and written, with everything under its path it no longer has — trie nodes,
+ * accounts or slots, and a gone account's storage — deleted. A leaf writes its entry; an account's leaf
+ * goes on to its storage trie and its code.
+ */
+async string heal(Asker peer, Store store, u8[] root, Fetched f) {
+  Vec<Need> todo = Vec.create();
+  todo.push(Need(u8[].filled(0, 0), u8[].filled(0, 0), Item.Bytes(root)));
+  while (todo.len() > 0) {
+    // What is already right comes off; the rest is asked for, up to 64 at a time.
+    Vec<Need> ask = Vec.create();
+    Vec<Need> known = Vec.create();
+    while (todo.len() > 0 && ask.len() < 64) {
+      Need n = todo.pop()!;
+      if (isList(n.ref)) {
+        known.push(n);
+        continue;
+      }
+      u8[]? have = await store.get(nodeKey(n.owner, n.path));
+      if (have is not null && same(keccak256(have!), bytesOf(n.ref))) { continue; }
+      ask.push(n);
+    }
+    Vec<Change> out = Vec.create();
+    for (i32 i = 0; i < known.len(); i++) {
+      // Inside its parent's encoding, so nothing is stored at its own path: whatever was, goes.
+      out.push(Change(nodeKey(known.get(i).owner, known.get(i).path), null));
+      string bad = await apply(store, f, known.get(i), known.get(i).ref, false, out, todo);
+      if (bad != "") { return bad; }
+    }
+    if (ask.len() > 0) {
+      Vec<Item> groups = Vec.create();
+      for (i32 i = 0; i < ask.len(); i++) {
+        Need n = ask.get(i);
+        groups.push(n.owner.len() == 0 ? Item.List([compact(n.path)]) : Item.List([bytes32(n.owner), compact(n.path)]));
+      }
+      u64 id = peer.nextId;
+      peer.nextId++;
+      f.requests++;
+      Item[]? got = await peer.ask(getTrieNodes(id, root, groups, peer.bytes));
+      if (got is null || got!.len() < 1 || itemsOf(got![0]).len() == 0) { return "a peer did not answer for trie nodes"; }
+      Item[] nodes = itemsOf(got![0]);
+      for (i32 i = 0; i < nodes.len() && i < ask.len(); i++) {
+        u8[] enc = bytesOf(nodes[i]);
+        Need n = ask.get(i);
+        if (!same(keccak256(enc), bytesOf(n.ref))) { return "a trie node is not the one asked for"; }
+        f.healed++;
+        string bad = await apply(store, f, n, decode(enc).item, true, out, todo);
+        if (bad != "") { return bad; }
+        out.push(Change(nodeKey(n.owner, n.path), enc));
+      }
+      // What was not answered goes back on the list.
+      for (i32 i = nodes.len(); i < ask.len(); i++) { todo.push(ask.get(i)); }
+    }
+    string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
+    if (bad != "") { return bad; }
+  }
+  // Codes the healed accounts name and the store has not got.
+  return await healCodes(peer, store, f);
+}
+
+u8[] nodeKey(u8[] owner, u8[] path) { return owner.len() == 0 ? key(3, path, u8[].filled(0, 0)) : key(4, owner, path); }
+
+/** The flat entries' keys under a trie path: accounts, or an owner's slots. */
+(u8[], u8[]) flatRange(u8[] owner, u8[] path) {
+  u8[] lo = owner.len() == 0 ? key(0, packed(path, 0), u8[].filled(0, 0)) : key(1, owner, packed(path, 0));
+  u8[] hi = owner.len() == 0 ? key(0, packed(path, 15), [0 as u8]) : key(1, owner, cat(packed(path, 15), [0 as u8]));
+  return (lo, hi);
+}
+
+u8[] cat(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+/** Everything the store has under `path` of the trie — its nodes and its entries, and gone accounts' storage — deleted, but for `keep`. */
+async void clearUnder(Store store, u8[] owner, u8[] path, u8[]? keep, Vec<Change> out) {
+  u8[] np = nodeKey(owner, path);
+  Vec<Change> nodes = await store.range(np, bump(np), 0x7fffffff);
+  for (i32 i = 0; i < nodes.len(); i++) {
+    // The node at the path itself is rewritten by the caller; those below it go.
+    if (nodes.get(i).key.len() > np.len()) { out.push(Change(nodes.get(i).key, null)); }
+  }
+  (u8[] lo, u8[] hi) = flatRange(owner, path);
+  Vec<Change> entries = await store.range(lo, hi, 0x7fffffff);
+  for (i32 i = 0; i < entries.len(); i++) {
+    u8[] k = entries.get(i).key;
+    if (keep is not null && same(k, keep!)) { continue; }
+    out.push(Change(k, null));
+    if (owner.len() == 0) {
+      // An account gone takes its storage, slots and trie, with it.
+      u8[] h = tail(k, 1);
+      u8[] sp = key(1, h, u8[].filled(0, 0));
+      Vec<Change> slots = await store.range(sp, bump(sp), 0x7fffffff);
+      for (i32 s = 0; s < slots.len(); s++) { out.push(Change(slots.get(s).key, null)); }
+      u8[] tp = key(4, h, u8[].filled(0, 0));
+      Vec<Change> tn = await store.range(tp, bump(tp), 0x7fffffff);
+      for (i32 s = 0; s < tn.len(); s++) { out.push(Change(tn.get(s).key, null)); }
+    }
+  }
+}
+
+/** The first key after every key that starts with `p`. */
+u8[] bump(u8[] p) {
+  u8[] out = u8[].filled(p.len(), 0);
+  out.copyFrom(p, 0, 0, p.len());
+  i32 i = p.len() - 1;
+  while (i >= 0 && out[i] == 255) {
+    out[i] = 0;
+    i--;
+  }
+  if (i >= 0) { out[i] = out[i] + 1; }
+  return out;
+}
+
+/** A node `it` (fetched, or inside its parent) at `n`: what it no longer covers cleared, its children or its entry next. */
+async string apply(Store store, Fetched f, Need n, Item it, bool stored, Vec<Change> out, Vec<Need> todo) {
+  if (!isList(it)) { return "a trie node is not a list"; }
+  Item[] fs = itemsOf(it);
+  if (fs.len() == 17) {
+    for (i32 i = 0; i < 16; i++) {
+      u8[] child = cat(n.path, [i as@ u8]);
+      if (!isList(fs[i]) && bytesOf(fs[i]).len() == 0) {
+        await clearUnder(store, n.owner, child, null, out);
+        // A node stored at the child's own path goes too.
+        out.push(Change(nodeKey(n.owner, child), null));
+      } else {
+        todo.push(Need(n.owner, child, fs[i]));
+      }
+    }
+    return "";
+  }
+  if (fs.len() != 2) { return "a trie node is neither a branch nor a pair"; }
+  u8[] hp = bytesOf(fs[0]);
+  bool leaf = hp.len() > 0 && (hp[0] >> 4) >= 2;
+  u8[] rest = uncompact(hp);
+  u8[] full = cat(n.path, rest);
+  if (!leaf) {
+    // Everything under this path not under the extension's goes.
+    for (i32 l = 0; l < rest.len(); l++) {
+      for (i32 nib = 0; nib < 16; nib++) {
+        if (nib == (rest[l] as i32)) { continue; }
+        u8[] off = cat(cat(n.path, slice(rest, 0, l)), [nib as@ u8]);
+        await clearUnder(store, n.owner, off, null, out);
+        out.push(Change(nodeKey(n.owner, off), null));
+      }
+    }
+    todo.push(Need(n.owner, full, fs[1]));
+    return "";
+  }
+  // A leaf: its entry, and nothing else under its path.
+  u8[] k = packed(full, 0);
+  u8[] flat = n.owner.len() == 0 ? key(0, k, u8[].filled(0, 0)) : key(1, n.owner, k);
+  await clearUnder(store, n.owner, n.path, flat, out);
+  u8[] value = bytesOf(fs[1]);
+  out.push(Change(flat, value));
+  if (n.owner.len() == 0) {
+    f.accounts++;
+    Item[] acct = itemsOf(decode(value).item);
+    u8[] sr = bytesOf(acct[2]);
+    if (!same(sr, emptyRoot())) { todo.push(Need(k, u8[].filled(0, 0), Item.Bytes(sr))); }
+    else {
+      // No storage: none left over from a state before.
+      u8[] sp = key(1, k, u8[].filled(0, 0));
+      Vec<Change> slots = await store.range(sp, bump(sp), 0x7fffffff);
+      for (i32 s = 0; s < slots.len(); s++) { out.push(Change(slots.get(s).key, null)); }
+      u8[] tp = key(4, k, u8[].filled(0, 0));
+      Vec<Change> tn = await store.range(tp, bump(tp), 0x7fffffff);
+      for (i32 s = 0; s < tn.len(); s++) { out.push(Change(tn.get(s).key, null)); }
+    }
+  } else {
+    f.slots++;
+  }
+  return "";
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+/** Every code an account in the store names and the store has not got, fetched. */
+async string healCodes(Asker peer, Store store, Fetched f) {
+  Vec<Change> accounts = await store.range([0], [1], 0x7fffffff);
+  Vec<u8[]> missing = Vec.create();
+  Map<string, bool> seenCode = Map.create(hashText, textEq);
+  for (i32 i = 0; i < accounts.len(); i++) {
+    u8[] ch = bytesOf(itemsOf(decode(accounts.get(i).value!).item)[3]);
+    if (same(ch, emptyCodeHash().toBytes()) || seenCode.has(text(ch))) { continue; }
+    seenCode.set(text(ch), true);
+    u8[] base = key(2, ch, u8[].filled(0, 0));
+    if ((await store.range(base, bump(base), 1)).len() == 0) { missing.push(ch); }
+  }
+  for (i32 at = 0; at < missing.len(); at += 64) {
+    i32 n = missing.len() - at < 64 ? missing.len() - at : 64;
+    u8[][] ask = u8[][].defaulted(n);
+    for (i32 i = 0; i < n; i++) { ask[i] = missing.get(at + i); }
+    u64 id = peer.nextId;
+    peer.nextId++;
+    f.requests++;
+    Item[]? got = await peer.ask(getByteCodes(id, ask, peer.bytes));
+    if (got is null || got!.len() < 1) { return "a peer did not answer for codes"; }
+    Item[] cs = itemsOf(got![0]);
+    Vec<Change> out = Vec.create();
+    for (i32 i = 0; i < cs.len(); i++) {
+      u8[] code = bytesOf(cs[i]);
+      u8[] h = keccak256(code);
+      i32 k = 0;
+      for (i32 c = 0; c < code.len(); c += 32768) {
+        i32 len = code.len() - c < 32768 ? code.len() - c : 32768;
+        u8[] part = u8[].filled(len, 0);
+        part.copyFrom(code, c, 0, len);
+        out.push(Change(key(2, h, [(k >> 8) as! u8, (k & 255) as! u8]), part));
+        k++;
+      }
+      f.codes++;
+    }
+    string bad = await store.commit(out.toArray(), u8[].filled(0, 0));
+    if (bad != "") { return bad; }
+  }
+  return "";
 }
 
 Fetched failedWith(Fetched f, string why) {

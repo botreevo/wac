@@ -21,7 +21,7 @@ import { blockFormOf } from "../engine/blobs.wac";
 import { publicKey } from "./secp.wac";
 import { Conn } from "./peer.wac";
 import { Deadlines, Watched, enforce } from "../net/deadlines.wac";
-import { Asker, Fetched, snapSync, answerAccountRange, answerStorageRanges, answerByteCodes, SOFT_BYTES,
+import { Asker, Fetched, snapSync, answerAccountRange, answerStorageRanges, answerByteCodes, answerTrieNodes, GET_TRIE_NODES, SOFT_BYTES,
          GET_ACCOUNT_RANGE, ACCOUNT_RANGE, GET_STORAGE_RANGES, STORAGE_RANGES, GET_BYTE_CODES, BYTE_CODES, TRIE_NODES } from "./snap.wac";
 import { Message, HelloMsg, StatusMsg, Response, ForkId, hello, helloWith, readHello, status, readStatus, forkId, disconnect,
          disconnectReason, getHeadersByHash, getBodies, readResponse, blockRange, numOf, small, HELLO, DISCONNECT, PING, PONG,
@@ -292,7 +292,7 @@ async void run(Sys sys, Network n, Peer p) {
           t!.resolve(rest);
         }
       }
-    } else if (p.snap && (code == GET_ACCOUNT_RANGE || code == GET_STORAGE_RANGES || code == GET_BYTE_CODES)) {
+    } else if (p.snap && (code == GET_ACCOUNT_RANGE || code == GET_STORAGE_RANGES || code == GET_BYTE_CODES || code == GET_TRIE_NODES)) {
       // Answered from the store when it holds the head's state; otherwise as a node without it, empty.
       await p.c.send(await answerSnap(n, code, body));
     } else if (code == TRANSACTIONS) {
@@ -509,7 +509,51 @@ async Message answerSnap(Network n, i32 code, Item body) {
   u8[] root = e.blocks.get(e.at)!.header.stateRoot.toBytes();
   if (code == GET_ACCOUNT_RANGE) { return await answerAccountRange(e.db!.store, root, body); }
   if (code == GET_STORAGE_RANGES) { return await answerStorageRanges(e.db!.store, root, body); }
+  if (code == GET_TRIE_NODES) { return await answerTrieNodes(e.db!.store, root, body); }
   return await answerByteCodes(e.db!.store, body);
+}
+
+/** The pivots a snap sync has had, newest last, each a header and its ancestors'. */
+struct Pivots {
+  Sys sys;
+  Network n;
+  Peer p;
+  Vec<Vec<Header>> seen;
+
+  /** The newest head the consensus client has named, fetched as headers if it is newer than the last pivot. */
+  async void refresh(this) {
+    U256? t = this.n.e.syncTarget;
+    if (t is null || t!.eq(this.seen.get(this.seen.len() - 1).get(0).hash)) { return; }
+    Vec<Header>? hs = await headersBack(this.sys, this.n, this.p, t!);
+    if (hs is not null) { this.seen.push(hs!); }
+  }
+
+  /** The newest pivot's state root. */
+  u8[] newest(this) { return this.seen.get(this.seen.len() - 1).get(0).stateRoot.toBytes(); }
+}
+
+/** `target`'s header and its 256 ancestors', newest first, each the parent of the one before; null if the peer will not say. */
+async Vec<Header>? headersBack(Sys sys, Network n, Peer p, U256 target) {
+  u64 id = n.nextId;
+  n.nextId++;
+  Item[]? hs = await request(sys, p, id, getHeadersByHash(id, target, 257, 0, true));
+  if (hs is null || hs!.len() == 0) { return null; }
+  Vec<Header> out = Vec.create();
+  for (i32 i = 0; i < hs!.len(); i++) {
+    string[] why = [""];
+    Header? h = headerOf(n.e.config.specAt(timestampOf(hs![i])), hs![i], why);
+    if (h is null || (i == 0 && !h!.hash.eq(target)) || (i > 0 && !h!.hash.eq(out.get(i - 1).parentHash))) { return null; }
+    out.push(h!);
+  }
+  return out;
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
 }
 
 /**
@@ -518,32 +562,28 @@ async Message answerSnap(Network n, i32 code, Item body) {
  * ordinary way.
  */
 async bool snapTo(Sys sys, Network n, Peer p, U256 target) {
-  u64 id = n.nextId;
-  n.nextId++;
-  Item[]? hs = await request(sys, p, id, getHeadersByHash(id, target, 257, 0, true));
-  if (hs is null || hs!.len() == 0) {
-    sys.warn("p2p: \{p.name} has no header for the snap target");
+  Vec<Header>? got = await headersBack(sys, n, p, target);
+  if (got is null) {
+    sys.warn("p2p: \{p.name} has no chain of headers back from the snap target");
     return false;
   }
-  Header[] headers = Header[].filled(hs!.len(), n.e.headHeader());
-  for (i32 i = 0; i < hs!.len(); i++) {
-    string[] why = [""];
-    Header? h = headerOf(n.e.config.specAt(timestampOf(hs![i])), hs![i], why);
-    if (h is null || (i > 0 && !h!.hash.eq(headers[i - 1].parentHash))) {
-      sys.warn("p2p: \{p.name}'s headers before the snap target do not chain");
-      return false;
-    }
-    headers[i] = h!;
-  }
+  Header[] headers = got!.toArray();
   Header pivot = headers[0];
-  if (!pivot.hash.eq(target)) { return false; }
   sys.log("p2p: snap sync from \{p.name} at block \{pivot.number.toDecimal()}, state root \{pivot.stateRoot.toHex()}");
   Network net = n;
   Peer peer = p;
+  // The head moves while the state is fetched, and peers keep only recent states: when this one stops
+  // answering about the pivot, the newest head the consensus client has named becomes the pivot.
+  Pivots pivots = Pivots(sys, n, p, Vec.create());
+  Vec<Header> start = Vec.create();
+  for (i32 i = 0; i < headers.len(); i++) { start.push(headers[i]); }
+  pivots.seen.push(start);
   Asker asker = Asker(async (Message m) => {
+    // A newer head named meanwhile is fetched first, so that the sync can move to it if it must.
+    await pivots.refresh();
     u64 rid = numOf(itemsOf(m.body)[0]).low();
     return await request(sys, peer, rid, m);
-  }, n.nextId, SOFT_BYTES);
+  }, n.nextId, SOFT_BYTES, () => pivots.newest());
   // Ids from a range of their own, so as not to meet this node's other requests.
   asker.nextId = n.nextId + 1000000;
   u8[] user = u8[].filled(40, 0);
@@ -554,9 +594,15 @@ async bool snapTo(Sys sys, Network n, Peer p, U256 target) {
     sys.warn("p2p: snap sync from \{p.name} failed: \{f.error}");
     return false;
   }
-  sys.log("p2p: snap sync done: \{f.accounts} accounts, \{f.slots} slots, \{f.codes} codes, \{f.nodes} trie nodes, \{f.requests} requests");
-  Header[] ancestors = Header[].filled(headers.len() - 1, pivot);
-  for (i32 i = 1; i < headers.len(); i++) { ancestors[i - 1] = headers[i]; }
+  sys.log("p2p: snap sync done: \{f.accounts} accounts, \{f.slots} slots, \{f.codes} codes, \{f.nodes} trie nodes, \{f.healed} healed, \{f.requests} requests");
+  // The pivot the state ended at: the first, or the newest it moved to.
+  Vec<Header> chosen = pivots.seen.get(0);
+  for (i32 i = 0; i < pivots.seen.len(); i++) {
+    if (same(pivots.seen.get(i).get(0).stateRoot.toBytes(), f.root)) { chosen = pivots.seen.get(i); }
+  }
+  pivot = chosen.get(0);
+  Header[] ancestors = Header[].filled(chosen.len() - 1, pivot);
+  for (i32 i = 1; i < chosen.len(); i++) { ancestors[i - 1] = chosen.get(i); }
   n.e.db!.discard();
   n.e.rebase(pivot, ancestors);
   return true;

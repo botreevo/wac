@@ -2,6 +2,17 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
+## An async lambda where wac cannot lower one is sometimes emitted as invalid wasm rather than declined (wac `7f559349c`)
+
+`issues/lang/0294c` says where an `async` lambda is lowered: the initialiser of a `fn<Ticket<…>(…)>`. Given one
+in a nullable field, `struct Holder { fn<Ticket<u8[]>()>? get; }` with `Holder(async () => s.root)`, a small
+program is declined with that explanation. The same in a bigger one — `Asker(..., async () => …)` passed
+for snap's pivot provider in `src/p2p/node.wac` — was not declined: wacc emitted a module V8 refused
+("Compiling function … `$lambda$13`: return[0] expected type (ref null 448), found call of type (ref null 1)"),
+and in the test file, one that trapped. Worked around by making that field synchronous (`fn<u8[]()>?`) and
+doing the asynchronous part in the asker's other lambda, which is a non-nullable field's. Worth a check
+that the decline happens wherever the lowering would not.
+
 ## A program holding `fetch` and the client's block types fails to emit (wac `7f559349c`)
 
 `tools/mainnet/` was one program: it asked a node over `fetch` and ran blocks. Built, it stopped at

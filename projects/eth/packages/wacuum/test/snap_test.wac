@@ -6,12 +6,13 @@
 import { Map, Vec, Ticket } from "core";
 import { rlp.Item, rlp.itemsOf } from "@/lib.wac";
 import { U256 } from "../src/u256.wac";
-import { World, Account } from "../src/state/world.wac";
+import { World, Account, AccountState, slotMap, hashU256, eqU256, emptyCodeHash } from "../src/state/world.wac";
+import { keccak256 } from "../src/crypto/keccak.wac";
 import { Store } from "../src/store/tree.wac";
 import { MemDisk } from "../src/store/disk.wac";
 import { StateDb, rootOf } from "../src/store/state.wac";
 import { Message } from "../src/p2p/wire.wac";
-import { Asker, Fetched, snapSync, answerAccountRange, answerStorageRanges, answerByteCodes,
+import { Asker, Fetched, snapSync, answerAccountRange, answerStorageRanges, answerByteCodes, answerTrieNodes, GET_TRIE_NODES,
          GET_ACCOUNT_RANGE, GET_STORAGE_RANGES, GET_BYTE_CODES } from "../src/p2p/snap.wac";
 import { bytesToHex } from "../src/hex.wac";
 import { PathTrie } from "../src/trie/pathtrie.wac";
@@ -47,7 +48,7 @@ Asker serverOf(Store s, u8[] root, u64 bytes, fn<Item[](Item[])> tamper) {
     Item[] rest = Item[].filled(all.len() - 1, all[0]);
     for (i32 i = 1; i < all.len(); i++) { rest[i - 1] = all[i]; }
     return tamper(rest);
-  }, 1, bytes);
+  }, 1, bytes, null);
 }
 
 async string run() {
@@ -104,3 +105,106 @@ Item[] dropOne(Item[] x) {
 }
 
 export string test_snap_sync_between_two_stores() { return run().wait().orElse("it never finished"); }
+
+/** A server whose state moves on after `after` requests, as a peer's does while a sync runs: then it answers only about the new root. */
+struct Moving {
+  Store s;
+  u8[] root;
+  i32 asked;
+  i32 after;
+  bool moved;
+}
+
+/** The state the server moves to: balances changed, accounts gone and new, slots changed and gone, a contract made. */
+async u8[] moveOn(Moving m) {
+  Vec<U256> addrs = Vec.create();
+  Vec<AccountState?> states = Vec.create();
+  for (i32 i = 1; i <= 300; i += 6) {
+    addrs.push(U256.ofU64(((i * 7919) as@ u32) as u64));
+    // Every other one gone, the rest richer.
+    states.push(i % 12 == 1 ? null : AccountState(true, 9, U256.ofU64(((i * 1000) as@ u32) as u64), u8[].filled(0, 0), emptyCodeHash()));
+  }
+  for (i32 i = 0; i < 20; i++) {
+    addrs.push(U256.ofU64(((900000 + i) as@ u32) as u64));
+    states.push(AccountState(true, 1, U256.ofU64(5), u8[].filled(0, 0), emptyCodeHash()));
+  }
+  u8[] code = [0x60 as u8, 0x2a, 0x60, 0x00, 0x55, 0x00];
+  addrs.push(U256.ofU64(777777));
+  states.push(AccountState(true, 1, U256.zero(), code, U256.fromBytes(keccak256(code), 0, 32)));
+  Map<U256, Map<U256, U256>> slots = Map.create(hashU256, eqU256);
+  Map<U256, U256> big = slotMap();
+  for (i32 k = 1; k <= 2000; k += 9) { big.set(U256.ofU64(((k) as@ u32) as u64), k % 2 == 0 ? U256.zero() : U256.ofU64(((k * 11) as@ u32) as u64)); }
+  slots.set(U256.ofU64(424242), big);
+  Map<U256, U256> fresh = slotMap();
+  fresh.set(U256.ofU64(1), U256.ofU64(99));
+  slots.set(U256.ofU64(777777), fresh);
+  AccountState?[] st = AccountState?[].defaulted(states.len());
+  for (i32 i = 0; i < st.len(); i++) { st[i] = states.get(i); }
+  string[] why = [""];
+  u8[]? r = await StateDb.over(m.s).write(addrs.toArray(), st, slots, u8[].filled(0, 0), why);
+  return r!;
+}
+
+async string runMoving(i32 after) {
+  Check t = Check.create();
+  MemDisk sd = MemDisk.create();
+  Store server = (await Store.open(sd.disk())).unwrap();
+  string[] why = [""];
+  u8[] first = (await StateDb.over(server).seed(state(), u8[].filled(0, 0), why))!;
+  Moving m = Moving(server, first, 0, after, false);
+  Asker peer = Asker(async (Message q) => {
+    m.asked++;
+    if (!m.moved && m.asked > m.after) {
+      m.root = await moveOn(m);
+      m.moved = true;
+    }
+    Message a = q;
+    if (q.code == GET_ACCOUNT_RANGE) { a = await answerAccountRange(m.s, m.root, q.body); }
+    else if (q.code == GET_STORAGE_RANGES) { a = await answerStorageRanges(m.s, m.root, q.body); }
+    else if (q.code == GET_BYTE_CODES) { a = await answerByteCodes(m.s, q.body); }
+    else if (q.code == GET_TRIE_NODES) { a = await answerTrieNodes(m.s, m.root, q.body); }
+    else { return null; }
+    Item[] all = itemsOf(a.body);
+    Item[] rest = Item[].filled(all.len() - 1, all[0]);
+    for (i32 i = 1; i < all.len(); i++) { rest[i - 1] = all[i]; }
+    return rest;
+  }, 1, 4096, () => m.root);
+
+  MemDisk cd = MemDisk.create();
+  Store client = (await Store.open(cd.disk())).unwrap();
+  Fetched f = await snapSync(peer, client, first, "pivot".toBytes());
+  t.eqStr(f.error, "", "the sync finishes though its pivot moved");
+  t.ok(m.moved, "the pivot did move, after \{m.after} requests");
+  t.ok(f.healed > 0, "and was healed: \{f.healed} nodes");
+  t.eqStr(bytesToHex(f.root), bytesToHex(m.root), "to the newest root");
+  t.eqStr(bytesToHex(await rootOf(client)), bytesToHex(m.root), "the client's entries come to it");
+  PathTrie back = PathTrie.of(client, u8[].filled(0, 0));
+  await back.open();
+  t.eqStr(bytesToHex(back.hash()), bytesToHex(m.root), "and its stored account trie");
+  PathTrie theirs = PathTrie.of(server, u8[].filled(0, 0));
+  await theirs.open();
+  i32 ours = await back.storedNodes();
+  i32 serverNodes = await theirs.storedNodes();
+  t.ok(ours == serverNodes, "with as many nodes as the server's: \{ours} and \{serverNodes}");
+  // Nothing left over: as many entries of each kind as the server.
+  i32 extra = 0;
+  for (i32 kind = 0; kind < 5; kind++) {
+    i32 a = (await client.range([kind as@ u8], [(kind + 1) as@ u8], 0x7fffffff)).len();
+    i32 b = (await server.range([kind as@ u8], [(kind + 1) as@ u8], 0x7fffffff)).len();
+    if (a != b) { extra++; }
+  }
+  t.ok(extra == 0, "every kind of entry counted the same as the server's");
+  return t.report();
+}
+
+export string test_snap_sync_heals_a_moving_pivot() {
+  // The pivot moving early in the accounts, later in them, in the storage, and near the end (a whole sync
+  // is some thirty requests).
+  string out = "";
+  i32[] when = [3, 8, 15, 22];
+  for (i32 i = 0; i < when.len(); i++) {
+    string r = runMoving(when[i]).wait().orElse("it never finished");
+    if (r != "") { out += "moving after \{when[i]}: " + r + "; "; }
+  }
+  return out;
+}

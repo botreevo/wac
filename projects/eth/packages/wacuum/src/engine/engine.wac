@@ -525,6 +525,22 @@ export struct Engine {
     return e;
   }
 
+  /**
+   * On a store that already holds a block's state (its meta names the block): the log's blocks up to it are
+   * recorded without running, as after a snapshot, and only those after it run. False when the store is
+   * at the genesis, whose state `onStore`'s caller seeded.
+   */
+  bool resumeFromStore(this) {
+    u8[] user = this.db!.store.committed().user;
+    if (user.len() < 40) { return false; }
+    U256 hash = U256.fromBytes(user, 0, 32);
+    if (hash.eq(this.head)) { return false; }
+    this.restoredAt = hash;
+    this.restoredNumber = U256.fromBytes(user, 32, 8);
+    this.snapshotNumber = this.restoredNumber;
+    return true;
+  }
+
   /** A fresh cache over the store: after the store moves, what the old one held may be stale. */
   void freshWorld(this) {
     World w = World.create();
@@ -1065,7 +1081,7 @@ export struct Engine {
    * process stopped while appending it — ends the replay there, and `good` says how much of the log to
    * keep. A record that is whole and does not apply is an error: the log is not this chain's.
    */
-  Replayed replay(this, u8[] log) {
+  async Replayed replay(this, u8[] log) {
     i32 at = 0;
     i32 blocks = 0;
     while (at < log.len()) {
@@ -1087,6 +1103,7 @@ export struct Engine {
           // At or below the snapshot: the state already includes it, so it is recorded, not run.
           this.adopt(spec, b);
         } else {
+          if (this.db is not null) { await this.prepareBlock(spec, b); }
           Answer a = this.importBlock(spec, b);
           string st = a.result!.member("status")!.text()!;
           // A block on a fork the snapshot's finality ruled out has no parent state to run on, and is
@@ -1096,6 +1113,7 @@ export struct Engine {
         }
       } else if (kind.len() == 1 && kind[0] == RECORD_CHOICE && f.len() == 4) {
         U256 head = U256.fromBytes(bytesOf(f[1]), 0, 32);
+        if (this.db is not null && this.blocks.has(head)) { await this.moveToAsync(head); }
         if (!this.choose(head, U256.fromBytes(bytesOf(f[2]), 0, 32), U256.fromBytes(bytesOf(f[3]), 0, 32))) {
           return Replayed(at, blocks, "fork choice at byte \{at} names a block the log has not");
         }
@@ -1303,6 +1321,27 @@ export struct Engine {
    * Import every orphan whose parent is now here, and their orphans in turn. Answers how many went in. The
    * sync target is cleared once it is a block this has.
    */
+  /** `adoptOrphans`, with each one's block prepared first when the engine is on a store. */
+  async i32 adoptOrphansAsync(this) {
+    if (this.db is null) { return this.adoptOrphans(); }
+    i32 n = 0;
+    while (true) {
+      U256[] hashes = this.orphans.keys();
+      bool ready = false;
+      for (i32 i = 0; i < hashes.len(); i++) {
+        Orphan o = this.orphans.get(hashes[i])!;
+        if (!this.blocks.has(o.block.header.parentHash)) { continue; }
+        await this.prepareBlock(o.spec, o.block);
+        ready = true;
+      }
+      if (!ready) { break; }
+      i32 got = this.adoptOrphans();
+      n += got;
+      if (got == 0) { break; }
+    }
+    return n;
+  }
+
   i32 adoptOrphans(this) {
     i32 n = 0;
     bool more = true;
@@ -1426,6 +1465,8 @@ export struct Engine {
    * each account [address, nonce, balance, code, [[slot, value]…]]. Null when the world cannot reach it.
    */
   u8[]? snapshot(this) {
+    // On the store, the store is the snapshot.
+    if (this.db is not null) { return null; }
     Node? f = this.blocks.get(this.finalized);
     if (f is null || !this.moveTo(this.finalized)) { return null; }
     World w = this.world;

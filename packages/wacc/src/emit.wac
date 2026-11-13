@@ -17,6 +17,7 @@
 // added is measured by running it rather than by reading it.
 
 import { canonicalSymbolMembers } from "./symkeys.wac";
+import { slotOrTrap } from "./capacity.wac";
 import { coreEntry } from "./carried.wac";
 import { KeyIndex, keyAdd, keyFirst } from "./keyindex.wac";
 import { indexDecls, indexConsts,
@@ -2939,7 +2940,22 @@ export struct Env {
           && this.paramCellFile[i] == this.curFile
           && this.paramCellName[i] == name) { return; }
     }
-    if (this.paramCellCount >= this.paramCellName.len()) { return; }
+    // **Grown, never dropped** — a parameter left out was not made a cell, and a lambda capturing it stopped sharing its
+    // writes with the function (the sweep after `issues/lang/0468d`). The table is the whole module's, never reset.
+    if (this.paramCellCount >= this.paramCellName.len()) {
+      i32 room = this.paramCellName.len() * 2 + 64;
+      i32[] l = i32[].filled(room, 0);
+      i32[] c = i32[].filled(room, 0);
+      i32[] f = i32[].filled(room, 0);
+      string[] n = string[].defaulted(room);
+      for (i32 i = 0; i < this.paramCellCount; i++) {
+        l[i] = this.paramCellLine[i]; c[i] = this.paramCellCol[i]; f[i] = this.paramCellFile[i]; n[i] = this.paramCellName[i];
+      }
+      this.paramCellLine = l;
+      this.paramCellCol = c;
+      this.paramCellFile = f;
+      this.paramCellName = n;
+    }
     this.paramCellLine[this.paramCellCount] = line;
     this.paramCellCol[this.paramCellCount] = col;
     this.paramCellFile[this.paramCellCount] = this.curFile;
@@ -3360,7 +3376,18 @@ export struct Env {
       if (this.promotedLine[i] == line && this.promotedCol[i] == col
           && this.promotedFile[i] == this.curFile) { return; }
     }
-    if (this.promotedCount >= this.promotedLine.len()) { return; }
+    // **Grown, never dropped** — a declaration left out was not made a cell, so a lambda and its function each wrote
+    // their own copy (the sweep after `issues/lang/0468d`). The table is the whole module's, never reset.
+    if (this.promotedCount >= this.promotedLine.len()) {
+      i32 room = this.promotedLine.len() * 2 + 64;
+      i32[] l = i32[].filled(room, 0);
+      i32[] c = i32[].filled(room, 0);
+      i32[] f = i32[].filled(room, 0);
+      for (i32 i = 0; i < this.promotedCount; i++) { l[i] = this.promotedLine[i]; c[i] = this.promotedCol[i]; f[i] = this.promotedFile[i]; }
+      this.promotedLine = l;
+      this.promotedCol = c;
+      this.promotedFile = f;
+    }
     this.promotedLine[this.promotedCount] = line;
     this.promotedCol[this.promotedCount] = col;
     this.promotedFile[this.promotedCount] = this.curFile;
@@ -6243,8 +6270,25 @@ Front frontOfRawIn(u8[] src, i32 entryDecls, i32[] starts, i32[] edges, string[]
     }
     env.fileCount = env.fileCount + 1;
   }
+  // **As many as the graph has.** These held 4096 and the edges past that were skipped (`continue`), while the link
+  // step above holds 32767 and refuses, loudly, past it — and an edge is one imported name, of which box alone has
+  // 2,236. A skipped edge sent its name to the module-wide lookup below, which picks wrongly or declines when two files
+  // declare it (`issues/lang/0468d`, the sweep after it). Grown to the count, copying what was already recorded.
+  if (env.importCount + edges[0] > env.importFrom.len()) {
+    i32 room = env.importCount + edges[0];
+    i32[] from = i32[].filled(room, 0);
+    i32[] to = i32[].filled(room, 0);
+    string[] names = string[].defaulted(room);
+    string[] decls = string[].defaulted(room);
+    for (i32 i = 0; i < env.importCount; i++) {
+      from[i] = env.importFrom[i]; to[i] = env.importTo[i]; names[i] = env.importNames[i]; decls[i] = env.importDecls[i];
+    }
+    env.importFrom = from;
+    env.importTo = to;
+    env.importNames = names;
+    env.importDecls = decls;
+  }
   for (i32 e = 0; e < edges[0]; e++) {
-    if (env.importCount >= env.importFrom.len()) { continue; }
     env.importFrom[env.importCount] = edges[e * 2 + 1];
     env.importTo[env.importCount] = edges[e * 2 + 2];
     string pair = e < names.len() ? names[e] : "";
@@ -8252,13 +8296,12 @@ void gatherUnionBlocksE(Env env, u8[] src, Lexed lexed, i32 fi, Stmt[] body) {
         match (type.kind) {
           Named(tok, typeArgs): {
             if (typeArgs.len() == 0 && tokenTextOf(src, lexed, tok) == "union") {
-              string[] ms = string[].filled(64, "");
-              i32[] n = i32[].filled(1, 0);
-              if (init is not null) { addUnionOriginE(env, src, lexed, init!, ms, n); }
-              gatherUnionAssignsE(env, src, lexed, body, tokenTextOf(src, lexed, nameTok), ms, n);
-              if (n[0] > 0) {
-                string[] exact = string[].filled(n[0], "");
-                for (i32 k = 0; k < n[0]; k++) { exact[k] = ms[k]; }
+              UnionOriginsE ms = UnionOriginsE(string[].defaulted(16), 0);
+              if (init is not null) { addUnionOriginE(env, src, lexed, init!, ms); }
+              gatherUnionAssignsE(env, src, lexed, body, tokenTextOf(src, lexed, nameTok), ms);
+              if (ms.n > 0) {
+                string[] exact = string[].filled(ms.n, "");
+                for (i32 k = 0; k < ms.n; k++) { exact[k] = ms.items[k]; }
                 env.unionAt = env.unionAt + ";" + numText(fi + 1) + ":" + numText(type.line) + ":"
                             + numText(type.col) + "=" + normUnionE(env, exact) + ";";
               }
@@ -8277,42 +8320,61 @@ void gatherUnionBlocksE(Env env, u8[] src, Lexed lexed, i32 fi, Stmt[] body) {
   }
 }
 
-void addUnionOriginE(Env env, u8[] src, Lexed lexed, Expr e, string[] ms, i32[] n) {
-  if (numberLiteralType(e) != "" || isNullLit(e) || n[0] >= ms.len()) { return; }
+/**
+ * The types flowing into a bare `union` local, in a list that grows: it was a fixed 64 that stopped recording without a
+ * word, so a 65th assignment's type was left out of the union the layout is built from — the emitter's copy of what
+ * `check.wac` had (the sweep after `issues/lang/0468d`).
+ */
+struct UnionOriginsE {
+  string[] items;
+  i32 n;
+}
+
+void addUnionOriginSlotE(UnionOriginsE o, string t) {
+  if (o.n >= o.items.len()) {
+    string[] grown = string[].defaulted(o.items.len() * 2 + 16);
+    for (i32 i = 0; i < o.n; i++) { grown[i] = o.items[i]; }
+    o.items = grown;
+  }
+  o.items[o.n] = t;
+  o.n = o.n + 1;
+}
+
+void addUnionOriginE(Env env, u8[] src, Lexed lexed, Expr e, UnionOriginsE ms) {
+  if (numberLiteralType(e) != "" || isNullLit(e)) { return; }
   match (e.kind) {
     Ternary(cond, then, els): {
-      addUnionOriginE(env, src, lexed, then, ms, n);
-      addUnionOriginE(env, src, lexed, els, ms, n);
+      addUnionOriginE(env, src, lexed, then, ms);
+      addUnionOriginE(env, src, lexed, els, ms);
       return;
     }
     default: { }
   }
   string t = env.canonType(typeOfE(src, lexed, env, e));
   if (t == "") { return; }
-  ms[n[0]] = t;
-  n[0] = n[0] + 1;
+  addUnionOriginSlotE(ms, t);
 }
 
-void gatherUnionAssignsE(Env env, u8[] src, Lexed lexed, Stmt[] body, string name, string[] ms, i32[] n) {
+void gatherUnionAssignsE(Env env, u8[] src, Lexed lexed, Stmt[] body, string name, UnionOriginsE ms) {
   for (i32 i = 0; i < body.len(); i++) {
     match (body[i].kind) {
       Assign(target, op, rhs): {
         match (target.kind) {
           LIdent(tok): {
             if (tokenTextOf(src, lexed, tok) == name && lexed.tokens[op * tokenStride()] == kAssign()) {
-              addUnionOriginE(env, src, lexed, rhs, ms, n);
+              addUnionOriginE(env, src, lexed, rhs, ms);
             }
           }
           default: { }
         }
       }
-      If(cond, then, els): { gatherUnionAssignsE(env, src, lexed, then, name, ms, n); gatherUnionAssignsE(env, src, lexed, els, name, ms, n); }
-      While(cond, inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms, n); }
-      For(init, cond, update, inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms, n); }
-      ForIn(elemTy, nameTok, iterable, inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms, n); }
-      Block(inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms, n); }
+      If(cond, then, els): { gatherUnionAssignsE(env, src, lexed, then, name, ms); gatherUnionAssignsE(env, src, lexed, els, name, ms); }
+      While(cond, inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms); }
+      For(init, cond, update, inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms); }
+      ForIn(elemTy, nameTok, iterable, inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms); }
+      Block(inner): { gatherUnionAssignsE(env, src, lexed, inner, name, ms); }
       Match(subject, arms): {
-        for (i32 a = 0; a < arms.len(); a++) { gatherUnionAssignsE(env, src, lexed, arms[a].body, name, ms, n); }
+        for (i32 a = 0; a < arms.len(); a++) { gatherUnionAssignsE(env, src, lexed, arms[a].body, name, ms); }
       }
       default: { }
     }
@@ -19346,9 +19408,25 @@ void declareConsts(Env env, u8[] src, Lexed lexed, Program prog, i32 file) {
   for (i32 d = 0; d < prog.decls.len(); d++) {
     match (prog.decls[d].kind) {
       StaticDecl(nameTok, type, init, exported): {
-        if (env.constCount >= env.constNames.len()) {
-          env.ranOut("constants");
-          continue;
+        // **Grown, rather than a limit.** These were 512 and the 513th constant refused the module ("ran out of room for
+        // constants") — loud, but a ceiling a program meets long before any other: this repository alone declares about
+        // 1132 statics (the sweep after `issues/lang/0468d`).
+        if (env.constCount >= env.constNames.len() || env.constCount >= env.constInitFiles.len()) {
+          i32 room = env.constNames.len() * 2 + 64;
+          string[] nm = string[].defaulted(room);
+          i32[] gl = i32[].filled(room, 0);
+          string[] ty = string[].defaulted(room);
+          Expr?[] ini = Expr?[].defaulted(room);
+          i32[] fl = i32[].filled(room, 0 - 1);
+          for (i32 i = 0; i < env.constCount; i++) {
+            nm[i] = env.constNames[i]; gl[i] = env.constGlobal[i]; ty[i] = env.constTypes[i]; ini[i] = env.constInits[i];
+            fl[i] = i < env.constInitFiles.len() ? env.constInitFiles[i] : 0 - 1;
+          }
+          env.constNames = nm;
+          env.constGlobal = gl;
+          env.constTypes = ty;
+          env.constInits = ini;
+          env.constInitFiles = fl;
         }
         string cname = env.declare(tokenTextOf(src, lexed, nameTok), fileFor(env, lexed, nameTok, file),
                                    exported);
@@ -21796,8 +21874,9 @@ i32 noteCallbackSig(Env env, i32 n, string t) {
 /** `t` added to `out` unless it is already there, answering the new count. */
 i32 addOutSig(string[] out, i32 n, string t) {
   for (i32 k = 0; k < n; k++) { if (out[k] == t) { return n; } }
-  if (n >= out.len()) { return n; }
-  out[n] = t;
+  // A signature left out gets no helper, so the returned funcref cannot be called — a crash, never a dropped one
+  // (`noteCallbackSig` is its loud sibling; the sweep after `issues/lang/0468d`).
+  out[slotOrTrap(n, out.len())] = t;
   return n + 1;
 }
 
@@ -22416,7 +22495,11 @@ i32 collectBindStructs(Env env, u8[] src, Lexed lexed, Program prog, string[] ou
   // Transitively, through fields **and through method signatures** — a fixed point, since a struct
   // can hold one that holds another. A method that returns a type nothing bound is a method the glue
   // silently drops, which is the one accessor some types exist for.
-  for (i32 round = 0; round < 8; round++) {
+  //
+  // **To the fixed point, not eight rounds.** A chain of bound types nine deep lost its ninth with no report, and the
+  // glue then failed at run time naming a class that was never written (the sweep after `issues/lang/0468d`). Each round
+  // adds a type or the loop ends, and the table it adds to is bounded and says so when full (`noteBindStruct`).
+  while (true) {
     i32 before = n;
     for (i32 i = 0; i < before; i++) {
       // **Not through a private member**, which is not bound (spec ch48 `§wac-bind-private-7kpcy8t`):
@@ -22561,7 +22644,10 @@ i32 noteArrays(Env env, string[] out, i32 n, string t) {
     a = core.toBytes();
   }
   if (!isArrayType(core)) { return n; }
-  if (!onBindList(out, n, core) && n < out.len()) {
+  // **Said when full, like the struct list beside it** — a boundary array left out gets no glue, and the host finds out
+  // at run time (the sweep after `issues/lang/0468d`).
+  if (!onBindList(out, n, core)) {
+    if (n >= out.len()) { env.ranOut("the arrays that cross the bind boundary"); return n; }
     out[n] = core;
     n = n + 1;
   }

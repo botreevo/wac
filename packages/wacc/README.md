@@ -97,6 +97,27 @@ It is checked, not hoped for: `wacboot`'s `ts/l5_test.ts` asserts the flattener 
 this graph, and names what it renamed when it fails. If you add a private helper whose name is
 already taken here, that is what will tell you.
 
+## A full table grows or traps
+
+**A fixed-capacity table in this package grows when it is full, or stops the compiler — it never drops the entry.**
+
+A guard like `if (n >= xs.len()) { return; }` reads as caution and is a wrong answer waiting for a program large
+enough: every one found so far dropped something another part of the compiler then needed. A type an importer never
+declared, so a field was "missing" two files away (`issues/lang/0468d`); import edges past 4096, so a name resolved by
+guesswork; async locals past 256, so one reset on resume; symbol spellings past 256, so two symbols became one member.
+Each was silent because the program around it still compiled.
+
+So: size a table from what goes in when that is known (count first), grow it when it is not, and where growing is
+awkward — several parallel arrays, an index other tables hold — write through `slotOrTrap` (`src/capacity.wac`):
+
+```wac
+xs[slotOrTrap(n, xs.len())] = x;
+```
+
+It traps when full. A crash is a bug report; a dropped entry is a miscompile nobody connects to its cause. A bound on
+work — a fixed-point loop's round count, a recursion guard — gets the same rule: reaching it is said, never taken as
+"done".
+
 ## Two things the language forces, found before writing any code
 
 **Tokens should not carry their text** — though as of `ea22a8f`/`35e938c` they

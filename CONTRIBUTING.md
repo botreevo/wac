@@ -56,6 +56,12 @@ still exists for the things that genuinely need a host, and is shrinking.
 If you took a shortcut, or you are not sure a test proves what it claims, say so rather than letting
 it pass. An honest gap is cheaper than a false one.
 
+## A full table grows or traps
+
+A fixed-size list or table must grow when full or fail loudly — never skip, truncate or overwrite the entry it was
+handed. In `packages/wacc`, write through `slotOrTrap` (`packages/wacc/src/capacity.wac`) where growing is awkward;
+`packages/wacc/README.md` ("A full table grows or traps") has the reasons, each of them a miscompile.
+
 ## Bugs and issues
 
 Anyone may change the compiler. If you are building something in wac and hit a compiler bug or need

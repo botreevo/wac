@@ -97,6 +97,12 @@ u8[] accountValue(u64 nonce, U256 balance, U256 storageRoot, U256 codeHash) {
                            Item.Bytes(codeHash.toBytes())]));
 }
 
+/** Changes ready to commit, and the state root they come to. */
+export struct Staged {
+  Change[] changes;
+  u8[] root;
+}
+
 export struct StateDb {
   Store store;
   /** Accounts read, by address: null for one the store does not have. */
@@ -202,10 +208,11 @@ export struct StateDb {
 
   /**
    * Accounts and slots — each account's new state, or null for gone, and the slots that changed under it —
-   * written with the tries that commit to them, as one commit with `user` beside it. The new state root, or
-   * null with `why[0]` saying why. What was read into memory is forgotten for what changed.
+   * as the changes that write them with the tries that commit to them, and the state root they come to;
+   * nothing is written until `commitStaged`, and `discard` forgets them instead. Null with `why[0]` saying
+   * why. What was read into memory is forgotten for what changed.
    */
-  async u8[]? write(this, U256[] addrs, AccountState?[] states, Map<U256, Map<U256, U256>> slotsOf, u8[] user, string[] why) {
+  async Staged? stage(this, U256[] addrs, AccountState?[] states, Map<U256, Map<U256, U256>> slotsOf, string[] why) {
     Vec<Change> out = Vec.create();
     PathTrie accounts = await this.trie();
     // Every account with changed slots, or changed itself.
@@ -257,6 +264,7 @@ export struct StateDb {
           }
           if (st.error != "") {
             why[0] = st.error;
+            this.discard();
             return null;
           }
           root = U256.fromBytes(st.hash(), 0, 32);
@@ -276,27 +284,73 @@ export struct StateDb {
     }
     if (accounts.error != "") {
       why[0] = accounts.error;
+      this.discard();
       return null;
     }
     u8[] root = accounts.hash();
     Change[] nodes = accounts.changes();
     for (i32 k = 0; k < nodes.len(); k++) { out.push(nodes[k]); }
-    string bad = await this.store.commit(out.toArray(), user);
+    return Staged(out.toArray(), root);
+  }
+
+  /** What `stage` made, written, with `user` beside it. "" or why not. */
+  async string commitStaged(this, Staged st, u8[] user) {
+    string bad = await this.store.commit(st.changes, user);
+    // A failed commit leaves the account trie in memory ahead of the store: read it again next time.
+    if (bad != "") { this.discard(); }
+    return bad;
+  }
+
+  /** What `stage` made, forgotten: the account trie is read from the store again, as is everything cached. */
+  void discard(this) {
+    this.accountTrie = null;
+    this.accounts = Map.create(hashU256, eqU256);
+    this.slots = Map.create(hashU256, eqU256);
+  }
+
+  /** `stage` and `commitStaged` together: the new state root, or null with `why[0]` saying why. */
+  async u8[]? write(this, U256[] addrs, AccountState?[] states, Map<U256, Map<U256, U256>> slotsOf, u8[] user, string[] why) {
+    Staged? st = await this.stage(addrs, states, slotsOf, why);
+    if (st is null) { return null; }
+    string bad = await this.commitStaged(st!, user);
     if (bad != "") {
       why[0] = bad;
-      // The trie in memory is ahead of the store now; read it again next time.
-      this.accountTrie = null;
       return null;
     }
-    return root;
+    return st!.root;
   }
 
   /** A block's changes, as `World.seal` recorded them, written with `write`. */
   async u8[]? flush(this, ChangeSet cs, u8[] user, string[] why) {
-    U256[] addrs = cs.after.keys();
+    Staged? st = await this.stageSet(cs, true, why);
+    if (st is null) { return null; }
+    string bad = await this.commitStaged(st!, user);
+    if (bad != "") {
+      why[0] = bad;
+      return null;
+    }
+    return st!.root;
+  }
+
+  /** A change set's after-states (`forward`) or before-states written: the new root, or null. */
+  async u8[]? writeSet(this, ChangeSet cs, bool forward, u8[] user, string[] why) {
+    Staged? st = await this.stageSet(cs, forward, why);
+    if (st is null) { return null; }
+    string bad = await this.commitStaged(st!, user);
+    if (bad != "") {
+      why[0] = bad;
+      return null;
+    }
+    return st!.root;
+  }
+
+  /** A change set's after-states (`forward`) or before-states staged. */
+  async Staged? stageSet(this, ChangeSet cs, bool forward, string[] why) {
+    Map<U256, AccountState> acc = forward ? cs.after : cs.before;
+    U256[] addrs = acc.keys();
     AccountState?[] states = AccountState?[].defaulted(addrs.len());
-    for (i32 i = 0; i < addrs.len(); i++) { states[i] = cs.after.get(addrs[i])!; }
-    return await this.write(addrs, states, cs.slotsAfter, user, why);
+    for (i32 i = 0; i < addrs.len(); i++) { states[i] = acc.get(addrs[i])!; }
+    return await this.stage(addrs, states, forward ? cs.slotsAfter : cs.slotsBefore, why);
   }
 
   /** Every account and slot of `w`, with code: a genesis, or a test's pre-state. */

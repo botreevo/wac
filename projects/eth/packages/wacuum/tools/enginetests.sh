@@ -4,11 +4,12 @@
 #
 #     sh tools/enginetests.sh                       # every Cancun engine test
 #     sh tools/enginetests.sh Prague fixtures/blockchain_tests_engine/prague
+#     COLD=1 sh tools/enginetests.sh                # the engine on a store, every call prepared first
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 fork=${1:-Cancun}
 where=${2:-$root/fixtures/blockchain_tests_engine}
 wac build --allow-read "$root/tools/enginetest.wac" -o "$root/dist/enginetest" >/dev/null
-find "$where" -name '*.json' | sort | xargs -n 50 -P 4 wac "$root/dist/enginetest.wasm" --fork "$fork" > "$root/dist/enginetests.log" 2>&1 || true
+find "$where" -name '*.json' | sort | xargs -n 50 -P 4 wac "$root/dist/enginetest.wasm" --fork "$fork" ${COLD:+--cold} > "$root/dist/enginetests.log" 2>&1 || true
 grep '^FAIL' "$root/dist/enginetests.log" || true
 grep 'passed,' "$root/dist/enginetests.log" | awk '{p += $1; f += $3} END {print p " passed, " f " failed"}'

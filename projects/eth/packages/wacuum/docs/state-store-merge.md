@@ -83,6 +83,13 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   kills over three runs, 47 before the block's commit was whole and 63 after — always came back to the uncrashed
   node's head, state root, slots and balances; and with commits batched, 40 kills flushing every 8 blocks and 40
   flushing every 64 (restarts replaying up to 62 blocks from the log), the same.
+  With side chains in the stream (every tenth block preceded by one or two side blocks made the head and then
+  reorged away, so kills land in reorgs and restarts must undo blocks they did not run): 51 runs of 200 blocks
+  and 40 kills each on 9286bee and after — 39 flushing every block, 12 every 64 — 50 came back exactly; the one
+  that did not was the harness (parallel runs taking one another's port as a node restarted; the ranges are now
+  wide). The runs before found three bugs, each now with a unit test (`test/resume_test.wac`): a store a block
+  ahead of the chain log stuck SYNCING for good; no undo across a restart, so any reorg below the store's block
+  after one stuck; and a fork choice for a side chain finality had ruled out refusing the log on replay.
 - **Mainnet blocks**: five consecutive blocks replayed on the store match their headers but for the state root
   (the store holds only what they read), at ~100 Mgas/s; 64 blocks traced for the cache's design.
 - **Hoodi, without the machine**: wacuum computes Hoodi's genesis hash, geth `--hoodi` accepts its handshake

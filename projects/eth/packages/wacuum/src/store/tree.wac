@@ -227,6 +227,8 @@ export struct Store {
   /** Leaves held in memory, oldest first, for evicting: the interior node holding each, and its index there. */
   Vec<Node> leafParents;
   Vec<u8[]> leafKeys;
+  /** Where the queue starts in `leafParents`/`leafKeys`: what is before it has been taken. */
+  i32 queueHead;
   i32 maxLeaves;
   /** Leaves the commit under way has written, to queue for letting go once it is on the disk. */
   Vec<Node> writtenParents;
@@ -249,7 +251,7 @@ export struct Store {
 
   /** The store in `disk`: the last commit, or an empty one for an empty file. */
   async Result<Store, string> open(Disk disk) {
-    Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), LEAVES, Vec.create(), Vec.create(), 0, 0, false, 0, Vec.create(), null,
+    Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), 0, LEAVES, Vec.create(), Vec.create(), 0, 0, false, 0, Vec.create(), null,
                     EntryCache.create(CACHE_MB * 1024 * 1024));
     i64 size = match (await disk.size()) {
       Ok(n): n,
@@ -328,6 +330,41 @@ export struct Store {
     u8[] t = u8[].filled(key.len() + 1, kind);
     t.copyFrom(key, 0, 1, key.len());
     this.trace!.push(t);
+  }
+
+  /** How many leaves are in memory, below the interior. */
+  i32 leavesHeld(this) {
+    i32 held = 0;
+    Vec<Node> stack = Vec.create();
+    stack.push(this.root);
+    while (stack.len() > 0) {
+      Node n = stack.pop()!;
+      if (n.leaf) {
+        held++;
+        continue;
+      }
+      for (i32 i = 0; i < n.kids.len(); i++) {
+        if (n.kids.get(i) is not null) { stack.push(n.kids.get(i)!); }
+      }
+    }
+    return held;
+  }
+
+  /** The sizes of what this keeps in memory, for whoever watches it: leaves queued and held, the cache, the free list. */
+  string sizes(this) {
+    i32 held = this.leavesHeld();
+    i32 interior = 0;
+    Vec<Node> stack = Vec.create();
+    stack.push(this.root);
+    while (stack.len() > 0) {
+      Node n = stack.pop()!;
+      if (n.leaf) { continue; }
+      interior++;
+      for (i32 i = 0; i < n.kids.len(); i++) {
+        if (n.kids.get(i) is not null) { stack.push(n.kids.get(i)!); }
+      }
+    }
+    return "queue \{this.leafParents.len() - this.queueHead}, leaves held \{held}, interior \{interior}, cache \{this.cache.index.len()} entries \{this.cache.bytes / 1024} KB ring \{this.cache.ring.len()} holes \{this.cache.holes.len()}, free \{this.free.len()}, freed \{this.freed.len()}, written \{this.writtenParents.len()}, waiting \{this.waiting.len()}, pages \{this.pages}";
   }
 
   /** What the last commit recorded beside the tree. */
@@ -440,13 +477,35 @@ export struct Store {
     // Nothing is let go while a commit is under way: a leaf it has rewritten is clean, with a page of its own,
     // before that page is on the disk, and one let go now would be read back from a page not yet written. A
     // read during a commit (an RPC or a peer asking about an old block) only queues; the commit's end lets go.
-    if (this.writing) { return; }
-    while (this.leafParents.len() > this.maxLeaves) {
-      Node p = this.leafParents.remove(0);
-      u8[] k = this.leafKeys.remove(0);
+    if (!this.writing) { this.trim(); }
+  }
+
+  /**
+   * Leaves let go, oldest queued first, until the bound holds. Also at a commit's end: when every read finds what
+   * it wants in memory, only commits load leaves, and if they alone trimmed nothing ever would — the queue and
+   * the leaves held then grew with the store (the soak's `wacuum_sizes`: 1.46 M queued, 11 916 leaves held).
+   */
+  void trim(this) {
+    while (this.leafParents.len() - this.queueHead > this.maxLeaves) {
+      Node p = this.leafParents.get(this.queueHead);
+      u8[] k = this.leafKeys.get(this.queueHead);
+      this.queueHead++;
       i32 i = childFor(p.keys, k);
       Node? leaf = p.kids.get(i);
       if (leaf is not null && leaf!.leaf && !leaf!.dirty && leaf!.page >= 0) { p.kids.set(i, null); }
+    }
+    // The queue's front is a head index, not removals from the front (each of which moved every entry behind
+    // it); what is behind the head is dropped once it is more than half the queue.
+    if (this.queueHead > 1024 && 2 * this.queueHead > this.leafParents.len()) {
+      Vec<Node> ps = Vec.create();
+      Vec<u8[]> ks = Vec.create();
+      for (i32 j = this.queueHead; j < this.leafParents.len(); j++) {
+        ps.push(this.leafParents.get(j));
+        ks.push(this.leafKeys.get(j));
+      }
+      this.leafParents = ps;
+      this.leafKeys = ks;
+      this.queueHead = 0;
     }
   }
 
@@ -470,6 +529,7 @@ export struct Store {
       this.cache.clear();
     }
     this.writing = false;
+    this.trim();
     this.wake();
     return out;
   }

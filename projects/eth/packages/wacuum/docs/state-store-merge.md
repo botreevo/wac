@@ -41,9 +41,26 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   age out and the state healed (`tools/e2e/snap.wac`), every account checked against geth, `eth_getProof` node
   for node; the JSON-RPC a wallet uses, on the store, with one block of history in memory and the rest read from
   disk, across a restart (`rpc.wac --store`); the devnet suite.
-- **Memory** (`tools/e2e/soak.wac`): 2400 blocks of 300–500 new slots each under `wac --max-heap 256m` — the store
-  grew to 411 MB, resident memory settled at 312–331 MB. Before this branch's fixes the same run grew ~0.75 MB a
-  block.
+- **Memory** (`tools/e2e/soak.wac`): 2400 blocks of 300–500 new slots each under `wac --max-heap 256m`, commits
+  batched 64 blocks at a time — the store grew to 714 MB, resident memory stayed at 269–319 MB. Before this branch's
+  fixes the same run grew ~0.75 MB a block.
+- **Scale** (`tools/measure/scale.wac`): a synthetic store filled to 5 GB (as much as this container's disk
+  allows with a margin) — 4.4M accounts and 438 contracts of 20 000 slots, in 219 snap-sized batches — probed
+  every 500 MB with three blocks of 1 000 cold account reads and 500 writes each:
+
+  | store | reads, ms | commit, ms | leaf reads a probe |
+  | ---: | ---: | ---: | ---: |
+  | 0.5 GB | 35 | 211 | 1 692 |
+  | 1 GB | 46 | 268 | 1 955 |
+  | 2 GB | 55 | 323 | 2 143 |
+  | 4 GB | 56 | 393 | 2 313 |
+  | 5 GB | 63 | 415 | 2 384 |
+
+  Costs grow with the tree's depth, about logarithmically. The 5 GB store opens and works under `--max-heap 256m`
+  (214 MB resident). Five mainnet blocks replayed on top of it: execution as on an empty store (1.36 s against
+  1.24 s), the commit six times slower (2.8 s against 0.48 s, 15 506 page reads against 2 964), 42 Mgas/s against
+  104 — a commit rewrites a leaf for nearly every key it touches, and on a big store those leaves are cold and
+  apart. That is ~0.57 s a block, well inside a slot; it is the number to watch at Hoodi's size.
 - **Crashes** (`tools/e2e/crash.wac`): a store node killed with SIGKILL at random points while importing — 110
   kills over three runs, 47 before the block's commit was whole and 63 after — always came back to the uncrashed
   node's head, state root, slots and balances; and with commits batched, 40 kills flushing every 8 blocks and 40
@@ -76,9 +93,9 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
   that ages out by our own simulation, because geth here kept serving old pivots.
 - **No consensus client has driven it.** Every Engine API call in testing came from fixtures or our own test
   driver. A local Prysm or Lighthouse was blocked in this container; Hoodi will be the first.
-- **Scale.** The largest store so far is 411 MB; Hoodi's will be tens of GB and mainnet's hundreds. The interior
-  is kept in memory (~400 MB estimated at mainnet), and how the cache, the leaf budget and commit cost behave at
-  that size is extrapolated from a 64-block trace, not measured.
+- **Scale.** The largest store so far is 5 GB, synthetic; Hoodi's will be tens of GB and mainnet's hundreds. The
+  interior is kept in memory (~400 MB estimated at mainnet). Commit cost grows with the store (above); beyond 5 GB
+  it is extrapolated, not measured.
 - **Commits batched over 64 blocks** (built after this note was first written): a stop of any kind replays up to
   64 blocks from the log on restart (wac programs cannot catch signals, so every stop is a crash); the overlay
   holding those blocks' changes is ~2 MB a block at mainnet's rate, bounded by a 64 MB flush.

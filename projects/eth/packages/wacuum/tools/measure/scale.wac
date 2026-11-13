@@ -7,7 +7,8 @@
 //
 //     wac --max-heap 2g run --allow-read --allow-write tools/measure/scale.wac -- PATH MAX_MB [STEP_MB] [FLUSH]
 //
-// PATH is created (or grown, if it holds a store this wrote). STEP_MB defaults to 500.
+// PATH is created (or grown, if it holds a store this wrote). STEP_MB defaults to 500. MAX_MB 0 only probes what
+// is there: under a small --max-heap, whether a store of that size works in it.
 
 import { Sys } from "std";
 import { Map, Vec } from "core";
@@ -74,33 +75,40 @@ export async i32 main(Sys sys) {
   sys.log("size MB | batches | fill MB/s | probe: reads ms, commit ms, leaf reads | resident MB");
   i64 t0 = await sys.monotonicNanos();
   i64 mb0 = (await sizeOf(store)) / (1024 * 1024);
+  // MAX_MB 0: no filling, the probes alone — under a tight --max-heap, what the store needs to work at its size.
+  bool probeOnly = maxMb == 0;
+  // The batch count rides in every commit, the probes' too, so a later run knows where this one got to.
+  u8[] mark = u8[].filled(8, 0);
+  for (i32 i = 0; i < 8; i++) { mark[i] = ((batch >> (56 - 8 * i)) & 255) as! u8; }
+  string[] why = [""];
   while (true) {
-    // A batch: new accounts, and new contracts with large storage.
-    i32 n = ACCOUNTS + CONTRACTS;
-    U256[] addrs = U256[].filled(n, U256.zero());
-    AccountState?[] states = AccountState?[].defaulted(n);
-    Map<U256, Map<U256, U256>> slots = Map.create(hashU256, eqU256);
-    for (i32 i = 0; i < ACCOUNTS; i++) {
-      addrs[i] = account(batch * (ACCOUNTS as i64) + (i as i64));
-      states[i] = AccountState(true, 1, U256.ofU64(((i as@ u32) as u64) + 1), u8[].filled(0, 0), emptyCodeHash());
+    i64 mb = 0;
+    if (!probeOnly) {
+      // A batch: new accounts, and new contracts with large storage.
+      i32 n = ACCOUNTS + CONTRACTS;
+      U256[] addrs = U256[].filled(n, U256.zero());
+      AccountState?[] states = AccountState?[].defaulted(n);
+      Map<U256, Map<U256, U256>> slots = Map.create(hashU256, eqU256);
+      for (i32 i = 0; i < ACCOUNTS; i++) {
+        addrs[i] = account(batch * (ACCOUNTS as i64) + (i as i64));
+        states[i] = AccountState(true, 1, U256.ofU64(((i as@ u32) as u64) + 1), u8[].filled(0, 0), emptyCodeHash());
+      }
+      for (i32 c = 0; c < CONTRACTS; c++) {
+        addrs[ACCOUNTS + c] = contract(batch * (CONTRACTS as i64) + (c as i64));
+        states[ACCOUNTS + c] = AccountState(true, 1, U256.zero(), u8[].filled(0, 0), emptyCodeHash());
+        Map<U256, U256> m = slotMap();
+        for (i32 k = 0; k < CONTRACT_SLOTS; k++) { m.set(U256.ofU64(r.next()), U256.ofU64(((k as@ u32) as u64) + 1)); }
+        slots.set(addrs[ACCOUNTS + c], m);
+      }
+      batch++;
+      for (i32 i = 0; i < 8; i++) { mark[i] = ((batch >> (56 - 8 * i)) & 255) as! u8; }
+      if ((await db.write(addrs, states, slots, mark, why)) is null) {
+        sys.warn("batch \{batch}: \{why[0]}");
+        return 1;
+      }
+      mb = (await sizeOf(store)) / (1024 * 1024);
+      if (mb < nextProbe && mb < maxMb) { continue; }
     }
-    for (i32 c = 0; c < CONTRACTS; c++) {
-      addrs[ACCOUNTS + c] = contract(batch * (CONTRACTS as i64) + (c as i64));
-      states[ACCOUNTS + c] = AccountState(true, 1, U256.zero(), u8[].filled(0, 0), emptyCodeHash());
-      Map<U256, U256> m = slotMap();
-      for (i32 k = 0; k < CONTRACT_SLOTS; k++) { m.set(U256.ofU64(r.next()), U256.ofU64(((k as@ u32) as u64) + 1)); }
-      slots.set(addrs[ACCOUNTS + c], m);
-    }
-    batch++;
-    u8[] mark = u8[].filled(8, 0);
-    for (i32 i = 0; i < 8; i++) { mark[i] = ((batch >> (56 - 8 * i)) & 255) as! u8; }
-    string[] why = [""];
-    if ((await db.write(addrs, states, slots, mark, why)) is null) {
-      sys.warn("batch \{batch}: \{why[0]}");
-      return 1;
-    }
-    i64 mb = (await sizeOf(store)) / (1024 * 1024);
-    if (mb < nextProbe && mb < maxMb) { continue; }
     await store.flush();
     mb = (await sizeOf(store)) / (1024 * 1024);
     i64 t1 = await sys.monotonicNanos();
@@ -136,7 +144,7 @@ export async i32 main(Sys sys) {
     nextProbe = (mb / stepMb + 1) * stepMb;
     t0 = await sys.monotonicNanos();
     mb0 = mb;
-    if (mb >= maxMb) { break; }
+    if (probeOnly || mb >= maxMb) { break; }
   }
   return 0;
 }

@@ -45,8 +45,12 @@ export static i32 LEAVES = (LEAF_BYTES / (PAGE as i64)) as! i32;
 static i32 PREFETCH = 64;
 /** The entry cache's budget by default, in MB. */
 export static i64 CACHE_MB = 256;
-/** "WACUMDB" and the format: 3 since 16 KB pages (2026-11-13). 2 was the same with 64 KB pages. */
-static u64 MAGIC = 0x3344554d55434157;
+/**
+ * "WACUMDD" and the format: 4 since the tries' top levels are keyed level by level (`pathtrie.wac`'s `nodeKey`,
+ * 2026-11-13). 3 was the same store with every trie node keyed depth first; 2 had 64 KB pages.
+ */
+static u64 MAGIC = 0x3444554d55434157;
+static u64 MAGIC_DEPTH_FIRST = 0x3344554d55434157;
 static u64 MAGIC_64K = 0x4244554d55434157;
 /** The free list's pages the meta can name: what a page holds after the meta's fixed fields and its user bytes. */
 static i32 MAX_LISTS = (PAGE - 44 - 4 - 3900 - 32) / 8;
@@ -281,6 +285,9 @@ export struct Store {
       Ok(head): {
         if (head.len() == 8 && get64(head, 0) == (MAGIC_64K as@ i64)) {
           return Result.Err("a store of 64 KB pages, from before 2026-11-13: this one has 16 KB pages; remove it and sync again");
+        }
+        if (head.len() == 8 && get64(head, 0) == (MAGIC_DEPTH_FIRST as@ i64)) {
+          return Result.Err("a store whose tries are keyed depth first, from before 2026-11-13: remove it and sync again");
         }
       }
       Err(e): { return Result.Err(e); }
@@ -680,6 +687,24 @@ export struct Store {
   }
 
   /**
+   * The page of the leaf `key` belongs in, from the interior alone (which is all in memory); with `missing`, -1
+   * when that leaf is in memory already. -1 for a tree that is one leaf.
+   */
+  i64 pageOf(this, const u8[] key, bool missing) {
+    Node n = this.root;
+    while (!n.leaf) {
+      i32 i = childFor(n.keys, key);
+      Node? k = n.kids.get(i);
+      if (k is null || k!.leaf) {
+        if (k is not null && missing) { return -1; }
+        return k is null ? n.kidPages.get(i) : k!.page;
+      }
+      n = k!;
+    }
+    return -1;
+  }
+
+  /**
    * The leaves `changes` from `from` on will need and memory lacks, up to `window` of them, read with every read
    * in flight at once, then put in their places; returns the first change past those leaves. The interior is all
    * in memory, so which leaf a key needs, and its page, is known without reading. Nothing moves meanwhile: a
@@ -692,17 +717,7 @@ export struct Store {
     i32 c = from;
     while (c < changes.len()) {
       u8[] key = changes.get(c).key;
-      Node n = this.root;
-      i64 page = -1;
-      while (!n.leaf) {
-        i32 i = childFor(n.keys, key);
-        Node? k = n.kids.get(i);
-        if (k is null) {
-          page = n.kidPages.get(i);
-          break;
-        }
-        n = k!;
-      }
+      i64 page = this.pageOf(key, true);
       if (page >= 0 && (pages.len() == 0 || pages.get(pages.len() - 1) != page)) {
         if (pages.len() == window) { break; }
         pages.push(page);

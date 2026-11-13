@@ -137,10 +137,53 @@ Item refOf(PNode n) {
   return r;
 }
 
+/**
+ * Depths stored a level at a time: under the trie's prefix, a node shallower than this is keyed by its depth and
+ * then its path, so a level's nodes are together (all 16 of depth 1 in one leaf of the store, depth 2's 256 in a
+ * few). Deeper nodes are keyed by their path alone, depth first, where a small subtree's nodes are together. Keyed
+ * depth first throughout, every node a block touched near the top was in a leaf of its own — at 5 GB, a block of
+ * 500 accounts rewrote 1 + 16 + 219 + 461 leaves for depths 0 to 3 alone (`tools/measure/stagecpu.wac`).
+ */
+export static i32 SHALLOW = 5;
+/** The byte after the prefix of a node deeper than `SHALLOW`: above any depth, and any nibble. */
+static u8 DEEP = 16;
+
+/** The store's key for the node at `path` (nibbles) of the account trie, or with `owner` of that account's storage trie. */
+export u8[] nodeKey(u8[] owner, u8[] path) {
+  u8[] prefix = owner.len() == 0 ? [3] : join([4], owner);
+  return join(join(prefix, [path.len() < SHALLOW ? path.len() as! u8 : DEEP]), path);
+}
+
+/**
+ * The key ranges, as pairs of first key and the first key after, that hold every node at `path` and under it: a
+ * range for each level-keyed depth from the path's down, and one for the depth-first rest.
+ */
+export Vec<u8[]> subtreeRanges(u8[] owner, u8[] path) {
+  Vec<u8[]> out = Vec.create();
+  for (i32 d = path.len(); d < SHALLOW; d++) {
+    u8[] prefix = owner.len() == 0 ? [3] : join([4], owner);
+    u8[] lo = join(join(prefix, [d as! u8]), path);
+    out.push(lo);
+    out.push(past(lo));
+  }
+  u8[] deep = owner.len() == 0 ? join([3, DEEP], path) : join(join(join([4], owner), [DEEP]), path);
+  out.push(deep);
+  out.push(past(deep));
+  return out;
+}
+
+/** The first key after every key that starts with `k`, whose last byte is a nibble, a depth or `DEEP`. */
+u8[] past(u8[] k) {
+  u8[] out = u8[].filled(k.len(), 0);
+  out.copyFrom(k, 0, 0, k.len());
+  out[k.len() - 1] = out[k.len() - 1] + 1;
+  return out;
+}
+
 export struct PathTrie {
   Store store;
-  /** The prefix of every node key: 0x03, or 0x04 and the owner's hash. */
-  u8[] prefix;
+  /** Whose storage trie this is (keccak of the address), or empty for the account trie. */
+  u8[] owner;
   PNode? root;
   /** Paths whose stored node went away, to delete unless written again. */
   Vec<u8[]> stale;
@@ -150,11 +193,10 @@ export struct PathTrie {
 
   /** The account trie, or with `owner` (keccak of an address) that account's storage trie. */
   PathTrie of(Store store, u8[] owner) {
-    u8[] prefix = owner.len() == 0 ? [3] : join([4], owner);
-    return PathTrie(store, prefix, null, Vec.create(), 0, "");
+    return PathTrie(store, owner, null, Vec.create(), 0, "");
   }
 
-  u8[] keyOf(this, u8[] path) { return join(this.prefix, path); }
+  u8[] keyOf(this, u8[] path) { return nodeKey(this.owner, path); }
 
   /** The trie as the store has it: its root, as a stub, when there is one. */
   async void open(this) {

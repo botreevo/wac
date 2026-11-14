@@ -107,6 +107,13 @@ Each has a test that fails without its fix.
 - The node kept every account and slot it had read, every payload it built, and every block's history, in memory.
 - After a snap sync the node fetched missing blocks from the same peer every time, and never got them if that
   peer lacked them.
+- A store a block ahead of the chain log (a stop between the commit and the log's write) left the node SYNCING for
+  good; and with no change sets across a restart, so did any reorg below the store's block after one. Now the
+  store keeps each unfinalized block's undo record, and a restart adopts its own block from the store first.
+- A fork choice in the log for a side chain finality had ruled out made replay refuse the log: the node did not
+  start.
+- Payload statuses named a hash with a leading zero nibble shortened; consensus clients cannot read it, so one block
+  in 16 failed and a follower stopped for good.
 
 The first three are in the same 150 lines of `tree.wac` (leaves in memory, letting them go, commits); that code
 has had the most bugs and the most new tests, and is where a reviewer's time is best spent.
@@ -144,9 +151,26 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 
 ## Not tested at all
 
-Hoodi; mainnet's size; days of uptime; a full disk; another client snap-syncing from
-wacuum (the server is tested against our own client only); deep reorgs on the store beyond what the fixtures
-contain.
+Hoodi; mainnet's size; days of uptime (the longest consensus-client run is ~4 minutes of chain, the 2400-block soak
+~9 minutes); a full disk; another client snap-syncing from wacuum (the server is tested against our own client
+only); real blobs' KZG work; Prysm and Lighthouse on one chain.
+
+## Where it stands, and what is next (2026-11-14, wound down)
+
+Everything above is on `state-store`, pushed; nothing went to master. Next, in order:
+
+1. **The follower soak** — `tools/e2e/clsoak.wac`: geth builds under Lighthouse, wacuum follows on a store (flush 64,
+   heap capped) under its own Lighthouse, with transfers, a blob block every ten minutes, a kill every 20–40
+   minutes, and `tools/hoodi/compare.wac` every minute. A 6-minute run passed (lag 0, 69 MB resident under 512m);
+   the 3-hour run was stopped in its setup when work wound down. Run it for hours before Hoodi:
+   `wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/clsoak.wac -- GETH PRYSM_BIN LIGHTHOUSE 180 512m`.
+2. **Hoodi** — `docs/hoodi.md`, with what the consensus-client tests taught folded in: Lighthouse 8.3.3 the version
+   tested; a wacuum at or after `ac19578`; restarts fetch missed blocks from the local geth `run-wacuum.sh` peers
+   it with; Lighthouse's log is where an execution-engine error shows. The units needed no change.
+3. **Open items**: deliberate reorgs under a consensus client (one validator client holding every key gives no way
+   to fork; reorgs after restarts are covered by unit tests and `crash.wac`'s side chains); commit cost on a big
+   store (~0.57 s a block at 5 GB before the layout work, 1.56 s for five mainnet blocks after; the two syncs a
+   commit are most of what is left — batching pays them once per 64 blocks); the store's scale beyond 5 GB.
 
 ## Recommendation
 

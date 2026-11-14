@@ -116,12 +116,18 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 - **Not yet run against the real network.** Snap sync has only met geth on private devnets: never a public peer
   set, rate limits, peers that drop or lie, or a state the size of Hoodi's (tens of GB). Healing has met a pivot
   that ages out by our own simulation, because geth here kept serving old pivots.
-- **One consensus client, on a private chain.** `tools/e2e/cl.wac` (2026-11-13): Prysm 7.3.1 with all 64
-  validators drives wacuum on a store from genesis, every fork through Fulu/Osaka at genesis, 2 s slots; a second
-  Prysm drives geth, which imports every block wacuum builds. 118 blocks in 128 slots with 53 transfers, geth
-  holding the same blocks; wacuum killed at block 22 and started again went on; epoch 2 finalized, the same
-  finalized block in both. Not yet: Lighthouse (Hoodi's deploy uses it), a chain wacuum did not build itself
-  from genesis, blobs, or a real network's latency and peers.
+- **Two consensus clients, on private chains** (2026-11-14), every fork through Fulu/Osaka at genesis, 2 s slots, 64
+  validators, geth beside wacuum judging every block by itself under its own beacon node:
+  - `tools/e2e/cl.wac` — Prysm 7.3.1 drives wacuum as the builder: 127 blocks in 128 slots, transfers and a blob
+    block in them, geth with the same blocks, wacuum killed and started again going on, epoch 2 finalized alike.
+  - `tools/e2e/cllh.wac` — the same under Lighthouse 8.3.3, Hoodi's deploy's client: 129 blocks in 130 slots.
+  - `tools/e2e/clfollow.wac` — Hoodi's situation: geth builds, wacuum only follows under its own Prysm (gossip,
+    newPayload), killed and caught up, takes geth's blob block, agrees on finality; and a second wacuum started
+    empty under a checkpoint-synced beacon node snap-syncs from geth to the head and follows, its balance geth's.
+  Found on the way: payload statuses gave a hash with a leading zero nibble shortened, which Prysm cannot read — one
+  block in 16 failed, and a follower stopped for good (fixed, with a test). Not covered: a public network's peers
+  and latency, real (non-zero) blobs' KZG work, Prysm and Lighthouse together (they do not peer here: Lighthouse
+  rejects Prysm's custody group count of 0).
 - **Scale.** The largest store so far is 5 GB, synthetic; Hoodi's will be tens of GB and mainnet's hundreds. The
   interior is kept in memory (~400 MB estimated at mainnet). Commit cost grows with the store (above); beyond 5 GB
   it is extrapolated, not measured.
@@ -138,7 +144,7 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 
 ## Not tested at all
 
-A consensus client other than Prysm; Hoodi; mainnet's size; days of uptime; a full disk; another client snap-syncing from
+Hoodi; mainnet's size; days of uptime; a full disk; another client snap-syncing from
 wacuum (the server is tested against our own client only); deep reorgs on the store beyond what the fixtures
 contain.
 

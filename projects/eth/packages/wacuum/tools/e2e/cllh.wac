@@ -1,7 +1,8 @@
 // wacuum driven by Lighthouse, the consensus client Hoodi's deploy runs it with: a Lighthouse beacon node and validator
-// client with all 64 validators drive wacuum on a store, which builds and imports every block; a Prysm beacon node,
-// peered with Lighthouse's, drives geth, which imports what wacuum built — so the chain also crosses two consensus
-// clients. Checked as `cl.wac` checks under Prysm: the chain grows with transfers, geth has the same blocks, wacuum
+// client with all 64 validators drive wacuum on a store, which builds and imports every block; a second Lighthouse
+// beacon node, booting from the first's ENR, drives geth, which imports what wacuum built. (Prysm 7.3.1 and Lighthouse
+// 8.3.3 do not peer here: Prysm's metadata gives a custody group count of 0, which Lighthouse rejects as out of range
+// and bans it for. Prysm serves only the chain's full spec, for Lighthouse's config.) Checked as `cl.wac` checks under Prysm: the chain grows with transfers, geth has the same blocks, wacuum
 // killed and started again goes on, blob transactions go into a block wacuum builds and geth takes it, and the
 // chain finalizes, the same finalized block in both.
 //
@@ -13,7 +14,7 @@ import { U256 } from "../../src/u256.wac";
 import { bytesToHex } from "../../src/hex.wac";
 import { Check, Proc, Rpc, shell, tempDir, removeDir, somePort, addressOf, field, quantity } from "./kit.wac";
 import { prepare, prepareLighthouse, gethNode, beaconNode, lighthouseBeacon, lighthouseValidator, wacuumNode, peerAddress, beacon, hashAt,
-         growTo, decimal, blobBlock, lighthouseAddress } from "./clkit.wac";
+         growTo, decimal, blobBlock, lighthouseEnr } from "./clkit.wac";
 
 export async i32 main(Sys sys) {
   string[] args = sys.args();
@@ -35,17 +36,16 @@ export async i32 main(Sys sys) {
   string ready = await prepare(sys, dir, bin, me, 75);
   t.that(ready == "", "prysmctl makes the genesis and the keystores \{ready}");
 
-  // geth under Prysm beacon B — first started only for its spec, which is Lighthouse's config; then again, once
-  // Lighthouse is up, to dial it (Lighthouse no longer dials a bare multiaddr).
+  // A Prysm beacon node, briefly, for the chain's full spec: Lighthouse's config.
   i32 gethBase = await somePort(sys, 22551, 400);
   Proc g = await gethNode(sys, geth, dir, gethBase);
   Rpc gr = Rpc.at(sys, gethBase + 2);
-  i32 bBase = await somePort(sys, 24551, 400);
-  Proc b = await beaconNode(sys, bin, dir, "beacon-b", bBase, gethBase + 1, []);
-  t.that((await peerAddress(sys, b)) != "", "Prysm beacon B is up");
-  string lh = await prepareLighthouse(sys, dir, lighthouse, bBase + 1);
+  i32 pBase = await somePort(sys, 24551, 400);
+  Proc p = await beaconNode(sys, bin, dir, "prysm-spec", pBase, gethBase + 1, []);
+  t.that((await peerAddress(sys, p)) != "", "a Prysm beacon node for the spec is up");
+  string lh = await prepareLighthouse(sys, dir, lighthouse, pBase + 1);
   t.that(lh == "", "Lighthouse takes the chain's config and imports the keystores \{lh}");
-  await b.stop(sys);
+  await p.stop(sys);
 
   // wacuum under Lighthouse, which has the validators.
   i32 wacPort = await somePort(sys, 21551, 400);
@@ -55,9 +55,10 @@ export async i32 main(Sys sys) {
          "wacuum and geth start from the same genesis block");
   i32 aBase = await somePort(sys, 23551, 400);
   Proc a = await lighthouseBeacon(sys, lighthouse, dir, "lighthouse", aBase, wacPort, []);
-  string lhPeer = await lighthouseAddress(sys, a, aBase);
-  t.that(lhPeer != "", "Lighthouse is up: \{lhPeer}");
-  b = await beaconNode(sys, bin, dir, "beacon-b", bBase, gethBase + 1, ["--peer", lhPeer]);
+  string enr = await lighthouseEnr(sys, a);
+  t.that(enr != "", "Lighthouse A is up: \{enr}");
+  i32 bBase = await somePort(sys, 24951, 400);
+  Proc b = await lighthouseBeacon(sys, lighthouse, dir, "lighthouse-b", bBase, gethBase + 1, ["--boot-nodes", enr]);
   Proc v = await lighthouseValidator(sys, lighthouse, dir, aBase + 2);
 
   u64[] nonce = [0];
@@ -68,7 +69,7 @@ export async i32 main(Sys sys) {
   await sys.sleepMillis(4000);
   string ours = await hashAt(wac, 20);
   string theirs = await hashAt(gr, 20);
-  t.that(ours != "" && ours == theirs, "geth, under Prysm, has wacuum's block 20: \{ours} \{theirs}");
+  t.that(ours != "" && ours == theirs, "geth, under Lighthouse B, has wacuum's block 20: \{ours} \{theirs}");
 
   u64 before = quantity(await wac.text("eth_blockNumber", "[]"));
   await shell(sys, "kill -9 \{w.pid}; while kill -0 \{w.pid} 2>/dev/null; do sleep 0.05; done");

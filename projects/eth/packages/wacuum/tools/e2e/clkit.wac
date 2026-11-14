@@ -4,7 +4,7 @@
 
 import { Sys } from "std";
 import { Vec } from "core";
-import { json.JsonValue, json.parse } from "wac";
+import { json.JsonValue, json.JsonObject, json.JsonArray, json.JsonMember, json.parse } from "wac";
 import { U256 } from "../../src/u256.wac";
 import { bytesToHex } from "../../src/hex.wac";
 import { systemContracts } from "../../src/chain/dev.wac";
@@ -184,4 +184,61 @@ export async u64 blobBlock(Sys sys, Rpc to, Rpc watch, i32 millis) {
     await sys.sleepMillis(1000);
   }
   return 0;
+}
+
+/**
+ * Lighthouse's testnet directory in `dir/lh-testnet` — the genesis state `prepare` made, and a config.yaml written
+ * from a running Prysm beacon node's whole spec (on `specPort`): Lighthouse wants every field of the chain config,
+ * where Prysm takes a few and fills the rest from its preset. Then the interop keystores imported for Lighthouse's
+ * validator client in `dir/lh-validator`. "" or what went wrong.
+ */
+export async string prepareLighthouse(Sys sys, string dir, string lighthouse, i32 specPort) {
+  string t = dir + "/lh-testnet";
+  await sys.files().mkdir(t, true);
+  JsonValue? spec = await beacon(sys, specPort, "/eth/v1/config/spec");
+  JsonObject? data = spec?.member("data")?.object();
+  if (data is null) { return "no spec from the Prysm beacon node"; }
+  string yaml = "";
+  for (i32 i = 0; i < data!.len(); i++) {
+    JsonMember m = data!.at(i);
+    string k = string.fromBytes(m.key);
+    if (m.value.text() is not null) {
+      yaml += "\{k}: \{m.value.text()!}\n";
+    } else if (m.value.array() is not null) {
+      // BLOB_SCHEDULE: a list of objects.
+      yaml += "\{k}:\n";
+      JsonArray list = m.value.array()!;
+      for (i32 e = 0; e < list.len(); e++) {
+        JsonObject o = list.get(e).object()!;
+        for (i32 f = 0; f < o.len(); f++) { yaml += "\{f == 0 ? "  - " : "    "}\{string.fromBytes(o.at(f).key)}: \{o.at(f).value.text() ?? ""}\n"; }
+      }
+    }
+  }
+  await sys.writeFile(t + "/config.yaml", yaml.toBytes());
+  await shell(sys, "cp \{quote(dir + "/genesis.ssz")} \{quote(t + "/genesis.ssz")}");
+  await sys.writeFile(t + "/deploy_block.txt", "0".toBytes());
+  await sys.writeFile(t + "/deposit_contract_block.txt", "0".toBytes());
+  string imported = await shell(sys, "\{quote(lighthouse)} --testnet-dir \{quote(t)} account validator import --datadir \{quote(dir + "/lh-validator")} " +
+                                     "--directory \{quote(dir + "/keys")} --password-file \{quote(dir + "/key.pw")} --reuse-password 2>&1 | grep -o 'Successfully imported [0-9]* validators'");
+  return trim(imported) == "Successfully imported \{VALIDATORS} validators" ? "" : "Lighthouse: \{trim(imported)}";
+}
+
+/** A Lighthouse beacon node on ports from `base` (p2p, quic, http, metrics), driving the execution client at `elPort`. */
+export async Proc lighthouseBeacon(Sys sys, string lighthouse, string dir, string name, i32 base, i32 elPort, string[] extra) {
+  Vec<string> argv = Vec.create();
+  string[] fixed = [lighthouse, "--testnet-dir", dir + "/lh-testnet", "bn", "--datadir", dir + "/" + name,
+                    "--execution-endpoint", "http://127.0.0.1:\{elPort}", "--execution-jwt", dir + "/jwt.hex",
+                    "--listen-address", "127.0.0.1", "--enr-address", "127.0.0.1", "--port", "\{base}", "--quic-port", "\{base + 1}",
+                    "--http", "--http-port", "\{base + 2}", "--disable-upnp", "--disable-packet-filter", "--supernode",
+                    "--allow-insecure-genesis-sync", "--suggested-fee-recipient", "0x00000000000000000000000000000000000000fe"];
+  for (i32 i = 0; i < fixed.len(); i++) { argv.push(fixed[i]); }
+  for (i32 i = 0; i < extra.len(); i++) { argv.push(extra[i]); }
+  return await Proc.start(sys, argv.toArray(), dir + "/" + name + ".log");
+}
+
+/** Lighthouse's validator client, with the keystores `prepareLighthouse` imported, on the beacon node at `http`. */
+export async Proc lighthouseValidator(Sys sys, string lighthouse, string dir, i32 http) {
+  return await Proc.start(sys, [lighthouse, "--testnet-dir", dir + "/lh-testnet", "vc", "--datadir", dir + "/lh-validator",
+                                "--beacon-nodes", "http://127.0.0.1:\{http}", "--init-slashing-protection",
+                                "--suggested-fee-recipient", "0x00000000000000000000000000000000000000fe"], dir + "/lh-validator.log");
 }

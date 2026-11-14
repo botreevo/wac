@@ -415,6 +415,8 @@ Declared[] declarations(Files fs, string[] files) {
       }
       why = laneOf(line, "heavy");
       if (why != "") { found.push(files[i]); lanes.push("heavy"); whys.push(why); continue; }
+      why = laneOf(line, "perf");
+      if (why != "") { found.push(files[i]); lanes.push("perf"); whys.push(why); continue; }
       why = laneOf(line, "browser");
       if (why != "") { found.push(files[i]); lanes.push("browser"); whys.push(why); }
     }
@@ -933,6 +935,8 @@ struct Opts {
   bool wacOnly;
   bool denoOnly;
   bool heavyOnly;
+  /** `--perf`: the wall-clock comparisons on their own, one at a time. */
+  bool perfOnly;
   string[] targets;
   /** Flags this runner does not know, handed to `deno test` — `--filter` is the caller's. */
   string[] extra;
@@ -964,6 +968,7 @@ Opts parseArgs(string[] argv, Env env) {
   bool wacOnly = false;
   bool denoOnly = false;
   bool heavyOnly = false;
+  bool perfOnly = false;
   // `DENO_JOBS=n` overrides the measured default, and `--jobs n` overrides that.
   string asked = envOf(env, "DENO_JOBS");
   if (asked != "" && atoi(asked) > 0) {
@@ -975,6 +980,7 @@ Opts parseArgs(string[] argv, Env env) {
     if (argv[i] == "--wac-only") { wacOnly = true; continue; }
     if (argv[i] == "--deno-only") { denoOnly = true; continue; }
     if (argv[i] == "--heavy") { heavyOnly = true; continue; }
+    if (argv[i] == "--perf") { perfOnly = true; continue; }
     if (argv[i] == "--jobs" && i + 1 < argv.len()) {
       jobs = atoi(argv[i + 1]);
       fromEnv = false;
@@ -988,7 +994,7 @@ Opts parseArgs(string[] argv, Env env) {
     targets.push(argv[i]);
   }
   if (jobs < 1) { jobs = 1; }
-  return Opts(jobs, fromEnv, dry, wacOnly, denoOnly, heavyOnly, targets.all(), extra.all());
+  return Opts(jobs, fromEnv, dry, wacOnly, denoOnly, heavyOnly, perfOnly, targets.all(), extra.all());
 }
 
 Found discover(Env env, Files fs, Opts o) {
@@ -1032,8 +1038,14 @@ Found discover(Env env, Files fs, Opts o) {
   string[] skippedHeavy = keepHeavy ? string[].filled(0, "") : heavy;
   string[] tsHeavy = keepHeavy ? string[].filled(0, "") : tsHeavyAll;
 
+  // **The perf lane is never in the broad pass.** Its files compare wall-clock times, which a loaded machine decides
+  // rather than the code, so they failed gates that changed nothing they measure; they run on their own, on a quiet
+  // machine, as `wac task test:perf`. A named target still runs them, as it runs the heavy ones.
+  bool keepPerf = o.targets.len() > 0 || o.perfOnly;
+  string[] perf = keepPerf ? string[].filled(0, "") : filesDeclaring(declared, "perf");
   Names skip = Names.create();
   for (i32 i = 0; i < skippedHeavy.len(); i++) { skip.push(skippedHeavy[i]); }
+  for (i32 i = 0; i < perf.len(); i++) { skip.push(perf[i]); }
   for (i32 i = 0; i < alone.len(); i++) { skip.push(alone[i]); }
 
   return Found(allDirs, dirs, everyFile.n, declared, skippedHeavy, alone, tsDeclared, tsFiles.n,
@@ -1053,7 +1065,7 @@ export struct Lanes {
  * it finds them. harness/testLane.ts (deleted 2026-11-11) was that copy, for the deleted tools/lane.test.ts.
  */
 export Lanes lanesAsRun(Env env, Files fs) {
-  Found f = discover(env, fs, Opts(1, false, false, false, false, false, string[](), string[]()));
+  Found f = discover(env, fs, Opts(1, false, false, false, false, false, false, string[](), string[]()));
   return Lanes(f.allDirs, f.declared, f.tsDeclared);
 }
 
@@ -1134,6 +1146,32 @@ i32 heavyLane(Output err, Output out, Clock clock, Env env, Files fs, Procs proc
       // Said, not swallowed: a green lane that never recorded it looks exactly like a green lane.
       out.line("(the lane passed, but its stamp could not be written: " + "\{wrote.isErr() ? "\{wrote.err()!}" : ""}" + ")");
     }
+  }
+  return code;
+}
+
+/**
+ * `--perf`: the files that compare wall-clock times, one at a time and nothing else running — which is the only
+ * condition their numbers mean anything under. Not in the whole-suite pass at all (`discover` leaves them out).
+ */
+i32 perfLane(Output err, Output out, Env env, Procs procs, Found f) {
+  string[] pw = filesDeclaring(f.declared, "perf");
+  if (pw.len() == 0) {
+    // Not success: a lane that runs nothing is the failure this repo keeps finding.
+    err.line("no file declares `// test-lane: perf`, so there is nothing to run");
+    return 1;
+  }
+  out.line("the perf lane: " + itoa(pw.len()) + " file(s), one at a time — run it on a quiet machine\n");
+  i32 code = 0;
+  string wac = wacBinaryPath(env);
+  for (i32 i = 0; i < pw.len(); i++) {
+    for (i32 k = 0; k < f.declared.len(); k++) {
+      if (f.declared[k].file == pw[i]) { out.line("   " + pw[i] + "  —" + f.declared[k].why); }
+    }
+    Exec r = flatten(procs.exec(wac, wacArgs(string[].filled(1, pw[i]), string[].filled(0, "")), u8[](),
+                                ChildEnv(false, string[].filled(0, "")), Launch("", false, true, false, false)).wait()).unwrap();
+    if (code == 0 && r.ran() && r.status != 0 && r.status != 4) { code = r.status; }
+    if (code == 0 && !r.ran()) { code = 1; }
   }
   return code;
 }
@@ -1680,7 +1718,8 @@ export i32 main(Sys sys) {
   // for twenty minutes by a pull that conflicted.
   markRun(clock, env, fs);
 
-  i32 code = o.heavyOnly ? heavyLane(err, out, clock, env, fs, procs, o, f) : lanes(err, out, clock, env, fs, procs, o, f);
+  i32 code = o.perfOnly ? perfLane(err, out, env, procs, f)
+           : o.heavyOnly ? heavyLane(err, out, clock, env, fs, procs, o, f) : lanes(err, out, clock, env, fs, procs, o, f);
 
   // Released here rather than left to an exit path, because there is no unwinding: a lock let go
   // anywhere but on the way out is a lock left behind on every ordinary run.

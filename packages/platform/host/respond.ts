@@ -55,6 +55,7 @@ import {
   STATUS_MORE,
   STATUS_OK,
   SUBMIT_SEQ,
+  watchFor,
 } from "./layout.ts";
 import { FAULT_OTHER, faultedBytes, faultOf } from "./faults.ts";
 import { OP } from "./ops.ts";
@@ -92,7 +93,7 @@ function joined(parts: Uint8Array[], last: Uint8Array): Uint8Array {
 export function serveHostCalls(
   b: Bridge,
   handlers: Handlers,
-  opts: { signal?: AbortSignal; scheduler?: Scheduler } = {},
+  opts: { signal?: AbortSignal; scheduler?: Scheduler; watchMs?: number } = {},
 ): {
   stats(): { running: boolean; sweeps: number; handling: string };
   stop(): void;
@@ -280,10 +281,25 @@ export function serveHostCalls(
     const handle = (op === OP.RECV || op === OP.SEND) && whole.length >= 4
       ? `(h=${new DataView(whole.buffer, whole.byteOffset, 4).getInt32(0, true)})`
       : "";
+    // **A handler that answers at once is answered at once**, here rather than a microtask later: then the
+    // loop sees nothing in flight when it is done, and watches for the next call rather than going back to
+    // the event loop for it (`watchMs`). `nowMillis` and the other synchronous capabilities are most calls.
+    let now: unknown;
+    try {
+      now = h(whole);
+    } catch (e) {
+      answer(id, STATUS_ERR, faultedBytes(faultOf(e), e instanceof Error ? e.message : String(e)));
+      return;
+    }
+    if (!(now instanceof Promise)) {
+      answer(id, STATUS_OK, now as Uint8Array);
+      return;
+    }
+    const pending = now;
     handling.set(id, `${opName(op)}${handle}`);
     void (async () => {
       try {
-        answer(id, STATUS_OK, await h(whole));
+        answer(id, STATUS_OK, await pending);
       } catch (e) {
         // The worker turns this into a thrown HostCallError, so a capability failing is
         // an error in wac's caller rather than a silent wrong answer.
@@ -361,6 +377,11 @@ export function serveHostCalls(
       // The worker has come back: whatever it was answered with, it is parked again. That is the signal
       // the scheduler waits on before letting another worker run — see `schedule.ts`.
       sched.quiet(bridgeId);
+      // **Watched for a moment before going back to the event loop**, where a host that may block its
+      // thread asks for it (`watchMs`, the Node host's): a program making calls one after another makes
+      // the next within microseconds, and a `waitAsync` wake is the dearest of the three a call costs.
+      // Not with work in flight, whose answers need the event loop this would hold; never on a page.
+      if (handling.size === 0 && watchFor(b.ctrl, SUBMIT_SEQ, seen, opts.watchMs ?? 0)) continue;
       const w = Atomics.waitAsync(b.ctrl, SUBMIT_SEQ, seen);
       if (w.async) await w.value;
       if (!running || opts.signal?.aborted) return;

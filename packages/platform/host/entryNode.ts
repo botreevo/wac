@@ -12,7 +12,7 @@
 // Node has no permission system, so the grants are enforced by the capability world alone
 // — see `node.ts`.
 
-import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
+import { bridgeOf, CHUNK, newBridge, WATCH_MS } from "./layout.ts";
 import { type NodeDatagram, type NodeListener, type NodeSock } from "./node.ts";
 import { type WorkerLike } from "./children.ts";
 
@@ -354,7 +354,7 @@ export async function runLauncherNode(
     makeWorker: workerFrom(wt, heapLimitMb(proc)),
     selfSource: workerSource,
     ...(moduleEntry === undefined ? {} : { moduleEntry }),
-  }));
+  }), { watchMs: WATCH_MS });
 
   const heapMb = heapLimitMb(proc);
   const worker = new wt.Worker(workerSource, heapMb === undefined ? { eval: true } : { eval: true, resourceLimits: { maxOldGenerationSizeMb: heapMb } });

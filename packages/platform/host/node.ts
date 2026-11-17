@@ -30,7 +30,7 @@ import {
   want,
   type WorkerLike,
 } from "./children.ts";
-import { bridgeOf, newBridge } from "./layout.ts";
+import { bridgeOf, newBridge, WATCH_MS } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
   FAULT_NOT_GRANTED,
@@ -412,7 +412,7 @@ export function nodeWorld(
         // And the entry for a child that is a module, so that a grandchild can start one too.
         moduleEntry: opts.moduleEntry,
         cwd: childCwd === "" ? opts.cwd : childCwd,
-      }));
+      }), { watchMs: WATCH_MS });
     }, newBridge, makeWorker, graceEnv(), opts.moduleEntry ?? moduleEntryFromSource("node"),
       // As Deno's: the host thread writes, in the order the child wrote. `issues/system/0282c`.
       inheritOut

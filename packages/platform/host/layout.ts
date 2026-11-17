@@ -328,6 +328,28 @@ export function detach(b: Bridge, at: number, field: number): number {
   return Atomics.exchange(b.ctrl, at + field, 0) - 1;
 }
 
+/**
+ * Watch `ctrl[at]` for up to `ms` milliseconds without sleeping, and answer whether it moved from `seen`.
+ *
+ * **What a round trip costs on a VM is mostly waking a thread**: an `Atomics.notify` that finds the other
+ * side asleep in `Atomics.wait` or `Atomics.waitAsync` is a futex wake, a reschedule and, for `waitAsync`, a
+ * task posted to an event loop — measured at 10–15 µs each here, three of them a call, so a bare
+ * `nowMillis` cost 50–68 µs on the Node host against 2 µs on the native one. A side that watches for a
+ * moment before it sleeps finds the answer already there, and the notify that would have woken it finds
+ * nobody to wake. Short, so a side with nothing coming wastes no more than this before it sleeps.
+ */
+export function watchFor(ctrl: Int32Array, at: number, seen: number, ms: number): boolean {
+  if (!(ms > 0)) return false;
+  const end = performance.now() + ms;
+  do {
+    if (Atomics.load(ctrl, at) !== seen) return true;
+  } while (performance.now() < end);
+  return Atomics.load(ctrl, at) !== seen;
+}
+
+/** How long a side watches before it sleeps (`watchFor`): about the time a quick answer takes to come. */
+export const WATCH_MS = 0.05;
+
 /** Where slot `i`'s control block starts. */
 export function slotAt(i: number): number {
   return SLOTS_AT + i * SLOT_INTS;

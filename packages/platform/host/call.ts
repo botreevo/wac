@@ -48,6 +48,8 @@ import {
   STATUS_ERR,
   STATUS_MORE,
   SUBMIT_SEQ,
+  WATCH_MS,
+  watchFor,
 } from "./layout.ts";
 import { FAULT_OTHER } from "./faults.ts";
 import { OP } from "./ops.ts";
@@ -249,6 +251,9 @@ function parkForHost(b: Bridge, seen: number, millis = Infinity): void {
   // closed by `seen`, which was read before this call: the host bumps `DONE_SEQ` after raising the flag,
   // so a wait armed with a stale value returns at once rather than sleeping.
   gone(b);
+  // Watched for a moment first (`watchFor`): most answers are back within it, and then nothing sleeps and
+  // nothing has to be woken. A poll (`millis` 0) does not watch.
+  if (watchFor(b.ctrl, DONE_SEQ, seen, Math.min(millis, WATCH_MS))) { gone(b); return; }
   Atomics.wait(b.ctrl, DONE_SEQ, seen, millis);
   gone(b);
 }

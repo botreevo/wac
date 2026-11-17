@@ -1,0 +1,144 @@
+// wacuum driven by the light-client driver, with no consensus client of its own: a Lighthouse beacon node and its
+// validator client (all 64 validators) drive geth, which builds every block; the same beacon node serves the
+// light-client API, and `cmd/driver.wac` reads it — bootstrap, updates, blocks — and drives wacuum (on a store) through
+// the Engine API. Lighthouse never talks to wacuum. Checked: wacuum follows geth's chain with transfers in it, a
+// blob block included; wacuum killed and started again goes on; the driver killed and started again goes on from the
+// finalized root it kept; the chain finalizes and wacuum's finalized block is geth's — the light client's two-thirds
+// finality, carried to the execution client.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/cldriver.wac -- GETH PRYSM_BIN_DIR LIGHTHOUSE
+
+import { Sys } from "std";
+import { json.JsonValue } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { Check, Proc, Rpc, shell, tempDir, removeDir, somePort, addressOf, field, quantity } from "./kit.wac";
+import { prepare, prepareLighthouse, gethNode, beaconNode, lighthouseBeacon, lighthouseValidator, wacuumNode, peerAddress, beacon,
+         hashAt, growTo, decimal, blobBlock } from "./clkit.wac";
+
+async Proc driver(Sys sys, string app, string dir, i32 beaconHttp, i32 wacPort, string root) {
+  string[] argv = [app, "--beacon", "http://127.0.0.1:\{beaconHttp}", "--engine", "http://127.0.0.1:\{wacPort}", "--jwt-secret", dir + "/jwt.hex",
+                   "--network", "node", "--checkpoint", root, "--state", dir + "/driver.json", "--poll-ms", "1000"];
+  Proc p = await Proc.start(sys, argv, dir + "/driver-\{(await sys.clock().nowMillis()).orElse(0 as i64)}.log");
+  await p.says(sys, "driver: following", 300000);
+  return p;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 3) {
+    sys.warn("usage: cldriver.wac GETH PRYSM_BIN_DIR LIGHTHOUSE");
+    return 2;
+  }
+  string geth = args[0];
+  string bin = args[1];
+  string lighthouse = args[2];
+  Check t = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-cldriver");
+  string app = dir + "/wacuum-bin";
+  string drv = dir + "/driver-bin";
+  await shell(sys, "wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o \{app} > /dev/null 2>&1");
+  await shell(sys, "wac app --allow-read --allow-write --allow-net --allow-env cmd/driver.wac -o \{drv} > /dev/null 2>&1");
+  u8[] key = u8[].filled(32, 0x11);
+  string me = addressOf(key);
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+  t.that((await prepare(sys, dir, bin, me, 75)) == "", "the genesis and the keystores");
+
+  // geth, and a Prysm beacon node briefly for the spec Lighthouse's config is written from.
+  i32 gethBase = await somePort(sys, 22551, 400);
+  Proc g = await gethNode(sys, geth, dir, gethBase);
+  Rpc gr = Rpc.at(sys, gethBase + 2);
+  i32 pBase = await somePort(sys, 24551, 400);
+  Proc p = await beaconNode(sys, bin, dir, "prysm-spec", pBase, gethBase + 1, []);
+  await peerAddress(sys, p);
+  t.that((await prepareLighthouse(sys, dir, lighthouse, pBase + 1)) == "", "Lighthouse's config and keystores");
+  await p.stop(sys);
+
+  // Lighthouse and the validators drive geth; wacuum stands alone.
+  i32 aBase = await somePort(sys, 23551, 400);
+  Proc a = await lighthouseBeacon(sys, lighthouse, dir, "lighthouse", aBase, gethBase + 1, []);
+  Proc v = await lighthouseValidator(sys, lighthouse, dir, aBase + 2);
+  i32 wPort = await somePort(sys, 21551, 400);
+  Proc w = await wacuumNode(sys, app, dir, "wacuum", wPort, []);
+  Rpc wr = Rpc.at(sys, wPort);
+  t.that(field(await wr.get("eth_getBlockByNumber", "[\"0x0\",false]"), "hash") == field(await gr.get("eth_getBlockByNumber", "[\"0x0\",false]"), "hash"),
+         "wacuum and geth start from the same genesis block");
+
+  // The trusted root: the beacon node's genesis block, taken here as an operator would take a checkpoint.
+  string root = "";
+  for (i32 i = 0; i < 120 && root == ""; i++) {
+    JsonValue? gen = await beacon(sys, aBase + 2, "/eth/v1/beacon/headers/genesis");
+    root = gen?.member("data")?.member("root")?.text() ?? "";
+    if (root == "") { await sys.sleepMillis(1000); }
+  }
+  t.that(root != "", "a checkpoint: the genesis block root \{root}");
+  Proc d = await driver(sys, drv, dir, aBase + 2, wPort, root);
+
+  u64[] nonce = [0];
+  bool grew = await growTo(sys, wr, gr, 20, 400000, key, nonce);
+  t.that(grew, "wacuum, driven by the light client alone, reaches block 20: at \{quantity(await wr.text("eth_blockNumber", "[]"))}");
+  await sys.sleepMillis(3000);
+  string ours = await hashAt(wr, 20);
+  t.that(ours != "" && ours == (await hashAt(gr, 20)), "and has geth's block 20: \{ours}");
+  u64 txs = quantity(await wr.text("eth_getTransactionCount", "[\"\{me}\",\"latest\"]"));
+  t.that(txs > 0, "with the transfers in it: \{txs}");
+
+  // wacuum killed: the driver's next payload finds it gone, then back.
+  u64 before = quantity(await wr.text("eth_blockNumber", "[]"));
+  await shell(sys, "kill -9 \{w.pid}; while kill -0 \{w.pid} 2>/dev/null; do sleep 0.05; done");
+  w = await wacuumNode(sys, app, dir, "wacuum", wPort, []);
+  t.that(await growTo(sys, wr, gr, before + 10, 240000, key, nonce), "wacuum killed at \{before} and started again goes on: at \{quantity(await wr.text("eth_blockNumber", "[]"))}");
+
+  // The driver killed: started again with the same checkpoint, it takes the finalized root it kept instead.
+  u64 mid = quantity(await wr.text("eth_blockNumber", "[]"));
+  await shell(sys, "kill -9 \{d.pid}; while kill -0 \{d.pid} 2>/dev/null; do sleep 0.05; done");
+  await sys.sleepMillis(6000);
+  d = await driver(sys, drv, dir, aBase + 2, wPort, root);
+  // Before the first finality past genesis nothing is kept, and the checkpoint serves again; after it, the kept root.
+  sys.log("  the driver started again from \{(await d.output(sys)).indexOf("kept in") >= 0 ? "the finalized root it kept" : "the checkpoint (nothing finalized past it yet)"}");
+  t.that(await growTo(sys, wr, gr, mid + 10, 240000, key, nonce),
+         "the driver killed at \{mid} and started again: wacuum goes on, the missed blocks walked back: at \{quantity(await wr.text("eth_blockNumber", "[]"))}");
+
+  u64 bb = await blobBlock(sys, gr, gr, 90000);
+  t.that(bb > 0, "blob transactions in a block geth builds: block \{bb}");
+  await growTo(sys, wr, gr, bb + 2, 120000, key, nonce);
+  JsonValue? wb = await wr.get("eth_getBlockByNumber", "[\"\{U256.ofU64(bb).toHex()}\",false]");
+  JsonValue? gb = await gr.get("eth_getBlockByNumber", "[\"\{U256.ofU64(bb).toHex()}\",false]");
+  t.that(field(wb, "hash") == field(gb, "hash") && field(wb, "blobGasUsed") == field(gb, "blobGasUsed") && field(wb, "blobGasUsed") != "0x0",
+         "and wacuum has it from the driver, the versioned hashes the driver derived accepted: blob gas \{field(wb, "blobGasUsed")}");
+
+  u64 fin = 0;
+  for (i32 i = 0; i < 240 && fin < 2; i++) {
+    JsonValue? cp = await beacon(sys, aBase + 2, "/eth/v1/beacon/states/head/finality_checkpoints");
+    fin = decimal(cp?.member("data")?.member("finalized")?.member("epoch")?.text() ?? "0");
+    if (fin < 2) { await growTo(sys, wr, gr, 0, 2000, key, nonce); await sys.sleepMillis(2000); }
+  }
+  t.that(fin >= 2, "the chain finalizes: epoch \{fin}");
+  // The light client's finality reaches the driver a slot or two after the beacon node's.
+  string wf = "";
+  string gf = "";
+  for (i32 i = 0; i < 60 && (wf == "" || wf != gf); i++) {
+    await sys.sleepMillis(2000);
+    wf = field(await wr.get("eth_getBlockByNumber", "[\"finalized\",false]"), "hash");
+    gf = field(await gr.get("eth_getBlockByNumber", "[\"finalized\",false]"), "hash");
+  }
+  t.that(wf != "" && wf == gf && wf != field(await gr.get("eth_getBlockByNumber", "[\"0x0\",false]"), "hash"),
+         "wacuum's finalized block is geth's, past genesis, by the light client's finality: \{wf}");
+  u64 head = quantity(await wr.text("eth_blockNumber", "[]"));
+  t.that((await hashAt(wr, head)) == (await hashAt(gr, head)), "and the same chain at wacuum's head, block \{head}");
+
+  // Killed again, after finality: it starts from the finalized root it verified and kept, not the checkpoint.
+  await shell(sys, "kill -9 \{d.pid}; while kill -0 \{d.pid} 2>/dev/null; do sleep 0.05; done");
+  d = await driver(sys, drv, dir, aBase + 2, wPort, root);
+  t.that((await d.output(sys)).indexOf("kept in") >= 0, "the driver killed after finality starts from the finalized root it kept");
+  t.that(await growTo(sys, wr, gr, head + 5, 120000, key, nonce), "and wacuum goes on: at \{quantity(await wr.text("eth_blockNumber", "[]"))}");
+
+  await d.stop(sys);
+  await v.stop(sys);
+  await a.stop(sys);
+  await g.stop(sys);
+  await w.stop(sys);
+  if (t.failed == 0) { await removeDir(sys, dir); } else { sys.log("  kept: \{dir}"); }
+  return t.done();
+}

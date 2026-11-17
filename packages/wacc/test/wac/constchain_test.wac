@@ -1,0 +1,66 @@
+// A chain of module constants, each reading the next, is computed however long it is.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/wacc/test/wac/constchain_test.wac
+//
+// `issues/lang/0469d`: a constant reading another is a recursion of the static evaluator (`demandConst` through
+// `evalExpr`), so 2000 statics each reading the one before took the compiler's stack — `wac check` and `wac build`
+// ended in "Maximum call stack size exceeded" where a program of 600 built. An ask more than `constDeferDepth()` deep
+// defers to the outermost ask now, which settles the far end first. Measured 2026-11-14: the chain of 2000 overflowed
+// on the native host whichever end was declared first; 3001 here, in both orders, and a cycle twice the bound.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Sys } from "std";
+import { diagnoseGraph, wireHasErrors } from "../../src/api.wac";
+import { Ran, runEmittedOne, scratchDir } from "./artifacts_probe.wac";
+
+static i32 N = 3001;
+
+/** `C0 = 1` and each `Ck = C(k-1) + 1`, declared from `C0` up — the order the checker asks in, so its asks are shallow. */
+string upward() {
+  string out = "static i32 C0 = 1;\n";
+  for (i32 k = 1; k < N; k++) { out = out + "static i32 C\{k} = C\{k - 1} + 1;\n"; }
+  return out + "export i32 main() { return C\{N - 1} % 250; }\n";
+}
+
+/** The same chain declared from the top down, so the first constant asked for reads every other one in turn. */
+string downward() {
+  string out = "";
+  for (i32 k = N - 1; k >= 1; k--) { out = out + "static i32 C\{k} = C\{k - 1} + 1;\n"; }
+  return out + "static i32 C0 = 1;\nexport i32 main() { return C\{N - 1} % 250; }\n";
+}
+
+Ran built(Sys sys, string source, string name) {
+  return runEmittedOne(sys.env(), sys.files(), sys.procs(), "/t/m.wac", source, scratchDir(sys.env(), sys.files()), name);
+}
+
+export string test_a_chain_declared_from_its_far_end_builds_and_has_its_value(Sys sys) {
+  T t = T.create();
+  Ran r = built(sys, upward(), "constchainup.wasm");
+  t.isTrue(r.ok, "the program checked, built and ran — " + r.error + r.stderr);
+  t.eqI32(r.status, N % 250, "C\{N - 1} is \{N}");
+  return t.report();
+}
+
+export string test_a_chain_declared_from_its_near_end_builds_and_has_its_value(Sys sys) {
+  T t = T.create();
+  Ran r = built(sys, downward(), "constchaindown.wasm");
+  t.isTrue(r.ok, "the program checked, built and ran — " + r.error + r.stderr);
+  t.eqI32(r.status, N % 250, "C\{N - 1} is \{N}");
+  return t.report();
+}
+
+export string test_a_cycle_longer_than_the_bound_is_said_with_its_whole_chain(Sys sys) {
+  T t = T.create();
+  // `C0` reads `C299`, which reads `C298`, … down to `C1`, which reads `C0`: the checker asks for `C0` first and the
+  // chain it would print without the bound is all 300, in that order.
+  string src = "static i32 C0 = C299 + 1;\n";
+  for (i32 k = 1; k < 300; k++) { src = src + "static i32 C\{k} = C\{k - 1} + 1;\n"; }
+  src = src + "export i32 main() { return 0; }\n";
+  string d = diagnoseGraph(["/t/c.wac"], [src], "/t/c.wac");
+  t.isTrue(wireHasErrors(d), "a cycle is an error");
+  t.isTrue(d.indexOf("the value of `C0` needs itself: `C0` -> `C299` -> `C298` -> ") >= 0,
+           "said from the constant asked for, through the far end: " + d.slice(0, d.len() < 400 ? d.len() : 400));
+  t.isTrue(d.indexOf("`C174` -> `C173` -> `C172` -> `C171` -> ") >= 0, "and across where the bound fell");
+  t.isTrue(d.indexOf("`C2` -> `C1` -> `C0`") >= 0, "and back to where it began");
+  return t.report();
+}

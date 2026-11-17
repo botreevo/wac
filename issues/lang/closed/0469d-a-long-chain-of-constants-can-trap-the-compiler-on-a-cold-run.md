@@ -1,7 +1,6 @@
 # 0469d — a long chain of constants can trap the compiler on a cold run, and not on a warm one
 
-- **Status:** open
-- **Claimed by:** wac1 (after the silent-cap sweep's second batch)
+- **Status:** closed 2026-11-17 (cloud) — `packages/wacc/src/consteval.wac` (`demandConst`, `demandOneConst`, `deferredCycle`); `packages/wacc/test/wac/constchain_test.wac`
 - **Reported by:** wac1, writing `packages/wacc/test/wac/manystatics_test.wac` for the sweep after `issues/lang/0468d`
 - **Date:** 2026-11-13
 - **Kind:** bug (compiler robustness)
@@ -34,3 +33,20 @@ can overflow the stack only on a cold run. That would also explain why 1100 pass
 What to find out: whether the trap is a stack overflow and at what depth; whether `wac build` (the compiler in its own
 child, with the host's stack) hits it too; and whether `demandConst` should be iterative — a worklist over the
 dependency order, which `constOrder` already records — so a chain's length never meets the stack at all.
+
+## Fix
+
+**It was a stack overflow, and deterministic.** A constant reading another is a recursion of the static evaluator
+(`demandConst` → `evalExpr` → `demandConst`). Asked of the real compiler on 2026-11-14: 2000 statics each reading the
+one before, declared from `C0` up, checked clean and failed `wac build` with "Maximum call stack size exceeded";
+declared from the top down, so the first constant the checker asks for reads every other one, `wac check` failed too.
+600 ran. The cold/warm difference in the report was the depth sitting near the limit, where frame sizes decide it.
+
+**An ask more than `constDeferDepth()` (128) constants deep defers to the outermost ask.** Everything between unwinds,
+unsettled, with a status nothing outside the evaluator sees (`evDeferred`); the outermost ask computes the constant
+that was wanted, then asks again. The values and the dependency order (`constOrder`) are the ones the recursion gave,
+and the stack never holds more than the bound. A chain that comes back to an ask still waiting is a cycle: the stacks
+the deferrals saw, end to end, are the stack the unbounded evaluator would have had, so the message names the same
+constant and the same chain, now not cut at the demand stack's 256 entries, and every constant on it gives up with those
+words. `constchain_test.wac`: chains of 3001 in both orders build and run, and a 300-long cycle is said in full. The
+first two trapped on the old compiler.

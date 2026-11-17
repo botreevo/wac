@@ -78,6 +78,13 @@ export i32 evLimit() { return 5; }
 export i32 evCycle() { return 6; }
 /** A construct this evaluator does not implement. A prototype gap, not a rule. */
 export i32 evUnsupported() { return 7; }
+/**
+ * A constant asked for too deep in a chain of them to compute here: unwinding to the outermost ask, which computes
+ * it first and then asks again (`demandConst`, `issues/lang/0469d`). Never seen outside the evaluator.
+ */
+export i32 evDeferred() { return 8; }
+/** How many constants deep one ask may go before the next is deferred to the outermost ask. */
+export i32 constDeferDepth() { return 128; }
 
 /** Did the run end with a value rather than with something to report? */
 export bool evFinished(i32 status) { return status == evOk() || status == evReturn(); }
@@ -214,6 +221,13 @@ export struct Ev {
   i32[] typeGuards;
   i32 typeDepth;
   i32 guards;
+  /** How many `demandConst`s are computing a constant right now, outermost first. */
+  i32 constDepth;
+  /** The constant a deferral unwound for: the outermost ask computes it before asking again. */
+  i32 deferredConst;
+  /** The demand stack and the constants being computed when that deferral happened, before unwinding took them. */
+  string[] deferredSaid;
+  i32[] deferredHeld;
 
   Ev create() {
     return Ev(evOk(), noneValue(), "", 0, 8000000,
@@ -224,7 +238,7 @@ export struct Ev {
               i32[].filled(1024, 0), Value[].filled(1024, noneValue()), i32[].filled(1024, 0), string[].filled(1024, ""),
               i32[].filled(1024, 0), 0,
               string[].filled(64, ""), string[].filled(64, ""), 0,
-              string[].filled(64, ""), i32[].filled(64, 0), 0, 0);
+              string[].filled(64, ""), i32[].filled(64, 0), 0, 0, 0, 0 - 1, string[](), i32[]());
   }
 
   /** Bind type parameter `name` to the type spelled `ty` until the count is put back. */
@@ -755,6 +769,83 @@ void growConsts(Ev ev, i32 need) {
  * the chain that got there is the only useful thing to print.
  */
 export Value demandConst(Ev ev, Decls cx, i32 ci) {
+  if (ci < 0 || ev.constDepth > 0) { return demandOneConst(ev, cx, ci); }
+  // **The outermost ask settles a deep chain from its far end** (`issues/lang/0469d`). A constant reading another is a
+  // recursion of this evaluator, through `evalExpr`, so 2000 statics each reading the one before overflowed the
+  // compiler's stack and `wac check` ended in "Maximum call stack size exceeded". An ask more than `constDeferDepth()`
+  // constants deep defers instead: everything between unwinds, unsettled, to here, and this computes the constant it
+  // wanted first and then asks again — the same values, in the same dependency order, never deeper than the bound.
+  i32 status = ev.status;
+  string message = ev.message;
+  i32 locals = ev.localCount;
+  i32 frame = ev.frameBase;
+  i32 depth = ev.depth;
+  i32 demand = ev.demandCount;
+  i32 tps = ev.tpCount;
+  i32 types = ev.typeDepth;
+  i32 guards = ev.guards;
+  string ret = ev.returnType;
+  i32[] pending = i32[].filled(8, 0);
+  // Per deferral: the asks on the stack below this one when it happened, and the constants among them.
+  string[][] said = string[][].filled(8, string[]());
+  i32[][] held = i32[][].filled(8, i32[]());
+  bool[] seen = bool[]();
+  pending[0] = ci;
+  i32 n = 1;
+  while (true) {
+    ev.status = status; ev.message = message; ev.localCount = locals; ev.frameBase = frame; ev.depth = depth;
+    ev.demandCount = demand; ev.tpCount = tps; ev.typeDepth = types; ev.guards = guards; ev.returnType = ret;
+    ev.constDepth = 0;
+    Value v = demandOneConst(ev, cx, pending[n - 1]);
+    if (ev.status != evDeferred()) {
+      if (n == 1) { return v; }
+      // Settled, or gave up: either way it answers the next ask from its table, as any settled constant does.
+      n = n - 1;
+      continue;
+    }
+    i32 want = ev.deferredConst;
+    if (n == pending.len()) {
+      i32[] more = i32[].filled(n * 2, 0);
+      string[][] moreSaid = string[][].filled(n * 2, string[]());
+      i32[][] moreHeld = i32[][].filled(n * 2, i32[]());
+      for (i32 k = 0; k < n; k++) { more[k] = pending[k]; moreSaid[k] = said[k]; moreHeld[k] = held[k]; }
+      pending = more;
+      said = moreSaid;
+      held = moreHeld;
+    }
+    string[] all = ev.deferredSaid;
+    string[] mine = string[].filled(all.len() > demand ? all.len() - demand : 0, "");
+    for (i32 k = 0; k < mine.len(); k++) { mine[k] = all[demand + k]; }
+    said[n - 1] = mine;
+    held[n - 1] = ev.deferredHeld;
+    // **A constant on two of these stacks is a cycle**: the stacks end to end are one stack, and it was asked for while
+    // that stack already held it.
+    bool again = false;
+    i32[] now = held[n - 1];
+    for (i32 k = 0; k < now.len(); k++) {
+      if (now[k] < seen.len() && seen[now[k]]) { again = true; }
+    }
+    if (seen.len() < ev.constState.len()) {
+      bool[] wider = bool[].filled(ev.constState.len(), false);
+      for (i32 k = 0; k < seen.len(); k++) { wider[k] = seen[k]; }
+      seen = wider;
+    }
+    for (i32 k = 0; k < now.len(); k++) { seen[now[k]] = true; }
+    for (i32 k = 0; k < n; k++) { if (pending[k] == want) { again = true; } }
+    if (again) {
+      ev.localCount = locals; ev.frameBase = frame; ev.depth = depth; ev.demandCount = demand; ev.tpCount = tps;
+      ev.typeDepth = types; ev.guards = guards; ev.returnType = ret; ev.constDepth = 0;
+      deferredCycle(ev, cx, demand, said, held, n, want);
+      return noneValue();
+    }
+    pending[n] = want;
+    n = n + 1;
+  }
+  return noneValue();
+}
+
+/** `demandConst`'s work for one constant, deferring rather than going past `constDeferDepth()`. */
+Value demandOneConst(Ev ev, Decls cx, i32 ci) {
   if (ci < 0) { return noneValue(); }
   // **Grown to the constant asked for, never answered "no value" past the end.** The tables were a fixed 1024, and a
   // constant past them answered nothing with the status still ok — check.wac asks this for every constant a program
@@ -775,13 +866,27 @@ export Value demandConst(Ev ev, Decls cx, i32 ci) {
     return noneValue();
   }
   if (cx.constInits[ci] is null) { return noneValue(); }
+  if (ev.constDepth >= constDeferDepth()) {
+    ev.status = evDeferred();
+    ev.deferredConst = ci;
+    ev.deferredSaid = demandsFrom(ev, 0);
+    ev.deferredHeld = constsInFlight(ev);
+    return noneValue();
+  }
 
   ev.constState[ci] = 1;
   pushDemand(ev, "`" + cx.constNames[ci] + "`");
+  ev.constDepth = ev.constDepth + 1;
   i32 mark = ev.localCount;
   Value v = evalExpr(ev, cx, cx.constFiles[ci], cx.constInits[ci]!, cx.constTypes[ci]);
   ev.localCount = mark;
+  ev.constDepth = ev.constDepth - 1;
   popDemand(ev);
+  // Unwinding for a deferral is not giving up: not started, so the ask after the deferred one computes it afresh.
+  if (ev.status == evDeferred()) {
+    ev.constState[ci] = 0;
+    return noneValue();
+  }
 
   if (!evFinished(ev.status)) {
     ev.constState[ci] = 3;
@@ -797,6 +902,68 @@ export Value demandConst(Ev ev, Decls cx, i32 ci) {
     ev.constOrderCount = ev.constOrderCount + 1;
   }
   return v;
+}
+
+/** The asks on the demand stack from `from` up, as `chainOf` spells them. */
+string[] demandsFrom(Ev ev, i32 from) {
+  i32 top = ev.demandCount < ev.demand.len() ? ev.demandCount : ev.demand.len();
+  i32 n = top > from ? top - from : 0;
+  string[] out = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { out[i] = ev.demand[from + i]; }
+  return out;
+}
+
+/** The constants being computed right now. */
+i32[] constsInFlight(Ev ev) {
+  i32 n = 0;
+  for (i32 i = 0; i < ev.constState.len(); i++) { if (ev.constState[i] == 1) { n = n + 1; } }
+  i32[] out = i32[].filled(n, 0);
+  i32 k = 0;
+  for (i32 i = 0; i < ev.constState.len(); i++) {
+    if (ev.constState[i] == 1) { out[k] = i; k = k + 1; }
+  }
+  return out;
+}
+
+/**
+ * A chain of deferrals that came back to an ask still waiting: a cycle, said as the evaluator without the bound would
+ * have said it. The stacks the deferrals saw, end to end, are the stack it would have had; it would have stopped at the
+ * first constant asked for while that stack already held it, and every constant on the stack gives up with its words.
+ */
+void deferredCycle(Ev ev, Decls cx, i32 demand, string[][] said, i32[][] held, i32 n, i32 want) {
+  i32 total = demand + 1;
+  for (i32 k = 0; k < n; k++) { total = total + said[k].len(); }
+  string[] chain = string[].filled(total, "");
+  i32 m = 0;
+  for (i32 i = 0; i < demand && i < ev.demand.len(); i++) { chain[m] = ev.demand[i]; m = m + 1; }
+  for (i32 k = 0; k < n; k++) {
+    string[] part = said[k];
+    for (i32 i = 0; i < part.len(); i++) { chain[m] = part[i]; m = m + 1; }
+  }
+  chain[m] = "`" + cx.constNames[want] + "`";
+  m = m + 1;
+  i32 stop = m - 1;
+  for (i32 j = 0; j < m && stop == m - 1; j++) {
+    if (chain[j].indexOf("`") != 0) { continue; }
+    for (i32 i = 0; i < j; i++) {
+      if (chain[i] == chain[j]) { stop = j; break; }
+    }
+  }
+  string out = "";
+  for (i32 i = 0; i < stop; i++) { out = out + (i > 0 ? " -> " : "") + chain[i]; }
+  string name = chain[stop].slice(1, chain[stop].len() - 1);
+  ev.status = evCycle();
+  ev.message = "the value of `" + name + "` needs itself: " + out + " -> `" + name + "`";
+  for (i32 k = 0; k < n; k++) {
+    i32[] them = held[k];
+    for (i32 i = 0; i < them.len(); i++) {
+      i32 c = them[i];
+      if (ev.constState[c] == 2) { continue; }
+      ev.constState[c] = 3;
+      ev.constFail[c] = evCycle();
+      ev.constWhy[c] = ev.message;
+    }
+  }
 }
 
 export void pushDemand(Ev ev, string what) {

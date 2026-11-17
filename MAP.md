@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `wac task map` after adding a package or an entry point; `wac task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-34 packages, 184,523 lines of wac, 2884 tests,
+34 packages, 184,523 lines of wac, 2860 tests,
 87 command-line programs and 13 browser pages.
 
 ## Packages
@@ -27,7 +27,7 @@ In dependency order: nothing here imports anything below it.
 | [`ts`](packages/ts/) | TypeScript to JavaScript, in wac. | 2,534 | 43 | `gzip` |
 | [`bignum`](packages/bignum/) | Arbitrary-precision integers. | 770 | 25 | `wactest` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,177 | 55 | `crypto` |
-| [`box`](packages/box/) | 66 applets in one program, chosen by the first argument — 65 tools and `help`, which prints the list. | 8,650 | 71 | `bytes` `codec` `crypto` `datetime` `fmt` `fs` `gzip` `http` `json` `platform` `raster` `regex` `server` `sh` `tls` `unicode` `url` `zstd` |
+| [`box`](packages/box/) | 66 applets in one program, chosen by the first argument — 65 tools and `help`, which prints the list. | 8,650 | 47 | `bytes` `codec` `crypto` `datetime` `fmt` `fs` `gzip` `http` `json` `platform` `raster` `regex` `server` `sh` `tls` `unicode` `url` `zstd` |
 | [`crypto`](packages/crypto/) | The hashes, AEADs, curves and one KEM the rest of this repo is built on — written in wac, calling nothing. | 7,381 | 316 | `bignum` `codec` `wactest` |
 | [`fetch`](packages/fetch/) | One HTTP request to a URL — `http://` or `https://` — and the whole response back. | 360 | 2 | `bytes` `http` `tls` |
 | [`fmt`](packages/fmt/) | Numbers to and from text. | 1,287 | 10 | `wactest` |

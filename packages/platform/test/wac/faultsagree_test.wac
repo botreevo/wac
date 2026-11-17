@@ -1,0 +1,219 @@
+// The fault numbering exists twice on this side of the hosts, and this is where the two copies are made to agree.
+//
+//     wac test --allow-read packages/platform/test/wac/faultsagree_test.wac
+//
+// `host/faults.ts` classifies a host error into a category; `std/platform.wac` names the same categories for the
+// program on the other side of the bridge. Neither can import the other, so the numbers are a shared constant with a
+// copy on each side, and nothing checked that they matched. Insert a category in one file and every code above it
+// shifts: a missing file starts reporting as denied, `rm -f` starts failing, and no test says a word, because each side
+// is internally consistent. The two Rust hosts' copies are `hostfaults_test.wac`'s.
+//
+// It was packages/platform/test/faults_agree.test.ts, which bound a wac probe from TypeScript to hold the wac numbers
+// beside the module's; both went on 2026-11-17. **Here both sides are read as source**, which is the same
+// instrument `hostfaults_test.wac` argues for: the thing compared *is* two pieces of source no program imports across,
+// and every scan below fails when it finds nothing. The scan of `platform.wac` is itself checked against the values
+// the program actually has, so a scan that misreads cannot agree with a wrong file. What is left of the TypeScript —
+// how `faultOf` and `statFault` classify an error — is a host unit test with no wac in it, `test/faults.test.ts`.
+//
+// The second half is about **`Stat`**. `Change` and `FileResult` carry the host's own sentence, so a category with no
+// phrase falls back to something readable. `Stat` carries no message — only the category — so a fault whose phrase is
+// empty prints as nothing at all: `stat: cannot tell — ` with the line ending after the dash. Every category a `stat`
+// can answer with therefore has to have words.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Files, Sys,
+         FAULT_NONE, FAULT_NOT_FOUND, FAULT_DENIED, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_OTHER,
+         FAULT_NOT_REPRESENTABLE, FAULT_NOT_GRANTED, FAULT_IS_DIR, FAULT_UNSUPPORTED,
+         FAULT_NOT_A_DIR, FAULT_READ_ONLY, FAULT_NAME_TOO_LONG, FAULT_LOOP, FAULT_NO_SPACE,
+         FAULT_REFUSED, FAULT_UNREACHABLE, FAULT_TIMED_OUT, faultWords } from "std";
+import { Vec, flatten } from "core";
+import { splitLines, startsWith, trimmed } from "../../../wactest/src/strings.wac";
+
+static string HOST = "packages/platform/host/faults.ts";
+static string STD = "std/platform.wac";
+
+struct Named {
+  string name;
+  i32 code;
+}
+
+/** The categories as this program has them — the values, not a reading of the source. */
+Named[] live() {
+  return [Named("FAULT_NONE", FAULT_NONE()), Named("FAULT_NOT_FOUND", FAULT_NOT_FOUND()),
+          Named("FAULT_DENIED", FAULT_DENIED()), Named("FAULT_EXISTS", FAULT_EXISTS()),
+          Named("FAULT_NOT_EMPTY", FAULT_NOT_EMPTY()), Named("FAULT_OTHER", FAULT_OTHER()),
+          Named("FAULT_NOT_REPRESENTABLE", FAULT_NOT_REPRESENTABLE()), Named("FAULT_NOT_GRANTED", FAULT_NOT_GRANTED()),
+          Named("FAULT_IS_DIR", FAULT_IS_DIR()), Named("FAULT_UNSUPPORTED", FAULT_UNSUPPORTED()),
+          Named("FAULT_NOT_A_DIR", FAULT_NOT_A_DIR()), Named("FAULT_READ_ONLY", FAULT_READ_ONLY()),
+          Named("FAULT_NAME_TOO_LONG", FAULT_NAME_TOO_LONG()), Named("FAULT_LOOP", FAULT_LOOP()),
+          Named("FAULT_NO_SPACE", FAULT_NO_SPACE()), Named("FAULT_REFUSED", FAULT_REFUSED()),
+          Named("FAULT_UNREACHABLE", FAULT_UNREACHABLE()), Named("FAULT_TIMED_OUT", FAULT_TIMED_OUT())];
+}
+
+string source(T t, Files fs, string path) {
+  u8[]? b = flatten(fs.readFile(path).wait()).ok();
+  t.isTrue(b is not null, "\{path} is readable");
+  return b is null ? "" : string.fromBytes(b!);
+}
+
+/** The decimal at the start of `s`, or -1. */
+i32 leadingNumber(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  i32 i = 0;
+  while (i < b.len() && b[i] >= '0' && b[i] <= '9') { n = n * 10 + (b[i] as i32 - '0'); i = i + 1; }
+  return i == 0 ? 0 - 1 : n;
+}
+
+/** The identifier at the start of `s`: capitals, digits and `_`. */
+string leadingName(string s) {
+  i32 i = 0;
+  while (i < s.len() && "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".indexOf(s.slice(i, i + 1)) >= 0) { i = i + 1; }
+  return s.slice(0, i);
+}
+
+/** Each `export const FAULT_X = N;` in the TypeScript. */
+Named[] ofHost(string src) {
+  Vec<Named> out = Vec.create();
+  const string MARK = "export const FAULT_";
+  for (string line in splitLines(src)) {
+    if (!startsWith(line, MARK)) { continue; }
+    string rest = line.slice(MARK.len() - 6, line.len());
+    string name = leadingName(rest);
+    i32 eq = rest.indexOf("= ");
+    if (name.len() <= 6 || eq < 0) { continue; }
+    out.push(Named(name, leadingNumber(rest.slice(eq + 2, rest.len()))));
+  }
+  return out.toArray();
+}
+
+/** Each `export i32 FAULT_X() { return N; }` in std. */
+Named[] ofStd(string src) {
+  Vec<Named> out = Vec.create();
+  const string MARK = "export i32 FAULT_";
+  for (string line in splitLines(src)) {
+    if (!startsWith(line, MARK)) { continue; }
+    string rest = line.slice(MARK.len() - 6, line.len());
+    string name = leadingName(rest);
+    i32 ret = rest.indexOf("return ");
+    if (name.len() <= 6 || ret < 0) { continue; }
+    out.push(Named(name, leadingNumber(rest.slice(ret + 7, rest.len()))));
+  }
+  return out.toArray();
+}
+
+/** `name`'s code in `ns`, or -2 when it is not there. */
+i32 codeOf(Named[] ns, string name) {
+  for (Named n in ns) { if (n.name == name) { return n.code; } }
+  return 0 - 2;
+}
+
+/** Each category `phraseOf` answers with words, read from its `if (fault === FAULT_X) return "…"` arms. */
+string[] phrased(string src) {
+  Vec<string> out = Vec.create();
+  i32 at = src.indexOf("export function phraseOf(");
+  if (at < 0) { return out.toArray(); }
+  string body = src.slice(at, src.len());
+  i32 end = body.indexOf("\n}");
+  if (end >= 0) { body = body.slice(0, end); }
+  const string ARM = "if (fault === ";
+  for (string line in splitLines(body)) {
+    string l = trimmed(line);
+    if (!startsWith(l, ARM)) { continue; }
+    string rest = l.slice(ARM.len(), l.len());
+    i32 q = rest.indexOf(") return \"");
+    // An arm that returns `""` is a category without words, and says so.
+    if (q < 0 || rest.slice(q + 10, q + 11) == "\"") { continue; }
+    out.push(leadingName(rest));
+  }
+  return out.toArray();
+}
+
+bool listed(string[] xs, string x) {
+  for (string s in xs) { if (s == x) { return true; } }
+  return false;
+}
+
+export string test_the_scan_of_std_reads_what_the_program_has(Sys sys) {
+  T t = T.create();
+  // Without this, everything below compares two readings of source, and a scan that misread `platform.wac` the same
+  // way twice would agree with itself.
+  Named[] scanned = ofStd(source(t, sys.files(), STD));
+  Named[] have = live();
+  t.eqI32(scanned.len(), have.len(), "std exports \{scanned.len()} FAULT_ functions and this file names \{have.len()} — "
+          + "add the new category to `live`");
+  for (Named n in have) { t.eqI32(codeOf(scanned, n.name), n.code, "\{n.name}: the scan read a different number"); }
+  return t.report();
+}
+
+export string test_the_two_copies_of_the_fault_numbering_agree(Sys sys) {
+  T t = T.create();
+  Named[] host = ofHost(source(t, sys.files(), HOST));
+  Named[] wac = live();
+  t.isTrue(host.len() > 10, "only \{host.len()} categories were read from \{HOST}");
+  for (Named n in wac) {
+    i32 h = codeOf(host, n.name);
+    t.isTrue(h != 0 - 2, "\{n.name} is in platform.wac and not in \{HOST}");
+    if (h != 0 - 2) { t.eqI32(h, n.code, "\{n.name}: platform.wac says \{n.code}, host/faults.ts says \{h}"); }
+  }
+  // The other direction, which the list above cannot make about itself: a category added to the host and stopped at.
+  string extra = "";
+  for (Named n in host) { if (codeOf(wac, n.name) == 0 - 2) { extra = extra + " " + n.name; } }
+  t.eqStr(extra, "", "host/faults.ts exports categories platform.wac does not have");
+  // And no two share a number.
+  string shared = "";
+  for (i32 i = 0; i < wac.len(); i++) {
+    for (i32 j = i + 1; j < wac.len(); j++) {
+      if (wac[i].code == wac[j].code) { shared = shared + " " + wac[i].name + "=" + wac[j].name; }
+    }
+  }
+  t.eqStr(shared, "", "two categories share a number");
+  return t.report();
+}
+
+export string test_every_category_a_stat_can_answer_with_has_words() {
+  T t = T.create();
+  // `Stat` has no message field, so an empty phrase is an empty reason. These are what a `stat` reply can carry:
+  // `statFault` narrows a host error to three of them, the hosts answer `FAULT_NOT_GRANTED` themselves when the world
+  // has no read capability, and `FAULT_NONE` means the answer is the answer.
+  for (i32 f in [FAULT_NOT_REPRESENTABLE(), FAULT_DENIED(), FAULT_NOT_GRANTED(), FAULT_NOT_A_DIR()]) {
+    t.isTrue(faultWords(f).len() > 0, "category \{f} would print an empty reason");
+  }
+  t.eqStr(faultWords(FAULT_NONE()), "", "FAULT_NONE is not a fault and has nothing to say");
+  return t.report();
+}
+
+export string test_the_categories_with_words_say_what_the_real_tools_say() {
+  T t = T.create();
+  // GNU's own strings, because that is what the differential tests compare against — a shell of ours printing "file
+  // not found" where `cat` prints "No such file or directory" fails those on the text.
+  t.eqStr(faultWords(FAULT_NOT_FOUND()), "No such file or directory", "not found");
+  t.eqStr(faultWords(FAULT_DENIED()), "Permission denied", "denied");
+  t.eqStr(faultWords(FAULT_EXISTS()), "File exists", "exists");
+  t.eqStr(faultWords(FAULT_NOT_EMPTY()), "Directory not empty", "not empty");
+  t.eqStr(faultWords(FAULT_NOT_A_DIR()), "Not a directory", "not a directory — GNU's phrase, which `ls f/g` prints");
+  // These two have no GNU equivalent: a program the operating system starts was handed everything the operating system
+  // has, and every name it can hold is one its filesystem can express.
+  t.eqStr(faultWords(FAULT_NOT_GRANTED()), "Not granted to this application", "not granted");
+  t.eqStr(faultWords(FAULT_NOT_REPRESENTABLE()), "cannot be named on this host", "not representable");
+  // `FAULT_OTHER` deliberately has none: it means the host said something no category covers, and the thing worth
+  // printing is that sentence. Both carriers of it — `Change` and `FileResult` — have one.
+  t.eqStr(faultWords(FAULT_OTHER()), "", "other");
+  return t.report();
+}
+
+export string test_the_hosts_phrase_list_covers_the_same_categories(Sys sys) {
+  T t = T.create();
+  // `phraseOf` is the host's own rendering — lower case, for embedding in a sentence a page shows — and it is a separate
+  // list from `faultWords`. So the thing to hold is not the wording but *which categories have any*: a category with
+  // words on one side and none on the other is a reader who gets an explanation from Deno and a blank from the browser.
+  string[] host = phrased(source(t, sys.files(), HOST));
+  t.isTrue(host.len() > 10, "only \{host.len()} phrased categories were read from phraseOf in \{HOST}");
+  for (Named n in live()) {
+    bool there = listed(host, n.name);
+    bool here = faultWords(n.code).len() > 0;
+    t.isTrue(there == here, "\{n.name}: phraseOf \{there ? "has words" : "has none"}, faultWords "
+             + "\{here ? "has \"" + faultWords(n.code) + "\"" : "has none"}");
+  }
+  return t.report();
+}

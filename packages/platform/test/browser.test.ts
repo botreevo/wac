@@ -16,7 +16,7 @@ import { i32le, readI32le, str, unstr } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
 // The categories by name rather than by number. Five assertions below wrote the number and named
 // the constant in the message beside it — so the two could disagree, and the message would be the
-// one lying. `faults_agree.test.ts` would catch a renumbering, but not in a way that points here.
+// one lying. `faultsagree_test.wac` would catch a renumbering, but not in a way that points here.
 import {
   FAULT_EXISTS,
   FAULT_NOT_EMPTY,

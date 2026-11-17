@@ -162,27 +162,67 @@ live traffic, while B is built. `deploy/mainnet/` installs it. *Probability it r
   `WACUUM_PRESTATE=1` names each block's reads with the node's `prestateTracer` in one call instead of
   learning them, for a node that serves `debug_` (a local reth or geth).
 - `tools/mainnet/follow.sh`: the shadow — each new head block replayed and logged, one line a block.
-- `deploy/mainnet/`: `install.sh` (wac at the pin, wac-eth, the unit tests, the service user and layout),
-  `reference.sh` (reth and Lighthouse from their releases, checkpoint-synced, as services) and the three
-  systemd units.
+- `deploy/mainnet/`: `preflight.sh` (the machine checked against this page before anything is installed),
+  `install.sh` (wac at the pin, wac-eth, the unit tests, the service user and layout, metrics and log rotation),
+  `reference.sh` (reth and Lighthouse from their releases, checkpoint-synced, as services), and the units:
+  `reth`, `lighthouse`, `wacuum-shadow`, and `wacuum-status.timer`, which writes the shadow's status each minute
+  as Prometheus metrics (`tools/mainnet/status.wac`).
 
 ## Runbook
 
 (This is the mainnet shadow's. **Hoodi comes first** — wacuum on its own store, snap-synced, driven by
 Lighthouse beside a geth reference: `docs/hoodi.md` and `deploy/hoodi/`.)
 
-1. `sh deploy/mainnet/install.sh` as root — about 15 minutes, most of it building wac from source.
-2. `sh deploy/mainnet/reference.sh RETH_VERSION LIGHTHOUSE_VERSION` with the current releases. Lighthouse
-   checkpoint-syncs in minutes; reth's full sync takes one to three days on this disk. Progress:
-   `journalctl -fu reth`, and `curl -s localhost:8545 -H 'content-type: application/json' -d
+1. **Check the machine**: `sh deploy/mainnet/preflight.sh` (from a checkout, or fetched alone) — the OS, cores,
+   memory, `/data` (size, free, solid state), the clock, the p2p ports, and the outbound HTTPS the install needs.
+   It changes nothing; a FAIL line says what to fix. A virtual disk that calls itself rotational is a WARN: ask
+   the provider.
+2. **Install**: `sh deploy/mainnet/install.sh` as root — about 20 minutes, most of it building wac from source.
+   `WAC_URL=https://git.voltrevo.com/wac.git` if the box reaches that and not GitHub. It installs wac at
+   wac-eth's pin, runs wacuum's unit tests as the service user, node_exporter on 127.0.0.1:9100, the units, and
+   logrotate's rule for the shadow's log.
+3. **The reference**: `sh deploy/mainnet/reference.sh RETH_VERSION LIGHTHOUSE_VERSION` with the current
+   releases. Lighthouse checkpoint-syncs in minutes; reth's full sync takes one to three days on this disk.
+   Progress: `journalctl -fu reth`, and `curl -s localhost:8545 -H 'content-type: application/json' -d
    '{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}'` answers `false` when it is done.
-3. `systemctl enable --now wacuum-shadow`. Its log is `/data/wacuum/follow.log`: `N ok MS ms MGAS Mgas/s` a
-   block, or `N DIFFERS …` with the reason. A block that differed keeps every answer under
-   `/opt/wac-eth/packages/wacuum/scratch/follow/N`; `sh tools/mainnet/replay.sh N 1 scratch/follow/N`
-   replays it again by hand, without the network.
-4. After a crash or a reboot every service restarts itself; the shadow resumes from the last block in its
-   log, or from the head if it has fallen more than 64 behind.
-5. Progress for whoever asks: `tail /data/wacuum/follow.log`, `grep -c DIFFERS /data/wacuum/follow.log`.
+4. **The shadow**: `systemctl enable --now wacuum-shadow wacuum-status.timer`.
+
+### What it writes, and where to look
+
+- **The log**, `/data/wacuum/follow.log`: `N ok MS ms MGAS Mgas/s` a block, or `N DIFFERS … — why`. Rotated weekly,
+  26 kept, compressed. `journalctl -u wacuum-shadow` has only what goes wrong around it (a build that failed, a
+  node that did not answer).
+- **A block that differed** keeps every answer under `/data/wacuum/differs/N`; `sh tools/mainnet/replay.sh N 1
+  /data/wacuum/differs/N` replays it again by hand, without the network. That directory is the bug report.
+- **Status, by hand**: `sh tools/mainnet/status.sh /data/wacuum/follow.log` (from `/opt/wac-eth/packages/wacuum`,
+  as `wacuum`) — blocks checked and differed, the last, the lag behind reth's head, and a block's time and Mgas/s
+  (median, p95, most) over the last 1000.
+- **Metrics**, each minute: `curl -s 127.0.0.1:9100/metrics | grep wacuum_shadow` —
+  `wacuum_shadow_blocks{result="ok"|"differs"}`, `wacuum_shadow_last_block`, `wacuum_shadow_last_differs`,
+  `wacuum_shadow_lag_blocks` (-1 when reth did not answer), `wacuum_shadow_block_ms{quantile}` and
+  `wacuum_shadow_mgas_per_second{quantile}`; with node_exporter's own (disk, memory, CPU). Nothing scrapes
+  them yet: point a Prometheus at it over an SSH tunnel, or read them with curl.
+- **What to alert on**, when something scrapes: `wacuum_shadow_blocks{result="differs"}` rising (a block
+  wacuum computes differently from mainnet: the point of the exercise); `wacuum_shadow_lag_blocks > 10` for
+  ten minutes (the shadow stuck or too slow — or reth behind, which `eth_syncing` tells apart);
+  `wacuum_shadow_block_ms{quantile="0.95"} > 4000` (a block's replay near a third of the slot); the data disk
+  past 85%.
+
+### Restarts and upgrades
+
+After a crash or a reboot every service restarts itself; the shadow resumes from the last block in its log, or
+from the head if it has fallen more than 64 behind (and after a rotation, from the head). Upgrading is
+`install.sh` again — it pulls wac-eth, moves wac to its pin if it moved, reruns the tests — then
+`systemctl restart wacuum-shadow`.
+
+Tested here (2026-11-17, an Ubuntu 24.04 container, not the box): `preflight.sh`; `install.sh` end to end, twice
+(install, then upgrade), up to the systemd steps the container cannot run — wac built at the pin, wacuum's 26
+unit-test files passing as the `wacuum` user; the units through `systemd-analyze verify`; logrotate's rule through
+`logrotate -d`; `follow.sh` and `status.sh` against a hosted mainnet endpoint (block 26 432 160: ok, 145 ms,
+133 Mgas/s), the metrics file written by `wacuum` and served by node_exporter. Installing found three things, now
+fixed: the pinned wac commit was not on GitHub yet (fetched from git.voltrevo.com when so); nor was the wac-web
+commit wac's own lock names (`tools/deps.sh` does the same); and a second run — an upgrade — stopped at `git
+pull`, root's git refusing the checkout the service user owns.
 
 ## What is needed from Andrew when the machine is ready
 
@@ -192,8 +232,9 @@ Lighthouse beside a geth reference: `docs/hoodi.md` and `deploy/hoodi/`.)
 - [ ] RAM 32 GB, 4 cores / 8 threads or better.
 - [ ] Inbound ports open: 30303 tcp+udp (execution p2p), 9000 tcp+udp (consensus p2p). Nothing else
       inbound; every RPC listens on 127.0.0.1.
-- [ ] Outbound HTTPS to github.com, sh.rustup.rs, static.rust-lang.org, crates.io, and the checkpoint
-      sync URL (mainnet.checkpoint.sigp.io, or another of the public ones).
+- [ ] Outbound HTTPS to github.com, sh.rustup.rs, static.rust-lang.org, crates.io, git.voltrevo.com (wac-eth;
+      read access without credentials, or a deploy key), and the checkpoint sync URL
+      (mainnet.checkpoint.sigp.io, or another of the public ones). `preflight.sh` checks each.
 - [ ] Choice of reference clients: reth + Lighthouse is assumed (reth serves the `debug_` tracers the
       shadow uses); geth + Lighthouse works as well.
 - [ ] Whether the machine may also run wacuum's own p2p (port 30304) once B begins.

@@ -4,16 +4,21 @@
 # and rebuilds). The reference node — reth and Lighthouse — is installed from their own releases by
 # reference.sh, since wacuum cannot sync mainnet yet and the shadow needs a node that has (docs/mainnet.md).
 #
-#     sh install.sh [WAC_ETH_URL]
+#     sh preflight.sh && sh install.sh [WAC_ETH_URL]
+#
+# WAC_URL (environment) is where wac comes from, GitHub by default: the pin names a commit the owner syncs to both
+# GitHub and git.voltrevo.com, and the box may have credentials for only one of them.
 #
 # Layout: /opt/wac (the compiler's source), /opt/wac-eth (this repository), /data/{reth,lighthouse,wacuum}
 # (each its own directory on the NVMe disk), and a `wacuum` user that owns /data/wacuum and runs the shadow.
+# Also: the shadow's status each minute as Prometheus metrics (wacuum-status.timer → node_exporter's textfile
+# collector, node_exporter on 127.0.0.1:9100 only), and its log rotated weekly.
 set -eu
 repo=${1:-https://git.voltrevo.com/wac-eth.git}
 [ "$(id -u)" -eq 0 ] || { echo "install.sh: run as root" >&2; exit 1; }
 
 apt-get update
-apt-get install -y git build-essential pkg-config curl ca-certificates python3
+apt-get install -y git build-essential pkg-config curl ca-certificates python3 prometheus-node-exporter logrotate
 
 # Rust, for the native wac host (V8). rustup into /opt/rust so the service user can use it too.
 if ! command -v cargo >/dev/null 2>&1; then
@@ -24,23 +29,42 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 id wacuum >/dev/null 2>&1 || useradd --system --create-home --home-dir /home/wacuum --shell /usr/sbin/nologin wacuum
-mkdir -p /data/reth /data/lighthouse /data/wacuum /opt
-chown wacuum:wacuum /data/wacuum
+mkdir -p /data/reth /data/lighthouse /data/wacuum /data/wacuum/differs /opt
+chown wacuum:wacuum /data/wacuum /data/wacuum/differs
 
 # wac-eth, then wac at exactly the commit wac-eth's wac.lock pins.
 [ -d /opt/wac-eth/.git ] || git clone "$repo" /opt/wac-eth
-git -C /opt/wac-eth pull --ff-only
-pin=$(sed -n 's/.*"wac".*"commit": *"\([0-9a-f]\{40\}\)".*/\1/p' /opt/wac-eth/wac.lock)
+# Owned by the service user after the first install; root's git refuses such a checkout unless told it is safe.
+git -c safe.directory=/opt/wac-eth -C /opt/wac-eth pull --ff-only
+# The lock as one line, and the commit from the "wac" entry alone: wac.lock lists other imports beside it.
+pin=$(tr '\n' ' ' < /opt/wac-eth/wac.lock | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
 [ -n "$pin" ] || { echo "install.sh: no wac commit in wac.lock" >&2; exit 1; }
-[ -d /opt/wac/.git ] || git clone https://github.com/voltrevo/wac.git /opt/wac
+[ -d /opt/wac/.git ] || git clone "${WAC_URL:-https://github.com/voltrevo/wac.git}" /opt/wac
 git -C /opt/wac fetch origin
+# GitHub can lag behind git.voltrevo.com, where pins are made (2026-11-17: aaef775ca was not on GitHub yet):
+# the commit is fetched from there when origin does not have it.
+if ! git -C /opt/wac cat-file -e "$pin^{commit}" 2>/dev/null; then
+  echo "install.sh: $pin is not at $(git -C /opt/wac remote get-url origin); fetching it from git.voltrevo.com" >&2
+  git -C /opt/wac fetch https://git.voltrevo.com/wac.git "$pin"
+fi
 git -C /opt/wac checkout --detach "$pin"
 # The binary goes to /usr/local/bin; its package cache is per user, so each user fills its own.
 (cd /opt/wac && ./bootstrap.sh -o /usr/local/bin/wac)
 chown -R wacuum:wacuum /opt/wac-eth
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth && sh tools/deps.sh'
-su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac test test'
+su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac test --allow-read test'
 
-install -m 644 /opt/wac-eth/packages/wacuum/deploy/mainnet/wacuum-shadow.service /etc/systemd/system/
+# Metrics: node_exporter on loopback only (its default is every address), reading the textfile the timer writes.
+here=/opt/wac-eth/packages/wacuum/deploy/mainnet
+textfiles=/var/lib/prometheus/node-exporter
+mkdir -p "$textfiles"
+chgrp wacuum "$textfiles" && chmod 775 "$textfiles"
+grep -q 'listen-address' /etc/default/prometheus-node-exporter 2>/dev/null ||
+  echo 'ARGS="--web.listen-address=127.0.0.1:9100 --collector.textfile.directory=/var/lib/prometheus/node-exporter"' >> /etc/default/prometheus-node-exporter
+install -m 644 "$here/wacuum-shadow.logrotate" /etc/logrotate.d/wacuum-shadow
+
+install -m 644 "$here/wacuum-shadow.service" "$here/wacuum-status.service" "$here/wacuum-status.timer" /etc/systemd/system/
 systemctl daemon-reload
-echo "install.sh: done. Next: sh reference.sh, wait for reth to sync, then systemctl enable --now wacuum-shadow"
+systemctl restart prometheus-node-exporter
+echo "install.sh: done. Next: sh reference.sh RETH_VERSION LIGHTHOUSE_VERSION, wait for reth to sync, then"
+echo "  systemctl enable --now wacuum-shadow wacuum-status.timer   (docs/mainnet.md, Runbook)"

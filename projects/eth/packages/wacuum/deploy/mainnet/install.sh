@@ -40,6 +40,12 @@ pin=$(tr '\n' ' ' < /opt/wac-eth/wac.lock | sed -n 's/.*"wac" *: *{[^}]*"commit"
 [ -n "$pin" ] || { echo "install.sh: no wac commit in wac.lock" >&2; exit 1; }
 [ -d /opt/wac/.git ] || git clone "${WAC_URL:-https://github.com/voltrevo/wac.git}" /opt/wac
 git -C /opt/wac fetch origin
+# GitHub can lag behind git.voltrevo.com, where pins are made (2026-11-17: aaef775ca was not on GitHub yet):
+# the commit is fetched from there when origin does not have it.
+if ! git -C /opt/wac cat-file -e "$pin^{commit}" 2>/dev/null; then
+  echo "install.sh: $pin is not at $(git -C /opt/wac remote get-url origin); fetching it from git.voltrevo.com" >&2
+  git -C /opt/wac fetch https://git.voltrevo.com/wac.git "$pin"
+fi
 git -C /opt/wac checkout --detach "$pin"
 # The binary goes to /usr/local/bin; its package cache is per user, so each user fills its own.
 (cd /opt/wac && ./bootstrap.sh -o /usr/local/bin/wac)

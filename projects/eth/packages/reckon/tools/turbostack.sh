@@ -49,7 +49,9 @@ step "1. turbostack's source, at $commit"
 cd "$work"
 git init -q ts && git -C ts fetch -q --depth 1 https://git.voltrevo.com/wac-turbostack.git "$commit" 2>/dev/null \
   || git -C ts fetch -q https://git.voltrevo.com/wac-turbostack.git
-full=$(git -C ts rev-parse "FETCH_HEAD" 2>/dev/null)
+# The commit asked for, not FETCH_HEAD: when the shallow fetch of a short hash fails, the fallback fetches the default
+# branch, whose head is not the commit.
+full=$(git -C ts rev-parse "$commit^{commit}")
 mkdir -p src/in src/home/cache/git && git -C ts archive "$full" | tar -x -C src/in
 for f in wac.json5 wac.lock; do
   sed -i "s|https://github.com/voltrevo/wac-web.git|https://git.voltrevo.com/wac-web.git|g; s|a14793f5e55af55b1ef9973715d31087e6d0c1f8|$web|g" "src/in/$f"

@@ -1,7 +1,7 @@
 # 0328a — `check` blames the test where `emit` names the ambiguous variant
 
 - **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Claimed by:** (nobody — the qualified half was fixed 2026-11-17; the bare half is open)
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
 - **Kind:** bug
@@ -81,3 +81,14 @@ recorded here because they are about the shipped language rather than about `vis
 Neither is filed as a defect here — the first is arguably right and the second is a deliberate
 asymmetry nobody has written down — but together they mean there is no spelling today for matching
 two same-named variants from two modules in one file.
+
+## The qualified form is fixed — 2026-11-17
+
+`x is A.Truncated` now names `A`'s `Truncated` in the checker (`qualifyingEnum` in `packages/wacc/src/check.wac`):
+`r1` above is clean, and `y is A.Truncated` on a `B` still warns, correctly.
+`packages/wacc/test/wac/qualifiedis_test.wac`. The build already ran `r1` right (it answers 1).
+
+**Still open: the bare form.** `import { A, Truncated } from "./a.wac"` beside `import { B } from "./b.wac"`, then
+`x is Truncated`, warns the same way, though the import says which `Truncated` is meant. The checker keys a variant
+by its bare name across files, so the fix is in how a type name is canonicalised (`typeOfTy` → `c.canon`), not at the
+`is`. The two `case` points in *Where it came from* are untouched.

@@ -1,8 +1,8 @@
 # Bootstrap derivations: rooting trust at reviewed sources (decision D)
 
-**Status, 2026-11-10: milestones 1 (`tools/ladder.sh`) and 2 (`wac-l0/1`, docs/l0-machine.md, `tools/l0.sh`) done, and
-the flattener from milestone 4 (`wac-flatten/1`, docs/flatten-machine.md, `tools/flatten.sh`). Each is needed under
-either choice. Milestone 3, the rest of 4, and 5 wait on the choice below.**
+**Status, 2026-11-17: option (A) chosen. Milestones 1, 2 (`wac-l0/1`, and `wac-flatten/1` from milestone 4) and 3
+(`wasm-seam/1`, docs/seam-machine.md, `tools/rungs.sh`: the whole ladder as derivations) done. Milestone 4's
+wacc-drive step and milestone 5 remain.**
 
 Today every compiler in reckon's chains is derived from one *seed*: wac's compiler at the pinned commit, built natively
 and named in the policy's `roots`. selfbuild.sh and the capstone show the seed is consistent with its source. A
@@ -101,7 +101,7 @@ the ones wac already argues for. Every step is a function of bytes to bytes, so 
    runners that sign: the TS and Rust assemblers wrapped by a reckon command. A recipe is `{program: none, in: x.l0}`
    (the machine is the assembler, so there is no program slot). Checked: both runners give one CID for every rung's L0
    in the ladder.
-3. **The rungs as derivations.** `wasm-seam/1` and its runners: the rust-ladder's seam step on V8, and a new wasmtime
+3. **The rungs as derivations. Done:** docs/seam-machine.md, 14 of 14; wacc's L0 byte for byte the ladder's. `wasm-seam/1` and its runners: the rust-ladder's seam step on V8, and a new wasmtime
    one. Each rung up to L5 becomes a signed derivation. Checked: the L0 text at each rung agrees with what
    `hosts_agree` records.
 4. **Flatten and wacc.**

@@ -1,8 +1,9 @@
-// boot — a runner for the bootstrap's host-run machines, wac-l0/1 and wac-flatten/1 (`src/boot.wac`;
-// docs/l0-machine.md, docs/flatten-machine.md).
+// boot — a runner for the bootstrap's host-run machines, wac-l0/1, wac-flatten/1 and wasm-seam/1 (`src/boot.wac`;
+// docs/l0-machine.md, docs/flatten-machine.md, docs/seam-machine.md).
 //
 //     boot recipe --source F                         a wac-l0/1 recipe: F as `source`
 //     boot recipe --tree DIR --entry PATH            a wac-flatten/1 recipe: DIR as `tree/`, PATH (within it) as `entry`
+//     boot recipe --module F --source F [--subject F] a wasm-seam/1 recipe: one rung of the ladder and its text
 //                                                    either way: the input tree and the recipe into the store; prints
 //                                                    the recipe's CID
 //     boot run RECIPE --tool CMD [--key F --runner NAME] [--work DIR]
@@ -12,8 +13,9 @@
 //
 // --store DIR (default .objects), --mirror DIR (repeatable) as for `obj`.
 //
-// The tool is a host command, run as `/bin/sh -c 'CMD "$1" "$2"' sh IN OUT`. IN is the L0 text, or the entry's path in
-// the tree written out under the work directory; OUT is where the answer goes. Its exit says which answer it gave: 0
+// The tool is a host command, run as `/bin/sh -c 'CMD "$1" "$2"' sh IN OUT`. IN is the L0 text, the entry's path in
+// the tree written out under the work directory, or for wasm-seam/1 a directory holding module, source and subject;
+// OUT is where the answer goes. Its exit says which answer it gave: 0
 // with OUT written is an answer, 1 is a refusal, anything else is this runner's failure, and no claim is made. wac's
 // Rust assembler is exactly that shape (`wax IN OUT`); tools/boot/ gives the others the same one.
 
@@ -24,7 +26,7 @@ import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.FileIn, ipfs.P
 import { Recipe, recipeFrom, recipeId, recipeValue, Statement, Signed, signStatement, statementId } from "../src/claims.wac";
 import { Index, loadIndex, saveIndex } from "../src/graph.wac";
 import { FORMAT } from "../src/machine.wac";
-import { L0_MACHINE, FLATTEN_MACHINE, isBootMachine, outName, answered, refused, dirsOf } from "../src/boot.wac";
+import { L0_MACHINE, FLATTEN_MACHINE, SEAM_MACHINE, isBootMachine, outName, answered, refused, dirsOf } from "../src/boot.wac";
 import { unhex } from "../src/hex.wac";
 
 string flag(string[] a, string name, string fallback) {
@@ -56,10 +58,24 @@ async i32 recipeCmd(Sys sys, Store store, string[] a) {
   string source = flag(a, "--source", "");
   string treeDir = flag(a, "--tree", "");
   string entry = flag(a, "--entry", "");
+  string module = flag(a, "--module", "");
   string machine;
   FileIn[] files;
   string[] dirs = string[]();
-  if (source != "" && treeDir == "") {
+  if (module != "" && source != "" && treeDir == "") {
+    // wasm-seam/1: the rung, the text it is given, and for the interpreter an optional subject.
+    machine = SEAM_MACHINE();
+    files = FileIn[]();
+    string[] names = ["module", "source", "subject"];
+    string[] paths = [module, source, flag(a, "--subject", "")];
+    for (i32 i = 0; i < 3; i++) {
+      if (paths[i] == "") { continue; }
+      match (await sys.readFile(paths[i])) {
+        Err(e): { sys.warn("boot: \{paths[i]}: \{e}"); return 1; }
+        Ok(b): { files = plusFile(files, FileIn(names[i], b)); }
+      }
+    }
+  } else if (source != "" && treeDir == "") {
     machine = L0_MACHINE();
     match (await sys.readFile(source)) {
       Err(e): { sys.warn("boot: \{source}: \{e}"); return 1; }
@@ -83,7 +99,7 @@ async i32 recipeCmd(Sys sys, Store store, string[] a) {
       }
     }
   } else {
-    sys.warn("boot recipe: --source F, or --tree DIR with --entry PATH");
+    sys.warn("boot recipe: --source F (wac-l0/1), --tree DIR with --entry PATH (wac-flatten/1), or --module F --source F [--subject F] (wasm-seam/1)");
     return 2;
   }
   Cid input;
@@ -118,7 +134,7 @@ async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
       }
     }
   }
-  if (!isBootMachine(recipe.machine)) { sys.warn("boot: this runner is for \{L0_MACHINE()} and \{FLATTEN_MACHINE()}, not \{recipe.machine}"); return 1; }
+  if (!isBootMachine(recipe.machine)) { sys.warn("boot: this runner is for \{L0_MACHINE()}, \{FLATTEN_MACHINE()} and \{SEAM_MACHINE()}, not \{recipe.machine}"); return 1; }
   if (recipe.format != FORMAT()) { sys.warn("boot: this runner reads \{FORMAT()}, not \{recipe.format}"); return 1; }
   FileIn[] tree;
   match (readTree(r, recipe.input)) {
@@ -132,7 +148,21 @@ async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
   await sys.files().remove(work, true);
   await sys.files().mkdir(work, true);
   string inPath;
-  if (recipe.machine == L0_MACHINE()) {
+  if (recipe.machine == SEAM_MACHINE()) {
+    // `module`, `source` and maybe `subject`, written into one directory, which is what the tool is handed.
+    bool hasModule = false;
+    bool hasSource = false;
+    await sys.files().mkdir(work + "/in", true);
+    for (i32 i = 0; i < tree.len(); i++) {
+      string p = tree[i].path;
+      if (p != "module" && p != "source" && p != "subject") { sys.warn("boot: a wasm-seam/1 input holds module, source and subject, not \{p}"); return 1; }
+      if (p == "module") { hasModule = true; }
+      if (p == "source") { hasSource = true; }
+      match (await sys.writeFile(work + "/in/" + p, tree[i].content)) { Err(e): { sys.warn("boot: abort: \{e}"); return 3; } Ok(_): { } }
+    }
+    if (!hasModule || !hasSource) { sys.warn("boot: a wasm-seam/1 input needs module and source"); return 1; }
+    inPath = work + "/in";
+  } else if (recipe.machine == L0_MACHINE()) {
     // The input is exactly one file, `source`: anything more or less is not a recipe for this machine.
     if (tree.len() != 1 || tree[0].path != "source") { sys.warn("boot: a wac-l0/1 input holds exactly one file, `source`"); return 1; }
     inPath = work + "/source.l0";
@@ -235,4 +265,10 @@ string hexOnly(u8[] b) {
   i32 j = 0;
   for (i32 i = 0; i < b.len(); i++) { if (b[i] != ' ' && b[i] != '\n' && b[i] != '\r' && b[i] != '\t') { out[j] = b[i]; j++; } }
   return string.fromBytes(out);
+}
+
+FileIn[] plusFile(FileIn[] xs, FileIn x) {
+  FileIn[] out = FileIn[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
 }

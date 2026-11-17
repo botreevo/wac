@@ -93,9 +93,19 @@ byte-identical copies of `startsWith` and `orVoid`, and eleven cases of one name
 functions. Where the two were the same function they were deduped; where they were different they
 were renamed apart.
 
-It is checked, not hoped for: `wacboot`'s `ts/l5_test.ts` asserts the flattener renames nothing in
+It is checked, not hoped for: `bootstrap/ts/l5.test.ts` asserts the flattener renames nothing in
 this graph, and names what it renamed when it fails. If you add a private helper whose name is
 already taken here, that is what will tell you.
+
+**Two more things follow from the same ladder.** wacc is written in the subset wac-L5 parses — which
+is most of wac, and not all of it: `string.fromBytes([(48 + d) as~ u8])` is one thing it refuses —
+and a file the self-host check builds (`bootstrap/drivers/selfcheck.wac` and what it imports) builds
+text with `+` rather than `"\{x}"`, whose lowering needs a host import the check does not provide.
+Every other string in `check.wac` is concatenated for that reason.
+
+**`wac task check:l5` asks all three in a few seconds** (`tools/l5subset.ts`), at the file and line,
+where the full gate's `l5.test.ts` and `selfhost.test.ts` answer an hour later at a line of the
+flattened graph. Run it after editing anything here.
 
 ## A full table grows or traps
 

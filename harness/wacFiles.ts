@@ -203,8 +203,8 @@ export function wacFilesIn(all: Map<string, string>, entry: string): Map<string,
  * **Because every build re-read the whole graph, cache hit or not.** `buildApp` keys its artefact on
  * the content of every file it reads, so a repeat build is served from `.cache` — but it called this
  * first, and this read 171 files one at a time: 157ms, against 9ms to hash them and about nothing to
- * fetch the artefact. `packages/box/test/box.test.ts` makes twenty-eight build or runner calls, so it
- * paid four seconds to read the same graph twenty-eight times.
+ * fetch the artefact. Box's TypeScript suite (`box.test.ts`, since ported to wac) made twenty-eight
+ * build or runner calls, so it paid four seconds to read the same graph twenty-eight times.
  *
  * A stamp is `mtime:size` per file. Validating one costs a `stat`, and 171 of them concurrently is
  * **4ms** — so the memo is checked rather than trusted, and a file edited between two builds in one

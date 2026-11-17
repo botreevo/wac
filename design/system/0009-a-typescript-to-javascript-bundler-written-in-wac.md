@@ -447,7 +447,8 @@ failure arrived after the ladder had already done its work — a late place to f
 to `harness/buildApp.ts`, which builds with `wac app`. It was reverted the same day.
 
 **A `wac app` artefact is not a drop-in for a `build.ts` deno one.** With the swap in place and
-nothing else changed, `packages/box/test/box.test.ts` failed four ways and hung a fifth:
+nothing else changed, box's TypeScript suite (`box.test.ts`, since ported to wac) failed four ways and
+hung a fifth:
 
     box's write-path applets: cp and tee                             FAILED
     cp writes beside its target and renames, and none of the tier…   FAILED

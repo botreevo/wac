@@ -299,7 +299,7 @@ src/applets/       one applet per file, always src/applets/<name>.wac
 src/lib/           args, bytes, num, lines, input, reader, safe
 src/bin/           four applets as standalone programs, and three shells:
                    sh (the host), sealedsh (memory, no grants), imaged (a file)
-test/box.test.ts   every applet against the utility it imitates
+test/wac/         every applet against the utility it imitates
 ```
 
 ## The tests are differential
@@ -322,7 +322,7 @@ reasoning from first principles would have produced.
 
 **The applet count is compared too.** "66 applets" in the first line is a digit rather than a word
 because it kept going stale: it said fifty-nine when the dispatcher had sixty, and before that
-forty-two in one paragraph and something else in another. `test/box.test.ts` reads it out of this
+forty-two in one paragraph and something else in another. `test/wac/readme_test.wac` reads it out of this
 README and counts `box.wac`'s branches, so adding an applet and forgetting the sentence is a failing
 test — and the usage message's list is held to the same dispatcher, because three counts were
 reachable and only two of them were tied together.

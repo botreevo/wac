@@ -1,0 +1,375 @@
+// `box` as a built program: what needs a real process, a real host or a real socket. Everything that does not has
+// moved to an in-process test (`applets_test.wac`, `grants_test.wac`, `tar_test.wac` and their kin, listed in the
+// table this file's TypeScript original kept).
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env --allow-net packages/box/test/wac/boxprocess_test.wac
+//
+// Built for the Deno host by `build.ts` (`builtByDeno`), as it always was here: these are claims about a built
+// artefact — its shebang, the grants it states and a host enforcing them — and about processes and sockets between
+// them. It was box's TypeScript `box.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtByDeno } from "../../../wactest/src/built.wac";
+import { freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains, trimmed } from "../../../wactest/src/strings.wac";
+import { Daemon, Held, logOf, start, stop, waitForLogWithin } from "../../../wactest/src/daemon.wac";
+import { quoted } from "../../../wactest/src/childenv.wac";
+import { ChildEnv, Exec, Launch, Listener, Net, Socket, Sys, TimedOut } from "std";
+import { Buf, Read, flatten } from "core";
+
+static string BOX = "packages/box/src/box.wac";
+
+struct Said {
+  string out;
+  u8[] bytes;
+  string err;
+  i32 status;
+}
+
+/** `cmd args`, given `input`, in `cwd` (`""` for here), bounded at 60 s: a run that never returns is a result. */
+async Said run(Sys sys, string cmd, string[] args, string input, string cwd) {
+  auto got = await sys.clock().within(sys.procs().exec(cmd, args, input.toBytes(), ChildEnv.inherited(),
+                                                       Launch(cwd, false, false, false, false)), 60000);
+  if (got.isErr()) { return Said("", u8[](), got.err()! is TimedOut ? "did not finish in 60s" : "\{got.err()!}", 0 - 1); }
+  Exec x = got.unwrap();
+  return Said(string.fromBytes(x.stdout), x.stdout, string.fromBytes(x.stderr), x.status);
+}
+
+string box(Sys sys, string name, string[] grants) {
+  return builtByDeno(sys.env(), sys.files(), sys.procs(), BOX, name, grants, "deno", false);
+}
+
+string here(Sys sys) { return flatten(sys.env().cwd().wait()).unwrap(); }
+
+/**
+ * `tar` refuses a symlink rather than following it — GitHub wac-mono#25, where it walked into a link to a directory and
+ * grew the path until something trapped on a self-referential one. Refused *and left out*: an archive that names a link
+ * it declined to follow unpacks to something other than what went in. The fixture is made with `ln -s`.
+ */
+export async string test_tar_refuses_a_symlink_rather_than_following_it(Sys sys) {
+  T t = T.create();
+  string built = box(sys, "boxprocess-box-r", ["--allow-read"]);
+  string dir = scratch(sys.env(), "boxprocess-links");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  t.eqStr(putFile(sys.files(), "\{dir}/real/f", "x"), "", "real/f");
+  await run(sys, "ln", ["-s", "real", "toDir"], "", dir);
+  await run(sys, "ln", ["-s", "real/f", "toFile"], "", dir);
+  await run(sys, "ln", ["-s", "loop", "loop"], "", dir);   // points at itself
+  Said tarred = await run(sys, built, ["tar", "."], "", dir);
+  t.eqI32(tarred.status, 1, "a refused entry is a failure");
+  for (string name in ["toDir", "toFile", "loop"]) { t.isTrue(contains(tarred.err, name), "\{name} should be refused: \{tarred.err}"); }
+  string listing = "\{scratch(sys.env(), "boxprocess-tar")}.tar";
+  sys.files().writeFile(listing, tarred.bytes).wait();
+  Said listed = await run(sys, "tar", ["-tf", listing], "", "");
+  t.isTrue(contains(listed.out, "./real/f"), listed.out);
+  t.isFalse(contains(listed.out, "toDir"), "a refused link must not be in the archive: \{listed.out}");
+  sys.files().remove(listing, false).wait();
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * **A file still needs the grant, and says so** — the one test that reads `Not granted to this application` from a
+ * *host* rather than from our own source. `grants_test.wac` asserts the same in process, against a sentence
+ * `packages/fs`'s `reason` hard-codes; delete this and that becomes an oracle agreeing with itself.
+ */
+export async string test_a_file_still_needs_the_grant_and_says_so(Sys sys) {
+  T t = T.create();
+  Said denied = await run(sys, box(sys, "boxprocess-box-none", string[]()), ["cat", "README.md"], "", "");
+  t.eqI32(denied.status, 1, denied.err);
+  t.isTrue(contains(denied.err, "Not granted to this application"), denied.err);
+  return t.report();
+}
+
+/** `cp` and the write tier, through a real process. */
+export async string test_cp_and_the_write_tier_through_a_real_process(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "boxprocess-cp");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  Said r = await run(sys, box(sys, "boxprocess-box-rw", ["--allow-read", "--allow-write"]), ["cp", "README.md", "\{dir}/copy"], "", "");
+  t.eqI32(r.status, 0, r.err);
+  u8[] copied = flatten(sys.files().readFile("\{dir}/copy").wait()).orElse(u8[]());
+  u8[] original = flatten(sys.files().readFile("README.md").wait()).orElse(u8[]());
+  t.isTrue(copied.len() > 0 && string.fromBytes(copied) == string.fromBytes(original), "the built program copied it");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * **`bin/`: one applet alone states only the grants it needs** — in its shebang, which is what the host enforces — and
+ * runs as itself: flags parse, `-` is standard input, a `wc` built with none cannot open a file, and the whole of box is
+ * much larger than one applet.
+ */
+export async string test_bin_one_applet_alone_states_only_the_grants_it_needs(Sys sys) {
+  T t = T.create();
+  string base = "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache";
+  string[] names = ["wc", "sha256sum", "grep", "cp"];
+  string[] wants = [base, base, base + " --allow-read", base + " --allow-read --allow-write"];
+  string[] paths = string[].filled(4, "");
+  for (i32 i = 0; i < names.len(); i++) {
+    string[] grants = names[i] == "grep" ? ["--allow-read"] : names[i] == "cp" ? ["--allow-read", "--allow-write"] : string[]();
+    paths[i] = builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/\{names[i]}.wac", "boxprocess-bin-\{names[i]}",
+                           grants, "deno", false);
+    string text = string.fromBytes(flatten(sys.files().readFile(paths[i]).wait()).orElse(u8[]()));
+    i32 nl = text.indexOf("\n");
+    t.eqStr(nl < 0 ? text : text.slice(0, nl), wants[i], "\{names[i]}'s shebang");
+  }
+  string text = "alpha beta\ngamma\n";
+  Said ref = await run(sys, "wc", string[](), text, "");
+  t.eqStr((await run(sys, paths[0], string[](), text, "")).out, ref.out, "wc agrees with the system's");
+  t.eqStr(trimmed((await run(sys, paths[0], ["-l"], text, "")).out), "2", "flags still parse");
+  string sum = trimmed((await run(sys, paths[1], string[](), text, "")).out);
+  t.isTrue(sum.len() > 3 && sum.slice(sum.len() - 3, sum.len()) == "  -", "stdin is still '-': \{sum}");
+  t.eqStr(trimmed((await run(sys, paths[2], ["-c", "beta"], text, "")).out), "1", "grep -c");
+  Said denied = await run(sys, paths[0], ["README.md"], "", "");
+  t.eqI32(denied.status, 1, "a wc with no grants cannot open a file");
+  t.isTrue(contains(denied.err, "Not granted to this application"), denied.err);
+  t.isTrue(denied.err.len() >= 4 && denied.err.slice(0, 4) == "wc: ", denied.err);
+  string dst = "\{scratch(sys.env(), "boxprocess-bin-dst")}.txt";
+  Said cp = await run(sys, paths[3], ["README.md", dst], "", "");
+  t.eqI32(cp.status, 0, cp.err);
+  t.eqStr(string.fromBytes(flatten(sys.files().readFile(dst).wait()).orElse(u8[]())),
+          string.fromBytes(flatten(sys.files().readFile("README.md").wait()).orElse(u8[]())), "cp copied it");
+  sys.files().remove(dst, false).wait();
+  // And the whole of box carries every applet, which one alone does not.
+  i64 alone = flatten(sys.files().stat(paths[0]).wait()).unwrap().size;
+  i64 all = flatten(sys.files().stat(box(sys, "boxprocess-box-rw", ["--allow-read", "--allow-write"])).wait()).unwrap().size;
+  t.isTrue(all - alone > 400000 as i64, "box carries every applet: \{all} - \{alone}, wanted > 400000");
+  return t.report();
+}
+
+// ── Over real sockets: a server and a client with a socket between them is a claim *about* the process boundary ──
+
+/**
+ * `built args`, in the background, logging to a file, with its exit status written after it (`exited=N`) — started on a
+ * port taken from the kernel and waited for by the line it prints, never by connecting: `-o` serves exactly one
+ * connection, so a probe that dialled it would *be* that connection.
+ */
+struct Server {
+  Daemon d;
+  i32 port;
+  bool up;
+}
+
+async Server serve(Sys sys, string built, string[] args, string name, string cwd) {
+  Held held = Held.take(sys.net());
+  i32 port = held.port;
+  string line = "";
+  for (string a in args) { line = line + " " + quoted(a == "PORT" ? "-\{port}" : a == "PORTNUM" ? "\{port}" : a); }
+  string log = "\{scratch(sys.env(), "boxprocess-\{name}")}.log";
+  sys.files().remove(log, false).wait();
+  string inner = (cwd == "" ? "" : "cd \{quoted(cwd)} && ") + quoted(built) + line + "; echo exited=$?";
+  held.release();
+  Daemon d = start(sys.procs(), "/bin/sh -c \{quoted(inner)}", log);
+  bool up = d.ok() && waitForLogWithin(sys.clock(), sys.files(), d, "listening on port \{port}", 60000);
+  return Server(d, port, up);
+}
+
+/** Whether the server has ended, and with status 0 — read from the line its wrapper writes. */
+bool endedClean(Sys sys, Server s) {
+  return waitForLogWithin(sys.clock(), sys.files(), s.d, "exited=", 30000) && logOf(sys.files(), s.d).indexOf("exited=0") >= 0;
+}
+
+/** `request` to 127.0.0.1:`port`, and everything that comes back until the server closes. */
+async string ask(Net net, i32 port, string request) {
+  auto c = await net.connect("127.0.0.1", port);
+  if (c.isErr()) { return "<could not connect: \{c.err()!}>"; }
+  Socket sock = c.unwrap();
+  await sock.send(request.toBytes());
+  Buf got = Buf.create();
+  while (true) {
+    auto r = await sock.recv();
+    if (r.isErr()) { break; }
+    bool done = false;
+    match (r.unwrap()) {
+      Data(bytes): { got.pushAll(bytes); }
+      default: { done = true; }
+    }
+    if (done) { break; }
+  }
+  sock.close();
+  return string.fromBytes(got.take());
+}
+
+bool startsWith(string s, string p) { return s.len() >= p.len() && s.slice(0, p.len()) == p; }
+
+bool endsWith(string s, string p) { return s.len() >= p.len() && s.slice(s.len() - p.len(), s.len()) == p; }
+
+export async string test_boxs_network_applets_a_wac_server_and_a_wac_client_over_real_tcp(Sys sys) {
+  T t = T.create();
+  string built = box(sys, "boxprocess-box-net", ["--allow-net"]);
+  // A wac server, asked by a raw socket.
+  Server s = await serve(sys, built, ["serve", "PORT", "-o"], "serve1", "");
+  t.isTrue(s.up, "it says where it is listening: \{logOf(sys.files(), s.d)}");
+  string reply = await ask(sys.net(), s.port, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  t.isTrue(startsWith(reply, "HTTP/1.1 200 OK\r\n"), reply);
+  t.isTrue(contains(reply, "wac http server"), reply);
+  t.isTrue(endedClean(sys, s), "the server exited cleanly: \{logOf(sys.files(), s.d)}");
+  // A wac client against a wac server.
+  Server s2 = await serve(sys, built, ["serve", "PORT", "-o"], "serve2", "");
+  t.isTrue(s2.up, "the second server listens");
+  Said got = await run(sys, built, ["get", "127.0.0.1", "/", "-\{s2.port}", "-i"], "", "");
+  t.eqI32(got.status, 0, got.err);
+  t.isTrue(contains(got.out, "HTTP 200"), got.out);
+  t.isTrue(endsWith(trimmed(got.out), "wac http server"), got.out);
+  t.isTrue(endedClean(sys, s2), "the second server exited cleanly");
+  // And without the net grant, the client says so rather than failing some other way.
+  Said denied = await run(sys, box(sys, "boxprocess-box-none", string[]()), ["get", "127.0.0.1", "/", "-9"], "", "");
+  t.eqI32(denied.status, 1, "no net, no connection");
+  t.isTrue(contains(denied.err, "network access not granted"), denied.err);
+  return t.report();
+}
+
+/** `httpd` serves a directory — types, an index, a query — and refuses to leave it, or to take anything but GET. */
+export async string test_httpd_serves_a_directory_and_refuses_to_leave_it(Sys sys) {
+  T t = T.create();
+  string built = box(sys, "boxprocess-box-rn", ["--allow-read", "--allow-net"]);
+  string base = scratch(sys.env(), "boxprocess-httpd");
+  t.eqStr(freshDir(sys.files(), base), "", "a scratch directory");
+  string root = "\{base}/www";
+  t.eqStr(putFile(sys.files(), "\{root}/index.html", "<h1>hi</h1>\n"), "", "index.html");
+  t.eqStr(putFile(sys.files(), "\{root}/notes.txt", "plain\n"), "", "notes.txt");
+  t.eqStr(putFile(sys.files(), "\{root}/sub/index.html", "deep\n"), "", "sub/index.html");
+  t.eqStr(putFile(sys.files(), "\{base}/wac-httpd-secret.txt", "should not be served\n"), "", "the secret beside it");
+  string[] targets = ["/", "/notes.txt", "/sub/", "/sub", "/notes.txt?v=2", "/nope", "/../wac-httpd-secret.txt",
+                      "/sub/../../wac-httpd-secret.txt", "notes.txt", "/a\\b"];
+  string[] wants = ["200", "200", "200", "200", "200", "404", "403", "403", "400", "403"];
+  for (i32 i = 0; i < targets.len(); i++) {
+    Server s = await serve(sys, built, ["httpd", "PORT", root, "-o"], "httpd\{i}", "");
+    t.isTrue(s.up, "httpd listens for \{targets[i]}");
+    string reply = await ask(sys.net(), s.port, "GET \{targets[i]} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    t.isTrue(startsWith(reply, "HTTP/1.1 \{wants[i]} "), "\{targets[i]}: wanted \{wants[i]}, got \{reply.len() > 60 ? reply.slice(0, 60) : reply}");
+    if (i == 0) {
+      t.isTrue(contains(reply, "Content-Type: text/html"), reply);
+      t.isTrue(endsWith(trimmed(reply), "<h1>hi</h1>"), reply);
+    }
+    if (i == 1) { t.isTrue(contains(reply, "Content-Type: text/plain"), reply); }
+    if (i == 2 || i == 3) { t.isTrue(endsWith(trimmed(reply), "deep"), reply); }
+    if (i == 4) { t.isTrue(endsWith(trimmed(reply), "plain"), reply); }
+    stop(sys.procs(), s.d);
+  }
+  Server post = await serve(sys, built, ["httpd", "PORT", root, "-o"], "httpd-post", "");
+  string posted = await ask(sys.net(), post.port, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+  t.isTrue(startsWith(posted, "HTTP/1.1 405 "), posted);
+  stop(sys.procs(), post.d);
+  sys.files().remove(base, true).wait();
+  return t.report();
+}
+
+/** `wget` writes one file, fetched from box's own `httpd`. */
+export async string test_wget_writes_one_file_fetched_from_boxs_own_httpd(Sys sys) {
+  T t = T.create();
+  string built = box(sys, "boxprocess-box-rwn", ["--allow-read", "--allow-write", "--allow-net"]);
+  string dir = scratch(sys.env(), "boxprocess-wget");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  string lines = "";
+  for (i32 i = 1; i <= 250; i++) { lines = lines + "\{i}\n"; }
+  t.eqStr(putFile(sys.files(), "\{dir}/big.txt", lines), "", "big.txt");
+  Server s = await serve(sys, built, ["httpd", "PORT", dir, "-o"], "wget", "");
+  t.isTrue(s.up, "httpd listens");
+  Said got = await run(sys, built, ["wget", "127.0.0.1", "/big.txt", "saved.txt", "-\{s.port}"], "", dir);
+  t.eqI32(got.status, 0, got.err);
+  t.eqStr(string.fromBytes(flatten(sys.files().readFile("\{dir}/saved.txt").wait()).orElse(u8[]())), lines, "wget saved the body");
+  stop(sys.procs(), s.d);
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * `gets`: TLS 1.3 in wac, against a real TLS server — Deno's, run as an oracle from here — and an untrusted root must
+ * not connect, nor produce any body at all.
+ */
+export async string test_gets_tls_13_in_wac_against_a_real_tls_server(Sys sys) {
+  T t = T.create();
+  string built = box(sys, "boxprocess-box-rn", ["--allow-read", "--allow-net"]);
+  string dir = scratch(sys.env(), "boxprocess-tls");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  string data = "\{here(sys)}/packages/tls/test/data";
+  await run(sys, "openssl", ["x509", "-in", "\{data}/ca.pem", "-outform", "DER", "-out", "\{dir}/ca.der"], "", "");
+  await run(sys, "openssl", ["x509", "-in", "\{data}/other_ca.pem", "-outform", "DER", "-out", "\{dir}/other.der"], "", "");
+  string body = "hello from a real TLS server";
+  string script = "const cert = await Deno.readTextFile(\"\{data}/leaf.pem\");\n" +
+    "const key = await Deno.readTextFile(\"\{data}/leaf.key\");\n" +
+    "const l = Deno.listenTls({ hostname: \"127.0.0.1\", port: Number(Deno.args[0]), cert, key });\n" +
+    "console.error(\"listening on port \" + Deno.args[0]);\n" +
+    "try {\n  const conn = await l.accept();\n  await conn.read(new Uint8Array(4096));\n" +
+    "  await conn.write(new TextEncoder().encode(\"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: \{body.len() + 1}\" +\n" +
+    "    \"\\r\\nConnection: close\\r\\n\\r\\n\{body}\\n\"));\n  conn.close();\n} catch { /* refused, below */ }\nl.close();\n";
+  t.eqStr(putFile(sys.files(), "\{dir}/server.ts", script), "", "the server script");
+  Server good = await serve(sys, "deno", ["run", "-A", "\{dir}/server.ts", "PORTNUM"], "tls-good", "");
+  t.isTrue(good.up, "the TLS server listens: \{logOf(sys.files(), good.d)}");
+  Said ok = await run(sys, built, ["gets", "localhost", "/", "\{dir}/ca.der", "-\{good.port}", "-i"], "", "");
+  t.eqI32(ok.status, 0, ok.err);
+  t.isTrue(contains(ok.out, "HTTP 200"), ok.out);
+  t.isTrue(endsWith(trimmed(ok.out), body), ok.out);
+  stop(sys.procs(), good.d);
+  Server bad = await serve(sys, "deno", ["run", "-A", "\{dir}/server.ts", "PORTNUM"], "tls-bad", "");
+  t.isTrue(bad.up, "the second TLS server listens");
+  Said refused = await run(sys, built, ["gets", "localhost", "/", "\{dir}/other.der", "-\{bad.port}"], "", "");
+  t.eqI32(refused.status, 1, "an untrusted root must not connect");
+  t.eqI32(refused.bytes.len(), 0, "and must produce no body at all");
+  t.isTrue(contains(refused.err, "connection failed"), refused.err);
+  stop(sys.procs(), bad.d);
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * `nc` relays both directions at once: a peer that speaks first is heard on standard output while standard input
+ * reaches the peer. The peer is this test, on a listener of its own, racing the `nc` process it started.
+ */
+export async string test_nc_relays_both_directions_at_once(Sys sys) {
+  T t = T.create();
+  string built = box(sys, "boxprocess-box-net", ["--allow-net"]);
+  Listener l = flatten(sys.net().listen("127.0.0.1", 0).wait()).unwrap();
+  auto ncRun = sys.procs().exec(built, ["nc", "127.0.0.1", "\{l.port}"], "client speaks second\n".toBytes(),
+                                ChildEnv.inherited(), Launch.plain());
+  string seen = "";
+  auto accepted = await sys.clock().within(l.accept(), 30000);
+  if (accepted.isOk()) {
+    Socket c = accepted.unwrap();
+    await c.send("peer speaks first\n".toBytes());
+    auto r = await c.recv();
+    if (r.isOk()) {
+      match (r.unwrap()) {
+        Data(bytes): { seen = trimmed(string.fromBytes(bytes)); }
+        default: { }
+      }
+    }
+    c.close();
+  }
+  l.close();
+  auto ended = await sys.clock().within(ncRun, 30000);
+  t.isTrue(ended.isOk(), "nc finished");
+  if (ended.isOk()) {
+    Exec out = ended.unwrap();
+    t.eqI32(out.status, 0, string.fromBytes(out.stderr));
+    t.eqStr(trimmed(string.fromBytes(out.stdout)), "peer speaks first", "the peer's greeting reached standard output");
+  }
+  t.eqStr(seen, "client speaks second", "standard input reached the peer");
+  return t.report();
+}
+
+/** `nc -l` takes one connection, and relays what it is sent. Its input is held open a moment, as a terminal's is. */
+export async string test_nc_l_takes_one_connection(Sys sys) {
+  T t = T.create();
+  string built = box(sys, "boxprocess-box-net", ["--allow-net"]);
+  Held held = Held.take(sys.net());
+  i32 port = held.port;
+  string log = "\{scratch(sys.env(), "boxprocess-ncl")}.log";
+  sys.files().remove(log, false).wait();
+  held.release();
+  Daemon d = start(sys.procs(), "/bin/sh -c \{quoted("sleep 5 | " + quoted(built) + " nc -\{port} -l; echo exited=$?")}", log);
+  t.isTrue(waitForLogWithin(sys.clock(), sys.files(), d, "listening on port \{port}", 60000), "nc -l listens: \{logOf(sys.files(), d)}");
+  auto c = await sys.net().connect("127.0.0.1", port);
+  t.isTrue(c.isOk(), "connected");
+  if (c.isOk()) {
+    Socket sock = c.unwrap();
+    await sock.send("over the wire\n".toBytes());
+    sock.close();
+  }
+  t.isTrue(waitForLogWithin(sys.clock(), sys.files(), d, "exited=", 30000), "nc -l ended once its input did");
+  t.isTrue(contains(logOf(sys.files(), d), "over the wire"), "the listener relayed what it was sent: \{logOf(sys.files(), d)}");
+  stop(sys.procs(), d);
+  return t.report();
+}

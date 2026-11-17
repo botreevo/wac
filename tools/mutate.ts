@@ -686,8 +686,9 @@ const staged = stagedFrom();
 
 async function stageProject(dest: string): Promise<void> {
   // `packages` and `harness` are the code. Every *file* at the repo root comes too, and that is not
-  // tidiness: `packages/box/test/box.test.ts` reads `README.md` as its input — a real file of real
-  // text to run `wc`, `sort` and `head` over — and staging without it made five box tests fail.
+  // tidiness: box's tests (`packages/box/test/wac/batch_test.wac` and others) read `README.md` as
+  // their input — a real file of real text to run `wc`, `sort` and `head` over — and staging without
+  // it made five box tests fail.
   //
   // The consequence was invisible and expensive. A red scope means every mutant in it is reported
   // as *unmeasurable* rather than killed, correctly and by design; but `box` depends on a dozen
@@ -933,7 +934,7 @@ const jobs = (() => {
  * Whether a test file spawns processes of its own, decided by what it imports.
  *
  * wac-mono 0031: `--jobs` was read as "this many `deno test` runs", and several of this repo's test
- * files are themselves swarms — `packages/box/test/box.test.ts` spawns about three hundred built
+ * files are themselves swarms — box's process tests (`packages/box/test/wac/boxprocess_test.wac`) spawn many built
  * binaries, each a `deno` process plus a worker. Four such jobs is not four processes, it is hundreds,
  * and the machine is shared: a fifty-second suite next door took over half an hour.
  *

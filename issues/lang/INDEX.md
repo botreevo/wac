@@ -26,7 +26,7 @@ has been fixed and why.
 | [0412a](closed/0412a-a-block-local-shadowing-a-parameter-in-an-async-function-emits-invalid-wasm.md) | In an `async` function a block-local that shadows a parameter shares its frame slot: the read after the block is the wrong type and the module is invalid | bug | invalid wasm |
 | [0411a](closed/0411a-a-field-read-on-a-result-is-not-checked.md) | `look().isDir` on a `Result<S, E>` passes `wac check`; in an async function the module is invalid (*invalid field index*) | bug | invalid wasm |
 | [0410a](closed/0410a-a-method-call-on-a-nullable-array-is-not-checked.md) | `out.write(b)` on a `u8[]? out` passes `wac check` and fails in the emitter; the same call on `u8[]` is *no such method* | diagnostic | compile error |
-| [0409a](open/0409a-a-narrower-union-does-not-widen-into-a-nullable-wider-one.md) | `Wide? n = narrow` is *initialiser does not match*: a narrower union widens into `Wide` and into a `Wide` parameter, not into `Wide?` | bug | compile error |
+| [0409a](closed/0409a-a-narrower-union-does-not-widen-into-a-nullable-wider-one.md) | `Wide? n = narrow` is *initialiser does not match*: a narrower union widens into `Wide` and into a `Wide` parameter, not into `Wide?` | bug | compile error |
 | [0408a](closed/0408a-a-core-type-imported-by-name-loses-its-text-conversion.md) | `import { Stuck } from "core"` and `"\{e}"` on a `Stuck` was *no conversion to text*: a built-in's `[toString]` types were recorded only from aliased imports of `toString`. **Closed 2026-10-27** by 3a4b7424e | bug | compile error |
 | [0407a](closed/0407a-a-void-type-argument-does-not-erase-a-method-parameter.md) | `Ticket<void>.resolve()` is *wrong number of arguments*: a `void` type argument erases a funcref's parameter and not a method's | bug | compile error |
 | [0406a](closed/0406a-a-method-call-on-a-union-value-is-not-checked.md) | `e.nothing()` on a `union<A, B>` passes the checker and fails in the emitter — found as `e.toString()` on a fault union, where `"\{e}"` works | diagnostic | compile error |
@@ -150,7 +150,7 @@ has been fixed and why.
 
 ## Closed
 
-372 issues, 343 closed.
+372 issues, 344 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

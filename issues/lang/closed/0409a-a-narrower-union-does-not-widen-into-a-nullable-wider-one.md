@@ -1,6 +1,6 @@
 # 0409a — a narrower union does not widen into a nullable wider one
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-10-27
@@ -33,3 +33,11 @@ Actual: *initialiser does not match the declared type* at both `Wide?` lines; th
 
 Found holding "the first fault so far" in a `FilesFault?` while copying a file (`packages/box/src/lib/safe.wac`): an
 `OutputFault` from `Output.write` would not assign into it. Worked around there by returning at each fault instead.
+
+## Fixed — 2026-11-17
+
+`assignable` refused any union source into a slot that was not itself a union, one line before the general unwrap of
+a nullable slot would have asked about its base. A union into a `T?` is now a union into `T`
+(`packages/wacc/src/check.wac`). The emitter already wrote it: `packages/wacc/test/wac/nullableunion_test.wac` checks
+the reproduction at all three positions, emits it, runs it, and holds that a wider union still does not narrow into a
+nullable narrower one.

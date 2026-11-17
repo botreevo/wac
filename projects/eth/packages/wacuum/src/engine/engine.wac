@@ -476,62 +476,10 @@ export struct Engine {
       }
     }
 
-    Header h = headerFrom(p);
-    U256 claimed = hexU256(p.member("blockHash"));
-    Vec<Item> txs = Vec.create();
-    JsonArray rawTxs = p.member("transactions")?.array() ?? JsonArray.create();
-    Vec<U256> blobHashes = Vec.create();
-    u8[][] txBytes = u8[][].defaulted(rawTxs.len());
-    for (i32 i = 0; i < rawTxs.len(); i++) {
-      u8[] raw = hexToBytes(rawTxs.get(i).text() ?? "x") ?? u8[].filled(0, 0);
-      txBytes[i] = raw;
-      Item? it = txItem(raw);
-      if (it is null) { return this.invalid(h, "transaction \{i} does not decode"); }
-      txs.push(it!);
-      DecodedTx d = decodeWith(it!, this.chainId, this.senders);
-      for (i32 k = 0; k < d.tx.blobHashes.len(); k++) { blobHashes.push(d.tx.blobHashes[k]); }
-    }
-    Withdrawal[] withdrawals = withdrawalsFrom(p.member("withdrawals"));
-
-    // The header the payload describes, with the fields the payload does not carry derived.
-    h.txRoot = U256.fromBytes(indexedRoot(txBytes), 0, 32);
-    u8[][] wsRaw = u8[][].defaulted(withdrawals.len());
-    for (i32 i = 0; i < withdrawals.len(); i++) {
-      Withdrawal wd = withdrawals[i];
-      Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
-                       Item.Bytes(u256Bytes(wd.amount))];
-      wsRaw[i] = encode(Item.List(fields));
-    }
-    h.withdrawalsRoot = U256.fromBytes(indexedRoot(wsRaw), 0, 32);
-    if (version >= 3) { h.parentBeaconBlockRoot = hexU256(ps.get(2)); }
-    if (version >= 4) {
-      // The requests hash is over each list's data with its type byte; the payload already has them so.
-      u8[][] byType = u8[][].defaulted(3);
-      for (i32 t = 0; t < 3; t++) { byType[t] = u8[].filled(0, 0); }
-      for (i32 i = 0; i < requests.len(); i++) {
-        i32 t = requests[i][0] as i32;
-        if (t < 3) {
-          u8[] data = u8[].filled(requests[i].len() - 1, 0);
-          for (i32 k = 0; k < data.len(); k++) { data[k] = requests[i][k + 1]; }
-          byType[t] = data;
-        }
-      }
-      h.requestsHash = requestsHashOf(byType);
-    }
-    Spec spec = this.config.specAt(h.timestamp);
-    h.hash = U256.fromBytes(keccak256(encode(headerItem(spec, h))), 0, 32);
-    if (!h.hash.eq(claimed)) { return this.invalidNoAncestor("block hash \{claimed.toHex()} is not the payload's, \{h.hash.toHex()}"); }
-
-    // EIP-4844: the blob hashes the consensus layer expects must be exactly the transactions', in order.
-    if (version >= 3) {
-      JsonArray expected = ps.get(1).array()!;
-      U256[] got = blobHashes.toArray();
-      bool same = expected.len() == got.len();
-      for (i32 i = 0; same && i < got.len(); i++) { same = hexU256(expected.get(i)).eq(got[i]); }
-      if (!same) { return this.invalidNoAncestor("the versioned hashes do not match the transactions'"); }
-    }
-
-    return this.importBlock(spec, Block(h, txs.toArray(), false, withdrawals));
+    Checked c = checkPayload(this.config, this.chainId, this.senders, version, ps, requests);
+    if (c.invalid != "") { return this.invalid(c.header, c.invalid); }
+    if (c.noAncestor != "") { return this.invalidNoAncestor(c.noAncestor); }
+    return this.importBlock(c.spec, Block(c.header, c.txs, false, c.withdrawals));
   }
 
   /** Execute a block on its parent's state and keep it: VALID, INVALID, or SYNCING without the parent. */
@@ -2187,6 +2135,88 @@ JsonValue payloadBody(Archived a) {
 
 /** The most bodies one request may ask for (the spec's lower bound on what a client must serve). */
 static i32 MAX_BODIES = 1024;
+
+
+/** What a payload says, checked as far as it can be without running it: its header, hash included, and why not. */
+export struct Checked {
+  Header header;
+  Item[] txs;
+  Withdrawal[] withdrawals;
+  /** A transaction that does not decode: the block is INVALID. */
+  string invalid;
+  /** The block hash or the versioned hashes not the payload's: INVALID with no ancestor named. */
+  string noAncestor;
+  Spec spec;
+}
+
+/**
+ * An `engine_newPayload` call's payload (params `ps`, its execution requests already read for V4), checked without
+ * running it: the header it describes, with the transaction, withdrawal and requests roots and the hash derived and the
+ * hash compared with the one it claims, and the blob hashes the consensus layer expects compared with the
+ * transactions'. `newPayload` runs what passes; `tools/e2e/stubel.wac` (the light-client driver's mainnet dry run)
+ * stops here. Every field the block hash covers is bound by this check: a payload that agrees with a proven hash
+ * is the block that hash names.
+ */
+export Checked checkPayload(ChainConfig config, U256 chainId, SenderCache senders, i32 version, JsonArray ps, u8[][] requests) {
+  JsonValue p = ps.get(0);
+  Spec spec0 = config.specAt(hexU256(p.member("timestamp")));
+    Header h = headerFrom(p);
+    U256 claimed = hexU256(p.member("blockHash"));
+    Vec<Item> txs = Vec.create();
+    JsonArray rawTxs = p.member("transactions")?.array() ?? JsonArray.create();
+    Vec<U256> blobHashes = Vec.create();
+    u8[][] txBytes = u8[][].defaulted(rawTxs.len());
+    for (i32 i = 0; i < rawTxs.len(); i++) {
+      u8[] raw = hexToBytes(rawTxs.get(i).text() ?? "x") ?? u8[].filled(0, 0);
+      txBytes[i] = raw;
+      Item? it = txItem(raw);
+      if (it is null) { return Checked(h, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))), Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())), "transaction \{i} does not decode", "", spec0); }
+      txs.push(it!);
+      DecodedTx d = decodeWith(it!, chainId, senders);
+      for (i32 k = 0; k < d.tx.blobHashes.len(); k++) { blobHashes.push(d.tx.blobHashes[k]); }
+    }
+    Withdrawal[] withdrawals = withdrawalsFrom(p.member("withdrawals"));
+
+    // The header the payload describes, with the fields the payload does not carry derived.
+    h.txRoot = U256.fromBytes(indexedRoot(txBytes), 0, 32);
+    u8[][] wsRaw = u8[][].defaulted(withdrawals.len());
+    for (i32 i = 0; i < withdrawals.len(); i++) {
+      Withdrawal wd = withdrawals[i];
+      Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
+                       Item.Bytes(u256Bytes(wd.amount))];
+      wsRaw[i] = encode(Item.List(fields));
+    }
+    h.withdrawalsRoot = U256.fromBytes(indexedRoot(wsRaw), 0, 32);
+    if (version >= 3) { h.parentBeaconBlockRoot = hexU256(ps.get(2)); }
+    if (version >= 4) {
+      // The requests hash is over each list's data with its type byte; the payload already has them so.
+      u8[][] byType = u8[][].defaulted(3);
+      for (i32 t = 0; t < 3; t++) { byType[t] = u8[].filled(0, 0); }
+      for (i32 i = 0; i < requests.len(); i++) {
+        i32 t = requests[i][0] as i32;
+        if (t < 3) {
+          u8[] data = u8[].filled(requests[i].len() - 1, 0);
+          for (i32 k = 0; k < data.len(); k++) { data[k] = requests[i][k + 1]; }
+          byType[t] = data;
+        }
+      }
+      h.requestsHash = requestsHashOf(byType);
+    }
+    Spec spec = config.specAt(h.timestamp);
+    h.hash = U256.fromBytes(keccak256(encode(headerItem(spec, h))), 0, 32);
+    if (!h.hash.eq(claimed)) { return Checked(h, txs.toArray(), withdrawals, "", "block hash \{claimed.toHex()} is not the payload's, \{h.hash.toHex()}", spec); }
+
+    // EIP-4844: the blob hashes the consensus layer expects must be exactly the transactions', in order.
+    if (version >= 3) {
+      JsonArray expected = ps.get(1).array()!;
+      U256[] got = blobHashes.toArray();
+      bool same = expected.len() == got.len();
+      for (i32 i = 0; same && i < got.len(); i++) { same = hexU256(expected.get(i)).eq(got[i]); }
+      if (!same) { return Checked(h, txs.toArray(), withdrawals, "", "the versioned hashes do not match the transactions'", spec); }
+    }
+
+    return Checked(h, txs.toArray(), withdrawals, "", "", spec);
+}
 
 JsonValue capabilities() {
   string[] names = ["engine_newPayloadV1", "engine_newPayloadV2", "engine_newPayloadV3", "engine_newPayloadV4",

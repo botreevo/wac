@@ -1,0 +1,86 @@
+// driver — an execution client driven by Ethereum's light-client protocol instead of a consensus client
+// (`src/driver/drive.wac` says what that trusts and what it does not).
+//
+//     driver --beacon URL --engine URL --jwt-secret FILE [--checkpoint ROOT] [--state FILE] [--network mainnet|node]
+//            [--poll-ms MS] [--max-walk BLOCKS]
+//
+// --beacon is any beacon node serving the light-client API and blocks (a public one will do: it is trusted for
+// nothing); --engine the execution client's authenticated Engine API (`http://127.0.0.1:8551`), with the JWT secret
+// both read. --checkpoint is a beacon block root trusted from outside, needed at the first start; after it, --state
+// keeps the last finalized root the light client verified, and a restart bootstraps from that. --network mainnet
+// (the default) takes mainnet's fork schedule and genesis from the specs; `node` reads them from the beacon node, for
+// a devnet. Each round (every --poll-ms, 4000 by default) the light client's updates are processed and the execution
+// client brought to the head they prove.
+
+import { Sys } from "std";
+import { U256 } from "../src/u256.wac";
+import { hexToBytes } from "../src/hex.wac";
+import { Beacon } from "../src/driver/beacon.wac";
+import { EngineClient } from "../src/driver/engineclient.wac";
+import { Driver, Network, networkFrom, start, round, keptRoot } from "../src/driver/drive.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+i32 number(string s) {
+  i32 n = 0;
+  u8[] d = s.toBytes();
+  for (i32 i = 0; i < d.len(); i++) { n = n * 10 + ((d[i] - 48) as i32); }
+  return n;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  string beaconUrl = flag(a, "--beacon", "");
+  string engineUrl = flag(a, "--engine", "http://127.0.0.1:8551");
+  string secretFile = flag(a, "--jwt-secret", "");
+  if (beaconUrl == "" || secretFile == "") {
+    sys.warn("usage: driver --beacon URL --engine URL --jwt-secret FILE [--checkpoint ROOT] [--state FILE] [--network mainnet|node] [--poll-ms MS] [--max-walk BLOCKS]");
+    return 2;
+  }
+  u8[]? secret = null;
+  match (await sys.readFile(secretFile)) {
+    Err(e): { sys.warn("driver: \{secretFile}: \{e}"); return 1; }
+    Ok(b): {
+      string t = string.fromBytes(b);
+      while (t.len() > 0 && (t.slice(t.len() - 1, t.len()) == "\n" || t.slice(t.len() - 1, t.len()) == " ")) { t = t.slice(0, t.len() - 1); }
+      secret = hexToBytes(t.indexOf("0x") == 0 ? t : "0x" + t);
+    }
+  }
+  if (secret is null || secret!.len() != 32) { sys.warn("driver: \{secretFile} is not a 32-byte hex secret"); return 1; }
+  Beacon beacon = Beacon.at(sys, beaconUrl);
+  EngineClient engine = EngineClient.at(sys, engineUrl, secret!);
+  Network net = Network.mainnet();
+  if (flag(a, "--network", "mainnet") == "node") {
+    auto n = await networkFrom(beacon);
+    if (n.isErr()) { sys.warn("driver: the network from the node: \{n.err()!}"); return 1; }
+    net = n.unwrap();
+  }
+  string stateFile = flag(a, "--state", "");
+  string root = await keptRoot(sys, stateFile);
+  if (root != "") { sys.log("driver: starting from the finalized root kept in \{stateFile}"); }
+  if (root == "") { root = flag(a, "--checkpoint", ""); }
+  if (root == "") { sys.warn("driver: no --checkpoint, and nothing kept in --state: a first start needs a trusted beacon block root"); return 1; }
+  i32 poll = number(flag(a, "--poll-ms", "4000"));
+
+  Driver? d = null;
+  // The beacon node may be starting too, or rate-limiting: the bootstrap is asked again until it answers.
+  for (i32 tries = 0; d is null; tries++) {
+    auto s = await start(sys, beacon, engine, net, root, stateFile);
+    if (s.isOk()) { d = s.unwrap(); }
+    else {
+      sys.warn("driver: \{s.err()!}");
+      if (tries >= 60) { return 1; }
+      await sys.sleepMillis(5000);
+    }
+  }
+  d!.maxWalk = number(flag(a, "--max-walk", "64"));
+  sys.log("driver: following \{beaconUrl}, driving \{engineUrl}");
+  while (true) {
+    await round(d!);
+    await sys.sleepMillis(poll);
+  }
+  return 0;
+}

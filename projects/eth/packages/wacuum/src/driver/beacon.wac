@@ -1,0 +1,72 @@
+// A beacon node's REST API, as the light-client driver reads it: light-client data as SSZ (believed only as far as the
+// light client verifies it) and blocks as JSON (believed only as far as their execution block hashes chain to one the
+// light client proved — `payload.wac`). The node is a source of bytes, nothing more.
+
+import { Sys } from "std";
+import { Result } from "core";
+import { fetch.fetchWithinAsync, fetch.Caps, fetch.Fetched } from "wac";
+import { json.parse, json.JsonValue } from "wac";
+
+export struct Beacon {
+  Sys sys;
+  /** The node's base URL, no trailing slash: `https://…` or `http://127.0.0.1:5052`. */
+  string url;
+  i32 timeoutMs;
+
+  Beacon at(Sys sys, string url) { return Beacon(sys, url, 30000); }
+
+  /**
+   * GET, asked again after a pause when the node says it is rate-limiting (429) or busy (503) — a public node does
+   * both — up to four times, 2, 4 and 8 s apart.
+   */
+  async Result<Fetched, string> get(this, string path, string accept) {
+    Caps caps = Caps(this.sys.clock(), this.sys.random(), this.sys.env(), this.sys.net(), this.sys.files());
+    for (i32 attempt = 0; true; attempt++) {
+      auto r = await fetchWithinAsync(caps, "GET", this.url + path, ["Accept: " + accept], u8[].filled(0, 0), this.timeoutMs);
+      if (r.isErr()) { return Result.Err("\{path}: \{r.err()!}"); }
+      Fetched f = r.unwrap();
+      if ((f.status == 429 || f.status == 503) && attempt < 3) {
+        await this.sys.sleepMillis(2000 << attempt);
+        continue;
+      }
+      if (f.status != 200) { return Result.Err("\{path}: HTTP \{f.status}: \{string.fromBytes(cut(f.body, 200))}"); }
+      return Result.Ok(f);
+    }
+    return Result.Err("\{path}: unreachable");
+  }
+
+  /** SSZ bytes, and the fork the node says they are laid out in (its `Eth-Consensus-Version`). */
+  async Result<Ssz, string> ssz(this, string path) {
+    auto r = await this.get(path, "application/octet-stream");
+    if (r.isErr()) { return Result.Err(r.err()!); }
+    Fetched f = r.unwrap();
+    return Result.Ok(Ssz(f.body, string.fromBytes(f.headers.first("eth-consensus-version"))));
+  }
+
+  /** A JSON answer's `data`. */
+  async Result<JsonValue, string> json(this, string path) {
+    auto r = await this.get(path, "application/json");
+    if (r.isErr()) { return Result.Err(r.err()!); }
+    match (parse(r.unwrap().body)) {
+      Err(e): { return Result.Err("\{path}: not JSON"); }
+      Ok(v): {
+        JsonValue? d = v.member("data");
+        if (d is null) { return Result.Err("\{path}: no data"); }
+        return Result.Ok(d!);
+      }
+    }
+  }
+}
+
+export struct Ssz {
+  u8[] bytes;
+  /** `Eth-Consensus-Version`: `fulu`, `electra`, …; "" if the node did not say. */
+  string fork;
+}
+
+u8[] cut(u8[] b, i32 n) {
+  i32 m = b.len() < n ? b.len() : n;
+  u8[] out = u8[].filled(m, 0);
+  for (i32 i = 0; i < m; i++) { out[i] = b[i]; }
+  return out;
+}

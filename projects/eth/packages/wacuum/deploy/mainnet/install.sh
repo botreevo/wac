@@ -61,6 +61,13 @@ git -C /opt/wac checkout --detach "$pin"
 chown -R wacuum:wacuum /opt/wac-eth
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth && sh tools/deps.sh'
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac test --allow-read test'
+# The light-client driver, built once into an executable (the all-wac mode, docs/mainnet.md), and the secret it and
+# wacuum share; its settings kept across reinstalls.
+su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && mkdir -p dist && wac app --allow-net --allow-read --allow-write --allow-env cmd/driver.wac -o dist/driver'
+mkdir -p /etc/eth
+[ -f /etc/eth/jwt-wacuum.hex ] || (od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > /etc/eth/jwt-wacuum.hex)
+chown wacuum /etc/eth/jwt-wacuum.hex && chmod 600 /etc/eth/jwt-wacuum.hex
+[ -f /etc/eth/mainnet-wac.env ] || install -m 644 /opt/wac-eth/packages/wacuum/deploy/mainnet/mainnet-wac.env /etc/eth/mainnet-wac.env
 
 # Metrics: node_exporter on loopback only (its default is every address), reading the textfile the timer writes.
 here=/opt/wac-eth/packages/wacuum/deploy/mainnet
@@ -71,7 +78,7 @@ grep -q 'listen-address' /etc/default/prometheus-node-exporter 2>/dev/null ||
   echo 'ARGS="--web.listen-address=127.0.0.1:9100 --collector.textfile.directory=/var/lib/prometheus/node-exporter"' >> /etc/default/prometheus-node-exporter
 install -m 644 "$here/wacuum-shadow.logrotate" /etc/logrotate.d/wacuum-shadow
 
-install -m 644 "$here/wacuum-shadow.service" "$here/wacuum-status.service" "$here/wacuum-status.timer" /etc/systemd/system/
+install -m 644 "$here/wacuum-shadow.service" "$here/wacuum-status.service" "$here/wacuum-status.timer" "$here/wacuum-driver.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl restart prometheus-node-exporter
 echo "install.sh: done. Next: sh reference.sh RETH_VERSION LIGHTHOUSE_VERSION, wait for reth to sync, then"

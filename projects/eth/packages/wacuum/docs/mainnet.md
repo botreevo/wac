@@ -259,6 +259,66 @@ fixed: the pinned wac commit was not on GitHub yet (fetched from git.voltrevo.co
 commit wac's own lock names (`tools/deps.sh` does the same); and a second run — an upgrade — stopped at `git
 pull`, root's git refusing the checkout the service user owns.
 
+## The all-wac mode: wacuum and the light-client driver (2026-11-17)
+
+**What it is.** wacuum driven by `cmd/driver.wac` instead of a consensus client: the driver follows the beacon chain
+with Ethereum's light-client protocol (`packages/lightclient`) and turns each head it proves into the Engine API calls
+a consensus client would make — `engine_newPayloadV4` for every block from one wacuum has to the head, then
+`engine_forkchoiceUpdatedV3` with the head and, as safe and finalized, the light client's finalized block. No beacon
+state, no validators, no p2p on the consensus side: the driver reads a beacon node's REST API (the light-client
+endpoints and `/eth/v2/beacon/blocks`), and any beacon node will do, a public one included.
+
+**What it trusts — plainly.** This is an *optimistic, light-client-driven* execution client, the model of Helios and
+of Nimbus's light-client mode:
+
+- **Trusted:** one beacon block root, at the first start (the checkpoint), and the sync committees that follow from it
+  by the protocol's rules. The head is a block the current sync committee (512 validators, rotated every ~27 hours)
+  signed with more than half of the highest participation seen over the last two periods; the finalized block is one
+  two thirds of the committee signed as finalized.
+- **Not trusted:** the beacon node. Light-client updates are believed only as far as their BLS signatures and Merkle
+  branches carry them; a block only as far as its execution block hash is the one the light client proved, or the
+  parent hash of a block already believed. wacuum derives that hash from every field of the payload, the parent beacon
+  root and the execution requests, and checks the blob versioned hashes against the transactions, so a beacon node
+  that changed a byte gets the block refused, never a different block accepted.
+- **Not checked, that a full consensus client checks:** the beacon state transition (attestations, slashings, the
+  validator set's balances), fork choice by attestation weight, and the availability of blob data. A sync committee
+  that signed a head the rest of the chain never accepted would be followed until a finalized update says
+  otherwise. Execution is checked in full — wacuum runs every block, so state, receipts and state roots are its own.
+- **Restarts** start from the last finalized root the driver verified (kept in `/data/wacuum/driver.json`), so the
+  checkpoint is trusted once.
+
+**Tested.**
+
+- *Unit*: a mainnet Fulu block (slot 15 677 439: 297 transactions, 18 blobs, 3 deposit requests) as the beacon API
+  serves it becomes a payload whose derived block hash is its own; a changed deposit or parent root is refused
+  (`test/driver_test.wac`).
+- *Devnet* (`tools/e2e/cldriver.wac`): geth builds under Lighthouse and its validators; the driver reads Lighthouse's
+  light-client API and drives wacuum, which no consensus client talks to. wacuum follows to block ~130 with transfers
+  and a blob block, survives its own kill and the driver's (before finality from the checkpoint, after it from the
+  root it kept), and its finalized block is geth's. A reorg was not provoked — one validator client holds every key —
+  and goes by the same walk: from the new head back by parent hash to a block wacuum has.
+- *Mainnet dry run*: DRYRUN
+
+**Running it** needs one more thing of wacuum: **it does not start on mainnet's genesis yet** ("the chain is not on
+Cancun or later at genesis" — it runs Cancun on, and mainnet's genesis is Frontier's). A start that takes mainnet's
+known genesis hash and its Cancun-onward schedule (`src/chain/mainnet.wac`) and snap-syncs to the head the driver
+names, never running a block before Cancun, is the missing piece. With it, on the box: `install.sh` builds
+`dist/driver`, makes `/etc/eth/jwt-wacuum.hex` and installs `/etc/eth/mainnet-wac.env` (set `CHECKPOINT`, and
+`BEACON_URL` if not the default) and `wacuum-driver.service`; then `systemctl enable --now wacuum-driver` beside
+wacuum on its store at 127.0.0.1:8551. `journalctl -fu wacuum-driver` shows one line a head: its slot, its execution
+hash, wacuum's answer and the finalized slot.
+
+**Memory, by mode** (the box's 32 GB):
+
+| mode | processes | resident, together |
+| --- | --- | ---: |
+| the shadow (C): reth + Lighthouse + `wacuum-shadow` | reth *8–12 GB*, Lighthouse *4–6 GB*, the shadow **< 1 GB** | *~14–20 GB* |
+| wacuum under Lighthouse (B), no reference | wacuum *3–5 GB*, Lighthouse *4–6 GB* | *~8–12 GB* |
+| **all wac: wacuum + the driver** | wacuum *3–5 GB*, the driver **~155 MB** (measured, mainnet, the dry run) | ***~3.5–5.5 GB*** |
+
+The all-wac mode is the smallest by the consensus client it leaves out; it leaves the most of the box to the page
+cache, which wacuum's store reads through.
+
 ## Memory on the 32 GB box (2026-11-17)
 
 Each figure is marked **measured** (here, on this container) or *estimated*. Two arrangements matter: the shadow (C),

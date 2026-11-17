@@ -69,6 +69,42 @@ test uses it for the two runners that break the machine.
 - **Revocation.** When wasmtime's runner revokes one of its suite derivations, it witnesses 12 of 13 and no longer
   counts.
 
+## The bootstrap's machines (2026-11-17, wac aaef775ca)
+
+The rule is the machine's, not `wasm-gc`'s: a policy may name a suite for any machine. `tools/bootconf.sh` (task
+`reckon:bootconf`) gives the two host-run machines that the rooted capstone leans on most their own suites: 10 of 10.
+
+- **`wac-l0/1`: 14 cases.**
+  - Every L0 text in wac's own tests (`bootstrap/tests/l0`, 9 files).
+  - The hand-written first rung, `boot/l1.l0`.
+  - The empty text, which is a module with nothing in it.
+  - Three refusals: an unknown directive, an unknown instruction, and a call to a name nothing declares.
+
+  A refusal is an output (`status` "refused" and no module), so a runner must refuse those three too.
+- **`wac-flatten/1`: 6 cases.**
+  - wac's L5 tests (`bootstrap/tests/l5`), including the imports fixture that finds `lib/` up the directory chain.
+  - A program built to exercise the renaming rules: two modules declaring one private `helper` (the second becomes
+    `helper_b`), and an import renamed with `as` (undone).
+  - wacc's own sources, 39 modules.
+  - An import of a missing file, refused.
+- **Neither machine has a case that gives nothing.** A runner's own failure is not an answer, and no input makes
+  these machines give none.
+
+What it checked:
+
+- **Agreement.** For every case, the two runners of each machine (wax and wax.js; flatten.rs and flatten.js) give
+  one output with the status the case wants. Each suite is one object.
+- **Admission.** An assembled module and a flattened program, neither of them a case, are admitted under a policy
+  naming both suites (`conformance: { "wac-l0/1": …, "wac-flatten/1": … }`), with all four witnesses counted.
+- **Runners that do not count:**
+  - an assembler that never witnessed the suite, though its module is right;
+  - an assembler that pads every module with one byte: its claims about the suite's cases are other trees, though
+    its claim about the subject is right;
+  - a flattener that names the clashing `helper` its own way (`helper__b`). It agrees with the others on every case
+    without a clash, and on the subject (which has none), and is still not counted.
+- **Revocation.** When wax revokes one suite case, it witnesses 13 of 14 and no longer counts. Its flattener
+  counterpart is under another suite and still counts.
+
 ## Limits
 
 - **The suite is a sample, not a proof.** It catches a runner that gets these programs wrong, not every way to be

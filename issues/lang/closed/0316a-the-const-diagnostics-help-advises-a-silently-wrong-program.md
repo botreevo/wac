@@ -1,6 +1,6 @@
 # 0316a — the const diagnostic's help advises a silently wrong program
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-01
@@ -95,3 +95,11 @@ answer.
 That one is about const being laundered through slots the checker does not guard, where the error
 never fires. This is the opposite: the error fires correctly and the advice beside it is wrong. They
 touch the same feature and neither fix depends on the other.
+
+## Fixed — 2026-11-17
+
+Neither half of the old help survives. A method of a struct called on a const receiver is labelled
+`` `mutate` writes to its receiver, and this one is const `` and told *take it non-const where it is handed out, or
+call something that does not write — a copy would take the write where nobody sees it*; every other site of code 15
+that has no help of its own (`s.table().push(r)`, a core type's writing method) gets the same two routes from the
+code's own help. `packages/wacc/test/wac/codes_test.wac` `test_a_writing_method_on_a_const_receiver_is_not_told_to_copy`.

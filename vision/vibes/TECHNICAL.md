@@ -193,16 +193,16 @@ error: a non-const reference cannot be taken from a const one
 accessor checks clean and writing through it is refused. `issues/lang/closed/0060` — *a value
 returned from a `const this` method stays const* — is what implemented it.
 
-The caret above is **not** what the compiler says. Today it is
+The caret's label above is **not** what the compiler says: it has no label at this site, only
 
 ```
-   |                                                     ^
-   = help: take a copy, or declare the destination `const` too
+   = help: take it non-const where it is handed out, or call something that does not write — a copy would lose the write
 ```
 
-and that help is wrong at this site — there is no destination — which is
-`issues/lang/open/0316a`, filed from this entry's own example. So the entry is a picture of the
-diagnostic it should have, and it was marked *Not yet* as though the rule were unimplemented.
+It used to say *take a copy, or declare the destination `const` too*, which was wrong here — there is
+no destination, and a copy compiles and loses the write — and `issues/lang/closed/0316a`, filed from this
+entry's own example, replaced it. A method of a struct written on a const receiver also gets the label,
+`` `mutate` writes to its receiver, and this one is const ``.
 
 ---
 

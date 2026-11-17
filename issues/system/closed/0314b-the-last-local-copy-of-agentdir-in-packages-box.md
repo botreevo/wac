@@ -1,6 +1,6 @@
 # 0314b — the last local copy of `agentDir`, in `packages/box`
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
 - **Date:** 2026-09-01
@@ -72,3 +72,7 @@ keeps its own `dirOf` for exactly that reason. And the counts are small enough p
 a judgement about that helper rather than one mechanical change.
 
 The number is recorded here so it is findable, not as a claim that 105 edits are wanted.
+
+## Done — 2026-11-17
+
+`frontpage_test.wac` imports `agentDir` from `wactest/src/host.wac` and its copy is gone; no other file carries one.

@@ -1,0 +1,442 @@
+// **What the bootstrap asks of wacc, checked in seconds** — the wac port of `tools/l5subset.ts`.
+//
+//     wac run --allow-read --allow-write --allow-run --allow-env tools/wac/l5subset.wac
+//
+// The same three checks and the same report as the TypeScript (whose header says why each exists):
+//
+//   - **names**: a top-level name declared by two of wacc's modules, found the way the ladder's flattener
+//     (`bootstrap/js/flatten.js`) finds it — its `topLevelDecls`, its keeper rule — so this reports what it would rename;
+//   - **subset**: the first thing wac-L5 refuses, placed on the source line it came from. wac-L5 runs in the
+//     bootstrap's `ladder` binary (`bootstrap/rust-ladder`, built by `bootstrap.sh`): `--dump-flat` flattens wacc,
+//     the round-0 driver is appended as the self-host check appends it, and `--flat --l0` compiles it;
+//   - **interpolation**: `"\{x}"` in a file the self-host check builds.
+//
+// Exit 0 when all three are clean, 1 with the problems listed, 2 when the ladder cannot be run.
+
+import { ChildEnv, Exec, Files, Launch, Output, Procs, Sys } from "std";
+import { Buf, Map, Vec, flatten, hashString, stringEq } from "core";
+import { endsWith, startsWith } from "../../packages/wactest/src/strings.wac";
+
+static string LADDER = "bootstrap/rust-ladder/target/release/ladder";
+static string API = "packages/wacc/src/api.wac";
+static string SELFCHECK = "bootstrap/drivers/selfcheck.wac";
+static string SELFCHECK_AS = "packages/wacc/src/selfcheck.wac";
+static string DRIVER = "bootstrap/drivers/spec_cases.wac";
+
+string readText(Files fs, string path) {
+  u8[]? b = flatten(fs.readFile(path).wait()).ok();
+  return b is null ? "" : string.fromBytes(b!);
+}
+
+/** `s` cut at each `sep`, empty pieces kept. */
+string[] split(string s, string sep) {
+  Vec<string> out = Vec.create();
+  i32 from = 0;
+  for (i32 i = 0; i + sep.len() <= s.len(); i++) {
+    if (s.slice(i, i + sep.len()) == sep) {
+      out.push(s.slice(from, i));
+      from = i + sep.len();
+      i = i + sep.len() - 1;
+    }
+  }
+  out.push(s.slice(from, s.len()));
+  return out.toArray();
+}
+
+/** `text` cut at each newline — over its bytes, since a slice per character costs an allocation each. */
+string[] lines(string text) {
+  u8[] b = text.toBytes();
+  Vec<string> out = Vec.create();
+  i32 from = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i < b.len() && b[i] != 10) { continue; }
+    Buf piece = Buf.create();
+    piece.pushBytes(b, from, i - from);
+    out.push(string.fromBytes(piece.bytes()));
+    from = i + 1;
+  }
+  return out.toArray();
+}
+
+string trim(string s) {
+  u8[] b = s.toBytes();
+  i32 a = 0;
+  i32 e = b.len();
+  while (a < e && (b[a] == 32 || b[a] == 9 || b[a] == 13 || b[a] == 10)) { a++; }
+  while (e > a && (b[e - 1] == 32 || b[e - 1] == 9 || b[e - 1] == 13 || b[e - 1] == 10)) { e--; }
+  if (a == 0 && e == b.len()) { return s; }
+  Buf out = Buf.create();
+  out.pushBytes(b, a, e - a);
+  return string.fromBytes(out.bytes());
+}
+
+bool isSpace(string c) { return c == " " || c == "\t" || c == "\r" || c == "\n"; }
+bool isWord(string c) { return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_"; }
+bool isWordStart(string c) { return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c == "_"; }
+bool isTypeChar(string c) { return isWord(c) || c == "<" || c == ">" || c == "[" || c == "]" || c == "?"; }
+
+/** `a/b/../c` → `a/c`; `.` dropped. */
+string normal(string path) {
+  string[] parts = split(path, "/");
+  Vec<string> kept = Vec.create();
+  for (string p in parts) {
+    if (p == "." || p == "") { continue; }
+    if (p == ".." && kept.len() > 0) { kept.pop(); continue; }
+    kept.push(p);
+  }
+  string out = "";
+  for (i32 i = 0; i < kept.len(); i++) { out = out + (i == 0 ? "" : "/") + kept.get(i); }
+  return out;
+}
+
+string dirOf(string path) { i32 k = lastSlash(path); return k < 0 ? "" : path.slice(0, k); }
+i32 lastSlash(string p) {
+  i32 at = -1;
+  for (i32 i = 0; i < p.len(); i++) { if (p.slice(i, i + 1) == "/") { at = i; } }
+  return at;
+}
+
+/** One module of the graph: where it is, its stem, its text, and its `import { x as y }` originals. */
+struct Mod {
+  string path;
+  string mod;
+  string text;
+  string[] aliased;
+}
+
+/**
+ * Each `import { … } from "…";` in `text`: the brace list and the specifier — `flatten.js`'s
+ * `^\s*import\s*\{([^}]*)\}\s*from\s*"([^"]+)"\s*;`, the list free to span lines.
+ */
+string[] importsOf(string text) {
+  Vec<string> out = Vec.create();
+  string[] ls = lines(text);
+  for (i32 i = 0; i < ls.len(); i++) {
+    if (!startsWith(trim(ls[i]), "import")) { continue; }
+    // The statement may run on: gather lines until the specifier's closing quote and semicolon.
+    string st = ls[i];
+    i32 j = i;
+    while (st.indexOf("from \"") < 0 && j + 1 < ls.len()) { j++; st = st + "\n" + ls[j]; }
+    i32 open = st.indexOf("{");
+    i32 close = st.indexOf("}");
+    i32 from = st.indexOf("from \"");
+    if (open < 0 || close < open || from < close) { continue; }
+    string rest = st.slice(from + 6, st.len());
+    i32 q = rest.indexOf("\"");
+    if (q < 0) { continue; }
+    out.push(st.slice(open + 1, close));
+    out.push(rest.slice(0, q));
+  }
+  return out.toArray();
+}
+
+/** The graph from `entry` in dependency order, as `flatten.js`'s `gather` walks it; `at` is where the entry is built. */
+void gather(Files fs, string entry, string at, Vec<string> seen, Vec<Mod> out) {
+  for (i32 i = 0; i < seen.len(); i++) { if (seen.get(i) == at) { return; } }
+  seen.push(at);
+  string text = readText(fs, entry);
+  string dir = dirOf(at);
+  string[] im = importsOf(text);
+  Vec<string> originals = Vec.create();
+  for (i32 i = 0; i + 1 < im.len(); i += 2) {
+    string spec = im[i + 1];
+    if (startsWith(spec, ".")) {
+      string next = normal(dir + "/" + spec);
+      gather(fs, next, next, seen, out);
+    }
+    for (string item in split(im[i], ",")) {
+      string t = trim(item);
+      i32 a = t.indexOf(" as ");
+      if (a > 0) { originals.push(trim(t.slice(0, a))); }
+    }
+  }
+  string base = at.slice(lastSlash(at) + 1, at.len());
+  string stem = endsWith(base, ".wac") ? base.slice(0, base.len() - 4) : base;
+  out.push(Mod(at, stem, text, originals.toArray()));
+}
+
+/** A line with comments and string contents taken out, as `topLevelDecls` reads it; `inBlock` carries a block comment on. */
+string code(string raw, bool[] inBlock) {
+  u8[] b = raw.toBytes();
+  Buf line = Buf.create();
+  i32 i = 0;
+  while (i < b.len()) {
+    u8 c = b[i];
+    u8 n = i + 1 < b.len() ? b[i + 1] : 0;
+    if (inBlock[0]) {
+      if (c == '*' && n == '/') { inBlock[0] = false; i += 2; continue; }
+      i++;
+      continue;
+    }
+    if (c == '/' && n == '*') { inBlock[0] = true; i += 2; continue; }
+    if (c == '/' && n == '/') { break; }
+    if (c == '"' || c == '\'') {
+      i++;
+      while (i < b.len() && b[i] != c) { i += b[i] == '\\' ? 2 : 1; }
+      i++;
+      line.push('"');
+      line.push('"');
+      continue;
+    }
+    line.push(c);
+    i++;
+  }
+  return string.fromBytes(line.bytes());
+}
+
+i32 skipSpace(string s, i32 at) { while (at < s.len() && isSpace(s.slice(at, at + 1))) { at++; } return at; }
+
+/** `word` and at least one space at `at`, or -1. */
+i32 keyword(string s, i32 at, string word) {
+  if (!startsWith(s.slice(at, s.len()), word)) { return -1; }
+  i32 after = at + word.len();
+  if (after >= s.len() || !isSpace(s.slice(after, after + 1))) { return -1; }
+  return skipSpace(s, after);
+}
+
+/** The name `[A-Za-z_]\w*` at `at` followed by `\s*[({=]`, or "". */
+string nameThen(string s, i32 at) {
+  if (at >= s.len() || !isWordStart(s.slice(at, at + 1))) { return ""; }
+  i32 e = at;
+  while (e < s.len() && isWord(s.slice(e, e + 1))) { e++; }
+  i32 k = skipSpace(s, e);
+  if (k >= s.len()) { return ""; }
+  string c = s.slice(k, k + 1);
+  return c == "(" || c == "{" || c == "=" ? s.slice(at, e) : "";
+}
+
+/** After the optional groups: `(?:[A-Za-z_][\w<>\[\]?]*\s+)?([A-Za-z_]\w*)\s*[({=]`, the type tried first. */
+string typedName(string s, i32 at) {
+  if (at < s.len() && isWordStart(s.slice(at, at + 1))) {
+    i32 e = at;
+    while (e < s.len() && isTypeChar(s.slice(e, e + 1))) { e++; }
+    if (e < s.len() && isSpace(s.slice(e, e + 1))) {
+      string n = nameThen(s, skipSpace(s, e));
+      if (n != "") { return n; }
+    }
+  }
+  return nameThen(s, at);
+}
+
+/**
+ * `flatten.js`'s declaration pattern on one line, each optional group tried taken and then not, as a
+ * backtracking match would: `^\s*(export\s+)?(?:const\s+)?(?:(?:struct|enum)\s+)?…`. "" when it does not match;
+ * the name otherwise, `exported` set from the first group.
+ */
+string declared(string s, bool[] exported) {
+  i32 p0 = skipSpace(s, 0);
+  i32[] exp = [keyword(s, p0, "export"), p0];
+  for (i32 a = 0; a < 2; a++) {
+    if (exp[a] < 0) { continue; }
+    i32[] cst = [keyword(s, exp[a], "const"), exp[a]];
+    for (i32 b = 0; b < 2; b++) {
+      if (cst[b] < 0) { continue; }
+      i32 st = keyword(s, cst[b], "struct");
+      if (st < 0) { st = keyword(s, cst[b], "enum"); }
+      i32[] kind = [st, cst[b]];
+      for (i32 c = 0; c < 2; c++) {
+        if (kind[c] < 0) { continue; }
+        string n = typedName(s, kind[c]);
+        if (n != "") {
+          exported[0] = a == 0;
+          return n;
+        }
+      }
+    }
+  }
+  return "";
+}
+
+/** The module's top-level declarations, as `name` then `1`/`0` for exported. */
+string[] topLevel(string text) {
+  Vec<string> out = Vec.create();
+  i32 depth = 0;
+  bool[] inBlock = [false];
+  for (string raw in lines(text)) {
+    string line = code(raw, inBlock);
+    if (depth == 0) {
+      bool[] ex = [false];
+      string n = declared(line, ex);
+      if (n != "" && n != "import") {
+        out.push(n);
+        out.push(ex[0] ? "1" : "0");
+      }
+    }
+    for (i32 i = 0; i < line.len(); i++) {
+      string c = line.slice(i, i + 1);
+      if (c == "{") { depth++; }
+      if (c == "}") { depth--; }
+    }
+  }
+  return out.toArray();
+}
+
+/** `flatten.js`'s collision report: each rename `name in mod -> name_mod`, and each pair of exports it cannot rename. */
+string[] collisions(Mod[] mods) {
+  Vec<string> names = Vec.create();
+  Vec<string> owners = Vec.create();   // "mod\texported" per entry of `names`, in dependency order
+  Vec<string> renames = Vec.create();
+  for (Mod m in mods) {
+    string[] d = topLevel(m.text);
+    for (string orig in m.aliased) {
+      for (i32 i = 0; i < d.len(); i += 2) {
+        if (d[i] == orig) { renames.push("\{orig} in \{m.mod} -> \{orig}_\{m.mod}"); break; }
+      }
+    }
+    for (i32 i = 0; i < d.len(); i += 2) {
+      names.push(d[i]);
+      owners.push("\{m.mod}\t\{d[i + 1]}");
+    }
+  }
+  // Each name's owners, in dependency order: "mod\texported" joined by newlines — one walk, not one per name.
+  Map<string, string> byName = Map.create(hashString, stringEq);
+  Vec<string> order = Vec.create();
+  for (i32 i = 0; i < names.len(); i++) {
+    string? had = byName.get(names.get(i));
+    if (had is null) { order.push(names.get(i)); }
+    byName.set(names.get(i), had is null ? owners.get(i) : had! + "\n" + owners.get(i));
+  }
+  Vec<string> out = Vec.create();
+  for (i32 i = 0; i < order.len(); i++) {
+    string name = order.get(i);
+    string[] list = lines(byName.get(name)!);
+    if (list.len() < 2) { continue; }
+    Vec<string> mods2 = Vec.create();
+    Vec<string> exported = Vec.create();
+    for (string o in list) {
+      string mod = o.slice(0, o.indexOf("\t"));
+      mods2.push(mod);
+      if (endsWith(o, "\t1")) { exported.push(mod); }
+    }
+    if (exported.len() > 1) {
+      string by = "";
+      for (i32 k = 0; k < exported.len(); k++) { by = by + (k == 0 ? "" : " and ") + exported.get(k); }
+      out.push("\{name}: exported by \{by} — neither can be renamed, so this reaches the assembler as a duplicate export");
+      continue;
+    }
+    string keeper = exported.len() == 1 ? exported.get(0) : mods2.get(0);
+    for (i32 k = 0; k < mods2.len(); k++) {
+      if (mods2.get(k) != keeper) { renames.push("\{name} in \{mods2.get(k)} -> \{name}_\{mods2.get(k)}"); }
+    }
+  }
+  for (i32 i = 0; i < renames.len(); i++) { out.push(renames.get(i)); }
+  return sorted(out.toArray());
+}
+
+string[] sorted(string[] xs) {
+  for (i32 i = 1; i < xs.len(); i++) {
+    string v = xs[i];
+    i32 j = i - 1;
+    while (j >= 0 && xs[j] > v) { xs[j + 1] = xs[j]; j--; }
+    xs[j + 1] = v;
+  }
+  return xs;
+}
+
+bool isComment(string line) {
+  string t = trim(line);
+  return startsWith(t, "//") || startsWith(t, "*") || startsWith(t, "/*");
+}
+
+/** Where a line of the flattened graph came from: the source lines with the same text, outside comments. */
+string placed(Mod[] graph, string text) {
+  string want = trim(text);
+  if (want == "") { return "(a blank line of the flattened graph)"; }
+  Vec<string> hits = Vec.create();
+  for (Mod m in graph) {
+    string[] ls = lines(m.text);
+    for (i32 i = 0; i < ls.len() && hits.len() < 3; i++) {
+      if (trim(ls[i]) == want && !isComment(ls[i])) { hits.push("\{m.path}:\{i + 1}"); }
+    }
+  }
+  if (hits.len() == 0) { return "(renamed in flattening: \{want.len() > 80 ? want.slice(0, 80) : want})"; }
+  string out = "";
+  for (i32 i = 0; i < hits.len(); i++) { out = out + (i == 0 ? "" : ", ") + hits.get(i); }
+  return out;
+}
+
+/** `\{` not itself escaped. */
+bool interpolates(string line) {
+  u8[] b = line.toBytes();
+  for (i32 i = 1; i < b.len(); i++) {
+    if (b[i - 1] == '\\' && b[i] == '{' && (i < 2 || b[i - 2] != '\\')) { return true; }
+  }
+  return false;
+}
+
+Exec? ran(Procs procs, string[] args) {
+  return flatten(procs.exec(LADDER, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+}
+
+export i32 main(Sys sys) {
+  Files fs = sys.files();
+  Output err = sys.stderr();
+  Vec<string> problems = Vec.create();
+
+  // ── names ──
+  Vec<Mod> graphV = Vec.create();
+  gather(fs, API, API, Vec.create(), graphV);
+  Mod[] graph = graphV.toArray();
+  for (string c in collisions(graph)) {
+    problems.push("names: \{c} — give one a distinct name, or keep one and import it");
+  }
+
+  // ── subset ──
+  Exec? flat = ran(sys.procs(), [API, "--dump-flat"]);
+  if (flat is null || flat!.status != 0) {
+    err.line("check:l5: \{LADDER} would not flatten wacc — build it with ./bootstrap.sh");
+    return 2;
+  }
+  string program = string.fromBytes(flat!.stdout) + "\n" + readText(fs, DRIVER);
+  string tmp = "/tmp/wac-l5subset-\{flatten(sys.clock().monotonicNanos().wait()).unwrap()}.wac";
+  flatten(fs.writeFile(tmp, program.toBytes()).wait());
+  Exec? l0 = ran(sys.procs(), [tmp, "--flat", "--l0"]);
+  fs.remove(tmp, false).wait();
+  if (l0 is null) {
+    err.line("check:l5: \{LADDER} could not be run");
+    return 2;
+  }
+  Vec<string> refusals = Vec.create();
+  for (string l in lines(string.fromBytes(l0!.stdout))) { if (startsWith(l, "!!")) { refusals.push(l); } }
+  if (refusals.len() > 0) {
+    string r = refusals.get(0);
+    string after = refusals.len() > 1 ? " (and \{refusals.len() - 1} more after it, where wac-L5's parser lost its place)" : "";
+    i32 at = r.indexOf("line ");
+    i32 colon = at < 0 ? -1 : r.slice(at, r.len()).indexOf(": ");
+    if (at < 0 || colon < 0) {
+      problems.push("subset: \{r.slice(3, r.len())}\{after}");
+    } else {
+      i32 n = 0;
+      string digits = r.slice(at + 5, at + colon);
+      for (i32 i = 0; i < digits.len(); i++) { n = n * 10 + "0123456789".indexOf(digits.slice(i, i + 1)); }
+      string[] flatLines = lines(program);
+      string src = n >= 1 && n <= flatLines.len() ? flatLines[n - 1] : "";
+      problems.push("subset: \{placed(graph, src)} — wac-L5: \{r.slice(at + colon + 2, r.len())}\{after}");
+    }
+  }
+
+  // ── interpolation ──
+  Vec<Mod> checkV = Vec.create();
+  gather(fs, SELFCHECK, SELFCHECK_AS, Vec.create(), checkV);
+  for (Mod m in checkV.toArray()) {
+    string shown = m.path == SELFCHECK_AS ? SELFCHECK : m.path;
+    if (!startsWith(shown, "packages/wacc/") && !startsWith(shown, "bootstrap/drivers/")) { continue; }
+    string[] ls = lines(m.text);
+    for (i32 i = 0; i < ls.len(); i++) {
+      if (!isComment(ls[i]) && interpolates(ls[i])) {
+        string t = trim(ls[i]);
+        problems.push("interpolation: \{shown}:\{i + 1} — build this text with `+`: \{t.len() > 90 ? t.slice(0, 90) : t}");
+      }
+    }
+  }
+
+  if (problems.len() == 0) {
+    sys.stdout().line("check:l5: wacc's \{graph.len()} files are in wac-L5's subset, their names are distinct, and the " +
+                      "self-host check's files interpolate nothing");
+    return 0;
+  }
+  err.line("check:l5: \{problems.len()} problem(s) the bootstrap would hit — packages/wacc/README.md, " +
+           "\"One thing the bootstrap asks of this package\":");
+  for (i32 i = 0; i < problems.len(); i++) { err.line("  \{problems.get(i)}"); }
+  return 1;
+}

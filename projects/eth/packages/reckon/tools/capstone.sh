@@ -148,11 +148,11 @@ if [ -z "${QUICK:-}" ]; then
   compilerRole='[{ within: { role: "selfbuild", path: "out/wac.wasm" } }]'
   if [ -n "${LADDER:-}" ]; then
     # Rooted at sources (decision D, milestone 5): the compiler is built by the wac command the rungs made, and nothing
-    # else; no binary is a root. The rungs' roles are rungs.sh's own, from its run; its runners sign as js and rust
-    # with the keys v8 and wasmtime sign with here.
+    # else; no binary is a root. The rungs' roles are rungs.sh's own, from its run; its runners sign with the keys v8
+    # and wasmtime sign with here, so its js and rust are those signers.
     selfbuildRole='[{ derived: { by: ["v8", "wasmtime"], at_least: 2, runners: 2, slots: { program: "ladder", in: "source", args: "source" } } }]'
     roots=""
-    chainRoles="$(cat rungs/roles.json5)"
+    chainRoles="$(sed 's/by: \["js", "rust"\]/by: ["v8", "wasmtime"]/g' rungs/roles.json5)"
     endorse "$ladderbuild"
   fi
 else
@@ -167,8 +167,7 @@ fi
 cat > policy.json5 <<POLICY
 {
   // Trusted: $trusted.
-  signers: { v8: "$($CL address --key v8.key)", wasmtime: "$($CL address --key wt.key)", reviewer: "$($CL address --key reviewer.key)",
-             js: "$($CL address --key v8.key)", rust: "$($CL address --key wt.key)" },
+  signers: { v8: "$($CL address --key v8.key)", wasmtime: "$($CL address --key wt.key)", reviewer: "$($CL address --key reviewer.key)" },
   roots: [$roots],
   machines: ["$(sed -n 's/.*MACHINE() { return "\([^"]*\)".*/\1/p' "$here/src/machine.wac")", "wac-l0/1", "wac-flatten/1", "wasm-seam/1", "wacc-drive/1"],
   formats: ["unixfs-v1-2025+hidden"],

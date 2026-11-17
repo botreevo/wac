@@ -18,6 +18,7 @@ import { P, parseProgram } from "./parse.wac";
 import { Decl, DeclKind, ImportItem, Param, Program, Ty, TyKind } from "./ast.wac";
 import { lowerNamespaces, lowerNamespacesForDeclarations } from "./namespaces.wac";
 import { Res } from "./path.wac";
+import { field, linesOf } from "./text.wac";
 
 export struct ProgramEntry {
   /** Why this entry cannot be built as a program, or `""`. */
@@ -708,12 +709,12 @@ bool importsName(string text, string name) {
  * consequences. With none, an error in the adapter is the compiler's and is kept, where it can be seen.
  *
  * `wire` is the diagnostic wire (`path`, `line`, `col`, …, severity, tab-separated); `original` and `adapted` are the
- * entry before and after `programEntry`.
+ * entry before and after `programEntry`. Written in the subset wac-L5 reads — slices, `field`, no interpolation —
+ * because wac-L5 builds this file for the self-host check.
  */
 export string mappedToEntry(string wire, string entry, string original, string adapted) {
   if (wire == "" || original == adapted) { return wire; }
-  i32 lines = 1;
-  for (i32 i = 0; i < original.len(); i++) { if (original[i] == "\n") { lines = lines + 1; } }
+  i32 lines = linesOf(original).len();
   i32 nameLine = 0 - 1;
   i32 nameCol = 0 - 1;
   i32 k = adapted.indexOf("__wacMain");
@@ -721,78 +722,63 @@ export string mappedToEntry(string wire, string entry, string original, string a
     nameLine = 1;
     i32 lastNl = 0 - 1;
     for (i32 i = 0; i < k; i++) {
-      if (adapted[i] == "\n") {
+      if (adapted.slice(i, i + 1) == "\n") {
         nameLine = nameLine + 1;
         lastNl = i;
       }
     }
     nameCol = k - lastNl;
   }
-  string[] rows = rowsOf(wire);
+  string[] rows = linesOf(wire);
   bool authors = false;
   for (i32 r = 0; r < rows.len(); r++) {
-    if (rows[r] == "") { continue; }
-    string[] f = tabbed(rows[r]);
-    if (f.len() < 3 || endsWith(rows[r], "\twarning")) { continue; }
-    if (f[0] != entry || atoi(f[1]) <= lines) { authors = true; }
+    string row = rows[r];
+    if (row == "" || field(row, 2) == "" || endsWith(row, "\twarning")) { continue; }
+    if (field(row, 0) != entry || decimalOf(field(row, 1)) <= lines) { authors = true; }
   }
   string out = "";
   for (i32 r = 0; r < rows.len(); r++) {
-    if (rows[r] == "") { continue; }
-    string[] f = tabbed(rows[r]);
-    if (f.len() < 3 || f[0] != entry) {
-      out = out + rows[r] + "\n";
+    string row = rows[r];
+    if (row == "") { continue; }
+    if (field(row, 2) == "" || field(row, 0) != entry) {
+      out = out + row + "\n";
       continue;
     }
-    i32 line = atoi(f[1]);
+    i32 line = decimalOf(field(row, 1));
     if (line > lines && authors) { continue; }
-    i32 col = atoi(f[2]);
-    if (line == nameLine && col > nameCol) { f[2] = "\{col - 5}"; }
-    string row = f[0];
-    for (i32 j = 1; j < f.len(); j++) { row = row + "\t" + f[j]; }
+    i32 col = decimalOf(field(row, 2));
+    if (line == nameLine && col > nameCol) {
+      // Path, line, then the column moved back, then everything after it as it was.
+      i32 a = row.indexOf("\t");
+      i32 b = a + 1 + row.slice(a + 1, row.len()).indexOf("\t");
+      string rest = row.slice(b + 1, row.len());
+      i32 c = rest.indexOf("\t");
+      row = row.slice(0, b + 1) + digits(col - 5) + (c < 0 ? "" : rest.slice(c, rest.len()));
+    }
     out = out + row + "\n";
   }
   return out;
 }
 
-/** `text` cut at each newline; the piece after a final newline is an empty row, which callers skip. */
-string[] rowsOf(string text) {
-  i32 n = 1;
-  for (i32 i = 0; i < text.len(); i++) { if (text[i] == "\n") { n = n + 1; } }
-  string[] out = string[].defaulted(n);
-  i32 from = 0;
-  i32 at = 0;
-  for (i32 i = 0; i <= text.len(); i++) {
-    if (i < text.len() && text[i] != "\n") { continue; }
-    out[at] = text.slice(from, i);
-    at = at + 1;
-    from = i + 1;
+/** `n` in decimal, for `n >= 0`. */
+string digits(i32 n) {
+  if (n <= 0) { return "0"; }
+  string out = "";
+  i32 v = n;
+  while (v > 0) {
+    i32 d = v % 10;
+    out = "0123456789".slice(d, d + 1) + out;
+    v = v / 10;
   }
   return out;
 }
 
-string[] tabbed(string row) {
-  i32 n = 1;
-  for (i32 i = 0; i < row.len(); i++) { if (row[i] == "\t") { n = n + 1; } }
-  string[] out = string[].defaulted(n);
-  i32 from = 0;
-  i32 at = 0;
-  for (i32 i = 0; i <= row.len(); i++) {
-    if (i < row.len() && row[i] != "\t") { continue; }
-    out[at] = row.slice(from, i);
-    at = at + 1;
-    from = i + 1;
-  }
-  return out;
-}
-
-/** A decimal count, or 0 for anything that is not one. */
-i32 atoi(string s) {
+/** A non-negative decimal, or 0 for anything that is not one. */
+i32 decimalOf(string s) {
   i32 v = 0;
-  u8[] b = s.toBytes();
-  for (i32 i = 0; i < b.len(); i++) {
-    i32 d = b[i] as i32 - 48;
-    if (d < 0 || d > 9) { return 0; }
+  for (i32 i = 0; i < s.len(); i++) {
+    i32 d = "0123456789".indexOf(s.slice(i, i + 1));
+    if (d < 0) { return 0; }
     v = v * 10 + d;
   }
   return v;

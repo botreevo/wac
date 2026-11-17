@@ -174,12 +174,14 @@ what the user installed, and its build can itself be a derivation, so it can be 
 - **Size.** `claim.wasm` is about 540 KB today. With the light client and BLS it is still fine for an extension;
   start-up is measured in milestone 1.
 - **CPU.** The light client's BLS checks run in V8 as they do on the Node host. Milestone 1 will time them.
-- **A mirror that does not answer delays admission, once.** A mirror that fails (no answer, or a 5xx such as a down
-  gateway's 522) is now marked down and asked nothing more in that run (`packages/ipfs`'s `Store.http` and
-  `Store.gateway`), so a tree no longer waits on it for every block. But its first request still waits as long as
-  the server takes to fail: wac's `fetch` and HTTP client have no timeout, and a store's reads are synchronous, so
-  neither a deadline nor asking mirrors in parallel can be done in reckon. That is asked of wac (a request timeout).
-  The extension no longer defaults to a gateway.
+- **A mirror that does not answer no longer delays admission.** A mirror that fails (no answer, or a 5xx such as a
+  down gateway's 522) is marked down and asked nothing more in that run (`packages/ipfs`'s `Store.http` and
+  `Store.gateway`). Each request has a deadline, 20 s by default (`--mirror-timeout`). With two or more mirrors named
+  by URL, `claim` and `web` ask them all at once for each block (`Store.race`, on wac's `async` clients and
+  `Ticket.first`, wac `issues/system/0461e`). The first answer that hashes to the block is taken, so a slow, silent or
+  lying mirror costs nothing while another answers (`packages/ipfs/tools/http-mirror.sh`). The requests that lose are
+  not stopped: each runs to its end or its deadline, and the program ends without them. Claims indexes are still read
+  from each mirror in turn. The extension no longer defaults to a gateway.
 - **Gateway availability.** trustless-gateway.link answered HTTP 522, then 526, all through 2026-11-10 (capstone.md). The
   extension takes a list of gateways and mirrors, in order, as `--mirror` does.
 

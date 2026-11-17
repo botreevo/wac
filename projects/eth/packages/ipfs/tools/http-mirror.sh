@@ -4,7 +4,8 @@
 # it into an empty store, every block re-hashed; then one block on the server is tampered with, and a fresh fetch of
 # what needs it is refused for that block, while the server's other blocks are still taken. Then the same over HTTPS
 # (`Store.gateway`, through wac's fetch: `--mirror https://…`), against a local TLS server whose certificate the
-# trust store is given by SSL_CERT_FILE, and refused when the certificate is not trusted.
+# trust store is given by SSL_CERT_FILE, and refused when the certificate is not trusted. Between them, mirrors raced
+# (`--race`, `Store.race`): a slow one and a silent one cost nothing while a good one answers.
 #
 #     sh packages/ipfs/tools/http-mirror.sh [WORKDIR]     (PORT defaults to 8770; needs python3 for the server)
 set -eu
@@ -73,6 +74,45 @@ asked=$(( $(cat dead.hits) - before ))
   && ok "a mirror answering 503 is asked once and then left out: the tree from the next, in $((t1 - t0)) s" \
   || bad "a failing mirror: $got files, it was asked $asked times, $((t1 - t0)) s"
 kill $dsrv 2>/dev/null || true
+
+# Raced mirrors (`--race`, `Store.race`): a slow mirror (PORT+3), honest but answering each request after 3 s, and one
+# that accepts and never answers (PORT+4), before the good one. In turn, the slow one is waited on for every block; raced,
+# the good one answers first, and the silent one costs nothing.
+sl=$((port + 3)); si=$((port + 4))
+cat > slow.mjs <<'JS'
+import http from 'node:http'; import fs from 'node:fs';
+const [dir, port] = process.argv.slice(2);
+http.createServer((q, s) => setTimeout(() => {
+  const f = dir + '/' + decodeURIComponent(q.url.split('?')[0]);
+  if (fs.existsSync(f) && fs.statSync(f).isFile()) { s.end(fs.readFileSync(f)); } else { s.statusCode = 404; s.end(); }
+}, 3000)).listen(Number(port), '127.0.0.1');
+JS
+node slow.mjs served "$sl" & ssrv=$!
+python3 -c "
+import socket,time
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', $si)); s.listen(64)
+held=[]
+while True: held.append(s.accept())
+" & isrv=$!
+trap 'kill $srv $ssrv $isrv 2>/dev/null || true' EXIT
+until curl -s -m5 -o /dev/null "http://127.0.0.1:$sl/"; do sleep 0.2; done
+SLOW="--mirror http://127.0.0.1:$sl"; SILENT="--mirror http://127.0.0.1:$si"
+t0=$(date +%s); got=$($O ls "$tree" --store fresh7 $SLOW $M 2>&1 | wc -l); t1=$(date +%s)
+[ "$got" -eq 3 ] && [ $((t1 - t0)) -ge 6 ] && ok "in turn, the slow mirror first: every block waits on it, $((t1 - t0)) s"   || bad "in turn: $got files in $((t1 - t0)) s"
+t0=$(date +%s); got=$($O ls "$tree" --store fresh8 $SLOW $SILENT $M --race 2>race.err | wc -l); t1=$(date +%s)
+[ "$got" -eq 3 ] && [ $((t1 - t0)) -lt 3 ] && ok "raced, past a slow and a silent mirror: the tree in $((t1 - t0)) s"   || bad "raced: $got files in $((t1 - t0)) s: $(cat race.err)"
+# The requests that lost are not stopped (an `async` request runs to its end or its deadline); the program ends without
+# them, and wac says so on stderr: "finished with N continuation(s) still waiting".
+[ "$($O cat "$tree" big.bin --store fresh9 $SLOW $SILENT $M --race 2>/dev/null | wc -c)" -eq 3000000 ] && ok "raced: a 3 MB file in 1 MiB blocks" || bad "big.bin raced"
+printf 'tampered!!!\n' > "served/ipfs/$leaf"
+mkdir -p honest/ipfs && printf 'second file\n' > "honest/ipfs/$leaf"
+( cd honest && exec python3 -m http.server $((port + 5)) --bind 127.0.0.1 >/dev/null 2>&1 ) & hsrv=$!
+trap 'kill $srv $ssrv $isrv $hsrv 2>/dev/null || true' EXIT
+until curl -s -m1 -o /dev/null "http://127.0.0.1:$((port + 5))/"; do sleep 0.2; done
+[ "$($O cat "$leaf" --store fresh10 $M --mirror "http://127.0.0.1:$((port + 5))" --race 2>&1)" = "second file" ] \
+  && ok "raced: a fast mirror serving other bytes is passed over for the next" || bad "raced past a tampered block"
+printf 'second file\n' > "served/ipfs/$leaf"
+kill $ssrv $isrv $hsrv 2>/dev/null || true
 
 # HTTPS: the same store behind a TLS server (PORT+1), as a trustless gateway is reached.
 sport=$((port + 1))

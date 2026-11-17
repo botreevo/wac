@@ -1,11 +1,11 @@
 // The store and resolver, over memory: what goes in comes out, and nothing that does not hash to its CID gets
 // through, whichever side of the store it was tampered with on.
 
-import { Result } from "core";
+import { Result, Ticket } from "core";
 import { Cid, RAW } from "../src/cid.wac";
 import { Params, Built, Block, buildFile } from "../src/unixfs.wac";
 import { FileIn, buildTree } from "../src/tree.wac";
-import { Store, Resolver, readFile, readTree, filesOnly, emptyDirsOf, importFiles, importCar, redirectTo } from "../src/store.wac";
+import { Store, Resolver, readFile, readTree, filesOnly, emptyDirsOf, importFiles, importCar, redirectTo, Asked } from "../src/store.wac";
 import { writeCar } from "../src/car.wac";
 import { Check } from "./check.wac";
 
@@ -60,6 +60,48 @@ export string test_a_mirror_serving_other_bytes_is_passed_over() {
   }
   Resolver onlyEvil = Resolver(Store.memory(), [evil]);
   c.ok(readFile(onlyEvil, f.root).isErr(), "with only the evil mirror: refused");
+  return c.report();
+}
+
+/** An asker over a memory store, answering at once; `asked` counts the requests. */
+fn<Ticket<Asked>(string)> askerOf(Store s, i32[] asked) {
+  return (string p) => {
+    asked[0] = asked[0] + 1;
+    Ticket<Asked> t;
+    t.resolve(Asked(false, s.read(p)));
+    return t;
+  };
+}
+
+export string test_raced_mirrors_take_the_first_good_answer() {
+  Check c = Check.create();
+  Built f = buildFile(bytes(100, 9), small());
+  Store good = Store.memory();
+  good.putAll(f.blocks);
+  Store evil = Store.memory();
+  for (i32 i = 0; i < f.blocks.len(); i++) { evil.write("ipfs/" + f.blocks[i].cid.text(), bytes(f.blocks[i].data.len(), 77)); }
+  i32[] n = [0];
+  i32[] downAsked = [0];
+  // One that never answers, one serving other bytes, one that fails, and the good one, last.
+  fn<Ticket<Asked>(string)> silent = (string p) => { Ticket<Asked> t; return t; };
+  fn<Ticket<Asked>(string)> failing = (string p) => {
+    downAsked[0] = downAsked[0] + 1;
+    Ticket<Asked> t;
+    u8[]? none = null;
+    t.resolve(Asked(true, none));
+    return t;
+  };
+  Store raced = Store.race([silent, askerOf(evil, n), failing, askerOf(good, n)]);
+  match (readFile(Resolver(Store.memory(), [raced]), f.root)) {
+    Err(e): { c.fail("raced, the good mirror last: \{e}"); }
+    Ok(b): { c.ok(b.len() == 100 && b[99] == bytes(100, 9)[99], "the right bytes, past the silent, other and failing mirrors"); }
+  }
+  c.ok(downAsked[0] == 1, "a mirror that failed is asked nothing more: asked \{downAsked[0]} time(s)");
+  Store bad = Store.race([silent, askerOf(evil, n), failing]);
+  c.ok(readFile(Resolver(Store.memory(), [bad]), f.root).isErr(), "with no good mirror among them: refused, not waited on");
+  c.ok(raced.read("claims/index") is null, "a path no mirror has: nothing");
+  good.write("claims/index", bytes(5, 1));
+  c.ok(raced.read("claims/index")!.len() == 5, "anything but a block: the first 200");
   return c.report();
 }
 

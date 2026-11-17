@@ -16,8 +16,13 @@ import { fetch.Caps } from "wac";
 import { Result } from "core";
 import { Cid, parseCid } from "../src/cid.wac";
 import { PROFILE } from "../src/unixfs.wac";
-import { Store, Resolver, isHttp, mirrorAt, importDir, importGit, importCar, readFile, readTree, blocksOf } from "../src/store.wac";
+import { Store, Resolver, isHttp, mirrorAt, racedMirrorsWithin, MIRROR_REQUEST_MS, importDir, importGit, importCar, readFile, readTree, blocksOf } from "../src/store.wac";
 import { writeCar } from "../src/car.wac";
+
+bool has(string[] a, string name) {
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] == name) { return true; } }
+  return false;
+}
 
 string flag(string[] a, string name, string fallback) {
   for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
@@ -26,7 +31,7 @@ string flag(string[] a, string name, string fallback) {
 
 export async i32 main(Sys sys) {
   string[] a = sys.args();
-  if (a.len() < 2) { sys.warn("usage: obj add DIR | add-git REPO COMMIT | cat CID [PATH] | ls CID | car CID OUT | import-car FILE  [--store DIR] [--mirror DIR]…"); return 2; }
+  if (a.len() < 2) { sys.warn("usage: obj add DIR | add-git REPO COMMIT | cat CID [PATH] | ls CID | car CID OUT | import-car FILE  [--store DIR] [--mirror DIR|URL]… [--race]"); return 2; }
   Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
   Store[] mirrors = Store[]();
   for (i32 i = 0; i + 1 < a.len(); i++) {
@@ -40,6 +45,31 @@ export async i32 main(Sys sys) {
     mirrors = next;
   }
   Resolver r = Resolver(store, mirrors);
+  // --race: the mirrors named by URL asked all at once for each block (`Store.race`), after any directories.
+  if (has(a, "--race")) {
+    string[] urls = string[]();
+    Store[] dirs = Store[]();
+    for (i32 i = 0; i + 1 < a.len(); i++) {
+      if (a[i] != "--mirror") { continue; }
+      if (isHttp(a[i + 1])) {
+        string[] u = string[].filled(urls.len() + 1, a[i + 1]);
+        for (i32 j = 0; j < urls.len(); j++) { u[j] = urls[j]; }
+        urls = u;
+      } else {
+        Store[] d = Store[].filled(dirs.len() + 1, Store.dir(sys.files(), a[i + 1]));
+        for (i32 j = 0; j < dirs.len(); j++) { d[j] = dirs[j]; }
+        dirs = d;
+      }
+    }
+    match (racedMirrorsWithin(Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files()), urls, MIRROR_REQUEST_MS())) {
+      Err(e): { sys.warn("obj: \{e}"); return 2; }
+      Ok(raced): {
+        Store[] all = Store[].filled(dirs.len() + 1, raced);
+        for (i32 j = 0; j < dirs.len(); j++) { all[j] = dirs[j]; }
+        r = Resolver(store, all);
+      }
+    }
+  }
   string cmd = a[0];
   if (cmd == "add") { return say(sys, await importDir(store, sys.files(), a[1], PROFILE())); }
   if (cmd == "add-git" && a.len() >= 3) { return say(sys, await importGit(store, sys.procs(), a[1], a[2], PROFILE())); }

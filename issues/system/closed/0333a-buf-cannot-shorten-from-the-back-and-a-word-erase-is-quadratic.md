@@ -1,6 +1,6 @@
 # 0333a — `Buf` cannot shorten from the back, and a word erase is quadratic
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-09-04
@@ -88,3 +88,9 @@ Found while rewriting the package for `vision/packages/tty`, which writes `trunc
 `Buf` and says so. Not added to the shipped one here: `packages/bytes` is under everything and the
 suite gate has had no memory to run in all day (1.9 GB available against `minAvailableMb()` of
 4,000), so this would be an untested change to the most-imported package in the tree.
+
+## Fixed — 2026-11-17
+
+`Buf.truncate(n)` (`core/buf.wac`, spec ch42 `[§wac-buf-truncate-r7kw2qe]` with a runnable example): the first `n`
+bytes kept, `len` moved, nothing copied. `packages/tty/src/line.wac`'s `dropLast` is gone; backspace is
+`truncate(len - 1)` and `^W` one `truncate(from)`.

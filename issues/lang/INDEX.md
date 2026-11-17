@@ -6,7 +6,7 @@ has been fixed and why.
 | # | summary | kind | symptom |
 |---|---|---|---|
 | [0469d](closed/0469d-a-long-chain-of-constants-can-trap-the-compiler-on-a-cold-run.md) | 600 constants each reading the one before trapped the compiler on a cold run and not a warm one — likely `demandConst` recursing a chain's length deep | bug (compiler robustness) | a nondeterministic trap |
-| [0465d](open/0465d-reading-a-static-arrays-element-costs-ten-times-a-locals.md) | reading an element of a `static` array costs about 10 ns against about 1 ns for a local array (a million reads in a loop) — a global load, a guard or a bounds check not hoisted on each read | performance | slow code |
+| [0465d](closed/0465d-reading-a-static-arrays-element-costs-ten-times-a-locals.md) | reading an element of a `static` array costs about 10 ns against about 1 ns for a local array (a million reads in a loop) — a global load, a guard or a bounds check not hoisted on each read | performance | slow code |
 | [0458e](closed/0458e-a-package-file-is-keyed-by-where-the-cache-is.md) | a package file is keyed by its absolute path under `$WAC_HOME` (`/root/.wac/cache/git/…/src/page.wac`), so a generic a package declares, instantiated over a type the project declares, is named after where this machine keeps its cache, and two machines with different caches build different modules from one source. `0270a` made the project's own keys root-relative and left these | bug | wrong answer |
 | [0449e](closed/0449e-wait-on-an-async-call-has-no-type-without-a-ticket-import.md) | `async i32 one()` then `i32 x = one().wait();` in a file that imports nothing checks clean and emits an invalid module; with any `std` or `core` import it is *expected i32, found Result<i32, Stuck>* — `wait()` has no type when `Ticket` was reached only through an `async` result. wac1's area | bug | accepted program |
 | [0448e](closed/0448e-ticket-any-over-only-void-tickets-emits-a-void-local.md) | `Ticket.any(f(), g())` over two `async void` calls checks clean and builds a module the engine refuses: `AnyValue<Ts>` collapses to `void` and `any`'s body declares a local of it. Left legal by `0378a`'s refusal, broken before it. wac1's area | bug | invalid wasm |
@@ -150,7 +150,7 @@ has been fixed and why.
 
 ## Closed
 
-372 issues, 338 closed.
+372 issues, 339 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

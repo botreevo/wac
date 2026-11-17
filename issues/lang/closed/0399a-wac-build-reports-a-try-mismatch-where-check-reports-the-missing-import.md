@@ -1,6 +1,6 @@
 # 0399a — `wac build` reports a `try` mismatch where `wac check` reports the missing import
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-10-24
@@ -28,3 +28,11 @@ error type … the function's error type is never*, which sends the reader to th
 `Sys` for it; the wrapped program seems to resolve `Sys` where the user's file did not, and the gathered error type
 comes out `never` instead of the unknown name being reported. Leaving `Result` unimported as well gives
 *unknown type 'Result'* pointing at the adapter's generated text (`__wacMain`, `__wacT`) rather than the user's line.
+
+## Fixed — 2026-11-17
+
+`wac build` had come to report the missing `Sys` too, but five columns to the right (`main` becomes `__wacMain`) and
+followed by two errors at lines the file does not have, inside the adapter (`expected Sys, found $wacSys`). A program
+build's wire is now mapped onto the entry as written (`mappedToEntry`, `packages/wacc/src/program.wac`): a column after
+`main`'s name moves back, and the adapter's lines are dropped when the author's own lines already have an error. With
+none, an adapter error is the compiler's and is kept. `packages/wacc/test/wac/programdiag_test.wac`.

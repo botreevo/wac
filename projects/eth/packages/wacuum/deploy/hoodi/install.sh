@@ -71,8 +71,13 @@ chmod 644 /etc/eth/hoodi-genesis.json /etc/eth/hoodi-bootnodes.txt 2>/dev/null |
 git -C /opt/wac-eth pull --ff-only
 pin=$(tr '\n' ' ' < /opt/wac-eth/wac.lock | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
 [ -n "$pin" ] || { echo "install.sh: no wac commit in wac.lock" >&2; exit 1; }
-[ -d /opt/wac/.git ] || git clone https://github.com/voltrevo/wac.git /opt/wac
+[ -d /opt/wac/.git ] || git clone "${WAC_URL:-https://github.com/voltrevo/wac.git}" /opt/wac
 git -C /opt/wac fetch origin
+# GitHub can lag behind git.voltrevo.com, where pins are made: the commit from there when origin lacks it.
+if ! git -C /opt/wac cat-file -e "$pin^{commit}" 2>/dev/null; then
+  echo "install.sh: $pin is not at $(git -C /opt/wac remote get-url origin); fetching it from git.voltrevo.com" >&2
+  git -C /opt/wac fetch https://git.voltrevo.com/wac.git "$pin"
+fi
 git -C /opt/wac checkout --detach "$pin"
 (cd /opt/wac && ./bootstrap.sh -o /usr/local/bin/wac)
 chown -R wacuum:wacuum /opt/wac-eth

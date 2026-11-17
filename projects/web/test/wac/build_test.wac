@@ -3,8 +3,8 @@
 // of its own; `--wrap` wraps the `page.wasm` that step made into `index.html`. The whole build is still the three
 // together (`template.test.ts` drives it). Over `sys.files()`, so the gate runs these with no grant: neither step
 // reads a file it did not write here.
-import { Files, Output, Sys } from "std";
-import { flatten } from "core";
+import { Files, Output, OutputFault, Sys } from "std";
+import { Result, Ticket, Vec, flatten } from "core";
 import { buildPage, wrapBuiltPage, writePageModule } from "../../tools";
 
 string fail(string why) { return why; }
@@ -57,4 +57,65 @@ export string test_the_two_halves_are_not_asked_for_together(Sys sys) {
   i32 code = buildPage(["example/beep.wac", ".cache/build-test/both", "--module-only", "--wrap"], sys.stderr(),
                        sys.stdout(), sys.files(), sys.procs());
   return code == 2 ? "" : fail("both halves answered \{code}, not 2");
+}
+
+/** What a run wrote to an `Output`, kept so a test can read it. */
+struct Heard {
+  Vec<string> said;
+  Output out;
+}
+
+Heard heard() {
+  Vec<string> said = Vec.create();
+  Output out = Output((u8[] b) => {
+    said.push(string.fromBytes(b));
+    Ticket<Result<void, OutputFault>> t;
+    t.resolve(Result.Ok());
+    return t;
+  }, () => {
+    Ticket<Result<void, OutputFault>> t;
+    t.resolve(Result.Ok());
+    return t;
+  });
+  return Heard(said, out);
+}
+
+string all(Heard h) {
+  string s = "";
+  for (i32 i = 0; i < h.said.len(); i++) { s = s + h.said.get(i); }
+  return s;
+}
+
+/**
+ * **A write the disk refuses fails the build, and says so** — it was ignored, and the line saying the page was written
+ * was printed anyway: a builder lost a 100 KB `index.html` to a run that reported success. Here the module is there to
+ * read and the directory refuses every write (`Files.readOnly`).
+ */
+export string test_wrap_fails_loudly_when_index_html_cannot_be_written(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/refused";
+  fs.remove(out, true).wait();
+  fs.mkdir(out, true).wait();
+  fs.writeFile(out + "/page.wasm", [0, 97, 115, 109, 1, 0, 0, 0] as u8[]).wait();
+  Heard err = heard();
+  Heard said = heard();
+  i32 code = wrapBuiltPage(["example/beep.wac", out], err.out, said.out, fs.readOnly());
+  if (code != 1) { return fail("a refused write answered \{code}, not 1"); }
+  if (all(err).indexOf(out + "/index.html") < 0) { return fail("the refusal did not name the file: \{all(err)}"); }
+  if (all(said).indexOf("bytes of module") >= 0) { return fail("it said the page was written: \{all(said)}"); }
+  if (flatten(fs.stat(out + "/index.html").wait()).isOk()) { return fail("index.html is there after all"); }
+  fs.remove(out, true).wait();
+  return "";
+}
+
+/** The same for the page's module, and for the directory it goes in. */
+export string test_module_only_fails_loudly_when_it_cannot_write(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/refused-module";
+  fs.remove(out, true).wait();
+  Heard err = heard();
+  i32 code = writePageModule(["example/beep.wac", out], err.out, sys.stdout(), fs.readOnly());
+  if (code != 1) { return fail("a refused directory answered \{code}, not 1"); }
+  if (all(err).indexOf(out) < 0) { return fail("the refusal did not name the directory: \{all(err)}"); }
+  return "";
 }

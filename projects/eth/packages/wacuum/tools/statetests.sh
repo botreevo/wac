@@ -4,11 +4,12 @@
 #
 #     sh tools/statetests.sh                         # every Cancun case under fixtures/state_tests
 #     sh tools/statetests.sh Cancun fixtures/state_tests/cancun
+#     COLD=1 sh tools/statetests.sh                  # every account and slot read from a store
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 fork=${1:-Cancun}
 where=${2:-$root/fixtures/state_tests}
 wac build --allow-read "$root/tools/statetest.wac" -o "$root/dist/statetest" >/dev/null
-find "$where" -name '*.json' | sort | xargs -n 100 -P 4 wac "$root/dist/statetest.wasm" --fork "$fork" > "$root/dist/statetests.log" 2>&1 || true
+find "$where" -name '*.json' | sort | xargs -n 100 -P 4 wac "$root/dist/statetest.wasm" --fork "$fork" ${COLD:+--cold} > "$root/dist/statetests.log" 2>&1 || true
 grep '^FAIL' "$root/dist/statetests.log" || true
 grep 'passed,' "$root/dist/statetests.log" | awk '{p += $1; f += $3} END {print p " passed, " f " failed"}'

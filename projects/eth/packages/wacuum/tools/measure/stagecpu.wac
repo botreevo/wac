@@ -1,0 +1,140 @@
+// Where staging a block's account writes spends its time on a big store (`scale.wac`'s): the account trie's
+// walk to each key (with its reads, each node read checked against its parent's hash), the new root (each
+// changed node encoded and hashed), and the nodes to write (each encoded again) — and, apart, what keccak and
+// a branch's encoding cost alone. For deciding between a faster keccak and less work around it.
+//
+//     wac run --allow-read --allow-write tools/measure/stagecpu.wac -- STORE [WRITES]
+//
+// STORE is a store `scale.wac` filled; it is only read. WRITES (500) accounts of it are set in each of three rounds.
+
+import { Sys } from "std";
+import { Vec, Map } from "core";
+import { U256 } from "../../src/u256.wac";
+import { Store, Change } from "../../src/store/tree.wac";
+import { fileDisk } from "../../src/store/file.wac";
+import { PathTrie, entryKey } from "../../src/trie/pathtrie.wac";
+import { keccak256 } from "../../src/crypto/keccak.wac";
+import { addressBytes } from "../../src/evm/evm.wac";
+import { rlp.Item, rlp.encode } from "@/lib.wac";
+
+static i32 ACCOUNTS = 20000;
+
+U256 account(i64 i) { return U256.ofU64(((i as! u64) * 0x9e3779b97f4a7c15) ^ 0x1234567); }
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 1) {
+    sys.warn("usage: stagecpu.wac STORE [WRITES]");
+    return 2;
+  }
+  i32 writes = a.len() > 1 ? parse(a[1]) : 500;
+  Store store = (await Store.open((await fileDisk(sys, a[0])).unwrap())).unwrap();
+  u8[] user = store.committed().user;
+  i64 batches = 0;
+  for (i32 i = 0; i < 8 && user.len() == 8; i++) { batches = (batches << 8) | (user[i] as i64); }
+  if (batches == 0) {
+    sys.warn("no batches recorded in the store");
+    return 1;
+  }
+  u64 x = 0x2545f4914f6cdd1d;
+  u8[] value = encode(Item.List([Item.Bytes([2]), Item.Bytes([1, 2, 3]), Item.Bytes(u8[].filled(32, 9)), Item.Bytes(u8[].filled(32, 7))]));
+  sys.log("stage of \{writes} account writes, on a store of \{batches * (ACCOUNTS as i64)} accounts:");
+  for (i32 round = 0; round < 3; round++) {
+    i64 t0 = await sys.monotonicNanos();
+    Vec<u8[]> owners = Vec.create();
+    for (i32 i = 0; i < writes; i++) {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      owners.push(keccak256(addressBytes(account((x % ((batches * (ACCOUNTS as i64)) as! u64)) as! i64))));
+    }
+    i64 t1 = await sys.monotonicNanos();
+    PathTrie t = PathTrie.of(store, u8[].filled(0, 0));
+    await t.open();
+    i32 reads0 = store.reads;
+    for (i32 i = 0; i < writes; i++) { await t.set(owners.get(i), value); }
+    i64 t2 = await sys.monotonicNanos();
+    u8[] root = t.hash();
+    i64 t3 = await sys.monotonicNanos();
+    Change[] changed = t.changes();
+    i32 nodes = changed.len();
+    i64 t4 = await sys.monotonicNanos();
+    // The leaves those writes land in: each node by its depth, and the accounts' own entries.
+    Map<i64, bool> all = Map.create(hashI64, eqI64);
+    string byDepth = "";
+    for (i32 d = 0; d <= 16; d++) {
+      Map<i64, bool> pages = Map.create(hashI64, eqI64);
+      i32 count = 0;
+      for (i32 i = 0; i < changed.len(); i++) {
+        // A node's key is 0x03, a byte for its level (or the depth-first group's), and its path.
+        if (changed[i].key.len() - 2 != d) { continue; }
+        count++;
+        i64 pg = store.pageOf(changed[i].key, false);
+        pages.set(pg, true);
+        all.set(pg, true);
+      }
+      if (count > 0) { byDepth = byDepth + " \{d}: \{count} in \{pages.len()};"; }
+    }
+    Map<i64, bool> entries = Map.create(hashI64, eqI64);
+    for (i32 i = 0; i < owners.len(); i++) {
+      i64 pg = store.pageOf(entryKey(u8[].filled(0, 0), owners.get(i)), false);
+      entries.set(pg, true);
+      all.set(pg, true);
+    }
+    sys.log("  leaves written — trie nodes by depth:\{byDepth} account entries: \{owners.len()} in \{entries.len()}; all \{all.len()}");
+    sys.log("  addresses hashed \{(t1 - t0) / 1000000} ms; walk and set \{(t2 - t1) / 1000000} ms (\{t.reads} nodes read, \{store.reads - reads0} pages); root \{(t3 - t2) / 1000000} ms; changes \{(t4 - t3) / 1000000} ms (\{nodes} nodes)");
+  }
+
+  // A page: read alone, and read and decoded (`Store.load`), at random pages of the file.
+  i64 pages = (await store.disk.size()).unwrap() / 16384;
+  i32 m = 2000;
+  i64 d0 = await sys.monotonicNanos();
+  for (i32 i = 0; i < m; i++) {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    await store.disk.read(((x % (pages as! u64)) as! i64) * 16384, 16384);
+  }
+  i64 d1 = await sys.monotonicNanos();
+  for (i32 i = 0; i < m; i++) {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    await store.load((x % (pages as! u64)) as! i64);
+  }
+  i64 d2 = await sys.monotonicNanos();
+  sys.log("a page read \{(d1 - d0) / (m as i64) / 1000} us; read and decoded \{(d2 - d1) / (m as i64) / 1000} us");
+
+  // Alone: keccak of a branch node's size and of an address's, and a full branch's encoding.
+  u8[] node = u8[].filled(532, 5);
+  u8[] addr = u8[].filled(20, 5);
+  i32 n = 20000;
+  i64 k0 = await sys.monotonicNanos();
+  for (i32 i = 0; i < n; i++) { keccak256(node); }
+  i64 k1 = await sys.monotonicNanos();
+  for (i32 i = 0; i < n; i++) { keccak256(addr); }
+  i64 k2 = await sys.monotonicNanos();
+  Item[] kids = Item[].filled(17, Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < 16; i++) { kids[i] = Item.Bytes(u8[].filled(32, i as@ u8)); }
+  for (i32 i = 0; i < n; i++) { encode(Item.List(kids)); }
+  i64 k3 = await sys.monotonicNanos();
+  sys.log("alone: keccak of 532 bytes \{(k1 - k0) / (n as i64)} ns, of 20 bytes \{(k2 - k1) / (n as i64)} ns; a full branch encoded \{(k3 - k2) / (n as i64)} ns");
+  return 0;
+}
+
+i32 parse(string s) {
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + ((b[i] - 48) as i32); }
+  return n;
+}
+
+i32 hashI64(i64 v) { return ((v * 0x9e3779b97f4a7c1) >> 32) as! i32; }
+bool eqI64(i64 a, i64 b) { return a == b; }
+
+u8[] join(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}

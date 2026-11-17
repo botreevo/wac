@@ -8,7 +8,7 @@
 
 import { Sys, Launch, ChildEnv, Socket } from "std";
 import { Vec } from "core";
-import { json.parse, json.JsonValue } from "wac";
+import { json.parse, json.JsonValue, json.stringify } from "wac";
 import { crypto.hmacSha256, crypto.sha256 } from "wac";
 import { keccak256 } from "../../src/crypto/keccak.wac";
 import { rlp.Item, rlp.encode } from "@/lib.wac";
@@ -72,7 +72,9 @@ export struct Proc {
   async Proc start(Sys sys, string[] argv, string log) {
     string cmd = "exec";
     for (i32 i = 0; i < argv.len(); i++) { cmd += " " + quote(argv[i]); }
-    string pid = await shell(sys, "\{cmd} > \{quote(log)} 2>&1 & echo $!");
+    // The log removed first, here, before the fork: the child's `>` truncates it only once it runs, and until then
+    // `says` would read a previous process's log — a restart on the same log taken as up before it was (crash.wac).
+    string pid = await shell(sys, "rm -f \{quote(log)}; \{cmd} > \{quote(log)} 2>&1 & echo $!");
     return Proc(trim(pid), log);
   }
 
@@ -112,8 +114,17 @@ export async void removeDir(Sys sys, string dir) { await shell(sys, "rm -rf \{qu
 
 /** A port to listen on: chosen at random in [from, from + span), so that runs side by side rarely meet. */
 export async i32 somePort(Sys sys, i32 from, i32 span) {
-  u8[] r = (await sys.random().bytes(2)).ok()!;
-  return from + ((r[0] as i32) * 256 + (r[1] as i32)) % span;
+  // One nothing answers on: runs side by side, or a process another left behind, would otherwise share it.
+  i32 port = from;
+  for (i32 tries = 0; tries < 50; tries++) {
+    u8[] r = (await sys.random().bytes(2)).ok()!;
+    port = from + ((r[0] as i32) * 256 + (r[1] as i32)) % span;
+    match (await sys.net().connect("127.0.0.1", port)) {
+      Err(err): { return port; }
+      Ok(sock): { sock.close(); }
+    }
+  }
+  return port;
 }
 
 // ── JSON-RPC ──
@@ -359,3 +370,74 @@ export u64 quantity(string hex) {
 
 /** Hex as a number, so that two spellings of one quantity compare equal: "0x0" and "0x00", say. */
 export U256 number(string hex) { return U256.fromHex(hex == "" ? "0x0" : hex) ?? U256.zero(); }
+
+// ── Being a consensus client ────────────────────────────────────────────────
+
+export static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+/** Where `makeBlocks`'s transfers go. */
+export static string TO = "0x2222222222222222222222222222222222222222";
+
+string json(JsonValue v) { return string.fromBytes(stringify(v)); }
+
+/** Tell a node its head (and that nothing is final yet); the status it answers. */
+export async string choose(Rpc auth, string head) {
+  JsonValue? r = await auth.get("engine_forkchoiceUpdatedV3",
+                                "[{\"headBlockHash\":\"\{head}\",\"safeBlockHash\":\"\{head}\",\"finalizedBlockHash\":\"\{ZERO}\"},null]");
+  return field(r?.member("payloadStatus"), "status");
+}
+
+/** Whether `choose` comes to VALID within `millis`: the node has fetched the chain up to `head`. */
+export async bool chosen(Sys sys, Rpc auth, string head, i32 millis) {
+  for (i32 t = 0; t < millis; t += 500) {
+    if (await choose(auth, head) == "VALID") { return true; }
+    await sys.sleepMillis(500);
+  }
+  return false;
+}
+
+/** Whether the transaction `hash` is known at `rpc` within `millis`, in a block or a pool. */
+export async bool arrives(Sys sys, Rpc rpc, string hash, i32 millis) {
+  for (i32 t = 0; t < millis; t += 200) {
+    JsonValue? tx = (await rpc.call("eth_getTransactionByHash", "[\"\{hash}\"]")).result();
+    if (tx is not null && !tx!.isNull()) { return true; }
+    await sys.sleepMillis(200);
+  }
+  return false;
+}
+
+/** Be the consensus client of the node at (`auth`, `rpc`) for `n` blocks, sending a transfer from `key` before each. */
+export async JsonValue? makeBlocks(Sys sys, Rpc auth, Rpc rpc, u8[] key, i32 n) {
+  JsonValue? head = await rpc.get("eth_getBlockByNumber", "[\"latest\",false]");
+  for (i32 i = 0; i < n; i++) {
+    u64 nonce = quantity(await rpc.text("eth_getTransactionCount", "[\"\{addressOf(key)}\",\"pending\"]"));
+    await rpc.get("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, TO, U256.ofU64(1000 + ((i as@ u32) as u64)), u8[].filled(0, 0), 21000)}\"]");
+    string h = field(head, "hash");
+    string attrs = "{\"timestamp\":\"\{U256.ofU64(quantity(field(head, "timestamp")) + 12).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                   "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fe\",\"withdrawals\":[],\"parentBeaconBlockRoot\":\"\{ZERO}\"}";
+    string id = field(await auth.get("engine_forkchoiceUpdatedV3",
+                                     "[{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{ZERO}\"},\{attrs}]"), "payloadId");
+    // Time for the builder to take the transaction just sent.
+    await sys.sleepMillis(300);
+    JsonValue? p = await auth.get("engine_getPayloadV5", "[\"\{id}\"]");
+    if (p is null) { return null; }
+    // Each blob's versioned hash, from its commitment: 0x01 and then sha256's last 31 bytes.
+    string hashes = "[";
+    JsonValue commitments = p!.member("blobsBundle")!.member("commitments")!;
+    for (i32 k = 0; k < commitments.array()!.len(); k++) {
+      u8[] v = sha256(hexToBytes(commitments.item(k)!.text()!)!);
+      v[0] = 1;
+      hashes += (k > 0 ? "," : "") + "\"\{bytesToHex(v)}\"";
+    }
+    hashes += "]";
+    JsonValue payload = p!.member("executionPayload")!;
+    string st = field(await auth.get("engine_newPayloadV4", "[\{json(payload)},\{hashes},\"\{ZERO}\",\{json(p!.member("executionRequests")!)}]"), "status");
+    if (st != "VALID") {
+      sys.warn("  a built block came back \{st}");
+      return null;
+    }
+    await choose(auth, field(payload, "blockHash"));
+    head = await rpc.get("eth_getBlockByNumber", "[\"latest\",false]");
+  }
+  return head;
+}
+

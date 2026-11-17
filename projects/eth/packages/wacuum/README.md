@@ -36,11 +36,11 @@ in about twenty minutes on the Node host (an hour and a half on wasmtime).
 | forks | **Cancun, Prague, Osaka and the BPO forks**, scheduled by timestamp from a genesis's `config` and `blobSchedule` |
 | blocks | **done**. Blocks and transactions decoded from RLP with every sender recovered, headers checked against their parents (base fee, blob gas with EIP-7918's floor, gas limit), EIP-4788 and EIP-2935 system calls, withdrawals, EIP-7685 requests, EIP-7934's size limit, and every root and the bloom checked. An invalid block is undone and leaves no trace |
 | the Engine API | **done**. `engine_newPayloadV1`–`V4`, `engine_forkchoiceUpdatedV1`–`V3` with and without payload attributes, `engine_getPayloadV3`–`V5` with blobs bundles, `engine_getBlobsV1`/`V2`, `eth_sendRawTransaction` into a mempool (blob transactions in their network form), over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Forks are followed and finality prunes them. Blob proofs and Osaka's cell proofs (each blob extended to its 128 cells) are verified, about half a second a blob |
-| persistence | **done**. With `--datadir`, every imported block and fork choice is appended to a log before it is acknowledged, and every `--snapshot-every` finalized blocks (1024) the state at the finalized block is written. On start the snapshot is loaded and the log replayed, running only the blocks after it |
+| persistence | **done**. With `--datadir`, every imported block and fork choice is appended to a log before it is acknowledged. With `--store` the state lives on disk (`DATADIR/state.db`: a copy-on-write B+tree, the tries by path, the receipts; `docs/state-on-disk.md`) at the block the engine is at, committed with each block, and a restart replays only the log's blocks after it. Without it the state is in memory and every `--snapshot-every` finalized blocks (1024) a snapshot of it is written |
 | the user's JSON-RPC | **done for what wallets and libraries use**. Blocks, transactions and receipts (`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`), `eth_getLogs`, state reads at any unfinalized block, `eth_call`, `eth_estimateGas`, fees (`eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_blobBaseFee`), and the `net_` and `web3_` basics. With `--public-rpc` they are answered without a token; `tools/e2e/rpc.wac` drives them all as a wallet would. Not yet: subscriptions and traces |
 | performance | **measured and tuned** on wac's Node host (wasmtime is slower on the same code). `wac run tools/bench.wac`: the interpreter at about 200 Mgas/s on arithmetic and KECCAK256 at 76; a block of 1428 plain transfers, every sender's signature recovered, in about 0.35 s; a block of 560 token transfers (two hashed storage keys, two balances, a log each) in about 150 ms recovering every sender and 21 ms with senders known — so signature recovery, about 150 µs a signature (GLV, wNAF, secp256k1's own field arithmetic, in place), is most of what a block costs. Precompiles: P256VERIFY 0.44 ms, a two-pair BN pairing about 8 ms, BLS G1ADD 23 µs. Constants are worked out at compile time. What remains slow is in `docs/wac-asks.md` and wac's issues where it is wac's code |
 | devp2p | **talks to geth**. RLPx (EIP-8's handshake, checked against its vectors; AES-CTR frames with keccak MACs), snappy, the base protocol and eth/69 with EIP-2124 fork ids, and discovery v4 (EIP-8's packets; Ping/Pong bonding, FindNode, Neighbors, ENR). The node finds peers from `--bootnode`s, dials them up to `--max-peers`, accepts others on `--p2p-port`, serves headers, bodies and receipts, and swaps transactions, blob transactions in their network form. Not yet: discv5, serving snap |
-| sync | **full sync from peers**. When the consensus client names a block this has not got, headers are fetched back to one it has, then bodies forward, each executed. `tools/e2e/devnet.wac` runs geth and wacuum side by side: each syncs the other's blocks, transactions cross both ways, and both end on the same state root. Not yet: snap sync, so joining a large chain means executing all of it |
+| sync | **full sync and snap sync from peers**. When the consensus client names a block this has not got, headers are fetched back to one it has, then bodies forward, each executed. With `--store --snap`, a node with nothing but its genesis fetches the state at that block by snap/1 instead — every range checked against its proof, the tries built from it, healed when the pivot moves — and goes on from there (`tools/e2e/snap.wac` does it against geth). It also answers snap requests from its store. `tools/e2e/devnet.wac` runs geth and wacuum side by side: each syncs the other's blocks, and both end on the same state root. **Mainnet**: recent blocks execute and match their headers (`tools/mainnet/replay.sh`), ~120 Mgas/s on the store; `docs/mainnet.md` is the plan, `docs/state-on-disk.md` how the state is kept |
 
 ## Running it
 
@@ -76,6 +76,17 @@ wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum
 ./dist/wacuum --genesis genesis.json --jwt-secret jwt.hex --datadir data --public-rpc --port 8551 \
   --p2p-port 30303 --peer enode://…
 ```
+
+### On a store, and snap sync
+
+```bash
+./dist/wacuum --genesis genesis.json --jwt-secret jwt.hex --datadir data --store --snap --peer enode://…
+```
+
+`--store` keeps the state in `data/state.db` rather than in memory, so a node's memory no longer grows with
+its chain's state; `--snap` lets a node with nothing but its genesis fetch the state at the first head its
+consensus client names from a peer that speaks snap/1, rather than running every block before it. Both
+work with `--dev` too.
 
 ### A devnet on its own
 
@@ -157,6 +168,9 @@ geth on one devnet and checks that they sync from each other, transactions and b
     tools/buildtest.wac      the block-building runner: each payload rebuilt from the mempool
     tools/dial.wac           dial a devp2p node and fetch its chain, saying what happens
     tools/e2e/               the node run as a program and spoken to: an engine fixture, a wallet, geth
+    tools/mainnet/           mainnet blocks replayed against a node's state and checked; follow.sh shadows the head
+    deploy/mainnet/          a machine set up to shadow mainnet: wac, wac-eth, reth and Lighthouse, systemd units
     tools/fixture.wac        what both runners read from a fixture
     tools/                   vector generators, the fixture fetcher, the cache filler
     docs/wac-asks.md         what wacuum has found wrong with, or wants from, wac
+    docs/mainnet.md          whether wacuum can sync mainnet, measured, and the way there

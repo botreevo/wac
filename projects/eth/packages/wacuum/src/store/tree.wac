@@ -1,0 +1,1270 @@
+// The state store: one file, a copy-on-write B+tree of byte keys and byte values, with 16 KB pages, the
+// interior always in memory, and commits that are atomic across a crash. `docs/state-on-disk.md` says why
+// each of those: a lookup is exactly one request (a leaf, its interior already in memory). The pages were
+// 64 KB while a host request cost ~70 µs whatever it carried; at ~10 µs and ~1 µs a KB (wac 0471w), a 16 KB
+// leaf reads in ~25 µs against ~75 µs, and at equal memory for leaves blocks ran ~30% faster on it
+// (docs/state-cache.md).
+//
+// ## The file
+//
+// Pages of `PAGE` bytes. Pages 0 and 1 are the two meta slots; every other page is a node or a page of the
+// free list. A commit writes every node it changed to pages no committed tree uses, syncs, then writes a
+// meta into the slot the last commit did not use, and syncs again. The meta with the higher sequence number
+// and a good checksum is the store: a crash anywhere before the second sync leaves the previous one, whose
+// pages nothing has touched. (LMDB's scheme; it needs no log of its own.)
+//
+// A node is `kind` (0 leaf, 1 interior), a u32 count, then its entries: a leaf's are a u16 key length, the
+// key, a u32 value length and the value; an interior's are a u16 key length, the key (the first key under
+// that child) and the child's u64 page. Integers are little-endian.
+//
+// ## Free pages
+//
+// Pages a commit stops using are still the previous commit's, which is the one a crash goes back to, so
+// they become free only at the commit after. The meta names the pages free at its commit — those left from
+// before, those it freed, and the pages of the previous free list — written contiguously at the file's
+// end, so the next commit can take them.
+
+import { Map, Vec, Ticket, Result } from "core";
+import { keccak256 } from "../crypto/keccak.wac";
+import { Disk } from "./disk.wac";
+import { EntryCache, Cached } from "./cache.wac";
+
+export static i32 PAGE = 16384;
+/** A value larger than this is refused: a leaf must hold at least one entry, with room for its key. */
+export static i32 MAX_VALUE = 15000;
+/** Larger values (codes, receipts, blocks) are stored in chunks of this size, each its own entry. */
+export static i32 CHUNK = 12288;
+/**
+ * Leaves kept in memory once read or written, by their size on disk: 64 MB. What is read again is kept as
+ * entries (`cache.wac`), at a fraction of the memory a leaf costs for what anyone wants of it; the leaves are
+ * for what writes need, since a commit rewrites whole leaves, and 64 of them proved too few (docs/state-cache.md).
+ */
+export static i64 LEAF_BYTES = 64 * 1024 * 1024;
+export static i32 LEAVES = (LEAF_BYTES / (PAGE as i64)) as! i32;
+/** Leaves a commit reads ahead of itself, and disk requests it has in flight (`Store.prefetch`, `inFlight`). */
+static i32 PREFETCH = 64;
+/** The entry cache's budget by default, in MB. */
+export static i64 CACHE_MB = 256;
+/**
+ * "WACUMDD" and the format: 5 since accounts and slots are kept beside their tries' nodes (`pathtrie.wac`'s
+ * `entryKey`, 2026-11-13). 4 kept them apart, under keys of their own; 3 also keyed every trie node depth first;
+ * 2 had 64 KB pages.
+ */
+static u64 MAGIC = 0x3544554d55434157;
+static u64 MAGIC_ENTRIES_APART = 0x3444554d55434157;
+static u64 MAGIC_DEPTH_FIRST = 0x3344554d55434157;
+static u64 MAGIC_64K = 0x4244554d55434157;
+/** The free list's pages the meta can name: what a page holds after the meta's fixed fields and its user bytes. */
+static i32 MAX_LISTS = (PAGE - 44 - 4 - 3900 - 32) / 8;
+
+/** A node, decoded. A leaf's `vals` hold its values; an interior's `kids` hold its children once loaded. */
+struct Node {
+  bool leaf;
+  /** Its page on disk, or -1 for one no commit has written yet. */
+  i64 page;
+  bool dirty;
+  Vec<u8[]> keys;
+  Vec<u8[]> vals;
+  Vec<i64> kidPages;
+  Vec<Node?> kids;
+  /** What it encodes to. */
+  i32 bytes;
+
+  Node fresh(bool leaf) {
+    return Node(leaf, -1, true, Vec.create(), Vec.create(), Vec.create(), Vec.create(), 5);
+  }
+}
+
+u8[] plain(const u8[] b) {
+  u8[] out = u8[].filled(b.len(), 0);
+  for (i32 i = 0; i < b.len(); i++) { out[i] = b[i]; }
+  return out;
+}
+
+/** -1, 0 or 1 as `a` sorts before, with, or after `b`, byte by byte. */
+export i32 compareKeys(const u8[] a, const u8[] b) {
+  i32 n = a.len() < b.len() ? a.len() : b.len();
+  for (i32 i = 0; i < n; i++) {
+    if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+  }
+  return a.len() < b.len() ? -1 : a.len() > b.len() ? 1 : 0;
+}
+
+/** In a leaf's keys, where `key` is or would go, and whether it is there. */
+(i32, bool) find(Vec<u8[]> keys, const u8[] key) {
+  i32 lo = 0;
+  i32 hi = keys.len();
+  while (lo < hi) {
+    i32 mid = (lo + hi) / 2;
+    i32 c = compareKeys(keys.get(mid), key);
+    if (c == 0) { return (mid, true); }
+    if (c < 0) { lo = mid + 1; } else { hi = mid; }
+  }
+  return (lo, false);
+}
+
+/** In an interior's keys, the child `key` belongs under: the last whose first key is not after it, else 0. */
+i32 childFor(Vec<u8[]> keys, const u8[] key) {
+  i32 lo = 0;
+  i32 hi = keys.len();
+  while (lo < hi) {
+    i32 mid = (lo + hi) / 2;
+    if (compareKeys(keys.get(mid), key) <= 0) { lo = mid + 1; } else { hi = mid; }
+  }
+  return lo == 0 ? 0 : lo - 1;
+}
+
+i32 leafEntry(u8[] k, u8[] v) { return 6 + k.len() + v.len(); }
+i32 interiorEntry(u8[] k) { return 10 + k.len(); }
+
+void put16(u8[] b, i32 at, i32 v) {
+  b[at] = (v & 255) as! u8;
+  b[at + 1] = ((v >> 8) & 255) as! u8;
+}
+void put32(u8[] b, i32 at, i32 v) {
+  for (i32 i = 0; i < 4; i++) { b[at + i] = ((v >> (8 * i)) & 255) as! u8; }
+}
+void put64(u8[] b, i32 at, i64 v) {
+  for (i32 i = 0; i < 8; i++) { b[at + i] = ((v >> ((8 * i) as i64)) & 255) as! u8; }
+}
+i32 get16(u8[] b, i32 at) { return (b[at] as i32) | ((b[at + 1] as i32) << 8); }
+i32 get32(u8[] b, i32 at) {
+  i32 v = 0;
+  for (i32 i = 0; i < 4; i++) { v = v | ((b[at + i] as i32) << (8 * i)); }
+  return v;
+}
+i64 get64(u8[] b, i32 at) {
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = v | ((b[at + i] as i64) << ((8 * i) as i64)); }
+  return v;
+}
+
+u8[] slice(u8[] b, i32 at, i32 n) {
+  u8[] out = u8[].filled(n, 0);
+  out.copyFrom(b, at, 0, n);
+  return out;
+}
+
+u8[] encode(Node n) {
+  u8[] out = u8[].filled(PAGE, 0);
+  out[0] = n.leaf ? 0 : 1;
+  put32(out, 1, n.keys.len());
+  i32 at = 5;
+  for (i32 i = 0; i < n.keys.len(); i++) {
+    u8[] k = n.keys.get(i);
+    put16(out, at, k.len());
+    out.copyFrom(k, 0, at + 2, k.len());
+    at += 2 + k.len();
+    if (n.leaf) {
+      u8[] v = n.vals.get(i);
+      put32(out, at, v.len());
+      out.copyFrom(v, 0, at + 4, v.len());
+      at += 4 + v.len();
+    } else {
+      put64(out, at, n.kidPages.get(i));
+      at += 8;
+    }
+  }
+  return out;
+}
+
+Node? decode(u8[] b, i64 page) {
+  if (b.len() < 5 || b[0] > 1) { return null; }
+  bool leaf = b[0] == 0;
+  Node n = Node(leaf, page, false, Vec.create(), Vec.create(), Vec.create(), Vec.create(), 5);
+  i32 count = get32(b, 1);
+  i32 at = 5;
+  for (i32 i = 0; i < count; i++) {
+    if (at + 2 > b.len()) { return null; }
+    i32 kl = get16(b, at);
+    if (at + 2 + kl > b.len()) { return null; }
+    u8[] k = slice(b, at + 2, kl);
+    at += 2 + kl;
+    n.keys.push(k);
+    if (leaf) {
+      if (at + 4 > b.len()) { return null; }
+      i32 vl = get32(b, at);
+      if (vl < 0 || at + 4 + vl > b.len()) { return null; }
+      n.vals.push(slice(b, at + 4, vl));
+      at += 4 + vl;
+      n.bytes += leafEntry(k, n.vals.get(i));
+    } else {
+      if (at + 8 > b.len()) { return null; }
+      n.kidPages.push(get64(b, at));
+      n.kids.push(null);
+      at += 8;
+      n.bytes += interiorEntry(k);
+    }
+  }
+  return n;
+}
+
+/** What a commit records beside the tree: the caller's own bytes (which block, which root). */
+export struct Committed {
+  u64 seq;
+  u8[] user;
+}
+
+/** A change to make: a value, or `null` to delete. */
+export struct Change {
+  u8[] key;
+  u8[]? value;
+}
+
+/** A page's place in a write: the page and its bytes. */
+struct Out {
+  i64 page;
+  u8[] bytes;
+}
+
+export struct Store {
+  Disk disk;
+  Node root;
+  i32 height;
+  u64 seq;
+  i32 slot;
+  /** The end of the file, in pages. */
+  i64 pages;
+  /** Pages this commit may write to: free since the last commit. */
+  Vec<i64> free;
+  /** Pages freed by this commit: the old copies of what it rewrote. */
+  Vec<i64> freed;
+  /** The pages the last commit's free list is on, which become free at the commit after it. */
+  i64[] listPages;
+  u8[] user;
+  /** Leaves held in memory, oldest first, for evicting: the interior node holding each, and its index there. */
+  Vec<Node> leafParents;
+  Vec<u8[]> leafKeys;
+  /** Where the queue starts in `leafParents`/`leafKeys`: what is before it has been taken. */
+  i32 queueHead;
+  i32 maxLeaves;
+  /** Leaves the commit under way has written, to queue for letting go once it is on the disk. */
+  Vec<Node> writtenParents;
+  Vec<u8[]> writtenKeys;
+  /** Requests to the disk, for whoever is measuring. */
+  i32 reads;
+  /**
+   * How many leaves a commit reads ahead of itself, all at once (`prefetch`): on a big store nearly every key it
+   * touches is in a leaf not in memory, and those reads one after another were most of its time. 0 reads each
+   * only when it is reached.
+   */
+  i32 prefetch;
+  /** Disk requests a commit has in flight at once, at most: its reads ahead (`prefetch`) and its writes. */
+  i32 inFlight;
+  /** Writes sent to the disk, for whoever is measuring. */
+  i32 writes;
+  /** Readers holding the committed state still (`hold`), and whether a commit is under way or waiting. */
+  i32 readers;
+  bool writing;
+  i32 wantWrite;
+  Vec<Ticket<bool>> waiting;
+  /**
+   * When set, every key looked up (`get`, `getNow`) and every key committed, in order, each led by `R` or
+   * `W`: the stream a cache in front of the tree would see, for whoever is measuring one
+   * (`tools/measure/cache.wac`).
+   */
+  Vec<u8[]>? trace;
+  /** Entries read and committed, kept between blocks (`cache.wac`); `cacheMb` sets its budget. */
+  EntryCache cache;
+  /**
+   * Changes staged and not yet committed (`stage`, `flush`): every read looks here first, so the store reads as
+   * if they were committed, and they go to the file together. Lost in a crash — the file is then at the last
+   * flush, whose own bytes name the block it holds, and the block log replays what came after.
+   */
+  Overlay overlay;
+
+  /** The store in `disk`: the last commit, or an empty one for an empty file. */
+  async Result<Store, string> open(Disk disk) {
+    Store s = Store(disk, Node.fresh(true), 1, 0, 0, 2, Vec.create(), Vec.create(), i64[].filled(0, 0), u8[].filled(0, 0), Vec.create(), Vec.create(), 0, LEAVES, Vec.create(), Vec.create(), 0, PREFETCH, PREFETCH, 0, 0, false, 0, Vec.create(), null,
+                    EntryCache.create(CACHE_MB * 1024 * 1024), Overlay.create());
+    i64 size = match (await disk.size()) {
+      Ok(n): n,
+      Err(e): return Result.Err(e),
+    };
+    if (size == 0) { return Result.Ok(s); }
+    // A store of the format before (64 KB pages) is refused, not taken for an empty one and written over.
+    match (await disk.read(0, 8)) {
+      Ok(head): {
+        if (head.len() == 8 && get64(head, 0) == (MAGIC_64K as@ i64)) {
+          return Result.Err("a store of 64 KB pages, from before 2026-11-13: this one has 16 KB pages; remove it and sync again");
+        }
+        if (head.len() == 8 && get64(head, 0) == (MAGIC_ENTRIES_APART as@ i64)) {
+          return Result.Err("a store whose accounts and slots are apart from their tries, from before 2026-11-13: remove it and sync again");
+        }
+        if (head.len() == 8 && get64(head, 0) == (MAGIC_DEPTH_FIRST as@ i64)) {
+          return Result.Err("a store whose tries are keyed depth first, from before 2026-11-13: remove it and sync again");
+        }
+      }
+      Err(e): { return Result.Err(e); }
+    }
+    Meta? best = null;
+    for (i32 slot = 0; slot < 2; slot++) {
+      u8[] b = match (await disk.read((slot as i64) * (PAGE as i64), PAGE)) {
+        Ok(x): x,
+        Err(e): return Result.Err(e),
+      };
+      Meta? m = readMeta(b, slot);
+      if (m is not null && (best is null || m!.seq > best!.seq)) { best = m; }
+    }
+    if (best is null) {
+      // A file whose first meta never reached the disk is an empty store, whatever else it holds.
+      return Result.Ok(s);
+    }
+    Meta m = best!;
+    s.seq = m.seq;
+    s.slot = m.slot;
+    s.height = m.height;
+    s.pages = m.pages;
+    s.user = m.user;
+    s.listPages = m.listPages;
+    // The free list, PAGE / 8 page numbers a page.
+    i32 perPage = PAGE / 8;
+    for (i32 p = 0; p < m.listPages.len(); p++) {
+      u8[] fb = match (await disk.read(m.listPages[p] * (PAGE as i64), PAGE)) {
+        Ok(x): x,
+        Err(e): return Result.Err(e),
+      };
+      for (i32 i = 0; i < perPage && p * perPage + i < m.freeCount; i++) { s.free.push(get64(fb, i * 8)); }
+    }
+    // The root, and every interior node under it: a lookup should never wait for one.
+    Node? r = await s.load(m.root);
+    if (r is null) { return Result.Err("the root page \{m.root} does not decode"); }
+    s.root = r!;
+    string bad = await s.loadInterior(s.root, s.height);
+    if (bad != "") { return Result.Err(bad); }
+    return Result.Ok(s);
+  }
+
+  async Node? load(this, i64 page) {
+    this.reads++;
+    match (await this.disk.read(page * (PAGE as i64), PAGE)) {
+      Ok(b): { return decode(b, page); }
+      Err(e): { return null; }
+    }
+  }
+
+  async string loadInterior(this, Node n, i32 level) {
+    if (level <= 2 || n.leaf) { return ""; }
+    for (i32 i = 0; i < n.kidPages.len(); i++) {
+      Node? k = await this.load(n.kidPages.get(i));
+      if (k is null || k!.leaf) { return "interior page \{n.kidPages.get(i)} does not decode"; }
+      n.kids.set(i, k);
+      string bad = await this.loadInterior(k!, level - 1);
+      if (bad != "") { return bad; }
+    }
+    return "";
+  }
+
+  void traced(this, u8 kind, const u8[] key) {
+    if (this.trace is null) { return; }
+    u8[] t = u8[].filled(key.len() + 1, kind);
+    t.copyFrom(key, 0, 1, key.len());
+    this.trace!.push(t);
+  }
+
+  /** How many leaves are in memory, below the interior. */
+  i32 leavesHeld(this) {
+    i32 held = 0;
+    Vec<Node> stack = Vec.create();
+    stack.push(this.root);
+    while (stack.len() > 0) {
+      Node n = stack.pop()!;
+      if (n.leaf) {
+        held++;
+        continue;
+      }
+      for (i32 i = 0; i < n.kids.len(); i++) {
+        if (n.kids.get(i) is not null) { stack.push(n.kids.get(i)!); }
+      }
+    }
+    return held;
+  }
+
+  /** The sizes of what this keeps in memory, for whoever watches it: leaves queued and held, the cache, the free list. */
+  string sizes(this) {
+    i32 held = this.leavesHeld();
+    i32 interior = 0;
+    Vec<Node> stack = Vec.create();
+    stack.push(this.root);
+    while (stack.len() > 0) {
+      Node n = stack.pop()!;
+      if (n.leaf) { continue; }
+      interior++;
+      for (i32 i = 0; i < n.kids.len(); i++) {
+        if (n.kids.get(i) is not null) { stack.push(n.kids.get(i)!); }
+      }
+    }
+    return "queue \{this.leafParents.len() - this.queueHead}, leaves held \{held}, interior \{interior}, cache \{this.cache.index.len()} entries \{this.cache.bytes / 1024} KB ring \{this.cache.ring.len()} holes \{this.cache.holes.len()}, free \{this.free.len()}, freed \{this.freed.len()}, written \{this.writtenParents.len()}, waiting \{this.waiting.len()}, pages \{this.pages}";
+  }
+
+  /** What the last commit recorded beside the tree. */
+  Committed committed(this) { return Committed(this.seq, this.user); }
+
+  Node? loadNow(this, i64 page) {
+    this.reads++;
+    match (this.disk.readNow(page * (PAGE as i64), PAGE)) {
+      Ok(b): { return decode(b, page); }
+      Err(e): { return null; }
+    }
+  }
+
+  /** `get`, read where it is asked (`Disk.readNow`): for the synchronous EVM. */
+  u8[]? getNow(this, const u8[] key) {
+    this.traced(82, key);
+    u8[] k0 = plain(key);
+    Pend? staged = this.overlay.entries.get(k0);
+    if (staged is not null) { return staged!.value; }
+    Cached c = this.cache.get(k0);
+    if (c.known) { return c.value; }
+    Node n = this.root;
+    while (!n.leaf) {
+      i32 i = childFor(n.keys, key);
+      Node? k = n.kids.get(i);
+      if (k is null) {
+        k = this.loadNow(n.kidPages.get(i));
+        // A page that did not read is not an absent key: nothing is cached.
+        if (k is null) { return null; }
+        // Queued before it is attached: the queue may hold an older entry for this same place, and letting
+        // that go after attaching would detach the leaf just read — whose changes a commit would then lose.
+        this.held(n, n.keys.get(i));
+        n.kids.set(i, k);
+      }
+      n = k!;
+    }
+    (i32 at, bool found) = find(n.keys, key);
+    u8[]? v = found ? n.vals.get(at) : null;
+    this.cache.put(k0, v);
+    return v;
+  }
+
+  /** `range`, read where it is asked. */
+  Vec<Change> rangeNow(this, u8[] from, u8[] to, i32 limit) {
+    Vec<Change> staged = this.overlay.within(from, to);
+    Vec<Change> out = Vec.create();
+    this.walkNow(this.root, from, to, more(limit, staged.len()), out);
+    return merged(out, staged, limit);
+  }
+
+  void walkNow(this, Node n, u8[] from, u8[] to, i32 limit, Vec<Change> out) {
+    if (n.leaf) {
+      (i32 at, bool found) = find(n.keys, from);
+      for (i32 i = at; i < n.keys.len() && out.len() < limit; i++) {
+        if (to.len() > 0 && compareKeys(n.keys.get(i), to) >= 0) { return; }
+        out.push(Change(n.keys.get(i), n.vals.get(i)));
+      }
+      return;
+    }
+    for (i32 i = childFor(n.keys, from); i < n.kids.len() && out.len() < limit; i++) {
+      if (to.len() > 0 && compareKeys(n.keys.get(i), to) >= 0) { return; }
+      Node? k = n.kids.get(i);
+      if (k is null) {
+        k = this.loadNow(n.kidPages.get(i));
+        if (k is null) { return; }
+        // Queued before it is attached: the queue may hold an older entry for this same place, and letting
+        // that go after attaching would detach the leaf just read — whose changes a commit would then lose.
+        this.held(n, n.keys.get(i));
+        n.kids.set(i, k);
+      }
+      this.walkNow(k!, from, to, limit, out);
+    }
+  }
+
+  /** The value at `key`, or null. One disk request at most: the leaf. */
+  async u8[]? get(this, const u8[] key) {
+    this.traced(82, key);
+    u8[] k0 = plain(key);
+    Pend? staged = this.overlay.entries.get(k0);
+    if (staged is not null) { return staged!.value; }
+    Cached c = this.cache.get(k0);
+    if (c.known) { return c.value; }
+    Node? leaf = await this.leafFor(key, null);
+    if (leaf is null) { return null; }
+    (i32 at, bool found) = find(leaf!.keys, key);
+    u8[]? v = found ? leaf!.vals.get(at) : null;
+    this.cache.put(k0, v);
+    return v;
+  }
+
+  /** The leaf `key` belongs in, loaded if it was not; the nodes on the way are pushed onto `path`. */
+  async Node? leafFor(this, const u8[] key, Vec<Node>? path) {
+    Node n = this.root;
+    while (!n.leaf) {
+      if (path is not null) { path!.push(n); }
+      i32 i = childFor(n.keys, key);
+      Node? k = n.kids.get(i);
+      if (k is null) {
+        k = await this.load(n.kidPages.get(i));
+        if (k is null) { return null; }
+        // Queued before it is attached: the queue may hold an older entry for this same place, and letting
+        // that go after attaching would detach the leaf just read — whose changes a commit would then lose.
+        this.held(n, n.keys.get(i));
+        n.kids.set(i, k);
+      }
+      n = k!;
+    }
+    return n;
+  }
+
+  /** A leaf just loaded under `parent`: remembered, and the oldest clean one dropped past the limit. */
+  void held(this, Node parent, u8[] firstKey) {
+    this.leafParents.push(parent);
+    this.leafKeys.push(firstKey);
+    // Nothing is let go while a commit is under way: a leaf it has rewritten is clean, with a page of its own,
+    // before that page is on the disk, and one let go now would be read back from a page not yet written. A
+    // read during a commit (an RPC or a peer asking about an old block) only queues; the commit's end lets go.
+    if (!this.writing) { this.trim(); }
+  }
+
+  /**
+   * Leaves let go, oldest queued first, until the bound holds. Also at a commit's end: when every read finds what
+   * it wants in memory, only commits load leaves, and if they alone trimmed nothing ever would — the queue and
+   * the leaves held then grew with the store (the soak's `wacuum_sizes`: 1.46 M queued, 11 916 leaves held).
+   */
+  void trim(this) {
+    while (this.leafParents.len() - this.queueHead > this.maxLeaves) {
+      Node p = this.leafParents.get(this.queueHead);
+      u8[] k = this.leafKeys.get(this.queueHead);
+      this.queueHead++;
+      i32 i = childFor(p.keys, k);
+      // The parent may have been emptied since (every key under it deleted: undo records pruned in a run, the
+      // leaves the prune's range read among them) and taken out of the tree; there is nothing under it to let go.
+      Node? leaf = i < p.kids.len() ? p.kids.get(i) : null;
+      if (leaf is not null && leaf!.leaf && !leaf!.dirty && leaf!.page >= 0) { p.kids.set(i, null); }
+    }
+    // The queue's front is a head index, not removals from the front (each of which moved every entry behind
+    // it); what is behind the head is dropped once it is more than half the queue.
+    if (this.queueHead > 1024 && 2 * this.queueHead > this.leafParents.len()) {
+      Vec<Node> ps = Vec.create();
+      Vec<u8[]> ks = Vec.create();
+      for (i32 j = this.queueHead; j < this.leafParents.len(); j++) {
+        ps.push(this.leafParents.get(j));
+        ks.push(this.leafKeys.get(j));
+      }
+      this.leafParents = ps;
+      this.leafKeys = ks;
+      this.queueHead = 0;
+    }
+  }
+
+  /**
+   * Apply `changes` and commit them, with `user` recorded beside the tree. The changes need not be sorted
+   * or unique (the last for a key wins). Returns "" once the commit is on the disk, or why it is not — in
+   * which case the store in memory is no longer the one on disk, and should be opened again.
+   */
+  async string commit(this, Change[] changes, u8[] user) {
+    this.wantWrite++;
+    while (this.writing || this.readers > 0) { await this.parked(); }
+    this.wantWrite--;
+    this.writing = true;
+    for (i32 i = 0; this.trace is not null && i < changes.len(); i++) { this.traced(87, changes[i].key); }
+    string out = await this.commitNow(changes, user);
+    // The cache is written through: what was committed is what the next read sees. After a failed commit
+    // the tree in memory is not the store's, and neither is anything the cache was told.
+    if (out == "") {
+      for (i32 i = 0; i < changes.len(); i++) { this.cache.put(changes[i].key, changes[i].value); }
+    } else {
+      this.cache.clear();
+    }
+    this.writing = false;
+    this.trim();
+    this.wake();
+    return out;
+  }
+
+  /**
+   * The committed state kept as it is until `release`: no commit starts meanwhile, and one waiting goes
+   * before new holders, so a reader that awaits between reads (a snap answer: a range, then proofs) sees one
+   * state throughout, and block import is not starved. A holder must not commit.
+   */
+  async void hold(this) {
+    while (this.writing || this.wantWrite > 0) { await this.parked(); }
+    this.readers++;
+  }
+
+  void release(this) {
+    this.readers--;
+    if (this.readers == 0) { this.wake(); }
+  }
+
+  /**
+   * A new ticket to wait on until the gate changes. Made here, not declared in the waiting loop: a ticket
+   * declared in a loop of an async function is one ticket for every pass (docs/wac-asks.md), and the second
+   * pass would await the first's, already settled.
+   */
+  Ticket<bool> parked(this) {
+    Ticket<bool> t;
+    this.waiting.push(t);
+    return t;
+  }
+
+  /** Everyone waiting for the gate to change: each looks again. */
+  void wake(this) {
+    Vec<Ticket<bool>> all = this.waiting;
+    this.waiting = Vec.create();
+    for (i32 i = 0; i < all.len(); i++) { all.get(i).resolve(true); }
+  }
+
+  async string commitNow(this, Change[] changes, u8[] user) {
+    this.writtenParents = Vec.create();
+    this.writtenKeys = Vec.create();
+    if (user.len() > 3900) { return "the commit's own bytes are over 3900"; }
+    for (i32 c = 0; c < changes.len(); c++) {
+      Change ch = changes[c];
+      if (ch.value is not null && ch.value!.len() > MAX_VALUE) { return "a value of \{ch.value!.len()} bytes is over the limit"; }
+      if (ch.key.len() > 1024) { return "a key of \{ch.key.len()} bytes is over the limit"; }
+    }
+    Vec<Out> outs = Vec.create();
+    if (this.height > 1) {
+      // Leaf by leaf, in key order, each written as soon as its changes are in and let go once on the disk: a
+      // commit holds one leaf at a time, not every leaf it touches — which for 64 blocks of mainnet would be
+      // a hundred thousand of them.
+      string bad = await this.streamLeaves(sortedChanges(arrayVec(changes)), outs);
+      if (bad != "") { return bad; }
+    } else {
+      // A tree that is one leaf: the changes merged into it in one pass, however many (the first commit of a
+      // store can be hundreds of thousands, and inserting them one by one was quadratic); then split by `fix`.
+      Vec<Change> sorted = sortedChanges(arrayVec(changes));
+      mergeInto(this.root, sorted, 0, sorted.len());
+      this.root.dirty = true;
+    }
+
+    // Splits, merges of the empty, a new root or a shorter tree.
+    Node[] top = this.fix(this.root);
+    while (top.len() > 1) {
+      Node r = Node.fresh(false);
+      for (i32 i = 0; i < top.len(); i++) { adopt(r, r.keys.len(), top[i]); }
+      this.height++;
+      top = this.fix(r);
+    }
+    this.root = top.len() == 1 ? top[0] : Node.fresh(true);
+    if (top.len() == 0) { this.height = 1; }
+    while (!this.root.leaf && this.root.kids.len() == 1 && this.root.kids.get(0) is not null) {
+      if (this.root.page >= 0) { this.freed.push(this.root.page); }
+      this.root = this.root.kids.get(0)!;
+      this.height--;
+    }
+
+    // Every dirty node left to a page of its own, children before parents.
+    i64 rootPage = this.place(this.root, outs);
+    // The free list for the next commit: what this one did not use, what it freed, and the old list's pages.
+    // Its own pages come from what is free now, like any other page; counted before taking them, which
+    // can only overcount by a page.
+    i32 perPage = PAGE / 8;
+    i32 listCount = (this.free.len() + this.freed.len() + this.listPages.len() + perPage - 1) / perPage;
+    i64[] lists = i64[].filled(listCount, 0);
+    for (i32 p = 0; p < listCount; p++) { lists[p] = this.free.len() > 0 ? this.free.pop()! : this.grow(); }
+    Vec<i64> nextFree = Vec.create();
+    for (i32 i = 0; i < this.free.len(); i++) { nextFree.push(this.free.get(i)); }
+    for (i32 i = 0; i < this.freed.len(); i++) { nextFree.push(this.freed.get(i)); }
+    for (i32 i = 0; i < this.listPages.len(); i++) { nextFree.push(this.listPages[i]); }
+    if (listCount > MAX_LISTS) { return "a free list of \{listCount} pages is more than the meta can name"; }
+    for (i32 p = 0; p < listCount; p++) {
+      u8[] b = u8[].filled(PAGE, 0);
+      for (i32 i = 0; i < perPage && p * perPage + i < nextFree.len(); i++) { put64(b, i * 8, nextFree.get(p * perPage + i)); }
+      outs.push(Out(lists[p], b));
+    }
+    string bad = await this.writeAll(outs);
+    if (bad != "") { return bad; }
+    match (await this.disk.sync()) {
+      Ok(v): {}
+      Err(e): { return e; }
+    }
+
+    u64 seq = this.seq + 1;
+    i32 slot = 1 - this.slot;
+    u8[] meta = writeMeta(Meta(seq, slot, rootPage, this.height, this.pages, lists, nextFree.len(), user));
+    match (await this.disk.write((slot as i64) * (PAGE as i64), meta)) {
+      Ok(v): {}
+      Err(e): { return e; }
+    }
+    match (await this.disk.sync()) {
+      Ok(v): {}
+      Err(e): { return e; }
+    }
+    this.seq = seq;
+    this.slot = slot;
+    this.user = user;
+    this.free = nextFree;
+    this.freed = Vec.create();
+    this.listPages = lists;
+    for (i32 i = 0; i < this.writtenParents.len(); i++) { this.held(this.writtenParents.get(i), this.writtenKeys.get(i)); }
+    this.writtenParents = Vec.create();
+    this.writtenKeys = Vec.create();
+    return "";
+  }
+
+  /**
+   * The page of the leaf `key` belongs in, from the interior alone (which is all in memory); with `missing`, -1
+   * when that leaf is in memory already. -1 for a tree that is one leaf.
+   */
+  i64 pageOf(this, const u8[] key, bool missing) {
+    Node n = this.root;
+    while (!n.leaf) {
+      i32 i = childFor(n.keys, key);
+      Node? k = n.kids.get(i);
+      if (k is null || k!.leaf) {
+        if (k is not null && missing) { return -1; }
+        return k is null ? n.kidPages.get(i) : k!.page;
+      }
+      n = k!;
+    }
+    return -1;
+  }
+
+  /**
+   * The leaves `changes` from `from` on will need and memory lacks, up to `window` of them, read with every read
+   * in flight at once, then put in their places; returns the first change past those leaves. The interior is all
+   * in memory, so which leaf a key needs, and its page, is known without reading. Nothing moves meanwhile: a
+   * commit is under way, so no other commit, and `streamLeaves` waits for this before it changes anything.
+   */
+  async i32 prefetchLeaves(this, Vec<Change> changes, i32 from, i32 window) {
+    Vec<Ticket<Result<u8[], string>>> asked = Vec.create();
+    Vec<i64> pages = Vec.create();
+    Vec<u8[]> keys = Vec.create();
+    i32 c = from;
+    while (c < changes.len()) {
+      u8[] key = changes.get(c).key;
+      i64 page = this.pageOf(key, true);
+      if (page >= 0 && (pages.len() == 0 || pages.get(pages.len() - 1) != page)) {
+        if (pages.len() == window) { break; }
+        pages.push(page);
+        keys.push(key);
+        asked.push(this.disk.read(page * (PAGE as i64), PAGE));
+      }
+      c++;
+    }
+    for (i32 j = 0; j < asked.len(); j++) {
+      Result<u8[], string> got = await asked.get(j);
+      this.reads++;
+      // A read that failed is left to `leafFor`, which reads it again when it is reached and says why.
+      if (!got.isOk()) { continue; }
+      Node? leaf = decode(got.unwrap(), pages.get(j));
+      if (leaf is null) { continue; }
+      // Its place again, from its key: the same as when it was asked for, nothing having moved.
+      Node n = this.root;
+      while (true) {
+        i32 i = childFor(n.keys, keys.get(j));
+        Node? k = n.kids.get(i);
+        if (k is null) {
+          if (n.kidPages.get(i) == pages.get(j)) {
+            this.held(n, n.keys.get(i));
+            n.kids.set(i, leaf);
+          }
+          break;
+        }
+        if (k!.leaf) { break; }
+        n = k!;
+      }
+    }
+    return c;
+  }
+
+  /** `changes`, in key order, applied a leaf at a time: each leaf fixed, placed, written and let go in turn. */
+  async string streamLeaves(this, Vec<Change> changes, Vec<Out> outs) {
+    Vec<Node> parents = Vec.create();
+    Vec<u8[]> firsts = Vec.create();
+    i64 pending = 0;
+    i32 c = 0;
+    i32 ahead = 0;
+    while (c < changes.len()) {
+      if (this.prefetch > 0 && c >= ahead) { ahead = await this.prefetchLeaves(changes, c, this.prefetch); }
+      Vec<Node> path = Vec.create();
+      Node? found = await this.leafFor(changes.get(c).key, path);
+      if (found is null) { return "a page on the way to a key does not decode"; }
+      Node l = found!;
+      Node parent = path.get(path.len() - 1);
+      // Its place in its parent, from a key it holds, before any change moves its first key.
+      i32 at = childFor(parent.keys, changes.get(c).key);
+      // Where this leaf's keys end: the next separator to the right, at the lowest level that has one.
+      u8[]? bound = null;
+      for (i32 j = path.len() - 1; j >= 0 && bound is null; j--) {
+        Node n = path.get(j);
+        i32 i = childFor(n.keys, changes.get(c).key);
+        if (i + 1 < n.keys.len()) { bound = n.keys.get(i + 1); }
+      }
+      i32 from = c;
+      while (c < changes.len() && (bound is null || compareKeys(changes.get(c).key, bound!) < 0)) { c++; }
+      mergeInto(l, changes, from, c);
+      l.dirty = true;
+      for (i32 p = 0; p < path.len(); p++) {
+        Node on = path.get(p);
+        on.dirty = true;
+      }
+      // Fixed (split, or gone if empty), put in its parent's place, and given pages now.
+      Node[] parts = this.fix(l);
+      parent.bytes -= interiorEntry(parent.keys.get(at));
+      parent.keys.remove(at);
+      parent.kids.remove(at);
+      parent.kidPages.remove(at);
+      for (i32 p = 0; p < parts.len(); p++) {
+        adopt(parent, at + p, parts[p]);
+        parent.kidPages.set(at + p, this.place(parts[p], outs));
+        parents.push(parent);
+        firsts.push(parts[p].keys.get(0));
+        pending += PAGE as i64;
+      }
+      if (pending >= 4 * 1024 * 1024) {
+        string bad = await this.writeAndLetGo(outs, parents, firsts);
+        if (bad != "") { return bad; }
+        pending = 0;
+      }
+    }
+    return await this.writeAndLetGo(outs, parents, firsts);
+  }
+
+  /** What is queued, written; then the leaves written let go — their pages hold them now. */
+  async string writeAndLetGo(this, Vec<Out> outs, Vec<Node> parents, Vec<u8[]> firsts) {
+    string bad = await this.writeAll(outs);
+    if (bad != "") { return bad; }
+    outs.clear();
+    for (i32 i = 0; i < parents.len(); i++) {
+      Node p = parents.get(i);
+      i32 k = childFor(p.keys, firsts.get(i));
+      Node? leaf = p.kids.get(k);
+      if (leaf is not null && leaf!.leaf && !leaf!.dirty && leaf!.page >= 0) { p.kids.set(k, null); }
+    }
+    parents.clear();
+    firsts.clear();
+    return "";
+  }
+
+  /**
+   * `n` made to fit: a dirty child replaced by what it became, an entry for each first key, and `n` itself
+   * split if it is over a page. What `n` became: none if it is empty, else one or more nodes.
+   */
+  Node[] fix(this, Node n) {
+    if (!n.dirty) { return [n]; }
+    if (!n.leaf) {
+      i32 i = 0;
+      while (i < n.kids.len()) {
+        Node? k = n.kids.get(i);
+        if (k is null || !k!.dirty) {
+          i++;
+          continue;
+        }
+        Node[] parts = this.fix(k!);
+        n.bytes -= interiorEntry(n.keys.get(i));
+        n.keys.remove(i);
+        n.kids.remove(i);
+        n.kidPages.remove(i);
+        for (i32 p = 0; p < parts.len(); p++) { adopt(n, i + p, parts[p]); }
+        i += parts.len();
+      }
+    }
+    if (n.keys.len() == 0) {
+      if (n.page >= 0) { this.freed.push(n.page); }
+      return [];
+    }
+    if (n.bytes <= PAGE) { return [n]; }
+    // Halves by bytes, each fixed again in case one is still over.
+    i32 half = 0;
+    i32 acc = 5;
+    while (half < n.keys.len() - 1 && acc < n.bytes / 2) {
+      acc += n.leaf ? leafEntry(n.keys.get(half), n.vals.get(half)) : interiorEntry(n.keys.get(half));
+      half++;
+    }
+    if (half == 0) { half = 1; }
+    Node right = Node.fresh(n.leaf);
+    // The upper half copied across in order, then taken off the end: a removal from the middle moved every entry
+    // behind it, which for a node of a big first commit (all of it in one leaf) was quadratic.
+    for (i32 i = half; i < n.keys.len(); i++) {
+      u8[] k = n.keys.get(i);
+      right.keys.push(k);
+      if (n.leaf) {
+        u8[] v = n.vals.get(i);
+        right.vals.push(v);
+        i32 sz = leafEntry(k, v);
+        n.bytes -= sz;
+        right.bytes += sz;
+      } else {
+        right.kids.push(n.kids.get(i));
+        right.kidPages.push(n.kidPages.get(i));
+        n.bytes -= interiorEntry(k);
+        right.bytes += interiorEntry(k);
+      }
+    }
+    while (n.keys.len() > half) {
+      n.keys.pop();
+      if (n.leaf) { n.vals.pop(); } else {
+        n.kids.pop();
+        n.kidPages.pop();
+      }
+    }
+    Node[] a = this.fix(n);
+    Node[] b = this.fix(right);
+    Node[] out = Node[].filled(a.len() + b.len(), n);
+    for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+    for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+    return out;
+  }
+
+  /** `n` and its dirty descendants given pages, their bytes queued; `n`'s page. */
+  i64 place(this, Node n, Vec<Out> outs) {
+    if (!n.dirty && n.page >= 0) { return n.page; }
+    if (!n.leaf) {
+      for (i32 i = 0; i < n.kids.len(); i++) {
+        Node? k = n.kids.get(i);
+        if (k is null) { continue; }
+        bool written = k!.dirty || k!.page < 0;
+        n.kidPages.set(i, this.place(k!, outs));
+        // A leaf written is in memory like one read, and is let go the same way: noted here, under the parent
+        // it ended in, and queued once the commit is on the disk (let go before, it would be read back from a
+        // page not yet written). Without this every leaf a commit touched stayed in memory for good — one
+        // read was queued once, skipped if dirty when its turn came, and one a split made was never queued.
+        if (written && k!.leaf) {
+          this.writtenParents.push(n);
+          this.writtenKeys.push(n.keys.get(i));
+        }
+      }
+    }
+    if (n.page >= 0) { this.freed.push(n.page); }
+    i64 page = this.free.len() > 0 ? this.free.pop()! : this.grow();
+    n.page = page;
+    n.dirty = false;
+    outs.push(Out(page, encode(n)));
+    return page;
+  }
+
+  i64 grow(this) {
+    i64 p = this.pages;
+    this.pages++;
+    return p;
+  }
+
+  /** The pages, sorted, with runs of neighbours written in one request each (up to 64 pages). */
+  async string writeAll(this, Vec<Out> outs) {
+    outs.sort((Out a, Out b) => a.page < b.page ? -1 : a.page > b.page ? 1 : 0);
+    // Runs of adjacent pages as one write each, and up to `inFlight` of them sent before any is awaited: the
+    // pages are distinct and nothing reads them before the sync that follows, so their order does not matter,
+    // and a commit's pages, taken from the free list, are scattered — one at a time, they were most of its time.
+    Vec<Ticket<Result<void, string>>> sent = Vec.create();
+    i32 i = 0;
+    while (i < outs.len()) {
+      i32 j = i + 1;
+      while (j < outs.len() && j - i < 64 && outs.get(j).page == outs.get(j - 1).page + 1) { j++; }
+      u8[] run = u8[].filled((j - i) * PAGE, 0);
+      for (i32 k = i; k < j; k++) { run.copyFrom(outs.get(k).bytes, 0, (k - i) * PAGE, PAGE); }
+      sent.push(this.disk.write(outs.get(i).page * (PAGE as i64), run));
+      this.writes++;
+      i = j;
+      if (sent.len() >= this.inFlight || i >= outs.len()) {
+        string bad = "";
+        for (i32 k = 0; k < sent.len(); k++) {
+          match (await sent.get(k)) {
+            Ok(v): {}
+            Err(e): { if (bad == "") { bad = e; } }
+          }
+        }
+        sent.clear();
+        if (bad != "") { return bad; }
+      }
+    }
+    return "";
+  }
+
+  /** Every key and value from `from` (inclusive) to `to` (exclusive; empty for the end), in order. */
+  async Vec<Change> range(this, u8[] from, u8[] to, i32 limit) {
+    Vec<Change> staged = this.overlay.within(from, to);
+    Vec<Change> out = Vec.create();
+    await this.walk(this.root, from, to, more(limit, staged.len()), out);
+    return merged(out, staged, limit);
+  }
+
+  /** A value stored in chunks under `base` (`base` and a u16 each, as `CHUNK` cuts them), read chunk by chunk. */
+  async u8[]? chunks(this, u8[] base) {
+    Vec<u8[]> parts = Vec.create();
+    for (i32 k = 0; k < 65536; k++) {
+      u8[]? part = await this.get(chunkKey(base, k));
+      if (part is null) { break; }
+      parts.push(part!);
+    }
+    return parts.len() == 0 ? null : concat(parts);
+  }
+
+  /** `chunks`, read where it is asked: point lookups, which see what is staged as a range would at more cost. */
+  u8[]? chunksNow(this, u8[] base) {
+    Vec<u8[]> parts = Vec.create();
+    for (i32 k = 0; k < 65536; k++) {
+      u8[]? part = this.getNow(chunkKey(base, k));
+      if (part is null) { break; }
+      parts.push(part!);
+    }
+    return parts.len() == 0 ? null : concat(parts);
+  }
+
+  /**
+   * `changes` staged with `user` beside them, as a commit would record them but kept in memory: every read sees
+   * them at once; `flush` writes them. Through the same gate as a commit, so a reader holding the store sees one
+   * state throughout.
+   */
+  async void stage(this, Change[] changes, u8[] user) {
+    this.wantWrite++;
+    while (this.writing || this.readers > 0) { await this.parked(); }
+    this.wantWrite--;
+    for (i32 i = 0; i < changes.len(); i++) {
+      this.traced(87, changes[i].key);
+      this.overlay.put(changes[i].key, changes[i].value);
+      this.cache.put(changes[i].key, changes[i].value);
+    }
+    this.overlay.user = user;
+    this.overlay.staged++;
+    this.wake();
+  }
+
+  /** What is staged, committed as one commit with the last staged bytes beside it. "" or why not. */
+  async string flush(this) {
+    if (this.overlay.staged == 0) { return ""; }
+    Change[] all = this.overlay.changes();
+    u8[] user = this.overlay.user;
+    string bad = await this.commit(all, user);
+    if (bad == "") { this.overlay = Overlay.create(); }
+    return bad;
+  }
+
+  async void walk(this, Node n, u8[] from, u8[] to, i32 limit, Vec<Change> out) {
+    if (n.leaf) {
+      (i32 at, bool found) = find(n.keys, from);
+      for (i32 i = at; i < n.keys.len() && out.len() < limit; i++) {
+        if (to.len() > 0 && compareKeys(n.keys.get(i), to) >= 0) { return; }
+        out.push(Change(n.keys.get(i), n.vals.get(i)));
+      }
+      return;
+    }
+    for (i32 i = childFor(n.keys, from); i < n.kids.len() && out.len() < limit; i++) {
+      if (to.len() > 0 && compareKeys(n.keys.get(i), to) >= 0) { return; }
+      Node? k = n.kids.get(i);
+      if (k is null) {
+        k = await this.load(n.kidPages.get(i));
+        if (k is null) { return; }
+        // Queued before it is attached: the queue may hold an older entry for this same place, and letting
+        // that go after attaching would detach the leaf just read — whose changes a commit would then lose.
+        this.held(n, n.keys.get(i));
+        n.kids.set(i, k);
+      }
+      await this.walk(k!, from, to, limit, out);
+    }
+  }
+}
+
+/**
+ * `changes[from, to)` (in key order; for a key given more than once, the last wins) merged into leaf `l` in one
+ * pass: the leaf's entries and the changes walked together into new lists.
+ */
+void mergeInto(Node l, Vec<Change> changes, i32 from, i32 to) {
+  Vec<u8[]> keys = Vec.create();
+  Vec<u8[]> vals = Vec.create();
+  i32 bytes = 5;
+  i32 i = 0;
+  i32 j = from;
+  while (i < l.keys.len() || j < to) {
+    i32 c = i >= l.keys.len() ? 1 : (j >= to ? -1 : compareKeys(l.keys.get(i), changes.get(j).key));
+    if (c < 0) {
+      keys.push(l.keys.get(i));
+      vals.push(l.vals.get(i));
+      bytes += leafEntry(l.keys.get(i), l.vals.get(i));
+      i++;
+      continue;
+    }
+    if (c == 0) { i++; }
+    // The last change to this key wins.
+    while (j + 1 < to && compareKeys(changes.get(j + 1).key, changes.get(j).key) == 0) { j++; }
+    Change ch = changes.get(j);
+    j++;
+    if (ch.value is not null) {
+      keys.push(ch.key);
+      vals.push(ch.value!);
+      bytes += leafEntry(ch.key, ch.value!);
+    }
+  }
+  l.keys = keys;
+  l.vals = vals;
+  l.bytes = bytes;
+}
+
+Vec<Change> arrayVec(Change[] a) {
+  Vec<Change> v = Vec.create();
+  for (i32 i = 0; i < a.len(); i++) { v.push(a[i]); }
+  return v;
+}
+
+/** A staged value, or `null` for a key staged as deleted. */
+struct Pend {
+  u8[]? value;
+}
+
+/** What `Store.stage` holds until `flush`: the latest change to each key, the bytes to record, how many stagings. */
+export struct Overlay {
+  Map<u8[], Pend> entries;
+  u8[] user;
+  i32 staged;
+  /** The keys and values' bytes, for a caller deciding when to flush. */
+  i64 bytes;
+
+  Overlay create() { return Overlay(Map.create(overlayHash, overlaySame), u8[].filled(0, 0), 0, 0); }
+
+  void put(this, u8[] key, u8[]? value) {
+    Pend? old = this.entries.get(key);
+    if (old is null) { this.bytes += key.len() as i64; }
+    else if (old!.value is not null) { this.bytes -= old!.value!.len() as i64; }
+    if (value is not null) { this.bytes += value!.len() as i64; }
+    this.entries.set(key, Pend(value));
+  }
+
+  /** Every staged key in `[from, to)` (to empty: no end), in order: a deletion as a change with no value. */
+  Vec<Change> within(this, u8[] from, u8[] to) {
+    Vec<Change> out = Vec.create();
+    if (this.entries.len() == 0) { return out; }
+    u8[][] ks = this.entries.keys();
+    for (i32 i = 0; i < ks.len(); i++) {
+      if (compareKeys(ks[i], from) < 0) { continue; }
+      if (to.len() > 0 && compareKeys(ks[i], to) >= 0) { continue; }
+      out.push(Change(ks[i], this.entries.get(ks[i])!.value));
+    }
+    return sortedChanges(out);
+  }
+
+  Change[] changes(this) {
+    u8[][] ks = this.entries.keys();
+    Change[] out = Change[].filled(ks.len(), Change(u8[].filled(0, 0), null));
+    for (i32 i = 0; i < ks.len(); i++) { out[i] = Change(ks[i], this.entries.get(ks[i])!.value); }
+    return out;
+  }
+}
+
+i32 overlayHash(u8[] b) {
+  i32 h = -2128831035 ^ b.len();
+  for (i32 i = 0; i < b.len(); i++) { h = (h ^ (b[i] as i32)) * 16777619; }
+  return h;
+}
+
+bool overlaySame(u8[] a, u8[] b) { return compareKeys(a, b) == 0; }
+
+/** A limit raised by `n`, for a walk whose results staged deletions may remove, without overflowing. */
+i32 more(i32 limit, i32 n) { return limit > 0x7fffffff - n ? 0x7fffffff : limit + n; }
+
+/** The tree's run and the staged changes in its range merged, both in key order: a staged key wins. */
+Vec<Change> merged(Vec<Change> tree, Vec<Change> staged, i32 limit) {
+  if (staged.len() == 0) {
+    while (tree.len() > limit) { tree.pop(); }
+    return tree;
+  }
+  Vec<Change> out = Vec.create();
+  i32 i = 0;
+  i32 j = 0;
+  while ((i < tree.len() || j < staged.len()) && out.len() < limit) {
+    i32 c = i >= tree.len() ? 1 : (j >= staged.len() ? -1 : compareKeys(tree.get(i).key, staged.get(j).key));
+    if (c < 0) {
+      out.push(tree.get(i));
+      i++;
+      continue;
+    }
+    if (c == 0) { i++; }
+    Change st = staged.get(j);
+    j++;
+    if (st.value is not null) { out.push(st); }
+  }
+  return out;
+}
+
+/** Changes in key order (a merge sort). */
+Vec<Change> sortedChanges(Vec<Change> v) {
+  if (v.len() < 2) { return v; }
+  Vec<Change> a = Vec.create();
+  Vec<Change> b = Vec.create();
+  for (i32 i = 0; i < v.len(); i++) {
+    if (i < v.len() / 2) { a.push(v.get(i)); } else { b.push(v.get(i)); }
+  }
+  a = sortedChanges(a);
+  b = sortedChanges(b);
+  Vec<Change> out = Vec.create();
+  i32 i = 0;
+  i32 j = 0;
+  while (i < a.len() || j < b.len()) {
+    if (j >= b.len() || (i < a.len() && compareKeys(a.get(i).key, b.get(j).key) <= 0)) {
+      out.push(a.get(i));
+      i++;
+    } else {
+      out.push(b.get(j));
+      j++;
+    }
+  }
+  return out;
+}
+
+export u8[] chunkKey(u8[] base, i32 k) {
+  u8[] key = u8[].filled(base.len() + 2, 0);
+  key.copyFrom(base, 0, 0, base.len());
+  key[base.len()] = ((k >> 8) & 255) as! u8;
+  key[base.len() + 1] = (k & 255) as! u8;
+  return key;
+}
+
+u8[] concat(Vec<u8[]> parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts.get(i).len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    out.copyFrom(parts.get(i), 0, at, parts.get(i).len());
+    at += parts.get(i).len();
+  }
+  return out;
+}
+
+/** A child `k` put at `i` of interior `n`, keyed by its first key. */
+void adopt(Node n, i32 i, Node k) {
+  u8[] first = k.keys.get(0);
+  n.keys.insert(i, first);
+  n.kids.insert(i, k);
+  n.kidPages.insert(i, k.page);
+  n.bytes += interiorEntry(first);
+  n.dirty = true;
+}
+
+struct Meta {
+  u64 seq;
+  i32 slot;
+  i64 root;
+  i32 height;
+  i64 pages;
+  i64[] listPages;
+  i32 freeCount;
+  u8[] user;
+}
+
+u8[] writeMeta(Meta m) {
+  u8[] b = u8[].filled(PAGE, 0);
+  put64(b, 0, MAGIC as@ i64);
+  put64(b, 8, m.seq as@ i64);
+  put64(b, 16, m.root);
+  put32(b, 24, m.height);
+  put64(b, 28, m.pages);
+  put32(b, 36, m.freeCount);
+  put32(b, 40, m.listPages.len());
+  i32 at = 44;
+  for (i32 i = 0; i < m.listPages.len(); i++) { put64(b, at + 8 * i, m.listPages[i]); }
+  at += 8 * m.listPages.len();
+  put32(b, at, m.user.len());
+  b.copyFrom(m.user, 0, at + 4, m.user.len());
+  i32 end = at + 4 + m.user.len();
+  u8[] sum = keccak256(slice(b, 0, end));
+  b.copyFrom(sum, 0, end, 32);
+  return slice(b, 0, end + 32);
+}
+
+Meta? readMeta(u8[] b, i32 slot) {
+  if (b.len() < 80 || get64(b, 0) != (MAGIC as@ i64)) { return null; }
+  i32 lists = get32(b, 40);
+  if (lists < 0 || 44 + 8 * lists + 4 > b.len()) { return null; }
+  i64[] listPages = i64[].filled(lists, 0);
+  for (i32 i = 0; i < lists; i++) { listPages[i] = get64(b, 44 + 8 * i); }
+  i32 at = 44 + 8 * lists;
+  i32 userLen = get32(b, at);
+  if (userLen < 0 || at + 4 + userLen + 32 > b.len()) { return null; }
+  i32 end = at + 4 + userLen;
+  u8[] sum = keccak256(slice(b, 0, end));
+  for (i32 i = 0; i < 32; i++) {
+    if (sum[i] != b[end + i]) { return null; }
+  }
+  return Meta(get64(b, 8) as@ u64, slot, get64(b, 16), get32(b, 24), get64(b, 28), listPages, get32(b, 36), slice(b, at + 4, userLen));
+}

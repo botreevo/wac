@@ -1,0 +1,402 @@
+// A node on a store, stopped after a block's commit and before the chain log got the block: the store is a block
+// ahead of the log. The crash e2e found it (a kill in that window, at --flush-every 1, left the node answering
+// SYNCING to every payload for good); this is the same window, without processes.
+
+import { Sys } from "std";
+import { Vec, Map } from "core";
+import { hashString, stringEq } from "core";
+import { json.JsonValue, json.JsonObject, json.JsonArray, json.parse } from "wac";
+import { U256 } from "../src/u256.wac";
+import { Engine, Answer, Replayed } from "../src/engine/engine.wac";
+import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
+import { systemContracts } from "../src/chain/dev.wac";
+import { Store, Change } from "../src/store/tree.wac";
+import { undoFrom } from "../src/store/undo.wac";
+import { bytesToHex } from "../src/hex.wac";
+import { MemDisk, Disk } from "../src/store/disk.wac";
+import { StateDb, rootOf } from "../src/store/state.wac";
+import { str, one } from "./chainkit.wac";
+import { Check } from "./check.wac";
+
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+static string RECIPIENT = "0x3333333333333333333333333333333333333333";
+
+Genesis genesis() {
+  string g = "{\"config\": {\"chainId\": 1, \"cancunTime\": 0, \"pragueTime\": 0}, \"gasLimit\": \"0x1c9c380\", \"baseFeePerGas\": \"0x3b9aca00\", " +
+             "\"alloc\": {\"0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A\": {\"balance\": \"0x56bc75e2d63100000\"}, " + systemContracts() + "}}";
+  string[] why = [""];
+  return genesisFrom(parse(g.toBytes()).ok()!, why)!;
+}
+
+/** A call as the node makes one on a store: prepared first (`Engine.prepare`), then answered. */
+async Answer call(Engine e, string method, JsonValue params) {
+  await e.prepare(method, params);
+  return e.call(method, params);
+}
+
+JsonValue choice(U256 head, JsonValue attrs) { return finalizing(head, U256.zero(), attrs); }
+
+/** A fork choice naming `finalized` (zero: none yet), as a consensus client sends it once finality has begun. */
+JsonValue finalizing(U256 head, U256 finalized, JsonValue attrs) {
+  JsonObject st = JsonObject.create();
+  st.push("headBlockHash".toBytes(), str(head.toHex()));
+  st.push("safeBlockHash".toBytes(), str(finalized.isZero() ? head.toHex() : finalized.toHex()));
+  st.push("finalizedBlockHash".toBytes(), str(finalized.toHex()));
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Object(st));
+  ps.push(attrs);
+  return JsonValue.Array(ps);
+}
+
+/** A block built on the head, as a payload's newPayload params; null if none was built. */
+async JsonValue? build(Engine e, i32 time) { return await buildFor(e, time, RECIPIENT, U256.zero()); }
+
+/** `build`, the fees to `recipient`. */
+async JsonValue? buildFor(Engine e, i32 time, string recipient, U256 finalized) {
+  JsonObject attrs = JsonObject.create();
+  attrs.push("timestamp".toBytes(), str(U256.ofI32(time).toHex()));
+  attrs.push("prevRandao".toBytes(), str(ZERO));
+  attrs.push("suggestedFeeRecipient".toBytes(), str(recipient));
+  attrs.push("withdrawals".toBytes(), JsonValue.Array(JsonArray.create()));
+  attrs.push("parentBeaconBlockRoot".toBytes(), str(ZERO));
+  Answer f = await call(e, "engine_forkchoiceUpdatedV3", finalizing(e.head, finalized, JsonValue.Object(attrs)));
+  JsonValue? id = f.result?.member("payloadId");
+  if (id is null || id!.isNull()) { return null; }
+  Answer g = await call(e, "engine_getPayloadV4", one(id!));
+  JsonArray np = JsonArray.create();
+  np.push(g.result!.member("executionPayload")!);
+  np.push(JsonValue.Array(JsonArray.create()));
+  np.push(str(ZERO));
+  np.push(g.result!.member("executionRequests")!);
+  return JsonValue.Array(np);
+}
+
+U256 hashOf(JsonValue payload) { return U256.fromHex(payload.array()!.get(0).member("blockHash")!.text()!)!; }
+
+/** A newPayload's status, or a forkchoiceUpdated's (inside its payloadStatus). */
+string statusOf(Answer a) { return a.result?.member("status")?.text() ?? a.result?.member("payloadStatus")?.member("status")?.text() ?? a.message; }
+
+/** The records so far as one log. */
+u8[] logOf(Engine e, i32 count) {
+  i32 total = 0;
+  for (i32 i = 0; i < count; i++) { total += e.records.get(i).len(); }
+  u8[] log = u8[].filled(total, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < count; i++) {
+    u8[] r = e.records.get(i);
+    log.copyFrom(r, 0, at, r.len());
+    at += r.len();
+  }
+  return log;
+}
+
+async string run() {
+  Check t = Check.create();
+  Genesis gen = genesis();
+  MemDisk md = MemDisk.create();
+  StateDb db = StateDb.over((await Store.open(md.disk())).unwrap());
+  string[] why = [""];
+  u8[] at = u8[].filled(40, 0);
+  at.copyFrom(gen.header.hash.toBytes(), 0, 0, 32);
+  t.ok((await db.seed(gen.world, at, why)) is not null, "the genesis into the store");
+  Engine e = Engine.onStore(gen.config, gen.header, db);
+
+  // Two blocks, each imported and made the head; then a third imported — its commit made — and the node stopped
+  // before the log got it: the log is the records from before the third's newPayload.
+  for (i32 i = 1; i <= 2; i++) {
+    JsonValue? p = await build(e, 12 * i);
+    t.ok(p is not null, "block \{i} built");
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p!)), "VALID", "block \{i} imports");
+    t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(p!), JsonValue.Null))), "VALID", "and is the head");
+  }
+  JsonValue third = (await build(e, 36))!;
+  i32 logged = e.records.len();
+  t.eqStr(statusOf(await call(e, "engine_newPayloadV4", third)), "VALID", "block 3 imports, its state committed");
+  u8[] log = logOf(e, logged);
+
+  // Started again: the store holds block 3, the log ends at block 2.
+  StateDb again = StateDb.over((await Store.open(md.disk())).unwrap());
+  Engine r = Engine.onStore(gen.config, gen.header, again);
+  t.ok(r.resumeFromStore() && r.restoredNumber.eq(U256.ofI32(3)), "the store holds block 3: \{r.restoredNumber.toDecimal()}");
+  Replayed rp = await r.replay(log);
+  t.eqStr(rp.error, "", "the log replays");
+  t.ok(await r.adoptStored(), "block 3, not in the log, is taken from the store");
+  // As the consensus client goes on: block 3 given again, made the head, and a block built on it.
+  t.eqStr(statusOf(await call(r, "engine_newPayloadV4", third)), "VALID", "block 3 given again is VALID, not SYNCING");
+  t.eqStr(statusOf(await call(r, "engine_forkchoiceUpdatedV3", choice(hashOf(third), JsonValue.Null))), "VALID", "and is the head");
+  JsonValue? fourth = await build(r, 48);
+  t.ok(fourth is not null, "block 4 built on it");
+  t.eqStr(statusOf(await call(r, "engine_newPayloadV4", fourth!)), "VALID", "and imported");
+  // The next start has block 3 in its log.
+  t.ok(r.records.len() > 0, "block 3 recorded for the log");
+  return t.report();
+}
+
+export async string test_a_store_a_block_ahead_of_the_log(Sys sys) { return await run(); }
+
+// ── Reorgs after a restart: the store taken back across blocks it holds, by their undo records ──
+
+/** A node on `md`'s store, started as the node starts: the store's block, the log replayed, a missing block adopted. */
+async Engine restarted(Genesis gen, MemDisk md, u8[] log, i32 flush) {
+  StateDb db = StateDb.over((await Store.open(md.disk())).unwrap());
+  db.flushEvery = flush;
+  Engine r = Engine.onStore(gen.config, gen.header, db);
+  r.resumeFromStore();
+  await r.replay(log);
+  await r.adoptStored();
+  return r;
+}
+
+/** A fresh store with the genesis in it, and an engine on it committing every `flush` blocks. */
+async Engine started(Genesis gen, MemDisk md, i32 flush) {
+  StateDb db = StateDb.over((await Store.open(md.disk())).unwrap());
+  string[] why = [""];
+  u8[] at = u8[].filled(40, 0);
+  at.copyFrom(gen.header.hash.toBytes(), 0, 0, 32);
+  await db.seed(gen.world, at, why);
+  db.flushEvery = flush;
+  return Engine.onStore(gen.config, gen.header, db);
+}
+
+/** Whether the store's entries, rebuilt into a root from nothing else, are the head's state. */
+async bool storeIsHead(Engine e) { return U256.fromBytes(await rootOf(e.db!.store), 0, 32).eq(e.headHeader().stateRoot); }
+
+/** `p` given to `e`, and made its head: "VALID" twice, or what was said instead. */
+async string goTo(Engine e, JsonValue p) {
+  string a = statusOf(await call(e, "engine_newPayloadV4", p));
+  string b = statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(p), JsonValue.Null)));
+  return a == "VALID" && b == "VALID" ? "VALID" : "\{a}, \{b}";
+}
+
+/**
+ * A main chain of `length` blocks on a store committing every `flush`, and a side chain of `side` blocks from
+ * block `from`, built on an engine in memory fed the same blocks — so the node meets the side chain only after
+ * its restart, as a consensus client would give it.
+ */
+async string reorgAfterRestart(i32 flush, i32 length, i32 from, i32 side) {
+  Check t = Check.create();
+  MemDisk md = MemDisk.create();
+  Engine e = await started(genesis(), md, flush);
+  Genesis g2 = genesis();
+  Engine m = Engine.create(g2.config, g2.header, g2.world);
+  Vec<JsonValue> main = Vec.create();
+  Vec<JsonValue> other = Vec.create();
+  for (i32 i = 1; i <= length; i++) {
+    if (i == from + 1) {
+      // The side chain, built on `m` from block `from` and then left: `m` goes back to the main chain.
+      for (i32 k = 0; k < side; k++) {
+        JsonValue? s = await buildFor(m, 12 * (from + k + 1) + 5, "0x4444444444444444444444444444444444444444", U256.zero());
+        other.push(s!);
+        await goTo(m, s!);
+      }
+      await call(m, "engine_forkchoiceUpdatedV3", choice(hashOf(main.get(from - 1)), JsonValue.Null));
+    }
+    JsonValue? p = await build(m, 12 * i);
+    main.push(p!);
+    await goTo(m, p!);
+    t.eqStr(await goTo(e, p!), "VALID", "main block \{i}");
+  }
+  u8[] log = logOf(e, e.records.len());
+  Engine r = await restarted(genesis(), md, log, flush);
+  t.ok(await storeIsHead(r), "restarted at the head, the store is its state");
+  for (i32 k = 0; k < side; k++) { t.eqStr(await goTo(r, other.get(k)), "VALID", "after the restart, side block \{from + k + 1}, branching at \{from}"); }
+  t.ok(await storeIsHead(r), "the store is the side chain's state");
+  t.eqStr(await goTo(r, main.get(length - 1)), "VALID", "and back to the main chain's head");
+  t.ok(await storeIsHead(r), "whose state the store is again");
+  return t.report();
+}
+
+export async string test_a_one_block_reorg_after_a_restart(Sys sys) {
+  // A sibling of the head, committing every block; and committing every 4 blocks, a sibling of the last flush's
+  // block (the 8th), its branch point below the store's block.
+  return await reorgAfterRestart(1, 3, 2, 1) + await reorgAfterRestart(4, 9, 7, 1);
+}
+
+export async string test_a_deep_reorg_after_a_restart(Sys sys) {
+  // Nothing finalized: a side chain from block 2 of a main chain of 10, longer than what it replaces.
+  return await reorgAfterRestart(1, 10, 2, 9) + await reorgAfterRestart(4, 10, 2, 9);
+}
+
+/** `md`'s disk, with what it holds durably taken after every sync: each a point a crash could leave. */
+Disk snapshotting(MemDisk md, Vec<MemDisk> points) {
+  Disk d = md.disk();
+  return Disk(d.read, d.readNow, d.write, async () => {
+    auto r = await d.sync();
+    points.push(md.copy());
+    return r;
+  }, d.size);
+}
+
+export async string test_a_crash_in_the_middle_of_a_reorg(Sys sys) {
+  Check t = Check.create();
+  Genesis gen = genesis();
+  MemDisk md = MemDisk.create();
+  Vec<MemDisk> points = Vec.create();
+  StateDb db = StateDb.over((await Store.open(snapshotting(md, points))).unwrap());
+  string[] why = [""];
+  u8[] at = u8[].filled(40, 0);
+  at.copyFrom(gen.header.hash.toBytes(), 0, 0, 32);
+  await db.seed(gen.world, at, why);
+  Engine e = Engine.onStore(gen.config, gen.header, db);
+  Genesis g2 = genesis();
+  Engine m = Engine.create(g2.config, g2.header, g2.world);
+  // Main to 6; a side chain of 4 from block 3, given to the node and left (the node back at 6).
+  Vec<JsonValue> main = Vec.create();
+  for (i32 i = 1; i <= 6; i++) {
+    JsonValue? p = await build(m, 12 * i);
+    main.push(p!);
+    await goTo(m, p!);
+    await goTo(e, p!);
+  }
+  await call(m, "engine_forkchoiceUpdatedV3", choice(hashOf(main.get(2)), JsonValue.Null));
+  Vec<JsonValue> side = Vec.create();
+  for (i32 k = 0; k < 4; k++) {
+    JsonValue? s = await buildFor(m, 12 * (k + 4) + 5, "0x4444444444444444444444444444444444444444", U256.zero());
+    side.push(s!);
+    await goTo(m, s!);
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", s!)), "VALID", "side block \{k + 4} imported");
+  }
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(main.get(5)), JsonValue.Null))), "VALID", "the node at the main chain's head");
+  // The log as it stands, and the reorg to the side chain's tip: three blocks back, four forward, a commit each.
+  u8[] log = logOf(e, e.records.len());
+  i32 before = points.len();
+  JsonValue tip = side.get(3);
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(tip), JsonValue.Null))), "VALID", "the reorg, uninterrupted");
+  t.ok(await storeIsHead(e), "uninterrupted, the store is the tip's state");
+  i32 after = points.len();
+  t.ok(after - before >= 7, "a durable point for each block crossed: \{after - before}");
+  // A stop at each point the reorg passed through, and the consensus client's fork choice given again.
+  i32 bad = 0;
+  for (i32 i = before; i < after; i++) {
+    Engine r = await restarted(gen, points.get(i), log, 1);
+    string st = statusOf(await call(r, "engine_forkchoiceUpdatedV3", choice(hashOf(tip), JsonValue.Null)));
+    if (st != "VALID" || !(await storeIsHead(r))) {
+      bad++;
+      t.fail("stopped at point \{i - before} of the reorg (the store at block \{r.restoredNumber.toDecimal()}): \{st}");
+    }
+  }
+  t.ok(bad == 0, "every stop in the reorg recovers to the tip: \{after - before} points");
+  return t.report();
+}
+
+/** Undo records in the store, by block number: how many blocks have one. */
+async i32 undoCount(Engine e, i32 below) {
+  Vec<Change> got = await e.db!.store.range(undoFrom(0), undoFrom(below as! u64), 0x7fffffff);
+  Map<string, bool> blocks = Map.create(hashString, stringEq);
+  for (i32 i = 0; i < got.len(); i++) {
+    // A record's chunks share its first 41 bytes: 9, the number, the hash.
+    u8[] k = u8[].filled(41, 0);
+    k.copyFrom(got.get(i).key, 0, 0, 41);
+    blocks.set(bytesToHex(k), true);
+  }
+  return blocks.len();
+}
+
+export async string test_undo_records_go_at_finality_and_past_a_bound(Sys sys) {
+  Check t = Check.create();
+  MemDisk md = MemDisk.create();
+  Engine e = await started(genesis(), md, 1);
+  Vec<JsonValue> main = Vec.create();
+  for (i32 i = 1; i <= 8; i++) {
+    JsonValue? p = await build(e, 12 * i);
+    main.push(p!);
+    t.eqStr(await goTo(e, p!), "VALID", "block \{i}");
+  }
+  t.ok((await undoCount(e, 100)) == 8, "a record for each block: \{await undoCount(e, 100)}");
+  // Block 5 finalized; the next commit deletes what is at or below it.
+  U256 fin = hashOf(main.get(4));
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(main.get(7)), fin, JsonValue.Null))), "VALID", "block 5 finalized");
+  JsonValue? p9 = await buildFor(e, 12 * 9, RECIPIENT, fin);
+  t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p9!)), "VALID", "block 9");
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(p9!), fin, JsonValue.Null))), "VALID", "made the head, block 5 still finalized");
+  t.ok((await undoCount(e, 6)) == 0, "none left at or below the finalized block: \{await undoCount(e, 6)}");
+  t.ok((await undoCount(e, 100)) == 4, "blocks 6 to 9 keep theirs: \{await undoCount(e, 100)}");
+  t.eqStr(e.undo.notice, "", "no notice while finality keeps up");
+  // Finality stalls: past 6 blocks below the head (the bound lowered from 1024 to see it), records go anyway, and
+  // the node is told.
+  e.undo.limit = 6;
+  for (i32 i = 10; i <= 16; i++) {
+    JsonValue? p = await buildFor(e, 12 * i, RECIPIENT, fin);
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p!)), "VALID", "block \{i}");
+    await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(p!), fin, JsonValue.Null));
+  }
+  t.ok((await undoCount(e, 100)) <= 7, "no more than the bound's worth kept: \{await undoCount(e, 100)}");
+  t.ok(e.undo.notice.indexOf("finality is more than 6 blocks behind") == 0, "and the notice says why: \{e.undo.notice}");
+  t.ok(e.undo.bytes > 0 && e.undo.stateBytes > 0, "the bytes counted: \{e.undo.bytes} undo, \{e.undo.stateBytes} state");
+  return t.report();
+}
+
+export async string test_a_fork_choice_of_a_side_chain_finality_ruled_out(Sys sys) {
+  // The crash e2e's failure, without processes: a side chain made the head, then the main chain finalized past it
+  // (its undo records, and the main block's below it, deleted with finality). A restart moves the store back to
+  // the log's head; the restart after it must run the side chain's block above the store, cannot, skips it — and
+  // must pass over the fork choice that named it, not refuse the log.
+  Check t = Check.create();
+  MemDisk md = MemDisk.create();
+  Engine e = await started(genesis(), md, 1);
+  Genesis g2 = genesis();
+  Engine m = Engine.create(g2.config, g2.header, g2.world);
+  Vec<JsonValue> main = Vec.create();
+  for (i32 i = 1; i <= 2; i++) {
+    JsonValue? p = await build(m, 12 * i);
+    main.push(p!);
+    await goTo(m, p!);
+    t.eqStr(await goTo(e, p!), "VALID", "main block \{i}");
+  }
+  U256 two = hashOf(main.get(1));
+  Vec<JsonValue> side = Vec.create();
+  for (i32 k = 0; k < 2; k++) {
+    JsonValue? s = await buildFor(m, 12 * (k + 3) + 5, "0x4444444444444444444444444444444444444444", U256.zero());
+    side.push(s!);
+    await goTo(m, s!);
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", s!)), "VALID", "side block \{k + 3}");
+  }
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(side.get(1)), two, JsonValue.Null))), "VALID", "the side chain the head");
+  await call(m, "engine_forkchoiceUpdatedV3", choice(two, JsonValue.Null));
+  for (i32 i = 3; i <= 4; i++) {
+    JsonValue? p = await build(m, 12 * i);
+    main.push(p!);
+    await goTo(m, p!);
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p!)), "VALID", "main block \{i}");
+    if (i == 3) { t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(p!), hashOf(p!), JsonValue.Null))), "VALID", "main block 3 the head, and finalized"); }
+  }
+  u8[] log = logOf(e, e.records.len());
+  Engine r1 = await restarted(genesis(), md, log, 1);
+  t.ok(r1.head.eq(hashOf(main.get(2))), "the first restart: the log's head, main block 3");
+  StateDb db2 = StateDb.over((await Store.open(md.disk())).unwrap());
+  Engine r2 = Engine.onStore(g2.config, g2.header, db2);
+  r2.resumeFromStore();
+  Replayed rp = await r2.replay(log);
+  t.eqStr(rp.error, "", "the second restart replays the log, the side chain's fork choice passed over");
+  await r2.adoptStored();
+  t.eqStr(await goTo(r2, main.get(3)), "VALID", "and goes on: main block 4");
+  t.ok(await storeIsHead(r2), "the store its state");
+  return t.report();
+}
+
+export async string test_a_payload_status_names_a_hash_in_full(Sys sys) {
+  // A block hash that starts with a zero nibble went out as latestValidHash shortened (U256.toHex drops leading zeros),
+  // which Prysm cannot read ("hex string of odd length"): its block processing failed on about one block in 16, and
+  // a following node stopped there. Blocks are built with timestamps one apart until one's hash starts with zero.
+  Check t = Check.create();
+  MemDisk md = MemDisk.create();
+  Engine e = await started(genesis(), md, 1);
+  Genesis g2 = genesis();
+  Engine m = Engine.create(g2.config, g2.header, g2.world);
+  JsonValue? found = null;
+  for (i32 time = 12; time < 12 + 200 && found is null; time++) {
+    JsonValue? p = await build(m, time);
+    string h = p!.array()!.get(0).member("blockHash")!.text()!;
+    if (h.slice(2, 3) == "0") { found = p; }
+  }
+  t.ok(found is not null, "a block whose hash starts with a zero nibble");
+  Answer a = await call(e, "engine_newPayloadV4", found!);
+  string lvh = a.result?.member("latestValidHash")?.text() ?? "";
+  t.eqStr(statusOf(a), "VALID", "it imports");
+  t.ok(lvh.len() == 66, "its latest valid hash in full, 32 bytes: \{lvh}");
+  t.eqStr(lvh, found!.array()!.get(0).member("blockHash")!.text()!, "the block's own hash");
+  Answer f = await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(found!), JsonValue.Null));
+  string flvh = f.result?.member("payloadStatus")?.member("latestValidHash")?.text() ?? "";
+  t.ok(flvh.len() == 66, "and in the fork choice's answer: \{flvh}");
+  return t.report();
+}

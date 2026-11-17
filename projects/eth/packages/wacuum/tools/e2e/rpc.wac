@@ -3,12 +3,15 @@
 // forkchoiceUpdated), and send a transfer, deploy a contract, call it, estimate gas, read receipts, blocks,
 // logs and fees. Then stop it, start it again from its snapshot, and check it is where it was.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/rpc.wac
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/rpc.wac [--store]
+//
+// With --store the node keeps its state on disk: blocks built on it, and the restart from the store. It keeps
+// one block of history in memory then, so what is asked about older blocks is answered from disk.
 //
 // It runs the node with the `wac` on PATH, from cmd/wacuum.wac.
 
 import { Sys } from "std";
-import { json.JsonValue, json.stringify } from "wac";
+import { json.JsonValue, json.JsonArray, json.stringify } from "wac";
 import { keccak256 } from "../../src/crypto/keccak.wac";
 import { U256 } from "../../src/u256.wac";
 import { bytesToHex } from "../../src/hex.wac";
@@ -30,11 +33,17 @@ struct Node {
   u64 time;
 }
 
-async Proc startNode(Sys sys, string dir, i32 port) {
-  Proc p = await Proc.start(sys, ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
-                                  "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
-                                  "--port", "\{port}", "--datadir", dir + "/data", "--snapshot-every", "2"],
-                            dir + "/wacuum.log");
+async Proc startNode(Sys sys, string dir, i32 port, bool store) {
+  string[] base = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                   "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
+                   "--port", "\{port}", "--datadir", dir + "/data", "--snapshot-every", "2"];
+  string[] argv = string[].filled(base.len() + (store ? 3 : 0), "--store");
+  for (i32 i = 0; i < base.len(); i++) { argv[i] = base[i]; }
+  if (store) {
+    argv[base.len() + 1] = "--history";
+    argv[base.len() + 2] = "1";
+  }
+  Proc p = await Proc.start(sys, argv, dir + "/wacuum.log");
   await p.says(sys, "Engine API on", 600000);
   return p;
 }
@@ -63,6 +72,9 @@ async JsonValue? makeBlock(Node n) {
 u8[] stringifyOf(JsonValue v) { return stringify(v); }
 
 export async i32 main(Sys sys) {
+  bool store = false;
+  string[] args = sys.args();
+  for (i32 i = 0; i < args.len(); i++) { store = store || args[i] == "--store"; }
   Check t = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-rpc");
   u8[] key = u8[].filled(32, 0x11);
@@ -75,7 +87,7 @@ export async i32 main(Sys sys) {
   await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
   i32 port = await somePort(sys, 19551, 1000);
 
-  Proc proc = await startNode(sys, dir, port);
+  Proc proc = await startNode(sys, dir, port, store);
   Rpc user = Rpc.at(sys, port);
   Node n = Node(sys, dir, port, proc, Rpc.authed(sys, port, secret), user, field(await user.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash"), 12);
 
@@ -125,20 +137,54 @@ export async i32 main(Sys sys) {
   t.that(await user.text("eth_call", "[{\"to\":\"\{contract}\"},\"latest\"]") == "0x", "eth_call");
   t.that(await user.text("eth_blockNumber", "[]") == "0x3", "eth_blockNumber");
   t.that((await user.call("engine_forkchoiceUpdatedV3", "[{},null]")).error() != "", "the Engine API is refused without a token");
+  if (store) {
+    // Block 1 has left the history held in memory: what is asked about it comes from disk.
+    string b1 = field(await user.get("eth_getBlockByNumber", "[\"0x1\",true]"), "hash");
+    t.that(b1 != "" && field(await user.get("eth_getBlockByHash", "[\"\{b1}\",false]"), "number") == "0x1", "block 1 by number and by hash, from disk");
+    t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{sent}\"]"), "status") == "0x1" &&
+           field(await user.get("eth_getTransactionByHash", "[\"\{sent}\"]"), "blockNumber") == "0x1", "and its transaction and receipt");
+    // A consensus client backfilling asks for bodies by hash and by range: block 1's comes from disk too.
+    JsonValue? byHash = await n.engine.get("engine_getPayloadBodiesByHashV1", "[[\"\{b1}\"]]");
+    JsonValue? byRange = await n.engine.get("engine_getPayloadBodiesByRangeV1", "[\"0x1\",\"0x10\"]");
+    i32 txs = bodyTxs(byHash, 0);
+    i32 txsByRange = bodyTxs(byRange, 0);
+    t.that(txs == 1 && txsByRange == 1 && (byRange?.array()?.len() ?? -1) == 3,
+           "and its payload body, by hash and by range (blocks 1 to 3 of 16 asked): \{txs} \{txsByRange} \{byRange?.array()?.len() ?? -1}");
+  }
 
   // Restarted, it starts from its last snapshot and replays only what came after.
-  t.that((await proc.output(sys)).indexOf("snapshot at block 2") >= 0, "a snapshot was taken at block 2");
+  if (!store) { t.that((await proc.output(sys)).indexOf("snapshot at block 2") >= 0, "a snapshot was taken at block 2"); }
   await proc.stop(sys);
-  proc = await startNode(sys, dir, port);
-  t.that((await proc.output(sys)).indexOf("starting from the snapshot at block 2") >= 0, "restarted from the snapshot");
+  proc = await startNode(sys, dir, port, store);
+  if (store) {
+    // From the block the store last wrote, and the blocks staged since replayed from the log (with blocks
+    // written 64 at a time, three blocks are all still in the log).
+    string said = await proc.output(sys);
+    t.that(said.indexOf("the store holds the state of block") >= 0 || said.indexOf("replayed 3 blocks") >= 0, "restarted from the store and its log");
+  } else {
+    t.that((await proc.output(sys)).indexOf("starting from the snapshot at block 2") >= 0, "restarted from the snapshot");
+  }
   t.that(await user.text("eth_blockNumber", "[]") == "0x3", "at the same head");
   t.that(quantity(await user.text("eth_getBalance", "[\"\{TO}\",\"latest\"]")) == 12345 &&
          await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + runtime, "with the same state");
-  t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{called}\"]"), "status") == "0x1", "and block 3's receipts, which ran again");
+  t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{called}\"]"), "status") == "0x1",
+         store ? "and block 3's receipts, kept in the store" : "and block 3's receipts, which ran again");
+  if (store) {
+    t.that(field(await user.get("eth_getTransactionReceipt", "[\"\{sent}\"]"), "blockNumber") == "0x1" &&
+           ((await user.get("eth_getLogs", "[{\"address\":\"\{contract}\",\"fromBlock\":\"0x0\"}]"))?.array()?.len() ?? -1) == 1,
+           "and block 1's transaction and the logs from disk, after the restart");
+  }
 
   await proc.stop(sys);
   await removeDir(sys, dir);
   return t.done();
+}
+
+/** The number of transactions in body `i` of a getPayloadBodies answer, or -1. */
+i32 bodyTxs(JsonValue? v, i32 i) {
+  JsonArray? a = v?.array();
+  if (a is null || a!.len() <= i) { return -1; }
+  return a!.get(i).member("transactions")?.array()?.len() ?? -1;
 }
 
 u8[] hexBytes(string h) {

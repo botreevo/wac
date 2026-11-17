@@ -1,0 +1,54 @@
+// A block run on a world backed by the store: a step at a time (`BodyRun`), and a step that read something
+// not yet in memory undone, what it missed read, and the step run again. So a block costs one run of each
+// transaction plus a rerun of each one that missed, rather than rerunning the whole block until nothing is
+// missed — the second layer of `docs/state-on-disk.md`'s reads; the third, an interpreter that stops at
+// the opcode, would make the reruns cheaper still.
+
+import { Map } from "core";
+import { U256 } from "../u256.wac";
+import { World, ChangeSet } from "../state/world.wac";
+import { Spec } from "../evm/spec.wac";
+import { SenderCache } from "../tx/decode.wac";
+import { Block, Header, Body, BodyRun, failed, checkBefore, checkAfter, envOf } from "../chain/block.wac";
+import { StateDb } from "./state.wac";
+
+/** How a backed run went: the steps it took, and how many of them had to run again. */
+export struct Steps {
+  i32 steps;
+  i32 reruns;
+}
+
+/**
+ * `b` on `w`, a world backed by `db`, checked as `executeBlock` checks it but for the state root, which is
+ * the store's to compute once the changes are written. "" in the body's error when the block is valid so far.
+ */
+export async Body executeFrom(StateDb db, World w, Spec spec, Block b, Header parent, U256 chainId, Map<U256, U256> hashes,
+                              SenderCache? senders, Steps tally) {
+  string bad = checkBefore(spec, b, parent);
+  if (bad != "") { return failed(bad); }
+  StateDb d = db;
+  BodyRun run = BodyRun.create(spec, w, envOf(spec, b.header, chainId, hashes), b.header, b.txs, b.withdrawals, false, senders,
+                               () => d.misses == 0);
+  while (run.result is null) {
+    db.misses = 0;
+    i32 mark = w.notesMark();
+    w.record();
+    bool kept = run.step();
+    ChangeSet cs = w.seal();
+    tally.steps++;
+    if (kept) {
+      // Kept: nothing before here will be taken back.
+      w.notes.clear();
+      continue;
+    }
+    // Undone, its misses forgotten, read, and run again.
+    w.undo(cs);
+    w.forgetSince(mark);
+    w.unask(db.wantAccounts.keys(), db.wantSlots);
+    string missing = await db.fetch();
+    if (missing != "") { return failed(missing); }
+    tally.reruns++;
+  }
+  bad = checkAfter(spec, b.header, run.result!, false);
+  return bad == "" ? run.result! : failed(bad);
+}

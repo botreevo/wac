@@ -18,26 +18,32 @@
 import { Map, Vec } from "core";
 import { crypto.sha256 } from "wac";
 import { keccak256 } from "../crypto/keccak.wac";
-import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { json.JsonValue, json.JsonObject, json.JsonArray, json.stringify } from "wac";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "@/lib.wac";
 import { U256 } from "../u256.wac";
 import { hexToBytes, bytesToHex } from "../hex.wac";
 import { World, Account, ChangeSet, hashU256, eqU256 } from "../state/world.wac";
 import { u256Bytes } from "../state/root.wac";
-import { proofJson } from "../state/proof.wac";
+import { proofJson, proofFromStore } from "../state/proof.wac";
 import { trieRoot } from "../trie/trie.wac";
 import { addressBytes, Evm, BlockEnv, TxEnv, Message, processMessage } from "../evm/evm.wac";
 import { Outcome } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
 import { blobGasPrice } from "../tx/process.wac";
 import { Spec, ChainConfig } from "../evm/spec.wac";
-import { Header, Block, Withdrawal, Receipt, Body, executeBlock, applyBlock, encodeBlock, decodeBlock, BlockDecode, blockTimestamp, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
+import { Header, Block, Withdrawal, Receipt, Body, timestampOf, headerOf, executeBlock, applyBlock, encodeBlock, decodeBlock, BlockDecode, blockTimestamp, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
          indexedRoot } from "../chain/block.wac";
 import { decodeTransaction, decodeWith, DecodedTx, SenderCache } from "../tx/decode.wac";
 import { Attributes, Built, buildBlock } from "../chain/build.wac";
 import { Sidecar, Unwrapped, unwrap, wrap, sidecarsFit, CELLS_PER_BLOB } from "./blobs.wac";
 import { blockJson, txJson, receiptJson, logJson, firstLogIndex } from "./eth.wac";
 import { Log } from "../state/world.wac";
+import { StateDb, Staged } from "../store/state.wac";
+import { executeFrom, Steps } from "../store/exec.wac";
+import { receiptsChanges, receiptsOf, receiptsKey, joined } from "../store/receipts.wac";
+import { blockKey, blockChanges, canonicalKey, txKey, txPlace, placeIndex } from "../store/blocks.wac";
+import { Change } from "../store/tree.wac";
+import { undoKey, undoFrom, undoChanges, decodeChangeSet } from "../store/undo.wac";
 import { Transaction, AccessEntry, Authorization, processTransaction, Processed, intrinsicGas } from "../tx/process.wac";
 
 /**
@@ -48,6 +54,56 @@ import { Transaction, AccessEntry, Authorization, processTransaction, Processed,
 struct Node {
   Header header;
   ChangeSet? changes;
+}
+
+/**
+ * The undo records' bookkeeping (`store/undo.wac`): the number below which they have been deleted, a notice for
+ * the node to log when finality stalls and the oldest are deleted anyway, and the bytes written, for measuring.
+ */
+struct Undo {
+  u64 prunedTo;
+  /** Undo records kept at most this many blocks below the head, finalized or not: a bound while finality stalls. */
+  u64 limit;
+  string notice;
+  bool warned;
+  i64 bytes;
+  i64 stateBytes;
+
+  Undo create() { return Undo(0, 1024, "", false, 0, 0); }
+}
+
+/** A payload `prepare` ran on the store: "" and committed, or why it is invalid. */
+struct Prepared {
+  string error;
+  ChangeSet changes;
+  Body body;
+}
+
+/** A call's method and parameters as one key. */
+string answerKey(string method, JsonValue params) { return method + string.fromBytes(stringify(params)); }
+
+i32 hashText(string s) {
+  u8[] b = s.toBytes();
+  i32 h = 0;
+  for (i32 i = 0; i < b.len(); i++) { h = h * 31 + (b[i] as i32); }
+  return h;
+}
+
+bool textEq(string a, string b) { return a == b; }
+
+/** What a store's commit records beside the tree: the hash and number of the block whose state it holds. */
+/** The first key after every key that starts with `p`. */
+u8[] keyAfter(u8[] p) {
+  u8[] out = u8[].filled(p.len() + 1, 0xff);
+  out.copyFrom(p, 0, 0, p.len());
+  return out;
+}
+
+u8[] storedAt(Header h) {
+  u8[] out = u8[].filled(40, 0);
+  out.copyFrom(h.hash.toBytes(), 0, 0, 32);
+  out.copyFrom(U256.ofU64(h.number.low()).toBytes(), 24, 32, 8);
+  return out;
 }
 
 /**
@@ -69,6 +125,16 @@ struct Orphan {
   Block block;
 }
 
+/** On a store, what blocks leaving the history held in memory add to the next commit, and its lookups meanwhile. */
+struct Persisting {
+  Vec<u8[]> keys;
+  Vec<u8[]> values;
+  Map<U256, U256> canonical;
+  Map<U256, TxAt> txs;
+
+  Persisting create() { return Persisting(Vec.create(), Vec.create(), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256)); }
+}
+
 /** Where a canonical transaction is. */
 struct TxAt {
   U256 block;
@@ -78,6 +144,8 @@ struct TxAt {
 /** The log's two kinds of record, each `rlp([kind, ...])`: a block's RLP, and a fork choice's three hashes. */
 static u8 RECORD_BLOCK = 1;
 static u8 RECORD_CHOICE = 2;
+/** The chain rebased onto a snap-synced block: its header and its 256 ancestors' (`rebase`). */
+static u8 RECORD_BASE = 3;
 
 /** What replaying a log came to: how many bytes of it were whole records, and how many blocks. */
 export struct Replayed {
@@ -191,12 +259,44 @@ export struct Engine {
    * before it answers: each block imported, and each fork choice. `replay` reads them back.
    */
   Vec<u8[]> records;
+  /**
+   * The store the state is in, or null when `world` holds all of it. On the store, `world` is a cache over
+   * it, the store holds the state of the block `at` (docs/state-on-disk.md, "The node on the store"), and
+   * `prepare` does the asynchronous part of each call before it.
+   */
+  StateDb? db;
+  /** What `prepare` found of each payload it ran: "" for one now committed, else why it is invalid. */
+  Map<U256, Prepared> prepared;
+  /** Set while `prepare` runs `newPayload` only to have the block it describes: `importBlock` keeps it. */
+  bool collecting;
+  Vec<Block> collected;
+  Vec<Spec> collectedSpecs;
+  /** How the backed runs went, for whoever is measuring. */
+  Steps steps;
+  /** What `settleRoot` last staged, for `produceAsync` to commit. */
+  Staged? lastStaged;
+  /** Answers `prepare` worked out whole (a proof, from the store's tries), for the call that follows. */
+  Map<string, JsonValue> answered;
+  /** On a store, what each built payload changed, by payload id: its state root is the store's to work out. */
+  Map<U256, ChangeSet> builtChanges;
+  /**
+   * On a store, blocks that left the history held in memory: where they go on disk (`blocks.wac`'s
+   * canonical and transaction entries), committed with the next block, and meanwhile answered from here.
+   * One field, not four: a 41st field of `Engine` made the devnet, which imports it, fail to check
+   * (`docs/wac-asks.md`).
+   */
+  Persisting persisting;
+  Undo undo;
+  /** Whether the log has the block the store holds: when not, `adoptStored` records it. */
+  bool restoredLogged;
 
   /** An engine whose chain starts at `genesis`, with `world` its state. */
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
                       genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                      null, Map.create(hashU256, eqU256), Vec.create(), null, U256.zero(), U256.zero(), SenderCache.create(), "wacuum".toBytes(), U256.zero(), 0, 1, 0, Vec.create());
+                      null, Map.create(hashU256, eqU256), Vec.create(), null, U256.zero(), U256.zero(), SenderCache.create(), "wacuum".toBytes(), U256.zero(), 0, 1, 0, Vec.create(),
+                      null, Map.create(hashU256, eqU256), false, Vec.create(), Vec.create(), Steps(0, 0), null, Map.create(hashText, textEq), Map.create(hashU256, eqU256),
+                      Persisting.create(), Undo.create(), false);
     e.blocks.set(genesis.hash, Node(genesis, null));
     e.archive.set(genesis.hash, Archived(genesis, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
                                          Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
@@ -221,6 +321,9 @@ export struct Engine {
     if (method == "engine_getPayloadV5") { return this.getPayload(5, ps!); }
     if (method == "engine_getBlobsV1") { return this.getBlobs(1, ps!); }
     if (method == "engine_getBlobsV2") { return this.getBlobs(2, ps!); }
+    if (method == "engine_getPayloadBodiesByHashV1") { return this.bodiesByHash(ps!); }
+    if (method == "engine_getPayloadBodiesByRangeV1") { return this.bodiesByRange(ps!); }
+    if (method == "engine_getClientVersionV1") { return Answer.ok(clientVersion()); }
     if (method == "eth_sendRawTransaction") { return this.sendRawTransaction(ps!); }
     if (method == "eth_getBalance" || method == "eth_getTransactionCount" || method == "eth_getCode") {
       World? w = this.stateAt(arg(ps!, 1));
@@ -239,6 +342,11 @@ export struct Engine {
       if (w is null) { return unavailable(); }
       return Answer.ok(str(hex32(w!.storage(hexU256(arg(ps!, 0)), hexU256(arg(ps!, 1))))));
     }
+    if (method == "eth_getProof" && this.db is not null) {
+      JsonValue? got = this.answered.get(answerKey(method, params));
+      this.answered.remove(answerKey(method, params));
+      return got is null ? unavailable() : Answer.ok(got!);
+    }
     if (method == "eth_getProof") {
       World? w = this.stateAt(arg(ps!, 2));
       if (w is null) { return unavailable(); }
@@ -251,20 +359,20 @@ export struct Engine {
     if (method == "eth_estimateGas") { return this.estimateGas(ps!); }
     if (method == "eth_getBlockByNumber" || method == "eth_getBlockByHash") {
       U256? hash = method == "eth_getBlockByHash" ? hexU256(arg(ps!, 0)) : this.blockFor(arg(ps!, 0));
-      Archived? a = hash is null ? null : this.archive.get(hash!);
+      Archived? a = hash is null ? null : this.archived(hash!);
       if (a is null) { return Answer.ok(JsonValue.Null); }
       bool full = arg(ps!, 1)?.boolean() ?? false;
       return Answer.ok(blockJson(a!.header, a!.txs, a!.withdrawals, a!.receipts, a!.size, full, this.chainId, this.senders));
     }
     if (method == "eth_getBlockTransactionCountByNumber" || method == "eth_getBlockTransactionCountByHash") {
       U256? hash = method == "eth_getBlockTransactionCountByHash" ? hexU256(arg(ps!, 0)) : this.blockFor(arg(ps!, 0));
-      Archived? a = hash is null ? null : this.archive.get(hash!);
+      Archived? a = hash is null ? null : this.archived(hash!);
       return Answer.ok(a is null ? JsonValue.Null : str(U256.ofI32(a!.txs.len()).toHex()));
     }
     if (method == "eth_getTransactionByHash" || method == "eth_getTransactionReceipt") {
       Archived? a = null;
       i32 i = this.txWhere(hexU256(arg(ps!, 0)));
-      if (i >= 0) { a = this.archive.get(this.txIndex.get(hexU256(arg(ps!, 0)))!.block); }
+      if (i >= 0) { a = this.archived(this.txAt(hexU256(arg(ps!, 0)))!.block); }
       if (a is null) {
         if (method == "eth_getTransactionByHash") { return this.pendingTx(hexU256(arg(ps!, 0))); }
         return Answer.ok(JsonValue.Null);
@@ -276,7 +384,7 @@ export struct Engine {
     }
     if (method == "eth_getBlockReceipts") {
       U256? hash = this.blockFor(arg(ps!, 0));
-      Archived? a = hash is null ? null : this.archive.get(hash!);
+      Archived? a = hash is null ? null : this.archived(hash!);
       if (a is null) { return Answer.ok(JsonValue.Null); }
       JsonArray out = JsonArray.create();
       for (i32 i = 0; i < a!.receipts.len(); i++) { out.push(receiptJson(a!.receipts[i], a!.header, a!.receipts, i)); }
@@ -302,6 +410,35 @@ export struct Engine {
     if (method == "web3_sha3") { return Answer.ok(str(bytesToHex(keccak256(hexBytes(arg(ps!, 0)))))); }
     if (method == "engine_exchangeCapabilities") { return Answer.ok(capabilities()); }
     if (method == "eth_chainId") { return Answer.ok(str(this.chainId.toHex())); }
+    // How big what the node keeps between blocks is: for tools/e2e/soak.wac, which watches for what grows.
+    if (method == "wacuum_sizes") {
+      JsonObject o = JsonObject.create();
+      o.push("blocks".toBytes(), str("\{this.blocks.len()}"));
+      o.push("canonical".toBytes(), str("\{this.canonical.len()}"));
+      o.push("archive".toBytes(), str("\{this.archive.len()}"));
+      o.push("txIndex".toBytes(), str("\{this.txIndex.len()}"));
+      o.push("mempool".toBytes(), str("\{this.mempool.len()}"));
+      o.push("payloads".toBytes(), str("\{this.payloads.len()}"));
+      o.push("builtChanges".toBytes(), str("\{this.builtChanges.len()}"));
+      o.push("prepared".toBytes(), str("\{this.prepared.len()}"));
+      o.push("orphans".toBytes(), str("\{this.orphans.len()}"));
+      o.push("records".toBytes(), str("\{this.records.len()}"));
+      o.push("answered".toBytes(), str("\{this.answered.len()}"));
+      o.push("senders".toBytes(), str("\{this.senders.senders.len()}"));
+      i32 changed = 0;
+      U256[] hs = this.blocks.keys();
+      for (i32 i = 0; i < hs.len(); i++) {
+        if (this.blocks.get(hs[i])!.changes is not null) { changed++; }
+      }
+      o.push("blocksWithChanges".toBytes(), str("\{changed}"));
+      if (this.db is not null) {
+        string st = this.db!.store.sizes();
+        o.push("store".toBytes(), str(st));
+        o.push("dbAccounts".toBytes(), str("\{this.db!.accounts.len()}"));
+        o.push("dbSlots".toBytes(), str("\{this.db!.slots.len()}"));
+      }
+      return Answer.ok(JsonValue.Object(o));
+    }
     if (method == "eth_blockNumber") { return Answer.ok(str(this.blocks.get(this.head)!.header.number.toHex())); }
     return Answer.error(-32601, "method not found: " + method);
   }
@@ -400,7 +537,7 @@ export struct Engine {
   /** Execute a block on its parent's state and keep it: VALID, INVALID, or SYNCING without the parent. */
   Answer importBlock(this, Spec spec, Block b) {
     Header h = b.header;
-    if (this.blocks.has(h.hash)) { return status("VALID", h.hash.toHex(), ""); }
+    if (this.blocks.has(h.hash)) { return status("VALID", hex32(h.hash), ""); }
     Node? parent = this.blocks.get(h.parentHash);
     if (parent is null) {
       // A block on a chain this client has not got: it waits, and the chain it needs is fetched from peers.
@@ -408,6 +545,7 @@ export struct Engine {
       this.syncTarget = h.parentHash;
       return status("SYNCING", "", "");
     }
+    if (this.db is not null) { return this.importPrepared(spec, b); }
     // A parent this client has but cannot reach the state of is on a fork that finality has ruled out.
     if (!this.moveTo(h.parentHash)) { return status("SYNCING", "", ""); }
     this.world.record();
@@ -422,12 +560,12 @@ export struct Engine {
     u8[] rlp = encodeBlock(spec, b);
     this.archive.set(h.hash, Archived(h, b.txs, b.withdrawals, body.receipts, rlp.len()));
     this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(rlp)])));
-    return status("VALID", h.hash.toHex(), "");
+    return status("VALID", hex32(h.hash), "");
   }
 
   /** INVALID, naming the parent as the latest valid ancestor when this client has it. */
   Answer invalid(this, Header h, string why) {
-    return status("INVALID", this.blocks.has(h.parentHash) ? h.parentHash.toHex() : "", why);
+    return status("INVALID", this.blocks.has(h.parentHash) ? hex32(h.parentHash) : "", why);
   }
 
   Answer invalidNoAncestor(this, string why) { return status("INVALID", "", why); }
@@ -439,6 +577,8 @@ export struct Engine {
    */
   bool moveTo(this, U256 target) {
     if (this.at.eq(target)) { return true; }
+    // On the store, moving is a commit, which `prepare` does; a move it did not do is one that cannot be made now.
+    if (this.db is not null) { return false; }
     Vec<ChangeSet> back = Vec.create();
     Vec<ChangeSet> forward = Vec.create();
     Header a = this.blocks.get(this.at)!.header;
@@ -481,6 +621,323 @@ export struct Engine {
 
   // ── engine_forkchoiceUpdated ──
 
+  /** The engine on a store: `db` holds the state of `genesis` (seeded by the caller), and `world` caches it. */
+  Engine onStore(ChainConfig config, Header genesis, StateDb db) {
+    World w = World.create();
+    w.backBy(db.source());
+    Engine e = Engine.create(config, genesis, w);
+    e.db = db;
+    return e;
+  }
+
+  /**
+   * On a store that already holds a block's state (its meta names the block): the log's blocks up to it are
+   * recorded without running, as after a snapshot, and only those after it run. False when the store is
+   * at the genesis, whose state `onStore`'s caller seeded.
+   */
+  bool resumeFromStore(this) {
+    u8[] user = this.db!.store.committed().user;
+    if (user.len() < 40) { return false; }
+    U256 hash = U256.fromBytes(user, 0, 32);
+    if (hash.eq(this.head)) { return false; }
+    this.restoredAt = hash;
+    this.restoredNumber = U256.fromBytes(user, 32, 8);
+    this.snapshotNumber = this.restoredNumber;
+    return true;
+  }
+
+  /**
+   * The chain begun again at `pivot`, a block whose state the store now holds (fetched by snap sync), with
+   * its ancestors (newest first, 256 for BLOCKHASH) known only as headers: what came before is not run, and
+   * the blocks after it are imported as usual. Recorded, so a restart rebases the same way.
+   */
+  void rebase(this, Header pivot, Header[] ancestors) {
+    this.blocks = Map.create(hashU256, eqU256);
+    this.canonical = Map.create(hashU256, eqU256);
+    this.archive = Map.create(hashU256, eqU256);
+    this.orphans = Map.create(hashU256, eqU256);
+    Vec<u8[]> raws = Vec.create();
+    raws.push(encode(headerItem(this.config.specAt(pivot.timestamp), pivot)));
+    // Newest first in the record, as `ancestors` are.
+    for (i32 i = 0; i < ancestors.len(); i++) { raws.push(encode(headerItem(this.config.specAt(ancestors[i].timestamp), ancestors[i]))); }
+    for (i32 i = ancestors.len() - 1; i >= -1; i--) {
+      Header h = i < 0 ? pivot : ancestors[i];
+      this.blocks.set(h.hash, Node(h, null));
+      this.canonical.set(h.number, h.hash);
+      this.archive.set(h.hash, Archived(h, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
+                                        Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
+                                        Vec<Receipt>.create().toArray(), 0));
+    }
+    this.head = pivot.hash;
+    this.safe = pivot.hash;
+    this.finalized = pivot.hash;
+    this.forgottenAt = pivot.hash;
+    this.at = pivot.hash;
+    this.keptFrom = ancestors.len() > 0 ? ancestors[ancestors.len() - 1].number.low() : pivot.number.low();
+    // Replayed after a restart, the store may already be past the pivot: the later of the two is where
+    // the log's blocks start running again.
+    if (this.restoredAt is null || this.restoredNumber.lt(pivot.number)) {
+      this.restoredAt = pivot.hash;
+      this.restoredNumber = pivot.number;
+      this.snapshotNumber = pivot.number;
+    }
+    if (this.syncTarget is not null && this.syncTarget!.eq(pivot.hash)) { this.syncTarget = null; }
+    if (this.db is not null) { this.freshWorld(); }
+    Item[] rec = Item[].filled(raws.len() + 1, Item.Bytes([RECORD_BASE]));
+    for (i32 i = 0; i < raws.len(); i++) { rec[i + 1] = Item.Bytes(raws.get(i)); }
+    this.records.push(encode(Item.List(rec)));
+  }
+
+  /** A fresh cache over the store: after the store moves, what the old one held may be stale. */
+  void freshWorld(this) {
+    World w = World.create();
+    w.backBy(this.db!.source());
+    this.world = w;
+  }
+
+  /**
+   * On the store, the asynchronous part of `call(method, params)`, awaited before it: payloads run and
+   * committed, the store moved to a fork choice's head, what a state query reads read. Nothing off the store.
+   */
+  async void prepare(this, string method, JsonValue params) {
+    if (this.db is null) { return; }
+    JsonArray? ps = params.array();
+    if (ps is null) { return; }
+    if (method.indexOf("engine_newPayload") == 0) {
+      // The block, as the call would see it: run the call to the point where it would import.
+      this.collecting = true;
+      this.collected = Vec.create();
+      this.collectedSpecs = Vec.create();
+      this.call(method, params);
+      this.collecting = false;
+      for (i32 i = 0; i < this.collected.len(); i++) { await this.prepareBlock(this.collectedSpecs.get(i), this.collected.get(i)); }
+      return;
+    }
+    if (method.indexOf("engine_forkchoiceUpdated") == 0) {
+      if (ps!.len() < 1 || ps!.get(0).object() is null) { return; }
+      U256 head = hexU256(ps!.get(0).member("headBlockHash"));
+      if (this.blocks.has(head)) { await this.moveToAsync(head); }
+      return;
+    }
+    if (method.indexOf("engine_getPayload") == 0) {
+      // The built block's state root, from what it changed staged on the store at its parent, and its hash.
+      if (ps!.len() < 1) { return; }
+      U256 id = hexU256(ps!.get(0));
+      ChangeSet? cs = this.builtChanges.get(id);
+      Built? b = this.payloads.get(id);
+      if (cs is null || b is null) { return; }
+      this.builtChanges.remove(id);
+      Header h = b!.block.header;
+      if (!this.at.eq(h.parentHash)) { await this.moveToAsync(h.parentHash); }
+      await this.settleRoot(b!.block, cs!);
+      this.db!.discard();
+      return;
+    }
+    if (method == "eth_getProof") {
+      // Of the head's state, from the store's tries; the call then answers it.
+      if (!this.at.eq(this.head) && this.blocks.has(this.head)) { await this.moveToAsync(this.head); }
+      JsonArray? keys = arg(ps!, 1)?.array();
+      U256[] slots = U256[].filled(keys is null ? 0 : keys!.len(), U256.zero());
+      for (i32 i = 0; i < slots.len(); i++) { slots[i] = hexU256(keys!.get(i)); }
+      this.answered.set(answerKey(method, params), await proofFromStore(this.db!, hexU256(arg(ps!, 0)), slots));
+      return;
+    }
+    if (method == "eth_call" || method == "eth_estimateGas") {
+      // Run until a run reads nothing it had not read before: then the call itself finds it all in memory.
+      if (!this.at.eq(this.head) && this.blocks.has(this.head)) { await this.moveToAsync(this.head); }
+      StateDb db = this.db!;
+      for (i32 round = 0; round < 1000; round++) {
+        this.freshWorld();
+        db.misses = 0;
+        this.call(method, params);
+        if (db.misses == 0) { break; }
+        string bad = await db.fetch();
+        if (bad != "") { break; }
+      }
+      this.freshWorld();
+      return;
+    }
+    if (method == "eth_getBalance" || method == "eth_getTransactionCount" || method == "eth_getCode" || method == "eth_getStorageAt") {
+      if (!this.at.eq(this.head) && this.blocks.has(this.head)) { await this.moveToAsync(this.head); }
+      U256 a = hexU256(arg(ps!, 0));
+      StateDb db = this.db!;
+      if (!db.accounts.has(a)) { db.wantAccounts.set(a, true); }
+      if (method == "eth_getStorageAt") { db.slot(a, hexU256(arg(ps!, 1))); }
+      this.world.unask([a], db.wantSlots);
+      await db.fetch();
+    }
+  }
+
+  /**
+   * A payload's block run on the store at its parent, a step at a time; committed if every commitment
+   * matches, the root included, which leaves the store at the block; its verdict kept for `importBlock`.
+   */
+  async void prepareBlock(this, Spec spec, Block b) {
+    Header h = b.header;
+    Node? parent = this.blocks.get(h.parentHash);
+    if (parent is null || this.blocks.has(h.hash) || this.prepared.has(h.hash)) { return; }
+    if (!(await this.moveToAsync(h.parentHash))) { return; }
+    StateDb db = this.db!;
+    this.freshWorld();
+    World w = this.world;
+    w.record();
+    Body body = await executeFrom(db, w, spec, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header), this.senders, this.steps);
+    ChangeSet cs = w.seal();
+    this.freshWorld();
+    if (body.error != "") {
+      db.discard();
+      this.prepared.set(h.hash, Prepared(body.error, cs, body));
+      return;
+    }
+    string[] why = [""];
+    Staged? st = await db.stageSet(cs, true, why);
+    if (st is null) {
+      this.prepared.set(h.hash, Prepared("the state did not write: \{why[0]}", cs, body));
+      return;
+    }
+    if (!U256.fromBytes(st!.root, 0, 32).eq(h.stateRoot)) {
+      db.discard();
+      this.prepared.set(h.hash, Prepared("state root does not match", cs, body));
+      return;
+    }
+    // The receipts with the state, so that a restart, which does not run this block again, still has them.
+    Change[] pruned = await this.undoPrunes(h.number.low());
+    string bad = await db.commitWith(st!, this.withBlock(h, encodeBlock(spec, b), body.receipts, cs, pruned, st!.changes), storedAt(h));
+    if (bad != "") {
+      this.prepared.set(h.hash, Prepared("the state did not commit: \{bad}", cs, body));
+      return;
+    }
+    this.at = h.hash;
+    this.prepared.set(h.hash, Prepared("", cs, body));
+  }
+
+  /** A block built on a world over the store: its state root (and so its hash) from its changes staged on the store. */
+  async bool settleRoot(this, Block b, ChangeSet cs) {
+    string[] why = [""];
+    Staged? st = await this.db!.stageSet(cs, true, why);
+    if (st is null) { return false; }
+    b.header.stateRoot = U256.fromBytes(st!.root, 0, 32);
+    b.header.hash = U256.fromBytes(keccak256(encode(headerItem(this.config.specAt(b.header.timestamp), b.header))), 0, 32);
+    this.lastStaged = st;
+    return true;
+  }
+
+  /**
+   * `produce` on the store: built on the head as there, its root from its changes staged on the store,
+   * committed, and made the head. "" or why not.
+   */
+  async string produceAsync(this, U256 timestamp, U256 feeRecipient) {
+    if (this.db is null) { return this.produce(timestamp, feeRecipient); }
+    if (!(await this.moveToAsync(this.head))) { return "the store cannot reach the head"; }
+    Header parent = this.blocks.get(this.head)!.header;
+    if (!timestamp.gt(parent.timestamp)) { timestamp = parent.timestamp.add(U256.one()); }
+    U256 randao = U256.fromBytes(keccak256(parent.hash.toBytes()), 0, 32);
+    Attributes attrs = Attributes(timestamp, randao, feeRecipient,
+                                  Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())), U256.zero());
+    Spec spec = this.config.specAt(timestamp);
+    this.freshWorld();
+    this.world.record();
+    Built built = buildBlock(spec, this.world, parent, attrs, this.candidates(spec), this.chainId,
+                             this.ancestorHashes(parent), this.extraData, this.senders);
+    ChangeSet cs = this.world.seal();
+    if (built.body.error != "") {
+      this.freshWorld();
+      return built.body.error;
+    }
+    Block b = built.block;
+    if (!(await this.settleRoot(b, cs))) {
+      this.freshWorld();
+      return "the block's state did not stage";
+    }
+    Change[] pruned = await this.undoPrunes(b.header.number.low());
+    string bad = await this.db!.commitWith(this.lastStaged!, this.withBlock(b.header, encodeBlock(spec, b), built.body.receipts, cs, pruned, this.lastStaged!.changes), storedAt(b.header));
+    this.freshWorld();
+    if (bad != "") { return "the block's state did not commit: \{bad}"; }
+    U256 hash = b.header.hash;
+    this.blocks.set(hash, Node(b.header, cs));
+    this.at = hash;
+    u8[] rlp = encodeBlock(spec, b);
+    this.archive.set(hash, Archived(b.header, b.txs, b.withdrawals, built.body.receipts, rlp.len()));
+    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(rlp)])));
+    this.choose(hash, hash, hash);
+    return "";
+  }
+
+  /** `moveTo` on the store: each block left and each reached committed, the root checked against its header. */
+  async bool moveToAsync(this, U256 target) {
+    if (this.at.eq(target)) { return true; }
+    Vec<ChangeSet> back = Vec.create();
+    Vec<ChangeSet> forward = Vec.create();
+    Vec<Header> reached = Vec.create();
+    Header a = this.blocks.get(this.at)!.header;
+    Node? tn = this.blocks.get(target);
+    if (tn is null) { return false; }
+    Header b = tn!.header;
+    while (!a.hash.eq(b.hash)) {
+      bool fromHere = !b.number.gt(a.number);
+      Header cur = fromHere ? a : b;
+      Node n = this.blocks.get(cur.hash)!;
+      Node? p = this.blocks.get(cur.parentHash);
+      if (n.changes is null || p is null) { return false; }
+      if (fromHere) {
+        back.push(n.changes!);
+        a = p!.header;
+        reached.push(a);
+      } else {
+        forward.push(n.changes!);
+        b = p!.header;
+      }
+    }
+    StateDb db = this.db!;
+    string[] why = [""];
+    // Each step is a commit (or a staged one), so `at` follows each: if a step fails part way, the engine still
+    // knows the block the store is at, and the next move starts from there rather than from where it set out.
+    for (i32 i = 0; i < back.len(); i++) {
+      Header to = reached.get(i);
+      u8[]? root = await db.writeSet(back.get(i), false, storedAt(to), why);
+      if (root is null || !U256.fromBytes(root!, 0, 32).eq(to.stateRoot)) { return false; }
+      this.at = to.hash;
+      this.freshWorld();
+    }
+    for (i32 i = forward.len() - 1; i >= 0; i--) {
+      // The blocks reached going forward, from the meeting point up to the target.
+      Header to = i == 0 ? tn!.header : this.headerAbove(tn!.header, i);
+      u8[]? root = await db.writeSet(forward.get(i), true, storedAt(to), why);
+      if (root is null || !U256.fromBytes(root!, 0, 32).eq(to.stateRoot)) { return false; }
+      this.at = to.hash;
+      this.freshWorld();
+    }
+    this.at = target;
+    this.freshWorld();
+    return true;
+  }
+
+  /** The ancestor of `h` `back` blocks below it. */
+  Header headerAbove(this, Header h, i32 back) {
+    Header cur = h;
+    for (i32 i = 0; i < back; i++) { cur = this.blocks.get(cur.parentHash)!.header; }
+    return cur;
+  }
+
+  /** On the store: the verdict `prepareBlock` reached on `b`, which it has already committed if valid. */
+  Answer importPrepared(this, Spec spec, Block b) {
+    Header h = b.header;
+    if (this.collecting) {
+      this.collected.push(b);
+      this.collectedSpecs.push(spec);
+      return status("SYNCING", "", "");
+    }
+    Prepared? pr = this.prepared.get(h.hash);
+    if (pr is null) { return status("SYNCING", "", ""); }
+    this.prepared.remove(h.hash);
+    if (pr!.error != "") { return this.invalid(h, pr!.error); }
+    this.blocks.set(h.hash, Node(h, pr!.changes));
+    u8[] rlp = encodeBlock(spec, b);
+    this.archive.set(h.hash, Archived(h, b.txs, b.withdrawals, pr!.body.receipts, rlp.len()));
+    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(rlp)])));
+    return status("VALID", hex32(h.hash), "");
+  }
+
   Answer forkchoiceUpdated(this, JsonArray ps) {
     if (ps.len() < 1 || ps.get(0).object() is null) { return Answer.error(-32602, "no forkchoice state"); }
     JsonValue fc = ps.get(0);
@@ -504,17 +961,27 @@ export struct Engine {
       this.world.record();
       Built built = buildBlock(spec, this.world, parent, attrs, this.candidates(spec), this.chainId,
                                this.ancestorHashes(parent), this.extraData, this.senders);
-      this.world.undo(this.world.seal());
+      ChangeSet builtCs = this.world.seal();
+      this.world.undo(builtCs);
       // A body that fails is a chain this client cannot extend at all — a system contract missing or
       // broken — and not something to hand out as an empty block.
       if (built.body.error != "") { return Answer.error(-32603, "cannot build on this head: " + built.body.error); }
       U256 id = U256.ofU64(this.nextPayloadId);
       this.nextPayloadId++;
       this.payloads.set(id, built);
+      // Only the latest are kept: a consensus client asks for a payload seconds after it began, and each holds
+      // a whole block. Kept for good, a node building every slot grew by a block's worth each time.
+      if (id.low() >= 32) {
+        U256 old = U256.ofU64(id.low() - 32);
+        this.payloads.remove(old);
+        this.builtChanges.remove(old);
+      }
+      // On a store the world holds only what the build read, so the header's root waits for getPayload's prepare.
+      if (this.db is not null) { this.builtChanges.set(id, builtCs); }
       payloadId = str(hex8(id));
     }
     JsonObject o = JsonObject.create();
-    o.push("payloadStatus".toBytes(), status("VALID", head.toHex(), "").result!);
+    o.push("payloadStatus".toBytes(), status("VALID", hex32(head), "").result!);
     o.push("payloadId".toBytes(), payloadId);
     return Answer.ok(JsonValue.Object(o));
   }
@@ -621,9 +1088,23 @@ export struct Engine {
       U256? h = this.canonical.get(n);
       if (h is null) { continue; }
       Archived? a = this.archive.get(h!);
+      // On a store it is kept on disk: its block and receipts are there already, and where it and its
+      // transactions are goes with the next commit.
+      if (this.db is not null) {
+        this.persisting.keys.push(canonicalKey(n.low()));
+        this.persisting.values.push(h!.toBytes());
+        this.persisting.canonical.set(n, h!);
+      }
       if (a is not null) {
         U256[] hashes = txHashes(a!);
-        for (i32 i = 0; i < hashes.len(); i++) { this.txIndex.remove(hashes[i]); }
+        for (i32 i = 0; i < hashes.len(); i++) {
+          if (this.db is not null) {
+            this.persisting.keys.push(txKey(hashes[i]));
+            this.persisting.values.push(txPlace(h!, i));
+            this.persisting.txs.set(hashes[i], TxAt(h!, i));
+          }
+          this.txIndex.remove(hashes[i]);
+        }
       }
       this.archive.remove(h!);
       this.canonical.remove(n);
@@ -869,9 +1350,14 @@ export struct Engine {
    * process stopped while appending it — ends the replay there, and `good` says how much of the log to
    * keep. A record that is whole and does not apply is an error: the log is not this chain's.
    */
-  Replayed replay(this, u8[] log) {
+  async Replayed replay(this, u8[] log) {
     i32 at = 0;
     i32 blocks = 0;
+    bool lookedAhead = false;
+    // Blocks of the log that could not run: on a fork finality has since ruled out, whose parent state the store
+    // cannot reach (its undo records gone with finality). A fork choice that named one is passed over too.
+    Map<U256, bool> skipped = Map.create(hashU256, eqU256);
+    await this.adoptFromStore();
     while (at < log.len()) {
       i32 n = rlpLength(log, at);
       if (n < 0) { break; }
@@ -887,19 +1373,46 @@ export struct Engine {
         BlockDecode bd = decodeBlock(spec, raw);
         if (bd.block is null) { return Replayed(at, blocks, "block at byte \{at}: \{bd.error}"); }
         Block b = bd.block!;
+        if (this.restoredAt is not null && b.header.hash.eq(this.restoredAt!)) { this.restoredLogged = true; }
         if (this.restoredAt is not null && !b.header.number.gt(this.restoredNumber)) {
-          // At or below the snapshot: the state already includes it, so it is recorded, not run.
-          this.adopt(spec, b);
+          await this.adoptLogged(spec, b);
         } else {
+          // The first block to run: every block at or below the store's that the log has later is adopted first,
+          // so that the store can be moved across them (a side chain imported after the main chain's later blocks).
+          if (this.restoredAt is not null && !lookedAhead) {
+            await this.adoptAhead(log, at + n);
+            lookedAhead = true;
+          }
+          if (this.db is not null) { await this.prepareBlock(spec, b); }
           Answer a = this.importBlock(spec, b);
           string st = a.result!.member("status")!.text()!;
           // A block on a fork the snapshot's finality ruled out has no parent state to run on, and is
           // skipped as finality would have dropped it; anything else that does not run is a broken log.
           if (st == "INVALID") { return Replayed(at, blocks, "block at byte \{at} is \{st} on replay"); }
-          if (st == "VALID") { blocks++; }
+          if (st == "VALID") { blocks++; } else { skipped.set(b.header.hash, true); }
         }
+      } else if (kind.len() == 1 && kind[0] == RECORD_BASE && f.len() >= 2) {
+        Header[] hs = Header[].filled(f.len() - 1, this.headHeader());
+        for (i32 k = 1; k < f.len(); k++) {
+          string[] why = [""];
+          u8[] raw = bytesOf(f[k]);
+          Header? h = headerOf(this.config.specAt(timestampOf(decode(raw).item)), decode(raw).item, why);
+          if (h is null) { return Replayed(at, blocks, "a base record's header at byte \{at}: \{why[0]}"); }
+          hs[k - 1] = h!;
+        }
+        Header[] ancestors = Header[].filled(hs.len() - 1, hs[0]);
+        for (i32 k = 1; k < hs.len(); k++) { ancestors[k - 1] = hs[k]; }
+        this.rebase(hs[0], ancestors);
+        // A rebase forgets every block; the store's own is taken again, and the log looked ahead of again.
+        await this.adoptFromStore();
+        lookedAhead = false;
       } else if (kind.len() == 1 && kind[0] == RECORD_CHOICE && f.len() == 4) {
         U256 head = U256.fromBytes(bytesOf(f[1]), 0, 32);
+        if (!this.blocks.has(head) && skipped.has(head)) {
+          at += n;
+          continue;
+        }
+        if (this.db is not null && this.blocks.has(head)) { await this.moveToAsync(head); }
         if (!this.choose(head, U256.fromBytes(bytesOf(f[2]), 0, 32), U256.fromBytes(bytesOf(f[3]), 0, 32))) {
           return Replayed(at, blocks, "fork choice at byte \{at} names a block the log has not");
         }
@@ -913,11 +1426,50 @@ export struct Engine {
     return Replayed(at, blocks, "");
   }
 
+  /**
+   * A block of the log at or below the store's: the state already includes it, so it is recorded, not run — with
+   * its change set from its undo record, so that a reorg can still take the store back across it, and its
+   * receipts, kept with its state.
+   */
+  async void adoptLogged(this, Spec spec, Block b) {
+    this.adopt(spec, b);
+    await this.loadUndo(b.header);
+    if (this.db is not null) {
+      u8[]? kept = await this.db!.store.chunks(receiptsKey(b.header.hash));
+      Archived? a = this.archive.get(b.header.hash);
+      if (kept is not null && a is not null) { a!.receipts = receiptsOf(kept!); }
+    }
+  }
+
+  /** The log's blocks from `from` on that are at or below the store's, adopted, up to a rebase (which forgets them). */
+  async void adoptAhead(this, u8[] log, i32 from) {
+    i32 at = from;
+    while (at < log.len()) {
+      i32 n = rlpLength(log, at);
+      if (n < 0) { return; }
+      u8[] rec = u8[].filled(n, 0);
+      rec.copyFrom(log, at, 0, n);
+      at += n;
+      Decoded d = decode(rec);
+      if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 2) { return; }
+      Item[] f = itemsOf(d.item);
+      u8[] kind = bytesOf(f[0]);
+      if (kind.len() == 1 && kind[0] == RECORD_BASE) { return; }
+      if (kind.len() != 1 || kind[0] != RECORD_BLOCK) { continue; }
+      u8[] raw = bytesOf(f[1]);
+      Spec spec = this.config.specAt(blockTimestamp(raw));
+      BlockDecode bd = decodeBlock(spec, raw);
+      if (bd.block is null || bd.block!.header.number.gt(this.restoredNumber)) { continue; }
+      if (bd.block!.header.hash.eq(this.restoredAt!)) { this.restoredLogged = true; }
+      await this.adoptLogged(spec, bd.block!);
+    }
+  }
+
   /** The block a JSON-RPC block parameter names: a tag, a number on the canonical chain, or `{blockHash}`. */
   U256? blockFor(this, JsonValue? p) {
     if (p is null || p!.isNull()) { return this.head; }
     JsonValue? byHash = p!.member("blockHash");
-    if (byHash is not null) { return this.archive.has(hexU256(byHash)) ? hexU256(byHash) : null; }
+    if (byHash is not null) { return this.archived(hexU256(byHash)) is not null ? hexU256(byHash) : null; }
     JsonValue? byNumber = p!.member("blockNumber");
     string tag = (byNumber ?? p!).text() ?? "latest";
     if (tag == "latest" || tag == "pending") { return this.head; }
@@ -925,7 +1477,7 @@ export struct Engine {
     if (tag == "finalized") { return this.archive.has(this.finalized) ? this.finalized : null; }
     U256 n = tag == "earliest" ? U256.zero() : (U256.fromHex(tag) ?? U256.ofU64(0xFFFFFFFFFFFFFFFF));
     if (n.gt(this.blocks.get(this.head)!.header.number)) { return null; }
-    return this.canonical.get(n);
+    return this.canonicalAt(n);
   }
 
   /**
@@ -940,11 +1492,11 @@ export struct Engine {
 
   /** The index of a canonical transaction in its block, or −1. */
   i32 txWhere(this, U256 hash) {
-    TxAt? t = this.txIndex.get(hash);
+    TxAt? t = this.txAt(hash);
     if (t is null) { return -1; }
-    Archived? a = this.archive.get(t!.block);
+    Archived? a = this.archived(t!.block);
     if (a is null) { return -1; }
-    U256? c = this.canonical.get(a!.header.number);
+    U256? c = this.canonicalAt(a!.header.number);
     if (c is null || !c!.eq(t!.block) || a!.header.number.gt(this.blocks.get(this.head)!.header.number)) { return -1; }
     return t!.index;
   }
@@ -968,18 +1520,18 @@ export struct Engine {
     Vec<U256> blocks = Vec.create();
     if (f!.member("blockHash") is not null) {
       U256 h = hexU256(f!.member("blockHash"));
-      if (!this.archive.has(h)) { return Answer.error(-32000, "unknown block"); }
+      if (this.archived(h) is null) { return Answer.error(-32000, "unknown block"); }
       blocks.push(h);
     } else {
       U256? from = this.blockFor(f!.member("fromBlock"));
       U256? to = this.blockFor(f!.member("toBlock"));
       if (from is null || to is null) { return Answer.ok(JsonValue.Array(JsonArray.create())); }
-      U256 lo = this.archive.get(from!)!.header.number;
-      U256 hi = this.archive.get(to!)!.header.number;
+      U256 lo = this.archived(from!)!.header.number;
+      U256 hi = this.archived(to!)!.header.number;
       if (hi.sub(lo).gt(U256.ofU64(10000)) && !lo.gt(hi)) { return Answer.error(-32005, "query covers more than 10000 blocks"); }
       for (U256 n = lo; !n.gt(hi); n = n.add(U256.one())) {
-        U256? h = this.canonical.get(n);
-        if (h is not null && this.archive.has(h!)) { blocks.push(h!); }
+        U256? h = this.canonicalAt(n);
+        if (h is not null) { blocks.push(h!); }
       }
     }
     U256[] addresses = U256[].filled(0, U256.zero());
@@ -995,7 +1547,9 @@ export struct Engine {
     JsonArray topics = f!.member("topics")?.array() ?? JsonArray.create();
     JsonArray out = JsonArray.create();
     for (i32 b = 0; b < blocks.len(); b++) {
-      Archived a = this.archive.get(blocks.get(b))!;
+      Archived? held = this.archived(blocks.get(b));
+      if (held is null) { continue; }
+      Archived a = held!;
       i32 logIndex = 0;
       for (i32 t = 0; t < a.receipts.len(); t++) {
         Receipt r = a.receipts[t];
@@ -1068,16 +1622,16 @@ export struct Engine {
     U256? newest = this.blockFor(arg(ps, 1));
     if (newest is null) { return Answer.error(-32000, "unknown block"); }
     JsonArray? percentiles = arg(ps, 2)?.array();
-    U256 top = this.archive.get(newest!)!.header.number;
+    U256 top = this.archived(newest!)!.header.number;
     U256 oldest = count.gt(top) ? U256.zero() : top.sub(count).add(U256.one());
-    // Not from before the history that is kept.
-    if (this.keptFrom > 1 && oldest.lt(U256.ofU64(this.keptFrom))) { oldest = U256.ofU64(this.keptFrom); }
+    // Not from before the history that is kept (on a store it is all kept, on disk).
+    if (this.db is null && this.keptFrom > 1 && oldest.lt(U256.ofU64(this.keptFrom))) { oldest = U256.ofU64(this.keptFrom); }
     JsonArray baseFees = JsonArray.create();
     JsonArray ratios = JsonArray.create();
     JsonArray rewards = JsonArray.create();
-    Header last = this.archive.get(newest!)!.header;
+    Header last = this.archived(newest!)!.header;
     for (U256 n = oldest; !n.gt(top); n = n.add(U256.one())) {
-      Archived a = this.archive.get(this.canonical.get(n)!)!;
+      Archived a = this.archived(this.canonicalAt(n)!)!;
       Header h = a.header;
       baseFees.push(str(h.baseFee.toHex()));
       f64 ratio = h.gasLimit.isZero() ? 0.0 : (h.gasUsed.low() as~ f64) / (h.gasLimit.low() as~ f64);
@@ -1107,6 +1661,27 @@ export struct Engine {
    * Import every orphan whose parent is now here, and their orphans in turn. Answers how many went in. The
    * sync target is cleared once it is a block this has.
    */
+  /** `adoptOrphans`, with each one's block prepared first when the engine is on a store. */
+  async i32 adoptOrphansAsync(this) {
+    if (this.db is null) { return this.adoptOrphans(); }
+    i32 n = 0;
+    while (true) {
+      U256[] hashes = this.orphans.keys();
+      bool ready = false;
+      for (i32 i = 0; i < hashes.len(); i++) {
+        Orphan o = this.orphans.get(hashes[i])!;
+        if (!this.blocks.has(o.block.header.parentHash)) { continue; }
+        await this.prepareBlock(o.spec, o.block);
+        ready = true;
+      }
+      if (!ready) { break; }
+      i32 got = this.adoptOrphans();
+      n += got;
+      if (got == 0) { break; }
+    }
+    return n;
+  }
+
   i32 adoptOrphans(this) {
     i32 n = 0;
     bool more = true;
@@ -1165,22 +1740,154 @@ export struct Engine {
   /** Whether this client has the block, executed. */
   bool has(this, U256 hash) { return this.blocks.has(hash); }
 
+  /**
+   * The extra changes a block's commit carries: its receipts, its RLP, and where the blocks that left the
+   * history are. Taken here, so the next commit does not carry them again; if this one fails the store is
+   * opened again and they are lost with it, which costs only answers about blocks that old.
+   */
+  Change[] withBlock(this, Header h, u8[] rlp, Receipt[] receipts, ChangeSet cs, Change[] pruned, Change[] state) {
+    Vec<Change> out = Vec.create();
+    Change[] r = receiptsChanges(h.hash, receipts);
+    for (i32 i = 0; i < r.len(); i++) { out.push(r[i]); }
+    Change[] k = blockChanges(h.hash, rlp);
+    for (i32 i = 0; i < k.len(); i++) { out.push(k[i]); }
+    // Its undo record, in the same commit as its state, so that a store holding one holds the other.
+    Change[] u = undoChanges(h.number.low(), h.hash, cs);
+    for (i32 i = 0; i < u.len(); i++) {
+      out.push(u[i]);
+      this.undo.bytes += (u[i].key.len() + u[i].value!.len()) as i64;
+    }
+    for (i32 i = 0; i < state.len(); i++) { this.undo.stateBytes += (state[i].key.len() + (state[i].value is null ? 0 : state[i].value!.len())) as i64; }
+    for (i32 i = 0; i < pruned.len(); i++) { out.push(pruned[i]); }
+    for (i32 i = 0; i < this.persisting.keys.len(); i++) { out.push(Change(this.persisting.keys.get(i), this.persisting.values.get(i))); }
+    this.persisting = Persisting.create();
+    return out.toArray();
+  }
+
+  /**
+   * Deletes for the undo records no reorg can need any more: those of finalized blocks, and past `this.undo.limit`
+   * below `number` (the block about to commit) whatever finality says — then a reorg that deep cannot be undone
+   * after a restart, and the notice says so.
+   */
+  async Change[] undoPrunes(this, u64 number) {
+    // Up to and including the finalized block: no reorg takes the store below it.
+    Header? f = this.headerByHash(this.finalized);
+    u64 upTo = f is null ? 0 : f!.number.low() + 1;
+    // Finality caught up again: the next stall is told of too.
+    if (number <= this.undo.limit || number - this.undo.limit <= upTo) { this.undo.warned = false; }
+    if (number > this.undo.limit && number - this.undo.limit > upTo) {
+      upTo = number - this.undo.limit;
+      if (!this.undo.warned) {
+        this.undo.warned = true;
+        this.undo.notice = "finality is more than \{this.undo.limit} blocks behind: undo records below block \{upTo} deleted; a reorg that deep cannot be followed after a restart";
+      }
+    }
+    if (upTo <= this.undo.prunedTo) { return Change[].filled(0, Change(u8[].filled(0, 0), null)); }
+    Vec<Change> old = await this.db!.store.range(undoFrom(this.undo.prunedTo), undoFrom(upTo), 0x7fffffff);
+    Change[] out = Change[].filled(old.len(), Change(u8[].filled(0, 0), null));
+    for (i32 i = 0; i < old.len(); i++) { out[i] = Change(old.get(i).key, null); }
+    this.undo.prunedTo = upTo;
+    return out;
+  }
+
+  /** A block adopted without running (at or below the store's): its change set from its undo record, if kept. */
+  async void loadUndo(this, Header h) {
+    Node? n = this.blocks.get(h.hash);
+    if (this.db is null || n is null || n!.changes is not null) { return; }
+    u8[]? raw = await this.db!.store.chunks(undoKey(h.number.low(), h.hash));
+    if (raw is null) { return; }
+    Node node = n!;
+    node.changes = decodeChangeSet(raw!);
+  }
+
+  /**
+   * `engine_getPayloadBodiesByHashV1`: each block's body, in the order asked, null for one this node does not have —
+   * in memory or on its store.
+   */
+  Answer bodiesByHash(this, JsonArray ps) {
+    JsonArray? hashes = arg(ps, 0)?.array();
+    if (hashes is null) { return Answer.error(-32602, "the first parameter must be an array of block hashes"); }
+    if (hashes!.len() > MAX_BODIES) { return Answer.error(-38004, "Too large request"); }
+    JsonArray out = JsonArray.create();
+    for (i32 i = 0; i < hashes!.len(); i++) {
+      Archived? a = this.archived(hexU256(hashes!.get(i)));
+      out.push(a is null ? JsonValue.Null : payloadBody(a!));
+    }
+    return Answer.ok(JsonValue.Array(out));
+  }
+
+  /**
+   * `engine_getPayloadBodiesByRangeV1`: the canonical bodies from `start`, `count` of them, null for one this node
+   * does not have, and none past its head — the spec forbids trailing nulls for blocks not yet known.
+   */
+  Answer bodiesByRange(this, JsonArray ps) {
+    U256 start = hexU256(arg(ps, 0));
+    U256 count = hexU256(arg(ps, 1));
+    if (start.isZero() || count.isZero()) { return Answer.error(-32602, "start and count must be at least 1"); }
+    if (count.gt(U256.ofI32(MAX_BODIES))) { return Answer.error(-38004, "Too large request"); }
+    U256 head = this.blocks.get(this.head)!.header.number;
+    JsonArray out = JsonArray.create();
+    U256 n = start;
+    for (i32 i = 0; i < (count.low() as! i32) && !n.gt(head); i++) {
+      U256? h = this.canonicalAt(n);
+      Archived? a = h is null ? null : this.archived(h!);
+      out.push(a is null ? JsonValue.Null : payloadBody(a!));
+      n = n.add(U256.one());
+    }
+    return Answer.ok(JsonValue.Array(out));
+  }
+
+  /** A block by hash: held in memory, or on a store read from it (`blocks.wac`), or null. */
+  Archived? archived(this, U256 hash) {
+    Archived? a = this.archive.get(hash);
+    if (a is not null || this.db is null) { return a; }
+    u8[]? whole = this.db!.store.chunksNow(blockKey(hash));
+    if (whole is null) { return null; }
+    u8[] rlp = whole!;
+    BlockDecode bd = decodeBlock(this.config.specAt(blockTimestamp(rlp)), rlp);
+    if (bd.block is null) { return null; }
+    Block b = bd.block!;
+    u8[]? rs = this.db!.store.chunksNow(receiptsKey(hash));
+    Receipt[] receipts = rs is null ? Receipt[].filled(0, Receipt(U256.zero(), 0, U256.zero(), null, false, 0, 0, U256.zero(), 0, U256.zero(), null, Log[].filled(0, Log(U256.zero(), U256[].filled(0, U256.zero()), u8[].filled(0, 0))), u8[].filled(0, 0))) : receiptsOf(rs!);
+    return Archived(b.header, b.txs, b.withdrawals, receipts, rlp.len());
+  }
+
+  /** The canonical block at `n`: held in memory, about to be written, or written; null if none. */
+  U256? canonicalAt(this, U256 n) {
+    U256? h = this.canonical.get(n);
+    if (h is not null || this.db is null) { return h; }
+    h = this.persisting.canonical.get(n);
+    if (h is not null) { return h; }
+    u8[]? v = this.db!.store.getNow(canonicalKey(n.low()));
+    return v is null ? null : U256.fromBytes(v!, 0, 32);
+  }
+
+  /** Where a canonical transaction is: held in memory, about to be written, or written. */
+  TxAt? txAt(this, U256 hash) {
+    TxAt? t = this.txIndex.get(hash);
+    if (t is not null || this.db is null) { return t; }
+    t = this.persisting.txs.get(hash);
+    if (t is not null) { return t; }
+    u8[]? v = this.db!.store.getNow(txKey(hash));
+    return v is null ? null : TxAt(U256.fromBytes(v!, 0, 32), placeIndex(v!));
+  }
+
   /** A canonical block's header by number, or any kept block's by hash, from the archive. */
   Header? headerByNumber(this, u64 n) {
-    U256? h = this.canonical.get(U256.ofU64(n));
+    U256? h = this.canonicalAt(U256.ofU64(n));
     if (h is null || U256.ofU64(n).gt(this.blocks.get(this.head)!.header.number)) { return null; }
-    Archived? a = this.archive.get(h!);
+    Archived? a = this.archived(h!);
     return a is null ? null : a!.header;
   }
 
   Header? headerByHash(this, U256 hash) {
-    Archived? a = this.archive.get(hash);
+    Archived? a = this.archived(hash);
     return a is null ? null : a!.header;
   }
 
   /** A block's body as eth's BlockBodies carries it — [transactions, ommers, withdrawals] — or null. */
   Item? bodyItem(this, U256 hash) {
-    Archived? a = this.archive.get(hash);
+    Archived? a = this.archived(hash);
     if (a is null) { return null; }
     Item[] ws = Item[].filled(a!.withdrawals.len(), Item.Bytes(u8[].filled(0, 0)));
     for (i32 i = 0; i < ws.len(); i++) {
@@ -1193,7 +1900,7 @@ export struct Engine {
 
   /** A block's receipts as eth/69 carries them — [type, status, cumulative gas, logs] each, no bloom — or null. */
   Item? receiptsItem(this, U256 hash) {
-    Archived? a = this.archive.get(hash);
+    Archived? a = this.archived(hash);
     if (a is null) { return null; }
     Item[] rs = Item[].filled(a!.receipts.len(), Item.Bytes(u8[].filled(0, 0)));
     for (i32 i = 0; i < rs.len(); i++) {
@@ -1208,6 +1915,45 @@ export struct Engine {
                          Item.Bytes(u256Bytes(U256.ofU64(r.cumulativeGasUsed as@ u64))), Item.List(logs)]);
     }
     return Item.List(rs);
+  }
+
+  /**
+   * The block whose state the store holds, read from the store — its commit kept the block, its receipts and its
+   * undo record (`withBlock`) — and adopted, before the log's replay runs anything: the engine is then where the
+   * store is from the start. Without it, a block of the log above the store's that came before the store's own
+   * block in the log (a side chain imported after the main chain's later blocks, then a reorg to it stopped
+   * part way) ran on a store the engine thought was elsewhere, failed, and the chain after it was lost. Its
+   * parent may not be known yet; the log adopts the ancestors before anything moves across them.
+   */
+  async bool adoptFromStore(this) {
+    if (this.db is null || this.restoredAt is null || this.blocks.has(this.restoredAt!)) { return false; }
+    u8[]? raw = await this.db!.store.chunks(blockKey(this.restoredAt!));
+    if (raw is null) { return false; }
+    Spec spec = this.config.specAt(blockTimestamp(raw!));
+    BlockDecode bd = decodeBlock(spec, raw!);
+    if (bd.block is null || !bd.block!.header.hash.eq(this.restoredAt!)) { return false; }
+    Block b = bd.block!;
+    this.adopt(spec, b);
+    await this.loadUndo(b.header);
+    u8[]? kept = await this.db!.store.chunks(receiptsKey(b.header.hash));
+    Archived? a = this.archive.get(b.header.hash);
+    if (kept is not null && a is not null) { a!.receipts = receiptsOf(kept!); }
+    return true;
+  }
+
+  /**
+   * After the log's replay: the store's block recorded for the log when the log never got it — a stop after the
+   * store's commit and before the log's write. Without it the engine had no block for the state it was at, and
+   * the payload given again was SYNCING for good. True when it was missing.
+   */
+  async bool adoptStored(this) {
+    await this.adoptFromStore();
+    if (this.restoredAt is null || this.restoredLogged || !this.blocks.has(this.restoredAt!)) { return false; }
+    u8[]? raw = await this.db!.store.chunks(blockKey(this.restoredAt!));
+    if (raw is null) { return false; }
+    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(raw!)])));
+    this.restoredLogged = true;
+    return true;
   }
 
   /** The head's header. */
@@ -1230,6 +1976,8 @@ export struct Engine {
    * each account [address, nonce, balance, code, [[slot, value]…]]. Null when the world cannot reach it.
    */
   u8[]? snapshot(this) {
+    // On the store, the store is the snapshot.
+    if (this.db is not null) { return null; }
     Node? f = this.blocks.get(this.finalized);
     if (f is null || !this.moveTo(this.finalized)) { return null; }
     World w = this.world;
@@ -1358,11 +2106,54 @@ JsonValue forkchoiceResult(JsonValue payloadStatus) {
   return JsonValue.Object(o);
 }
 
+/**
+ * `engine_getClientVersionV1`: this client, one entry. The code is two letters the spec's table does not list (it
+ * names the clients it knows); the commit is not known to a build, so it is zero, as the spec allows for "unknown".
+ */
+JsonValue clientVersion() {
+  JsonObject o = JsonObject.create();
+  o.push("code".toBytes(), str("WA"));
+  o.push("name".toBytes(), str("wacuum"));
+  o.push("version".toBytes(), str("v0.1.0"));
+  o.push("commit".toBytes(), str("0x00000000"));
+  JsonArray a = JsonArray.create();
+  a.push(JsonValue.Object(o));
+  return JsonValue.Array(a);
+}
+
+/** A block's ExecutionPayloadBodyV1: its transactions as their raw bytes, and its withdrawals. */
+JsonValue payloadBody(Archived a) {
+  JsonArray txs = JsonArray.create();
+  for (i32 i = 0; i < a.txs.len(); i++) {
+    // A typed transaction is its bytes; a legacy one is a list, whose encoding is its bytes.
+    txs.push(str(bytesToHex(isList(a.txs[i]) ? encode(a.txs[i]) : bytesOf(a.txs[i]))));
+  }
+  JsonArray ws = JsonArray.create();
+  for (i32 i = 0; i < a.withdrawals.len(); i++) {
+    Withdrawal wd = a.withdrawals[i];
+    JsonObject o = JsonObject.create();
+    o.push("index".toBytes(), str(wd.index.toHex()));
+    o.push("validatorIndex".toBytes(), str(wd.validator.toHex()));
+    o.push("address".toBytes(), str(bytesToHex(addressBytes(wd.address))));
+    o.push("amount".toBytes(), str(wd.amount.toHex()));
+    ws.push(JsonValue.Object(o));
+  }
+  JsonObject b = JsonObject.create();
+  b.push("transactions".toBytes(), JsonValue.Array(txs));
+  // Every fork this client runs is after Shanghai, so a block always has a withdrawals list, if an empty one.
+  b.push("withdrawals".toBytes(), JsonValue.Array(ws));
+  return JsonValue.Object(b);
+}
+
+/** The most bodies one request may ask for (the spec's lower bound on what a client must serve). */
+static i32 MAX_BODIES = 1024;
+
 JsonValue capabilities() {
   string[] names = ["engine_newPayloadV1", "engine_newPayloadV2", "engine_newPayloadV3", "engine_newPayloadV4",
                     "engine_forkchoiceUpdatedV1", "engine_forkchoiceUpdatedV2", "engine_forkchoiceUpdatedV3",
                     "engine_getPayloadV3", "engine_getPayloadV4", "engine_getPayloadV5", "engine_getBlobsV1",
-                    "engine_getBlobsV2"];
+                    "engine_getBlobsV2", "engine_getPayloadBodiesByHashV1", "engine_getPayloadBodiesByRangeV1",
+                    "engine_getClientVersionV1"];
   JsonArray a = JsonArray.create();
   for (i32 i = 0; i < names.len(); i++) { a.push(str(names[i])); }
   return JsonValue.Array(a);

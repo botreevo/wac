@@ -1,0 +1,60 @@
+// wacuum against the reference, on a running pair (deploy/hoodi): every minute, wacuum's head, and the reference's
+// block at the same height, compared by hash and state root. One line each time, appended to FILE (- for stdout):
+//
+//     N same 0xHASH             wacuum is at N, and so is the reference
+//     N DIFFERS ours 0x… theirs 0x… (state root ours 0x… theirs 0x…)
+//     N behind M                the reference has M, wacuum is still at N (syncing, or stuck if it stays)
+//     N ahead of the reference at M
+//     no answer from wacuum|the reference
+//
+//     wac run --allow-net --allow-read --allow-write tools/hoodi/compare.wac -- FILE|- [WACUUM_PORT] [REFERENCE_PORT]
+//
+// The ports default to deploy/hoodi's: wacuum's RPC on 8552, geth's on 8545, both on 127.0.0.1.
+
+import { Sys } from "std";
+import { json.JsonValue } from "wac";
+import { Rpc, field, quantity } from "../e2e/kit.wac";
+
+i32 port(string[] a, i32 at, i32 fallback) {
+  if (a.len() <= at) { return fallback; }
+  u8[] b = a[at].toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + ((b[i] as i32) - 48); }
+  return n;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  string file = a.len() > 0 && a[0] != "-" ? a[0] : "";
+  Rpc ours = Rpc.at(sys, port(a, 1, 8552));
+  Rpc theirs = Rpc.at(sys, port(a, 2, 8545));
+  while (true) {
+    string line = await check(ours, theirs);
+    if (file == "") {
+      sys.log(line);
+    } else {
+      string before = string.fromBytes((await sys.readFile(file)).orElse(u8[].filled(0, 0)));
+      await sys.writeFile(file, (before + line + "\n").toBytes());
+    }
+    await sys.sleepMillis(60000);
+  }
+  return 0;
+}
+
+async string check(Rpc ours, Rpc theirs) {
+  JsonValue? head = await ours.get("eth_getBlockByNumber", "[\"latest\",false]");
+  if (head is null) { return "no answer from wacuum"; }
+  string n = field(head, "number");
+  JsonValue? same = await theirs.get("eth_getBlockByNumber", "[\"\{n}\",false]");
+  if (same is null) {
+    JsonValue? top = await theirs.get("eth_getBlockByNumber", "[\"latest\",false]");
+    if (top is null) { return "no answer from the reference"; }
+    return "\{quantity(n)} ahead of the reference at \{quantity(field(top, "number"))}";
+  }
+  JsonValue? top = await theirs.get("eth_getBlockByNumber", "[\"latest\",false]");
+  u64 theirsTop = top is null ? 0 : quantity(field(top, "number"));
+  if (field(head, "hash") == field(same, "hash")) {
+    return theirsTop > quantity(n) + 2 ? "\{quantity(n)} behind \{theirsTop}" : "\{quantity(n)} same \{field(head, "hash")}";
+  }
+  return "\{quantity(n)} DIFFERS ours \{field(head, "hash")} theirs \{field(same, "hash")} (state root ours \{field(head, "stateRoot")} theirs \{field(same, "stateRoot")})";
+}

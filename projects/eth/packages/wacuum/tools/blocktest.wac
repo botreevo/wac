@@ -18,7 +18,11 @@ import { bytesToHex } from "../src/hex.wac";
 import { World, hashU256, eqU256 } from "../src/state/world.wac";
 import { stateRoot } from "../src/state/root.wac";
 import { Spec, ChainConfig } from "../src/evm/spec.wac";
-import { Header, Block, BlockDecode, headerOf, decodeBlock, applyBlock, blockTimestamp, timestampOf } from "../src/chain/block.wac";
+import { Store } from "../src/store/tree.wac";
+import { MemDisk } from "../src/store/disk.wac";
+import { StateDb, rootOf } from "../src/store/state.wac";
+import { executeFrom, Steps } from "../src/store/exec.wac";
+import { Header, Block, BlockDecode, Body, headerOf, decodeBlock, applyBlock, executeBlock, blockTimestamp, timestampOf } from "../src/chain/block.wac";
 import { num, bytes, worldFrom, diffState, configOf } from "./fixture.wac";
 
 struct Tally {
@@ -27,6 +31,9 @@ struct Tally {
   bool verbose;
   string fork;
   string filter;
+  /** Every account and slot read from a store rather than held: see `runCold`. */
+  bool cold;
+  Steps steps;
 }
 
 /** One test; "" when it passes, otherwise why not. */
@@ -77,12 +84,80 @@ string runTest(Sys sys, Tally tally, ChainConfig chain, JsonValue test) {
   return "";
 }
 
+/**
+ * The test with its state in a store (on a disk in memory) and nothing held: each block run on a world
+ * backed by the store a step at a time, a step that missed something undone and run again once it is read
+ * (`executeFrom`); a block valid but for the state root (which a
+ * world holding part of the state cannot compute) has its changes committed and the root computed from the
+ * store, and is refused, the store put back, if that is not the header's. Awaited from `main` rather than
+ * driven with `wait()`, which keeps every call alive (wac 0473w).
+ */
+async string runCold(Tally tally, ChainConfig chain, JsonValue test) {
+  MemDisk md = MemDisk.create();
+  Store s = (await Store.open(md.disk())).unwrap();
+  string[] why = [""];
+  u8[]? seeded = (await StateDb.over(s).seed(worldFrom(test.member("pre")!), u8[].filled(0, 0), why));
+  if (seeded is null) { return "the pre-state did not commit: \{why[0]}"; }
+  U256 chainId = chain.chainId;
+  Decoded g = decode(bytes(test.member("genesisRLP")));
+  if (!g.ok || !isList(g.item)) { return "genesis RLP does not decode"; }
+  Header? genesis = headerOf(chain.specAt(timestampOf(itemsOf(g.item)[0])), itemsOf(g.item)[0], why);
+  if (genesis is null) { return "genesis header: " + why[0]; }
+  if (!U256.fromBytes(seeded!, 0, 32).eq(genesis!.stateRoot)) { return "the stored pre-state does not hash to the genesis state root"; }
+
+  Header head = genesis!;
+  Map<U256, U256> hashes = Map.create(hashU256, eqU256);
+  hashes.set(head.number, head.hash);
+  JsonArray blocks = test.member("blocks")!.array()!;
+  for (i32 i = 0; i < blocks.len(); i++) {
+    JsonValue b = blocks.get(i);
+    bool expectInvalid = b.member("expectException") is not null;
+    u8[] raw = bytes(b.member("rlp"));
+    Spec spec = chain.specAt(blockTimestamp(raw));
+    BlockDecode d = decodeBlock(spec, raw);
+    string err = d.error;
+    if (err == "") {
+      Block blk = d.block!;
+      StateDb db = StateDb.over(s);
+      World w = World.create();
+      w.backBy(db.source());
+      w.record();
+      Body r0 = await executeFrom(db, w, spec, blk, head, chainId, hashes, null, tally.steps);
+      Body? r = r0;
+      err = r!.error;
+      if (err == "" || err == "state root does not match") {
+        MemDisk before = md.copy();
+        u8[]? root = (await db.flush(w.seal(), u8[].filled(0, 0), why));
+        if (root is null) { return "block \{i + 1}: committing: \{why[0]}"; }
+        // The tries the store keeps against the flat entries alone.
+        if (bytesToHex(await rootOf(s)) != bytesToHex(root!)) { return "block \{i + 1}: the stored tries and the entries disagree"; }
+        err = U256.fromBytes(root!, 0, 32).eq(blk.header.stateRoot) ? "" : "state root does not match";
+        if (err != "") {
+          md = before;
+          s = (await Store.open(md.disk())).unwrap();
+        }
+      }
+      if (err == "") {
+        if (expectInvalid) { return "block \{i + 1} was accepted; the fixture expects it refused"; }
+        head = blk.header;
+        hashes.set(head.number, head.hash);
+        continue;
+      }
+    }
+    if (!expectInvalid) { return "block \{i + 1} refused: \{err}"; }
+  }
+  string want = test.member("lastblockhash")!.text()!;
+  if (head.hash.toHex() != U256.fromHex(want)!.toHex()) { return "the chain ends at \{head.hash.toHex()}, want \{want}"; }
+  return "";
+}
+
 export async i32 main(Sys sys) {
   string[] args = sys.args();
-  Tally tally = Tally(0, 0, false, "Cancun", "");
+  Tally tally = Tally(0, 0, false, "Cancun", "", false, Steps(0, 0));
   for (i32 a = 0; a < args.len(); a++) {
     string arg = args[a];
     if (arg == "--verbose") { tally.verbose = true; continue; }
+    if (arg == "--cold") { tally.cold = true; continue; }
     if (arg == "--fork") { a++; tally.fork = args[a]; continue; }
     if (arg == "--filter") { a++; tally.filter = args[a]; continue; }
     match (await sys.readFile(arg)) {
@@ -99,7 +174,7 @@ export async i32 main(Sys sys) {
               if ((test.member("network")!.text() ?? "") != tally.fork) { continue; }
               ChainConfig? chain = configOf(test);
               if (chain is null) { continue; }
-              string why = runTest(sys, tally, chain!, test);
+              string why = tally.cold ? await runCold(tally, chain!, test) : runTest(sys, tally, chain!, test);
               if (why == "") {
                 tally.passed++;
               } else {
@@ -112,6 +187,6 @@ export async i32 main(Sys sys) {
       }
     }
   }
-  sys.log("\{tally.passed} passed, \{tally.failed} failed");
+  sys.log("\{tally.passed} passed, \{tally.failed} failed" + (tally.cold ? ", cold, \{tally.steps.steps} steps of which \{tally.steps.reruns} again" : ""));
   return tally.failed == 0 ? 0 : 1;
 }

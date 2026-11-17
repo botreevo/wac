@@ -94,16 +94,16 @@ export u8[] httpResponse(i32 code, string reason, u8[] body) {
  * every method but the Engine API's own: a wallet or a library reads the chain and sends transactions that
  * way, and only the consensus client, which holds the secret, steers it.
  */
-export u8[] answerHttp(Engine e, HttpRequest r, u8[] secret, i64 nowSeconds, bool publicRpc) {
+export async u8[] answerHttp(Engine e, HttpRequest r, u8[] secret, i64 nowSeconds, bool publicRpc) {
   string auth = r.authorization;
-  if (auth == "" && publicRpc) { return httpResponse(200, "OK", answerRpc(e, r.body, false)); }
+  if (auth == "" && publicRpc) { return httpResponse(200, "OK", await answerRpcOn(e, r.body, false)); }
   if (auth.indexOf("Bearer ") != 0) { return httpResponse(401, "Unauthorized", "{\"error\":\"missing bearer token\"}".toBytes()); }
   string why = checkJwt(auth.slice(7, auth.len()), secret, nowSeconds);
   if (why != "") { return httpResponse(401, "Unauthorized", ("{\"error\":\"" + why + "\"}").toBytes()); }
-  return httpResponse(200, "OK", answerRpc(e, r.body, true));
+  return httpResponse(200, "OK", await answerRpcOn(e, r.body, true));
 }
 
-/** A JSON-RPC response body: one answer, or an array of them for a batch. */
+/** A JSON-RPC response body: one answer, or an array of them for a batch. For an engine not on a store. */
 export u8[] answerRpc(Engine e, u8[] body, bool engine) {
   JsonValue? doc = parse(body).ok();
   if (doc is null) { return stringify(rpcError(JsonValue.Null, -32700, "parse error")); }
@@ -114,12 +114,36 @@ export u8[] answerRpc(Engine e, u8[] body, bool engine) {
   return stringify(JsonValue.Array(out));
 }
 
+/** `answerRpc` for any engine: each request prepared first, which on a store reads what it needs (`Engine.prepare`). */
+export async u8[] answerRpcOn(Engine e, u8[] body, bool engine) {
+  JsonValue? doc = parse(body).ok();
+  if (doc is null) { return stringify(rpcError(JsonValue.Null, -32700, "parse error")); }
+  JsonArray? batch = doc!.array();
+  if (batch is null) {
+    await prepareOne(e, doc!, engine);
+    return stringify(one(e, doc!, engine));
+  }
+  JsonArray out = JsonArray.create();
+  for (i32 i = 0; i < batch!.len(); i++) {
+    await prepareOne(e, batch!.get(i), engine);
+    out.push(one(e, batch!.get(i), engine));
+  }
+  return stringify(JsonValue.Array(out));
+}
+
+async void prepareOne(Engine e, JsonValue req, bool engine) {
+  string? method = req.member("method")?.text();
+  if (method is null || (!engine && method!.indexOf("engine_") == 0)) { return; }
+  await e.prepare(method!, req.member("params") ?? JsonValue.Array(JsonArray.create()));
+}
+
 JsonValue one(Engine e, JsonValue req, bool engine) {
   JsonValue id = req.member("id") ?? JsonValue.Null;
   string? method = req.member("method")?.text();
   if (method is null) { return rpcError(id, -32600, "invalid request"); }
   if (!engine && method!.indexOf("engine_") == 0) { return rpcError(id, -32601, "the Engine API needs a token"); }
-  Answer a = e.call(method!, req.member("params") ?? JsonValue.Array(JsonArray.create()));
+  JsonValue params = req.member("params") ?? JsonValue.Array(JsonArray.create());
+  Answer a = e.call(method!, params);
   if (a.result is null) { return rpcErrorWith(id, a.code, a.message, a.data); }
   JsonObject o = JsonObject.create();
   o.push("jsonrpc".toBytes(), JsonValue.Str("2.0".toBytes()));

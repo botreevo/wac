@@ -1,0 +1,118 @@
+// engine_getPayloadBodiesByHashV1 and ByRangeV1, which a consensus client asks when it backfills or serves blocks by
+// range from its own database without their bodies; and engine_getClientVersionV1. Three blocks, the second with a
+// transfer: each body is the block's raw transactions and its withdrawals, null for a block not known, nothing past
+// the head; and the limits the spec sets on what may be asked.
+
+import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { U256 } from "../src/u256.wac";
+import { Engine, Answer } from "../src/engine/engine.wac";
+import { engineFor, str, one } from "./chainkit.wac";
+import { Check } from "./check.wac";
+
+/** A transfer of 1 wei from the funded account to 0x22…22, nonce 0, signed by ethers for chain 1. */
+static string TRANSFER =
+  "0x02f8670180018502540be4008252089422222222222222222222222222222222222222220180c001a05065635dbb8c9d50fec33bf0408fea1b5189ca6e03c73d849e88abb36fc1d562a0409e0bc47f86ff65c69e434559d8ae00973f4822a2ce6917fa26b3897104e821";
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+Answer forkchoice(Engine e, U256 head, JsonValue attrs) {
+  JsonObject st = JsonObject.create();
+  st.push("headBlockHash".toBytes(), str(head.toHex()));
+  st.push("safeBlockHash".toBytes(), str(ZERO));
+  st.push("finalizedBlockHash".toBytes(), str(ZERO));
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Object(st));
+  ps.push(attrs);
+  return e.call("engine_forkchoiceUpdatedV3", JsonValue.Array(ps));
+}
+
+/** A block built on the head, with a withdrawal, imported and made the head; its hash. */
+U256 grow(Check t, Engine e, i32 time) {
+  JsonObject w = JsonObject.create();
+  w.push("index".toBytes(), str(U256.ofI32(time).toHex()));
+  w.push("validatorIndex".toBytes(), str("0x7"));
+  w.push("address".toBytes(), str("0x3333333333333333333333333333333333333333"));
+  w.push("amount".toBytes(), str("0x64"));
+  JsonArray ws = JsonArray.create();
+  ws.push(JsonValue.Object(w));
+  JsonObject attrs = JsonObject.create();
+  attrs.push("timestamp".toBytes(), str(U256.ofI32(time).toHex()));
+  attrs.push("prevRandao".toBytes(), str(ZERO));
+  attrs.push("suggestedFeeRecipient".toBytes(), str("0x00000000000000000000000000000000000000aa"));
+  attrs.push("withdrawals".toBytes(), JsonValue.Array(ws));
+  attrs.push("parentBeaconBlockRoot".toBytes(), str(ZERO));
+  JsonValue? id = forkchoice(e, e.head, JsonValue.Object(attrs)).result?.member("payloadId");
+  if (id is null || id!.isNull()) {
+    t.fail("no payload at \{time}");
+    return U256.zero();
+  }
+  Answer g = e.call("engine_getPayloadV4", one(id!));
+  JsonValue payload = g.result!.member("executionPayload")!;
+  JsonArray np = JsonArray.create();
+  np.push(payload);
+  np.push(JsonValue.Array(JsonArray.create()));
+  np.push(str(ZERO));
+  np.push(g.result!.member("executionRequests")!);
+  t.eqStr(e.call("engine_newPayloadV4", JsonValue.Array(np)).result?.member("status")?.text() ?? "", "VALID", "block at \{time} imports");
+  U256 hash = U256.fromHex(payload.member("blockHash")!.text()!)!;
+  forkchoice(e, hash, JsonValue.Null);
+  return hash;
+}
+
+JsonValue range(i32 start, i32 count) {
+  JsonArray ps = JsonArray.create();
+  ps.push(str(U256.ofI32(start).toHex()));
+  ps.push(str(U256.ofI32(count).toHex()));
+  return JsonValue.Array(ps);
+}
+
+i32 lenOf(Answer a) { return a.result?.array()?.len() ?? -1; }
+
+export string test_payload_bodies_by_hash_and_by_range() {
+  Check t = Check.create();
+  Engine e = engineFor("\"cancunTime\": 0, \"pragueTime\": 0")!;
+  U256 b1 = grow(t, e, 12);
+  e.call("eth_sendRawTransaction", one(str(TRANSFER)));
+  U256 b2 = grow(t, e, 24);
+  U256 b3 = grow(t, e, 36);
+
+  JsonArray hs = JsonArray.create();
+  hs.push(str(b2.toHex()));
+  // Not the zero hash: the genesis this test kit makes has that hash, its header never hashed.
+  hs.push(str("0x1111111111111111111111111111111111111111111111111111111111111111"));
+  hs.push(str(b1.toHex()));
+  Answer byHash = e.call("engine_getPayloadBodiesByHashV1", one(JsonValue.Array(hs)));
+  t.ok(lenOf(byHash) == 3, "one answer a hash asked, in order: \{byHash.message}");
+  JsonValue second = byHash.result!.array()!.get(0);
+  JsonArray txs = second.member("transactions")!.array()!;
+  t.ok(txs.len() == 1 && (txs.get(0).text() ?? "") == TRANSFER, "block 2's transfer, as the bytes that were sent");
+  JsonArray w2 = second.member("withdrawals")!.array()!;
+  t.ok(w2.len() == 1 && (w2.get(0).member("index")?.text() ?? "") == "0x18" && (w2.get(0).member("amount")?.text() ?? "") == "0x64",
+       "and its withdrawal");
+  t.ok(byHash.result!.array()!.get(1).isNull(), "null for a block not known");
+  t.ok(byHash.result!.array()!.get(2).member("transactions")!.array()!.len() == 0, "block 1, empty");
+
+  Answer all = e.call("engine_getPayloadBodiesByRangeV1", range(1, 3));
+  t.ok(lenOf(all) == 3, "blocks 1 to 3 by range");
+  t.ok(all.result!.array()!.get(1).member("transactions")!.array()!.len() == 1, "the second with its transfer");
+  t.ok(lenOf(e.call("engine_getPayloadBodiesByRangeV1", range(2, 10))) == 2, "nothing past the head: blocks 2 and 3 of 10 asked");
+  t.ok(lenOf(e.call("engine_getPayloadBodiesByRangeV1", range(9, 2))) == 0, "an empty list for a range wholly past it");
+  t.ok(e.call("engine_getPayloadBodiesByRangeV1", range(1, 1025)).code == -38004, "more than 1024 is too large a request");
+  t.ok(e.call("engine_getPayloadBodiesByRangeV1", range(0, 1)).code == -32602, "a start of 0 is refused");
+  t.ok(e.call("engine_getPayloadBodiesByRangeV1", range(1, 0)).code == -32602, "and a count of 0");
+
+  JsonObject me = JsonObject.create();
+  me.push("code".toBytes(), str("LH"));
+  me.push("name".toBytes(), str("Lighthouse"));
+  me.push("version".toBytes(), str("v8.3.3"));
+  me.push("commit".toBytes(), str("0x12345678"));
+  Answer v = e.call("engine_getClientVersionV1", one(JsonValue.Object(me)));
+  t.ok(lenOf(v) == 1 && (v.result!.array()!.get(0).member("name")?.text() ?? "") == "wacuum", "engine_getClientVersionV1 names this client");
+  JsonArray caps = e.call("engine_exchangeCapabilities", one(JsonValue.Array(JsonArray.create()))).result!.array()!;
+  i32 found = 0;
+  for (i32 i = 0; i < caps.len(); i++) {
+    string c = caps.get(i).text() ?? "";
+    if (c == "engine_getPayloadBodiesByHashV1" || c == "engine_getPayloadBodiesByRangeV1" || c == "engine_getClientVersionV1") { found++; }
+  }
+  t.ok(found == 3, "and all three are in the capabilities");
+  return t.report();
+}

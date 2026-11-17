@@ -1,0 +1,158 @@
+// Memory over a long run on the store: wacuum, with --store on a fresh chain, is made to build and import
+// block after block — as a consensus client would, through the Engine API — each one writing a few hundred
+// new slots and funding a new account, so the state on disk grows all the while. The node runs under a tight
+// heap (`wac --max-heap`), so what it keeps in memory between blocks must be bounded — the store's leaves and
+// cache, the history it holds — or it runs out and the next block is not made: a leak fails the run outright.
+// Resident memory is printed as it goes, for whoever reads the log.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/soak.wac [BLOCKS] [HEAP]
+//
+// BLOCKS defaults to 2400 (about 1.2 million slots), HEAP to 256m, and the store's cache is held to 32 MB.
+// Before 2026-11-13 the node grew ~0.75 MB a block (it kept every slot it had read, decoded, and the store
+// every leaf it had written, and every payload built): under this cap it would stop within a few hundred.
+// Needs the `wac` on PATH to be one that takes --max-heap (wac 78121eefb or later, on the V8 host).
+
+import { Sys } from "std";
+import { json.JsonValue, json.stringify } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { systemContracts } from "../../src/chain/dev.wac";
+import { Check, Proc, Rpc, shell, tempDir, removeDir, somePort, addressOf, createAddress, type2, field, trim } from "./kit.wac";
+
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+/** New slots each call writes: two calls a block, each at its own offset. */
+static i32 SLOTS = 250;
+static i64 CACHE_MB = 32;
+
+struct Chain {
+  Rpc engine;
+  Rpc user;
+  string head;
+  u64 time;
+}
+
+/** One block: built from the mempool, imported, made head and final. False if any step fails. */
+async bool makeBlock(Chain c) {
+  string fc = "{\"headBlockHash\":\"\{c.head}\",\"safeBlockHash\":\"\{c.head}\",\"finalizedBlockHash\":\"\{ZERO}\"}";
+  string attrs = "{\"timestamp\":\"\{U256.ofU64(c.time).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                 "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fe\",\"withdrawals\":[],\"parentBeaconBlockRoot\":\"\{ZERO}\"}";
+  c.time += 12;
+  string id = field(await c.engine.get("engine_forkchoiceUpdatedV3", "[\{fc},\{attrs}]"), "payloadId");
+  JsonValue? p = (await c.engine.call("engine_getPayloadV4", "[\"\{id}\"]")).result();
+  if (p is null) { return false; }
+  JsonValue payload = p!.member("executionPayload")!;
+  string requests = string.fromBytes(stringify(p!.member("executionRequests")!));
+  string st = field(await c.engine.get("engine_newPayloadV4", "[\{string.fromBytes(stringify(payload))},[],\"\{ZERO}\",\{requests}]"), "status");
+  if (st != "VALID") { return false; }
+  string h = field(payload, "blockHash");
+  await c.engine.get("engine_forkchoiceUpdatedV3", "[{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{h}\"},null]");
+  c.head = h;
+  return true;
+}
+
+/**
+ * The contract each block calls twice: SLOTS slots written, at NUMBER × 2·SLOTS + the calldata's first word
+ * + i for i from SLOTS down to 1, each to NUMBER — every one new.
+ */
+string runtime() {
+  string k = bytesToHex([((SLOTS >> 8) & 255) as! u8, (SLOTS & 255) as! u8]).slice(2, 6);
+  string k2 = bytesToHex([(((2 * SLOTS) >> 8) & 255) as! u8, ((2 * SLOTS) & 255) as! u8]).slice(2, 6);
+  return "61" + k + "5b" + "80" + "15" + "61001e" + "57" + "43" + "81" + "600035" + "01" + "43" + "61" + k2 + "02" + "01" + "55" +
+         "600190" + "03" + "600356" + "5b00";
+}
+
+/** Resident memory of `pid` and its children, in MB. */
+async i64 residentMb(Sys sys, string pid) {
+  string kb = trim(await shell(sys, "for p in \{pid} $(pgrep -P \{pid}); do grep VmRSS /proc/$p/status 2>/dev/null; done | awk '{s+=$2} END {print s+0}'"));
+  return parse(kb) / 1024;
+}
+
+async i64 fileMb(Sys sys, string path) { return parse(trim(await shell(sys, "stat -c %s \{path} 2>/dev/null || echo 0"))) / (1024 * 1024); }
+
+i64 parse(string s) {
+  u8[] b = s.toBytes();
+  i64 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] >= 48 && b[i] <= 57) { n = n * 10 + ((b[i] - 48) as i64); }
+  }
+  return n;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  i32 blocks = args.len() > 0 ? (parse(args[0]) as! i32) : 2400;
+  string heap = args.len() > 1 ? args[1] : "256m";
+  Check t = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-soak");
+  u8[] key = u8[].filled(32, 0x11);
+  string me = addressOf(key);
+  string genesis = "{\"config\":{\"chainId\":1337,\"cancunTime\":0,\"pragueTime\":0},\"gasLimit\":\"0x2faf080\"," +
+                   "\"baseFeePerGas\":\"0x3b9aca00\",\"timestamp\":\"0x0\",\"alloc\":{\"\{me}\":{\"balance\":\"0xd3c21bcecceda1000000\"}," +
+                   systemContracts() + "}}";
+  await sys.writeFile(dir + "/genesis.json", genesis.toBytes());
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+  i32 port = await somePort(sys, 19651, 1000);
+  Proc proc = await Proc.start(sys, ["wac", "--max-heap", heap, "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                                     "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc",
+                                     "--port", "\{port}", "--datadir", dir + "/data", "--store", "--cache-mb", "\{CACHE_MB}"], dir + "/wacuum.log");
+  if (!t.that(await proc.says(sys, "Engine API on", 600000), "wacuum starts on a store")) {
+    sys.warn(await proc.output(sys));
+    return t.done();
+  }
+  Rpc user = Rpc.at(sys, port);
+  Chain c = Chain(Rpc.authed(sys, port, secret), user, field(await user.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash"), 12);
+
+  // The contract, deployed by init code that returns it.
+  string code = runtime();
+  string len = bytesToHex([((code.len() / 2) & 255) as! u8]).slice(2, 4);
+  string init = "60" + len + "600c60003960" + len + "6000f3" + code;
+  await user.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, 0, "", U256.zero(), hexBytes(init), 200000)}\"]");
+  t.that(await makeBlock(c), "the contract is deployed");
+  string contract = createAddress(me, 0);
+  t.that(await user.text("eth_getCode", "[\"\{contract}\",\"latest\"]") == "0x" + code, "with its code");
+
+  u64 nonce = 1;
+  i64 peak = 0;
+  i64 i0 = await sys.monotonicNanos();
+  bool ok = true;
+  for (i32 b = 1; b <= blocks && ok; b++) {
+    for (i32 k = 0; k < 2; k++) {
+      u8[] off = U256.ofU64(((k * SLOTS) as@ u32) as u64).toBytes();
+      await user.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, contract, U256.zero(), off, 7000000)}\"]");
+      nonce++;
+    }
+    // And an account that did not exist.
+    string fresh = bytesToHex(U256.ofU64(0x5000000 + ((b as@ u32) as u64)).toBytes()).slice(26, 66);
+    await user.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, "0x" + fresh, U256.ofU64(1), u8[].filled(0, 0), 21000)}\"]");
+    nonce++;
+    ok = await makeBlock(c);
+    if (b % 50 == 0) {
+      i64 rss = await residentMb(sys, proc.pid);
+      i64 file = await fileMb(sys, dir + "/data/state.db");
+      i64 secs = (await sys.monotonicNanos() - i0) / 1000000000;
+      sys.log("  block \{b}: \{rss} MB resident, store \{file} MB, \{secs} s");
+      if (b % 300 == 0) { sys.log("    " + string.fromBytes(stringify((await user.get("wacuum_sizes", "[]"))!))); }
+      peak = rss > peak ? rss : peak;
+    }
+  }
+  t.that(ok, "wacuum built and imported \{blocks} blocks under a heap of \{heap}");
+  // What the node said last: "ran out of memory" if it was the heap.
+  if (!ok) { sys.warn(trim(await shell(sys, "tail -5 \{dir}/wacuum.log"))); }
+  string slotAt = "[\"\{contract}\",\"\{U256.ofU64(((blocks as@ u32) as u64) * 2 * ((SLOTS as@ u32) as u64) + 1).toHex()}\",\"latest\"]";
+  t.that(await user.text("eth_getStorageAt", slotAt) == bytesToHex(U256.ofU64((blocks as@ u32) as u64).toBytes()), "and the last block's slots are there");
+  i64 lateFile = await fileMb(sys, dir + "/data/state.db");
+  sys.log("  store \{lateFile} MB at the end; resident memory at most \{peak} MB");
+  await proc.stop(sys);
+  await removeDir(sys, dir);
+  return t.done();
+}
+
+u8[] hexBytes(string h) {
+  u8[] out = u8[].filled(h.len() / 2, 0);
+  u8[] d = h.toBytes();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ((nibble(d[2 * i]) << 4) | nibble(d[2 * i + 1])) as! u8; }
+  return out;
+}
+
+i32 nibble(u8 c) { return c >= 97 ? (c as i32) - 87 : (c as i32) - 48; }

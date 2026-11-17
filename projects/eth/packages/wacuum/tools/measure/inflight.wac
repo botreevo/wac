@@ -1,0 +1,85 @@
+// What the host's file reads and writes cost one at a time and with many in flight at once: whether a commit
+// gains by sending its requests together (`Store.prefetch`, `Store.inFlight`), and whether what is left is the
+// host's round trip per request — the case for a vectored read. 16 KB pages, as the store's, at random offsets.
+//
+//     wac run --allow-read --allow-write tools/measure/inflight.wac -- READ_PATH WRITE_PATH
+//
+// READ_PATH is any big file, read only (a store from `scale.wac`; drop the page cache first for the disk's
+// numbers, not the page cache's). WRITE_PATH is made, 256 MB, and written over at random.
+
+import { Sys } from "std";
+import { Ticket, Result, Vec } from "core";
+import { Disk } from "../../src/store/disk.wac";
+import { fileDisk } from "../../src/store/file.wac";
+
+static i32 PAGE = 16384;
+static i32 COUNT = 4000;
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 2) {
+    sys.warn("usage: inflight.wac READ_PATH WRITE_PATH");
+    return 2;
+  }
+  Disk r = (await fileDisk(sys, args[0])).unwrap();
+  i64 pages = (await r.size()).unwrap() / (PAGE as i64);
+  u64 x = 88172645463325252;
+  i32[] depths = [1, 8, 64, 256];
+  sys.log("reads of \{COUNT} random pages of \{pages}:");
+  i64 t0 = await sys.monotonicNanos();
+  for (i32 i = 0; i < COUNT; i++) {
+    x = step(x);
+    r.readNow(((x % (pages as! u64)) as! i64) * (PAGE as i64), PAGE);
+  }
+  i64 t1 = await sys.monotonicNanos();
+  sys.log("  waited where asked (readNow): \{(t1 - t0) / (COUNT as i64) / 1000} us a read");
+  for (i32 d = 0; d < depths.len(); d++) {
+    t0 = await sys.monotonicNanos();
+    Vec<Ticket<Result<u8[], string>>> asked = Vec.create();
+    for (i32 i = 0; i < COUNT; i++) {
+      x = step(x);
+      asked.push(r.read(((x % (pages as! u64)) as! i64) * (PAGE as i64), PAGE));
+      if (asked.len() >= depths[d]) {
+        for (i32 k = 0; k < asked.len(); k++) { await asked.get(k); }
+        asked.clear();
+      }
+    }
+    for (i32 k = 0; k < asked.len(); k++) { await asked.get(k); }
+    t1 = await sys.monotonicNanos();
+    sys.log("  \{depths[d]} in flight: \{(t1 - t0) / (COUNT as i64) / 1000} us a read");
+  }
+
+  Disk w = (await fileDisk(sys, args[1])).unwrap();
+  i64 wpages = (256 * 1024 * 1024) / (PAGE as i64);
+  u8[] page = u8[].filled(PAGE, 7);
+  if ((await w.size()).unwrap() < wpages * (PAGE as i64)) {
+    u8[] block = u8[].filled(1 << 20, 7);
+    for (i64 at = 0; at < wpages * (PAGE as i64); at += 1 << 20) { await w.write(at, block); }
+  }
+  await w.sync();
+  sys.log("writes of \{COUNT} random pages of \{wpages}, then a sync:");
+  for (i32 d = 0; d < depths.len(); d++) {
+    t0 = await sys.monotonicNanos();
+    Vec<Ticket<Result<void, string>>> sent = Vec.create();
+    for (i32 i = 0; i < COUNT; i++) {
+      x = step(x);
+      sent.push(w.write(((x % (wpages as! u64)) as! i64) * (PAGE as i64), page));
+      if (sent.len() >= depths[d]) {
+        for (i32 k = 0; k < sent.len(); k++) { await sent.get(k); }
+        sent.clear();
+      }
+    }
+    for (i32 k = 0; k < sent.len(); k++) { await sent.get(k); }
+    t1 = await sys.monotonicNanos();
+    await w.sync();
+    i64 t2 = await sys.monotonicNanos();
+    sys.log("  \{depths[d]} in flight: \{(t1 - t0) / (COUNT as i64) / 1000} us a write; the sync \{(t2 - t1) / 1000000} ms");
+  }
+  return 0;
+}
+
+u64 step(u64 x) {
+  x = x ^ (x << 13);
+  x = x ^ (x >> 7);
+  return x ^ (x << 17);
+}

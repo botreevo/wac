@@ -4,7 +4,9 @@
 // Then stop it, start it again on the same data directory, and check the state it replayed against the
 // fixture's post-state.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/engine.wac -- FIXTURE.json [TEST-NAME-SUBSTRING]
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/engine.wac -- FIXTURE.json [TEST-NAME-SUBSTRING] [--store]
+//
+// With --store the node keeps its state on disk, and the restart resumes from the store rather than replaying from the genesis.
 
 import { Sys } from "std";
 import { json.parse, json.JsonValue, json.JsonObject, json.stringify } from "wac";
@@ -14,11 +16,13 @@ import { Check, Proc, Rpc, Reply, tempDir, removeDir, somePort, field, number } 
 
 static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
-async Proc startNode(Sys sys, string dir, i32 port) {
-  Proc p = await Proc.start(sys, ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
-                                  "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/data",
-                                  "--port", "\{port}"],
-                            dir + "/wacuum.log");
+async Proc startNode(Sys sys, string dir, i32 port, bool store) {
+  string[] base = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                   "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/data",
+                   "--port", "\{port}"];
+  string[] argv = string[].filled(base.len() + (store ? 1 : 0), "--store");
+  for (i32 i = 0; i < base.len(); i++) { argv[i] = base[i]; }
+  Proc p = await Proc.start(sys, argv, dir + "/wacuum.log");
   await p.says(sys, "Engine API on", 600000);
   return p;
 }
@@ -31,7 +35,10 @@ export async i32 main(Sys sys) {
     sys.warn("usage: tools/e2e/engine.wac FIXTURE.json [TEST-NAME-SUBSTRING]");
     return 2;
   }
-  string filter = args.len() > 1 ? args[1] : "";
+  string filter = args.len() > 1 && args[1] != "--store" ? args[1] : "";
+  // With --store, the node keeps its state on disk (its --store), and the restart resumes from it.
+  bool store = false;
+  for (i32 i = 1; i < args.len(); i++) { store = store || args[i] == "--store"; }
   JsonObject? doc = null;
   match (await sys.readFile(args[0])) {
     Err(e): { sys.warn("\{args[0]}: \{e}"); return 1; }
@@ -64,7 +71,7 @@ export async i32 main(Sys sys) {
   u8[] secret = (await sys.random().bytes(32)).ok()!;
   await sys.writeFile(dir + "/jwt.hex", (bytesToHex(secret) + "\n").toBytes());
   i32 port = await somePort(sys, 18551, 1000);
-  Proc proc = await startNode(sys, dir, port);
+  Proc proc = await startNode(sys, dir, port, store);
   Check c = Check.on(sys);
   if (!c.that((await proc.output(sys)).indexOf("genesis \{field(g, "hash")}") >= 0, "the genesis hash is the fixture's")) {
     await proc.stop(sys);
@@ -100,8 +107,14 @@ export async i32 main(Sys sys) {
 
   // Stop it, and start it again on what it wrote: everything below is answered from the replayed log.
   await proc.stop(sys);
-  proc = await startNode(sys, dir, port);
-  c.that((await proc.output(sys)).indexOf("replayed") >= 0, "the restarted node replayed its log");
+  proc = await startNode(sys, dir, port, store);
+  string said = await proc.output(sys);
+  c.that(said.indexOf("replayed") >= 0, "the restarted node replayed its log");
+  if (store && lastValid != "") {
+    // From the store: the blocks it holds the state of are recorded, not run again.
+    c.that(said.indexOf("the store holds the state of block") >= 0 && said.indexOf("replayed 0 blocks") >= 0,
+           "the restarted node resumed from the store, running nothing again");
+  }
   string n = field((await engine.call("eth_blockNumber", "[]")).body, "result");
   c.that(lastValid == "" || number(n).eq(number(lastValid)), "eth_blockNumber is \{n}");
 

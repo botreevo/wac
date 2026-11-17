@@ -2,6 +2,48 @@
 
 Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
 
+## A 41st field on `Engine` makes a program that imports it fail to check (wac `7f559349c`)
+
+`Engine` had 38 fields. Adding any three more (`Map<U256, U256>` each, nothing else changed) leaves
+`wac check packages/wacuum/src` clean but makes `wac check packages/wacuum-devnet` report *no such field* at
+`packages/wacuum-devnet/src/explorer.wac:83:45`, on `e.call(method, …).result`, where `Answer.result` is
+there. Two more fields are fine; the types do not matter. Worked around by putting the new state in one
+struct-typed field (`Persisting`, `src/engine/engine.wac`). Reported to the coordinator for wac.
+
+## A local declared in a loop of an async function is one object for every pass (wac `issues/lang/0474w`)
+
+`Ticket<bool> t;` inside a `while` that then awaits it gets, on its second pass, the first pass's ticket —
+already settled — so a wait queue built that way spins pushing it (to out of memory) or traps resolving it
+twice. Any struct declared with no initialiser does the same (`D d;` pushed twice is one `D`); a synchronous
+function, or a declaration with an initialiser, does not. Found by the store's read/write gate, whose waits
+take their ticket from a synchronous `parked()` instead (`src/store/tree.wac`); the snap test's server does
+the same.
+
+## An async lambda where wac cannot lower one is sometimes emitted as invalid wasm rather than declined (wac `7f559349c`)
+
+`issues/lang/0294c` says where an `async` lambda is lowered: the initialiser of a `fn<Ticket<…>(…)>`. Given one
+in a nullable field, `struct Holder { fn<Ticket<u8[]>()>? get; }` with `Holder(async () => s.root)`, a small
+program is declined with that explanation. The same in a bigger one — `Asker(..., async () => …)` passed
+for snap's pivot provider in `src/p2p/node.wac` — was not declined: wacc emitted a module V8 refused
+("Compiling function … `$lambda$13`: return[0] expected type (ref null 448), found call of type (ref null 1)"),
+and in the test file, one that trapped. Worked around by making that field synchronous (`fn<u8[]()>?`) and
+doing the asynchronous part in the asker's other lambda, which is a non-nullable field's. Worth a check
+that the decline happens wherever the lowering would not.
+
+## A program holding `fetch` and the client's block types fails to emit (wac `7f559349c`)
+
+`tools/mainnet/` was one program: it asked a node over `fetch` and ran blocks. Built, it stopped at
+`wacc: cannot emit tools/mainnet/replay.wac — a constant whose value is not a constant expression`, with no
+name and no line; `wac check` on the same file finds nothing. Bisected: it needs a struct of this file's
+that holds a `fetch.Caps` *or* has a method calling `fetch`, together with any use of `Header` from
+`src/chain/block.wac` (a local `Header h = g.header;` is enough), with `genesis.wac` in the program. Each of
+those alone builds, and so does a small file with all three, so there is no paste-sized reproduction yet —
+the 0374a family (a static declined inside a method instance) is the likeliest. Worked around by splitting
+the tool: `fetch.wac` talks to the node and never sees a block type, `replay.wac` runs blocks and never
+sees `fetch`, and `replay.sh` alternates them. wac master has `6f6b1d657` (types matched by declaration,
+not spelling), which may be the fix; check on the next pin move, and if not, the message should name the
+constant.
+
 ## The static evaluator: no `switch`, and one step budget for a whole file (wac `issues/lang/0422w`)
 
 Two things met while moving bn254's and secp256k1's constants to compile time:

@@ -2947,8 +2947,8 @@ fn fault_of(e: &std::io::Error) -> i32 {
 /// exited 2 with a diagnostic here while the JavaScript host said plain false, as bash does.
 ///
 /// `FAULT_NOT_A_DIR` rides along without making the `Stat` unanswerable; `platform.wac`'s `Stat.answered`
-/// is the half that makes that safe, and `packages/platform/test/faults_agree.test.ts` holds the two
-/// hosts' rules side by side.
+/// is the half that makes that safe, and `packages/platform/test/faults.test.ts` holds the JavaScript
+/// host's rule for it.
 fn stat_fault(e: &std::io::Error) -> i32 {
     match fault_of(e) {
         FAULT_DENIED => FAULT_DENIED,

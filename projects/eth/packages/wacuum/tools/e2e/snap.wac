@@ -3,7 +3,11 @@
 // the state at that head over snap/1 rather than run the blocks, agree with geth account by account, then
 // take geth's next blocks the ordinary way, and after a restart go on from its store.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/snap.wac -- path/to/geth [--heal] [--peers N]
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/snap.wac -- path/to/geth [--heal] [--peers N] [--shanghai]
+//
+// With --shanghai, the chain's genesis is Shanghai's and Cancun, Prague and Osaka come at time 60 (block 5), as
+// mainnet's genesis is before every fork wacuum runs: wacuum takes the genesis for its hash and fork id, never runs
+// blocks 1 to 4 — geth builds them with the Engine API's V2 methods — and snap-syncs to a head past the fork.
 //
 // With --peers N, N geths serve the state: the first makes the chain and the others follow it, told of its
 // head as a consensus client would tell them; wacuum is given all of them, and splits the state among them.
@@ -20,7 +24,7 @@ import { json.JsonValue, json.stringify } from "wac";
 import { U256 } from "../../src/u256.wac";
 import { bytesToHex } from "../../src/hex.wac";
 import { systemContracts } from "../../src/chain/dev.wac";
-import { Check, Proc, Rpc, shell, quote, tempDir, removeDir, somePort, addressOf, field, quantity, choose, chosen, makeBlocks,
+import { Check, Proc, Rpc, shell, quote, tempDir, removeDir, somePort, addressOf, type2, field, quantity, choose, chosen, makeBlocks,
          TO, ZERO } from "./kit.wac";
 
 /** The address of the `i`th account of the alloc: spread over the key space once hashed. */
@@ -62,24 +66,28 @@ export async i32 main(Sys sys) {
   }
   string geth = args[0];
   bool heal = false;
+  bool shanghai = false;
   i32 count = 1;
   for (i32 i = 1; i < args.len(); i++) {
     if (args[i] == "--heal") { heal = true; }
+    if (args[i] == "--shanghai") { shanghai = true; }
     if (args[i] == "--peers" && i + 1 < args.len()) { count = parseInt(args[i + 1]); }
   }
   Check c = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-snap");
   u8[] key = u8[].filled(32, 0x11);
+  // Cancun, Prague and Osaka at genesis, or (--shanghai) at time 60: block 5.
+  string later = shanghai ? "60" : "0";
   string genesis = "{\"config\":{\"chainId\":1337,\"homesteadBlock\":0,\"eip150Block\":0,\"eip155Block\":0,\"eip158Block\":0," +
     "\"byzantiumBlock\":0,\"constantinopleBlock\":0,\"petersburgBlock\":0,\"istanbulBlock\":0,\"berlinBlock\":0,\"londonBlock\":0," +
-    "\"mergeNetsplitBlock\":0,\"terminalTotalDifficulty\":0,\"shanghaiTime\":0,\"cancunTime\":0,\"pragueTime\":0,\"osakaTime\":0," +
+    "\"mergeNetsplitBlock\":0,\"terminalTotalDifficulty\":0,\"shanghaiTime\":0,\"cancunTime\":\{later},\"pragueTime\":\{later},\"osakaTime\":\{later}," +
     "\"depositContractAddress\":\"0x0000000000000000000000000000000000000000\",\"blobSchedule\":{" +
     "\"cancun\":{\"target\":3,\"max\":6,\"baseFeeUpdateFraction\":3338477}," +
     "\"prague\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716}," +
     "\"osaka\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716}}}," +
     "\"nonce\":\"0x0\",\"timestamp\":\"0x0\",\"extraData\":\"0x\",\"gasLimit\":\"0x1c9c380\",\"difficulty\":\"0x0\"," +
     "\"mixHash\":\"\{ZERO}\",\"coinbase\":\"0x0000000000000000000000000000000000000000\",\"number\":\"0x0\",\"gasUsed\":\"0x0\"," +
-    "\"parentHash\":\"\{ZERO}\",\"baseFeePerGas\":\"0x3b9aca00\",\"excessBlobGas\":\"0x0\",\"blobGasUsed\":\"0x0\"," +
+    "\"parentHash\":\"\{ZERO}\",\"baseFeePerGas\":\"0x3b9aca00\"," + (shanghai ? "" : "\"excessBlobGas\":\"0x0\",\"blobGasUsed\":\"0x0\",") +
     "\"alloc\":{\"\{addressOf(key)}\":{\"balance\":\"0x56bc75e2d63100000\"}," + alloc() + systemContracts() + "}}";
   await sys.writeFile(dir + "/genesis.json", genesis.toBytes());
   u8[] secret = (await sys.random().bytes(32)).ok()!;
@@ -116,12 +124,14 @@ export async i32 main(Sys sys) {
     up = (await gethRpc.call("eth_chainId", "[]")).result() is not null;
     if (!up) { await sys.sleepMillis(200); }
   }
+  if (!up) { sys.warn(await shell(sys, "tail -20 \{quote(dir + "/geth.log")}; cat \{quote(dir + "/genesis.json")} | head -c 600")); }
   if (c.that(up, "geth is up")) {
     string enode = field(await gethRpc.get("admin_nodeInfo", "[]"), "enode");
     wacArgv.push("--peer");
     wacArgv.push(enode);
+    if (shanghai) { c.that(await shanghaiBlocks(sys, gethAuth, gethRpc, key, 4), "geth made four Shanghai blocks before the fork"); }
     JsonValue? gethHead = await makeBlocks(sys, gethAuth, gethRpc, key, 5);
-    c.that(quantity(field(gethHead, "number")) == 5, "geth made five blocks");
+    c.that(quantity(field(gethHead, "number")) == (shanghai ? 9 : 5), "geth made \{shanghai ? "five more, past Cancun" : "five blocks"}");
 
     // The others follow the first: peered with it, and told of its head.
     for (i32 k = 1; k < count; k++) {
@@ -250,6 +260,28 @@ export async i32 main(Sys sys) {
   await gethProc.stop(sys);
   await removeDir(sys, dir);
   return c.done();
+}
+
+/** `n` blocks on geth's head built with the Engine API's Shanghai methods (V2: no blobs, no beacon root, no requests). */
+async bool shanghaiBlocks(Sys sys, Rpc auth, Rpc rpc, u8[] key, i32 n) {
+  for (i32 i = 0; i < n; i++) {
+    JsonValue? head = await rpc.get("eth_getBlockByNumber", "[\"latest\",false]");
+    u64 nonce = quantity(await rpc.text("eth_getTransactionCount", "[\"\{addressOf(key)}\",\"pending\"]"));
+    await rpc.get("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, TO, U256.ofU64(1000 + ((i as@ u32) as u64)), u8[].filled(0, 0), 21000)}\"]");
+    string h = field(head, "hash");
+    string attrs = "{\"timestamp\":\"\{U256.ofU64(quantity(field(head, "timestamp")) + 12).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                   "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fe\",\"withdrawals\":[]}";
+    string id = field(await auth.get("engine_forkchoiceUpdatedV2",
+                                     "[{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{ZERO}\"},\{attrs}]"), "payloadId");
+    await sys.sleepMillis(300);
+    JsonValue? p = await auth.get("engine_getPayloadV2", "[\"\{id}\"]");
+    if (p is null) { return false; }
+    JsonValue payload = p!.member("executionPayload")!;
+    if (field(await auth.get("engine_newPayloadV2", "[\{json(payload)}]"), "status") != "VALID") { return false; }
+    string bh = field(payload, "blockHash");
+    await auth.get("engine_forkchoiceUpdatedV2", "[{\"headBlockHash\":\"\{bh}\",\"safeBlockHash\":\"\{bh}\",\"finalizedBlockHash\":\"\{ZERO}\"},null]");
+  }
+  return true;
 }
 
 i32 occurrences(string s, string of) {

@@ -117,7 +117,10 @@ export i32 main(Sys sys) {
 EOF
 printf 'build\nin/in/capstone.wac\n-o\n/out/capstone\n' > app.args
 build=$($D recipe --program compiler.wasm --args app.args --in app/in $st 2>/dev/null)
+sed -n 's/^signed //p' builder/claims/index 2>/dev/null | sort > signed-before
 set -- $(derive2 "$build"); buildTree=$1; buildWt=$3
+# The blocks of the build's two derivations, as the index names them (for 5c's forgery).
+sed -n 's/^signed //p' builder/claims/index | sort | comm -13 signed-before - > build-signed
 [ "$buildTree" != ENGINES-DIFFER ] && ok "V8 and wasmtime derive the same app ($buildTree)" || bad "the engines built different apps"
 $O cat "$buildTree" out/capstone.wasm $st > capstone.wasm
 # The app's own CID: under 1 MiB, a file is one raw block, so its CID is the raw CID of its bytes; the check below asks
@@ -274,9 +277,10 @@ expect refused "a mirror whose build output tree is not what the derivations nam
 expect refused "a mirror without the reviewer's endorsement of the source" "endorsed by nobody" -- $CL admit "ens:$name" app $A --anchor "$anchor" --store client-5b --mirror mirror-unreviewed
 # 5c. A lying mirror: wasmtime's derivation of the build swapped for other bytes under its name.
 cp -r mirror mirror-lying
-for c in $(sed -n 's/^signed //p' mirror-lying/claims/index); do other=$c; done
-first=$(sed -n 's/^signed //p' mirror-lying/claims/index | head -1)
-cp "mirror-lying/ipfs/$other" "mirror-lying/ipfs/$first"
+# The forged one is one of the app's build's two derivations: under its CID, another statement's bytes.
+forged=$(head -1 build-signed)
+other=$(sed -n 's/^signed //p' mirror-lying/claims/index | grep -v "^$forged$" | tail -1)
+cp "mirror-lying/ipfs/$other" "mirror-lying/ipfs/$forged"
 expect refused "a mirror serving a forged statement: it is left out, and the rest decides" "left out: mirror 0" -- $CL admit "ens:$name" app $A --anchor "$anchor" --store client-5c --mirror mirror-lying
 # 5d. A revoked runner: wasmtime's runner withdraws its derivation of the build, on chain.
 expect ok "wasmtime's runner revokes its derivation of the app's build, on chain" -- $reg revoke wt.key "$registry" "$buildWt"

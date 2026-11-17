@@ -28,7 +28,7 @@
 // model: `test/store_test.wac`, a commit cut short anywhere.)
 
 import { Sys } from "std";
-import { Vec, Ticket } from "core";
+import { Vec, Ticket, strings } from "core";
 import { json.JsonValue, json.stringify } from "wac";
 import { U256 } from "../../src/u256.wac";
 import { bytesToHex } from "../../src/hex.wac";
@@ -79,7 +79,9 @@ string fcWith(string h, string fin) { return "{\"headBlockHash\":\"\{h}\",\"safe
 async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store, i32 flush) {
   string[] argv = [app, "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc", "--port", "\{port}",
                    "--datadir", data, store ? "--store" : "--snapshot-every", store ? "--flush-every" : "1000000", store ? "\{flush}" : "--public-rpc"];
-  Proc p = await Proc.start(sys, argv, data + ".log");
+  // The node's output beside the test's directory, never in its data: on the torn disk, this process holding it open
+  // kept the disk from being unmounted at a cut (power cut 4 of 40, 10 of 40, in the first full runs).
+  Proc p = await Proc.start(sys, argv, dir + "/" + data.slice(strings.lastIndexOf(data, "/") + 1, data.len()) + ".log");
   await p.says(sys, "Engine API on", 300000);
   // Answering, and this process rather than one before it: anything the test asks next is about this one.
   Rpc u = Rpc.at(sys, port);
@@ -99,8 +101,11 @@ async void cutPower(Sys sys, string dir) { await shell(sys, "cp --reflink=always
 
 /** The running disk let go and the clone put in its place, mounted — ext4 replays its journal as it would at boot. */
 async string bootFromCut(Sys sys, string dir) {
-  return await shell(sys, "set -e; cd \{dir}; dev=$(findmnt -no SOURCE mnt); umount mnt; losetup -d $dev; " +
-                          "mv x/cut.img x/disk.img; mount \"$(losetup --direct-io=on -f --show x/disk.img)\" mnt && echo mounted");
+  // The unmount tried for a while: a process just killed can hold the disk a moment longer (in the first full runs,
+  // at one cut in 20 or so, "target is busy"); who still holds it is said if it never lets go.
+  return await shell(sys, "set -e; cd \{dir}; dev=$(findmnt -no SOURCE mnt); " +
+                          "i=0; until umount mnt 2>/dev/null; do i=$((i+1)); if [ $i -ge 50 ]; then fuser -vm mnt 2>&1; exit 1; fi; sleep 0.2; done; " +
+                          "losetup -d $dev 2>&1; mv x/cut.img x/disk.img; mount \"$(losetup --direct-io=on -f --show x/disk.img)\" mnt 2>&1 && echo mounted");
 }
 
 async void unmountTorn(Sys sys, string dir) {
@@ -230,7 +235,8 @@ export async i32 main(Sys sys) {
       if (torn) { await cutPower(sys, dir); }
       await killHard(sys, b.pid);
       killed++;
-      if (torn && !t.that(trim(await bootFromCut(sys, dir)) == "mounted", "the disk as cut by power cut \{killed} mounts")) {
+      string booted = torn ? trim(await bootFromCut(sys, dir)) : "mounted";
+      if (!t.that(booted == "mounted", "the disk as cut by power cut \{killed} mounts \{booted == "mounted" ? "" : booted}")) {
         stuck = true;
         break;
       }

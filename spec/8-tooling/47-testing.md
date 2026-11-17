@@ -35,6 +35,11 @@ when it answers `""` and fails with the message otherwise; one that answers `voi
 
 `[§wac-test-traps-nnb3n9z]` A test whose name begins with `test_traps_` passes only if it traps, and fails if it returns.
 
+`[§wac-test-skip-k4r8w2m]` A test that answers a message beginning `skip: ` is **skipped**: it is reported with the rest of the
+message as the reason, counted apart from the passed and the failed, and does not fail the run. It is for a test that cannot
+ask its question here — the tool it compares against is not installed, or the machine cannot refuse what the test needs refused
+— and says which, rather than passing having asked nothing.
+
 A test may name itself with a sentence, using a verbatim name ([01](../1-programs/01-names-and-identity.md)). The runner prints
 the name as written.
 

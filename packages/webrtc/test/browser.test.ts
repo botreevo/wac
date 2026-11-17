@@ -271,8 +271,25 @@ async function browserScript(script: string) {
   };
 }
 
+/**
+ * **Skipped, saying why, where `~/pw` has no playwright** — the install `browserScript` runs beside. Without it the test
+ * failed writing its script into a directory that is not there, which read as a fault in the code rather than a
+ * machine without the tool (spec ch47 `§wac-test-skip-k4r8w2m` is the same rule for wac tests).
+ */
+const cannotBecause = (() => {
+  const home = Deno.env.get("HOME") ?? "";
+  try {
+    Deno.statSync(`${home}/pw/node_modules/playwright`);
+    return "";
+  } catch {
+    return `no playwright installed under ${home}/pw for node to run`;
+  }
+})();
+if (cannotBecause !== "") console.error(`webrtc browser test: skipped — ${cannotBecause}`);
+
 Deno.test({
   name: "Chromium completes ICE against us, and reads our SDP as we read its",
+  ignore: cannotBecause !== "",
   sanitizeResources: false,
   sanitizeOps: false,
   fn: async () => {

@@ -4,7 +4,7 @@
 # site, at https://pages.voltrevo.com/wac-eth/.
 #
 #     sh packages/reckon/tools/site.sh                 build dist/site from what is recorded
-#     WASMTIME_WAC=… sh packages/reckon/tools/site.sh --record WORKDIR [DEMO…]
+#     WASMTIME_WAC=… LADDER=… WAC_SRC=… sh packages/reckon/tools/site.sh --record WORKDIR [DEMO…]
 #                                                      run the demos (all nine, or those named) again into
 #                                                      site/demos first (about 75 minutes for all; capstone.sh (in full, with LADDER), ladder.sh and
 #                                                      flatten.sh take LADDER or build the ladder with cargo; a demo
@@ -24,7 +24,7 @@ if [ "${1:-}" = --record ]; then
   mkdir -p "$work"
   cd "$root"
   shift 2
-  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten conformance discovery}
+  demos=${*:-demo admit-by-name claims-mirror selfbuild capstone ladder l0 flatten conformance discovery demo-app turbostack chess}
   for d in $demos; do
     echo "recording $d"
     case $d in
@@ -32,10 +32,14 @@ if [ "${1:-}" = --record ]; then
       capstone) if [ -n "${LADDER:-}" ]; then sh "$here/tools/$d.sh" "$work/$d"; else env QUICK=1 sh "$here/tools/$d.sh" "$work/$d"; fi ;;
       *) sh "$here/tools/$d.sh" "$work/$d" ;;
     esac > "$work/$d.txt" 2>&1 || { echo "site: $d failed; see $work/$d.txt"; exit 1; }
-    # Paths of this machine's work directory are not part of what was shown.
-    sed "s|$work/$d|WORKDIR|g; s|$root|wac-eth|g; s|$HOME|~|g" "$work/$d.txt" > "$here/site/demos/$d.txt"
-    echo "$(date -u +%Y-%m-%d) $(git -C "$root" rev-parse --short HEAD)" > "$here/site/demos/$d.recorded"
+    # Paths of this machine's work directory are not part of what was shown. Kept in WORKDIR/demos until every demo
+    # has run: the app demos build from HEAD and want a clean tree, which writing into site/demos would end.
+    mkdir -p "$work/demos"
+    sed "s|$work/$d|WORKDIR|g; s|$root|wac-eth|g; s|$HOME|~|g; s|${WAC_SRC:-/nonexistent}|WAC_SRC|g" "$work/$d.txt" > "$work/demos/$d.txt"
+    echo "$(date -u +%Y-%m-%d) $(git -C "$root" rev-parse --short HEAD)" > "$work/demos/$d.recorded"
+    for shot in "$work/$d"/shots/*.png; do [ -f "$shot" ] && cp "$shot" "$work/demos/$d-$(basename "$shot")"; done
   done
+  cp "$work/demos/"* "$here/site/demos/"
 fi
 
 rm -rf "$out"

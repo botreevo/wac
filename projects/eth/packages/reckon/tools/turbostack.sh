@@ -49,7 +49,9 @@ step "1. turbostack's source, at $commit"
 cd "$work"
 git init -q ts && git -C ts fetch -q --depth 1 https://git.voltrevo.com/wac-turbostack.git "$commit" 2>/dev/null \
   || git -C ts fetch -q https://git.voltrevo.com/wac-turbostack.git
-full=$(git -C ts rev-parse "FETCH_HEAD" 2>/dev/null)
+# The commit asked for, not FETCH_HEAD: when the shallow fetch of a short hash fails, the fallback fetches the default
+# branch, whose head is not the commit.
+full=$(git -C ts rev-parse "$commit^{commit}")
 mkdir -p src/in src/home/cache/git && git -C ts archive "$full" | tar -x -C src/in
 for f in wac.json5 wac.lock; do
   sed -i "s|https://github.com/voltrevo/wac-web.git|https://git.voltrevo.com/wac-web.git|g; s|a14793f5e55af55b1ef9973715d31087e6d0c1f8|$web|g" "src/in/$f"
@@ -60,10 +62,19 @@ sed -n 's/.*"git": "\([^"]*\)".*"commit": "\([0-9a-f]\{40\}\)".*/\1 \2/p' src/in
 echo "https://github.com/voltrevo/wac-web.git a14793f5e55af55b1ef9973715d31087e6d0c1f8" >> deps.txt
 while read -r g c; do
   d="$(quote "$g")/$c"
-  [ -d "$cache/$d" ] || { (cd "$root" && LOCK=/dev/stdin sh tools/deps.sh) <<LOCK >/dev/null 2>&1
+  [ -d "$cache/$d" ] || { (cd "$root" && LOCK=/dev/stdin sh tools/deps.sh) <<LOCK >/dev/null 2>&1 || true
 { "imports": { "x": { "git": "$g", "ref": "$c", "commit": "$c" } } }
 LOCK
   }
+  # A github.com/voltrevo repository is mirrored on git.voltrevo.com: the same commit from there, kept where wac looks
+  # for the URL the lock names. The commit is the same object either way.
+  m=$(echo "$g" | sed -n 's|^https://github.com/voltrevo/|https://git.voltrevo.com/|p')
+  if [ ! -d "$cache/$d" ] && [ -n "$m" ]; then
+    (cd "$root" && LOCK=/dev/stdin sh tools/deps.sh) <<LOCK >/dev/null 2>&1 || true
+{ "imports": { "x": { "git": "$m", "ref": "$c", "commit": "$c" } } }
+LOCK
+    [ -d "$cache/$(quote "$m")/$c" ] && mkdir -p "$cache/$(quote "$g")" && cp -r "$cache/$(quote "$m")/$c" "$cache/$d"
+  fi
   [ -d "$cache/$d" ] || { bad "not in the package cache: $g at $c"; exit 1; }
   mkdir -p "src/home/cache/git/$d" && cp -r "$cache/$d/." "src/home/cache/git/$d/"
 done < deps.txt

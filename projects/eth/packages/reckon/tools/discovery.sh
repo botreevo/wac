@@ -9,6 +9,7 @@
 #   - a manifest that leads to a lying mirror costs nothing: its forged statement is left out and reported;
 #   - a long chain of manifests stops at the limit, and says so;
 #   - `--mirrors-from URL` walks inside the command: the mirrors found join those given with --mirror;
+#   - a mirror or manifest that never answers is given up on after its budget (--mirror-timeout), not waited on;
 #   - mirrors given by hand work as before.
 #
 #     sh packages/reckon/tools/discovery.sh WORKDIR     (PORT defaults to 8860; the second site is PORT+1, the third PORT+2)
@@ -18,7 +19,7 @@ set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 root=$(cd "$here/../.." && pwd)
 work=${1:?WORKDIR}; rm -rf "$work"; mkdir -p "$work"; work=$(cd "$work" && pwd)
-p1=${PORT:-8860}; p2=$((p1 + 1)); p3=$((p1 + 2))
+p1=${PORT:-8860}; p2=$((p1 + 1)); p3=$((p1 + 2)); p4=$((p1 + 3))
 pass=0; fail=0
 step() { printf '\n== %s\n' "$*"; }
 ok() { pass=$((pass + 1)); echo "ok    $*"; }
@@ -53,7 +54,8 @@ $CL manifest site2/reckon-mirrors.json --lists deep/b --follow "$u1/reckon-mirro
 printf '<html>not a manifest</html>\n' > site2/garbage.json
 sed 's/^/   | /' site1/reckon-mirrors.json
 for s in 1 2 3; do eval "port=\$p$s"; python3 "$here/tools/serve.py" "$port" "site$s" & eval "srv$s=\$!"; done
-trap 'kill $srv1 $srv2 $srv3 2>/dev/null || true' EXIT INT TERM
+srv4=
+trap 'kill $srv1 $srv2 $srv3 $srv4 2>/dev/null || true' EXIT INT TERM
 for u in "$u1" "$u2" "$u3"; do until curl -s -m1 -o /dev/null "$u/"; do sleep 0.2; done; done
 
 step "CORS on everything a page reads"
@@ -107,6 +109,24 @@ step "--mirrors-from: the walk inside the command"
   && ok "a walk that finds no mirror adds none, and says so; one mirror by hand is not enough" || bad "an empty walk: $(cat admit.log)"
 [ "$(admit --store client9 --mirror "$u1/a/mirror" --mirrors-from "$u2/reckon-mirrors.json")" = yes ] \
   && ok "by hand and found together: admitted" || bad "by hand and found: $(cat admit.log)"
+
+step "a mirror that never answers"
+# A server that takes the connection and never answers: each request to it is given up on after --mirror-timeout,
+# and the mirror is then taken as down, so it costs one wait, not one per block.
+python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", '"$p4"')); s.listen(64); time.sleep(3600)' &
+srv4=$!
+until python3 -c 'import socket; socket.create_connection(("127.0.0.1", '"$p4"'), 1).close()' 2>/dev/null; do sleep 0.2; done
+t0=$(date +%s)
+r=$(admit --store client10 --mirror "http://127.0.0.1:$p4" --mirror "$u1/a/mirror" --mirror "$u2/deep/b" --mirror-timeout 1500)
+t=$(( $(date +%s) - t0 ))
+[ "$r" = yes ] && [ "$t" -lt 15 ] && ok "a silent mirror first: given up on after 1.5 s, admitted from the others in ${t} s" \
+  || bad "a silent mirror: $r after ${t} s: $(cat admit.log)"
+$CL manifest site3/silent.json --follow "http://127.0.0.1:$p4/reckon-mirrors.json" --lists "$u1/a/mirror" >/dev/null
+t0=$(date +%s)
+$CL mirrors "$u3/silent.json" > found4 2> silent.log || true
+t=$(( $(date +%s) - t0 ))
+grep -q "timed out" silent.log && [ "$(wc -l < found4)" -eq 1 ] && ok "a manifest that never answers is a problem after its budget, and the walk goes on (${t} s)" \
+  || bad "a silent manifest: $(cat silent.log) / $(cat found4)"
 
 step "mirrors given by hand, as before"
 [ "$(admit --store client5 --mirror "$u1/a/mirror" --mirror "$u2/deep/b")" = yes ] && ok "mirrors given by hand still work" || bad "by hand: $(cat admit.log)"

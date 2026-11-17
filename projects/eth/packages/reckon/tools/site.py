@@ -18,6 +18,14 @@ site = os.path.join(here, "site")
 out = sys.argv[1]
 
 DEMOS = {
+    "hostile": ("A hostile app, every way out", "node packages/reckon/extension/test/hostile.cjs [PORT]",
+                "An admitted app whose pages try every way out of the sandbox loader we know of: fetch, XHR, "
+                "WebSocket, EventSource, beacons, workers, imports, every kind of subresource, frames, objects, forms, "
+                "popups, every kind of navigation, storage, cookies, the parent's DOM, the extension's API, other "
+                "trees, and WebRTC. Each way out is aimed at its own path on a TCP and UDP listener, and each line "
+                "says what the app saw, the CSP directive the browser reported, and what stopped it. Two got through "
+                "before: a frame navigating itself, now closed by a per-tab request fence, and WebRTC, now closed by "
+                "the loader's shim."),
     "turbostack": ("A third-party app, sealed end to end", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/turbostack.sh WORKDIR",
                    "wac-turbostack's duel page — a Tetris network that taught itself by self-play against turbostack's "
                    "original model — built only inside the sealed machine, with nothing of turbostack's run outside "
@@ -27,11 +35,18 @@ DEMOS = {
                    "through all four steps back to the compiler, the name turbostack on a devnet's registry, the "
                    "mirror found from a manifest (--mirrors-from); then admitted by name in the browser extension, "
                    "where both players load their weights and play in the sandbox loader."),
+    "chess": ("A chess engine, sealed end to end", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/chess.sh WORKDIR",
+              "wac-chess, a chess engine written from scratch in wac with a page to play it on, and the first app in "
+              "wac-web's worker mode (the search runs off the page's thread): built only inside the sealed machine "
+              "by wac-web's own page builder and the compiler, each step a derivation agreed by V8 and wasmtime, "
+              "reviewed, named chess on a devnet's registry, admitted by name through every step back to the "
+              "compiler, then opened in the browser extension, where the board is set and the engine answers a move "
+              "from its opening book, with no network and no extension API."),
     "demo-app": ("A real app, admitted and run", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/demo-app.sh WORKDIR",
                  "A Mandelbrot set as a wac-web page (demo/mandelbrot.wac), end to end, every build step sealed: "
                  "wac-web's own page builder (its two halves that start no process) and the compiler, each a "
-                 "derivation on V8 and on wasmtime, making the page the builder makes natively in one step (byte for "
-                 "byte but the entry path wac records in the module), a reviewer's endorsements, the page named "
+                 "derivation on V8 and on wasmtime, making the page the builder makes natively in one step, byte for "
+                 "byte, a reviewer's endorsements, the page named "
                  "mandelbrot on a devnet's registry, admitted by name on the command line, then in the browser "
                  "extension: the name read by proof, the page fetched and checked, and run in the sandbox loader, "
                  "where it draws and zooms with no network and no extension API."),

@@ -8,8 +8,8 @@
 // mirror that serves other bytes, is caught at the block, wherever it came from. That is what lets `http` read from
 // any trustless gateway, or any web server in front of a store directory, without trusting it.
 
-import { Files, Procs, ChildEnv, Launch, Net } from "std";
-import { http.get, http.Incoming, fetch.fetch, fetch.Caps } from "wac";
+import { Files, Procs, ChildEnv, Launch, Net, Clock } from "std";
+import { http.get, http.requestWithin, http.Incoming, fetch.fetchWithin, fetch.Caps } from "wac";
 import { Result, flatten } from "core";
 import { Cid, parseCid, RAW, DAG_PB } from "./cid.wac";
 import { Params, Built, Block, Node, readNode, slotLabel } from "./unixfs.wac";
@@ -47,6 +47,7 @@ export struct Store {
    * **A mirror that fails is asked nothing more.** No answer at all, or a 5xx (a gateway whose own origin is down
    * answers 502, 504, 522 or 526, often slowly), marks it down for as long as this store lives, and every later read
    * is "not here" at once. Otherwise each block of a tree would wait on it again. A 404 is an answer, not a failure.
+   * No deadline: `httpWithin` gives each request one, and a request that runs out is a failure like any other.
    */
   Store http(Net net, string host, i32 port) { return Store.httpUnder(net, host, port, ""); }
 
@@ -54,14 +55,27 @@ export struct Store {
    * `http`, with every path under `prefix` (`/a/b`, or "" for the root): a store directory a static web server
    * publishes below its root, as a pages site does.
    */
-  Store httpUnder(Net net, string host, i32 port, string prefix) {
+  Store httpUnder(Net net, string host, i32 port, string prefix) { return Store.httpAt(net, null, host, port, prefix, 0 - 1); }
+
+  /**
+   * `httpUnder`, each request given up on after `timeoutMs`, connection to last byte (`requestWithin`). A request that
+   * runs out marks the mirror down like any failure, so a server that accepts and never answers costs one budget, not
+   * one per block.
+   */
+  Store httpWithin(Net net, Clock clock, string host, i32 port, string prefix, i32 timeoutMs) {
+    return Store.httpAt(net, clock, host, port, prefix, timeoutMs);
+  }
+
+  Store httpAt(Net net, Clock? clock, string host, i32 port, string prefix, i32 timeoutMs) {
     bool down = false;
     return Store(
       (string p) => {
         u8[]? none = null;
         if (down) { return none; }
         string path = prefix + "/" + p + (p.indexOf("ipfs/") == 0 ? "?format=raw" : "");
-        match (get(net, host, port, path)) {
+        Result<Incoming, string> answer = clock is null ? get(net, host, port, path)
+          : requestWithin(net, clock!, "GET".toBytes(), host, port, path, u8[](), "", timeoutMs);
+        match (answer) {
           Err(_): { down = true; return none; }
           Ok(res): { if (res.status >= 500) { down = true; } return res.status == 200 ? res.body : none; }
         }
@@ -75,7 +89,10 @@ export struct Store {
    * `GET /ipfs/<cid>?format=raw` asking for `application/vnd.ipld.raw`, anything else `GET /<path>`. Anything but a
    * 200 is "not here", and what a 200 says is re-hashed by `get`, so a public gateway is trusted only to be there.
    */
-  Store gateway(Caps caps, string base) {
+  Store gateway(Caps caps, string base) { return Store.gatewayWithin(caps, base, 0 - 1); }
+
+  /** `gateway`, each request given up on after `timeoutMs` (`fetchWithin`; negative is none), as `httpWithin`. */
+  Store gatewayWithin(Caps caps, string base, i32 timeoutMs) {
     bool down = false;   // as for `http`: a mirror that fails is asked nothing more
     return Store(
       (string p) => {
@@ -84,10 +101,26 @@ export struct Store {
         bool block = p.indexOf("ipfs/") == 0;
         string url = base + "/" + p + (block ? "?format=raw" : "");
         string[] headers = block ? ["Accept: application/vnd.ipld.raw"] : string[]();
-        match (fetch(caps, "GET", url, headers, u8[]())) {
-          Err(_): { down = true; return none; }
-          Ok(res): { if (res.status >= 500) { down = true; } return res.status == 200 ? res.body : none; }
+        // A gateway may send the request elsewhere: ipfs.io and dweb.link answer 301 with the same path on a subdomain
+        // gateway (`CID.ipfs.dweb.link`). Followed, at most four times and only to https, since whatever answers is
+        // re-hashed by `get` like any block, so where the bytes come from changes nothing about trusting them.
+        for (i32 hop = 0; hop < 5; hop++) {
+          match (fetchWithin(caps, "GET", url, headers, u8[](), timeoutMs)) {
+            Err(_): { down = true; return none; }
+            Ok(res): {
+              bool moved = res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307 || res.status == 308;
+              string to = string.fromBytes(res.headers.first("Location"));
+              if (moved && to != "" && hop < 4) {
+                url = redirectTo(url, to);
+                if (url.indexOf("https://") != 0) { return none; }
+                continue;
+              }
+              if (res.status >= 500) { down = true; }
+              return res.status == 200 ? res.body : none;
+            }
+          }
         }
+        return none;
       },
       (string p, u8[] b) => false);
   }
@@ -138,6 +171,22 @@ export struct Store {
   bool has(this, Cid c) { return this.read("ipfs/" + c.text()) is not null; }
 }
 
+/** Where a redirect's `Location` points, from the URL that answered with it: absolute, from the origin, or beside it. */
+export string redirectTo(string from, string location) {
+  if (location.indexOf("https://") == 0 || location.indexOf("http://") == 0) { return location; }
+  i32 scheme = from.indexOf("://") + 3;
+  string rest = from.slice(scheme, from.len());
+  i32 slash = rest.indexOf("/");
+  string origin = slash < 0 ? from : from.slice(0, scheme + slash);
+  if (location.indexOf("/") == 0) { return origin + location; }
+  string path = slash < 0 ? "/" : rest.slice(slash, rest.len());
+  i32 q = path.indexOf("?");
+  if (q >= 0) { path = path.slice(0, q); }
+  i32 last = 0;
+  for (i32 i = 0; i < path.len(); i++) { if (path.slice(i, i + 1) == "/") { last = i; } }
+  return origin + path.slice(0, last + 1) + location;
+}
+
 /** Whether a mirror is named by URL (`http://` or `https://`) rather than as a directory. */
 export bool isHttp(string spec) { return spec.indexOf("http://") == 0 || spec.indexOf("https://") == 0; }
 
@@ -147,18 +196,46 @@ export bool isHttp(string spec) { return spec.indexOf("http://") == 0 || spec.in
  * PATH, when given, is where the store directory is published: `claims/index` is read at PATH/claims/index and a
  * block at PATH/ipfs/CID, so a static site can carry a mirror below its root.
  */
-export Result<Store, string> mirrorAt(Caps caps, string url) {
-  if (url.indexOf("http://") == 0) { return httpStoreAt(caps.net, url); }
+export Result<Store, string> mirrorAt(Caps caps, string url) { return mirrorAtWithin(caps, url, MIRROR_REQUEST_MS()); }
+
+/**
+ * How long one request to a mirror named by URL may take, connection to last byte, before the mirror is taken as
+ * down: 20 s. A gateway whose origin is down can hold a request for a minute and a half, and a mirror is asked for
+ * every block of a tree.
+ */
+export i32 MIRROR_REQUEST_MS() { return 20000; }
+
+/** `mirrorAt`, each request given up on after `timeoutMs` (negative: no deadline), the mirror then taken as down. */
+export Result<Store, string> mirrorAtWithin(Caps caps, string url, i32 timeoutMs) {
+  if (url.indexOf("http://") == 0) {
+    match (httpPartsOf(url)) {
+      Err(e): { return Result.Err(e); }
+      Ok(h): { return Result.Ok(Store.httpWithin(caps.net, caps.clock, h.host, h.port, h.prefix, timeoutMs)); }
+    }
+  }
   if (url.indexOf("https://") != 0) { return Result.Err("\{url} is not an http:// or https:// URL"); }
   string hp = url.slice(8, url.len());
   while (hp.len() > 0 && hp.slice(hp.len() - 1, hp.len()) == "/") { hp = hp.slice(0, hp.len() - 1); }
   if (hp.indexOf("?") >= 0 || hp.indexOf("#") >= 0) { return Result.Err("\{url}: a mirror's URL has no query or fragment"); }
   if (hp.len() == 0 || hp.indexOf(":") == 0 || hp.indexOf("/") == 0) { return Result.Err("\{url}: no host"); }
-  return Result.Ok(Store.gateway(caps, "https://" + hp));
+  return Result.Ok(Store.gatewayWithin(caps, "https://" + hp, timeoutMs));
 }
 
 /** `http://HOST[:PORT][/PATH]` as a read-only `Store.http` under PATH, or why it is not one. */
 export Result<Store, string> httpStoreAt(Net net, string url) {
+  match (httpPartsOf(url)) {
+    Err(e): { return Result.Err(e); }
+    Ok(h): { return Result.Ok(Store.httpUnder(net, h.host, h.port, h.prefix)); }
+  }
+}
+
+struct HttpParts {
+  string host;
+  i32 port;
+  string prefix;
+}
+
+Result<HttpParts, string> httpPartsOf(string url) {
   if (url.indexOf("http://") != 0) { return Result.Err("\{url} is not an http:// URL"); }
   string hp = url.slice(7, url.len());
   while (hp.len() > 0 && hp.slice(hp.len() - 1, hp.len()) == "/") { hp = hp.slice(0, hp.len() - 1); }
@@ -182,7 +259,7 @@ export Result<Store, string> httpStoreAt(Net net, string url) {
     hp = hp.slice(0, colon);
   }
   if (hp.len() == 0) { return Result.Err("\{url}: no host"); }
-  return Result.Ok(Store.httpUnder(net, hp, port, prefix));
+  return Result.Ok(HttpParts(hp, port, prefix));
 }
 
 // ---------------------------------------------------------------- resolving

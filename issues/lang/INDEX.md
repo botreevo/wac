@@ -10,7 +10,7 @@ has been fixed and why.
 | [0458e](closed/0458e-a-package-file-is-keyed-by-where-the-cache-is.md) | a package file is keyed by its absolute path under `$WAC_HOME` (`/root/.wac/cache/git/…/src/page.wac`), so a generic a package declares, instantiated over a type the project declares, is named after where this machine keeps its cache, and two machines with different caches build different modules from one source. `0270a` made the project's own keys root-relative and left these | bug | wrong answer |
 | [0449e](closed/0449e-wait-on-an-async-call-has-no-type-without-a-ticket-import.md) | `async i32 one()` then `i32 x = one().wait();` in a file that imports nothing checks clean and emits an invalid module; with any `std` or `core` import it is *expected i32, found Result<i32, Stuck>* — `wait()` has no type when `Ticket` was reached only through an `async` result. wac1's area | bug | accepted program |
 | [0448e](closed/0448e-ticket-any-over-only-void-tickets-emits-a-void-local.md) | `Ticket.any(f(), g())` over two `async void` calls checks clean and builds a module the engine refuses: `AnyValue<Ts>` collapses to `void` and `any`'s body declares a local of it. Left legal by `0378a`'s refusal, broken before it. wac1's area | bug | invalid wasm |
-| [0447e](open/0447e-the-spec-shows-within-with-nested-patterns-the-language-does-not-have.md) | `spec/7-library/44-std.md`'s only `within` example matches `Ok(Data(bytes))` and `Err(TimedOut t)` — nested patterns, which `0027` deferred — so the program it shows is *expected ')', found 't'*; it is marked `// fragment`, so nothing compiled it | diagnostic | a spec example that does not parse |
+| [0447e](closed/0447e-the-spec-shows-within-with-nested-patterns-the-language-does-not-have.md) | `spec/7-library/44-std.md`'s only `within` example matches `Ok(Data(bytes))` and `Err(TimedOut t)` — nested patterns, which `0027` deferred — so the program it shows is *expected ')', found 't'*; it is marked `// fragment`, so nothing compiled it | diagnostic | a spec example that does not parse |
 | [0446e](closed/0446e-an-integer-literal-above-i64-skips-the-member-check.md) | `9223372036854775808.nofield` checks clean and the build cannot emit it (*member of an unknown type*); every literal up to `i64`'s maximum is refused with *no such field*, and so is the same value in a typed slot — a literal with no `i64` type is left untyped as a receiver, up to and past 2^64 | bug | accepted program |
 | [0438d](closed/0438d-a-generic-call-named-only-inside-a-lambda-argument-is-not-instantiated.md) | A generic function called only in the bodies of lambdas handed to a constructor (`std`'s `RandomFile(…)` calling `hostAsk<U>`) is never instantiated: *a call to `hostAsk` … not in the program* | bug | emit failure |
 | [0436d](closed/0436d-a-type-reached-only-through-std-has-no-members-to-the-checker.md) | `c.nowMillis().wait()` in a file that never imported `Ticket` has no type: the checker's reach over imported signatures skips `std`, so a `core` type `std` hands on has no members, and a mismatch after it passes the check and stops the build | bug | accepted program |
@@ -150,7 +150,7 @@ has been fixed and why.
 
 ## Closed
 
-372 issues, 339 closed.
+372 issues, 340 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

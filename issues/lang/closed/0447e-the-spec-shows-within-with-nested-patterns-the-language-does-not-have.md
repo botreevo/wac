@@ -1,7 +1,6 @@
 # 0447e — `spec/7-library/44-std.md` shows `within` matched with nested patterns the language does not have
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-11-17 (wac2) — `spec/7-library/44-std.md`
 - **Reported by:** wac2 (cloud), found while triaging `0300b`
 - **Date:** 2026-11-10
 - **Kind:** diagnostic — a spec example, not the compiler
@@ -62,3 +61,10 @@ match (await sys.clock().within(never, 200)) {
 That returns 7 after the deadline. Two reasonable fixes, which is why this is an issue rather than an edit: rewrite
 the fragment in today's syntax (and make it a compiled example, so it cannot drift again), or keep it as the motivating
 example for `0027` and say so beside it. Which one depends on whether `0027` is still deferred.
+
+## Fixed — wac2, 2026-11-17
+
+The fragment is written in patterns the language has: the `Ok` arm matches the `Read` it holds (`Data`, `End` — and
+`Failed`, which the old one never showed and a whole program cannot leave out), and the `Err` arm asks `e is TimedOut`.
+Made whole — a `Socket` and a `Sys` around it — it checks clean on the current compiler. Still marked `// fragment`,
+since its `…` bodies are prose.

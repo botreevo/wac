@@ -265,10 +265,17 @@ A deadline belongs to the clock. `within` answers what a capability's ticket ans
 ```wac
 // fragment
 match (await sys.clock().within(sock.recv(), 30000)) {
-  Ok(Data(bytes)): { … }
-  Ok(End): { … }
-  Err(TimedOut t): { sock.close(); }        // silent for thirty seconds
-  Err(e): { … }
+  Ok(r): {
+    match (r) {
+      Data(bytes): { … }
+      End: { … }
+      Failed(why): { … }
+    }
+  }
+  Err(e): {
+    if (e is TimedOut) { sock.close(); }     // silent for thirty seconds
+    …
+  }
 }
 ```
 

@@ -254,6 +254,13 @@ export struct Shell {
    */
   bool capture;
   Buf outBuf;
+  /**
+   * Whether the command being dispatched writes to this shell's own streams, with nothing between: the last stage,
+   * no output redirection, and nothing capturing. An external run in process may then write `stdout` and `stderr`
+   * as it goes instead of handing its bytes back at the end — which, for a server, was never (`issues/system/0362a`).
+   * Set by `runSimple` for the length of one `dispatch`.
+   */
+  bool writesThrough;
 
   /**
    * What to try for a command that is not a builtin. There is nothing after it: an unwired shell
@@ -566,7 +573,7 @@ export struct Shell {
            ProcTable table, string cwd, bool hostEnv) {
     return Shell(stdin, stdout, stderr, clock, env, net, procs, fs, table,
                  Map.create(hashString, stringEq), 0, false, 0, 0, 0, false, 0, 0, Vec.create(), Vec.create(),
-                 Vec.create(), Buf.create(), false, Buf.create(), noExternal, noExternalNames, false, null, false,
+                 Vec.create(), Buf.create(), false, Buf.create(), false, noExternal, noExternalNames, false, null, false,
                  Vec.create(), Map.create(hashString, stringEq), Vec.create(), Vec.create(), false, u8[](), 0, false,
                  false, false, false, cwd, hostEnv, 0, Vec.create(), 0);
   }
@@ -2327,7 +2334,10 @@ async u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last, bool piped) {
   i32 parent = sh.table.current;
   i32 pid = sh.table.start(parent, argv, sh.now());
   sh.table.current = pid;
+  bool wasThrough = sh.writesThrough;
+  sh.writesThrough = last && !sh.capture && !movesOutput(cmd);
   Ran result = await dispatch(sh, argv, mayInherit);
+  sh.writesThrough = wasThrough;
   sh.table.current = parent;
   // Reaped straight away: nothing can `wait` for a stage yet, so a row left behind would be a leak
   // rather than a status somebody is coming for. `jobs` is what gives these somewhere to wait.
@@ -2392,6 +2402,19 @@ async u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last, bool piped) {
     return u8[]();
   }
   return going;
+}
+
+/** Whether any of `cmd`'s redirections sends an output stream somewhere else: `>`, `>>` or `>&`. */
+bool movesOutput(Simple cmd) {
+  for (i32 i = 0; i < cmd.redirs.len(); i++) {
+    match (cmd.redirs.get(i).kind) {
+      Out: { return true; }
+      Append: { return true; }
+      Dup: { return true; }
+      default: { }
+    }
+  }
+  return false;
 }
 
 /**

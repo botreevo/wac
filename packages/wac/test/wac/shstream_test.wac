@@ -1,0 +1,54 @@
+// An applet `wac sh` runs says what it says while it runs, not when it exits. `issues/system/0362a`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env --allow-net packages/wac/test/wac/shstream_test.wac
+//
+// `wac sh` runs box's applets in process, and their output was held until the applet returned — right for a pipe or
+// a capture, which place the bytes afterwards, and for a server never: `wac sh -c 'httpd -8080 dist'` served and
+// said nothing, though `httpd: listening on port …` is the line a caller waits for. With nothing between the command
+// and the shell's own streams, it now writes as it goes; a redirection still holds the bytes and places them.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath, freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { Daemon, Held, logOf, start, stop, waitForLogWithin } from "../../../wactest/src/daemon.wac";
+import { quoted } from "../../../wactest/src/childenv.wac";
+import { Sys } from "std";
+
+/** `wac sh -c script`, started in `dir` and left running, its two streams in one log. */
+Daemon shell(Sys sys, string dir, string script, string log) {
+  sys.files().remove(log, false).wait();
+  string line = "cd \{quoted(dir)} && \{quoted(binaryPath(sys.env()))} sh --allow-read --allow-write --allow-net -c " +
+                quoted(script);
+  return start(sys.procs(), "/bin/sh -c \{quoted(line)}", log);
+}
+
+export string test_a_server_says_it_is_listening_while_it_listens(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "shstream");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  t.eqStr(putFile(sys.files(), "\{dir}/dist/index.html", "hi\n"), "", "something to serve");
+  Held held = Held.take(sys.net());
+  i32 port = held.port;
+  held.release();
+  Daemon d = shell(sys, dir, "httpd -\{port} dist", "\{dir}/served.log");
+  t.isTrue(waitForLogWithin(sys.clock(), sys.files(), d, "listening on port \{port}", 60000),
+           "the applet's first line arrived while it ran: \{logOf(sys.files(), d)}");
+  stop(sys.procs(), d);
+  return t.report();
+}
+
+/** The control: redirected, the same line goes where it was sent, and not to the shell's own stream. */
+export string test_a_redirected_server_still_writes_where_it_was_sent(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "shstream-redir");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  t.eqStr(putFile(sys.files(), "\{dir}/dist/index.html", "hi\n"), "", "something to serve");
+  // A command that ends, so its redirected output is placed: `seq` to a file, then the file read back.
+  Daemon d = shell(sys, dir, "seq 3 > out.txt 2> err.txt; echo done", "\{dir}/redir.log");
+  t.isTrue(waitForLogWithin(sys.clock(), sys.files(), d, "done", 60000), "the script finished: \{logOf(sys.files(), d)}");
+  t.isFalse(contains(logOf(sys.files(), d), "1\n2\n3"), "nothing of seq's reached the shell's own output");
+  string got = string.fromBytes((sys.files().readFile("\{dir}/out.txt").wait()).unwrap().orElse(u8[]()));
+  t.eqStr(got, "1\n2\n3\n", "it went to the file");
+  stop(sys.procs(), d);
+  return t.report();
+}

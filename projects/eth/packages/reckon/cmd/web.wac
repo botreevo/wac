@@ -17,7 +17,7 @@
 
 import { Sys } from "std";
 import { fetch.Caps } from "wac";
-import { ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.mirrorAtWithin, ipfs.MIRROR_REQUEST_MS } from "@/lib.wac";
+import { ipfs.Store, ipfs.Resolver, ipfs.isHttp, ipfs.mirrorAtWithin, ipfs.racedMirrorsWithin, ipfs.MIRROR_REQUEST_MS } from "@/lib.wac";
 import { Loaded, loadIndexes } from "../src/graph.wac";
 import { AdmitRequest, Admitted, admitSubject, writeOut } from "../src/admission.wac";
 import { Discovered, mirrorsAsked } from "../src/discovery.wac";
@@ -70,7 +70,32 @@ export async i32 main(Sys sys) {
       }
     }
   }
+  // Blocks: mirrors named by URL are asked all at once when there are two or more (`Store.race`), so a slow or
+  // down one costs nothing while another answers; directories first, in turn. Indexes are still read from each.
   Resolver r = Resolver(store, mirrors);
+  string[] urls = string[]();
+  for (i32 i = 0; i < asked.mirrors.len(); i++) {
+    if (!isHttp(asked.mirrors[i])) { continue; }
+    string[] u = string[].filled(urls.len() + 1, asked.mirrors[i]);
+    for (i32 j = 0; j < urls.len(); j++) { u[j] = urls[j]; }
+    urls = u;
+  }
+  if (urls.len() >= 2) {
+    match (racedMirrorsWithin(Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files()), urls, budget)) {
+      Err(e): { sys.warn("web: \{e}"); return 2; }
+      Ok(raced): {
+        Store[] blocks = Store[].filled(1, raced);
+        for (i32 i = 0; i < asked.mirrors.len(); i++) {
+          if (isHttp(asked.mirrors[i])) { continue; }
+          Store[] b = Store[].filled(blocks.len() + 1, raced);
+          for (i32 j = 0; j < blocks.len() - 1; j++) { b[j] = blocks[j]; }
+          b[blocks.len() - 1] = Store.dir(sys.files(), asked.mirrors[i]);
+          blocks = b;
+        }
+        r = Resolver(store, blocks);
+      }
+    }
+  }
   Loaded loaded = loadIndexes(store, mirrors);
   for (i32 i = 0; i < loaded.refused.len(); i++) { sys.warn("web: left out: \{loaded.refused[i]}"); }
   sys.log("web: \{loaded.index.signed.len()} statement(s) from \{mirrors.len()} mirror(s)");

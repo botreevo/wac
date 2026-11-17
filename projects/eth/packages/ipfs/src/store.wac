@@ -9,8 +9,8 @@
 // any trustless gateway, or any web server in front of a store directory, without trusting it.
 
 import { Files, Procs, ChildEnv, Launch, Net, Clock } from "std";
-import { http.get, http.requestWithin, http.Incoming, fetch.fetchWithin, fetch.Caps } from "wac";
-import { Result, flatten } from "core";
+import { http.get, http.requestWithinAsync, http.Incoming, fetch.fetchWithinAsync, fetch.Caps } from "wac";
+import { Result, Ticket, TicketBase, flatten } from "core";
 import { Cid, parseCid, RAW, DAG_PB } from "./cid.wac";
 import { Params, Built, Block, Node, readNode, slotLabel } from "./unixfs.wac";
 import { hamtByte } from "./murmur3.wac";
@@ -72,13 +72,10 @@ export struct Store {
       (string p) => {
         u8[]? none = null;
         if (down) { return none; }
-        string path = prefix + "/" + p + (p.indexOf("ipfs/") == 0 ? "?format=raw" : "");
-        Result<Incoming, string> answer = clock is null ? get(net, host, port, path)
-          : requestWithin(net, clock!, "GET".toBytes(), host, port, path, u8[](), "", timeoutMs);
-        match (answer) {
-          Err(_): { down = true; return none; }
-          Ok(res): { if (res.status >= 500) { down = true; } return res.status == 200 ? res.body : none; }
-        }
+        Asked a = clock is null ? askedOf(get(net, host, port, httpPath(prefix, p)))
+          : waited(askHttp(net, clock!, host, port, prefix, p, timeoutMs));
+        if (a.failed) { down = true; }
+        return a.body;
       },
       (string p, u8[] b) => false);
   }
@@ -98,27 +95,60 @@ export struct Store {
       (string p) => {
         u8[]? none = null;
         if (down) { return none; }
-        bool block = p.indexOf("ipfs/") == 0;
-        string url = base + "/" + p + (block ? "?format=raw" : "");
-        string[] headers = block ? ["Accept: application/vnd.ipld.raw"] : string[]();
-        // A gateway may send the request elsewhere: ipfs.io and dweb.link answer 301 with the same path on a subdomain
-        // gateway (`CID.ipfs.dweb.link`). Followed, at most four times and only to https, since whatever answers is
-        // re-hashed by `get` like any block, so where the bytes come from changes nothing about trusting them.
-        for (i32 hop = 0; hop < 5; hop++) {
-          match (fetchWithin(caps, "GET", url, headers, u8[](), timeoutMs)) {
-            Err(_): { down = true; return none; }
-            Ok(res): {
-              bool moved = res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307 || res.status == 308;
-              string to = string.fromBytes(res.headers.first("Location"));
-              if (moved && to != "" && hop < 4) {
-                url = redirectTo(url, to);
-                if (url.indexOf("https://") != 0) { return none; }
-                continue;
-              }
-              if (res.status >= 500) { down = true; }
-              return res.status == 200 ? res.body : none;
-            }
-          }
+        Asked a = waited(askGateway(caps, base, p, timeoutMs));
+        if (a.failed) { down = true; }
+        return a.body;
+      },
+      (string p, u8[] b) => false);
+  }
+
+  /**
+   * Several mirrors asked at once, read-only (wac's `Ticket.first`, over requests made with `async` clients). A read
+   * goes to every mirror not yet down, and the first good answer is taken: for a block (`ipfs/<cid>`), the first
+   * whose bytes hash to its CID; for anything else, the first 200. So a slow mirror costs nothing while another
+   * answers, and a fast one serving other bytes is passed over for the next. A mirror that fails is asked nothing
+   * more, as for `http`. The requests that lose are left to finish or run out within their own deadlines: a request
+   * an `async` client is making is not stopped part-way.
+   *
+   * Each asker answers one path (`askerAt`). Raced mirrors read as one, so a `Resolver` given this one store asks
+   * them all at once for each block, where given them separately it asks them in turn.
+   */
+  Store race(fn<Ticket<Asked>(string)>[] askers) {
+    bool[] down = bool[].filled(askers.len(), false);
+    return Store(
+      (string p) => {
+        u8[]? none = null;
+        Cid? want = null;
+        if (p.indexOf("ipfs/") == 0) {
+          match (parseCid(p.slice(5, p.len()))) { Ok(c): { want = c; } Err(_): { return none; } }
+        }
+        Ticket<Asked>[] open = Ticket<Asked>[]();
+        i32[] who = i32[]();
+        for (i32 i = 0; i < askers.len(); i++) {
+          if (down[i]) { continue; }
+          Ticket<Asked> t = askers[i](p);
+          Ticket<Asked>[] o = Ticket<Asked>[].filled(open.len() + 1, t);
+          i32[] w = i32[].filled(who.len() + 1, i);
+          for (i32 j = 0; j < open.len(); j++) { o[j] = open[j]; w[j] = who[j]; }
+          open = o;
+          who = w;
+        }
+        while (open.len() > 0) {
+          TicketBase[] parts = TicketBase[].filled(open.len(), open[0]);
+          for (i32 j = 0; j < open.len(); j++) { parts[j] = open[j]; }
+          i32 k = 0;
+          match (Ticket.first(parts).wait()) { Ok(x): { k = x; } Err(_): { return none; } }
+          Asked a = waited(open[k]);
+          i32 i = who[k];
+          Ticket<Asked>[] o = open.len() > 1 ? Ticket<Asked>[].filled(open.len() - 1, open[0]) : Ticket<Asked>[]();
+          i32[] w = i32[].filled(who.len() - 1, 0);
+          i32 n = 0;
+          for (i32 j = 0; j < open.len(); j++) { if (j != k) { o[n] = open[j]; w[n] = who[j]; n++; } }
+          open = o;
+          who = w;
+          if (a.failed) { down[i] = true; continue; }
+          if (a.body is null) { continue; }
+          if (want is null || want!.names(a.body!)) { return a.body; }
         }
         return none;
       },
@@ -171,6 +201,59 @@ export struct Store {
   bool has(this, Cid c) { return this.read("ipfs/" + c.text()) is not null; }
 }
 
+/** What one mirror said about one path: the bytes of a 200, or nothing; and whether it failed (no answer, or a 5xx). */
+export struct Asked {
+  bool failed;
+  u8[]? body;
+}
+
+/** An asker's answer, waited for; a wait that is refused is a failure. */
+Asked waited(Ticket<Asked> t) {
+  match (t.wait()) { Ok(a): { return a; } Err(_): { u8[]? none = null; return Asked(true, none); } }
+}
+
+Asked askedOf(Result<Incoming, string> answer) {
+  u8[]? none = null;
+  match (answer) {
+    Err(_): { return Asked(true, none); }
+    Ok(res): { return Asked(res.status >= 500, res.status == 200 ? res.body : none); }
+  }
+}
+
+string httpPath(string prefix, string p) { return prefix + "/" + p + (p.indexOf("ipfs/") == 0 ? "?format=raw" : ""); }
+
+/** `Store.http`'s request for `p`, made with the `async` client, so that several can be in flight. */
+export async Asked askHttp(Net net, Clock clock, string host, i32 port, string prefix, string p, i32 timeoutMs) {
+  return askedOf(await requestWithinAsync(net, clock, "GET".toBytes(), host, port, httpPath(prefix, p), u8[](), "", timeoutMs));
+}
+
+/** `Store.gateway`'s request for `p`, redirects followed, made with the `async` client. */
+export async Asked askGateway(Caps caps, string base, string p, i32 timeoutMs) {
+  u8[]? none = null;
+  bool block = p.indexOf("ipfs/") == 0;
+  string url = base + "/" + p + (block ? "?format=raw" : "");
+  string[] headers = block ? ["Accept: application/vnd.ipld.raw"] : string[]();
+  // A gateway may send the request elsewhere: ipfs.io and dweb.link answer 301 with the same path on a subdomain
+  // gateway (`CID.ipfs.dweb.link`). Followed, at most four times and only to https, since whatever answers is
+  // re-hashed by `get` like any block, so where the bytes come from changes nothing about trusting them.
+  for (i32 hop = 0; hop < 5; hop++) {
+    match (await fetchWithinAsync(caps, "GET", url, headers, u8[](), timeoutMs)) {
+      Err(_): { return Asked(true, none); }
+      Ok(res): {
+        bool moved = res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307 || res.status == 308;
+        string to = string.fromBytes(res.headers.first("Location"));
+        if (moved && to != "" && hop < 4) {
+          url = redirectTo(url, to);
+          if (url.indexOf("https://") != 0) { return Asked(false, none); }
+          continue;
+        }
+        return Asked(res.status >= 500, res.status == 200 ? res.body : none);
+      }
+    }
+  }
+  return Asked(false, none);
+}
+
 /** Where a redirect's `Location` points, from the URL that answered with it: absolute, from the origin, or beside it. */
 export string redirectTo(string from, string location) {
   if (location.indexOf("https://") == 0 || location.indexOf("http://") == 0) { return location; }
@@ -213,12 +296,56 @@ export Result<Store, string> mirrorAtWithin(Caps caps, string url, i32 timeoutMs
       Ok(h): { return Result.Ok(Store.httpWithin(caps.net, caps.clock, h.host, h.port, h.prefix, timeoutMs)); }
     }
   }
+  match (gatewayBase(url)) {
+    Err(e): { return Result.Err(e); }
+    Ok(base): { return Result.Ok(Store.gatewayWithin(caps, base, timeoutMs)); }
+  }
+}
+
+/** `https://HOST[:PORT][/PATH]`, checked, without a trailing slash; or why it is not a mirror's URL. */
+Result<string, string> gatewayBase(string url) {
   if (url.indexOf("https://") != 0) { return Result.Err("\{url} is not an http:// or https:// URL"); }
   string hp = url.slice(8, url.len());
   while (hp.len() > 0 && hp.slice(hp.len() - 1, hp.len()) == "/") { hp = hp.slice(0, hp.len() - 1); }
   if (hp.indexOf("?") >= 0 || hp.indexOf("#") >= 0) { return Result.Err("\{url}: a mirror's URL has no query or fragment"); }
   if (hp.len() == 0 || hp.indexOf(":") == 0 || hp.indexOf("/") == 0) { return Result.Err("\{url}: no host"); }
-  return Result.Ok(Store.gatewayWithin(caps, "https://" + hp, timeoutMs));
+  return Result.Ok("https://" + hp);
+}
+
+/** A mirror named by URL, as `mirrorAtWithin` reads it, as an asker for `Store.race`. */
+export Result<fn<Ticket<Asked>(string)>, string> askerAt(Caps caps, string url, i32 timeoutMs) {
+  if (url.indexOf("http://") == 0) {
+    match (httpPartsOf(url)) {
+      Err(e): { return Result.Err(e); }
+      Ok(h): {
+        fn<Ticket<Asked>(string)> f = (string p) => askHttp(caps.net, caps.clock, h.host, h.port, h.prefix, p, timeoutMs);
+        return Result.Ok(f);
+      }
+    }
+  }
+  match (gatewayBase(url)) {
+    Err(e): { return Result.Err(e); }
+    Ok(base): {
+      fn<Ticket<Asked>(string)> f = (string p) => askGateway(caps, base, p, timeoutMs);
+      return Result.Ok(f);
+    }
+  }
+}
+
+/** Mirrors named by URL, raced (`Store.race`): one store that asks them all at once. */
+export Result<Store, string> racedMirrorsWithin(Caps caps, string[] urls, i32 timeoutMs) {
+  fn<Ticket<Asked>(string)>[] askers = fn<Ticket<Asked>(string)>[]();
+  for (i32 i = 0; i < urls.len(); i++) {
+    match (askerAt(caps, urls[i], timeoutMs)) {
+      Err(e): { return Result.Err(e); }
+      Ok(f): {
+        fn<Ticket<Asked>(string)>[] next = fn<Ticket<Asked>(string)>[].filled(askers.len() + 1, f);
+        for (i32 j = 0; j < askers.len(); j++) { next[j] = askers[j]; }
+        askers = next;
+      }
+    }
+  }
+  return Result.Ok(Store.race(askers));
 }
 
 /** `http://HOST[:PORT][/PATH]` as a read-only `Store.http` under PATH, or why it is not one. */

@@ -34,7 +34,8 @@ chown wacuum:wacuum /data/wacuum /data/wacuum/differs
 
 # wac-eth, then wac at exactly the commit wac-eth's wac.lock pins.
 [ -d /opt/wac-eth/.git ] || git clone "$repo" /opt/wac-eth
-git -C /opt/wac-eth pull --ff-only
+# Owned by the service user after the first install; root's git refuses such a checkout unless told it is safe.
+git -c safe.directory=/opt/wac-eth -C /opt/wac-eth pull --ff-only
 # The lock as one line, and the commit from the "wac" entry alone: wac.lock lists other imports beside it.
 pin=$(tr '\n' ' ' < /opt/wac-eth/wac.lock | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
 [ -n "$pin" ] || { echo "install.sh: no wac commit in wac.lock" >&2; exit 1; }

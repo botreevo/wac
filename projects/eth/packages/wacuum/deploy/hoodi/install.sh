@@ -68,7 +68,8 @@ chmod 644 /etc/eth/hoodi-genesis.json /etc/eth/hoodi-bootnodes.txt 2>/dev/null |
 
 # wac-eth, then wac at exactly the commit wac-eth's wac.lock pins, then wacuum built once into an executable.
 [ -d /opt/wac-eth/.git ] || git clone "$repo" /opt/wac-eth
-git -C /opt/wac-eth pull --ff-only
+# Owned by the service user after the first install; root's git refuses such a checkout unless told it is safe.
+git -c safe.directory=/opt/wac-eth -C /opt/wac-eth pull --ff-only
 pin=$(tr '\n' ' ' < /opt/wac-eth/wac.lock | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
 [ -n "$pin" ] || { echo "install.sh: no wac commit in wac.lock" >&2; exit 1; }
 [ -d /opt/wac/.git ] || git clone "${WAC_URL:-https://github.com/voltrevo/wac.git}" /opt/wac

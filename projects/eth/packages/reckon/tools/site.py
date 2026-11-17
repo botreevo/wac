@@ -18,6 +18,14 @@ site = os.path.join(here, "site")
 out = sys.argv[1]
 
 DEMOS = {
+    "hostile": ("A hostile app, every way out", "node packages/reckon/extension/test/hostile.cjs [PORT]",
+                "An admitted app whose pages try every way out of the sandbox loader we know of: fetch, XHR, "
+                "WebSocket, EventSource, beacons, workers, imports, every kind of subresource, frames, objects, forms, "
+                "popups, every kind of navigation, storage, cookies, the parent's DOM, the extension's API, other "
+                "trees, and WebRTC. Each way out is aimed at its own path on a TCP and UDP listener, and each line "
+                "says what the app saw, the CSP directive the browser reported, and what stopped it. Two got through "
+                "before: a frame navigating itself, now closed by a per-tab request fence, and WebRTC, now closed by "
+                "the loader's shim."),
     "turbostack": ("A third-party app, sealed end to end", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/turbostack.sh WORKDIR",
                    "wac-turbostack's duel page — a Tetris network that taught itself by self-play against turbostack's "
                    "original model — built only inside the sealed machine, with nothing of turbostack's run outside "

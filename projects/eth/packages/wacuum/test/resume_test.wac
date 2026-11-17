@@ -134,6 +134,47 @@ async string run() {
 
 export async string test_a_store_a_block_ahead_of_the_log(Sys sys) { return await run(); }
 
+// A power cut (crash.wac's `torn` mode): the log's appends are not synced, so it can lose every block since its last
+// write to the disk, while the store, synced at each commit, has them all. Five blocks, each finalized as it comes
+// (so the store cannot be taken back below them), and a log that kept only the first.
+async string runLostTail() {
+  Check t = Check.create();
+  Genesis gen = genesis();
+  MemDisk md = MemDisk.create();
+  StateDb db = StateDb.over((await Store.open(md.disk())).unwrap());
+  string[] why = [""];
+  u8[] at = u8[].filled(40, 0);
+  at.copyFrom(gen.header.hash.toBytes(), 0, 0, 32);
+  t.ok((await db.seed(gen.world, at, why)) is not null, "the genesis into the store");
+  Engine e = Engine.onStore(gen.config, gen.header, db);
+  i32 afterFirst = 0;
+  U256 fifth = U256.zero();
+  for (i32 i = 1; i <= 5; i++) {
+    JsonValue? p = await build(e, 12 * i);
+    t.ok(p is not null, "block \{i} built");
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p!)), "VALID", "block \{i} imports");
+    t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", finalizing(hashOf(p!), hashOf(p!), JsonValue.Null))), "VALID",
+            "and is the head, finalized");
+    if (i == 1) { afterFirst = e.records.len(); }
+    fifth = hashOf(p!);
+  }
+  u8[] log = logOf(e, afterFirst);
+
+  StateDb again = StateDb.over((await Store.open(md.disk())).unwrap());
+  Engine r = Engine.onStore(gen.config, gen.header, again);
+  t.ok(r.resumeFromStore() && r.restoredNumber.eq(U256.ofI32(5)), "the store holds block 5: \{r.restoredNumber.toDecimal()}");
+  t.eqStr((await r.replay(log)).error, "", "the log, ending at block 1, replays");
+  t.ok(await r.adoptStored(), "block 5 is taken from the store");
+  t.ok(r.head.eq(fifth), "and blocks 2 to 4 with it, so the head is block 5, not the log's block 1: \{r.headHeader().number.toDecimal()}");
+  t.ok(r.records.len() >= 5, "blocks 2 to 5 and the head recorded for the log: \{r.records.len()} records");
+  JsonValue? sixth = await build(r, 72);
+  t.ok(sixth is not null, "block 6 built on it");
+  t.eqStr(statusOf(await call(r, "engine_newPayloadV4", sixth!)), "VALID", "and imported");
+  return t.report();
+}
+
+export async string test_a_log_that_lost_its_tail_to_a_power_cut(Sys sys) { return await runLostTail(); }
+
 // ── Reorgs after a restart: the store taken back across blocks it holds, by their undo records ──
 
 /** A node on `md`'s store, started as the node starts: the store's block, the log replayed, a missing block adopted. */

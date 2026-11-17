@@ -1951,9 +1951,49 @@ export struct Engine {
     if (this.restoredAt is null || this.restoredLogged || !this.blocks.has(this.restoredAt!)) { return false; }
     u8[]? raw = await this.db!.store.chunks(blockKey(this.restoredAt!));
     if (raw is null) { return false; }
+    // Its ancestors the log lost too, from the store (each block's commit keeps it, and none is deleted). The log's
+    // appends are not synced, so after a power cut it can end blocks before the store does — every block since its
+    // last write to the disk gone (crash.wac's `torn` mode: a run of five) — and the store's block, its parent
+    // unknown, was connected to nothing: the head stayed at the log's last, and each payload given again was
+    // SYNCING for good. Recorded oldest first, so the log is whole again.
+    Vec<u8[]> lost = Vec.create();
+    U256 p = this.blocks.get(this.restoredAt!)!.header.parentHash;
+    while (!this.blocks.has(p)) {
+      u8[]? pr = await this.db!.store.chunks(blockKey(p));
+      if (pr is null) { break; }
+      Spec ps = this.config.specAt(blockTimestamp(pr!));
+      BlockDecode pd = decodeBlock(ps, pr!);
+      if (pd.block is null || !pd.block!.header.hash.eq(p)) { break; }
+      this.adopt(ps, pd.block!);
+      await this.loadUndo(pd.block!.header);
+      u8[]? kept = await this.db!.store.chunks(receiptsKey(p));
+      Archived? a = this.archive.get(p);
+      if (kept is not null && a is not null) { a!.receipts = receiptsOf(kept!); }
+      lost.push(pr!);
+      p = pd.block!.header.parentHash;
+    }
+    for (i32 i = lost.len() - 1; i >= 0; i--) { this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(lost.get(i))]))); }
     this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(raw!)])));
     this.restoredLogged = true;
+    // And the head the log had, when it is an ancestor of the store's block, moved up to it: the store's block is
+    // one this node called VALID and built on, and below it the store cannot go once finality has passed — so a
+    // consensus client told the old head would give again blocks this node cannot run.
+    if (lost.len() > 0 && this.descends(this.restoredAt!, this.head)) { this.choose(this.restoredAt!, this.safe, this.finalized); }
     return true;
+  }
+
+  /** Whether `a` is `b` or descends from it, by the blocks held. */
+  bool descends(this, U256 a, U256 b) {
+    Node? n = this.blocks.get(a);
+    Node? anc = this.blocks.get(b);
+    if (n is null || anc is null) { return false; }
+    Header cur = n!.header;
+    while (cur.number.gt(anc!.header.number)) {
+      Node? up = this.blocks.get(cur.parentHash);
+      if (up is null) { return false; }
+      cur = up!.header;
+    }
+    return cur.hash.eq(b);
   }
 
   /** The head's header. */

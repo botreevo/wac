@@ -103,3 +103,19 @@ export string backReference() {
 copy that overlaps what it is writing repeats the pattern — the shape an LZ77 back-reference needs.
 
 `[§wac-buf-drop-front-mevddnn]` `dropFront(n)` removes the first `n` bytes, moving the rest to the front.
+
+```wac
+// expect: erased() = "ab"
+import { Buf } from "core";
+
+export string erased() {
+  Buf b = Buf.create();
+  b.pushAll(['a', 'b', 'c', 'd']);
+  b.truncate(9);                           // past the end: nothing changes
+  b.truncate(2);                           // keep the first 2 bytes
+  return b.toStr();
+}
+```
+
+`[§wac-buf-truncate-r7kw2qe]` `truncate(n)` keeps the first `n` bytes and forgets the rest; the bytes kept do not
+move. An `n` at or past the length changes nothing, and one below zero empties the buffer.

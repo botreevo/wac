@@ -85,14 +85,20 @@ rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getProof\",\"params\":[\"$re
 lc --block "$work/block.json" --proof "$work/proof.json" --ens "$name" --contenthash "$work/contenthash.json" \
   --version "$version" | tee "$work/content.out" | grep -E '^(content|  )'
 
-# The content itself, from a public trustless gateway (GATEWAY, default https://trustless-gateway.link; GATEWAY= to
-# stop at the CID): the whole DAG as one CAR, then `obj import-car`, which keeps a block only if it hashes to its CID,
-# and `obj ls`, which reads the tree from those blocks alone. The gateway is trusted for nothing but being there.
+# The content itself, from a public trustless gateway (GATEWAYS, default trustless-gateway.link, ipfs.io and dweb.link,
+# the first that answers; GATEWAYS= to stop at the CID): the whole DAG as one CAR (redirects followed), then
+# `obj import-car`, which keeps a block only if it hashes to its CID, and `obj ls`, which reads the tree from those
+# blocks alone. A gateway is trusted for nothing but being there.
 cid=$(sed -n 's/^content .*→ ipfs:\/\/\([a-zA-Z0-9]*\).*/\1/p' "$work/content.out" | head -1)
-gateway=${GATEWAY-https://trustless-gateway.link}
-[ -n "$cid" ] && [ -n "$gateway" ] || exit 0
-code=$(curl -sS -m 600 -H 'Accept: application/vnd.ipld.car' -o "$work/content.car" -w '%{http_code}' "$gateway/ipfs/$cid?dag-scope=all" || true)
-if [ "$code" != 200 ]; then echo "gateway $gateway answered HTTP ${code:-nothing} for $cid: content not fetched" >&2; exit 1; fi
+gateways=${GATEWAYS-https://trustless-gateway.link https://ipfs.io https://dweb.link}
+[ -n "$cid" ] && [ -n "$gateways" ] || exit 0
+gateway=""
+for g in $gateways; do
+  code=$(curl -sS -L -m 600 -H 'Accept: application/vnd.ipld.car' -o "$work/content.car" -w '%{http_code}' "$g/ipfs/$cid?dag-scope=all" || true)
+  if [ "$code" = 200 ]; then gateway=$g; break; fi
+  echo "gateway $g answered HTTP ${code:-nothing} for $cid" >&2
+done
+if [ -z "$gateway" ]; then echo "no gateway answered for $cid: content not fetched" >&2; exit 1; fi
 wac build --quiet --allow-read --allow-write packages/ipfs/cmd/obj.wac -o "$work/obj"
 wac "$work/obj.wasm" import-car "$work/content.car" --store "$work/content" >/dev/null
 echo "content: $cid, $(wc -c < "$work/content.car") bytes of CAR from $gateway, every block checked; $(wac "$work/obj.wasm" ls "$cid" --store "$work/content" | wc -l) file(s)"

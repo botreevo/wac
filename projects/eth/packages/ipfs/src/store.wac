@@ -101,10 +101,26 @@ export struct Store {
         bool block = p.indexOf("ipfs/") == 0;
         string url = base + "/" + p + (block ? "?format=raw" : "");
         string[] headers = block ? ["Accept: application/vnd.ipld.raw"] : string[]();
-        match (fetchWithin(caps, "GET", url, headers, u8[](), timeoutMs)) {
-          Err(_): { down = true; return none; }
-          Ok(res): { if (res.status >= 500) { down = true; } return res.status == 200 ? res.body : none; }
+        // A gateway may send the request elsewhere: ipfs.io and dweb.link answer 301 with the same path on a subdomain
+        // gateway (`CID.ipfs.dweb.link`). Followed, at most four times and only to https, since whatever answers is
+        // re-hashed by `get` like any block, so where the bytes come from changes nothing about trusting them.
+        for (i32 hop = 0; hop < 5; hop++) {
+          match (fetchWithin(caps, "GET", url, headers, u8[](), timeoutMs)) {
+            Err(_): { down = true; return none; }
+            Ok(res): {
+              bool moved = res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307 || res.status == 308;
+              string to = string.fromBytes(res.headers.first("Location"));
+              if (moved && to != "" && hop < 4) {
+                url = redirectTo(url, to);
+                if (url.indexOf("https://") != 0) { return none; }
+                continue;
+              }
+              if (res.status >= 500) { down = true; }
+              return res.status == 200 ? res.body : none;
+            }
+          }
         }
+        return none;
       },
       (string p, u8[] b) => false);
   }
@@ -153,6 +169,22 @@ export struct Store {
   }
 
   bool has(this, Cid c) { return this.read("ipfs/" + c.text()) is not null; }
+}
+
+/** Where a redirect's `Location` points, from the URL that answered with it: absolute, from the origin, or beside it. */
+export string redirectTo(string from, string location) {
+  if (location.indexOf("https://") == 0 || location.indexOf("http://") == 0) { return location; }
+  i32 scheme = from.indexOf("://") + 3;
+  string rest = from.slice(scheme, from.len());
+  i32 slash = rest.indexOf("/");
+  string origin = slash < 0 ? from : from.slice(0, scheme + slash);
+  if (location.indexOf("/") == 0) { return origin + location; }
+  string path = slash < 0 ? "/" : rest.slice(slash, rest.len());
+  i32 q = path.indexOf("?");
+  if (q >= 0) { path = path.slice(0, q); }
+  i32 last = 0;
+  for (i32 i = 0; i < path.len(); i++) { if (path.slice(i, i + 1) == "/") { last = i; } }
+  return origin + path.slice(0, last + 1) + location;
 }
 
 /** Whether a mirror is named by URL (`http://` or `https://`) rather than as a directory. */

@@ -13,8 +13,8 @@
 #                 double-compiling, the `agree` rule)
 #
 # Ports from PORT (8830): the devnet, the mirror over HTTP, the recorded beacon and execution nodes. 4b fetches
-# vitalik.eth's content from a public trustless gateway (GATEWAY, default https://trustless-gateway.link; GATEWAY= to
-# skip), and says so, counting nothing, when the gateway does not answer.
+# vitalik.eth's content from public trustless gateways (GATEWAYS, default trustless-gateway.link, ipfs.io and dweb.link;
+# GATEWAYS= to skip), each answering one a mirror, and says so, counting nothing, when none answers.
 # Needs: wac on PATH, node with tools/oracle's packages installed, python3, curl, git.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -222,19 +222,24 @@ expect refused "the claims mirror does not hold its content" "no source has" -- 
 # The content from a public trustless gateway (decision G): `claim run --out`, so the same command admits it and fetches
 # it, every block from the gateway checked against its CID, and writes the tree out. The gateway is trusted for nothing
 # but being there; a gateway that is not there is reported, and counts neither way.
-gateway=${GATEWAY-https://trustless-gateway.link}
-if [ -n "$gateway" ]; then
-  code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H 'Accept: application/vnd.ipld.raw' "$gateway/ipfs/$vitalik?format=raw" || true)
-  if [ "$code" = 200 ]; then
-    expect ok "claim run ens:vitalik.eth --out: admitted, then its content from $gateway, every block checked" "ADMITTED" -- \
-      $CL run ens:vitalik.eth site --policy mainnet/policy.json5 --store client-mainnet $M --mirror "$gateway" --out mainnet/site \
-        --checkpoint 0xa8356934e2fba13cb82917ea04203c75ca84bb735cefe3cf2f35976628e1e937 --beacon-url http://127.0.0.1:$bport --now 15630000 --rpc 127.0.0.1:$eport
-    n=$(find mainnet/site -type f 2>/dev/null | wc -l)
-    [ "$n" -gt 0 ] && ok "the site written out from checked blocks: $n file(s), $(du -sh mainnet/site | cut -f1)" || bad "nothing written out"
-    expect ok "and now the client's own store has it: no mirror needed" -- $O ls "$vitalik" --store client-mainnet
-  else
-    echo "   SKIP ($gateway answered HTTP ${code:-nothing} for the raw block: content not fetched, nothing counted)"
-  fi
+# ipfs.io and dweb.link answer a raw block request with a redirect (to trustless-gateway.link, or a subdomain gateway),
+# which the store follows: whoever answers in the end is re-hashed like any mirror.
+gateways=${GATEWAYS-https://trustless-gateway.link https://ipfs.io https://dweb.link}
+answering=""
+for g in $gateways; do
+  code=$(curl -s -L -m 15 -o /dev/null -w '%{http_code}' -H 'Accept: application/vnd.ipld.raw' "$g/ipfs/$vitalik?format=raw" || true)
+  if [ "$code" = 200 ]; then answering="$answering $g"; else echo "   gateway $g answered HTTP ${code:-nothing} for the raw block"; fi
+done
+if [ -n "$answering" ]; then
+  gm=$(for g in $answering; do printf -- '--mirror %s ' "$g"; done)
+  expect ok "claim run ens:vitalik.eth --out: admitted, then its content from$answering, every block checked" "ADMITTED" -- \
+    $CL run ens:vitalik.eth site --policy mainnet/policy.json5 --store client-mainnet $M $gm --out mainnet/site \
+      --checkpoint 0xa8356934e2fba13cb82917ea04203c75ca84bb735cefe3cf2f35976628e1e937 --beacon-url http://127.0.0.1:$bport --now 15630000 --rpc 127.0.0.1:$eport
+  n=$(find mainnet/site -type f 2>/dev/null | wc -l)
+  [ "$n" -gt 0 ] && ok "the site written out from checked blocks: $n file(s), $(du -sh mainnet/site | cut -f1)" || bad "nothing written out"
+  expect ok "and now the client's own store has it: no mirror needed" -- $O ls "$vitalik" --store client-mainnet
+elif [ -n "$gateways" ]; then
+  echo "   SKIP (no gateway answered for the raw block: content not fetched, nothing counted)"
 fi
 
 step "5. what it refuses"

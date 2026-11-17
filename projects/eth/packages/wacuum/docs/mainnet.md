@@ -215,9 +215,14 @@ from the head if it has fallen more than 64 behind (and after a rotation, from t
 `install.sh` again — it pulls wac-eth, moves wac to its pin if it moved, reruns the tests — then
 `systemctl restart wacuum-shadow`.
 
-Tested here (2026-11-17, a container, not the box): `preflight.sh` on Ubuntu 24.04; `install.sh` end to end up
-to the systemd steps (no systemd in the container); the units through `systemd-analyze verify`; `follow.sh` and
-`status.sh` against a hosted mainnet endpoint (block 26 432 160: ok, 145 ms, 133 Mgas/s), metrics written.
+Tested here (2026-11-17, an Ubuntu 24.04 container, not the box): `preflight.sh`; `install.sh` end to end, twice
+(install, then upgrade), up to the systemd steps the container cannot run — wac built at the pin, wacuum's 26
+unit-test files passing as the `wacuum` user; the units through `systemd-analyze verify`; logrotate's rule through
+`logrotate -d`; `follow.sh` and `status.sh` against a hosted mainnet endpoint (block 26 432 160: ok, 145 ms,
+133 Mgas/s), the metrics file written by `wacuum` and served by node_exporter. Installing found three things, now
+fixed: the pinned wac commit was not on GitHub yet (fetched from git.voltrevo.com when so); nor was the wac-web
+commit wac's own lock names (`tools/deps.sh` does the same); and a second run — an upgrade — stopped at `git
+pull`, root's git refusing the checkout the service user owns.
 
 ## What is needed from Andrew when the machine is ready
 

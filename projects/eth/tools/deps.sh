@@ -54,7 +54,15 @@ while read -r url commit; do
   [ -f "$dest/pack.pack" ] && continue
   tmp=$(mktemp -d)
   git -C "$tmp" init -q
-  git -C "$tmp" fetch -q --depth 1 "$url" "$commit"
+  # A github.com/voltrevo pin is fetched from git.voltrevo.com when GitHub does not have it (yet): the owner pushes
+  # there first and syncs GitHub after, as wac's own fetcher assumes (wac's `packages/wacpkg/src/mirror.wac`).
+  # wac's lock names wac-web at a859d17 on GitHub, which GitHub did not have on 2026-11-17.
+  if ! git -C "$tmp" fetch -q --depth 1 "$url" "$commit"; then
+    mirror=$(printf '%s' "$url" | sed -n 's|^https://github.com/voltrevo/|https://git.voltrevo.com/|p')
+    [ -n "$mirror" ] || exit 1
+    echo "deps: $commit is not at $url; fetching it from $mirror" >&2
+    git -C "$tmp" fetch -q --depth 1 "$mirror" "$commit"
+  fi
   mkdir -p "$dest"
   git -C "$tmp" archive "$commit" | tar -x -C "$dest"
   touch "$dest/pack.pack"     # the cache's "this checkout is complete" marker

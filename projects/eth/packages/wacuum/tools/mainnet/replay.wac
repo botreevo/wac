@@ -20,7 +20,7 @@
 import { Sys } from "std";
 import { Map, Vec } from "core";
 import { json.parse, json.JsonValue, json.JsonArray } from "wac";
-import { rlp.Item } from "@/lib.wac";
+import { rlp.Item, rlp.encode, rlp.bytesOf, rlp.isList } from "@/lib.wac";
 import { keccak256 } from "../../src/crypto/keccak.wac";
 import { U256 } from "../../src/u256.wac";
 import { hexToBytes, bytesToHex } from "../../src/hex.wac";
@@ -31,7 +31,7 @@ import { fileDisk } from "../../src/store/file.wac";
 import { Disk } from "../../src/store/disk.wac";
 import { StateDb, Staged } from "../../src/store/state.wac";
 import { executeFrom, Steps } from "../../src/store/exec.wac";
-import { Header, Block, Withdrawal, Body, executeBlock, executeBody } from "../../src/chain/block.wac";
+import { Header, Block, Withdrawal, Body, Receipt, executeBlock, executeBody } from "../../src/chain/block.wac";
 import { BlockEnv } from "../../src/evm/evm.wac";
 import { blobGasPrice } from "../../src/tx/process.wac";
 import { SenderCache } from "../../src/tx/decode.wac";
@@ -194,6 +194,50 @@ async Run runRange(Sys sys, Cache cache, ChainConfig config, Block[] blocks, Hea
   return Run(errors, gas, txs, (await sys.monotonicNanos()) - t0);
 }
 
+/**
+ * `--hold K`: what a block of history costs in memory, as the node keeps it (`--history`: the header, the
+ * transactions and the receipts of each finalized block it holds). The range run K more times, every block and its
+ * receipts kept, and the growth of resident memory divided by the blocks kept. Rough: resident memory also holds
+ * what the collector has not yet taken back, so this errs high.
+ */
+async void holding(Sys sys, Cache cache, ChainConfig config, Block[] range, Header first, Map<U256, U256> hashes, i32 k) {
+  i64 before = await rssKb(sys);
+  Vec<Block> blocks = Vec.create();
+  Vec<Receipt[]> receipts = Vec.create();
+  for (i32 pass = 0; pass < k; pass++) {
+    World w = World.create();
+    w.backBy(cache.source());
+    Header parent = first;
+    Map<U256, U256> hs = copyOf(hashes);
+    for (i32 i = 0; i < range.len(); i++) {
+      // A fresh copy of the block each pass, decoded again, as each block the node holds is its own.
+      Block b = range[i];
+      Item[] txs = Item[].filled(b.txs.len(), Item.Bytes(u8[].filled(0, 0)));
+      for (i32 j = 0; j < txs.len(); j++) { txs[j] = txItem(isList(b.txs[j]) ? encode(b.txs[j]) : bytesOf(b.txs[j]))!; }
+      Block copy = Block(b.header, txs, false, b.withdrawals);
+      Body r = executeBlock(config.specAt(b.header.timestamp), w, copy, parent, config.chainId, hs, null);
+      blocks.push(copy);
+      receipts.push(r.receipts);
+      hs.set(b.header.number, b.header.hash);
+      parent = b.header;
+    }
+  }
+  i64 after = await rssKb(sys);
+  i64 held = (blocks.len() as i64);
+  sys.log("held \{held} blocks with their receipts: resident memory \{before / 1024} → \{after / 1024} MB, about \{(after - before) / held} KB a block");
+}
+
+async i64 rssKb(Sys sys) {
+  string s = string.fromBytes((await sys.readFile("/proc/self/status")).ok()!);
+  i32 at = s.indexOf("VmRSS:");
+  i64 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = at + 6; i < b.len() && b[i] != 107; i++) {
+    if (b[i] >= 48 && b[i] <= 57) { n = n * 10 + ((b[i] - 48) as i64); }
+  }
+  return n;
+}
+
 /** An address as 0x and forty hex digits. */
 string addrHex(U256 a) {
   u8[] b = a.toBytes();
@@ -281,8 +325,10 @@ export async i32 main(Sys sys) {
   // Go on to the timed runs (and --store) though the state is not all fetched, what is missing read as empty:
   // for measuring the reads of a long range, whose last few rounds of learning find little.
   bool anyway = false;
+  i32 hold = 0;
   for (i32 i = 0; i + 1 < args.len(); i++) {
     if (args[i] == "--dir") { dir = args[i + 1]; }
+    if (args[i] == "--hold") { hold = num(args[i + 1]) as! i32; }
     if (args[i] == "--store") { storePath = args[i + 1]; }
     if (args[i] == "--keys") { keysPath = args[i + 1]; }
   }
@@ -393,6 +439,7 @@ export async i32 main(Sys sys) {
     sys.log("\{range.len()} blocks from \{from}, \{r.txs} transactions, \{r.gas / 1000000} Mgas in \{us / 1000} ms \{how}: \{mgas} Mgas/s");
   }
   sys.log(bad == 0 ? "every block matches its header but for the state root" : "\{bad} block(s) differ from their headers");
+  if (hold > 0) { await holding(sys, cache, g.config, range, first!, hashes, hold); }
   if (storePath != "") { await onStore(sys, storePath, keysPath, cache, g.config, range, first!, copyOf(hashes)); }
   return bad == 0 ? 0 : 1;
 }

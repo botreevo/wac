@@ -103,7 +103,7 @@ and a file the self-host check builds (`bootstrap/drivers/selfcheck.wac` and wha
 text with `+` rather than `"\{x}"`, whose lowering needs a host import the check does not provide.
 Every other string in `check.wac` is concatenated for that reason.
 
-**`wac task check:l5` asks all three in a few seconds** (`tools/l5subset.ts`), at the file and line,
+**`wac task check:l5` asks all three in a few seconds** (`tools/wac/l5subset.wac`), at the file and line,
 where the full gate's `l5.test.ts` and `selfhost.test.ts` answer an hour later at a line of the
 flattened graph. Run it after editing anything here.
 

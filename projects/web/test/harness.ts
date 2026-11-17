@@ -38,15 +38,24 @@ export async function buildModule(entry: string, out: string): Promise<void> {
 export async function buildPage(entry: string, outDir: string, extra: string[] = []): Promise<string> {
   const name = entry.replace(/^.*\//, "").replace(/\.wac$/, "") + (extra.includes("--in-page") ? "-inpage" : "");
   const built = `.cache/pages/${name}`;
-  const out = await new Deno.Command(WAC, {
-    args: [
-      "run", "--allow-read", "--allow-write", "--allow-run", "tools/build.wac",
-      entry, built, "--page", "./src/page.wac", "--wac", WAC, ...extra,
-    ],
-    cwd: ROOT,
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
+  let out: Deno.CommandOutput;
+  try {
+    out = await new Deno.Command(WAC, {
+      args: [
+        "run", "--allow-read", "--allow-write", "--allow-run", "tools/build.wac",
+        entry, built, "--page", "./src/page.wac", "--wac", WAC, ...extra,
+      ],
+      cwd: ROOT,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+  } catch (e) {
+    // A machine with no `wac` on PATH said only *Failed to spawn 'wac': entity not found*, nine times over.
+    if (e instanceof Deno.errors.NotFound) {
+      throw new Error(`no \`${WAC}\` to build ${entry} with: put wac on PATH, or set WAC to a wac binary`);
+    }
+    throw e;
+  }
   if (!out.success) {
     const said = new TextDecoder().decode(out.stderr) + new TextDecoder().decode(out.stdout);
     throw new Error(`building ${entry} as a page failed:\n${said}`);

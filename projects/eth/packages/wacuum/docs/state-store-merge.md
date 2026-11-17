@@ -1,7 +1,7 @@
 # Merging `state-store` — what it changes, how it is tested, what is not (2026-11-13, brought up to date 2026-11-17)
 
-For Andrew, deciding whether `state-store` goes into master — approved 2026-11-17. It is 85 commits ahead of master
-and none behind, so it fast-forwards. Outside `packages/wacuum` it changes three lines: the wac pin (`wac.lock`), the
+For Andrew, deciding whether `state-store` goes into master — approved 2026-11-17. It is 88 commits ahead of master
+(master merged in once, 2026-11-17, for its wac pin and the reckon work), and none behind, so it fast-forwards. Outside `packages/wacuum` it changes three lines: the wac pin (`wac.lock`), the
 unit-test task's grant (`tasks.json5`), and one line of the devnet (`e.replay` is awaited now).
 
 ## What it is
@@ -47,7 +47,8 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   for node; the JSON-RPC a wallet uses, on the store, with one block of history in memory and the rest read from
   disk, across a restart (`rpc.wac --store`); the devnet suite.
 - **Memory** (`tools/e2e/soak.wac`): 2400 blocks of 300–500 new slots each under `wac --max-heap 256m`, commits
-  batched 64 blocks at a time — the store grew to 714 MB, resident memory stayed at 269–319 MB. Before this branch's
+  batched 64 blocks at a time, undo records pruned past their 1 024-block bound from block 1 025 — the store grew to
+  765 MB, resident memory stayed at 215–339 MB. Before this branch's
   fixes the same run grew ~0.75 MB a block.
 - **Scale** (`tools/measure/scale.wac`): a synthetic store filled to 5 GB (as much as this container's disk
   allows with a margin) — 4.4M accounts and 438 contracts of 20 000 slots, in 219 snap-sized batches — probed
@@ -133,8 +134,12 @@ Each has a test that fails without its fix.
   start.
 - Payload statuses named a hash with a leading zero nibble shortened; consensus clients cannot read it, so one block
   in 16 failed and a follower stopped for good.
+- Pruning undo records trapped the node ~400 blocks after it began (the merge gate's soak, block ~1 400): the prune's
+  range loaded cold leaves, queuing each with its parent to be let go later, then deleted every key under them; the
+  emptied parent left the tree, and letting go read a kid of a node with none. `wac run` says only "trapped": run
+  as a child (`Child.ended()` gives the kind) with checked reads in `tree.wac`, it named the line.
 
-The first three are in the same 150 lines of `tree.wac` (leaves in memory, letting them go, commits); that code
+The first three, and the last, are in the same 150 lines of `tree.wac` (leaves in memory, letting them go, commits); that code
 has had the most bugs and the most new tests, and is where a reviewer's time is best spent.
 
 ## Risks
@@ -165,7 +170,13 @@ only); real blobs' KZG work; Prysm and Lighthouse on one chain.
 
 ## Where it stands, and what is next
 
-Approved 2026-11-17 and merged into master as a fast-forward, after the gate below. Next, in order:
+Approved 2026-11-17 and merged into master as a fast-forward, after the gate, run on the merge of master into the
+branch with wac at `aaef775ca` (master's pin; the branch had been tested at `424e0273b`): `wac task check` clean; the
+wacuum unit tests, 25 files; every fixture set in memory (Cancun, Prague, Osaka: state, block, engine, build; the six
+fork transitions) and on a cold store (block and engine), 0 failed; snap from one geth and healing from three;
+`rpc.wac` with and without `--store`; the devnet; `crash.wac` committing every block and every 64; the 2400-block
+soak. The one failure in the whole repository's unit tests is the ethers column of `packages/abi`'s table of the
+real tools, which needs `deno`, absent here. Next, in order:
 
 1. **The follower soak** — `tools/e2e/clsoak.wac`: geth builds under Lighthouse, wacuum follows on a store (flush 64,
    heap capped) under its own Lighthouse, with transfers, a blob block every ten minutes, a kill every 20–40

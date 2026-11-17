@@ -73,8 +73,8 @@ Each drive takes a few minutes: about 2½ on V8 and 5 on wasmtime. wacc is drive
 
 ## What it does not do yet
 
-- **The capstone is still rooted at the seed.** Milestone 5 roots its policy here instead: its compiler is derived
-  through this drive output, and the fixed-point rounds (`wasm-gc/wac-host/3`) follow from it.
+- **The capstone uses it** (milestone 5). With LADDER, the capstone's compiler is built by this drive's output, and
+  its policy has no roots (docs/capstone.md, "Rooted at sources").
 - **The tree is endorsed whole.** A reviewer endorses the copy of wac's checkout the drive reads, not each file the
   program reaches.
 - **The runners are host programs**, as for the other host-run machines. Two of them, on two engines, must agree.

@@ -187,6 +187,32 @@ Lighthouse beside a geth reference: `docs/hoodi.md` and `deploy/hoodi/`.)
    '{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}'` answers `false` when it is done.
 4. **The shadow**: `systemctl enable --now wacuum-shadow wacuum-status.timer`.
 
+### Access to the pinned commits
+
+The install fetches three things by commit: wac-eth itself, wac at the commit wac-eth's `wac.lock` pins, and what
+wac's own lock pins (wac-web). Pins name GitHub, and the owner pushes to git.voltrevo.com first and syncs GitHub
+after — so a fresh pin is often on git.voltrevo.com alone (on 2026-11-17 neither wac `aaef775ca` nor wac-web
+`a859d17` was on GitHub). `install.sh` and `tools/deps.sh` fetch a pin GitHub lacks from git.voltrevo.com, and
+wac-eth comes from there in any case — but **git.voltrevo.com is not public**: it needs credentials, which this
+project's development containers get from a proxy and a fresh box does not have. One of two things is needed:
+
+- **(a) Read credentials for git.voltrevo.com on the box.** An access token for an account that can read
+  `wac`, `wac-web` and `wac-eth`, as one line in `/etc/eth/git-credentials`, before `install.sh` runs:
+
+      mkdir -p /etc/eth && install -m 600 /dev/null /etc/eth/git-credentials
+      echo 'https://USER:TOKEN@git.voltrevo.com' > /etc/eth/git-credentials
+
+  `install.sh` makes it readable by the `wacuum` user and points git at it for every user
+  (`git config --system credential.https://git.voltrevo.com.helper "store --file /etc/eth/git-credentials"`),
+  so root's clones and the service user's `tools/deps.sh` both use it, at install and at every upgrade. (An SSH
+  deploy key would need every URL rewritten to SSH; the token keeps the URLs as they are.)
+- **(b) The pinned commits on GitHub.** Andrew pushes wac at the pin (and wac-web at wac's pin) to
+  github.com/voltrevo, and wac-eth too, then runs `install.sh https://github.com/voltrevo/wac-eth.git`. Nothing
+  else changes; the next pin move needs the same again.
+
+`preflight.sh` says which: it fetches each of the four commits from here, as the install will, and FAILs naming any
+it cannot get (`pinned: wac aaef775… is at neither … nor git.voltrevo.com`).
+
 ### What it writes, and where to look
 
 - **The log**, `/data/wacuum/follow.log`: `N ok MS ms MGAS Mgas/s` a block, or `N DIFFERS … — why`. Rotated weekly,
@@ -270,9 +296,10 @@ its own, or the box has 64 GB. The memory figures to take on the day: `systemctl
 - [ ] RAM 32 GB, 4 cores / 8 threads or better.
 - [ ] Inbound ports open: 30303 tcp+udp (execution p2p), 9000 tcp+udp (consensus p2p). Nothing else
       inbound; every RPC listens on 127.0.0.1.
-- [ ] Outbound HTTPS to github.com, sh.rustup.rs, static.rust-lang.org, crates.io, git.voltrevo.com (wac-eth;
-      read access without credentials, or a deploy key), and the checkpoint sync URL
-      (mainnet.checkpoint.sigp.io, or another of the public ones). `preflight.sh` checks each.
+- [ ] Outbound HTTPS to github.com, sh.rustup.rs, static.rust-lang.org, crates.io, git.voltrevo.com, and the
+      checkpoint sync URL (mainnet.checkpoint.sigp.io, or another of the public ones). `preflight.sh` checks each.
+- [ ] Access to the pinned commits: a read token for git.voltrevo.com in `/etc/eth/git-credentials`, or the pins
+      pushed to GitHub ("Access to the pinned commits", above). `preflight.sh` checks each pinned commit.
 - [ ] Choice of reference clients: reth + Lighthouse is assumed (reth serves the `debug_` tracers the
       shadow uses); geth + Lighthouse works as well.
 - [ ] Whether the machine may also run wacuum's own p2p (port 30304) once B begins.

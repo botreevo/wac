@@ -22,6 +22,10 @@ there for good.
 
 ## Day one
 
+0. **Access**: git.voltrevo.com is not public — put a read token in `/etc/eth/git-credentials`, or have the pinned
+   commits pushed to GitHub, as `docs/mainnet.md` says ("Access to the pinned commits"); `sh
+   deploy/mainnet/preflight.sh` checks that every pinned commit can be fetched.
+
 1. **Install** — about 20 minutes, most of it building wac:
 
        sh /path/to/wac-eth/packages/wacuum/deploy/hoodi/install.sh LIGHTHOUSE_VERSION

@@ -29,6 +29,14 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 id wacuum >/dev/null 2>&1 || useradd --system --create-home --home-dir /home/wacuum --shell /usr/sbin/nologin wacuum
+# Read access to git.voltrevo.com, which is not public, for root and the service user alike: a line
+# https://USER:TOKEN@git.voltrevo.com in /etc/eth/git-credentials, if it is there (docs/mainnet.md, "Access to the
+# pinned commits"). Without it, every pinned commit must be on GitHub.
+if [ -f /etc/eth/git-credentials ]; then
+  chown root:wacuum /etc/eth/git-credentials
+  chmod 640 /etc/eth/git-credentials
+  git config --system credential.https://git.voltrevo.com.helper "store --file /etc/eth/git-credentials"
+fi
 mkdir -p /data/reth /data/lighthouse /data/wacuum /data/wacuum/differs /opt
 chown wacuum:wacuum /data/wacuum /data/wacuum/differs
 

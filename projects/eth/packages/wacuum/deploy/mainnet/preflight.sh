@@ -68,5 +68,51 @@ for url in https://github.com/voltrevo/wac.git/info/refs?service=git-upload-pack
   esac
 done
 
+# Every commit the install fetches, fetched now, with this machine's own credentials: wac-eth (WAC_ETH_URL), wac at
+# the commit wac-eth's wac.lock pins, and each import wac's own lock pins (wac-web). A github.com/voltrevo pin is tried
+# on GitHub and then on git.voltrevo.com, as install.sh and tools/deps.sh fetch it. git.voltrevo.com is not public:
+# without read credentials there (docs/mainnet.md, "Access to the pinned commits"), a pin GitHub lacks cannot be had.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+# A commit at a URL, or at its git.voltrevo.com mirror: which one served it, or nothing.
+fetchable() {
+  url=$1
+  commit=$2
+  d="$tmp/$(printf '%s' "$url$commit" | md5sum | cut -c1-12)"
+  git init -q "$d"
+  if GIT_TERMINAL_PROMPT=0 git -C "$d" fetch -q --depth 1 "$url" "$commit" 2>/dev/null; then echo "$url"; return; fi
+  mirror=$(printf '%s' "$url" | sed -n 's|^https://github.com/voltrevo/|https://git.voltrevo.com/|p')
+  if [ -n "$mirror" ] && GIT_TERMINAL_PROMPT=0 git -C "$d" fetch -q --depth 1 "$mirror" "$commit" 2>/dev/null; then echo "$mirror"; fi
+}
+# The commit field of an import named NAME in a wac.lock (the lock as one line; an entry holds no braces).
+pinOf() { tr '\n' ' ' < "$2" | sed -n "s/.*\"$1\" *: *{[^}]*\"commit\" *: *\"\([0-9a-f]\{40\}\)\".*/\1/p"; }
+urlOf() { tr '\n' ' ' < "$2" | sed -n "s/.*\"$1\" *: *{[^}]*\"git\" *: *\"\([^\"]*\)\".*/\1/p"; }
+
+ethUrl=${WAC_ETH_URL:-https://git.voltrevo.com/wac-eth.git}
+if GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "$ethUrl" "$tmp/wac-eth" 2>/dev/null; then
+  pass "pinned: wac-eth from $ethUrl"
+  wacPin=$(pinOf wac "$tmp/wac-eth/wac.lock")
+  wacUrl=${WAC_URL:-https://github.com/voltrevo/wac.git}
+  from=$(fetchable "$wacUrl" "$wacPin")
+  if [ -n "$from" ]; then
+    pass "pinned: wac $wacPin from $from"
+    # wac's own imports, from its lock at that commit.
+    d="$tmp/$(printf '%s' "$wacUrl$wacPin" | md5sum | cut -c1-12)"
+    git -C "$d" show "$wacPin:wac.lock" > "$tmp/wac.lock" 2>/dev/null
+    for name in web webbuild; do
+      u=$(urlOf "$name" "$tmp/wac.lock")
+      c=$(pinOf "$name" "$tmp/wac.lock")
+      [ -n "$c" ] || continue
+      got=$(fetchable "$u" "$c")
+      if [ -n "$got" ]; then pass "pinned: wac's $name $c from $got"
+      else fail "pinned: wac's $name $c is at neither $u nor its git.voltrevo.com mirror (from here)"; fi
+    done
+  else
+    fail "pinned: wac $wacPin is at neither $wacUrl nor git.voltrevo.com (from here) — see docs/mainnet.md, \"Access to the pinned commits\""
+  fi
+else
+  fail "pinned: wac-eth cannot be cloned from $ethUrl (from here) — see docs/mainnet.md, \"Access to the pinned commits\""
+fi
+
 [ "$failed" -eq 0 ] && echo "preflight: ready" || echo "preflight: not ready — see the FAIL lines"
 exit "$failed"

@@ -52,12 +52,12 @@ DEMOS = {
                  "where it draws and zooms with no network and no extension API."),
     "capstone": ("The capstone", "LADDER=… sh packages/reckon/tools/capstone.sh WORKDIR",
                  "Source to a compiler to an app to its run, each a derivation signed by a runner on V8 and one on "
-                 "wasmtime. The compiler has two unrelated origins that must agree: the seed, and a compiler wac's "
-                 "bootstrap ladder builds from its hand-written rungs (diverse double-compiling, the agree rule); "
-                 "withdraw either and the compiler is refused. Then claims published to a mirror, an ENS name on a "
-                 "devnet pointing at the app, and a fresh client that resolves the name by proof, takes the claims "
-                 "from the mirror, fetches and checks the bytes, admits and runs it; the mainnet half from a "
-                 "checkpoint; and the refusals."),
+                 "wasmtime, under a policy with no roots: the compiler is built by the wac command wac's bootstrap "
+                 "makes from its hand-written rungs, every step derived by two runners (rungs.sh), and the app is "
+                 "admitted through 55 objects back to 16 a reviewer endorsed; withdraw one runner's run of one rung "
+                 "and it is refused. Then claims published to a mirror, an ENS name on a devnet pointing at the app, "
+                 "and a fresh client that resolves the name by proof, takes the claims from the mirror, fetches and "
+                 "checks the bytes, admits and runs it; the mainnet half from a checkpoint; and the refusals."),
     "admit-by-name": ("vitalik.eth, from a checkpoint", "sh packages/reckon/tools/admit-by-name.sh WORKDIR",
                       "Offline on recorded mainnet data: one claim admit from a beacon checkpoint to a decision, with "
                       "the beacon data from a directory and then over the light-client REST API from a replaying "
@@ -87,6 +87,17 @@ DEMOS = {
                     "Each runner witnesses it as it witnesses anything; a policy that names the suite counts a runner's "
                     "word only once that runner has. A runner that never ran it, one that leaks its engine's NaNs, and "
                     "one with no floor are each left out, and admission says why."),
+    "rungs": ("The whole bootstrap, as derivations", "LADDER=… sh packages/reckon/tools/rungs.sh WORKDIR",
+              "Every step from wac's five hand-written rungs to the wac command, each a derivation two runners sign: "
+              "assembled (wac-l0/1), run through the rung's seam (wasm-seam/1, on V8 and wasmtime), flattened "
+              "(wac-flatten/1), and wacc driven to compile wac (wacc-drive/1). wacc's 7.9 MB of assembly and the wac "
+              "command are byte for byte what wac's own ladder makes, and the command is admitted back to reviewed "
+              "text, with no binary among its roots. When one runner withdraws one rung's run, the chain is refused."),
+    "bootconf": ("Conformance for the bootstrap", "LADDER=… sh packages/reckon/tools/bootconf.sh WORKDIR",
+                 "The bootstrap's own machines get suites too: 14 cases for the assembler (wac's L0 tests, the first "
+                 "rung, the empty text, three texts that must be refused) and 6 for the flattener (wac's L5 tests, a "
+                 "renaming clash, wacc's sources, a missing import). An assembler that pads its modules, or a "
+                 "flattener that renames a clash its own way, is not counted, even where it agrees."),
     "discovery": ("Finding mirrors", "sh packages/reckon/tools/discovery.sh WORKDIR",
                   "From one URL to every mirror: manifests are static JSON files, served with CORS, naming mirrors and "
                   "further manifests. Two sites each carry one mirror and a manifest; following them finds both, and "

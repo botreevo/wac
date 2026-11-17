@@ -59,12 +59,21 @@ roots, on wac's native V8 host, one thread of this container's Xeon (2.1 GHz).
 | --- | ---: | ---: | ---: | ---: | --- |
 | 26,404,000 (2026-11-13, under BPO2) | 211 | 40.4 M | 327 ms — **123 Mgas/s** | 232 ms — **173 Mgas/s** | all match but the state root |
 | 26,404,100–26,404,104 (20–21 blobs each, one block at the 60 M limit) | 1131 | 178.9 M | 825 ms — **216 Mgas/s** | 674 ms — **265 Mgas/s** | all match but the state root |
+| 26,432,348–26,432,379 (2026-11-17, offline, from answers fetched over HTTPS) | 6914 | 976 M | 5753 ms — **169 Mgas/s** | 4031 ms — **242 Mgas/s** | 18 match but the state root; 14 differ in gas used only, with one slot still unfetched (below) |
 
 Fetching the first block's state took 56 rounds against a hosted endpoint's free tier, learning a few slots
 a round (a read that comes back empty makes a transaction take another path). For the five, the access
 lists named 2669 accounts and 10 330 slots up front, and 111 more rounds found the last ~2% — about an
 hour, most of it the rate limit. A node of one's own with `prestateTracer` names everything in one round.
 The first figure is lower because one block is too short to time well: the five are the better number.
+
+The 32 blocks of 2026-11-17 (replayed offline: `replay.sh` fetches into a directory, and `replay.wac --dir` runs
+it with no network) were run the same way, then the 1- and 5-block sets of 11-13 again on the code of the day, both
+as before. Learning their state took ~2 h of rounds on the free tier, and stalled in a chain of one contract's slots
+(0xbeef007e…, which reads a slot whose key is the last one's value), learnt one a round for 250+ rounds; with the
+last read as empty (`--anyway`), the 14 blocks that differ do so in gas used only — as a transaction taking another
+path on a missing read does. That is likely, not shown, until the chain is fetched to its end; a node of one's own
+with `prestateTracer` names all of it in one round, which is what the shadow box will have.
 
 So the interpreter, the precompiles and the transaction rules agree with mainnet on the traffic it has
 today, and execution is not what stands between wacuum and the head: a block arrives every 12 s and

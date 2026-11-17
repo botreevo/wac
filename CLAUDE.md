@@ -57,7 +57,9 @@ and 79 numbers collide. A reference to "wac 0076" means `issues/lang/`, and "wac
 (`web.git` on git.voltrevo.com until 2026-11-02)** — with its history, its app template (`templates/webapp` was
 here) and a gate of its own that runs in half a minute. The site and the page examples under `packages/` import it
 as `web`, pinned to one commit by `wac.json5` and `wac.lock`; moving that pin is how a change there reaches here,
-and it goes through this gate. **Pins name GitHub**, where the owner syncs the same commits; development fetches
+and it goes through this gate. **Pins name GitHub**, where the owner syncs the same commits — except wac-web's own,
+which names git.voltrevo.com while GitHub's copy lags (2026-11-17: it stops at e642c79, before every commit pinned
+here since; `wac.json5` says so); development fetches
 them from git.voltrevo.com, which has them first, through one git setting (`sh tools/use-mirror.sh`, once per
 machine — `wac update`'s fetcher follows it too, `packages/wacpkg/src/mirror.wac`). And `sh tools/fill-cache.sh` puts the locked commit in the
 cache with `git` — the gate runs it, and a fresh checkout runs it once after `./bootstrap.sh`. A page is built from here with `tools/wac/buildpage.wac`.

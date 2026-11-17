@@ -62,10 +62,19 @@ sed -n 's/.*"git": "\([^"]*\)".*"commit": "\([0-9a-f]\{40\}\)".*/\1 \2/p' src/in
 echo "https://github.com/voltrevo/wac-web.git a14793f5e55af55b1ef9973715d31087e6d0c1f8" >> deps.txt
 while read -r g c; do
   d="$(quote "$g")/$c"
-  [ -d "$cache/$d" ] || { (cd "$root" && LOCK=/dev/stdin sh tools/deps.sh) <<LOCK >/dev/null 2>&1
+  [ -d "$cache/$d" ] || { (cd "$root" && LOCK=/dev/stdin sh tools/deps.sh) <<LOCK >/dev/null 2>&1 || true
 { "imports": { "x": { "git": "$g", "ref": "$c", "commit": "$c" } } }
 LOCK
   }
+  # A github.com/voltrevo repository is mirrored on git.voltrevo.com: the same commit from there, kept where wac looks
+  # for the URL the lock names. The commit is the same object either way.
+  m=$(echo "$g" | sed -n 's|^https://github.com/voltrevo/|https://git.voltrevo.com/|p')
+  if [ ! -d "$cache/$d" ] && [ -n "$m" ]; then
+    (cd "$root" && LOCK=/dev/stdin sh tools/deps.sh) <<LOCK >/dev/null 2>&1 || true
+{ "imports": { "x": { "git": "$m", "ref": "$c", "commit": "$c" } } }
+LOCK
+    [ -d "$cache/$(quote "$m")/$c" ] && mkdir -p "$cache/$(quote "$g")" && cp -r "$cache/$(quote "$m")/$c" "$cache/$d"
+  fi
   [ -d "$cache/$d" ] || { bad "not in the package cache: $g at $c"; exit 1; }
   mkdir -p "src/home/cache/git/$d" && cp -r "$cache/$d/." "src/home/cache/git/$d/"
 done < deps.txt

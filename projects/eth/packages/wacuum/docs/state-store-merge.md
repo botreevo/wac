@@ -1,8 +1,8 @@
-# Merging `state-store` — what it changes, how it is tested, what is not (2026-11-13)
+# Merging `state-store` — what it changes, how it is tested, what is not (2026-11-13, brought up to date 2026-11-17)
 
-For Andrew, deciding whether `state-store` goes into master. It is 53 commits ahead of master and none behind,
-so it fast-forwards. Outside `packages/wacuum` it changes three lines: the wac pin (`wac.lock`), the unit-test
-task's grant (`tasks.json5`), and one line of the devnet.
+For Andrew, deciding whether `state-store` goes into master — approved 2026-11-17. It is 85 commits ahead of master
+and none behind, so it fast-forwards. Outside `packages/wacuum` it changes three lines: the wac pin (`wac.lock`), the
+unit-test task's grant (`tasks.json5`), and one line of the devnet (`e.replay` is awaited now).
 
 ## What it is
 
@@ -14,9 +14,10 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
 
 | area | what | where |
 | --- | --- | --- |
-| store | one file, a copy-on-write B+tree of 16 KB pages, crash-safe two-meta commits, interior in memory, leaves by a 64 MB budget, a read/write gate | `src/store/tree.wac` |
+| store | one file, a copy-on-write B+tree of 16 KB pages, crash-safe two-meta commits, interior in memory, leaves by a 64 MB budget, a read/write gate; commits batched every 64 blocks (an overlay), their writes 64 in flight and the leaves they need read ahead | `src/store/tree.wac` |
 | cache | raw entries (and absences) between blocks, 256 MB by default, CLOCK, written through by commits | `src/store/cache.wac` |
-| state | accounts, slots, codes and trie nodes under snap's keys; the tries by path, rehashing only what changed | `src/store/state.wac`, `src/trie/pathtrie.wac` |
+| state | accounts, slots, codes and trie nodes; the tries by path, rehashing only what changed; the top five trie levels keyed level by level, and each account's and slot's entry beside its trie node (store format 5) | `src/store/state.wac`, `src/trie/pathtrie.wac` |
+| undo | each unfinalized block's change set in the store, written in its own commit, deleted at finality (or past 1 024 blocks): a restart can still take the store back across a reorg | `src/store/undo.wac`, `Engine.loadUndo` |
 | execution | reads where the EVM misses (`getNow`), so no step runs twice | `src/store/exec.wac`, `StateDb.readsNow` |
 | engine | `--store`: the store holds the state of the block the engine is at; reorgs commit back and forth; restart from the store plus the block log | `src/engine/engine.wac`, `cmd/wacuum.wac` |
 | history | every block's RLP and receipts in the store; old blocks answered from it; 256 finalized blocks held in memory | `src/store/blocks.wac`, `receipts.wac` |
@@ -31,7 +32,11 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   engine and block-building suites — and the six fork transitions to BPO4: 0 failures (Cancun state 16 847,
   Osaka engine 21 577, …; `dist/all-fixtures.txt`). On the store (`COLD=1`, every account and slot read from a
   store, the engine moving the store across invalid payloads): 0 failures too — Cancun block and engine 17 685 each, Prague 20 859 and 20 878, Osaka 21 558 and 21 577.
-- **Unit tests**, 24 files, among them: the store against a map across commits and reopenings; a commit cut at
+- **Unit tests**, 25 files, among them: a restart with the store a block ahead of the log, one-block and nine-block
+  reorgs after a restart (committing every block and every 4), a stop at each of the 14 durable points of a
+  multi-block reorg, undo records pruned at finality and past their bound, a side chain's fork choice that finality
+  ruled out, a payload status naming a hash with a leading zero (`test/resume_test.wac`); snap ranges that pass over
+  trie nodes among the entries; the store against a map across commits and reopenings; a commit cut at
   every one of its writes, with none, all and six random subsets of the unsynced writes kept, coming back as
   exactly the state before or after; a leaf rewritten by a commit not let go before its page is written (a gated
   disk); leaves held within their bound when only commits load them; a 64 KB store refused; the cache against a
@@ -77,8 +82,10 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   node. The top five levels are now keyed level by level (store format 4, `pathtrie.wac`'s `nodeKey`): those
   depths take 1 + 2 + 10 + 178 leaves, all leaves written per block ~1 900 → ~1 660, page writes 2 171 → 1 721,
   staging 113–150 → 90 ms, the store's commit 262 → 211 ms. Refilled to 5 GB the same way, the five mainnet blocks
-  on top: commit 2.83 → 2.08 s, 42 → 48 Mgas/s. What is left is one leaf per account for its deep nodes (depth 5
-  and below) and one for its entry.
+  on top: commit 2.83 → 2.08 s, 42 → 48 Mgas/s. Then each account's and slot's entry was keyed beside its trie
+  node (store format 5): leaves written per block ~1 660 → ~1 170, page writes 1 721 → 1 114, the store's commit
+  211 → 178 ms, the five mainnet blocks on top 48 → 57 Mgas/s (an empty store: ~104). Undo records add 18% to what
+  a commit writes (64 mainnet blocks: 10.1 MB against 53.5 MB, ~160 KB a block).
 - **Crashes** (`tools/e2e/crash.wac`): a store node killed with SIGKILL at random points while importing — 110
   kills over three runs, 47 before the block's commit was whole and 63 after — always came back to the uncrashed
   node's head, state root, slots and balances; and with commits batched, 40 kills flushing every 8 blocks and 40
@@ -90,6 +97,18 @@ of reach on both counts. The design documents are `docs/state-on-disk.md` and `d
   wide). The runs before found three bugs, each now with a unit test (`test/resume_test.wac`): a store a block
   ahead of the chain log stuck SYNCING for good; no undo across a restart, so any reorg below the store's block
   after one stuck; and a fork choice for a side chain finality had ruled out refusing the log on replay.
+- **Two consensus clients, on private chains** (2026-11-14), every fork through Fulu/Osaka at genesis, 2 s slots, 64
+  validators, geth beside wacuum judging every block by itself under its own beacon node:
+  - `tools/e2e/cl.wac` — Prysm 7.3.1 drives wacuum as the builder: 127 blocks in 128 slots, transfers and a blob
+    block in them, geth with the same blocks, wacuum killed and started again going on, epoch 2 finalized alike.
+  - `tools/e2e/cllh.wac` — the same under Lighthouse 8.3.3, Hoodi's deploy's client: 129 blocks in 130 slots.
+  - `tools/e2e/clfollow.wac` — Hoodi's situation: geth builds, wacuum only follows under its own Prysm (gossip,
+    newPayload), killed and caught up, takes geth's blob block, agrees on finality; and a second wacuum started
+    empty under a checkpoint-synced beacon node snap-syncs from geth to the head and follows, its balance geth's.
+  Found on the way: payload statuses gave a hash with a leading zero nibble shortened, which Prysm cannot read — one
+  block in 16 failed, and a follower stopped for good (fixed, with a test). Not covered: a public network's peers
+  and latency, real (non-zero) blobs' KZG work, Prysm and Lighthouse together (they do not peer here: Lighthouse
+  rejects Prysm's custody group count of 0).
 - **Mainnet blocks**: five consecutive blocks replayed on the store match their headers but for the state root
   (the store holds only what they read), at ~100 Mgas/s; 64 blocks traced for the cache's design.
 - **Hoodi, without the machine**: wacuum computes Hoodi's genesis hash, geth `--hoodi` accepts its handshake
@@ -123,18 +142,6 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 - **Not yet run against the real network.** Snap sync has only met geth on private devnets: never a public peer
   set, rate limits, peers that drop or lie, or a state the size of Hoodi's (tens of GB). Healing has met a pivot
   that ages out by our own simulation, because geth here kept serving old pivots.
-- **Two consensus clients, on private chains** (2026-11-14), every fork through Fulu/Osaka at genesis, 2 s slots, 64
-  validators, geth beside wacuum judging every block by itself under its own beacon node:
-  - `tools/e2e/cl.wac` — Prysm 7.3.1 drives wacuum as the builder: 127 blocks in 128 slots, transfers and a blob
-    block in them, geth with the same blocks, wacuum killed and started again going on, epoch 2 finalized alike.
-  - `tools/e2e/cllh.wac` — the same under Lighthouse 8.3.3, Hoodi's deploy's client: 129 blocks in 130 slots.
-  - `tools/e2e/clfollow.wac` — Hoodi's situation: geth builds, wacuum only follows under its own Prysm (gossip,
-    newPayload), killed and caught up, takes geth's blob block, agrees on finality; and a second wacuum started
-    empty under a checkpoint-synced beacon node snap-syncs from geth to the head and follows, its balance geth's.
-  Found on the way: payload statuses gave a hash with a leading zero nibble shortened, which Prysm cannot read — one
-  block in 16 failed, and a follower stopped for good (fixed, with a test). Not covered: a public network's peers
-  and latency, real (non-zero) blobs' KZG work, Prysm and Lighthouse together (they do not peer here: Lighthouse
-  rejects Prysm's custody group count of 0).
 - **Scale.** The largest store so far is 5 GB, synthetic; Hoodi's will be tens of GB and mainnet's hundreds. The
   interior is kept in memory (~400 MB estimated at mainnet). Commit cost grows with the store (above); beyond 5 GB
   it is extrapolated, not measured.
@@ -143,8 +150,9 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
   holding those blocks' changes is ~2 MB a block at mainnet's rate, bounded by a 64 MB flush.
 - **Torn writes on a real power cut** are modelled (any subset of unsynced writes lost), not exercised: SIGKILL
   leaves the kernel's page cache intact.
-- **Store format**: new, and changed once already (64 KB → 16 KB pages); there is no migration, and none is
-  needed while no store exists anywhere that matters.
+- **Store format**: new, and changed three times on this branch (64 KB → 16 KB pages; level-keyed tries, 4; entries
+  beside their trie nodes, 5); an older store is refused with a message, there is no migration, and none is needed
+  while no store exists anywhere that matters.
 - **wac**: pinned at 424e0273b, which fixes the checker's field-table limit (0468d) that `Engine`'s new fields
   first ran into; they stay grouped in `Persisting`, which reads well as it is. The deno-only oracle tests (abi,
   mpt, ssz) are not runnable in this container.
@@ -155,9 +163,9 @@ Hoodi; mainnet's size; days of uptime (the longest consensus-client run is ~4 mi
 ~9 minutes); a full disk; another client snap-syncing from wacuum (the server is tested against our own client
 only); real blobs' KZG work; Prysm and Lighthouse on one chain.
 
-## Where it stands, and what is next (2026-11-14, wound down)
+## Where it stands, and what is next
 
-Everything above is on `state-store`, pushed; nothing went to master. Next, in order:
+Approved 2026-11-17 and merged into master as a fast-forward, after the gate below. Next, in order:
 
 1. **The follower soak** — `tools/e2e/clsoak.wac`: geth builds under Lighthouse, wacuum follows on a store (flush 64,
    heap capped) under its own Lighthouse, with transfers, a blob block every ten minutes, a kill every 20–40

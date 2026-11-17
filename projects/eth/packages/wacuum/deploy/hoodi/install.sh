@@ -59,7 +59,9 @@ chmod 640 /etc/eth/jwt-geth.hex /etc/eth/jwt-wacuum.hex
 # Hoodi's genesis as geth has it built in (wacuum computes its hash, 0xbbe31286…557c971b, and checks it), and
 # the execution bootnodes eth-clients publishes.
 geth --hoodi dumpgenesis > /etc/eth/hoodi-genesis.json
-curl -fsSL https://raw.githubusercontent.com/eth-clients/hoodi/main/metadata/enodes.txt > /etc/eth/hoodi-bootnodes.txt ||
+# (enodes.yaml, a YAML list; enodes.txt, which this fetched before, is gone — checked 2026-11-17), one per line.
+curl -fsSL https://raw.githubusercontent.com/eth-clients/hoodi/main/metadata/enodes.yaml |
+  grep -oE 'enode://[0-9a-f]{128}@[^ #]+' > /etc/eth/hoodi-bootnodes.txt ||
   echo "install.sh: no bootnode list fetched; wacuum will use only the local geth" >&2
 chmod 644 /etc/eth/hoodi-genesis.json /etc/eth/hoodi-bootnodes.txt 2>/dev/null || true
 [ -f /etc/eth/hoodi.env ] || install -m 644 "$here/hoodi.env" /etc/eth/hoodi.env

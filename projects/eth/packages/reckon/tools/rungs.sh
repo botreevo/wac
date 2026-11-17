@@ -105,6 +105,7 @@ dr=$(wac boot.wasm recipe --wacc t/driven.wasm --tree inputs/wac --entry package
 echo "   (each runner a few minutes: wacc is driven a byte at a time)"
 both "drive: the wac command" "$dr" "$DR_JS" "wacc-drive (node, V8) at wac $short" "$DR_RUST" "wacc-drive (Rust, wasmtime) at wac $short"
 command=$out
+echo "$command" > command.cid                                 # for capstone.sh
 wac obj.wasm cat "$command" out/module.wasm $st > t/wac.wasm
 mkdir -p ref && (cd "$src" && "$LADDER" packages/wacc/src/api.wac --with-wacc packages/wac/src/wac.wac \
   --allow-read --allow-write --allow-env --allow-net --allow-run -o "$work/ref/wac.wasm" >/dev/null 2>&1)
@@ -115,13 +116,8 @@ step "admission: wacc, through every step, back to reviewed sources"
 cid() { python3 -c "import sys,hashlib,base64; d=hashlib.sha256(open(sys.argv[1],'rb').read()).digest(); print('b'+base64.b32encode(bytes([1,0x55,0x12,0x20])+d).decode().lower().rstrip('='))" "$1"; }
 # wacc's module is larger than one block, so the subject is the tree it was assembled into, admitted as such.
 module=$wacc
-cat > policy.json5 <<EOF
-{
-  signers: { js: "$(claim address --key js.key)", rust: "$(claim address --key rust.key)",
-             reviewer: "$(claim address --key reviewer.key)" },
-  machines: ["wac-l0/1", "wac-flatten/1", "wasm-seam/1", "wacc-drive/1"],
-  formats: ["unixfs-v1-2025+hidden"],
-  roles: {
+# The roles, kept in roles.json5 for a policy that builds on this chain (capstone.sh, with LADDER).
+cat > roles.json5 <<EOF
     // A module: assembled by both assemblers, from L0 text that is either reviewed or a rung's answer.
     assembled: [{ derived: { by: ["js", "rust"], at_least: 2, runners: 2, slots: { source: "l0" } } }],
     l0: [{ endorsed: { by: ["reviewer"], at_least: 1 } }, { within: { role: "answer", path: "out/answer.l0" } }],
@@ -135,6 +131,15 @@ cat > policy.json5 <<EOF
     // The wac command: compiled by a driven wacc that is itself assembled, from reviewed sources and settings.
     command: [{ derived: { by: ["js", "rust"], at_least: 2, runners: 2, slots: { wacc: "rung" }, other: "reviewed" } }],
     reviewed: [{ endorsed: { by: ["reviewer"], at_least: 1 } }],
+EOF
+cat > policy.json5 <<EOF
+{
+  signers: { js: "$(claim address --key js.key)", rust: "$(claim address --key rust.key)",
+             reviewer: "$(claim address --key reviewer.key)" },
+  machines: ["wac-l0/1", "wac-flatten/1", "wasm-seam/1", "wacc-drive/1"],
+  formats: ["unixfs-v1-2025+hidden"],
+  roles: {
+$(cat roles.json5)
   },
 }
 EOF
@@ -161,6 +166,7 @@ echo "   its roots: $(grep -c "endorsed by reviewer" admit-cmd.log) reviewed obj
 l4r=$(wac boot.wasm recipe --module t/l3.wasm --source "$boot/l4.l3" $st 2>/dev/null)
 d=$(wac boot.wasm run "$l4r" $st --work w-rust --tool "$SE_RUST" --key rust.key --runner "seam (wasmtime) at wac $short" 2>/dev/null | sed -n 2p)
 cp -r store store-revoked
+echo "$d" > withdrawable.cid                                    # for capstone.sh: the same withdrawal there
 wac claim.wasm revoke "$d" --key rust.key --store store-revoked >/dev/null 2>&1
 wac claim.wasm admit "$module" assembled --policy policy.json5 --store store-revoked > admit2.log 2>/dev/null && r=yes || r=no
 [ "$r" = no ] && grep -q "on 1 runner" admit2.log && ok "wasmtime withdraws the L4 rung's run: one runner is not enough, and wacc is refused" \

@@ -74,7 +74,7 @@ then `boot run RECIPE --tool CMD`. The tool is called `CMD IN OUT`, where IN is 
 
 - **wacc is not `wac`.** wacc compiling the `wac` command needs a host to hand it the files: that is
   `wacc-drive/1`, milestone 4 (docs/drive-machine.md), which `tools/rungs.sh` runs after these steps.
-- **The seed is still in the capstone's roots.** Milestone 5 roots the capstone's policy here instead.
+- **The capstone roots here** (milestone 5): with LADDER, its policy has no roots (docs/capstone.md).
 - **No NaN canonicalization.** A rung computes text and runs no floating point the answer depends on. It compiles
   float code; it does not execute it.
 - **The runners are host programs**, as for `wac-l0/1` and `wac-flatten/1`. Two of them, on two engines, must agree.

@@ -1,0 +1,246 @@
+// What a shell says about a file it can list and cannot open — and its kin: a path the grant does not reach, a
+// directory that cannot be listed, an operation not written. Each is a failure that used to read as *absence*.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/unnameable_test.wac
+//
+// wac-mono 0065. `bad-\xff-name` is an ordinary file on this filesystem and an unnameable one from Deno: `readDir`
+// replaces the invalid byte with U+FFFD and every path built from that name fails. So `ls` shows a file nothing can
+// touch, and every program said "No such file or directory" about it — which reads as *the caller got the name wrong*
+// rather than *this runtime cannot express it*. **Not a differential case**: bash handles these names perfectly, so
+// this asserts our own sentence. The fixture is made with bash, the only thing here that can write such a name.
+//
+// **The Deno-hosted shell, on purpose**: the gap is the Deno host's (`builtByDeno`, target `deno`), and Deno as a wac
+// host is what is under test. It was box's TypeScript `unnameable.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtByDeno } from "../../../wactest/src/built.wac";
+import { freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains, trimmed } from "../../../wactest/src/strings.wac";
+import { ChildEnv, Env, Exec, Launch, Sys, TimedOut } from "std";
+import { flatten } from "core";
+
+struct Said {
+  string out;
+  string err;
+  i32 status;
+}
+
+ChildEnv cleared(Env env) {
+  u8[]? path = flatten(env.get("PATH").wait()).orElse(null);
+  return ChildEnv.empty().set("LC_ALL", "C").set("PATH", path is null ? "/usr/bin:/bin" : string.fromBytes(path!));
+}
+
+/** `cmd args` in `cwd` (`""` for here), bounded: a run that never returns is a result, not a wedged suite. */
+async Said run(Sys sys, string cmd, string[] args, string cwd) {
+  auto got = await sys.clock().within(sys.procs().exec(cmd, args, u8[](), cleared(sys.env()),
+                                                       Launch(cwd, false, false, false, false)), 60000);
+  if (got.isErr()) { return Said("", got.err()! is TimedOut ? "did not finish in 60s" : "\{got.err()!}", 0 - 1); }
+  Exec x = got.unwrap();
+  return Said(string.fromBytes(x.stdout), string.fromBytes(x.stderr), x.status);
+}
+
+string shell(Sys sys) {
+  return builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sh.wac", "unnameable-sh",
+                     ["--allow-read", "--allow-write", "--allow-env"], "deno", false);
+}
+
+async Said sh(Sys sys, string script, string cwd) { return await run(sys, shell(sys), ["-c", script], cwd); }
+
+/** A directory holding one ordinary file and one whose name is not valid UTF-8, or `""` when bash could not make it. */
+async string fixture(Sys sys, T t, string name) {
+  string dir = scratch(sys.env(), "box-unnameable-\{name}");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  t.eqStr(putFile(sys.files(), "\{dir}/plain.txt", "ordinary\n"), "", "plain.txt");
+  // `$'…'` is bash's byte-literal syntax, and bash is the only thing here that can write this name.
+  Said made = await run(sys, "bash", ["-c", "printf 'invalid\\n' > \"$1\"/$'bad-\\xff-name'", "bash", dir], "");
+  t.eqI32(made.status, 0, "could not create the fixture: \{made.err}");
+  return dir;
+}
+
+export async string test_a_file_that_cannot_be_named_says_so_rather_than_saying_it_is_missing(Sys sys) {
+  T t = T.create();
+  string dir = await fixture(sys, t, "named");
+  // It is listed, because the host can enumerate it though it cannot open it — the asymmetry is the whole problem.
+  Said listing = await sh(sys, "ls", dir);
+  t.isTrue(contains(listing.out, "plain.txt"), listing.out);
+  t.isTrue(contains(listing.out, "\u{FFFD}"), "the lossy name should be listed: \{listing.out}");
+  // Every program that opens it says which side is at fault; a glob is how a script reaches it.
+  for (string script in ["cat bad-*-name", "wc -l bad-*-name"]) {
+    Said r = await sh(sys, script, dir);
+    t.isTrue(contains(r.err, "cannot be named on this host"), "\{script} should name the gap, said: \{r.err}");
+    t.isFalse(contains(r.err, "No such file or directory"), "\{script} still blames the caller: \{r.err}");
+    t.eqI32(r.status, 1, "\{script} exited \{r.status}");
+  }
+  // A genuinely missing file is still missing, in GNU's words — the category the refinement could most easily swallow.
+  Said absent = await sh(sys, "cat no-such-file", dir);
+  t.isTrue(contains(absent.err, "No such file or directory"), absent.err);
+  t.isFalse(contains(absent.err, "cannot be named"), absent.err);
+  t.eqStr((await sh(sys, "cat plain.txt", dir)).out, "ordinary\n", "the ordinary file is untouched");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/** Removing one says the same, so a script cannot mistake it for gone — and `rm -f`, which ignores *absence*, too. */
+export async string test_removing_one_says_the_same_thing_so_a_script_cannot_mistake_it_for_gone(Sys sys) {
+  T t = T.create();
+  string dir = await fixture(sys, t, "rm");
+  Said r = await sh(sys, "rm bad-*-name; echo status=$?", dir);
+  t.isTrue(contains(r.err, "cannot be named on this host"), "rm should name the gap, said: \{r.err}");
+  t.eqStr(trimmed(r.out), "status=1", "rm's status");
+  Said forced = await sh(sys, "rm -f bad-*-name; echo status=$?", dir);
+  t.isTrue(contains(forced.err, "cannot be named on this host"), "rm -f swallowed a failure that is not absence: \{forced.err}");
+  t.eqStr(trimmed(forced.out), "status=1", "rm -f's status");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * `test -e` refuses to answer rather than saying no: `exists = false` for a file that is *there* is an answer a script
+ * acts on. Status 2 and a diagnostic is `test`'s one way to say it could not tell.
+ */
+export async string test_test_e_refuses_to_answer_rather_than_saying_no(Sys sys) {
+  T t = T.create();
+  string dir = await fixture(sys, t, "test");
+  for (string op in ["-e", "-f", "-s"]) {
+    Said r = await sh(sys, "test \{op} bad-*-name; echo status=$?", dir);
+    t.isTrue(contains(r.err, "cannot be named on this host"), "test \{op} said nothing about why: \{r.err}");
+    t.eqStr(trimmed(r.out), "status=2", "test \{op} answered instead of refusing: \{r.out}");
+  }
+  // A name genuinely absent still answers, silently, with 1 — the reason the fault is narrow.
+  Said absent = await sh(sys, "test -e no-such-file; echo status=$?", dir);
+  t.eqStr(trimmed(absent.out), "status=1", "absent");
+  t.eqStr(absent.err, "", "it complained about an ordinary absent file");
+  t.eqStr(trimmed((await sh(sys, "test -e plain.txt; echo status=$?", dir)).out), "status=0", "an ordinary file");
+  Said through = await sh(sys, "test -e plain.txt/inside; echo status=$?", dir);
+  t.eqStr(trimmed(through.out), "status=1", "a path through a file is false, not an error");
+  t.eqStr(through.err, "", through.err);
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+export async string test_ls_of_the_name_it_just_listed_does_not_call_it_missing(Sys sys) {
+  T t = T.create();
+  string dir = await fixture(sys, t, "ls");
+  Said r = await sh(sys, "ls bad-*-name", dir);
+  t.isTrue(contains(r.err, "cannot be named on this host") || contains(r.out, "cannot be named on this host"),
+           "ls blamed the path: \{r.out} / \{r.err}");
+  t.isFalse(contains(r.out, "No such file or directory"), r.out);
+  t.eqI32(r.status, 2, "GNU's status for an inaccessible operand");
+  // A genuinely missing operand keeps GNU's sentence exactly, on the error stream.
+  Said missing = await sh(sys, "ls no-such-file", dir);
+  t.isTrue(contains(missing.err, "cannot access 'no-such-file': No such file or directory"), "\{missing.out} / \{missing.err}");
+  t.eqStr(missing.out, "", "a complaint went to standard output");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+// ── The other side of the same name: the system's own filesystem, where a name is bytes all the way down ──
+
+/** `n\xff`, in the shell's own byte syntax — written as the four characters `\xff`, since a test about bytes must be. */
+static string BYTE_NAME = "$'n\\xff'";
+
+export async string test_a_name_that_is_not_valid_utf8_is_an_ordinary_file_in_the_systems_own_filesystem(Sys sys) {
+  T t = T.create();
+  string sealed = builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sealedsh.wac",
+                              "unnameable-sealedsh", string[](), "deno", false);
+  // Listed as the bytes it is — `6e ff` — and readable by the name that made it; through `hex`, as nothing here can hold it.
+  Said r = await run(sys, sealed, ["-c", "echo inside > \{BYTE_NAME}; ls | hex; cat \{BYTE_NAME}"], "");
+  t.eqI32(r.status, 0, r.err);
+  t.isTrue(contains(r.out, "6eff0a"), "the name was not the bytes: \{r.out}");
+  t.isTrue(trimmed(r.out).len() >= 6 && trimmed(r.out).slice(trimmed(r.out).len() - 6, trimmed(r.out).len()) == "inside",
+           "it could not be read back: \{r.out}");
+  return t.report();
+}
+
+/** …and it survives an image, which is where a length-prefixed format would lose it: a second process reads it back. */
+export async string test_and_it_survives_an_image(Sys sys) {
+  T t = T.create();
+  string imaged = builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/imaged.wac",
+                              "unnameable-imaged", ["--allow-read", "--allow-write"], "deno", false);
+  string dir = scratch(sys.env(), "box-bytes-image");
+  freshDir(sys.files(), dir);
+  string image = "\{dir}/bytes.wacimg";
+  Said made = await run(sys, imaged, [image, "-c", "echo kept > \{BYTE_NAME}; ls | hex"], "");
+  t.eqI32(made.status, 0, made.err);
+  t.isTrue(contains(made.out, "6eff0a"), made.out);
+  Said back = await run(sys, imaged, [image, "-c", "ls | hex; cat \{BYTE_NAME}"], "");
+  t.isTrue(contains(back.out, "6eff0a"), "the name did not survive the image: \{back.out}");
+  t.isTrue(contains(back.out, "kept"), "the contents did not: \{back.out}");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+// ── A path the grant does not reach: `--allow-read` does not cover `/proc` under Deno, and a denial arrived as absence ──
+
+export async string test_a_path_the_builds_grant_does_not_reach_is_refused_not_called_absent(Sys sys) {
+  T t = T.create();
+  Said r = await run(sys, shell(sys), ["-c", "stat /proc"], "");
+  t.isTrue(contains(r.err, "Not granted to this application"), "\{r.out} / \{r.err}");
+  t.isFalse(contains(r.err, "not found"), "a denial should not read as absence: \{r.err}");
+  // The canary, asked of bash: `/proc` really is there, so "not found" would have been false.
+  t.eqStr(trimmed((await run(sys, "bash", ["-c", "test -d /proc && echo yes"], "")).out), "yes", "this machine has no /proc");
+  return t.report();
+}
+
+export async string test_test_e_refuses_about_a_path_it_may_not_look_at(Sys sys) {
+  T t = T.create();
+  Said denied = await run(sys, shell(sys), ["-c", "test -e /proc; echo [$?]"], "");
+  t.isTrue(contains(denied.out, "[2]"), "\{denied.out} / \{denied.err}");
+  // Ordinary absence is still ordinary: status 1, no complaint.
+  Said absent = await run(sys, shell(sys), ["-c", "test -e /nosuchpath; echo [$?]"], "");
+  t.eqStr(trimmed(absent.out), "[1]", absent.out);
+  t.eqStr(absent.err, "", "absence should be silent");
+  return t.report();
+}
+
+/**
+ * **A directory that is there and cannot be listed** is a failure, not a name: `chmod 000 d; ls d` printed `d` and
+ * exited 0, where GNU says "cannot open directory 'd': Permission denied" and exits 2. bash is the oracle. **Skipped,
+ * saying so, where bash can list it** — running as root — since then the comparison is between two successes.
+ */
+export async string test_a_directory_that_cannot_be_listed_is_a_failure_not_a_name(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "box-unlistable");
+  freshDir(sys.files(), dir);
+  t.eqStr(putFile(sys.files(), "\{dir}/plain", "x\n"), "", "plain");
+  sys.files().mkdir("\{dir}/shut", true).wait();
+  await run(sys, "chmod", ["000", "\{dir}/shut"], "");
+  Said theirs = await run(sys, "bash", ["-c", "cd \"$1\"; ls shut; echo status=$?", "bash", dir], "");
+  if (trimmed(theirs.out) != "status=2") {
+    sys.stderr().line("unnameable_test: the unlistable-directory case skipped — bash could list a 000 directory " +
+                      "(running as root?), so there is nothing to compare");
+    await run(sys, "chmod", ["700", "\{dir}/shut"], "");
+    sys.files().remove(dir, true).wait();
+    return t.report();
+  }
+  Said ours = await run(sys, shell(sys), ["-c", "cd \{dir}; ls shut; echo status=$?"], "");
+  t.eqStr(trimmed(ours.out), "status=2", "\{ours.out} / \{ours.err}");
+  t.eqStr(ours.err, theirs.err, "the complaint should be bash's, word for word");
+  // And the branch it used to take is still right for a file: `ls f` prints `f`.
+  t.eqStr((await run(sys, shell(sys), ["-c", "cd \{dir}; ls plain; echo status=$?"], "")).out, "plain\nstatus=0\n", "ls of a file");
+  await run(sys, "chmod", ["700", "\{dir}/shut"], "");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * An operation we have not written says so, and blames no file (wac-mono 0117): `chown` cannot be done on the host
+ * — its owners are numbers, not names — and says why, not "Permission denied". `chmod`, which left this category, is
+ * the control; and GNU can chown to yourself, the canary that our refusal is about us.
+ */
+export async string test_an_operation_we_have_not_written_says_so_and_blames_no_file(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "box-unsupported");
+  freshDir(sys.files(), dir);
+  Said did = await run(sys, shell(sys), ["-c", "cd \{dir}; mkdir o; chmod 700 o; echo status=$?"], "");
+  t.eqStr(trimmed(did.out), "status=0", did.err);
+  t.eqStr(trimmed(did.err), "", "chmod says nothing now that it works");
+  Said own = await run(sys, shell(sys), ["-c", "cd \{dir}; chown somebody o"], "");
+  t.eqStr(trimmed(own.err), "chown: \{dir}/o: the host's owners are not names, so a file cannot be given to one", own.err);
+  t.isFalse(contains(own.err, "Permission denied"), own.err);
+  t.isFalse(contains(own.err, "cannot access"), own.err);
+  Said gnu = await run(sys, "bash", ["-c", "cd \"$1\"; chown \"$(id -un)\" o; echo status=$?", "bash", dir], "");
+  t.eqStr(trimmed(gnu.out), "status=0", "bash could not chown either");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}

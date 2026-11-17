@@ -170,7 +170,7 @@ export function faultOf(e: unknown): number {
     // without it throws `NotCapable` rather than `PermissionDenied`. With no case here the error
     // reached `statFault` as an unknown one and a *denial arrived as absence* — `stat /proc` in a
     // host-mounted shell said "not found" about a directory that is plainly there, which is the
-    // failure `Stat.fault` exists to prevent and the one `unnameable.test.ts` is about.
+    // failure `Stat.fault` exists to prevent and the one box's `unnameable_test.wac` is about.
     //
     // `FAULT_NOT_GRANTED` rather than `FAULT_DENIED`, by this file's own distinction below: nothing
     // about the path or its mode refused, the program was built without the capability. It is the

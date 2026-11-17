@@ -34,7 +34,12 @@ fn main() -> ExitCode {
 
 fn run(dir: &str) -> Result<Vec<u8>, String> {
     let wasm = std::fs::read(format!("{dir}/module")).map_err(|e| format!("module: {e}"))?;
-    let source = std::fs::read(format!("{dir}/source")).map_err(|e| format!("source: {e}"))?;
+    let mut source = std::fs::read(format!("{dir}/source")).map_err(|e| format!("source: {e}"))?;
+    // A suffix, after a newline: what the Rust ladder appends to wacc's flattened source, the driver.
+    if let Ok(suffix) = std::fs::read(format!("{dir}/suffix")) {
+        source.push(b'\n');
+        source.extend_from_slice(&suffix);
+    }
     let subject = std::fs::read(format!("{dir}/subject")).ok();
     let mut config = Config::new();
     config.wasm_function_references(true);

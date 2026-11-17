@@ -12,6 +12,7 @@ every CID below against the file.
 | `wasm-seam/1` | `wac:bootstrap/js/ladder.js` | `bafkreiftyqf7afochsqjz3jjgu3r4w4znxeuruwuaunmxqrhqbie2jud64` | one rung of wac's bootstrap ladder run through its seam (`l1Text`, `through`); runners: node (V8) and wasmtime (docs/seam-machine.md) |
 | `wac-flatten/1` | `wac:bootstrap/js/flatten.js` | `bafkreifcoey5u3sfwx4e6kzta5sru3wcu33zsqyumuxhzmynkbpfqfb4em` | a module graph as one program; with the next line, the two implementations that define it together (docs/flatten-machine.md) |
 | `wac-flatten/1` | `wac:bootstrap/rust-ladder/src/flatten.rs` | `bafkreibgzsis2ncnyf2nw55fwktvc7jmhcg5lv23afcrdyxkn6bedcj7pu` | |
+| `wacc-drive/1` | `wac:bootstrap/rust-ladder/src/main.rs` | `bafkreiczywyurplbmcwugoswpcykzgtsviqyklzmxkcrjhpxkmufpm5buq` | a drivable wacc compiling a program from a tree of sources, sealed (`--with-wacc`'s tail); with `wacc.rs`, `wacc.js` and the flatteners' file sets; runners: node (V8) and wasmtime (docs/drive-machine.md) |
 
 `wac:` paths are in wac's source at the commit `wac.lock` pins. A CID of a file this small is the raw CID
 of its SHA-256, which is what `obj add` gives a file of up to 1 MiB under `unixfs-v1-2025`.

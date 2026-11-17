@@ -3,7 +3,10 @@
 //
 //     boot recipe --source F                         a wac-l0/1 recipe: F as `source`
 //     boot recipe --tree DIR --entry PATH            a wac-flatten/1 recipe: DIR as `tree/`, PATH (within it) as `entry`
-//     boot recipe --module F --source F [--subject F] a wasm-seam/1 recipe: one rung of the ladder and its text
+//     boot recipe --module F --source F [--subject F] [--suffix F]
+//                                                    a wasm-seam/1 recipe: one rung of the ladder and its text
+//     boot recipe --wacc F --tree DIR --entry PATH --name N --grants "read write …"
+//                                                    a wacc-drive/1 recipe: the driven wacc compiling PATH in DIR
 //                                                    either way: the input tree and the recipe into the store; prints
 //                                                    the recipe's CID
 //     boot run RECIPE --tool CMD [--key F --runner NAME] [--work DIR]
@@ -26,7 +29,7 @@ import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.FileIn, ipfs.P
 import { Recipe, recipeFrom, recipeId, recipeValue, Statement, Signed, signStatement, statementId } from "../src/claims.wac";
 import { Index, loadIndex, saveIndex } from "../src/graph.wac";
 import { FORMAT } from "../src/machine.wac";
-import { L0_MACHINE, FLATTEN_MACHINE, SEAM_MACHINE, isBootMachine, outName, answered, refused, dirsOf } from "../src/boot.wac";
+import { L0_MACHINE, FLATTEN_MACHINE, SEAM_MACHINE, DRIVE_MACHINE, isBootMachine, outName, answered, refused, dirsOf } from "../src/boot.wac";
 import { unhex } from "../src/hex.wac";
 
 string flag(string[] a, string name, string fallback) {
@@ -66,9 +69,9 @@ async i32 recipeCmd(Sys sys, Store store, string[] a) {
     // wasm-seam/1: the rung, the text it is given, and for the interpreter an optional subject.
     machine = SEAM_MACHINE();
     files = FileIn[]();
-    string[] names = ["module", "source", "subject"];
-    string[] paths = [module, source, flag(a, "--subject", "")];
-    for (i32 i = 0; i < 3; i++) {
+    string[] names = ["module", "source", "subject", "suffix"];
+    string[] paths = [module, source, flag(a, "--subject", ""), flag(a, "--suffix", "")];
+    for (i32 i = 0; i < 4; i++) {
       if (paths[i] == "") { continue; }
       match (await sys.readFile(paths[i])) {
         Err(e): { sys.warn("boot: \{paths[i]}: \{e}"); return 1; }
@@ -82,7 +85,8 @@ async i32 recipeCmd(Sys sys, Store store, string[] a) {
       Ok(b): { files = [FileIn("source", b)]; }
     }
   } else if (treeDir != "" && entry != "" && source == "") {
-    machine = FLATTEN_MACHINE();
+    string waccPath = flag(a, "--wacc", "");
+    machine = waccPath == "" ? FLATTEN_MACHINE() : DRIVE_MACHINE();
     // The directory through the importer, so it is read exactly as `obj add` reads it, then read back.
     Cid sub;
     match (await importDir(store, sys.files(), treeDir, PROFILE())) {
@@ -98,8 +102,17 @@ async i32 recipeCmd(Sys sys, Store store, string[] a) {
         dirs = ["tree"];
       }
     }
+    if (machine == DRIVE_MACHINE()) {
+      // wacc-drive/1: the driven wacc, and the name and grants the manifest records.
+      match (await sys.readFile(waccPath)) {
+        Err(e): { sys.warn("boot: \{waccPath}: \{e}"); return 1; }
+        Ok(b): { files = plusFile(files, FileIn("wacc", b)); }
+      }
+      files = plusFile(files, FileIn("name", (flag(a, "--name", "") + "\n").toBytes()));
+      files = plusFile(files, FileIn("grants", (flag(a, "--grants", "") + "\n").toBytes()));
+    }
   } else {
-    sys.warn("boot recipe: --source F (wac-l0/1), --tree DIR with --entry PATH (wac-flatten/1), or --module F --source F [--subject F] (wasm-seam/1)");
+    sys.warn("boot recipe: --source F (wac-l0/1), --tree DIR --entry PATH (wac-flatten/1), --module F --source F [--subject F] [--suffix F] (wasm-seam/1), or --wacc F --tree DIR --entry PATH --name N --grants \"read …\" (wacc-drive/1)");
     return 2;
   }
   Cid input;
@@ -148,14 +161,30 @@ async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
   await sys.files().remove(work, true);
   await sys.files().mkdir(work, true);
   string inPath;
-  if (recipe.machine == SEAM_MACHINE()) {
+  if (recipe.machine == DRIVE_MACHINE()) {
+    // The driven wacc, `entry`, `name`, `grants` and the tree, written into one directory, which the tool is handed.
+    await sys.files().mkdir(work + "/in", true);
+    for (i32 i = 0; i < tree.len(); i++) {
+      string p = tree[i].path;
+      bool ok = p == "wacc" || p == "entry" || p == "name" || p == "grants" || (p.len() > 5 && p.slice(0, 5) == "tree/");
+      if (!ok) { sys.warn("boot: a wacc-drive/1 input holds wacc, entry, name, grants and tree/, not \{p}"); return 1; }
+      if (p == "entry" && (firstLine(tree[i].content).slice(0, 1) == "/" || hasDotDot(firstLine(tree[i].content)))) {
+        sys.warn("boot: a wacc-drive/1 input names its entry within tree/");
+        return 1;
+      }
+      string at = work + "/in/" + p;
+      await sys.files().mkdir(at.slice(0, lastSlash(at)), true);
+      match (await sys.writeFile(at, tree[i].content)) { Err(e): { sys.warn("boot: abort: \{e}"); return 3; } Ok(_): { } }
+    }
+    inPath = work + "/in";
+  } else if (recipe.machine == SEAM_MACHINE()) {
     // `module`, `source` and maybe `subject`, written into one directory, which is what the tool is handed.
     bool hasModule = false;
     bool hasSource = false;
     await sys.files().mkdir(work + "/in", true);
     for (i32 i = 0; i < tree.len(); i++) {
       string p = tree[i].path;
-      if (p != "module" && p != "source" && p != "subject") { sys.warn("boot: a wasm-seam/1 input holds module, source and subject, not \{p}"); return 1; }
+      if (p != "module" && p != "source" && p != "subject" && p != "suffix") { sys.warn("boot: a wasm-seam/1 input holds module, source, subject and suffix, not \{p}"); return 1; }
       if (p == "module") { hasModule = true; }
       if (p == "source") { hasSource = true; }
       match (await sys.writeFile(work + "/in/" + p, tree[i].content)) { Err(e): { sys.warn("boot: abort: \{e}"); return 3; } Ok(_): { } }

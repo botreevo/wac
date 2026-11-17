@@ -13,6 +13,9 @@ try {
   const wasm = readFileSync(`${dir}/module`);
   let text = readFileSync(`${dir}/source`);
   const subject = existsSync(`${dir}/subject`) ? readFileSync(`${dir}/subject`) : null;
+  // A compiler rung's text may carry a suffix, after a newline: what the Rust ladder appends to wacc's flattened source
+  // (`format!("{waccc}\n{driver}")`), the driver a host then calls it through.
+  if (existsSync(`${dir}/suffix`)) text = Buffer.concat([text, Buffer.from("\n"), readFileSync(`${dir}/suffix`)]);
   const { instance } = await WebAssembly.instantiate(wasm, {});
   const e = instance.exports;
   const memory = e.memory;

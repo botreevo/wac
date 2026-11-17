@@ -6,7 +6,7 @@ compilers. A host hands each rung text through a *seam*, an address in its memor
 a rung is now a derivation. With `wac-l0/1` (the assembler) and `wac-flatten/1` (the flattener), every step from the
 hand-written rungs to wacc is a claim that two runners sign.
 
-`tools/rungs.sh` (task `reckon:rungs`) checks it: 14 of 14, in about three minutes.
+`tools/rungs.sh` (task `reckon:rungs`) checks it, then milestone 4's steps (docs/drive-machine.md).
 
 ## The rule
 
@@ -17,6 +17,8 @@ hand-written rungs to wacc is a claim that two runners sign.
     input tree    module            the rung, a wasm module
                   source            the text it is given
                   subject           optional, for the interpreter: an L2 program for `source` (the L2 compiler) to compile
+                  suffix            optional, for a compiler: appended to `source` after a newline, as the Rust ladder
+                                    appends a driver to wacc's flattened source (`format!("{waccc}\n{driver}")`)
     output tree   status            "ok"
                   out/answer.l0     the rung's answer
 
@@ -70,8 +72,8 @@ then `boot run RECIPE --tool CMD`. The tool is called `CMD IN OUT`, where IN is 
 
 ## What it does not do yet
 
-- **wacc is not yet `wac`.** wacc compiling the `wac` command needs a host to answer its file reads. That is
-  milestone 4, the wacc-drive step.
+- **wacc is not `wac`.** wacc compiling the `wac` command needs a host to hand it the files: that is
+  `wacc-drive/1`, milestone 4 (docs/drive-machine.md), which `tools/rungs.sh` runs after these steps.
 - **The seed is still in the capstone's roots.** Milestone 5 roots the capstone's policy here instead.
 - **No NaN canonicalization.** A rung computes text and runs no floating point the answer depends on. It compiles
   float code; it does not execute it.

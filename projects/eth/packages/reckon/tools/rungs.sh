@@ -7,10 +7,13 @@
 #     L3 compiles boot/l4.l3 ──wasm-seam/1──▶ L0 ──wac-l0/1──▶ the L4 compiler
 #     L4 compiles boot/l5.l4 ──wasm-seam/1──▶ L0 ──wac-l0/1──▶ the L5 compiler
 #     packages/wacc/src ──wac-flatten/1──▶ one program; L5 compiles it ──wasm-seam/1──▶ L0 ──wac-l0/1──▶ wacc
+#     …and with wac's driver appended ──wasm-seam/1──▶ L0 ──wac-l0/1──▶ a wacc a host can drive
+#     that wacc compiles packages/wac/src/wac.wac ──wacc-drive/1──▶ the wac command   (milestone 4)
 #
 # Each machine has two runners written apart, and each signs: wac-l0/1 wac's Rust and JavaScript assemblers;
 # wac-flatten/1 its JavaScript flattener and the ladder's Rust one; wasm-seam/1 V8 (node) and wasmtime
-# (tools/seam/wasmtime). Checked: both runners agree at every step; wacc's L0 is byte for byte what wac's own ladder
+# (tools/seam/wasmtime); wacc-drive/1 wac's JavaScript file set and driver (node) and its Rust file set with a
+# wasmtime driver (tools/drive/wasmtime). The wac command at the end is byte for byte what `ladder --with-wacc` makes. Checked: both runners agree at every step; wacc's L0 is byte for byte what wac's own ladder
 # makes; and a policy admits wacc's module only through the whole chain, back to the reviewed sources, refusing it when
 # a step's second runner is withdrawn or a rung's source is not reviewed.
 #
@@ -42,6 +45,7 @@ wac build --quiet --allow-read --allow-write packages/ipfs/cmd/obj.wac -o "$work
 echo "building wax (Rust assembler) and the wasmtime seam runner, offline"
 (cd "$src/bootstrap/rust" && cargo build --release --quiet --offline --target-dir "$work/wax-target")
 (cd "$here/tools/seam/wasmtime" && cargo build --release --quiet --offline --target-dir "$work/seam-target")
+(cd "$here/tools/drive/wasmtime" && WAC_SRC="$src" cargo build --release --quiet --offline --target-dir "$work/drive-target")
 cd "$work"
 rm -rf store w-* t && mkdir -p t
 st="--store $work/store"
@@ -52,6 +56,7 @@ printf '%s\n' add2f9f8b6e2bff7d0b6e7d1bbcd8fe16c3fbd8b5b1fbb1c0a63e5a0e7a2c3b1 >
 L0_JS="node $here/tools/boot/assemble.mjs $src/bootstrap/js/assemble.js";   L0_RUST="$work/wax-target/release/wax"
 FL_JS="node $here/tools/boot/flatten.mjs $src/bootstrap/js/flatten.js";     FL_RUST="sh $here/tools/boot/flatten-rust.sh $LADDER"
 SE_JS="node $here/tools/seam/node.mjs";                                       SE_RUST="$work/seam-target/release/seam-wasmtime"
+DR_JS="node $here/tools/drive/node.mjs $src/bootstrap";                       DR_RUST="$work/drive-target/release/drive-wasmtime"
 
 # both NAME RECIPE JSTOOL JSNAME RUSTTOOL RUSTNAME: run by both runners, each signing; one output, or FAIL. Sets $out.
 both() {
@@ -66,9 +71,9 @@ assemble() {
   both "assemble $1" "$r" "$L0_JS" "wax.js (node) at wac $short" "$L0_RUST" "wax (Rust) at wac $short"
   wac obj.wasm cat "$out" out/module.wasm $st > "t/$1.wasm"
 }
-# seam NAME MODULE SOURCE [SUBJECT]: wasm-seam/1; the answer in t/NAME.l0. Sets $out.
+# seam NAME MODULE SOURCE [SUBJECT] [SUFFIX]: wasm-seam/1; the answer in t/NAME.l0. Sets $out.
 seam() {
-  r=$(wac boot.wasm recipe --module "$2" --source "$3" ${4:+--subject "$4"} $st 2>/dev/null)
+  r=$(wac boot.wasm recipe --module "$2" --source "$3" ${4:+--subject "$4"} ${5:+--suffix "$5"} $st 2>/dev/null)
   both "run $1" "$r" "$SE_JS" "seam (node, V8) at wac $short" "$SE_RUST" "seam (wasmtime) at wac $short"
   wac obj.wasm cat "$out" out/answer.l0 $st > "t/$1.l0"
 }
@@ -92,6 +97,20 @@ cmp -s t/wacc.l0 ladder-wacc.l0 && ok "wacc's L0, $(wc -c < t/wacc.l0) bytes, is
 assemble wacc t/wacc.l0
 wacc=$out
 
+step "the wac command: wacc with its driver, driven to compile packages/wac/src/wac.wac (milestone 4)"
+seam driven t/l5.wasm t/wacc.flat.wac "" "$src/bootstrap/drivers/spec_cases.wac"; assemble driven t/driven.l0
+rm -rf inputs/wac && mkdir -p inputs/wac && cp -r "$src/." inputs/wac/ && rm -f inputs/wac/pack.pack
+dr=$(wac boot.wasm recipe --wacc t/driven.wasm --tree inputs/wac --entry packages/wac/src/wac.wac --name wac.wasm \
+     --grants "read write env net run" $st 2>/dev/null)
+echo "   (each runner a few minutes: wacc is driven a byte at a time)"
+both "drive: the wac command" "$dr" "$DR_JS" "wacc-drive (node, V8) at wac $short" "$DR_RUST" "wacc-drive (Rust, wasmtime) at wac $short"
+command=$out
+wac obj.wasm cat "$command" out/module.wasm $st > t/wac.wasm
+mkdir -p ref && (cd "$src" && "$LADDER" packages/wacc/src/api.wac --with-wacc packages/wac/src/wac.wac \
+  --allow-read --allow-write --allow-env --allow-net --allow-run -o "$work/ref/wac.wasm" >/dev/null 2>&1)
+cmp -s t/wac.wasm ref/wac.wasm && ok "the wac command, $(wc -c < t/wac.wasm) bytes, is byte for byte what ladder --with-wacc makes" \
+  || bad "the wac command differs from ladder --with-wacc's"
+
 step "admission: wacc, through every step, back to reviewed sources"
 cid() { python3 -c "import sys,hashlib,base64; d=hashlib.sha256(open(sys.argv[1],'rb').read()).digest(); print('b'+base64.b32encode(bytes([1,0x55,0x12,0x20])+d).decode().lower().rstrip('='))" "$1"; }
 # wacc's module is larger than one block, so the subject is the tree it was assembled into, admitted as such.
@@ -100,7 +119,7 @@ cat > policy.json5 <<EOF
 {
   signers: { js: "$(claim address --key js.key)", rust: "$(claim address --key rust.key)",
              reviewer: "$(claim address --key reviewer.key)" },
-  machines: ["wac-l0/1", "wac-flatten/1", "wasm-seam/1"],
+  machines: ["wac-l0/1", "wac-flatten/1", "wasm-seam/1", "wacc-drive/1"],
   formats: ["unixfs-v1-2025+hidden"],
   roles: {
     // A module: assembled by both assemblers, from L0 text that is either reviewed or a rung's answer.
@@ -109,10 +128,12 @@ cat > policy.json5 <<EOF
     // A rung's answer: run on V8 and wasmtime, by a module that is itself assembled, from text that is reviewed or
     // flattened from reviewed sources.
     answer: [{ derived: { by: ["js", "rust"], at_least: 2, runners: 2,
-                          slots: { module: "rung", source: "text", subject: "text" } } }],
+                          slots: { module: "rung", source: "text", subject: "text", suffix: "text" } } }],
     rung: [{ within: { role: "assembled", path: "out/module.wasm" } }],
     text: [{ endorsed: { by: ["reviewer"], at_least: 1 } }, { within: { role: "flattened", path: "out/flat.wac" } }],
     flattened: [{ derived: { by: ["js", "rust"], at_least: 2, runners: 2, other: "reviewed" } }],
+    // The wac command: compiled by a driven wacc that is itself assembled, from reviewed sources and settings.
+    command: [{ derived: { by: ["js", "rust"], at_least: 2, runners: 2, slots: { wacc: "rung" }, other: "reviewed" } }],
     reviewed: [{ endorsed: { by: ["reviewer"], at_least: 1 } }],
   },
 }
@@ -123,10 +144,19 @@ for f in "$boot/l1.l0" "$boot/l2.l1" "$boot/l3.l2" "$boot/l4.l3" "$boot/l5.l4"; 
   claim endorse "$(cid "$f")" "reviewed: wac's bootstrap rung $(basename "$f") at $short" --key reviewer.key >/dev/null
 done
 claim slots "$fr" | while read -r slot c; do claim endorse "$c" "reviewed: wacc's source at $short" --key reviewer.key >/dev/null; done
+claim endorse "$(cid "$src/bootstrap/drivers/spec_cases.wac")" "reviewed: the ladder's wacc driver at $short" --key reviewer.key >/dev/null
 [ "$(admit)" = yes ] && ok "admitted: wacc, through $(grep -c "admitted as" admit.log) admitted objects, back to the five rungs and wacc's source" \
   || bad "refused: $(grep -i "refused\|nobody" admit.log | head -5)"
 depth=$(grep -o "admitted as [a-z0-9]*" admit.log | sort | uniq -c | tr '\n' ' ')
 echo "   $depth"
+[ "$(wac claim.wasm admit "$command" command --policy policy.json5 $st 2> /dev/null > admit-cmd.log && echo yes || echo no)" = no ] \
+  && grep -q "endorsed by nobody" admit-cmd.log && ok "the wac command: refused while wac's source and the drive's settings are unreviewed" \
+  || bad "the wac command admitted unreviewed: $(tail -3 admit-cmd.log)"
+claim slots "$dr" | while read -r slot c; do [ "$slot" = wacc ] || claim endorse "$c" "reviewed: wac's source and the drive's settings at $short" --key reviewer.key >/dev/null; done
+wac claim.wasm admit "$command" command --policy policy.json5 $st > admit-cmd.log 2>/dev/null \
+  && ok "admitted: the wac command, through the drive, the driven wacc, every rung and the flattening, back to reviewed sources" \
+  || bad "the wac command refused: $(grep -i "refused\|nobody" admit-cmd.log | head -5)"
+echo "   its roots: $(grep -c "endorsed by reviewer" admit-cmd.log) reviewed objects; $(grep -c "admitted as" admit-cmd.log) admitted in all"
 # The second runner of one middle step withdrawn: the L4 compiler's answer, on wasmtime.
 l4r=$(wac boot.wasm recipe --module t/l3.wasm --source "$boot/l4.l3" $st 2>/dev/null)
 d=$(wac boot.wasm run "$l4r" $st --work w-rust --tool "$SE_RUST" --key rust.key --runner "seam (wasmtime) at wac $short" 2>/dev/null | sed -n 2p)

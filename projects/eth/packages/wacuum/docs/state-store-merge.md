@@ -150,11 +150,23 @@ has had the most bugs and the most new tests, and is where a reviewer's time is 
 - **Scale.** The largest store so far is 5 GB, synthetic; Hoodi's will be tens of GB and mainnet's hundreds. The
   interior is kept in memory (~400 MB estimated at mainnet). Commit cost grows with the store (above); beyond 5 GB
   it is extrapolated, not measured.
-- **Commits batched over 64 blocks** (built after this note was first written): a stop of any kind replays up to
-  64 blocks from the log on restart (wac programs cannot catch signals, so every stop is a crash); the overlay
-  holding those blocks' changes is ~2 MB a block at mainnet's rate, bounded by a 64 MB flush.
-- **Torn writes on a real power cut** are modelled (any subset of unsynced writes lost), not exercised: SIGKILL
-  leaves the kernel's page cache intact.
+- **Commits batched** (built after this note was first written): a stop of any kind replays the blocks since the
+  last flush from the log on restart (wac programs cannot catch signals, so every stop is a crash). *Since the
+  merge* the default is 8 blocks, not 64, from measurements (`docs/state-on-disk.md`, `tools/measure/flush.wac`):
+  the flush runs inside the block that reaches it, and at a 2.9 GB store 64 made every 64th block take 4.4 s — a
+  third of a slot, growing with the store — for a mean a block 20% lower than 8's; 8 costs 1.4 s once in 8.
+  Taking the flush off the block's path would give both; not built.
+- **Torn writes on a real power cut**: *since the merge*, exercised — `crash.wac … torn` runs the store node on
+  ext4 on a direct-I/O loop device and, at each kill, restarts it on an atomic clone of the device (a reflink on
+  XFS), so what was in the page cache is lost. Its first run found that the chain log, whose appends are not
+  synced, can lose a run of blocks the store has, and the node then came back unable to follow (SYNCING for good);
+  a restart now recovers them from the store (`adoptStored`, `resume_test`). 200 blocks with 40 power cuts then
+  passed at `--flush-every` 1 and 64. Not covered: a disk that loses writes it acknowledged, and reordering below
+  ext4 — the store's own tests model those.
+- **Memory on a 32 GB box**: *since the merge*, budgeted in `docs/mainnet.md` ("Memory on the 32 GB box"): the
+  shadow fits; wacuum following beside a reference stack (two Lighthouses) is tight, ~21–30 GB, mostly estimated.
+  A block of history costs ~320 KB of memory on mainnet (measured), so Hoodi's `HISTORY=8192` is 2.6 GB there;
+  1024 is the mainnet setting.
 - **Store format**: new, and changed three times on this branch (64 KB → 16 KB pages; level-keyed tries, 4; entries
   beside their trie nodes, 5); an older store is refused with a message, there is no migration, and none is needed
   while no store exists anywhere that matters.

@@ -64,7 +64,7 @@ there for good.
   '{"jsonrpc":"2.0","id":1,"method":"wacuum_sizes","params":[]}' 127.0.0.1:8552` lists what it holds between
   blocks (the store's leaves, cache and queue; the blocks, history and payloads it keeps).
 - **A restart** goes on from the store: the state of the block it last committed, then the log of what came
-  after — up to 64 blocks replayed — and blocks it missed while down fetched from the local geth (its `--peer`).
+  after — up to 8 blocks replayed (`--flush-every`) — and blocks it missed while down fetched from the local geth (its `--peer`).
   A crash at any point leaves the store whole, and a reorg after one can still take the store back, by the blocks'
   undo records (`docs/state-on-disk.md`, "Crash windows").
 - **Lighthouse's view**: `journalctl -u lighthouse-wacuum | grep -E 'ERRO|CRIT'` — an execution engine error there

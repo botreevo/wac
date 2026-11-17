@@ -224,6 +224,44 @@ fixed: the pinned wac commit was not on GitHub yet (fetched from git.voltrevo.co
 commit wac's own lock names (`tools/deps.sh` does the same); and a second run — an upgrade — stopped at `git
 pull`, root's git refusing the checkout the service user owns.
 
+## Memory on the 32 GB box (2026-11-17)
+
+Each figure is marked **measured** (here, on this container) or *estimated*. Two arrangements matter: the shadow (C),
+which is what the box runs first, and later wacuum on its own store following mainnet beside the reference (B).
+
+**wacuum's own parts**, on a store, at mainnet's rate:
+
+| part | size | how known |
+| --- | ---: | --- |
+| the entry cache (`--cache-mb`) | as set: 256 MB default, 2 GB on Hoodi | the setting |
+| leaves held | 64 MB | a fixed budget (`LEAF_BYTES`) |
+| the store's interior (B+tree separators) | *~400 MB at mainnet's ~150 GB flat state* | estimated (`docs/state-on-disk.md`, `state-cache.md`) |
+| the overlay, at `--flush-every 8` | **5 MB** at a 2.9 GB store (35 MB at 64); at most 64 MB, when it flushes | measured (`tools/measure/flush.wac`); the cap |
+| history (`--history N`) | **~320 KB a mainnet block**: header, transactions, receipts — 8192 blocks ≈ 2.6 GB, 1024 ≈ 330 MB | measured roughly (`replay.wac --hold`, resident growth, errs high) |
+| payloads built, mempool, peers | tens of MB | the soak's `wacuum_sizes` |
+| the process beyond its heap (V8, code, buffers) | **~80–150 MB** | measured: the soak's 2400 blocks under a 256 MB heap peaked at 323–339 MB resident |
+
+So on mainnet `CACHE_MB=1536` and `HISTORY=1024` come to ~2.5 GB of live data; V8 wants room above that to collect,
+so `WAC_MAX_HEAP=6g`, and wacuum's resident memory is expected at *3–5 GB*. Hoodi's settings (`HISTORY=8192`) are
+for Hoodi's small blocks: on mainnet they would hold ~2.6 GB of history alone.
+
+**The box, 32 GB** (*estimated* from the clients' documentation and common reports; to be measured on the box):
+
+| process | shadow (C) | wacuum following too (B) |
+| --- | ---: | ---: |
+| reth (mainnet, full) | *8–12 GB*, plus the page cache it reads through | the same |
+| Lighthouse for reth | *4–6 GB* | the same |
+| `wacuum-shadow` (one block's replay at a time) | **< 1 GB** (bounded at 8 GB by its unit) | — |
+| wacuum on its store (`WAC_MAX_HEAP=6g`, `CACHE_MB=1536`, `HISTORY=1024`) | — | *3–5 GB* |
+| a second Lighthouse, driving wacuum (each execution client needs its own) | — | *4–6 GB* |
+| node_exporter, the OS | < 1 GB | < 1 GB |
+| **total** | **~14–20 GB**, the rest page cache | **~21–30 GB**: tight |
+
+The shadow fits with room for reth's page cache, which is what makes reth fast. Both stacks together leave little:
+on 32 GB, wacuum's cache goes down (`CACHE_MB=1024`), or the shadow's reference is stopped once wacuum follows on
+its own, or the box has 64 GB. The memory figures to take on the day: `systemctl status` of each unit (its memory),
+`free -g`, and `wacuum_sizes` from wacuum's RPC.
+
 ## What is needed from Andrew when the machine is ready
 
 - [ ] Its address, and SSH access as root (a key for this agent's sessions).

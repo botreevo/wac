@@ -159,18 +159,38 @@ restart needs only the block log after the block the store's meta names, and the
 the store rather than the state. A commit a block (~0.2 s of host requests and an `fsync`) fits a 12 s slot;
 batching commits during a long catch-up is the optimisation, if measurements ask for it.
 
-**Since built** (`Store.stage`, `flush`; `--flush-every`, 64 by default): a block's commit is staged in an
+**Since built** (`Store.stage`, `flush`; `--flush-every`, 8 by default since 2026-11-17, 64 before): a block's commit is staged in an
 overlay in the store, which every read looks through first (point reads at once; ranges merged in key order,
 and the hot paths — codes, receipts, blocks — read their chunks point by point instead), and the overlay is
-written as one commit every 64 blocks or 64 MB of keys and values. The store still reads as holding the state of
+written as one commit every N blocks or 64 MB of keys and values. The store still reads as holding the state of
 the block the engine is at, so nothing above it changed. A crash, or any stop (wac has no signal handlers, so a
 stop is a crash), loses the overlay: the file is at the last flush, whose bytes name its block, and the block
-log replays what came after — up to 64 blocks. `tools/e2e/crash.wac -- 200 40 64`: 40 kills, restarts replaying
+log replays what came after — up to N blocks. `tools/e2e/crash.wac -- 200 40 64`: 40 kills, restarts replaying
 up to 62 blocks each, the same head, root, slots and balances as a node never killed. Writes a block fall from
 ~5190 keys to ~1950 at 64 (the 64-block mainnet trace). One limit,
 recorded rather than solved: undoing a block that deleted an account with storage needs every slot it
 had, and only the slots read are noted — after Cancun, SELFDESTRUCT deletes only what the same transaction
 created, so no such block exists on a chain this runs.
+
+**The default, from measurements** (2026-11-17, `tools/measure/flush.wac` on a 2.9 GB store `scale.wac` filled: 256
+blocks of 1000 cold account reads, 500 of them written and 300 new slots, the root computed). The flush runs inside the
+block whose commit reaches N, so a batch's saving is paid as one long block:
+
+| flush every | block, mean | median | longest (the flush) | overlay at the flush |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 255–283 ms | 248–275 ms | 0.4–0.6 s | — |
+| 4 | 242 ms | 125 ms | 0.7 s | 2 MB |
+| 8 | 234 ms | 118 ms | 1.4 s | 5 MB |
+| 16 | 225 ms | 125 ms | 1.8 s | 10 MB |
+| 32 | 216 ms | 124 ms | 3.1 s | 19 MB |
+| 64 | 183–186 ms | 115 ms | 4.2–4.4 s | 35 MB |
+| 128 | 172 ms | 114 ms | 7.1 s | 63 MB |
+
+64 saves a third of a block's mean against 1, but every 64th `newPayload` waits 4.4 s at 3 GB — a third of a slot
+and past the 4 s at which attesters vote — and the pause grows with the store, which on mainnet is a hundred times
+this. 8 keeps most of what 4 to 16 save (a mean 10% under 1), a pause near 1.4 s, a restart's replay of 8 blocks at
+most and an overlay of a few MB. The better answer is to take the flush off the block's path — answer `newPayload`,
+then flush — which would give 64's mean with no long block; not built yet.
 
 The engine stays synchronous — its JSON-RPC handlers, tests and fixture runners call it so — and gains
 `prepare(method, params)`, which the server awaits before `call`: in store mode it does the asynchronous

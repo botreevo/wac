@@ -1,6 +1,6 @@
 # 0394a — When the engine rejects a built module, `wac` says `wac build … -o out` keeps it, and no file is written
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-10-21
@@ -26,3 +26,11 @@ Found while bisecting the seed failure during the 2026-10-21 bug hunt. The messa
 The v8 host's message no longer says `wac build … -o out` keeps the module (`native/v8/src/main.rs`, with
 `issues/system/0365a`): it names the engine's own reason instead, and says when the rejected module was the binary's
 seed. What this issue asks for is still open — the rejected module written to disk so it can be inspected.
+
+## Fixed — 2026-11-17
+
+`wac build` and `wac compile` keep a module the engine refuses at `<output>.rejected.wasm` — `-o dist/app` gives
+`dist/app.rejected.wasm`, `wac compile x.wac out.wasm` gives `out.rejected.wasm` — and the refusal names it, or says
+why it could not be kept. The output's own name is still never written, so it keeps meaning a module that loads.
+`packages/wac/src/rejected.wac`; `packages/wac/test/wac/rejected_test.wac` drives the keeping directly, since no
+program known today reaches the engine's refusal end to end.

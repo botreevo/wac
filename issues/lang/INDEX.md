@@ -42,7 +42,7 @@ has been fixed and why.
 | [0397a](closed/0397a-an-import-alias-inside-a-fields-nested-instance-emits-a-bogus-instance.md) | An import alias inside a struct field's nested generic instance (`Ticket<Result<Chunk, O>>`) leaves a bogus instance the emitter declines with "a null in a Result<Chunk,O> slot" | bug | compile error |
 | [0396a](closed/0396a-const-is-still-stripped-through-construction-returns-and-fields.md) | A `const` reference stored into a plain field, returned through a plain function, or read from a `const` field is writable | bug | wrong answer |
 | [0395a](closed/0395a-a-duplicate-matches-binding-is-accepted.md) | `R p matches m && R p matches n` compiles and silently uses the second `p`; two wordings are wrong | bug | wrong answer |
-| [0394a](open/0394a-wac-build-says-o-keeps-a-rejected-module-and-does-not.md) | When the engine rejects a built module, `wac` says `wac build … -o out` keeps it, and no file is written | bug | wrong answer |
+| [0394a](closed/0394a-wac-build-says-o-keeps-a-rejected-module-and-does-not.md) | When the engine rejects a built module, `wac` says `wac build … -o out` keeps it, and no file is written | bug | wrong answer |
 | [0393a](open/0393a-generic-tag-functions-and-markup-in-static-initialisers.md) | A generic tag function (`T first<T>(T[] kids)`) and markup in a static initialiser are refused | missing feature | not implemented |
 | [0392a](open/0392a-a-bound-method-with-its-own-type-arguments-as-a-value.md) | `c.pick<i32>` as a value is refused; the parser drops the written type arguments | missing feature | not implemented |
 | [0391a](closed/0391a-a-lambda-capturing-a-match-binding-in-an-async-function.md) | A lambda capturing a match-arm binding inside an `async` function declines with "a type was registered while a body was being emitted … i32[][]" | bug | compile error |
@@ -150,7 +150,7 @@ has been fixed and why.
 
 ## Closed
 
-372 issues, 340 closed.
+372 issues, 341 closed.
 
 Most of the closed ones came from porting `wacc`'s AST to sum types and then probing shapes
 that port does not reach. Twelve typechecked cleanly and then failed at instantiation or ran

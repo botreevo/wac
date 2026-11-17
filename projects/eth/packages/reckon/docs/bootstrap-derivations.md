@@ -2,7 +2,8 @@
 
 **Status, 2026-11-17: option (A) chosen. Milestones 1, 2 (`wac-l0/1`, and `wac-flatten/1` from milestone 4) and 3
 (`wasm-seam/1`, docs/seam-machine.md, `tools/rungs.sh`: the whole ladder as derivations) and 4 (`wacc-drive/1`,
-docs/drive-machine.md: the `wac` command, byte for byte the ladder's) done. Milestone 5 remains.**
+docs/drive-machine.md: the `wac` command, byte for byte the ladder's) done. Milestone 5 done: the capstone with
+LADDER has no roots, and its compiler is admitted back to reviewed text (docs/capstone.md).**
 
 Today every compiler in reckon's chains is derived from one *seed*: wac's compiler at the pinned commit, built natively
 and named in the policy's `roots`. selfbuild.sh and the capstone show the seed is consistent with its source. A
@@ -109,7 +110,7 @@ the ones wac already argues for. Every step is a function of bytes to bytes, so 
    - The wacc driving step: it compiles `packages/wac/src/wac.wac` with the ladder's wacc. **Done:** `wacc-drive/1`,
      docs/drive-machine.md; the `wac` command is byte for byte what `ladder --with-wacc` makes.
    - Then the fixed-point rounds in `wasm-gc/wac-host/2` as today.
-5. **The policy and the capstone, rooted at sources.**
+5. **The policy and the capstone, rooted at sources. Done:** docs/capstone.md, "Rooted at sources".
    - `roots` lose the seed binary. They gain the rung sources (`boot/*`), the L0 spec and both assemblers' sources,
      both flatteners, and the host glue, each as an endorsed object (endorsed by a reviewer key, as the app's source
      is), or as roots directly.

@@ -6,7 +6,7 @@ an anchor. Every step is one this repository already does on its own, and the sc
 
     WASMTIME_WAC=/path/to/native/wac sh packages/reckon/tools/capstone.sh WORKDIR     # about 30 minutes
     QUICK=1 …                                                                       # a few minutes: no self-build
-    LADDER=… (not QUICK)                                                            # the ladder as a second origin
+    LADDER=… (not QUICK)                                                            # rooted at sources: no binary trusted
 
 ## What it does
 
@@ -46,31 +46,37 @@ an anchor. Every step is one this repository already does on its own, and the sc
 
 24 of 24, and 22 of 22 with QUICK. Every derivation agreed across V8 and wasmtime.
 
-With LADDER, at wac 64e87365, the run passes 27 of 27:
-- the ladder built a compiler from its rungs (2,614,977 bytes) with no compiler binary;
-- inside the machine, on both engines, that compiler built the same compiler tree as the seed;
-- the compiler was admitted through `agree`, both origins holding;
-- with the ladder's endorsement revoked on a copy of the store, the seed alone was refused ("origin 2 of 2 does not
-  hold"). The app's CID
-(`bafkreihqj7pxd3hu…`) is the same whether the seed or the compiler it built does the building. That is the
-compiler's fixed point (selfbuild.sh) seen from the outside: the derived compiler builds exactly what the seed builds.
+## Rooted at sources (2026-11-17, wac aaef775ca; decision D, milestone 5)
+
+With LADDER, the policy has **no roots**. The run passes 28 of 28 (4b skipped: no public gateway answered):
+- step 1a+ runs `tools/rungs.sh` (20 of 20). Every step from the five hand-written rungs to the `wac` command is a
+  derivation that two runners sign: assembled by `wac-l0/1`, run through `wasm-seam/1`, flattened by `wac-flatten/1`,
+  and wacc driven by `wacc-drive/1` (docs/seam-machine.md, docs/drive-machine.md). Its blocks and claims go into the
+  builder's store;
+- that `wac` command (2,713,106 bytes, byte for byte what `ladder --with-wacc` makes) builds the compiler inside the
+  machine, on both engines, and gets the same compiler tree as the seed;
+- the policy admits the compiler only through it. The app is admitted through 55 objects, back to 16 a reviewer
+  endorsed: the rungs, wacc's and wac's sources, the driver, the drive's settings, and the app's and the compiler's
+  sources;
+- with wasmtime's run of the L4 rung withdrawn on a copy of the store, the app is refused ("on 1 runner"): a step far
+  down the chain with one runner is not enough.
+
+The seed still builds the compiler (step 1a) and must build the same tree, but no policy rule names it.
+
+The app's CID (`bafkreied45hba…`) is the same whichever compiler does the building. That is the compiler's fixed
+point (selfbuild.sh) seen from the outside.
 
 ## What is still trusted, or stubbed
 
 Said plainly, because the point is to know exactly what an answer rests on.
 
-- **The seed compiler is a trust root, but no longer the only origin.** The compiler that builds the app is derived
-  (unless QUICK). The compiler that built it, wac's own at the pinned commit built natively, is named in the policy's
-  `roots`.
-  - With `LADDER` (step 1a+), the compiler has a second, unrelated origin: wac's bootstrap ladder builds a compiler
-    from its hand-written rungs, and that one builds the same compiler tree inside the machine on both engines.
-  - The policy's `selfbuild` role is then `agree: [via the seed, via the ladder]`, which is diverse double-compiling.
-    The compiler is admitted only when both build it, so a backdoor in the seed would have to be in the ladder's
-    output too. With the ladder's origin withdrawn, the seed alone is refused.
-  - The ladder's output is endorsed by the key that ran the ladder (`bootstrap`) and is not a root. That is milestone
-    1's unsigned step, stated as what it is.
-  - Making the ladder's own steps derivations and taking the seed out of `roots` altogether is decision **D**'s
-    remaining work (docs/bootstrap-derivations.md).
+- **With LADDER, no compiler binary is trusted.** The compiler is admitted only through the bootstrap chain, back to
+  reviewed text (above). What is still trusted there:
+  - the two engines and the runners' host programs, which must agree: V8 and wasmtime;
+  - the two assemblers, the two flatteners and the two drivers, each pair agreeing;
+  - the reviewer, who endorses the hand-written rungs and the sources.
+- **Without LADDER, the seed compiler is a trust root.** The compiler that builds the app is derived (unless QUICK),
+  but the compiler that built it, wac's own at the pinned commit built natively, is named in the policy's `roots`.
 - **On the devnet, the anchor is a block hash taken from the node.** A devnet has no beacon chain, so nothing proves
   its headers. The run takes the node's latest block hash as the anchor, and every read is then fixed to it, so the
   node cannot answer from another block. But that the block is the "right" chain rests on the node. On mainnet the

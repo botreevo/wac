@@ -299,14 +299,25 @@ of Nimbus's light-client mode:
   and goes by the same walk: from the new head back by parent hash to a block wacuum has.
 - *Mainnet dry run*: DRYRUN
 
-**Running it** needs one more thing of wacuum: **it does not start on mainnet's genesis yet** ("the chain is not on
-Cancun or later at genesis" — it runs Cancun on, and mainnet's genesis is Frontier's). A start that takes mainnet's
-known genesis hash and its Cancun-onward schedule (`src/chain/mainnet.wac`) and snap-syncs to the head the driver
-names, never running a block before Cancun, is the missing piece. With it, on the box: `install.sh` builds
-`dist/driver`, makes `/etc/eth/jwt-wacuum.hex` and installs `/etc/eth/mainnet-wac.env` (set `CHECKPOINT`, and
-`BEACON_URL` if not the default) and `wacuum-driver.service`; then `systemctl enable --now wacuum-driver` beside
-wacuum on its store at 127.0.0.1:8551. `journalctl -fu wacuum-driver` shows one line a head: its slot, its execution
-hash, wacuum's answer and the finalized slot.
+**Starting on mainnet.** Mainnet's genesis is Frontier's, and wacuum runs Cancun on, so it takes the genesis for its
+hash and fork schedule only (its hash computed from the alloc in the 15-field header Frontier had:
+`0xd4e56740…8fa3`, as geth's) and never runs a block before Cancun: it starts only with `--store --snap`, answers a
+payload before Cancun `SYNCING`, and snap-syncs from peers to the head the driver names, keeping the ancestors'
+headers in whatever shape their forks gave them. Its EIP-2124 fork id is geth's at every fork of mainnet, Sepolia
+and Hoodi (`test/genesis_test.wac`), so peers take its handshake. A devnet whose genesis is Shanghai's and which forks
+into Cancun at block 5 (`tools/e2e/snap.wac --shanghai`) exercises the whole path against geth. **Not exercised:**
+a snap sync from mainnet's own peers, at mainnet's size (hundreds of GB of state) — the container has no p2p.
+
+**Running it**, on the box: `install.sh` builds `dist/wacuum` and `dist/driver`, makes `/etc/eth/jwt-wacuum.hex`, and
+installs `/etc/eth/mainnet-wac.env` — set `CHECKPOINT` (and `BEACON_URL` if not the default); the heap, cache,
+history and mainnet's bootnodes are there too — and the units. Then:
+
+    systemctl enable --now wacuum-mainnet wacuum-driver
+
+`journalctl -fu wacuum-mainnet` shows the snap sync (`snap sync from N peer(s)` … `snap sync done`), then blocks
+following; `journalctl -fu wacuum-driver` one line a head: its slot, its execution hash, wacuum's answer
+(`SYNCING` until the snap sync is done, then `VALID`) and the finalized slot. Both restart themselves; the driver
+from the finalized root it kept, wacuum from its store.
 
 **Memory, by mode** (the box's 32 GB):
 

@@ -75,7 +75,7 @@ export function bounded(
   // *thrown* "Text file busy" from Deno's own spawn; this does not spawn the target, it spawns
   // `timeout` and hands the target over as an argument. So Deno's spawn succeeds and it is `timeout`
   // whose `execve` fails, on stderr, with a status nobody chose. Nothing throws and the retry never
-  // turns over — which turned a gate red in `packages/box/test/sealing.test.ts` reading as a program
+  // turns over — which turned a gate red in `packages/box/test/wac/sealing_test.wac` reading as a program
   // that printed nothing. `harness/boundedBusy.test.ts` holds the binary open on purpose so both
   // halves of this are checked rather than waited for.
   for (let attempt = 1;; attempt++) {

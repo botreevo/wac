@@ -5,7 +5,7 @@
 //
 // ## What went wrong, and why the guard did not catch it
 //
-// `packages/box/test/sealing.test.ts` turned a gate red with
+// `packages/box/test/wac/sealing_test.wac` turned a gate red with
 //
 //     assertEquals failed — /usr/bin/timeout: failed to run command
 //       ‘/tmp/wac-sealing-…/box’: Text file busy

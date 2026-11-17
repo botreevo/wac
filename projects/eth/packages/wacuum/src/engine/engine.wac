@@ -321,6 +321,9 @@ export struct Engine {
     if (method == "engine_getPayloadV5") { return this.getPayload(5, ps!); }
     if (method == "engine_getBlobsV1") { return this.getBlobs(1, ps!); }
     if (method == "engine_getBlobsV2") { return this.getBlobs(2, ps!); }
+    if (method == "engine_getPayloadBodiesByHashV1") { return this.bodiesByHash(ps!); }
+    if (method == "engine_getPayloadBodiesByRangeV1") { return this.bodiesByRange(ps!); }
+    if (method == "engine_getClientVersionV1") { return Answer.ok(clientVersion()); }
     if (method == "eth_sendRawTransaction") { return this.sendRawTransaction(ps!); }
     if (method == "eth_getBalance" || method == "eth_getTransactionCount" || method == "eth_getCode") {
       World? w = this.stateAt(arg(ps!, 1));
@@ -1797,6 +1800,43 @@ export struct Engine {
     node.changes = decodeChangeSet(raw!);
   }
 
+  /**
+   * `engine_getPayloadBodiesByHashV1`: each block's body, in the order asked, null for one this node does not have —
+   * in memory or on its store.
+   */
+  Answer bodiesByHash(this, JsonArray ps) {
+    JsonArray? hashes = arg(ps, 0)?.array();
+    if (hashes is null) { return Answer.error(-32602, "the first parameter must be an array of block hashes"); }
+    if (hashes!.len() > MAX_BODIES) { return Answer.error(-38004, "Too large request"); }
+    JsonArray out = JsonArray.create();
+    for (i32 i = 0; i < hashes!.len(); i++) {
+      Archived? a = this.archived(hexU256(hashes!.get(i)));
+      out.push(a is null ? JsonValue.Null : payloadBody(a!));
+    }
+    return Answer.ok(JsonValue.Array(out));
+  }
+
+  /**
+   * `engine_getPayloadBodiesByRangeV1`: the canonical bodies from `start`, `count` of them, null for one this node
+   * does not have, and none past its head — the spec forbids trailing nulls for blocks not yet known.
+   */
+  Answer bodiesByRange(this, JsonArray ps) {
+    U256 start = hexU256(arg(ps, 0));
+    U256 count = hexU256(arg(ps, 1));
+    if (start.isZero() || count.isZero()) { return Answer.error(-32602, "start and count must be at least 1"); }
+    if (count.gt(U256.ofI32(MAX_BODIES))) { return Answer.error(-38004, "Too large request"); }
+    U256 head = this.blocks.get(this.head)!.header.number;
+    JsonArray out = JsonArray.create();
+    U256 n = start;
+    for (i32 i = 0; i < (count.low() as! i32) && !n.gt(head); i++) {
+      U256? h = this.canonicalAt(n);
+      Archived? a = h is null ? null : this.archived(h!);
+      out.push(a is null ? JsonValue.Null : payloadBody(a!));
+      n = n.add(U256.one());
+    }
+    return Answer.ok(JsonValue.Array(out));
+  }
+
   /** A block by hash: held in memory, or on a store read from it (`blocks.wac`), or null. */
   Archived? archived(this, U256 hash) {
     Archived? a = this.archive.get(hash);
@@ -2066,11 +2106,54 @@ JsonValue forkchoiceResult(JsonValue payloadStatus) {
   return JsonValue.Object(o);
 }
 
+/**
+ * `engine_getClientVersionV1`: this client, one entry. The code is two letters the spec's table does not list (it
+ * names the clients it knows); the commit is not known to a build, so it is zero, as the spec allows for "unknown".
+ */
+JsonValue clientVersion() {
+  JsonObject o = JsonObject.create();
+  o.push("code".toBytes(), str("WA"));
+  o.push("name".toBytes(), str("wacuum"));
+  o.push("version".toBytes(), str("v0.1.0"));
+  o.push("commit".toBytes(), str("0x00000000"));
+  JsonArray a = JsonArray.create();
+  a.push(JsonValue.Object(o));
+  return JsonValue.Array(a);
+}
+
+/** A block's ExecutionPayloadBodyV1: its transactions as their raw bytes, and its withdrawals. */
+JsonValue payloadBody(Archived a) {
+  JsonArray txs = JsonArray.create();
+  for (i32 i = 0; i < a.txs.len(); i++) {
+    // A typed transaction is its bytes; a legacy one is a list, whose encoding is its bytes.
+    txs.push(str(bytesToHex(isList(a.txs[i]) ? encode(a.txs[i]) : bytesOf(a.txs[i]))));
+  }
+  JsonArray ws = JsonArray.create();
+  for (i32 i = 0; i < a.withdrawals.len(); i++) {
+    Withdrawal wd = a.withdrawals[i];
+    JsonObject o = JsonObject.create();
+    o.push("index".toBytes(), str(wd.index.toHex()));
+    o.push("validatorIndex".toBytes(), str(wd.validator.toHex()));
+    o.push("address".toBytes(), str(bytesToHex(addressBytes(wd.address))));
+    o.push("amount".toBytes(), str(wd.amount.toHex()));
+    ws.push(JsonValue.Object(o));
+  }
+  JsonObject b = JsonObject.create();
+  b.push("transactions".toBytes(), JsonValue.Array(txs));
+  // Every fork this client runs is after Shanghai, so a block always has a withdrawals list, if an empty one.
+  b.push("withdrawals".toBytes(), JsonValue.Array(ws));
+  return JsonValue.Object(b);
+}
+
+/** The most bodies one request may ask for (the spec's lower bound on what a client must serve). */
+static i32 MAX_BODIES = 1024;
+
 JsonValue capabilities() {
   string[] names = ["engine_newPayloadV1", "engine_newPayloadV2", "engine_newPayloadV3", "engine_newPayloadV4",
                     "engine_forkchoiceUpdatedV1", "engine_forkchoiceUpdatedV2", "engine_forkchoiceUpdatedV3",
                     "engine_getPayloadV3", "engine_getPayloadV4", "engine_getPayloadV5", "engine_getBlobsV1",
-                    "engine_getBlobsV2"];
+                    "engine_getBlobsV2", "engine_getPayloadBodiesByHashV1", "engine_getPayloadBodiesByRangeV1",
+                    "engine_getClientVersionV1"];
   JsonArray a = JsonArray.create();
   for (i32 i = 0; i < names.len(); i++) { a.push(str(names[i])); }
   return JsonValue.Array(a);

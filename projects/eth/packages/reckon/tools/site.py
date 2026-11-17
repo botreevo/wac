@@ -35,11 +35,18 @@ DEMOS = {
                    "through all four steps back to the compiler, the name turbostack on a devnet's registry, the "
                    "mirror found from a manifest (--mirrors-from); then admitted by name in the browser extension, "
                    "where both players load their weights and play in the sandbox loader."),
+    "chess": ("A chess engine, sealed end to end", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/chess.sh WORKDIR",
+              "wac-chess, a chess engine written from scratch in wac with a page to play it on, and the first app in "
+              "wac-web's worker mode (the search runs off the page's thread): built only inside the sealed machine "
+              "by wac-web's own page builder and the compiler, each step a derivation agreed by V8 and wasmtime, "
+              "reviewed, named chess on a devnet's registry, admitted by name through every step back to the "
+              "compiler, then opened in the browser extension, where the board is set and the engine answers a move "
+              "from its opening book, with no network and no extension API."),
     "demo-app": ("A real app, admitted and run", "WASMTIME_WAC=… WAC_SRC=… sh packages/reckon/tools/demo-app.sh WORKDIR",
                  "A Mandelbrot set as a wac-web page (demo/mandelbrot.wac), end to end, every build step sealed: "
                  "wac-web's own page builder (its two halves that start no process) and the compiler, each a "
-                 "derivation on V8 and on wasmtime, making the page the builder makes natively in one step (byte for "
-                 "byte but the entry path wac records in the module), a reviewer's endorsements, the page named "
+                 "derivation on V8 and on wasmtime, making the page the builder makes natively in one step, byte for "
+                 "byte, a reviewer's endorsements, the page named "
                  "mandelbrot on a devnet's registry, admitted by name on the command line, then in the browser "
                  "extension: the name read by proof, the page fetched and checked, and run in the sandbox loader, "
                  "where it draws and zooms with no network and no extension API."),

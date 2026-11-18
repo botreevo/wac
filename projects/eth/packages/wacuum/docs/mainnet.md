@@ -32,14 +32,14 @@ today). Two asks beyond it, both cheap:
 | | today | what a mainnet sync needs |
 | --- | --- | --- |
 | sync modes | full sync from its own genesis, fetching headers back and bodies forward from peers when the consensus client names an unknown head | snap sync (or a state import) at a recent block — or full sync from 2015's genesis |
-| forks | Cancun, Prague, Osaka, BPO1–5, by timestamp; every execution-spec-tests v5.4.0 fixture for them passes | the same, for following the head. A sync from genesis needs Frontier through Shanghai as well, plus proof-of-work header rules |
+| forks | Cancun, Prague, Osaka, BPO1–5, by timestamp; every execution-specs tests@v21.0.1 fixture for them passes | the same, for following the head. A sync from genesis needs Frontier through Shanghai as well, plus proof-of-work header rules |
 | genesis | a geth-format `genesis.json` whose chain is on Cancun or later at block 0 (`genesisFrom` refuses mainnet's) | mainnet's 2015 genesis, or a trusted checkpoint (a block hash and its state) to start from |
 | state storage | entirely in memory, in wac GC objects: accounts, storage, both tries | on disk, with a bounded cache |
 | persistence | a log of every imported block and fork choice, and every 1024 finalized blocks a snapshot of the *whole* state, rewritten | incremental writes of what each block changed |
 | memory | **measured**: about 1.4 KB an account and 0.6 KB a storage slot, 0.9 KB once its trie exists; and the Node/V8 host stops at a ~1.4 GB heap | a cache of a few GB, the rest on disk |
 | p2p | RLPx, discv4, eth/69 with EIP-2124 fork ids; dials and accepts peers, serves headers, bodies and receipts, gossips transactions; talks to geth (`tools/e2e/devnet.wac`) | snap/1 as a client, to fetch a state; discv5 is optional |
 | following the head | the Engine API, V1–V5, with JWT: a consensus client (Lighthouse, Teku, …) drives it as it would geth | the same — this part is done |
-| correctness | execution-spec-tests v5.4.0: every state, blockchain and engine test for Cancun, Prague and Osaka (and the transitions to BPO4); **and, measured here, real mainnet blocks match their headers** | the same, on every mainnet block — which the shadow checks |
+| correctness | execution-specs tests@v21.0.1: every state, blockchain and engine test for Cancun, Prague, Osaka and Amsterdam (and the transitions); **and, measured here, real mainnet blocks match their headers** | the same, on every mainnet block — which the shadow checks |
 | execution speed | **measured** 216 Mgas/s on five recent mainnet blocks, senders recovered (below) | ~5 Mgas/s to keep up with a 60 M gas limit; much more to catch up |
 
 ## Measurements

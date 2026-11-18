@@ -10,19 +10,21 @@ imports a chain.
 
 ## Where it is
 
-Against execution-spec-tests v5.4.0 (the `fixtures_develop` release, which has Osaka and the BPO forks),
-every fixture of every suite passes:
+Against execution-specs' `tests@v21.0.1` — the release go-ethereum 1.17.10 tests against, pinned in
+`tools/fetch-fixtures.sh` with how to move it — every fixture of every suite passes:
 
-| | Cancun | Prague | Osaka |
-| --- | --- | --- | --- |
-| state tests | 16,847 | 18,869 | 19,517 |
-| blockchain tests, imported from block RLP | 17,685 | 20,859 | 21,558 |
-| engine tests, through `engine_newPayload` and `engine_forkchoiceUpdated` | 17,685 | 20,878 | 21,577 |
-| block building: each engine fixture's payloads rebuilt from the mempool, same roots | 17,685 | 20,878 | 21,577 |
+| | Cancun | Prague | Osaka | Amsterdam |
+| --- | --- | --- | --- | --- |
+| state tests | 11,702 | 14,042 | 14,716 | 16,955 |
+| blockchain tests, imported from block RLP | 13,050 | 16,790 | 17,550 | 26,398 |
+| engine tests, through `engine_newPayload` and `engine_forkchoiceUpdated` | 13,050 | 16,809 | 17,569 | 26,441 |
+| block building: each engine fixture's payloads rebuilt from the mempool, same roots | 13,050 | 16,809 | 17,569 | 26,441 |
 
-And so does every transition network the fixtures have — Cancun to Prague, Prague to Osaka, and Osaka
-through BPO1 to BPO4 — in block import and through the Engine API. `sh tools/all-fixtures.sh` runs it all
-in about twenty minutes on the Node host (an hour and a half on wasmtime).
+And so does every transition network the fixtures have for these forks — Cancun to Prague, Prague to Osaka, Osaka
+through BPO1 to BPO4, and BPO2 to Amsterdam — in block import and through the Engine API, and the blockchain and
+engine tests again with every account and slot read from a store. `sh tools/all-fixtures.sh` runs the in-memory
+suites. Amsterdam (not scheduled on mainnet or Hoodi yet) is execution-specs' as of that release: EIP-7928's block
+access lists, EIP-8037's state gas and the rest of EIP-7773's list.
 
 | | state |
 | --- | --- |
@@ -52,7 +54,7 @@ wac test test         # the unit tests, in about a second (or `wac task wacuum:t
 ```
 
 ```bash
-wac task fixtures     # execution-spec-tests v5.4.0 into fixtures/, once: 250 MB to fetch
+wac task fixtures     # execution-specs tests@v21.0.1 into fixtures/, once: 1 GB streamed, 11 GB unpacked
 ```
 
 ```bash

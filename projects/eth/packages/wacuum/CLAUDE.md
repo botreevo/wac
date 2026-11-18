@@ -40,7 +40,7 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
     sh ../../tools/deps.sh # the wac the root wac.lock pins, into the package cache with git — once, and after it moves
     wac test --allow-read test   # the unit tests, in a few seconds (the grant lets the ones taking a Sys run)
     wac task vectors     # regenerate the U256 cases (needs node)
-    wac task fixtures    # execution-spec-tests v5.4.0 into fixtures/
+    wac task fixtures    # execution-specs tests@v21.0.1 into fixtures/ (the pin, and how to move it: tools/fetch-fixtures.sh)
     wac task statetests  # every Cancun state test, about a minute
     wac task blocktests  # every Cancun blockchain test, about a minute; add Prague as an argument to the scripts
 

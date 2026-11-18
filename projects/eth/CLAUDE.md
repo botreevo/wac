@@ -27,7 +27,7 @@ Read README.md first. This is what it does not say.
     sh tools/deps.sh                     the pins into wac's package cache
     wac task test                        every unit test
     wac task check                       the whole project
-    wac task wacuum:fixtures             execution-spec-tests, once (250 MB), then wacuum:statetests and friends
+    wac task wacuum:fixtures             execution-specs tests@v21.0.1, once (1 GB streamed), then wacuum:statetests and friends
     wac task devnet:build                packages/wacuum-devnet/dist/devnet
 
 Some package tests ask an oracle written in TypeScript (`packages/mpt/test/oracle.ts`), which wactest runs with

@@ -1,0 +1,200 @@
+// EIP-7928's block access list (Amsterdam): every account and slot a block's execution touched, and what it wrote to
+// them, by when. A header commits to its hash, and the list itself is not in the block: a node executing the block
+// builds it and checks the hash, as execution-specs' `block_access_lists.py` does.
+//
+// When is an index: 0 for the system calls before the transactions, i + 1 for transaction i, and one past the last
+// transaction for the withdrawals and the requests after them. What an index wrote is its net change — each account's
+// balance, nonce and code, and each slot, as the index left it against how it found it — which the world's change
+// sets already record. What was read is every account and slot the execution asked the world for, kept through a
+// revert, since the read happened: the world notes them here while a block access list is being built.
+
+import { Map, Vec } from "core";
+import { keccak256 } from "../crypto/keccak.wac";
+import { U256 } from "../u256.wac";
+import { rlp.Item, rlp.encode } from "@/lib.wac";
+import { AccountState, ChangeSet, slotMap, hashU256, eqU256 } from "./world.wac";
+import { u256Bytes } from "./root.wac";
+
+/** A change at an index: the value it left, a number for balances, nonces and slots, bytes for code. */
+export struct BalChange {
+  i32 index;
+  U256 value;
+  u8[] code;
+}
+
+/** One account's part of the list. */
+export struct BalAccount {
+  Map<U256, Vec<BalChange>> storage;
+  Map<U256, bool> reads;
+  Vec<BalChange> balance;
+  Vec<BalChange> nonce;
+  Vec<BalChange> code;
+
+  BalAccount create() {
+    return BalAccount(Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), Vec.create(), Vec.create());
+  }
+}
+
+export struct BlockAccessList {
+  Map<U256, BalAccount> accounts;
+  /** What was read: accounts, and slots by account. Filled by the world while it is set on it. */
+  Map<U256, bool> accountReads;
+  Map<U256, Map<U256, bool>> slotReads;
+
+  BlockAccessList create() {
+    return BlockAccessList(Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256));
+  }
+
+  BalAccount account(this, U256 addr) {
+    BalAccount? a = this.accounts.get(addr);
+    if (a is not null) { return a!; }
+    BalAccount fresh = BalAccount.create();
+    this.accounts.set(addr, fresh);
+    return fresh;
+  }
+
+  void readAccount(this, U256 addr) { this.accountReads.set(addr, true); }
+
+  void readSlot(this, U256 addr, U256 key) {
+    Map<U256, bool>? m = this.slotReads.get(addr);
+    if (m is null) {
+      Map<U256, bool> fresh = Map.create(hashU256, eqU256);
+      this.slotReads.set(addr, fresh);
+      m = fresh;
+    }
+    m!.set(key, true);
+  }
+
+  /** What index `index` wrote, from the change set recorded across it: each value it left that differs from before. */
+  void addChanges(this, i32 index, ChangeSet cs) {
+    U256[] addrs = cs.before.keys();
+    for (i32 i = 0; i < addrs.len(); i++) {
+      AccountState b = cs.before.get(addrs[i])!;
+      AccountState a = cs.after.get(addrs[i])!;
+      if (!b.balance.eq(a.balance)) { this.account(addrs[i]).balance.push(BalChange(index, a.balance, u8[].filled(0, 0))); }
+      if (b.nonce != a.nonce) { this.account(addrs[i]).nonce.push(BalChange(index, U256.ofU64(a.nonce), u8[].filled(0, 0))); }
+      if (!b.codeHash.eq(a.codeHash)) { this.account(addrs[i]).code.push(BalChange(index, U256.zero(), a.code)); }
+    }
+    U256[] holders = cs.slotsBefore.keys();
+    for (i32 i = 0; i < holders.len(); i++) {
+      Map<U256, U256> before = cs.slotsBefore.get(holders[i])!;
+      Map<U256, U256> after = cs.slotsAfter.get(holders[i])!;
+      U256[] keys = before.keys();
+      for (i32 k = 0; k < keys.len(); k++) {
+        U256 v = after.getOr(keys[k], U256.zero());
+        if (before.get(keys[k])!.eq(v)) { continue; }
+        BalAccount acct = this.account(holders[i]);
+        Vec<BalChange>? changes = acct.storage.get(keys[k]);
+        if (changes is null) {
+          Vec<BalChange> fresh = Vec.create();
+          acct.storage.set(keys[k], fresh);
+          changes = fresh;
+        }
+        changes!.push(BalChange(index, v, u8[].filled(0, 0)));
+      }
+    }
+  }
+
+  /** The reads folded in: an account read is in the list, and a slot read is unless it was also written. */
+  void foldReads(this) {
+    U256[] addrs = this.accountReads.keys();
+    for (i32 i = 0; i < addrs.len(); i++) { this.account(addrs[i]); }
+    U256[] holders = this.slotReads.keys();
+    for (i32 i = 0; i < holders.len(); i++) {
+      BalAccount acct = this.account(holders[i]);
+      U256[] keys = this.slotReads.get(holders[i])!.keys();
+      for (i32 k = 0; k < keys.len(); k++) {
+        if (!acct.storage.has(keys[k])) { acct.reads.set(keys[k], true); }
+      }
+    }
+  }
+
+  /** How many items count against EIP-7928's limit: each account, and each slot it read or wrote. */
+  i64 items(this) {
+    i64 n = 0;
+    U256[] addrs = this.accounts.keys();
+    for (i32 i = 0; i < addrs.len(); i++) {
+      BalAccount a = this.accounts.get(addrs[i])!;
+      n += 1 + (a.storage.len() as i64) + (a.reads.len() as i64);
+    }
+    return n;
+  }
+
+  /** The list's RLP: accounts by address, slots by number, changes by index. */
+  u8[] encoded(this) {
+    U256[] addrs = sorted(this.accounts.keys());
+    Item[] out = Item[].filled(addrs.len(), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))));
+    for (i32 i = 0; i < addrs.len(); i++) {
+      BalAccount a = this.accounts.get(addrs[i])!;
+      U256[] slots = sorted(a.storage.keys());
+      Item[] storage = Item[].filled(slots.len(), Item.Bytes(u8[].filled(0, 0)));
+      for (i32 s = 0; s < slots.len(); s++) {
+        storage[s] = Item.List([num(slots[s]), changesItem(a.storage.get(slots[s])!, false)]);
+      }
+      U256[] reads = sorted(a.reads.keys());
+      Item[] readItems = Item[].filled(reads.len(), Item.Bytes(u8[].filled(0, 0)));
+      for (i32 r = 0; r < reads.len(); r++) { readItems[r] = num(reads[r]); }
+      u8[] address = addrs[i].toBytes();
+      u8[] a20 = u8[].filled(20, 0);
+      for (i32 b = 0; b < 20; b++) { a20[b] = address[12 + b]; }
+      out[i] = Item.List([Item.Bytes(a20), Item.List(storage), Item.List(readItems), changesItem(a.balance, false),
+                          changesItem(a.nonce, false), changesItem(a.code, true)]);
+    }
+    return encode(Item.List(out));
+  }
+
+  /** One line an account, for comparing with a fixture's list by eye: `blocktest --verbose` prints it. */
+  string[] describe(this) {
+    U256[] addrs = sorted(this.accounts.keys());
+    string[] out = string[].defaulted(addrs.len());
+    for (i32 i = 0; i < addrs.len(); i++) {
+      BalAccount a = this.accounts.get(addrs[i])!;
+      string line = addrs[i].toHex() + " reads";
+      U256[] reads = sorted(a.reads.keys());
+      for (i32 r = 0; r < reads.len(); r++) { line += " " + reads[r].toHex(); }
+      line += " | storage";
+      U256[] slots = sorted(a.storage.keys());
+      for (i32 k = 0; k < slots.len(); k++) { line += " " + slots[k].toHex() + changesText(a.storage.get(slots[k])!, false); }
+      line += " | balance" + changesText(a.balance, false) + " | nonce" + changesText(a.nonce, false) + " | code" + changesText(a.code, true);
+      out[i] = line;
+    }
+    return out;
+  }
+
+  /** keccak256 of the list's RLP: what the header's block access list hash is. */
+  U256 hash(this) { return U256.fromBytes(keccak256(this.encoded()), 0, 32); }
+}
+
+Item num(U256 v) { return Item.Bytes(u256Bytes(v)); }
+
+/** Changes as [index, value] pairs, by index. */
+Item changesItem(Vec<BalChange> v, bool code) {
+  Vec<BalChange> copy = Vec.create();
+  for (i32 i = 0; i < v.len(); i++) { copy.push(v.get(i)); }
+  copy.sort((BalChange a, BalChange b) => a.index < b.index ? -1 : a.index > b.index ? 1 : 0);
+  BalChange[] cs = copy.toArray();
+  Item[] out = Item[].filled(cs.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < cs.len(); i++) {
+    out[i] = Item.List([num(U256.ofI32(cs[i].index)), code ? Item.Bytes(cs[i].code) : num(cs[i].value)]);
+  }
+  return Item.List(out);
+}
+
+U256[] sorted(U256[] xs) {
+  Vec<U256> v = Vec.create();
+  for (i32 i = 0; i < xs.len(); i++) { v.push(xs[i]); }
+  v.sort((U256 a, U256 b) => a.compare(b));
+  return v.toArray();
+}
+
+string changesText(Vec<BalChange> v, bool code) {
+  Vec<BalChange> copy = Vec.create();
+  for (i32 i = 0; i < v.len(); i++) { copy.push(v.get(i)); }
+  copy.sort((BalChange a, BalChange b) => a.index < b.index ? -1 : a.index > b.index ? 1 : 0);
+  string s = "";
+  for (i32 i = 0; i < copy.len(); i++) {
+    BalChange c = copy.get(i);
+    s += " \{c.index}=" + (code ? "\{c.code.len()}b" : c.value.toHex());
+  }
+  return s;
+}

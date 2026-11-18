@@ -22,6 +22,7 @@ import { Spec, MAX_RLP_BLOCK_SIZE } from "../evm/spec.wac";
 import { precompileAddresses } from "../evm/precompiles.wac";
 import { Transaction, Processed, processTransaction, blobGasPrice, GAS_PER_BLOB } from "../tx/process.wac";
 import { processAmsterdam } from "../tx/amsterdam.wac";
+import { BlockAccessList } from "../state/bal.wac";
 import { DecodedTx, decodeTransaction, decodeWith, SenderCache } from "../tx/decode.wac";
 
 export struct Header {
@@ -360,6 +361,9 @@ export static string BEACON_ROOTS = "0x000f3df6d732807ef1319fb7b8bb8522d0beac02"
 export static string HISTORY_STORAGE = "0x0000f90827f1c53a10cb7a02335b175320002935";
 export static string WITHDRAWAL_REQUESTS = "0x00000961ef480eb55e80d19ad83579a64c007002";
 export static string CONSOLIDATION_REQUESTS = "0x0000bbddc7ce488642fb579f8b00f3a590007251";
+/** EIP-8282's builder deposit and exit contracts (Amsterdam): request types 3 and 4. */
+export static string BUILDER_DEPOSITS = "0x0000BFF46984E3725691FA540A8C7589300D8282";
+export static string BUILDER_EXITS = "0x000064D678505AD48F8CCB093BC65613800E8282";
 export static string DEPOSIT_CONTRACT = "0x00000000219ab540356cbb839cbe05303d7705fa";
 export static string DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5";
 
@@ -484,6 +488,11 @@ export BlockEnv envOf(Spec spec, Header h, U256 chainId, Map<U256, U256> hashes)
 export string checkAfter(Spec spec, Header h, Body r, bool stateRoot) {
   if (r.error != "") { return r.error; }
   if (spec.isPrague && !r.requestsHash.eq(h.requestsHash)) { return "requests hash does not match"; }
+  if (spec.isAmsterdam) {
+    // EIP-7928: the list this block's execution touched, as the header committed to it, and within its gas.
+    if (r.bal is null || !r.bal!.hash().eq(h.blockAccessListHash)) { return "block access list hash does not match"; }
+    if (r.bal!.items() > (h.gasLimit.low() as@ i64) / 2000) { return "block access list over its gas limit"; }
+  }
   if (!U256.ofU64(r.gasUsed as! u64).eq(h.gasUsed)) { return "gas used \{r.gasUsed}, header says \{h.gasUsed.toDecimal()}"; }
   if (!U256.ofU64(r.blobGasUsed as! u64).eq(h.blobGasUsed)) { return "blob gas used does not match"; }
   if (!r.txRoot.eq(h.txRoot)) { return "transactions root does not match"; }
@@ -520,6 +529,8 @@ export struct Body {
   U256 requestsHash;
   /** Each included transaction's receipt, for the JSON-RPC methods that report them. */
   Receipt[] receipts;
+  /** EIP-7928's block access list (Amsterdam), built as the block ran; null before. */
+  BlockAccessList? bal;
 }
 
 /** What a transaction came to, as `eth_getTransactionReceipt` reports it. */
@@ -543,7 +554,7 @@ export struct Receipt {
 
 export Body failed(string why) {
   return Body(why, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))), 0, 0, U256.zero(), u8[].filled(256, 0), U256.zero(), U256.zero(),
-              U256.zero(), U256.zero(), u8[][].defaulted(0), U256.zero(), Vec<Receipt>.create().toArray());
+              U256.zero(), U256.zero(), u8[][].defaulted(0), U256.zero(), Vec<Receipt>.create().toArray(), null);
 }
 
 /**
@@ -600,6 +611,8 @@ export struct BodyRun {
    */
   i64 execUsed;
   i64 stateUsed;
+  /** EIP-7928 (Amsterdam): the block access list being built; null before Amsterdam. */
+  BlockAccessList? bal;
 
   BodyRun create(Spec spec, World w, BlockEnv env, Header h, Item[] txs, Withdrawal[] withdrawals, bool skipInvalid,
                  SenderCache? senders, fn<bool()>? clean) {
@@ -613,7 +626,7 @@ export struct BodyRun {
     bool sized = skipInvalid && spec.isOsaka;
     return BodyRun(spec, w, env, h, txs, withdrawals, skipInvalid, senders, clean, h.gasLimit.low() as@ i64, 0, 0, U256.zero(),
                    Vec.create(), Vec.create(), Vec.create(), Vec.create(), sized, sized ? listSize(withdrawalsSize(withdrawals)) : 0, 0,
-                   shape, u8[].filled(256, 0), Vec.create(), -1, null, 0, 0);
+                   shape, u8[].filled(256, 0), Vec.create(), -1, null, 0, 0, spec.isAmsterdam ? BlockAccessList.create() : null);
   }
 
   /** The header's gas used: the receipts' total, or under Amsterdam the larger of the two dimensions'. */
@@ -627,9 +640,27 @@ export struct BodyRun {
   /** One step; false when it read something missing and kept nothing, to be stepped again. */
   bool step(this) {
     if (this.result is not null) { return true; }
-    if (this.next < 0) { return this.open(); }
-    if (this.next < this.txs.len()) { return this.transaction(this.next); }
-    return this.close();
+    if (this.bal is null) {
+      if (this.next < 0) { return this.open(); }
+      if (this.next < this.txs.len()) { return this.transaction(this.next); }
+      return this.close();
+    }
+    // Under Amsterdam each step is an index of the block access list: the world notes what it reads while the step
+    // runs, and the change set recorded across it is what the index wrote. A step that kept nothing adds nothing.
+    World w = this.w;
+    i32 included = this.included.len();
+    bool opening = this.next < 0;
+    bool closing = !opening && this.next >= this.txs.len();
+    i32 index = opening ? 0 : included + 1;
+    w.bal = this.bal;
+    w.record();
+    bool kept = opening ? this.open() : closing ? this.close() : this.transaction(this.next);
+    ChangeSet cs = w.seal();
+    w.bal = null;
+    bool wrote = opening || closing || this.included.len() > included;
+    if (kept && wrote && !this.missed()) { this.bal!.addChanges(index, cs); }
+    if (closing && kept && this.result is not null && this.result!.error == "") { this.bal!.foldReads(); }
+    return kept;
   }
 
   bool open(this) {
@@ -637,7 +668,10 @@ export struct BodyRun {
     World w = this.w;
     systemCall(spec, w, this.env, U256.fromHex(BEACON_ROOTS)!, this.h.parentBeaconBlockRoot.toBytes());
     if (spec.isPrague) { systemCall(spec, w, this.env, U256.fromHex(HISTORY_STORAGE)!, this.h.parentHash.toBytes()); }
+    BlockAccessList? noting = w.bal;
+    w.bal = null;
     U256 before = w.balance(this.env.coinbase);
+    w.bal = noting;
     if (this.missed()) { return false; }
     this.coinbaseBefore = before;
     this.next = 0;
@@ -735,7 +769,10 @@ export struct BodyRun {
     Spec spec = this.spec;
     World w = this.w;
     BlockEnv env = this.env;
+    BlockAccessList? noting = w.bal;
+    w.bal = null;
     U256 fees = w.balance(env.coinbase).sub(this.coinbaseBefore);
+    w.bal = noting;
 
     // Withdrawals credit gwei, and an account a zero withdrawal created is removed again.
     u8[][] wsRaw = u8[][].defaulted(this.withdrawals.len());
@@ -773,6 +810,16 @@ export struct BodyRun {
         at += depositList[i].len();
       }
       requests = [depositBytes, withdrawalRequests!, consolidations!];
+      if (spec.isAmsterdam) {
+        u8[]? builderDeposits = requestCall(spec, w, env, BUILDER_DEPOSITS);
+        u8[]? builderExits = builderDeposits is null ? null : requestCall(spec, w, env, BUILDER_EXITS);
+        if (this.missed()) { return false; }
+        if (builderDeposits is null || builderExits is null) {
+          this.result = failed("a builder request contract failed");
+          return true;
+        }
+        requests = [depositBytes, withdrawalRequests!, consolidations!, builderDeposits!, builderExits!];
+      }
       requestsHash = requestsHashOf(requests);
     }
     if (this.missed()) { return false; }
@@ -780,7 +827,7 @@ export struct BodyRun {
     U256 root = this.clean is null ? U256.fromBytes(stateRoot(w), 0, 32) : U256.zero();
     this.result = Body("", this.included.toArray(), this.headerGas(), this.blobUsed, fees, this.blockBloom,
                        U256.fromBytes(indexedRoot(this.txRaw.toArray()), 0, 32), U256.fromBytes(indexedRoot(this.receipts.toArray()), 0, 32),
-                       U256.fromBytes(indexedRoot(wsRaw), 0, 32), root, requests, requestsHash, this.receiptList.toArray());
+                       U256.fromBytes(indexedRoot(wsRaw), 0, 32), root, requests, requestsHash, this.receiptList.toArray(), this.bal);
     return true;
   }
 }

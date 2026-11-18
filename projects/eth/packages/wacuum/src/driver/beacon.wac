@@ -3,26 +3,62 @@
 // light client proved — `payload.wac`). The node is a source of bytes, nothing more.
 
 import { Sys } from "std";
-import { Result } from "core";
+import { Result, Vec } from "core";
 import { fetch.fetchWithinAsync, fetch.Caps, fetch.Fetched } from "wac";
 import { json.parse, json.JsonValue } from "wac";
 
 export struct Beacon {
   Sys sys;
-  /** The node's base URL, no trailing slash: `https://…` or `http://127.0.0.1:5052`. */
-  string url;
+  /**
+   * Beacon nodes' base URLs, no trailing slash: `https://…` or `http://127.0.0.1:5052`. Several, comma-separated in
+   * `at`, are tried in turn when one fails: each is trusted for nothing, so any that answers will do, and a public node
+   * that rate-limits or goes away stops nothing.
+   */
+  string[] urls;
+  /** The one that last answered, tried first. */
+  i32 current;
   i32 timeoutMs;
 
-  Beacon at(Sys sys, string url) { return Beacon(sys, url, 30000); }
+  Beacon at(Sys sys, string urls) {
+    Vec<string> us = Vec.create();
+    string rest = urls;
+    while (rest != "") {
+      i32 comma = rest.indexOf(",");
+      string u = comma < 0 ? rest : rest.slice(0, comma);
+      rest = comma < 0 ? "" : rest.slice(comma + 1, rest.len());
+      if (u != "") { us.push(u); }
+    }
+    return Beacon(sys, us.toArray(), 0, 30000);
+  }
+
+  /** The node in use, for the log. */
+  string url(this) { return this.urls.len() == 0 ? "" : this.urls[this.current]; }
 
   /**
    * GET, asked again after a pause when the node says it is rate-limiting (429) or busy (503) — a public node does
    * both — up to four times, 2, 4 and 8 s apart.
    */
   async Result<Fetched, string> get(this, string path, string accept) {
+    string why = "no beacon node given";
+    for (i32 k = 0; k < this.urls.len(); k++) {
+      i32 i = (this.current + k) % this.urls.len();
+      auto r = await this.getFrom(this.urls[i], path, accept);
+      if (r.isOk()) {
+        if (i != this.current) { this.sys.log("driver: beacon node \{this.urls[i]} answers; \{this.urls[this.current]} did not"); }
+        this.current = i;
+        return r;
+      }
+      why = r.err()!;
+      // A 404 is the node's answer about this path (a block it does not have), not about the node: the next is
+      // asked too, since another may have it.
+    }
+    return Result.Err(why);
+  }
+
+  async Result<Fetched, string> getFrom(this, string base, string path, string accept) {
     Caps caps = Caps(this.sys.clock(), this.sys.random(), this.sys.env(), this.sys.net(), this.sys.files());
     for (i32 attempt = 0; true; attempt++) {
-      auto r = await fetchWithinAsync(caps, "GET", this.url + path, ["Accept: " + accept], u8[].filled(0, 0), this.timeoutMs);
+      auto r = await fetchWithinAsync(caps, "GET", base + path, ["Accept: " + accept], u8[].filled(0, 0), this.timeoutMs);
       if (r.isErr()) { return Result.Err("\{path}: \{r.err()!}"); }
       Fetched f = r.unwrap();
       if ((f.status == 429 || f.status == 503) && attempt < 3) {

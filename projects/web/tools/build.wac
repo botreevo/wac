@@ -57,11 +57,17 @@ struct Asked {
    * page that keeps its own content clear of them with `env(safe-area-inset-…)`.
    */
   bool edge;
+  /**
+   * **The first frame in the page** (`--prerender`): the program run once at build time against a document of records
+   * (`Prerender`, in `src/prerender.wac`), and what it drew written into `#app`, so the reader sees it before the
+   * module has arrived — and the host adopts it rather than drawing it again (`documentSide`).
+   */
+  bool prerender;
 }
 
 /** The arguments, or a usage line in `title` and empty `entry` when they do not make sense. */
 Asked askedOf(string[] argv) {
-  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false);
+  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false, false);
   i32 argc = argv.len();
   string[] args = string[].filled(argc, "");
   for (i32 k = 0; k < argc; k++) { args[k] = argv[k]; }
@@ -102,6 +108,11 @@ Asked askedOf(string[] argv) {
     }
     if (w == "--edge") {
       a.edge = true;
+      i++;
+      continue;
+    }
+    if (w == "--prerender") {
+      a.prerender = true;
       i++;
       continue;
     }
@@ -208,6 +219,24 @@ export string moduleFor(string entrySpec, string pageSpec, string spawn, bool de
        + (dev ? "  page.checking = true;\n" : "")
        + "  program(page);\n"
        + "  await page.keepRendering();\n"
+       + "  return 0;\n"
+       + "}\n";
+}
+
+/**
+ * The module that draws the page's first frame at build time (`--prerender`): the program handed a page over a
+ * document of records, as `moduleFor`'s `run` hands it the real one, and the markup that page's first batch left
+ * written to standard output.
+ */
+export string prerenderModuleFor(string entrySpec, string pageSpec) {
+  return "// Written by web's tools/build.wac — the page's first frame, drawn at build time (`--prerender`).\n"
+       + "import { main as program } from \"\{entrySpec}\";\n"
+       + "import { Prerender } from \"\{pageSpec}\";\n"
+       + "import { Sys } from \"std\";\n\n"
+       + "export i32 main(Sys sys) {\n"
+       + "  Prerender r = Prerender.create();\n"
+       + "  program(r.page);\n"
+       + "  sys.stdout().write(r.first().toBytes());\n"
        + "  return 0;\n"
        + "}\n";
 }
@@ -1424,9 +1453,93 @@ export string documentSide() {
         // listener outside it, and the text field typed into is the one that matters (`Element.shadow`).
         const origin = (ev) => (ev.composedPath ? ev.composedPath()[0] : ev.target) ?? ev.target;
         root.addEventListener("input", (ev) => { origin(ev).__wacTyped = numbered(ev); }, true);
+        // **Hydration** (`src/prerender.wac`): a page built with `--prerender` arrives with its first frame already in
+        // `#app` — each element marked with its handle, `data-wac-h`, and each text node after a comment naming its.
+        // Until the program's first batch has been applied, a handle it makes is matched to the node already there and
+        // that node kept: moved only if it is not where the program puts it, an attribute set only if it differs. Then
+        // whatever the batch did not make or keep goes, with the marks (`sweep`), and what the reader did meanwhile is
+        // handed to the listeners the batch put in place (`replay`). **A node kept is the node the reader may already
+        // have focused, typed into, scrolled or selected in**, which drawing it again would throw away.
+        let hydrating = root.hasAttribute("data-wac-pre");
+        // Each handle's mark not yet claimed: its element, or the comment before its text node.
+        const marked = new Map();
+        // Every node the first batch made or kept; for a kept element, the attributes the batch gave it; and the kept
+        // elements whose content it replaced with text.
+        const claimed = new WeakSet();
+        const given = new Map();
+        const texted = new WeakSet();
+        // Each parent's last child the first batch put at its end.
+        const lastPlaced = new Map();
+        let kept = 0, made = 0;
+        if (hydrating) {
+          const marks = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
+          for (let n = marks.nextNode(); n; n = marks.nextNode()) {
+            if (n.nodeType === 1 && n.hasAttribute("data-wac-h")) marked.set(Number(n.getAttribute("data-wac-h")), n);
+            else if (n.nodeType === 8 && n.data.startsWith("wac:")) marked.set(Number(n.data.slice(4)), n);
+          }
+        }
+        // The node marked with handle `id`, taken if `fits` it, and `null` otherwise — left where it is, for the sweep.
+        const claim = (id, fits) => {
+          const n = marked.get(id);
+          if (n === undefined || !fits(n)) return null;
+          marked.delete(id);
+          return n;
+        };
         const place = (parent, n, before) => {
           const p = nodes.get(parent);
-          if (p) p.insertBefore(n, before < 0 ? null : (nodes.get(before) ?? null));
+          if (!p) return;
+          if (hydrating) {
+            claimed.add(n);
+            // **At the end of what the first batch has put here so far**: whatever follows that is markup not yet
+            // claimed, so a node already there — after unclaimed markup at most — stays where it is.
+            if (before < 0) {
+              const last = lastPlaced.get(p) ?? null;
+              lastPlaced.set(p, n);
+              let at = n.parentNode === p ? n.previousSibling : undefined;
+              while (at && !claimed.has(at)) at = at.previousSibling;
+              if (at !== undefined && (at ?? null) === last) return;
+              p.insertBefore(n, last ? last.nextSibling : p.firstChild);
+              return;
+            }
+            const b = nodes.get(before) ?? null;
+            if (n.parentNode === p && n.nextSibling === b) return;
+          }
+          p.insertBefore(n, before < 0 ? null : (nodes.get(before) ?? null));
+        };
+        // **The first batch is done**: what it neither made nor kept goes — unclaimed markup, an attribute the program
+        // did not give a node it kept, text it did not make there — and so do the marks. Said on the console only when
+        // the first frame drawn ahead of time was not the one drawn here, which is drift worth knowing about.
+        const sweep = () => {
+          hydrating = false;
+          let removed = 0;
+          for (const n of marked.values()) {
+            if (n.nodeType === 8) {
+              const t = n.nextSibling;
+              if (t && t.nodeType === 3 && !claimed.has(t)) t.remove();
+            } else if (n.isConnected) removed++;
+            n.remove();
+          }
+          for (const [el, names] of given) {
+            for (const a of [...el.attributes]) if (!names.has(a.name)) el.removeAttribute(a.name);
+            if (!texted.has(el)) for (const k of [...el.childNodes]) if (k.nodeType === 3 && !claimed.has(k)) k.remove();
+          }
+          marked.clear(); given.clear(); lastPlaced.clear();
+          root.removeAttribute("data-wac-pre");
+          if (made > 0 || removed > 0) console.log(`wac: hydrated — ${kept} kept, ${made} made, ${removed} removed`);
+        };
+        // **What the reader did before the program listened** (`earlyScript`): each event handed, in order, to the
+        // listeners the first batch put on its target and everything above it, nearest first — the program hears it as
+        // it would have. Not dispatched again: what the browser did with it, it has done, and a click dispatched again
+        // would tick a checkbox back. An event on a node that is gone is dropped, as a late one is.
+        const replay = (events) => {
+          for (const ev of events) {
+            const t = origin(ev);
+            if (!t || !t.isConnected || !root.contains(t)) continue;
+            if (ev.type === "input") t.__wacTyped = numbered(ev);
+            for (let n = t; n; n = n === root ? null : n.parentNode) {
+              for (const f of n.__wacHeard?.get(ev.type) ?? []) f(ev);
+            }
+          }
         };
         const forget = (n) => {
           if (handleOf.has(n)) nodes.delete(handleOf.get(n));
@@ -1503,17 +1616,29 @@ export string documentSide() {
             // the browser makes an unknown HTML element that draws nothing. The program names tags the same way either way.
             const above = nodes.get(parent);
             const svg = tag === "svg" || (above && above.namespaceURI === WAC_SVG && above.localName !== "foreignObject");
-            const el = svg ? document.createElementNS(WAC_SVG, tag) : document.createElement(tag);
+            const old = hydrating ? claim(id, (n) => n.nodeType === 1 && n.localName === tag) : null;
+            if (old) { kept++; old.removeAttribute("data-wac-h"); given.set(old, new Set()); }
+            else if (hydrating) made++;
+            const el = old ?? (svg ? document.createElementNS(WAC_SVG, tag) : document.createElement(tag));
             nodes.set(id, el); handleOf.set(el, id); place(parent, el, before);
           },
           makeText: (id, parent, text, before) => {
-            const t = document.createTextNode(text);
+            // A mark's text is the node after it, unless it was empty — then there is no node to keep.
+            const mark = hydrating ? claim(id, (n) => n.nodeType === 8) : null;
+            let t = mark && mark.nextSibling?.nodeType === 3 && !claimed.has(mark.nextSibling) ? mark.nextSibling : null;
+            if (mark) mark.remove();
+            if (t) { kept++; if (t.data !== text) t.data = text; }
+            else { if (hydrating) made++; t = document.createTextNode(text); }
             nodes.set(id, t); handleOf.set(t, id); place(parent, t, before);
           },
           text: (id, text) => {
             const n = nodes.get(id);
             if (!n) return;
             if (n.nodeType === 3) { n.data = text; return; }
+            if (hydrating && given.has(n)) {
+              texted.add(n);
+              if (n.childNodes.length === 1 && n.firstChild.nodeType === 3 && n.firstChild.data === text) return;
+            }
             for (const k of n.childNodes) forget(k);
             n.textContent = text;
           },
@@ -1521,11 +1646,21 @@ export string documentSide() {
             const n = nodes.get(id);
             // A handed-over canvas is sized by the worker that draws it, and refuses to be resized here.
             if (n && n.__wacSurface && (name === "width" || name === "height")) return;
+            if (n && hydrating && given.has(n)) {
+              given.get(n).add(name);
+              if (present ? n.getAttribute(name) === value : !n.hasAttribute(name)) return;
+            }
             if (n && n.setAttribute) { if (present) n.setAttribute(name, value); else n.removeAttribute(name); }
           },
           prop: (id, name, value, seen) => {
             const n = nodes.get(id);
             if (!n) return;
+            // A kept field keeps the attribute that started it off, and what the reader typed or ticked before the program
+            // listened: the program hears of that from `replay`, after this.
+            if (hydrating && given.has(n)) {
+              given.get(n).add(name);
+              if (n.__wacEarly) return;
+            }
             if (name === "value") {
               if ((n.__wacTyped ?? 0) > seen) return;
               if (n.value !== value) n.value = value;
@@ -1599,7 +1734,7 @@ export string documentSide() {
               }).observe(box);
               return;
             }
-            n.addEventListener(kind, (ev) => {
+            const heard = (ev) => {
               let t = ev.target;
               // Inside a shadow root, `parentNode` stops at the root, whose host is the next node out.
               while (t && t !== n && !handleOf.has(t)) t = t.parentNode ?? t.host;
@@ -1624,7 +1759,12 @@ export string documentSide() {
               emit(["el", numbered(ev), kind, handleOf.get(t), id, value, x, y, mods,
                     caret ? el.selectionStart : -1, caret ? el.selectionEnd : -1, performance.timeOrigin + ev.timeStamp,
                     typeof ev.pointerId === "number" ? ev.pointerId : -1]);
-            });
+            };
+            n.addEventListener(kind, heard);
+            // Kept by kind, for `replay` to hand an event the reader made before this listener was here.
+            const byKind = n.__wacHeard ??= new Map();
+            if (!byKind.has(kind)) byKind.set(kind, []);
+            byKind.get(kind).push(heard);
           },
           focus: (id) => { const n = nodes.get(id); if (n && n.focus) n.focus(); },
           // **Full screen, as the program asked** (`PAGE_FULLSCREEN`): the browser's own where it has it — which says no
@@ -1840,7 +1980,20 @@ export string documentSide() {
         const apply = (m) => ops[m[0]](...m.slice(1));
         return (m) => {
           batchNow = performance.timeOrigin + performance.now();
-          try { if (m[0] === "ops") { for (const x of m[1]) apply(x); } else apply(m); } finally { batchNow = null; batchAudio = null; }
+          try {
+            if (m[0] !== "ops") apply(m);
+            else if (!hydrating) { for (const x of m[1]) apply(x); }
+            else {
+              // **The first batch, over the first frame drawn ahead of time.** A field the reader has already typed into or
+              // ticked keeps what they did; the events that did it are handed over once the listeners are in place.
+              const early = window.wacEarly ?? [];
+              window.wacEarly = null;
+              for (const ev of early) if (ev.type === "input" || ev.type === "change") { const t = origin(ev); if (t) t.__wacEarly = true; }
+              for (const x of m[1]) apply(x);
+              sweep();
+              replay(early);
+            }
+          } finally { batchNow = null; batchAudio = null; }
         };
       };
       """;
@@ -1997,8 +2150,8 @@ export string brokerClient() {
  * `file://` URL — and a **classic** worker: a module worker made from a blob is refused on a `file://` page, and a
  * `data:` one would lose the page's origin and the storage that goes with it.
  */
-export string workerIndexFor(string title, string wasm, i32 grants) {
-  return head(title) + moduleElement(wasm)
+export string workerIndexFor(string title, string first, string wasm, i32 grants) {
+  return head(title, first) + moduleElement(wasm)
        + "<script type=\"text/plain\" id=\"wac-program\">\n" + systemSide() + programSide() + moduleSide()
        // The first message says who this worker is: the page's program, or a module a program started.
        + brokerClient()
@@ -2025,8 +2178,8 @@ export string workerIndexFor(string title, string wasm, i32 grants) {
 }
 
 /** The page, with the program on the page's own thread: the two halves joined directly. */
-export string inPageIndexFor(string title, string wasm, i32 grants) {
-  return head(title) + moduleElement(wasm)
+export string inPageIndexFor(string title, string first, string wasm, i32 grants) {
+  return head(title, first) + moduleElement(wasm)
        + documentScript(systemSide() + moduleSide() + programSide() + documentSide() + moduleBytes()
        + "let receive = null;\n"
        + "const apply = wacDocument(document.getElementById(\"app\"), (m) => receive(m));\n"
@@ -2087,7 +2240,8 @@ export string loaderHash() { return "xLE7i4agIkrLt+lCU03oQkaXG/ugC3kfxyQdZETBPVM
  * and keeps under the page's folder. A program runs no script of its own, so the host is all that can.
  */
 export string policy() {
-  return "default-src 'none'; connect-src 'self'; script-src 'sha256-" + loaderHash() + "' blob: 'wasm-unsafe-eval'; "
+  return "default-src 'none'; connect-src 'self'; script-src 'sha256-" + loaderHash() + "' 'sha256-" + earlyHash()
+       + "' blob: 'wasm-unsafe-eval'; "
        + "worker-src blob:; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; "
        + "media-src data: blob:; base-uri 'none'; form-action 'none'";
 }
@@ -2185,12 +2339,31 @@ export string serviceWorker() {
 }
 
 /** Everything before the script: the document the program draws into. */
-string head(string title) {
+string head(string title, string first) {
   return "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
        + "<meta http-equiv=\"Content-Security-Policy\" content=\"" + policy() + "\">\n"
        + "<meta name=\"viewport\" content=\"" + VIEWPORT + "\">\n"
-       + "<title>" + title + "</title>\n</head>\n<body>\n<div id=\"app\"></div>\n";
+       + "<title>" + title + "</title>\n</head>\n<body>\n"
+       // **The first frame comes before the module**, which is most of the file: the browser paints what it has parsed,
+       // so the reader sees the page while the rest arrives.
+       + (first == "" ? "<div id=\"app\"></div>\n"
+                      : "<div id=\"app\" data-wac-pre>" + first + "</div>\n<script>" + earlyScript() + "</script>\n");
 }
+
+/**
+ * **What the reader does before the program is listening** — on a first frame drawn ahead of time, which looks ready
+ * while its module is still on the way: each click, key and edit on it kept, for the host to hand the program once its
+ * first batch has put its listeners in place (`documentSide`'s `replay`). The page's second inline script, allowed by
+ * its hash as the loader is (`earlyHash`); change it and the hash changes with it.
+ */
+export string earlyScript() {
+  return "window.wacEarly = []; "
+       + "for (const k of [\"click\", \"dblclick\", \"keydown\", \"keyup\", \"input\", \"change\", \"submit\"]) "
+       + "document.getElementById(\"app\").addEventListener(k, (e) => { if (window.wacEarly) window.wacEarly.push(e); }, true);";
+}
+
+/** `earlyScript`'s SHA-256, base64 — what the policy allows it by. */
+export string earlyHash() { return "GtRCwmcBFFLpZHUUCg6p7zDxfxAyVr6T1pO6dEBweSU="; }
 
 /**
  * **A page in three steps, and the two that spawn nothing are steps of their own** — for a builder that may not start
@@ -2216,6 +2389,10 @@ export i32 writePageModule(string[] argv, Output err, Output out, Files fs) {
   string entrySpec = relativeTo(a.out, a.entry);
   string wrote = written(fs, a.out + "/page.wac", moduleFor(entrySpec, pageSpec, a.spawn, a.dev).toBytes());
   if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  if (a.prerender) {
+    wrote = written(fs, a.out + "/prerender.wac", prerenderModuleFor(entrySpec, pageSpec).toBytes());
+    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  }
   return 0;
 }
 
@@ -2231,8 +2408,20 @@ export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
     return 1;
   }
   string index = a.out + "/index.html";
+  // **The first frame, when there is one**: what running `<out>/prerender.wac` wrote, kept as `<out>/first.html` — by
+  // `buildPage`, or by whoever builds in steps, between `--module-only` and `--wrap`.
+  string first = "";
+  if (a.prerender) {
+    string firstPath = a.out + "/first.html";
+    auto firstRead = flatten(fs.readFile(firstPath).wait());
+    if (firstRead.isErr()) {
+      err.write("build.wac: \{firstPath}: \{firstRead.err()!} — --prerender wraps the first frame `wac run \{a.out}/prerender.wac` writes there\n".toBytes());
+      return 1;
+    }
+    first = string.fromBytes(firstRead.ok()!);
+  }
   string encoded = base64(wasm!);
-  string page = a.inPage ? inPageIndexFor(a.title, encoded, a.grants) : workerIndexFor(a.title, encoded, a.grants);
+  string page = a.inPage ? inPageIndexFor(a.title, first, encoded, a.grants) : workerIndexFor(a.title, first, encoded, a.grants);
   if (a.edge) { page = edgeToEdge(page); }
   if (a.appIcon != "") {
     auto icon = flatten(fs.readFile(a.appIcon).wait());
@@ -2269,7 +2458,7 @@ string madeDir(Files fs, string dir) {
 }
 
 i32 usage(Output err) {
-  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --wrap] [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
+  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --wrap] [--in-page] [--dev] [--edge] [--prerender] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
   return 2;
 }
 
@@ -2298,6 +2487,20 @@ export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs proc
     }
     if (builtRan.isErr()) { flatten(err.write("build.wac: \{a.wac}: \{builtRan.err()!}\n".toBytes()).wait()).isOk(); }
     return 1;
+  }
+  if (a.prerender) {
+    auto drawnRan = flatten(procs.exec(a.wac, ["run", a.out + "/prerender.wac"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+    Exec? drawn = drawnRan.ok();
+    if (drawn is null || !drawn!.ok()) {
+      if (drawn is not null) {
+        err.write(drawn!.stderr);
+        err.write(drawn!.stdout);
+      }
+      err.line("build.wac: the first frame could not be drawn ahead of time (--prerender)");
+      return 1;
+    }
+    string wrote = written(fs, a.out + "/first.html", drawn!.stdout);
+    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
   }
   return wrapBuiltPage(argv, err, out, fs);
 }

@@ -36,7 +36,9 @@ export async function buildModule(entry: string, out: string): Promise<void> {
  * reports a confusing second failure about a file that is not there.
  */
 export async function buildPage(entry: string, outDir: string, extra: string[] = []): Promise<string> {
-  const name = entry.replace(/^.*\//, "").replace(/\.wac$/, "") + (extra.includes("--in-page") ? "-inpage" : "");
+  // Each set of flags that changes the page builds apart: the same entry built two ways is two pages.
+  const name = entry.replace(/^.*\//, "").replace(/\.wac$/, "") + (extra.includes("--in-page") ? "-inpage" : "")
+    + (extra.includes("--prerender") ? "-prerender" : "");
   const built = `.cache/pages/${name}`;
   let out: Deno.CommandOutput;
   try {

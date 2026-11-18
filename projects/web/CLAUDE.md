@@ -70,4 +70,9 @@ of the desktop (step 2 of the handover in `https://git.voltrevo.com/notes.git`,
 - **Done:** `wac.origin` (`src/origin.wac`): requests of any method to the page's own origin, and WebSockets to it,
   answered in the program's worker; `TestDoc.serving` answers it in tests. For an app whose API is beside its page
   (autonag's client, in autonag-wac).
+- **Done:** `--prerender` and hydration: the first frame drawn at build time into `index.html` (`src/prerender.wac`,
+  `prerenderModuleFor`), and adopted by the browser's host by its handles (`documentSide`: `claim`, `place`, `sweep`,
+  `replay`), with what the reader did before the program listened handed to it. `test/hydrate_live.test.ts` drives it;
+  `example/drift.wac` is a page whose frame differs on purpose. **For the wac website, built as wac-desktop** — fast first
+  paint is why it exists.
 - **Next:** a program's description of itself, which needs a section wac's builder does not write yet.

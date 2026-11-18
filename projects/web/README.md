@@ -226,7 +226,7 @@ for the clock and the sleeps it wakes, `paint` for frames, `answerValue`, `hand`
 ## Building one
 
     wac run --allow-read --allow-write --allow-run tools/build.wac \
-        <entry.wac> <out-dir> [--module-only | --wrap] [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
+        <entry.wac> <out-dir> [--module-only | --wrap] [--in-page] [--dev] [--edge] [--prerender] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
 
 `tools/build.wac` writes three files: `page.wac`, **the page's program as a module** — a `main(Sys sys)` that
 opens the page its host provides, runs your `main(Page page)`, and renders each time a view has something to
@@ -245,6 +245,22 @@ half makes a decision; everything a page does is in `src/`, and what it was not 
 **`--edge` draws to the screen's edges**: under a phone's notch and home bar too (`viewport-fit=cover`), for a page
 that keeps its content clear of them with `env(safe-area-inset-…)`. Every page is made smaller by an on-screen
 keyboard rather than covered by it (`interactive-widget=resizes-content`), where the browser offers the choice.
+
+**`--prerender` puts the first frame in the page**, so the reader sees it before the module has arrived. The build
+runs the program once against a document of records (`Prerender`, `src/prerender.wac`) — writing `prerender.wac` and
+running it, which leaves `first.html` — and `index.html` carries what its first batch drew inside `#app`, before the
+module. The first frame is what `main` draws in its first turn, before any answer from the host, so it depends only on
+the program, its clock and its randomness: the build's clock stands still at 0. Each element carries its handle
+(`data-wac-h`) and each text node follows a comment naming its, and **in the browser the host adopts them**: for each
+handle the program's first batch makes, the node already there is kept — moved only if it is somewhere else, an
+attribute set only if it differs — and once the batch is applied whatever it did not make or keep is removed, with
+the marks. A node kept is the node the reader may already have focused, typed into or scrolled. What the reader does
+before the program listens — clicks, keys, edits — is kept by a small script after `#app` (`earlyScript`, allowed by
+its hash) and handed to the program's listeners once the first batch has put them there, without dispatching it again;
+a field typed into early keeps what was typed. A frame in the browser that differs from the build's is mended rather
+than wrong, and said on the console: `wac: hydrated — 7 kept, 1 made, 1 removed`. A shadow root and a canvas's pixels
+are not markup, and are drawn when the module runs. Building in steps, `--module-only` writes `prerender.wac` too, and
+`--wrap` reads `<out>/first.html`, which whoever builds writes from `wac run <out>/prerender.wac`.
 
 **`--app <icon.png>` makes it an app to install**: beside `index.html` the build writes a manifest — the page's
 title as its name, standing alone (`display: standalone`), `--app-color` its bar — the icon, square and at least

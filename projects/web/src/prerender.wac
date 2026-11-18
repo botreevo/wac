@@ -1,0 +1,114 @@
+// A page's first frame, drawn ahead of time: what `tools/build.wac --prerender` puts in `index.html`, so the reader
+// sees the page while its module is still on the way, and what the browser's host then adopts rather than draws again.
+//
+// **The first frame is the program's first batch** (`PAGE_BATCH`): what `main` drew before its first turn ended —
+// `moduleFor`'s `run` renders straight after calling the program, before any answer from the host has arrived. So it
+// depends on nothing but the program, its clock and its randomness, and a build and a browser draw the same one. A
+// program that draws something else in the browser loses nothing but time: the host rebuilds what does not match.
+//
+// **Every element carries its handle**, `data-wac-h="17"`, and every text node is preceded by a comment naming
+// its, `<!--wac:18-->`, since the browser's parser joins neighbouring text into one node and an empty one is no node
+// at all. That is how the host finds, for each handle the program makes, the node already there
+// (`hydratingSide` in `tools/build.wac`). Both marks are gone once the first batch has been applied.
+//
+// What cannot be written as markup is left out, or written without its mark and drawn when the module runs: a shadow root and what is in it, and
+// a canvas's pixels.
+
+import { Buf } from "core";
+import { Page } from "./page.wac";
+import { TestDoc, TestNode } from "./testdoc.wac";
+import { isVoidElement, writeCss, writeEscaped } from "./html.wac";
+
+/** A page drawn into records, for its first frame to be read back as markup. */
+export struct Prerender {
+  TestDoc doc;
+  /** The page to hand the program: `program(prerender.page)`, as `moduleFor`'s `run` hands it the real one. */
+  Page page;
+  /** The document as the first batch left it, once one has landed. */
+  string? markup;
+
+  Prerender create() {
+    TestDoc doc = TestDoc.batched();
+    Prerender r = Prerender(doc, doc.page(), null);
+    doc.onBatch = () => { if (r.markup is null) { r.markup = markupOf(r.doc); } };
+    return r;
+  }
+
+  /**
+   * The first frame, as markup: the program's first turn ended as a browser's host ends it — the views rendered and
+   * the changes sent — and the document as that batch left it. Empty when the program drew nothing.
+   */
+  string first(this) {
+    this.page.turn();
+    return this.markup ?? markupOf(this.doc);
+  }
+}
+
+/** What is under the document's root, as markup carrying the handles. */
+export string markupOf(TestDoc doc) {
+  Buf out = Buf.create();
+  TestNode root = doc.at(0);
+  for (i32 i = 0; i < root.kids.len(); i++) { writeRecord(out, doc, root.kids.get(i), ""); }
+  return string.fromBytes(out.take());
+}
+
+/** Node `id` as markup, inside an element whose tag is `inside`. */
+void writeRecord(Buf out, TestDoc doc, i32 id, string inside) {
+  TestNode n = doc.at(id);
+  if (n.tag == "") {
+    // **Text in a stylesheet or a textarea has no mark**: in there a comment is text, not a node. The host makes that
+    // text again, and drops the old.
+    if (inside != "style" && inside != "textarea") { out.pushStr("<!--wac:\{id}-->"); }
+    writeText(out, n.text, inside == "style");
+    return;
+  }
+  // A shadow root is a page of its own inside its host, made when the module runs.
+  if (n.tag == "#shadow") { return; }
+  out.pushStr("<");
+  out.pushStr(n.tag);
+  out.pushStr(" data-wac-h=\"\{id}\"");
+  string value = "";
+  bool hasValue = false;
+  for (i32 i = 0; i < n.names.len(); i++) {
+    string name = n.names.get(i);
+    string v = n.values.get(i);
+    // **A property is not an attribute**, but the three a program sets have one that starts the element off the same:
+    // an input's `value`, and `checked` and `selected` when they are true. A textarea's value is its content.
+    if (name.len() > 0 && name.slice(0, 1) == ".") {
+      if (name == ".value") {
+        value = v;
+        hasValue = true;
+        if (n.tag != "input") { continue; }
+        name = "value";
+      } else if ((name == ".checked" || name == ".selected") && v == "true") {
+        out.pushStr(" " + name.slice(1, name.len()));
+        continue;
+      } else {
+        continue;
+      }
+    }
+    out.pushStr(" ");
+    out.pushStr(name);
+    out.pushStr("=\"");
+    writeEscaped(out, v, true);
+    out.pushStr("\"");
+  }
+  out.pushStr(">");
+  if (isVoidElement(n.tag)) { return; }
+  // A textarea with a value shows that rather than its content.
+  if (n.tag == "textarea" && hasValue) {
+    writeEscaped(out, value, false);
+    out.pushStr("</textarea>");
+    return;
+  }
+  // `text` on an element: its content replaced with text, which the host makes no handle for.
+  if (n.tag != "canvas") { writeText(out, n.text, n.tag == "style"); }
+  for (i32 i = 0; i < n.kids.len(); i++) { writeRecord(out, doc, n.kids.get(i), n.tag); }
+  out.pushStr("</");
+  out.pushStr(n.tag);
+  out.pushStr(">");
+}
+
+void writeText(Buf out, string text, bool css) {
+  if (css) { writeCss(out, text); } else { writeEscaped(out, text, false); }
+}

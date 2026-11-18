@@ -6,7 +6,11 @@
 // its store's size, and the execution-engine errors its beacon node has logged. At the end: no block compared
 // differently, every restart caught up, the same head and finalized block as geth.
 //
-//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/clsoak.wac -- GETH PRYSM_BIN_DIR LIGHTHOUSE MINUTES [HEAP]
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/clsoak.wac -- GETH PRYSM_BIN_DIR LIGHTHOUSE MINUTES [HEAP] [driver]
+//
+// With `driver`, the light-client driver (cmd/driver.wac) drives wacuum instead of a second Lighthouse, reading
+// Lighthouse A's light-client API — the all-wac mode — and the kills alternate between wacuum and the driver; the driver's
+// status file gives its lag behind the clock and the INVALIDs it saw, which must stay none.
 //
 // HEAP (default 512m) is wacuum's --max-heap. Its directory is kept, with every node's log, and its lines go to
 // `soak.log` there as well.
@@ -24,6 +28,21 @@ async Proc wacuum(Sys sys, string app, string dir, i32 port, i32 p2p, string eno
                                   "--datadir", dir + "/wacuum", "--store", "--port", "\{port}", "--public-rpc", "--p2p-port", "\{p2p}", "--peer", enode],
                             dir + "/wacuum-\{(await sys.clock().nowMillis()).orElse(0 as i64) / 1000}.log");
   await p.says(sys, "Engine API on", 300000);
+  return p;
+}
+
+/** The light-client driver on Lighthouse A's API, driving wacuum: the all-wac mode's consensus side. */
+async Proc startDriver(Sys sys, string drv, string dir, i32 beaconHttp, i32 wPort) {
+  string root = "";
+  for (i32 i = 0; i < 120 && root == ""; i++) {
+    root = (await beacon(sys, beaconHttp, "/eth/v1/beacon/headers/genesis"))?.member("data")?.member("root")?.text() ?? "";
+    if (root == "") { await sys.sleepMillis(1000); }
+  }
+  Proc p = await Proc.start(sys, [drv, "--beacon", "http://127.0.0.1:\{beaconHttp}", "--engine", "http://127.0.0.1:\{wPort}", "--jwt-secret",
+                                  dir + "/jwt.hex", "--network", "node", "--checkpoint", root, "--state", dir + "/driver.json",
+                                  "--status", dir + "/driver-status.json", "--poll-ms", "1000"],
+                            dir + "/driver-\{(await sys.clock().nowMillis()).orElse(0 as i64)}.log");
+  await p.says(sys, "driver: following", 300000);
   return p;
 }
 
@@ -47,11 +66,14 @@ export async i32 main(Sys sys) {
   string lighthouse = args[2];
   u64 minutes = parse(args[3]);
   string heap = args.len() > 4 ? args[4] : "512m";
+  bool viaDriver = args.len() > 5 && args[5] == "driver";
   Check t = Check.on(sys);
   string dir = await tempDir(sys, "wacuum-clsoak");
   sys.log("  directory: \{dir}");
   string app = dir + "/wacuum-bin";
   await shell(sys, "wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o \{app} > /dev/null 2>&1");
+  string drv = dir + "/driver-bin";
+  if (viaDriver) { await shell(sys, "wac app --allow-read --allow-write --allow-net --allow-env cmd/driver.wac -o \{drv} > /dev/null 2>&1"); }
   u8[] key = u8[].filled(32, 0x11);
   string me = addressOf(key);
   u8[] secret = (await sys.random().bytes(32)).ok()!;
@@ -80,7 +102,8 @@ export async i32 main(Sys sys) {
   Proc w = await wacuum(sys, app, dir, wPort, wP2p, enode, heap);
   Rpc wr = Rpc.at(sys, wPort);
   i32 bBase = await somePort(sys, 24951, 400);
-  Proc b = await lighthouseBeacon(sys, lighthouse, dir, "lighthouse-b", bBase, wPort, ["--boot-nodes", enr]);
+  // The Lighthouse mode's second beacon node, or the driver reading Lighthouse A.
+  Proc b = viaDriver ? await startDriver(sys, drv, dir, aBase + 2, wPort) : await lighthouseBeacon(sys, lighthouse, dir, "lighthouse-b", bBase, wPort, ["--boot-nodes", enr]);
   Proc cmp = await Proc.start(sys, ["wac", "run", "--allow-net", "--allow-read", "--allow-write", "tools/hoodi/compare.wac", "--",
                                     dir + "/compare.log", "\{wPort}", "\{gethBase + 2}"], dir + "/compare.out");
 
@@ -113,7 +136,8 @@ export async i32 main(Sys sys) {
     u64 rss = parse(await shell(sys, "ps -o rss= -p \{w.pid}")) / 1024;
     u64 store = parse(await shell(sys, "du -m \{quote(dir + "/wacuum/state.db")} | cut -f1"));
     // Its beacon node's errors about the execution engine — not its discovery's about loopback addresses.
-    u64 errs = parse(await shell(sys, "grep -E 'ERRO|CRIT' \{quote(dir + "/lighthouse-b.log")} | grep -ciE 'execution|engine|payload'"));
+    u64 errs = viaDriver ? parse(await shell(sys, "sed -n 's/.*\"invalid\":\\([0-9]*\\).*/\\1/p' \{quote(dir + "/driver-status.json")}"))
+                         : parse(await shell(sys, "grep -E 'ERRO|CRIT' \{quote(dir + "/lighthouse-b.log")} | grep -ciE 'execution|engine|payload'"));
     maxRss = rss > maxRss ? rss : maxRss;
     // The lag right after a restart is expected; it counts only once wacuum has had five minutes.
     if (lagAfterKill == 0) { maxLag = lag > maxLag ? lag : maxLag; }
@@ -128,7 +152,16 @@ export async i32 main(Sys sys) {
     sys.log("  " + line);
     string before = string.fromBytes((await sys.readFile(dir + "/soak.log")).orElse(u8[].filled(0, 0)));
     await sys.writeFile(dir + "/soak.log", (before + line + "\n").toBytes());
-    if (now >= nextKill) {
+    if (now >= nextKill && viaDriver && kills % 2 == 1) {
+      // Every other kill in the driver mode is the driver's: it starts again from the finalized root it kept.
+      await shell(sys, "kill -9 \{b.pid}; while kill -0 \{b.pid} 2>/dev/null; do sleep 0.05; done");
+      kills++;
+      sys.log("  killed the driver (\{kills}) at wacuum's block \{wh}");
+      b = await startDriver(sys, drv, dir, aBase + 2, wPort);
+      lagAfterKill = 5;
+      u8[] rr = (await sys.random().bytes(1)).ok()!;
+      nextKill = now + 1200 + ((rr[0] as i64) * 1200 / 256);
+    } else if (now >= nextKill) {
       await shell(sys, "kill -9 \{w.pid}; while kill -0 \{w.pid} 2>/dev/null; do sleep 0.05; done");
       kills++;
       sys.log("  killed wacuum (\{kills}) at its block \{wh}");

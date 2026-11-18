@@ -76,12 +76,12 @@ string fc(string h) { return fcWith(h, h); }
 /** A fork choice whose safe and finalized block is `fin`: a side chain's blocks are never finalized. */
 string fcWith(string h, string fin) { return "{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{fin}\",\"finalizedBlockHash\":\"\{fin}\"}"; }
 
-async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store, i32 flush) {
+async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store, i32 flush, string tag) {
   string[] argv = [app, "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc", "--port", "\{port}",
                    "--datadir", data, store ? "--store" : "--snapshot-every", store ? "--flush-every" : "1000000", store ? "\{flush}" : "--public-rpc"];
   // The node's output beside the test's directory, never in its data: on the torn disk, this process holding it open
   // kept the disk from being unmounted at a cut (power cut 4 of 40, 10 of 40, in the first full runs).
-  Proc p = await Proc.start(sys, argv, dir + "/" + data.slice(strings.lastIndexOf(data, "/") + 1, data.len()) + ".log");
+  Proc p = await Proc.start(sys, argv, dir + "/" + data.slice(strings.lastIndexOf(data, "/") + 1, data.len()) + tag + ".log");
   await p.says(sys, "Engine API on", 300000);
   // Answering, and this process rather than one before it: anything the test asks next is about this one.
   Rpc u = Rpc.at(sys, port);
@@ -142,7 +142,7 @@ export async i32 main(Sys sys) {
 
   // The chain, built by a wacuum in memory.
   i32 portA = await somePort(sys, 30000, 10000);
-  Proc a = await start(sys, app, dir, dir + "/a", portA, false, 1);
+  Proc a = await start(sys, app, dir, dir + "/a", portA, false, 1, "");
   Rpc ua = Rpc.at(sys, portA);
   Rpc ea = Rpc.authed(sys, portA, secret);
   string head = field(await ua.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash");
@@ -206,7 +206,9 @@ export async i32 main(Sys sys) {
   // The same chain into a wacuum on a store, killed at random as it goes.
   i32 portB = await somePort(sys, 40000, 20000);
   string dataB = torn ? dir + "/mnt/b" : dir + "/b";
-  Proc b = await start(sys, app, dir, dataB, portB, true, flush);
+  Proc b = await start(sys, app, dir, dataB, portB, true, flush, "-0");
+  // What each kill hit, for a run that comes back wrong (issues/open/0009d).
+  string events = "";
   Rpc ub = Rpc.at(sys, portB);
   Rpc eb = Rpc.authed(sys, portB, secret);
   i32 killed = 0;
@@ -240,7 +242,7 @@ export async i32 main(Sys sys) {
         stuck = true;
         break;
       }
-      b = await start(sys, app, dir, dataB, portB, true, flush);
+      b = await start(sys, app, dir, dataB, portB, true, flush, "-\{restarts + 1}");
       restarts++;
       // Given again from where it says it is.
       string n = await ub.text("eth_blockNumber", "[]");
@@ -267,6 +269,7 @@ export async i32 main(Sys sys) {
       if (replayed < 0) { replayed = 0; }
       replayedMost = replayed > replayedMost ? replayed : replayedMost;
       replayedAll += replayed;
+      events += "kill \{killed}: \{g.side ? "side " : ""}block \{g.number} (\{next + 1} of the stream), the store holding \{holds}, the head \{quantity(n)}, \{replayed} replayed\n";
       // Given again from just after its head, wherever that is in the stream: on a side chain, or the main one.
       string at = field(await ub.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash");
       next = 0;
@@ -287,7 +290,7 @@ export async i32 main(Sys sys) {
   t.that(!stuck, "every block went in, \{killed} kills and restarts along the way (\{lost} with the block being imported not in the store, \{kept} with it in); flushing every \{flush}, each restart replayed up to \{replayedMost} blocks from the log, \{replayedAll} in all");
   // Once more, cleanly, from the store alone.
   await b.stop(sys);
-  b = await start(sys, app, dir, dataB, portB, true, flush);
+  b = await start(sys, app, dir, dataB, portB, true, flush, "-final");
   JsonValue? hb = await ub.get("eth_getBlockByNumber", "[\"latest\",false]");
   JsonValue? ha = await ua.get("eth_getBlockByNumber", "[\"latest\",false]");
   t.that(field(hb, "hash") == field(ha, "hash") && field(hb, "stateRoot") == field(ha, "stateRoot"),
@@ -306,6 +309,12 @@ export async i32 main(Sys sys) {
   await b.stop(sys);
   await a.stop(sys);
   if (torn) { await unmountTorn(sys, dir); }
-  await removeDir(sys, dir);
+  // A run that failed keeps everything: both nodes' data, every restart's log (b-N.log), and what each kill hit.
+  if (stuck || differ > 0 || field(hb, "hash") != field(ha, "hash")) {
+    await sys.writeFile(dir + "/events.txt", events.toBytes());
+    sys.log("  kept: \{dir} (events.txt, b-0.log … b-\{restarts}.log, b-final.log)");
+  } else {
+    await removeDir(sys, dir);
+  }
   return t.done();
 }

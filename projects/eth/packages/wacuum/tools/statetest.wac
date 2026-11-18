@@ -15,6 +15,7 @@ import { Map } from "core";
 import { Sys } from "std";
 import { json.parse, json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
 import { U256 } from "../src/u256.wac";
+import { keccak256 } from "../src/crypto/keccak.wac";
 import { hexToBytes, bytesToHex } from "../src/hex.wac";
 import { num, bytes, worldFrom, diffState } from "./fixture.wac";
 import { World, Account, Log, hashU256, eqU256 } from "../src/state/world.wac";
@@ -51,9 +52,18 @@ JsonValue? at(JsonValue? v, i32 i) {
 
 BlockEnv blockFrom(Spec spec, JsonValue env, U256 chainId) {
   JsonValue? excess = env.member("currentExcessBlobGas");
-  return BlockEnv(num(env.member("currentCoinbase")), num(env.member("currentNumber")), num(env.member("currentTimestamp")),
+  // A state test has no chain: BLOCKHASH(n) of the 256 before is keccak256 of n in decimal, as the tests' tools have
+  // it (tests@v21.0.1's blockhash_zero_in_window_control reads it).
+  Map<U256, U256> hashes = Map.create(hashU256, eqU256);
+  U256 current = num(env.member("currentNumber"));
+  U256 n = current.gt(U256.ofU64(256)) ? current.sub(U256.ofU64(256)) : U256.zero();
+  while (n.lt(current)) {
+    hashes.set(n, U256.fromBytes(keccak256(n.toDecimal().toBytes()), 0, 32));
+    n = n.add(U256.one());
+  }
+  return BlockEnv(num(env.member("currentCoinbase")), current, num(env.member("currentTimestamp")),
                   num(env.member("currentGasLimit")), num(env.member("currentRandom")), num(env.member("currentBaseFee")),
-                  blobGasPrice(spec, num(excess)), chainId, Map.create(hashU256, eqU256));
+                  blobGasPrice(spec, num(excess)), chainId, hashes);
 }
 
 Transaction txFrom(JsonValue t, JsonValue indexes) {
@@ -148,7 +158,7 @@ async bool runCase(Sys sys, Tally tally, string name, JsonValue test, JsonValue 
   JsonValue? config = test.member("config");
   U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
   if (chainId.isZero()) { chainId = U256.one(); }
-  Spec spec = Spec.byName(tally.fork)!;
+  Spec spec = specFor(tally.fork, num(test.member("env")!.member("currentTimestamp")))!;
   BlockEnv block = blockFrom(spec, test.member("env")!, chainId);
   Transaction tx = txFrom(test.member("transaction")!, post.member("indexes")!);
   bool expectInvalid = post.member("expectException") is not null;
@@ -206,7 +216,7 @@ export async i32 main(Sys sys) {
     if (arg == "--fork") {
       a++;
       tally.fork = args[a];
-      if (Spec.byName(tally.fork) is null) { sys.log("unknown fork \{tally.fork}: Cancun and Prague are what this runs"); return 2; }
+      if (specFor(tally.fork, U256.zero()) is null) { sys.log("unknown fork \{tally.fork}: Cancun and Prague are what this runs"); return 2; }
       continue;
     }
     if (arg == "--filter") { a++; tally.filter = args[a]; continue; }
@@ -237,4 +247,18 @@ async void runFile(Sys sys, Tally tally, JsonValue doc) {
       if (await runCase(sys, tally, name, test, cases.get(c), c)) { tally.passed++; } else { tally.failed++; }
     }
   }
+}
+
+/**
+ * The fork a case runs under: the one named, or for a transition `XToYAtTime15k` X before timestamp 15,000 and Y
+ * from it — the case's own timestamp decides.
+ */
+Spec? specFor(string fork, U256 timestamp) {
+  i32 to = fork.indexOf("To");
+  i32 at = fork.indexOf("AtTime15k");
+  if (to < 0 || at < 0) { return Spec.byName(fork); }
+  Spec? before = Spec.byName(fork.slice(0, to));
+  Spec? after = Spec.byName(fork.slice(to + 2, at));
+  if (before is null || after is null) { return null; }
+  return timestamp.lt(U256.ofU64(15000)) ? before : after;
 }

@@ -6,4 +6,4 @@ set -eu
 . /etc/eth/mainnet-wac.env
 cd /opt/wac-eth/packages/wacuum
 exec dist/driver --beacon "$BEACON_URL" --engine http://127.0.0.1:8551 --jwt-secret /etc/eth/jwt-wacuum.hex \
-  --checkpoint "$CHECKPOINT" --state /data/wacuum/driver.json --network mainnet
+  --checkpoint "$CHECKPOINT" --state /data/wacuum/driver.json --status /data/wacuum/driver-status.json --network mainnet

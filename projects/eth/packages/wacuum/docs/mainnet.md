@@ -319,6 +319,28 @@ following; `journalctl -fu wacuum-driver` one line a head: its slot, its executi
 (`SYNCING` until the snap sync is done, then `VALID`) and the finalized slot. Both restart themselves; the driver
 from the finalized root it kept, wacuum from its store.
 
+**Before starting**, set `PUBLIC_IP` in `/etc/eth/mainnet-wac.env` to the box's public address (port 30304 tcp and
+udp open inbound): without it wacuum advertises 127.0.0.1 and only its own outbound dials connect. `MAX_PEERS` is 25.
+
+**Monitoring.** The driver writes its status each round to `/data/wacuum/driver-status.json`;
+`wacuum-allwac-status.timer` turns it and wacuum's own answers (head, finalized, `eth_syncing`, `net_peerCount`, over
+the JWT port) into metrics each minute — `driver_head_slot`, `driver_lag_slots`, `driver_finalized_slot`,
+`driver_invalid_total`, `driver_status_age_seconds`, `driver_last_valid`, `wacuum_head_block`,
+`wacuum_finalized_block`, `wacuum_syncing`, `wacuum_peers` — at `curl -s 127.0.0.1:9100/metrics`. By hand:
+`dist/allwac /data/wacuum/driver-status.json http://127.0.0.1:8551 /etc/eth/jwt-wacuum.hex`. Alert on:
+`driver_invalid_total` rising (wacuum refused a block the chain took — a divergence, the first thing to look at);
+`driver_lag_slots > 10` for ten minutes (the driver stalled or every beacon node gone — `BEACON_URL` may list several,
+comma-separated, tried in turn); `driver_status_age_seconds > 120` (the driver not running); `wacuum_syncing` still 1
+long after the first sync; `wacuum_peers < 3`.
+
+**The first sync, projected** (nothing here has run at mainnet's size). Mainnet's state is about 300 million accounts
+and 1.3 billion storage slots (*estimated*, from public figures). wacuum's store held 380–530 bytes an entry with its
+tries and page overhead (measured: 13.2 million entries in 5 GB, 3.9 million in 2 GB), so mainnet's store is *~0.6–0.85
+TB* — more than the 0.4–0.6 TB the machine request below first assumed, within the box's 4 TB. Filling it is ~1.6 billion entries; `scale.wac`
+filled at 7–9 MB/s through the same staging snap uses, so *~22–30 hours* of writing alone, more if the peers serve
+slower than that, then healing the trie to the pivot that has moved meanwhile (hours). Plan for **one to three days**
+to the first head, during which `wacuum_syncing` is 1 and the driver's answers are `SYNCING`.
+
 **Memory, by mode** (the box's 32 GB):
 
 | mode | processes | resident, together |
@@ -433,8 +455,8 @@ reference EL + CL + wacuum — is a few hundred GB.
 | --- | ---: | --- |
 | Hoodi: reference EL + Lighthouse + wacuum `--store --snap` | ~0.3–0.5 TB | the first test of snap and healing on a public chain |
 | shadow mode C on mainnet: reth/geth + Lighthouse | ~1.5 TB | as `deploy/mainnet/` sets it up |
-| mainnet wacuum on the store, beside the reference | ~0.4–0.6 TB | flat state ~150 GB, tries and page overhead on top |
-| **together** | **~2.5 TB of 4** | Hoodi can be removed before mainnet if room is short |
+| mainnet wacuum on the store, beside the reference | ~0.6–0.85 TB | 380–530 bytes an entry measured on stores to 5 GB, ~1.6 billion entries (2026-11-18; first estimated at 0.4–0.6) |
+| **together** | **~2.4–2.9 TB of 4** | Hoodi can be removed before mainnet if room is short |
 
 RAM: 32 GB is ample — wacuum's heap is capped at ~1.4 GB today (4 GB once wac's `--max-heap` lands), the
 reference EL wants ~8–16 GB, Lighthouse ~4–8 GB. CPU: wacuum executes on one core. Nothing above EIP-7870 is

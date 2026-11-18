@@ -1,0 +1,86 @@
+// The all-wac mode's status (wacuum and the light-client driver, docs/mainnet.md): what the driver last wrote to its
+// --status file, and what wacuum says over its Engine API port (JWT-authenticated, as the driver calls it) — its head,
+// its finalized block, whether it is syncing, how many peers it has. Printed for whoever asks; with `--prom FILE`
+// also written as Prometheus metrics for node_exporter's textfile collector (wacuum-allwac-status.timer, each minute).
+//
+//     wac run --allow-read --allow-write --allow-net tools/mainnet/allwac.wac -- STATUS_FILE ENGINE_URL JWT_FILE [--prom FILE]
+//
+// What to alert on (docs/mainnet.md): driver_lag_slots above ~10 for ten minutes (the driver stalled, or its beacon
+// nodes gone); driver_status_age_seconds above ~120 (the driver not running); driver_invalid_total rising (wacuum
+// refused a block the chain accepted: a divergence, the thing to look at first); wacuum_syncing at 1 for hours after
+// the first sync; wacuum_peers below 3.
+
+import { Sys } from "std";
+import { json.parse, json.JsonValue } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { hexToBytes } from "../../src/hex.wac";
+import { EngineClient } from "../../src/driver/engineclient.wac";
+
+i64 num(JsonValue? v) {
+  if (v is null) { return -1; }
+  f64? n = v!.number();
+  if (n is not null) { return n! as~ i64; }
+  string? s = v!.text();
+  if (s is null) { return -1; }
+  U256? u = U256.fromHex(s!);
+  return u is null ? -1 : (u!.low() as! i64);
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 3) {
+    sys.warn("usage: allwac.wac STATUS_FILE ENGINE_URL JWT_FILE [--prom FILE]");
+    return 2;
+  }
+  string prom = "";
+  for (i32 i = 3; i + 1 < a.len(); i++) { if (a[i] == "--prom") { prom = a[i + 1]; } }
+  i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+
+  JsonValue? st = null;
+  match (await sys.readFile(a[0])) {
+    Err(e): {}
+    Ok(b): { st = parse(b).ok(); }
+  }
+  i64 clock = num(st?.member("clockSlot"));
+  i64 head = num(st?.member("headSlot"));
+  i64 fin = num(st?.member("finalizedSlot"));
+  i64 invalid = num(st?.member("invalid"));
+  i64 age = st is null ? -1 : now - num(st?.member("time"));
+  string answer = st?.member("lastAnswer")?.text() ?? "";
+
+  string t = string.fromBytes((await sys.readFile(a[2])).orElse(u8[].filled(0, 0)));
+  while (t.len() > 0 && (t.slice(t.len() - 1, t.len()) == "\n" || t.slice(t.len() - 1, t.len()) == " ")) { t = t.slice(0, t.len() - 1); }
+  u8[]? secret = hexToBytes(t.indexOf("0x") == 0 ? t : "0x" + t);
+  i64 wHead = -1;
+  i64 wFin = -1;
+  i64 syncing = -1;
+  i64 peers = -1;
+  if (secret is not null && secret!.len() == 32) {
+    EngineClient e = EngineClient.at(sys, a[1], secret!);
+    auto h = await e.call("eth_blockNumber", "[]");
+    if (h.isOk()) { wHead = num(h.unwrap()); }
+    auto f = await e.call("eth_getBlockByNumber", "[\"finalized\",false]");
+    if (f.isOk() && !f.unwrap().isNull()) { wFin = num(f.unwrap().member("number")); }
+    auto s = await e.call("eth_syncing", "[]");
+    if (s.isOk()) { syncing = (s.unwrap().boolean() ?? true) ? 1 : 0; }
+    auto p = await e.call("net_peerCount", "[]");
+    if (p.isOk()) { peers = num(p.unwrap()); }
+  }
+  i64 lag = clock >= 0 && head >= 0 ? clock - head : -1;
+  string say = "driver: head slot \{head}, \{lag} behind the clock; finalized slot \{fin}; wacuum's last answer \{answer}; \{invalid} invalid; status \{age} s old\n" +
+               "wacuum: head block \{wHead}, finalized block \{wFin}, syncing \{syncing}, peers \{peers}\n";
+  await sys.stdout().write(say.toBytes());
+  if (prom == "") { return 0; }
+  string m = "# HELP driver_head_slot The beacon slot of the head the light client proved.\n# TYPE driver_head_slot gauge\ndriver_head_slot \{head}\n" +
+             "# HELP driver_lag_slots How far the proven head is behind the clock, in slots; -1 if not known.\n# TYPE driver_lag_slots gauge\ndriver_lag_slots \{lag}\n" +
+             "# HELP driver_finalized_slot The beacon slot of the finalized block the light client proved.\n# TYPE driver_finalized_slot gauge\ndriver_finalized_slot \{fin}\n" +
+             "# HELP driver_invalid_total Payloads wacuum has called INVALID since the driver started.\n# TYPE driver_invalid_total counter\ndriver_invalid_total \{invalid}\n" +
+             "# HELP driver_status_age_seconds How old the driver's last status is; -1 if there is none.\n# TYPE driver_status_age_seconds gauge\ndriver_status_age_seconds \{age}\n" +
+             "# HELP driver_last_valid Whether wacuum's last fork-choice answer was VALID.\n# TYPE driver_last_valid gauge\ndriver_last_valid \{answer == "VALID" ? "1" : "0"}\n" +
+             "# HELP wacuum_head_block wacuum's head block number; -1 if it did not answer.\n# TYPE wacuum_head_block gauge\nwacuum_head_block \{wHead}\n" +
+             "# HELP wacuum_finalized_block wacuum's finalized block number.\n# TYPE wacuum_finalized_block gauge\nwacuum_finalized_block \{wFin}\n" +
+             "# HELP wacuum_syncing 1 while wacuum is syncing to a head it was given, 0 at it, -1 if it did not answer.\n# TYPE wacuum_syncing gauge\nwacuum_syncing \{syncing}\n" +
+             "# HELP wacuum_peers Peers wacuum is connected to.\n# TYPE wacuum_peers gauge\nwacuum_peers \{peers}\n";
+  if (!(await sys.writeFile(prom + ".tmp", m.toBytes())).isOk()) { return 1; }
+  return (await sys.files().rename(prom + ".tmp", prom)).isOk() ? 0 : 1;
+}

@@ -95,6 +95,11 @@ export struct Driver {
   /** Counts, for the log. */
   i64 blocksSent;
   i64 reorgs;
+  /** Where each round's status goes for a monitor (`tools/mainnet/allwac.wac`); "" for nowhere. */
+  string statusFile;
+  /** wacuum's last answer to a fork choice, and how many payloads it has called INVALID. */
+  string lastAnswer;
+  i64 invalid;
 
   i64 slotNow(this, i64 nowSeconds) { return (nowSeconds - this.net.genesisTime) / this.net.secondsPerSlot; }
 
@@ -114,7 +119,7 @@ export async Result<Driver, string> start(Sys sys, Beacon beacon, EngineClient e
   Store? s = initializeStoreWith(net.schedule, fork, unhex(trustedRoot), boot.unwrap().bytes);
   if (s is null) { return Result.Err("the bootstrap is not the trusted root's, or its committee is not proven by it"); }
   Map<string, bool> known = Map.create(hashString, stringEq);
-  Driver d = Driver(sys, beacon, engine, net, s!, known, "", "", stateFile, trustedRoot, 64, 0 as i64, 0 as i64);
+  Driver d = Driver(sys, beacon, engine, net, s!, known, "", "", stateFile, trustedRoot, 64, 0 as i64, 0 as i64, "", "", 0 as i64);
   sys.log("driver: bootstrap verified against \{trustedRoot}: slot \{headerSlot(d.store.finalizedHeader)}, period \{net.schedule.periodAt(headerSlot(d.store.finalizedHeader))}");
   await catchUp(d);
   return Result.Ok(d);
@@ -146,6 +151,7 @@ async void catchUp(Driver d) {
 /** One round: the light client's updates, then the execution client brought to its head. */
 export async void round(Driver d) {
   i64 now = await d.clockSlot();
+  await writeStatus(d, now);
   // A committee's next is learnt from its period's update; without it the store cannot follow past the period's end.
   if (!isNextSyncCommitteeKnown(d.store) || d.net.schedule.periodAt(now) > d.net.schedule.periodAt(headerSlot(d.store.finalizedHeader))) {
     await catchUp(d);
@@ -181,6 +187,7 @@ export async void round(Driver d) {
   d.sys.log("driver: head slot \{headerSlot(d.store.optimisticHeader)} \{head} \{st}; finalized slot \{headerSlot(d.store.finalizedHeader)}");
   d.sentHead = head;
   d.sentFinal = final;
+  d.lastAnswer = st;
   await keepState(d);
 }
 
@@ -224,6 +231,7 @@ async string follow(Driver d, string head, string root) {
     if (r.isErr()) { return "newPayload of block \{p.number}: \{r.err()!}"; }
     string st = r.unwrap().member("status")?.text() ?? "?";
     if (st == "INVALID" || st == "INVALID_BLOCK_HASH") {
+      d.invalid++;
       return "block \{p.number} is \{st}: \{r.unwrap().member("validationError")?.text() ?? ""}";
     }
     if (st == "VALID") { d.known.set(hex(p.blockHash.toBytes()), true); }
@@ -254,6 +262,20 @@ async void keepState(Driver d) {
   if ((await d.sys.writeFile(d.stateFile + ".tmp", body.toBytes())).isOk() && (await d.sys.files().rename(d.stateFile + ".tmp", d.stateFile)).isOk()) {
     d.lastFinalRoot = root;
   }
+}
+
+/**
+ * The status a monitor reads, written each round: the clock's slot, the light client's head and finalized slots (what
+ * the beacon chain has proven so far), wacuum's last answer to a fork choice and the INVALIDs it has given, and the
+ * beacon node in use. A head slot falling behind the clock is the driver stalled or its beacon node gone; an INVALID
+ * is wacuum disagreeing with the chain — both worth waking someone for.
+ */
+async void writeStatus(Driver d, i64 clockSlot) {
+  if (d.statusFile == "") { return; }
+  i64 at = (await d.sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+  string body = "{\"time\":\{at},\"clockSlot\":\{clockSlot},\"headSlot\":\{headerSlot(d.store.optimisticHeader)},\"finalizedSlot\":\{headerSlot(d.store.finalizedHeader)}," +
+                "\"head\":\"\{d.sentHead}\",\"lastAnswer\":\"\{d.lastAnswer}\",\"invalid\":\{d.invalid},\"blocksSent\":\{d.blocksSent},\"beacon\":\"\{d.beacon.url()}\"}\n";
+  if ((await d.sys.writeFile(d.statusFile + ".tmp", body.toBytes())).isOk()) { await d.sys.files().rename(d.statusFile + ".tmp", d.statusFile); }
 }
 
 /** The root a previous run kept, or "". */

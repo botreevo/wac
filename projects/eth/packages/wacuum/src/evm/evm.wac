@@ -9,8 +9,8 @@ import { Map, Vec } from "core";
 import { keccak256 } from "../crypto/keccak.wac";
 import { rlp.Item, rlp.encode } from "@/lib.wac";
 import { U256 } from "../u256.wac";
-import { World, Snapshot, Account } from "../state/world.wac";
-import { Frame, Outcome, Halt, run, resume } from "./interp.wac";
+import { World, Snapshot, Account, Log } from "../state/world.wac";
+import { Frame, Outcome, Halt, run, resume, chargeStateOn } from "./interp.wac";
 import { OpTable } from "./table.wac";
 import { isPrecompile, runPrecompile } from "./precompiles.wac";
 import { Spec } from "./spec.wac";
@@ -20,6 +20,53 @@ export static i32 MAX_DEPTH = 1024;
 export static i32 MAX_CODE_SIZE = 24576;
 /** EIP-3860: twice the code size limit. */
 export static i32 MAX_INITCODE_SIZE = 49152;
+/** EIP-7954: Amsterdam's code size limit, and twice it for init code. */
+export static i32 MAX_CODE_SIZE_AMSTERDAM = 65536;
+export static i32 MAX_INITCODE_SIZE_AMSTERDAM = 131072;
+
+// EIP-8037's state gas: what new state costs, by the bytes it adds, in a dimension of its own.
+export static i64 COST_PER_STATE_BYTE = 1530;
+export static i64 STATE_NEW_ACCOUNT = 120 * 1530;
+export static i64 STATE_STORAGE_SET = 64 * 1530;
+export static i64 STATE_AUTH_BASE = 23 * 1530;
+
+/** The code size limit `spec` has. */
+export i32 maxCodeSize(Spec spec) { return spec.isAmsterdam ? MAX_CODE_SIZE_AMSTERDAM : MAX_CODE_SIZE; }
+
+/** The init code size limit `spec` has. */
+export i32 maxInitcodeSize(Spec spec) { return spec.isAmsterdam ? MAX_INITCODE_SIZE_AMSTERDAM : MAX_INITCODE_SIZE; }
+
+/**
+ * A frame's state gas (EIP-8037), execution-specs' `GasMeter` less the execution gas, which stays the frame's `gas`:
+ * the reservoir left; the level a rollback refills it to; and the execution gas spent on state charges once the
+ * reservoir ran dry (the spill), which a rollback or a refund gives back first. Before Amsterdam all three stay zero.
+ */
+export struct Meter {
+  i64 left;
+  i64 baseline;
+  i64 spilled;
+
+  /** A frame entered with `reservoir`: nothing spilled, and a rollback refills to all of it. */
+  Meter of(i64 reservoir) { return Meter(reservoir, reservoir, 0); }
+
+  /** Rolled back to the baseline: the spill returns to `gas` first. Returns what `gas` becomes. */
+  i64 restore(this, i64 gas) {
+    i64 g = gas + this.spilled;
+    this.spilled = 0;
+    this.left = this.baseline;
+    return g;
+  }
+}
+
+/** EIP-7708: the log a transfer of ether emits, from the system address, as an ERC-20 Transfer. */
+export static string TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+export static string SYSTEM_ADDRESS = "0xfffffffffffffffffffffffffffffffffffffffe";
+
+/** The EIP-7708 log of `value` moving from `from` to `to`; nothing for a zero value. */
+export void transferLog(World w, U256 from, U256 to, U256 value) {
+  if (value.isZero()) { return; }
+  w.log(Log(U256.fromHex(SYSTEM_ADDRESS)!, [U256.fromHex(TRANSFER_TOPIC)!, from, to], value.toBytes()));
+}
 
 export struct BlockEnv {
   U256 coinbase;
@@ -32,6 +79,8 @@ export struct BlockEnv {
   U256 chainId;
   /** The hashes BLOCKHASH can answer, by block number. */
   Map<U256, U256> hashes;
+  /** EIP-7843's beacon slot, which SLOTNUM pushes (Amsterdam). */
+  U256 slotNumber;
 }
 
 export struct TxEnv {
@@ -68,6 +117,8 @@ export struct Message {
    * is a precompile's address — precompiles are not code, so delegating to one runs nothing.
    */
   bool noPrecompile;
+  /** The state gas the frame is entered with (EIP-8037): the caller's whole reservoir, with no 63/64 rule. */
+  Meter sm;
 }
 
 // ## Calls without recursion
@@ -92,7 +143,10 @@ Begun beginCall(Evm evm, Message m) {
   World w = evm.world;
   Snapshot s = w.snapshot();
   w.markTouched(m.target);
-  if (m.transfersValue && !m.value.isZero()) { w.transfer(m.caller, m.target, m.value); }
+  if (m.transfersValue && !m.value.isZero()) {
+    w.transfer(m.caller, m.target, m.value);
+    if (evm.spec.isAmsterdam && !m.caller.eq(m.target)) { transferLog(w, m.caller, m.target, m.value); }
+  }
   Account? acct = w.get(m.codeAddress);
   return started(evm, m, false, s, w.code(m.codeAddress), acct is null ? null : acct!.codeHash);
 }
@@ -108,7 +162,10 @@ Begun beginCreate(Evm evm, Message m) {
   w.markCreated(m.target);
   w.setNonce(m.target, 1);
   w.markTouched(m.target);
-  if (!m.value.isZero()) { w.transfer(m.caller, m.target, m.value); }
+  if (!m.value.isZero()) {
+    w.transfer(m.caller, m.target, m.value);
+    if (evm.spec.isAmsterdam) { transferLog(w, m.caller, m.target, m.value); }
+  }
   u8[] initcode = m.data;
   m.data = u8[].filled(0, 0);
   return started(evm, m, true, s, initcode, null);
@@ -128,6 +185,7 @@ Begun started(Evm evm, Message m, bool isCreate, Snapshot s, u8[] code, U256? co
  * is checked and paid for (EIP-3541's 0xEF, EIP-170's size, 200 gas a byte) and becomes the account's.
  */
 Outcome finish(Evm evm, Begun b, Outcome o) {
+  if (evm.spec.isAmsterdam) { return finishAmsterdam(evm, b, o); }
   World w = evm.world;
   if (!o.succeeded()) {
     w.revert(b.snap);
@@ -142,6 +200,40 @@ Outcome finish(Evm evm, Begun b, Outcome o) {
   }
   w.setCode(b.m.target, code);
   return Outcome(Halt.Return(u8[].filled(0, 0)), o.gasLeft - deposit);
+}
+
+/**
+ * `finish` under EIP-8037: a frame that failed has its state gas rolled back to its baseline, the spill given back
+ * to its gas first (all of which a halt then forfeits, as before); and a creation's code is paid for in both
+ * dimensions — 6 a word to hash it, execution gas, and 1530 a byte of state gas — up to EIP-7954's 64 KiB.
+ */
+Outcome finishAmsterdam(Evm evm, Begun b, Outcome o) {
+  World w = evm.world;
+  Meter sm = b.m.sm;
+  if (!o.succeeded()) {
+    w.revert(b.snap);
+    i64 back = sm.restore(o.gasLeft);
+    return Outcome(o.halt, o.failed() ? 0 : back);
+  }
+  if (!b.isCreate) { return o; }
+  u8[] code = o.output();
+  i64 gas = o.gasLeft;
+  i64 hashing = 6 * (((code.len() as i64) + 31) / 32);
+  i64 state = COST_PER_STATE_BYTE * (code.len() as i64);
+  bool ok = !(code.len() > 0 && code[0] == 0xEF) && code.len() <= MAX_CODE_SIZE_AMSTERDAM && hashing <= gas;
+  if (ok) {
+    gas -= hashing;
+    i64 g = chargeStateOn(sm, gas, state);
+    ok = g >= 0;
+    gas = g;
+  }
+  if (!ok) {
+    w.revert(b.snap);
+    sm.restore(0);
+    return Outcome(Halt.Failure("code deposit refused"), 0);
+  }
+  w.setCode(b.m.target, code);
+  return Outcome(Halt.Return(u8[].filled(0, 0)), gas);
 }
 
 /** Run a message call: the value moves, then the code (or the precompile) runs, and a failure undoes both. */
@@ -165,7 +257,7 @@ Outcome drive(Evm evm, Begun first) {
       f.spawned = null;
       Begun b = f.spawnedCreate ? beginCreate(evm, child) : beginCall(evm, child);
       if (b.done is not null) {
-        resume(f, finish(evm, b, b.done!));
+        resume(f, finish(evm, b, b.done!), b.m.sm);
       } else {
         stack.push(b);
       }
@@ -174,7 +266,7 @@ Outcome drive(Evm evm, Begun first) {
     stack.pop();
     Outcome out = finish(evm, top, o!);
     if (stack.len() == 0) { return out; }
-    resume(stack.get(stack.len() - 1).frame!, out);
+    resume(stack.get(stack.len() - 1).frame!, out, top.m.sm);
   }
 }
 

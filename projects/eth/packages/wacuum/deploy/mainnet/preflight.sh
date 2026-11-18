@@ -3,9 +3,17 @@
 # data disk (size, free, solid state), the clock, the p2p ports free, and the outbound HTTPS the install and the
 # reference node need. One line a check — PASS, WARN or FAIL — and exit 1 if any failed. Changes nothing.
 #
-#     sh preflight.sh [DATA_DIR]        # /data by default
+#     sh preflight.sh [DATA_DIR]                  # /data by default; mainnet's sizes
+#     NETWORK=hoodi sh preflight.sh [DATA_DIR]    # Hoodi's: 1 TB, 16 GB (docs/mainnet.md, "Machine request")
 set -u
 data=${1:-/data}
+network=${NETWORK:-mainnet}
+# What each network asks of the box: memory in GB (good, enough), disk in GB (good, enough), the checkpoint to reach.
+if [ "$network" = hoodi ]; then
+  memGood=15; memLow=7; diskGood=900; diskLow=500; checkpoint=https://checkpoint-sync.hoodi.ethpandaops.io/eth/v1/beacon/headers/finalized
+else
+  memGood=30; memLow=15; diskGood=3500; diskLow=2000; checkpoint=https://mainnet.checkpoint.sigp.io/eth/v1/node/version
+fi
 failed=0
 pass() { echo "PASS  $*"; }
 warn() { echo "WARN  $*"; }
@@ -23,16 +31,16 @@ else fail "$cores threads: at least 4"; fi
 
 # The kernel keeps some for itself: a 32 GB machine shows 31, a 16 GB one 15.
 mem=$(awk '/^MemTotal:/ { print int($2 / 1048576) }' /proc/meminfo)
-if [ "$mem" -ge 30 ]; then pass "$mem GB of memory"
-elif [ "$mem" -ge 15 ]; then warn "$mem GB of memory: 32 is asked for; reth and Lighthouse want ~12–24 between them"
-else fail "$mem GB of memory: at least 16"; fi
+if [ "$mem" -ge "$memGood" ]; then pass "$mem GB of memory"
+elif [ "$mem" -ge "$memLow" ]; then warn "$mem GB of memory: $((memGood + 1)) is asked for $network"
+else fail "$mem GB of memory: at least $((memLow + 1)) for $network"; fi
 
 if [ -d "$data" ]; then
   size=$(df -BG --output=size "$data" | tail -1 | tr -dc 0-9)
   free=$(df -BG --output=avail "$data" | tail -1 | tr -dc 0-9)
-  if [ "$size" -ge 3500 ]; then pass "$data: $size GB, $free GB free"
-  elif [ "$size" -ge 2000 ]; then warn "$data: $size GB: a mainnet reth is ~1.5 TB and grows; 4 TB is asked for"
-  else fail "$data: $size GB: a mainnet reth alone is ~1.5 TB"; fi
+  if [ "$size" -ge "$diskGood" ]; then pass "$data: $size GB, $free GB free"
+  elif [ "$size" -ge "$diskLow" ]; then warn "$data: $size GB: $diskGood GB or more is asked for $network"
+  else fail "$data: $size GB: too small for $network (at least $diskLow GB)"; fi
   dev=$(df --output=source "$data" | tail -1)
   rota=$(lsblk -ndo ROTA "$dev" 2>/dev/null | head -1 | tr -d ' ')
   case "$rota" in
@@ -59,7 +67,7 @@ done
 # What install.sh and reference.sh fetch, and the checkpoint Lighthouse starts from. git.voltrevo.com is where
 # wac-eth comes from: an answer of 401 there means the box needs credentials for it (or pass install.sh a URL).
 for url in https://github.com/voltrevo/wac.git/info/refs?service=git-upload-pack https://sh.rustup.rs https://static.rust-lang.org https://index.crates.io/config.json \
-           https://mainnet.checkpoint.sigp.io/eth/v1/node/version https://git.voltrevo.com/wac-eth.git/info/refs?service=git-upload-pack; do
+           "$checkpoint" https://git.voltrevo.com/wac-eth.git/info/refs?service=git-upload-pack; do
   code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$url")
   case "$code" in
     2*|3*) pass "outbound: $url ($code)" ;;

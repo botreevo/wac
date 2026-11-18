@@ -20,11 +20,56 @@ Lighthouse for hours with kills. What this run adds is Hoodi's own state and pee
 without that nibble, which consensus clients cannot read: about one block in 16 failed, and a following node stopped
 there for good.
 
+## The short version, for whoever runs it
+
+**Two modes**, one install. Both run geth and a Lighthouse beside wacuum as the reference it is checked against and
+snap-syncs from; they differ in what drives wacuum:
+
+- **Lighthouse mode**: a second Lighthouse (`lighthouse-wacuum`) drives wacuum through the Engine API.
+- **Driver mode (all-wac)**: `wacuum-driver-hoodi`, wac's light-client driver, drives it instead — Ethereum's
+  light-client protocol, read from the local Lighthouse (and public nodes as fallbacks), every update and block
+  verified (the trust model is in `docs/mainnet.md`, "The all-wac mode"). One mode at a time: each unit conflicts with
+  the other's.
+
+**Steps**, on a fresh Ubuntu 24.04 box (4 cores, 16 GB, 1 TB NVMe; ports 30303, 30304, 9000, 9002 open inbound):
+
+    NETWORK=hoodi sh preflight.sh                     # deploy/mainnet/preflight.sh: the box, and every pinned commit
+    sh deploy/hoodi/install.sh LIGHTHOUSE_VERSION     # ~20 minutes; v8.3.3 is the tested one
+    # set PUBLIC_IP in /etc/eth/hoodi.env (and check CHECKPOINT_URL)
+    systemctl enable --now geth-hoodi lighthouse-geth  # the reference; wait for geth's sync (hours)
+    systemctl enable --now wacuum-hoodi wacuum-hoodi-status.timer
+    systemctl enable --now lighthouse-wacuum           # Lighthouse mode — or, instead:
+    systemctl enable --now wacuum-driver-hoodi         # driver mode
+
+git.voltrevo.com is not public: the install needs a read token in `/etc/eth/git-credentials`, or the pinned commits on
+GitHub (`docs/mainnet.md`, "Access to the pinned commits"); preflight says which is missing.
+
+**What good looks like**, in order:
+
+1. `journalctl -u wacuum-hoodi`: `Engine API on 127.0.0.1:8552`, then peers — `p2p: … serving blocks` — the local
+   geth among them.
+2. Once something names a head: `p2p: snap sync from N peer(s) at block …`, then, after a while,
+   `p2p: snap sync done: … accounts, … slots, … healed, … requests`. Hoodi's state is tens of GB (estimated): **expect
+   a few hours** — mainnet's is projected at one to three days. Meanwhile `wacuum_syncing` is 1 and the head
+   is answered `SYNCING`.
+3. Then blocks following: `wacuum_head_block` rising with the chain, `wacuum_syncing` 0, and — driver mode —
+   `journalctl -u wacuum-driver-hoodi` showing one line a slot, `driver: head slot … VALID; finalized slot …`, with
+   `driver_lag_slots` under ~3 and `driver_invalid_total` 0. Lighthouse mode: `journalctl -u lighthouse-wacuum` with
+   `Synced` lines, `exec_hash … (verified)`, and no execution-engine errors.
+4. The comparison against geth (step 4 of "Day one" below): `N same 0x…` each minute, no `DIFFERS`.
+
+Metrics: `curl -s 127.0.0.1:9100/metrics | grep -E '^(wacuum|driver)_'`.
+
+**If it goes wrong, send back**: `journalctl -u wacuum-hoodi --since -2h`, the driver's or `lighthouse-wacuum`'s
+journal for the same time, `/data/wacuum/driver-status.json` (driver mode), the metrics line above, `du -sh /data/*`,
+`free -g`, and the `DIFFERS` lines of `/data/wacuum/compare.log` if there are any. A wacuum crash restarts itself from
+its store; a store that will not open says why in its first log lines.
+
 ## Day one
 
 0. **Access**: git.voltrevo.com is not public — put a read token in `/etc/eth/git-credentials`, or have the pinned
-   commits pushed to GitHub, as `docs/mainnet.md` says ("Access to the pinned commits"); `sh
-   deploy/mainnet/preflight.sh` checks that every pinned commit can be fetched.
+   commits pushed to GitHub, as `docs/mainnet.md` says ("Access to the pinned commits"); `NETWORK=hoodi sh
+   deploy/mainnet/preflight.sh` checks the box and that every pinned commit can be fetched.
 
 1. **Install** — about 20 minutes, most of it building wac:
 

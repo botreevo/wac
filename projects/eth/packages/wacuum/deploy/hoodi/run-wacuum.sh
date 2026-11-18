@@ -19,6 +19,9 @@ done
 if [ -f /etc/eth/hoodi-bootnodes.txt ]; then
   for b in $(grep '^enode://' /etc/eth/hoodi-bootnodes.txt); do args="$args --bootnode $b"; done
 fi
+# The address peers dial back, and how many peers to keep.
+if [ -n "${PUBLIC_IP:-}" ]; then args="$args --ip $PUBLIC_IP"; else echo "run-wacuum.sh: PUBLIC_IP is not set in /etc/eth/hoodi.env: no peer can dial this node" >&2; fi
+args="$args --max-peers ${MAX_PEERS:-25}"
 cd /opt/wac-eth/packages/wacuum
 # shellcheck disable=SC2086
 exec dist/wacuum $args

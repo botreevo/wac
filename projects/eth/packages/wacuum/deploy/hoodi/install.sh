@@ -23,7 +23,7 @@ repo=${2:-https://git.voltrevo.com/wac-eth.git}
 here=$(cd "$(dirname "$0")" && pwd)
 
 apt-get update
-apt-get install -y git build-essential pkg-config curl ca-certificates python3 software-properties-common
+apt-get install -y git build-essential pkg-config curl ca-certificates python3 software-properties-common prometheus-node-exporter
 # geth from the Ethereum team's PPA: the reference, and the source of Hoodi's genesis.
 add-apt-repository -y ppa:ethereum/ethereum
 apt-get update
@@ -93,10 +93,23 @@ chown -R wacuum:wacuum /opt/wac-eth
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth && sh tools/deps.sh'
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac test --allow-read test'
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && mkdir -p dist && wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum'
+# The light-client driver (the driver mode) and the status tool.
+su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac app --allow-net --allow-read --allow-write --allow-env cmd/driver.wac -o dist/driver'
+su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac app --allow-net --allow-read --allow-write tools/mainnet/allwac.wac -o dist/allwac'
 
-for unit in geth-hoodi lighthouse-geth wacuum-hoodi lighthouse-wacuum; do
+# Metrics: node_exporter on loopback only (its default is every address), reading the textfile the status timer writes.
+textfiles=/var/lib/prometheus/node-exporter
+mkdir -p "$textfiles"
+chgrp wacuum "$textfiles" && chmod 775 "$textfiles"
+grep -q 'listen-address' /etc/default/prometheus-node-exporter 2>/dev/null ||
+  echo 'ARGS="--web.listen-address=127.0.0.1:9100 --collector.textfile.directory=/var/lib/prometheus/node-exporter"' >> /etc/default/prometheus-node-exporter
+
+for unit in geth-hoodi lighthouse-geth wacuum-hoodi lighthouse-wacuum wacuum-driver-hoodi wacuum-hoodi-status; do
   install -m 644 "$here/$unit.service" /etc/systemd/system/
 done
+install -m 644 "$here/wacuum-hoodi-status.timer" /etc/systemd/system/
 systemctl daemon-reload
+systemctl restart prometheus-node-exporter
 echo "install.sh: done. Next (docs/hoodi.md): systemctl enable --now geth-hoodi lighthouse-geth; once geth has synced,"
-echo "  systemctl enable --now wacuum-hoodi lighthouse-wacuum"
+echo "  systemctl enable --now wacuum-hoodi wacuum-hoodi-status.timer, and one of lighthouse-wacuum (the Lighthouse mode)"
+echo "  or wacuum-driver-hoodi (the all-wac driver mode) — docs/hoodi.md"

@@ -330,6 +330,37 @@ from the finalized root it kept, wacuum from its store.
 The all-wac mode is the smallest by the consensus client it leaves out; it leaves the most of the box to the page
 cache, which wacuum's store reads through.
 
+## Networked storage instead of local NVMe (2026-11-17, estimated with a delay layer)
+
+`tools/measure/netdisk.wac` puts a latency under the store's `Disk` — every file read ~1.3 ms (a 1 ms timer as the
+host keeps it), every sync 2 ms, as EBS- or DO-volume-style storage gives — and runs mainnet-shaped blocks on the
+2.9 GB store `scale.wac` filled: ~2 600 keys read (a hot set tuned to the mainnet trace's 29% entry-cache miss rate),
+1 250 written, the root computed, a flush every 8. Every file read counts as a networked one (the page cache cold:
+the worst case).
+
+| | block mean | p50 | p99 | flush p50 |
+| --- | ---: | ---: | ---: | ---: |
+| local, entry cache 256 MB | 194 ms | 106 ms | 880 ms | 654 ms |
+| local, 4 096 MB | 178 ms | 92 ms | 831 ms | 683 ms |
+| ~1.3 ms disk, 256 MB | 1 378 ms | 1 192 ms | 2 640 ms | 1 218 ms |
+| ~1.3 ms disk, 1 024 MB | 1 337 ms | 1 176 ms | 2 610 ms | 1 230 ms |
+| ~1.3 ms disk, 4 096 MB | 1 287 ms | 1 123 ms | 2 470 ms | 1 144 ms |
+
+File reads a block: 755 for the state reads, 119 for the root, 733 for the commit (amortized; already prefetched 64
+at a time). The state reads are made one at a time on the EVM's synchronous path, so they are most of the cost.
+
+- **It keeps up**: ~1.4 s a block mean, 2.6 s at p99, against 12 s slots.
+- **RAM does not fix it**: the entry cache reaches the trace's 72% hit rate at ~29 MB, and what misses is read for
+  the first time in that window; 16× the cache saved 7%. A 32 GB box's page cache holds a few percent of a mainnet
+  store, so first reads go to the network either way.
+- **Issuing reads ahead does**: in 32 real mainnet blocks (38 418 distinct keys) 64% were named before execution by
+  access lists alone and 71% after one speculative replay; EIP-7928's block access lists would name all of them. The
+  root's reads are all known once the writes are (the tries are keyed by path), one round. Projected at ~1.3 ms:
+  all reads issued ahead ≈ 0.3 s a block, a speculative prefetcher ≈ 0.6 s, against 1.38 s now. Not built.
+- **IOPS caps** do not bind the serial path (~1 200 a second); a parallel one spends ~0.25 s a block of a 3 000 cap.
+- **Not measured**: snap sync and healing under the delay (snap is mostly large sequential writes; healing asks a
+  level at a time, already in parallel).
+
 ## Memory on the 32 GB box (2026-11-17)
 
 Each figure is marked **measured** (here, on this container) or *estimated*. Two arrangements matter: the shadow (C),

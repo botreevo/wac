@@ -128,5 +128,7 @@ its store; a store that will not open says why in its first log lines.
 ## Upgrading
 
 `sh deploy/hoodi/install.sh LIGHTHOUSE_VERSION` again pulls wac-eth, moves wac to its pin if it moved, reruns the
-tests, rebuilds `dist/wacuum` and keeps `/etc/eth/hoodi.env` and the data; then `systemctl restart wacuum-hoodi`.
+tests, rebuilds `wac` and `dist/` and keeps `/etc/eth/hoodi.env` and the data, with the units still running (each
+binary is built beside the old one and renamed over it, so a failed test or build leaves the old `dist/` in place); then
+`systemctl restart wacuum-hoodi wacuum-driver-hoodi` (or `wacuum-hoodi` alone in Lighthouse mode).
 A store written by an older format is refused with a message saying so; remove it and sync again.

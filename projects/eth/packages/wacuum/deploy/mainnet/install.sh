@@ -57,15 +57,18 @@ if ! git -C /opt/wac cat-file -e "$pin^{commit}" 2>/dev/null; then
 fi
 git -C /opt/wac checkout --detach "$pin"
 # The binary goes to /usr/local/bin; its package cache is per user, so each user fills its own.
-(cd /opt/wac && ./bootstrap.sh -o /usr/local/bin/wac)
+# Built beside the old one and renamed over it: the running units hold /usr/local/bin/wac open, and a copy onto a
+# running executable fails (Text file busy), which stopped an upgrade here with the units up.
+(cd /opt/wac && ./bootstrap.sh -o /usr/local/bin/wac.new)
+mv -f /usr/local/bin/wac.new /usr/local/bin/wac
 chown -R wacuum:wacuum /opt/wac-eth
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth && sh tools/deps.sh'
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac test --allow-read test'
 # The light-client driver, built once into an executable (the all-wac mode, docs/mainnet.md), and the secret it and
 # wacuum share; its settings kept across reinstalls.
-su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && mkdir -p dist && wac app --allow-net --allow-read --allow-write --allow-env cmd/driver.wac -o dist/driver'
-su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac app --allow-net --allow-read --allow-write cmd/wacuum.wac -o dist/wacuum'
-su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac app --allow-net --allow-read --allow-write tools/mainnet/allwac.wac -o dist/allwac'
+su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && mkdir -p dist && wac app --allow-net --allow-read --allow-write --allow-env cmd/driver.wac -o dist/driver.new && mv -f dist/driver.new dist/driver'
+su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac app --allow-net --allow-read --allow-write cmd/wacuum.wac -o dist/wacuum.new && mv -f dist/wacuum.new dist/wacuum'
+su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac app --allow-net --allow-read --allow-write tools/mainnet/allwac.wac -o dist/allwac.new && mv -f dist/allwac.new dist/allwac'
 mkdir -p /etc/eth
 [ -f /etc/eth/jwt-wacuum.hex ] || (od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > /etc/eth/jwt-wacuum.hex)
 chown wacuum /etc/eth/jwt-wacuum.hex && chmod 600 /etc/eth/jwt-wacuum.hex

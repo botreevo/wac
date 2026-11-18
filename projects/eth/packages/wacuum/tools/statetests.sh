@@ -8,7 +8,11 @@
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 fork=${1:-Cancun}
-where=${2:-$root/fixtures/state_tests}
+# A fork's own directory (fixtures/state_tests/for_cancun, as execution-specs lays them out) when there is one.
+lower=$(echo "$fork" | tr 'A-Z' 'a-z')
+default="$root/fixtures/state_tests"
+[ -d "$default/for_$lower" ] && default="$default/for_$lower"
+where=${2:-$default}
 wac build --allow-read "$root/tools/statetest.wac" -o "$root/dist/statetest" >/dev/null
 find "$where" -name '*.json' | sort | xargs -n 100 -P 4 wac "$root/dist/statetest.wasm" --fork "$fork" ${COLD:+--cold} > "$root/dist/statetests.log" 2>&1 || true
 grep '^FAIL' "$root/dist/statetests.log" || true

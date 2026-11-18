@@ -181,7 +181,7 @@ for (const mode of [[], ["--in-page"]]) {
         assertEquals(await page.evaluate("['drift', 'same', 'when', 'where'].every((id) => document.getElementById(id).__kept)"),
                      true, "everything else is the node that was parsed");
         await waitInPage(page, "true", null, { timeout: 100 });
-        assertEquals(said.filter((l) => l.startsWith("wac: hydrated")), ["wac: hydrated — 7 kept, 1 made, 1 removed"],
+        assertEquals(said.filter((l) => l.startsWith("wac: hydrated")), ["wac: hydrated — 8 kept, 1 made, 1 removed"],
                      "the drift is said");
       } finally {
         await browser?.close();

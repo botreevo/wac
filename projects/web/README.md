@@ -258,7 +258,7 @@ the marks. A node kept is the node the reader may already have focused, typed in
 before the program listens — clicks, keys, edits — is kept by a small script after `#app` (`earlyScript`, allowed by
 its hash) and handed to the program's listeners once the first batch has put them there, without dispatching it again;
 a field typed into early keeps what was typed. A frame in the browser that differs from the build's is mended rather
-than wrong, and said on the console: `wac: hydrated — 7 kept, 1 made, 1 removed`. A shadow root and a canvas's pixels
+than wrong, and said on the console: `wac: hydrated — 8 kept, 1 made, 1 removed`. A shadow root and a canvas's pixels
 are not markup, and are drawn when the module runs. Building in steps, `--module-only` writes `prerender.wac` too, and
 `--wrap` reads `<out>/first.html`, which whoever builds writes from `wac run <out>/prerender.wac`.
 

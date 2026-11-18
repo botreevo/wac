@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fetch execution-specs' test fixtures into fixtures/ (gitignored), for the forks this client runs: the state,
-# blockchain and engine tests for Cancun, Prague and Osaka and every timed transition between them and the BPO forks.
-# About 1 GB to fetch, streamed (nothing is kept but what is unpacked), and about 7 GB unpacked.
+# blockchain and engine tests for Cancun, Prague, Osaka and Amsterdam, and every timed transition between them.
+# About 1 GB to fetch, streamed (nothing is kept but what is unpacked), and about 11 GB unpacked.
 #
 #     sh tools/fetch-fixtures.sh
 #
@@ -15,11 +15,11 @@
 set -eu
 version=tests@v21.0.1
 sha256=b9b14391ed1a625e4ca9a058c055d0eacd98a42b76c7a6127c640cdc2d3c9439
-forks="cancun prague osaka"
+forks="cancun prague osaka amsterdam"
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$root/fixtures"
 cd "$root/fixtures"
-if [ -f .version ] && [ "$(cat .version)" = "$version" ]; then echo "fixtures $version already here"; exit 0; fi
+if [ -f .version ] && [ "$(cat .version)" = "$version $forks" ]; then echo "fixtures $version already here"; exit 0; fi
 patterns=""
 for kind in state_tests blockchain_tests blockchain_tests_engine; do
   for f in $forks; do patterns="$patterns fixtures/$kind/for_$f/*"; done
@@ -39,5 +39,5 @@ if [ "$(cut -d' ' -f1 .hash)" != "$sha256" ]; then
   exit 1
 fi
 rm .hash
-echo "$version" > .version
+echo "$version $forks" > .version
 echo "fixtures $version in $root/fixtures"

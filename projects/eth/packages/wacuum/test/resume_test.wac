@@ -441,3 +441,49 @@ export async string test_a_payload_status_names_a_hash_in_full(Sys sys) {
   t.ok(flvh.len() == 66, "and in the fork choice's answer: \{flvh}");
   return t.report();
 }
+
+// ── issues/closed/0009d: the store flushed on a side block, the main block at its height only in the log ──
+//
+// crash.wac at --flush-every 64 caught it once in 28 runs: the last flush landed on a side chain's block, and the main
+// chain's block at the same height went into the log after it, never flushed. The restart adopted every logged
+// block at or below the store's height as already in its state, the main one too; with no state and no change set
+// it could not be built on, so its children were passed over as a dead fork, and the node came back with the head
+// short and the store's state answering under the main block's name.
+async string runSideFlush() {
+  Check t = Check.create();
+  Genesis gen = genesis();
+  MemDisk md = MemDisk.create();
+  // Every third step flushed: blocks 1 and 2 staged, the side block 3' staged and flushed with them.
+  Engine e = await started(gen, md, 3);
+  JsonValue second = JsonValue.Null;
+  for (i32 i = 1; i <= 2; i++) {
+    JsonValue p = (await build(e, 12 * i))!;
+    t.eqStr(statusOf(await call(e, "engine_newPayloadV4", p)), "VALID", "block \{i} imports");
+    t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(p), JsonValue.Null))), "VALID", "and is the head");
+    second = p;
+  }
+  JsonValue side = (await buildFor(e, 36, "0x4444444444444444444444444444444444444444", U256.zero()))!;
+  t.eqStr(statusOf(await call(e, "engine_newPayloadV4", side)), "VALID", "the side block 3' imports, and the store flushes on it");
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(side), JsonValue.Null))), "VALID", "and is the head");
+  // The consensus client goes back to block 2 and the main chain's block 3 is built and imported there: the store
+  // moved back and the block run are staged, not flushed, so only the log has the main block 3.
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(second), JsonValue.Null))), "VALID", "block 2 the head again");
+  JsonValue main = (await build(e, 36))!;
+  t.ok(!hashOf(main).eq(hashOf(side)), "the main block 3 is not the side one");
+  t.eqStr(statusOf(await call(e, "engine_newPayloadV4", main)), "VALID", "the main block 3 imports");
+  t.eqStr(statusOf(await call(e, "engine_forkchoiceUpdatedV3", choice(hashOf(main), JsonValue.Null))), "VALID", "and is the head");
+  u8[] log = logOf(e, e.records.len());
+
+  Engine r = await restarted(gen, md, log, 3);
+  t.ok(r.restoredNumber.eq(U256.ofI32(3)) && r.restoredAt!.eq(hashOf(side)),
+       "the store holds the side block 3': \{r.restoredNumber.toDecimal()} \{r.restoredAt!.toHex()}");
+  t.ok(r.head.eq(hashOf(main)), "the head is the main block 3, as the log left it");
+  // Built on the main block 3: run on its state, which the store must reach.
+  JsonValue? fourth = await build(r, 48);
+  t.ok(fourth is not null, "block 4 built on the main block 3");
+  t.eqStr(statusOf(await call(r, "engine_newPayloadV4", fourth!)), "VALID", "and imported, not SYNCING");
+  t.eqStr(statusOf(await call(r, "engine_forkchoiceUpdatedV3", choice(hashOf(fourth!), JsonValue.Null))), "VALID", "and is the head");
+  return t.report();
+}
+
+export async string test_a_store_flushed_on_a_side_block_with_the_main_block_only_in_the_log(Sys sys) { return await runSideFlush(); }

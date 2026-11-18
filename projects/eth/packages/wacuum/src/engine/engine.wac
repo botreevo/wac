@@ -1334,6 +1334,7 @@ export struct Engine {
     // cannot reach (its undo records gone with finality). A fork choice that named one is passed over too.
     Map<U256, bool> skipped = Map.create(hashU256, eqU256);
     await this.adoptFromStore();
+    Map<U256, bool> chain = this.storeChain(log);
     while (at < log.len()) {
       i32 n = rlpLength(log, at);
       if (n < 0) { break; }
@@ -1350,13 +1351,15 @@ export struct Engine {
         if (bd.block is null) { return Replayed(at, blocks, "block at byte \{at}: \{bd.error}"); }
         Block b = bd.block!;
         if (this.restoredAt is not null && b.header.hash.eq(this.restoredAt!)) { this.restoredLogged = true; }
-        if (this.restoredAt is not null && !b.header.number.gt(this.restoredNumber)) {
+        // Only the store's own chain is already in its state: a block of the log at or below the store's height on
+        // another fork (a side block at the height the store last flushed at, say) is run like any other.
+        if (this.restoredAt is not null && !b.header.number.gt(this.restoredNumber) && chain.has(b.header.hash)) {
           await this.adoptLogged(spec, b);
         } else {
           // The first block to run: every block at or below the store's that the log has later is adopted first,
           // so that the store can be moved across them (a side chain imported after the main chain's later blocks).
           if (this.restoredAt is not null && !lookedAhead) {
-            await this.adoptAhead(log, at + n);
+            await this.adoptAhead(log, at + n, chain);
             lookedAhead = true;
           }
           if (this.db is not null) { await this.prepareBlock(spec, b); }
@@ -1417,8 +1420,55 @@ export struct Engine {
     }
   }
 
-  /** The log's blocks from `from` on that are at or below the store's, adopted, up to a rebase (which forgets them). */
-  async void adoptAhead(this, u8[] log, i32 from) {
+  /**
+   * The store's block and its ancestors among the log's blocks, by hash: what the store's state already includes. A
+   * block of the log at the same height or below that is not one of them is on another fork, and was never applied
+   * to the store as it now is. Adopting such a block by its number alone (issues/closed/0009d) left it with no state
+   * and no change set: its children could not run, and a restart whose store had flushed on a side block came back
+   * short of the head with the store's state under another block's name.
+   */
+  Map<U256, bool> storeChain(this, u8[] log) {
+    Map<U256, bool> chain = Map.create(hashU256, eqU256);
+    if (this.restoredAt is null) { return chain; }
+    Map<U256, U256> parentOf = Map.create(hashU256, eqU256);
+    i32 at = 0;
+    while (at < log.len()) {
+      i32 n = rlpLength(log, at);
+      if (n < 0) { break; }
+      u8[] rec = u8[].filled(n, 0);
+      rec.copyFrom(log, at, 0, n);
+      at += n;
+      Decoded d = decode(rec);
+      if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 2) { continue; }
+      Item[] f = itemsOf(d.item);
+      u8[] kind = bytesOf(f[0]);
+      if (kind.len() != 1 || kind[0] != RECORD_BLOCK) { continue; }
+      Decoded bd = decode(bytesOf(f[1]));
+      if (!bd.ok || !isList(bd.item) || itemsOf(bd.item).len() < 1 || !isList(itemsOf(bd.item)[0])) { continue; }
+      Item header = itemsOf(bd.item)[0];
+      if (itemsOf(header).len() < 1 || isList(itemsOf(header)[0])) { continue; }
+      U256 hash = U256.fromBytes(keccak256(encode(header)), 0, 32);
+      parentOf.set(hash, U256.fromBytes(bytesOf(itemsOf(header)[0]), 0, 32));
+    }
+    U256 cur = this.restoredAt!;
+    chain.set(cur, true);
+    for (Node? n = this.blocks.get(cur); true; ) {
+      U256? up = parentOf.get(cur);
+      if (up is null && n is not null) { up = n!.header.parentHash; }
+      if (up is null || chain.has(up!)) { break; }
+      cur = up!;
+      chain.set(cur, true);
+      n = this.blocks.get(cur);
+      if (n is null && !parentOf.has(cur)) { break; }
+    }
+    return chain;
+  }
+
+  /**
+   * The log's blocks from `from` on that are on the store's chain at or below its block (`chain`), adopted, up to a
+   * rebase (which forgets them).
+   */
+  async void adoptAhead(this, u8[] log, i32 from, Map<U256, bool> chain) {
     i32 at = from;
     while (at < log.len()) {
       i32 n = rlpLength(log, at);
@@ -1435,7 +1485,7 @@ export struct Engine {
       u8[] raw = bytesOf(f[1]);
       Spec spec = this.config.specAt(blockTimestamp(raw));
       BlockDecode bd = decodeBlock(spec, raw);
-      if (bd.block is null || bd.block!.header.number.gt(this.restoredNumber)) { continue; }
+      if (bd.block is null || bd.block!.header.number.gt(this.restoredNumber) || !chain.has(bd.block!.header.hash)) { continue; }
       if (bd.block!.header.hash.eq(this.restoredAt!)) { this.restoredLogged = true; }
       await this.adoptLogged(spec, bd.block!);
     }

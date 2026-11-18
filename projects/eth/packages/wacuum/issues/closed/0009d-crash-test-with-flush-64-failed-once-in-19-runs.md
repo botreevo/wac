@@ -1,6 +1,6 @@
 # 0009d — The crash test with `--flush-every 64` failed once in 19 runs: the restarted node ended four blocks short, its state not the never-killed node's
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-d
 - **Date:** 2026-11-18
 - **Kind:** bug
@@ -28,3 +28,21 @@ reported did not bring it level. With a flush every 64 blocks most kills fall be
 replay of the block log since the last flush (`adoptStored`, the lost-tail recovery) and a reorg's undo across a
 flush. To catch it: run the test in a loop with its directory and every restart's log kept (crash.wac removes them
 when it ends), and stop at the first failure.
+
+## Fixed (2026-11-18)
+
+Caught on the 28th of 35 runs with everything kept (the crash test now keeps a failing run's directory): the
+identical wrong state root, 0x39d23f35…, as in the gate. The block log ended `196' 197' 196 197 198 199 200` — a
+side chain of two empty blocks, then the main chain — and the store's last flush had landed on the side block 196'.
+The restart adopted every logged block at or below the store's height as already in its state, by number: the main
+block 196 too, though the store had never held it and no undo record existed for it. Replaying 197' moved the store
+onto the side chain; the main 197 needed the main 196's state, which nothing could reach, so it and its children were
+passed over as a dead fork; and the last fork choice the log could follow named the main 196. The node came back
+with that block as its head and the store's state (197') answering under its name.
+
+Now only the store's own block and its ancestors among the log's blocks are adopted (`Engine.storeChain`); any other
+block of the log at or below the store's height is run, the store moved back to its parent by the undo records.
+On a copy of the failing run's store and log the old code comes back at head 196 with the wrong root, and the fixed
+one at head 200 with the never-killed node's root. `test/resume_test.wac`'s
+`test_a_store_flushed_on_a_side_block_with_the_main_block_only_in_the_log` builds the same shape in a few blocks
+(a flush every third step, landing on a side block 3'): SYNCING before the fix, VALID after.

@@ -82,6 +82,9 @@ for (const mode of [[], ["--in-page"]]) {
         await page.goto(`${site}docs/a/`);
         await waitInPage(page, hydrated, null, { timeout: 30_000 });
         assertEquals(said.filter((l) => l.startsWith("wac: hydrated")), [], "the program drew /docs/a/ as the build did");
+        // The site is read from its root, whichever page this is: /site/sitemap.xml, not /site/docs/a/sitemap.xml.
+        await waitInPage(page, "document.getElementById('read').textContent.startsWith('the site')", null, { timeout: 10_000 });
+        assertEquals((await page.textContent("#read")).startsWith("the site's sitemap: "), true, "the site's files, from a page at a route");
         await page.evaluate("window.__stayed = true");
         await page.click("#to-2");
         await waitInPage(page, "document.getElementById('title').textContent === 'Page B'", null, { timeout: 10_000 });

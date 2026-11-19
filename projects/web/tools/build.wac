@@ -23,7 +23,7 @@
 // project does not map this package as `web`.
 
 import { Exec, Sys, ChildEnv, Files, Launch, Output, Procs } from "std";
-import { Vec, flatten } from "core";
+import { Buf, Vec, flatten } from "core";
 
 // A site's `index.json`, which its build writes last (`index.wac`): exported here, as the package's one entry.
 export { indexSite } from "./index.wac";
@@ -64,11 +64,16 @@ struct Asked {
    * one built so is for serving.
    */
   bool moduleFile;
+  /**
+   * **Where the site is served** (`--site-url https://example.org/wac`): each page's canonical address, and a
+   * `sitemap.xml` naming every page — what a search engine reads to find the pages a link alone would not reach.
+   */
+  string siteUrl;
 }
 
 /** The arguments, or a usage line in `title` and empty `entry` when they do not make sense. */
 Asked askedOf(string[] argv) {
-  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false, false);
+  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false, false, "");
   i32 argc = argv.len();
   string[] args = string[].filled(argc, "");
   for (i32 k = 0; k < argc; k++) { args[k] = argv[k]; }
@@ -110,6 +115,11 @@ Asked askedOf(string[] argv) {
     if (w == "--edge") {
       a.edge = true;
       i++;
+      continue;
+    }
+    if (w == "--site-url" && i + 1 < argc) {
+      a.siteUrl = args[i + 1];
+      i += 2;
       continue;
     }
     if (w == "--module-file") {
@@ -328,12 +338,13 @@ export string base64(u8[] bytes) {
  */
 export string programSide() {
   return """
-      const wacPageServer = (next, answer, post, where, site, size) => {
+      const wacPageServer = (next, answer, post, where, site, size, route) => {
         // **Where `wac.page`'s numbers start here** — above every request std numbers, below the 2^20 a parent
         // numbers the capabilities it provides from — and how many there are: `src/line.wac`'s `PAGE_COUNT`, which
         // a request asked directly rather than sent in a batch is routed by. It stayed at 23 while the changes after
         // that were added, which nobody saw because each of them travels in a batch; `PAGE_ZONE` is asked.
-        const BASE = 4096, COUNT = 37;
+        // `PAGE_COUNT` in `src/line.wac`: a request numbered past it is not this host's, and goes on to `next`.
+        const BASE = 4096, COUNT = 41;
         const NONE = new Uint8Array(0), dec = new TextDecoder(), enc = new TextEncoder();
         const lo = (v) => Number(BigInt.asIntN(32, v)), hi = (v) => Number(v >> 32n);
         const pair = (high, low) => (BigInt(high) << 32n) | BigInt(low >>> 0);
@@ -355,6 +366,8 @@ export string programSide() {
         // program on in a turn of its own, and renders before the next.
         const events = [], eventAsks = [], files = [], fileAsks = [], frames = new Map(), values = new Map(), stores = new Map(), audios = new Map();
         let at = where, locationAsks = [], lastFrame = 0, lastValue = 0;
+        // **The page's path on its site** (`PAGE_PATH`), as the document worked it out from its address (`wacRouteOf`).
+        let path = route ?? "/", pathAsks = [];
         // Whether the page is seen, as the document last said — `""` until it has — and who waits to hear it change.
         let seen = "", seenAsks = [];
         const seenNow = () => {
@@ -377,6 +390,12 @@ export string programSide() {
           const waiting = locationAsks;
           locationAsks = [];
           for (const w of waiting) { if (strip(at) !== w.known) answer(w.id, 0, strip(at), NONE, 0n, 0n, 0); else locationAsks.push(w); }
+        };
+        // A path is answered at once, as a location is: the program knows which page it is before its first turn.
+        const pathed = () => {
+          const waiting = pathAsks;
+          pathAsks = [];
+          for (const w of waiting) { if (path !== w.known) answer(w.id, 0, path, NONE, 0n, 0n, 0); else pathAsks.push(w); }
         };
         const flush = () => {
           while (eventAsks.length && events.length) giveEvent(eventAsks.shift(), events.shift());
@@ -411,6 +430,11 @@ export string programSide() {
             case 30: return answer(id, 0, "", NONE, BigInt(-new Date(Number(a)).getTimezoneOffset()), 0n, 0);
             case 31: seenAsks.push({ id, known: text }); return seenNow();
             case 32: return send(["back"]);
+            case 37: pathAsks.push({ id, known: text }); return pathed();
+            // The program's new path, known here at once; the address bar is the document's to change.
+            case 38: path = text; pathed(); return send(["navigate", text, a !== 0n]);
+            case 39: return send(["links", a !== 0n]);
+            case 40: return send(["describe", text]);
             // The reader's zone by name: this thread's `Intl` knows it as the document's does, so answered at once.
             case 33: return answer(id, 0, Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", NONE, 0n, 0n, 0);
             // `localStorage` is the document's alone — a worker has none — so a read goes there and back.
@@ -712,6 +736,7 @@ export string programSide() {
             case "el": events.push(m.slice(1)); return flush();
             case "file": files.push(m.slice(1)); return flush();
             case "where": at = m[1]; return located();
+            case "path": path = m[1]; return pathed();
             case "seen": seen = m[1]; return seenNow();
             case "value": { const id = values.get(m[1]); values.delete(m[1]); if (id !== undefined) answer(id, 0, m[2], NONE, 0n, 0n, 0); return; }
             case "stored": { const id = stores.get(m[1]); stores.delete(m[1]); if (id !== undefined) answer(id, 0, m[2] ?? "", NONE, 0n, 0n, m[2] === null ? 1 : 0); return; }
@@ -1473,9 +1498,9 @@ export string moduleSide() {
       //
       // It holds what the build granted (`grants`), draws by sending `post` what the document applies, starts at
       // location `where`, and answers `receive` for what the document sends back.
-      const wacPage = (wasm, grants, post, where, site, size) => {
+      const wacPage = (wasm, grants, post, where, site, size, route) => {
         const me = { child: false, args: [], cwd: "/", post: null };
-        const top = wacRun(wasm, me, grants, (next, answer) => wacPageServer(next, answer, post, where, site, size), (text) => console.error(text));
+        const top = wacRun(wasm, me, grants, (next, answer) => wacPageServer(next, answer, post, where, site, size, route), (text) => console.error(text));
         return top === null ? () => {} : top.receive;
       };
       """;
@@ -1491,6 +1516,20 @@ export string moduleSide() {
  */
 export string documentSide() {
   return """
+      // **The site's root, and where on the site this page is.** A page the build wrote for a route (`Frame.on`) says
+      // which, `data-wac-route` on `#app`; what its address has before that route is the folder the site is served
+      // from — `/wac-website-proto` on a host that serves many — and a path on the site is the rest. A page with no
+      // route is the site's root.
+      const wacSiteBase = (() => {
+        const p = location.pathname.replace(/index[.]html$/, "");
+        const r = document.getElementById("app")?.dataset.wacRoute ?? "/";
+        return p.endsWith(r) ? p.slice(0, p.length - r.length) : p.replace(/[/]$/, "");
+      })();
+      const wacRouteOf = (pathname) => {
+        let p = pathname.replace(/index[.]html$/, "");
+        if (p.startsWith(wacSiteBase)) p = p.slice(wacSiteBase.length);
+        return p.startsWith("/") ? p : "/" + p;
+      };
       // The canvases handed to workers to draw, by the document's number for each: sized as their workers say.
       const wacSurfaceEls = new Map();
       let wacSurfaceDocNext = 0;
@@ -1523,7 +1562,7 @@ export string documentSide() {
         const texted = new WeakSet();
         // Each parent's last child the first batch put at its end.
         const lastPlaced = new Map();
-        let kept = 0, made = 0;
+        let kept = 0, made = 0, differed = 0;
         // **One frame of several** (`framesHtml`): the first whose media query matches, by the rule the stylesheet
         // showed it by, is the one kept — unwrapped into `#app` — and the others go before anything is read from it.
         // The program is told the window's size at this same moment, and draws the layout the frame was drawn for.
@@ -1591,7 +1630,7 @@ export string documentSide() {
           }
           marked.clear(); given.clear(); lastPlaced.clear();
           root.removeAttribute("data-wac-pre");
-          if (made > 0 || removed > 0) console.log(`wac: hydrated — ${kept} kept, ${made} made, ${removed} removed`);
+          if (made > 0 || removed > 0 || differed > 0) console.log(`wac: hydrated — ${kept} kept, ${made} made, ${removed} removed, ${differed} changed`);
         };
         // **What the reader did before the program listened** (`earlyScript`): each event handed, in order, to the
         // listeners the first batch put on its target and everything above it, nearest first — the program hears it as
@@ -1696,7 +1735,7 @@ export string documentSide() {
             // A mark claimed is a match, kept, even when its text was empty and there is no node to keep but a new one.
             if (mark) kept++;
             else if (hydrating) made++;
-            if (t) { if (t.data !== text) t.data = text; }
+            if (t) { if (t.data !== text) { t.data = text; differed++; } }
             else t = document.createTextNode(text);
             nodes.set(id, t); handleOf.set(t, id); place(parent, t, before);
           },
@@ -1707,6 +1746,7 @@ export string documentSide() {
             if (hydrating && given.has(n)) {
               texted.add(n);
               if (n.childNodes.length === 1 && n.firstChild.nodeType === 3 && n.firstChild.data === text) return;
+              differed++;
             }
             for (const k of n.childNodes) forget(k);
             n.textContent = text;
@@ -1718,6 +1758,7 @@ export string documentSide() {
             if (n && hydrating && given.has(n)) {
               given.get(n).add(name);
               if (present ? n.getAttribute(name) === value : !n.hasAttribute(name)) return;
+              differed++;
             }
             if (n && n.setAttribute) { if (present) n.setAttribute(name, value); else n.removeAttribute(name); }
           },
@@ -1940,6 +1981,17 @@ export string documentSide() {
             if (push) history.pushState(null, "", url); else history.replaceState(null, "", url);
           },
           back: () => { history.back(); },
+          // A path on the site, in the address bar: a new place in the history, or this one's.
+          navigate: (path, push) => {
+            const url = wacSiteBase + path;
+            if (push) history.pushState(null, "", url); else history.replaceState(null, "", url);
+          },
+          links: (on) => { linksOn = on; },
+          describe: (text) => {
+            let m = document.querySelector('meta[name="description"]');
+            if (!m) { m = document.createElement("meta"); m.name = "description"; document.head.append(m); }
+            m.content = text;
+          },
           // The page's store: `localStorage`, which a browser may refuse (storage off, a private window's quota) —
           // then nothing is stored, and a read finds nothing, as it would in a fresh profile.
           // **The audio, as the program asks about it** (`PAGE_AUDIO`): its state, or a resume — the browser's own
@@ -2034,6 +2086,24 @@ export string documentSide() {
         root.addEventListener("change", changed);
         // A link to `#/somewhere`, and the browser's back and forward, move the location; the program follows.
         addEventListener("hashchange", () => emit(["where", location.hash]));
+        // Back and Forward between the site's pages, which the program navigated to: where the reader is now.
+        addEventListener("popstate", () => emit(["path", wacRouteOf(location.pathname)]));
+        // **A link to a page of this site, followed here** once the program has asked (`PAGE_LINKS`): the history moved
+        // and the program told, rather than the page loaded again. Not a link a handler has prevented, one opened in a
+        // new tab or window — a modifier held, a target — nor one to download, elsewhere, or within this page.
+        let linksOn = false;
+        root.addEventListener("click", (ev) => {
+          if (!linksOn || ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+          if (location.protocol === "file:") return;
+          const a = ev.target instanceof Element ? ev.target.closest("a[href]") : null;
+          if (!a || !root.contains(a) || (a.target && a.target !== "_self") || a.hasAttribute("download")) return;
+          const u = new URL(a.href, location.href);
+          if (u.origin !== location.origin || !(u.pathname + "/").startsWith(wacSiteBase + "/")) return;
+          if (u.pathname === location.pathname && u.search === location.search && u.hash) return;
+          ev.preventDefault();
+          history.pushState(null, "", u.pathname + u.search + u.hash);
+          emit(["path", wacRouteOf(u.pathname)]);
+        });
         // **Whether the page is seen**: said once now and at each change. `pagehide` as well as `visibilitychange`,
         // because a page being left is not always hidden first, and what it has not saved by then is lost.
         // The first after this returns: whoever made this document starts the program only then, and a message before
@@ -2219,8 +2289,8 @@ export string brokerClient() {
  * `file://` URL — and a **classic** worker: a module worker made from a blob is refused on a `file://` page, and a
  * `data:` one would lose the page's origin and the storage that goes with it.
  */
-export string workerIndexFor(string title, string first, string wasm, i32 grants, string moduleUrl) {
-  return head(title, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
+export string workerIndexFor(PageHead h, string first, string wasm, i32 grants, string moduleUrl) {
+  return head(h, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
        + "<script type=\"text/plain\" id=\"wac-program\">\n" + systemSide() + programSide() + moduleSide()
        // The first message says who this worker is: the page's program, or a module a program started.
        + brokerClient()
@@ -2229,7 +2299,7 @@ export string workerIndexFor(string title, string first, string wasm, i32 grants
        + "  if (wacFromPage(e.data)) return;\n"
        + "  if (receive !== null) return receive(e.data);\n"
        + "  if (e.data[0] === \"module\") { receive = () => {}; return wacModule(e.data[1], e.data[2]); }\n"
-       + "  receive = wacPage(e.data[2], \{grants}, (m, transfer) => postMessage(m, transfer ?? []), e.data[1], e.data[3], e.data[4]);\n"
+       + "  receive = wacPage(e.data[2], \{grants}, (m, transfer) => postMessage(m, transfer ?? []), e.data[1], e.data[3], e.data[4], e.data[5]);\n"
        + "};\n</script>\n"
        + documentScript(documentSide() + brokerSide() + moduleBytes(moduleUrl)
        + """
@@ -2248,7 +2318,7 @@ export string workerIndexFor(string title, string first, string wasm, i32 grants
          // The window's size as the document chose its frame by, now, whenever the module arrives.
          const size = `${innerWidth}x${innerHeight}`;
          wacModuleBytes().then((wasm) => {
-           worker.postMessage(["page", location.hash, wasm, location.protocol === "file:" ? null : location.href, size], [wasm.buffer]);
+           worker.postMessage(["page", location.hash, wasm, location.protocol === "file:" ? null : location.href, size, wacRouteOf(location.pathname)], [wasm.buffer]);
            started = true;
            for (const [m, transfer] of held) worker.postMessage(m, transfer ?? []);
          }, (e) => console.error("wac: the page's module could not be loaded: " + e.message));
@@ -2257,8 +2327,8 @@ export string workerIndexFor(string title, string first, string wasm, i32 grants
 }
 
 /** The page, with the program on the page's own thread: the two halves joined directly. */
-export string inPageIndexFor(string title, string first, string wasm, i32 grants, string moduleUrl) {
-  return head(title, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
+export string inPageIndexFor(PageHead h, string first, string wasm, i32 grants, string moduleUrl) {
+  return head(h, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
        + documentScript(systemSide() + moduleSide() + programSide() + documentSide() + moduleBytes(moduleUrl)
        + "let receive = null;\n"
        // What the document says before the program is started is held for it, as the worker's page does.
@@ -2266,7 +2336,7 @@ export string inPageIndexFor(string title, string first, string wasm, i32 grants
        + "const apply = wacDocument(document.getElementById(\"app\"), (m) => { if (receive !== null) receive(m); else held.push(m); });\n"
        + "const size = `${innerWidth}x${innerHeight}`;\n"
        + "wacModuleBytes().then((wasm) => {\n"
-       + "  receive = wacPage(wasm, \{grants}, (m) => apply(m), location.hash, location.protocol === \"file:\" ? null : location.href, size);\n"
+       + "  receive = wacPage(wasm, \{grants}, (m) => apply(m), location.hash, location.protocol === \"file:\" ? null : location.href, size, wacRouteOf(location.pathname));\n"
        + "  for (const m of held) receive(m);\n"
        + "}, (e) => console.error(\"wac: the page's module could not be loaded: \" + e.message));\n")
        + "</body>\n</html>\n";
@@ -2400,14 +2470,14 @@ export string appPolicy() {
  * its policy allowing them, and its document registering the service worker, from a site (a page opened from a file
  * has no origin to install from). Edge to edge, a phone's status bar is drawn over the page, which keeps clear of it.
  */
-export string asApp(string page, string color, bool edge) {
-  string tags = "<link rel=\"manifest\" href=\"manifest.webmanifest\">\n"
-              + "<link rel=\"icon\" href=\"" + APP_ICON + "\">\n<link rel=\"apple-touch-icon\" href=\"" + APP_ICON + "\">\n"
+export string asApp(string page, string color, bool edge, string prefix) {
+  string tags = "<link rel=\"manifest\" href=\"" + prefix + "manifest.webmanifest\">\n"
+              + "<link rel=\"icon\" href=\"" + prefix + APP_ICON + "\">\n<link rel=\"apple-touch-icon\" href=\"" + prefix + APP_ICON + "\">\n"
               + "<meta name=\"theme-color\" content=\"" + color + "\">\n"
               + "<meta name=\"mobile-web-app-capable\" content=\"yes\">\n<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n"
               + (edge ? "<meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\">\n" : "");
   string register = "if (\"serviceWorker\" in navigator && location.protocol !== \"file:\") {\n"
-                  + "  navigator.serviceWorker.register(\"" + APP_WORKER + "\").catch((e) => console.warn(\"no copy to open without the network: \" + e.message));\n}\n";
+                  + "  navigator.serviceWorker.register(\"" + prefix + APP_WORKER + "\").catch((e) => console.warn(\"no copy to open without the network: \" + e.message));\n}\n";
   string script = "<script type=\"text/plain\" id=\"wac-document\">\n\"use strict\";\n";
   return swap(swap(swap(page, policy(), appPolicy()), "<title>", tags + "<title>"), script, script + register);
 }
@@ -2453,16 +2523,42 @@ export string serviceWorker() {
   """;
 }
 
+/** What a page's head says about it: its title, its description, its path on its site, its canonical address. */
+export struct PageHead {
+  string title;
+  string description;
+  string route;
+  string canonical;
+
+  /** A page with a title and nothing else to say: the site's root. */
+  PageHead titled(string title) { return PageHead(title, "", "/", ""); }
+}
+
 /** Everything before the script: the document the program draws into. */
-string head(string title, string first) {
+string head(PageHead h, string first) {
   return "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
        + "<meta http-equiv=\"Content-Security-Policy\" content=\"" + policy() + "\">\n"
        + "<meta name=\"viewport\" content=\"" + VIEWPORT + "\">\n"
-       + "<title>" + title + "</title>\n</head>\n<body>\n"
+       + "<title>" + textSafe(h.title) + "</title>\n"
+       + (h.description == "" ? "" : "<meta name=\"description\" content=\"" + attrSafe(h.description) + "\">\n")
+       + (h.canonical == "" ? "" : "<link rel=\"canonical\" href=\"" + attrSafe(h.canonical) + "\">\n")
+       + "</head>\n<body>\n"
        // **The first frame comes before the module**, which is most of the file: the browser paints what it has parsed,
-       // so the reader sees the page while the rest arrives.
-       + (first == "" ? "<div id=\"app\"></div>\n"
-                      : "<div id=\"app\" data-wac-pre>" + first + "</div>\n<script>" + earlyScript() + "</script>\n");
+       // so the reader sees the page while the rest arrives. A page at a route says which (`wacSiteBase`).
+       + "<div id=\"app\"" + (h.route == "/" ? "" : " data-wac-route=\"" + attrSafe(h.route) + "\"")
+       + (first == "" ? "></div>\n" : " data-wac-pre>" + first + "</div>\n<script>" + earlyScript() + "</script>\n");
+}
+
+/** Text as it may sit in an element: nothing in it read as markup. */
+string textSafe(string s) {
+  string out = "";
+  u8[] b = s.toBytes();
+  i32 from = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    string esc = b[i] == '&' ? "&amp;" : (b[i] == '<' ? "&lt;" : (b[i] == '>' ? "&gt;" : ""));
+    if (esc != "") { out = out + string.fromBytes(bytesIn(b, from, i)) + esc; from = i + 1; }
+  }
+  return out + string.fromBytes(bytesIn(b, from, b.len()));
 }
 
 /**
@@ -2525,22 +2621,159 @@ export i32 drawPageFrames(string[] argv, Output err, Output out, Files fs, Procs
   string wasm = a.out + "/page.wasm";
   auto counted = ran(procs, a.wac, [wasm, "--frames"], err);
   if (counted is null) { return 1; }
-  i32 n = 0;
-  for (u8 c in counted!) { if (c >= '0' && c <= '9') { n = n * 10 + ((c - '0') as i32); } }
-  if (n == 0) { err.line("build.wac: \{a.entry} declares no frames: prerendered() is empty"); return 1; }
-  string[] media = string[].filled(n, "");
-  string[] markup = string[].filled(n, "");
+  string listed = string.fromBytes(counted!);
+  i32 n = numberOf(lineOf(listed, 0));
+  if (n <= 0) { err.line("build.wac: \{a.entry} declares no frames: prerendered() is empty"); return 1; }
+  // **The frames by page**: each path, in the order the program first names it, and the frames drawn for it.
+  Vec<string> paths = Vec.create();
+  string[] pathOf = string[].filled(n, "/");
   for (i32 k = 0; k < n; k++) {
-    auto drawn = ran(procs, a.wac, [wasm, "--frame", "\{k}"], err);
-    if (drawn is null) { return 1; }
-    string text = string.fromBytes(drawn!);
-    i32 nl = text.indexOf("\n");
-    media[k] = nl < 0 ? text : text.slice(0, nl);
-    markup[k] = nl < 0 ? "" : text.slice(nl + 1, text.len());
+    pathOf[k] = lineOf(listed, k + 1);
+    bool seen = false;
+    for (i32 i = 0; i < paths.len(); i++) { if (paths.get(i) == pathOf[k]) { seen = true; } }
+    if (!seen) { paths.push(pathOf[k]); }
   }
-  string wrote = written(fs, a.out + "/first.html", framesHtml(media, markup).toBytes());
+  Vec<Routed> routes = Vec.create();
+  for (i32 p = 0; p < paths.len(); p++) {
+    Vec<string> media = Vec.create();
+    Vec<string> markup = Vec.create();
+    string title = "";
+    string description = "";
+    for (i32 k = 0; k < n; k++) {
+      if (pathOf[k] != paths.get(p)) { continue; }
+      auto drawn = ran(procs, a.wac, [wasm, "--frame", "\{k}"], err);
+      if (drawn is null) { return 1; }
+      string text = string.fromBytes(drawn!);
+      media.push(lineOf(text, 0));
+      // A page's title and description are its first frame's: what a reader whose window matches no query sees is
+      // the same page, in another layout.
+      if (media.len() == 1) { title = lineOf(text, 1); description = lineOf(text, 2); }
+      markup.push(afterLines(text, 3));
+    }
+    routes.push(Routed(paths.get(p), title, description, framesHtml(media.toArray(), markup.toArray())));
+  }
+  string wrote = written(fs, a.out + "/frames.txt", framesFileOf(routes.toArray()));
   if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
   return 0;
+}
+
+/** **One page of a site, drawn**: its path, its title and description, and what goes in its `#app` (`framesHtml`). */
+export struct Routed {
+  string path;
+  string title;
+  string description;
+  string html;
+}
+
+/**
+ * `<out>/frames.txt`: what `drawPageFrames` drew, for `--wrap` to read — a first line naming the format, then each page:
+ * its path, title and description a line each, its HTML's length in bytes on a line, then that HTML.
+ */
+export u8[] framesFileOf(Routed[] routes) {
+  Buf out = Buf.create();
+  out.pushStr("wac-frames 1\n");
+  for (Routed r in routes) {
+    u8[] html = r.html.toBytes();
+    out.pushStr(r.path + "\n" + r.title + "\n" + r.description + "\n" + "\{html.len()}\n");
+    out.pushAll(html);
+  }
+  return out.bytes();
+}
+
+/** What `framesFileOf` wrote, read back; null if it is not that. */
+export Routed[]? routesOf(u8[] file) {
+  Vec<Routed> out = Vec.create();
+  i32 at = 0;
+  string first = byteLine(file, at);
+  if (first != "wac-frames 1") { return null; }
+  at = at + first.toBytes().len() + 1;
+  while (at < file.len()) {
+    string[] fields = string[].filled(4, "");
+    for (i32 i = 0; i < 4; i++) {
+      fields[i] = byteLine(file, at);
+      at = at + fields[i].toBytes().len() + 1;
+      if (at > file.len()) { return null; }
+    }
+    i32 length = numberOf(fields[3]);
+    if (length < 0 || at + length > file.len()) { return null; }
+    out.push(Routed(fields[0], fields[1], fields[2], string.fromBytes(bytesIn(file, at, at + length))));
+    at = at + length;
+  }
+  return out.toArray();
+}
+
+/** `bytes` from `from` up to `to`. */
+u8[] bytesIn(u8[] bytes, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0 as u8);
+  for (i32 i = from; i < to; i++) { out[i - from] = bytes[i]; }
+  return out;
+}
+
+/** A run of decimal digits as a number; -1 for anything else. */
+i32 numberOf(string s) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0 || b.len() > 9) { return 0 - 1; }
+  i32 n = 0;
+  for (u8 c in b) {
+    if (c < '0' || c > '9') { return 0 - 1; }
+    n = n * 10 + ((c - '0') as i32);
+  }
+  return n;
+}
+
+/** The line of `bytes` starting at `at`, without its line break. */
+string byteLine(u8[] bytes, i32 at) {
+  i32 end = at;
+  while (end < bytes.len() && bytes[end] != '\n') { end++; }
+  return string.fromBytes(bytesIn(bytes, at, end));
+}
+
+/** The `k`th line of `text`, from 0, without its line break: `""` past the last. */
+string lineOf(string text, i32 k) {
+  string rest = text;
+  for (i32 i = 0; i < k; i++) {
+    i32 nl = rest.indexOf("\n");
+    if (nl < 0) { return ""; }
+    rest = rest.slice(nl + 1, rest.len());
+  }
+  i32 nl = rest.indexOf("\n");
+  return nl < 0 ? rest : rest.slice(0, nl);
+}
+
+/** What follows `text`'s first `k` lines. */
+string afterLines(string text, i32 k) {
+  string rest = text;
+  for (i32 i = 0; i < k; i++) {
+    i32 nl = rest.indexOf("\n");
+    if (nl < 0) { return ""; }
+    rest = rest.slice(nl + 1, rest.len());
+  }
+  return rest;
+}
+
+/** The way from a page at `path` back to its site's root: `../` for each folder, `""` at the root. */
+export string upFrom(string path) {
+  string out = "";
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 cut = rest.indexOf("/");
+    string part = cut < 0 ? rest : rest.slice(0, cut);
+    if (part != "") { out = out + "../"; }
+    rest = cut < 0 ? "" : rest.slice(cut + 1, rest.len());
+  }
+  return out;
+}
+
+/** The sitemap naming every page, each at `site` (`--site-url`) and its path. */
+export string sitemapOf(string site, Routed[] routes) {
+  string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n";
+  for (Routed r in routes) { out = out + "  <url><loc>" + textSafe(siteRoot(site) + r.path) + "</loc></url>\n"; }
+  return out + "</urlset>\n";
+}
+
+/** `--site-url` without the `/` it may end in, so a path can follow it. */
+string siteRoot(string site) {
+  return site.len() > 0 && site.slice(site.len() - 1, site.len()) == "/" ? site.slice(0, site.len() - 1) : site;
 }
 
 /** What `wac <args>` wrote, or null — having said why — when it failed. */
@@ -2567,31 +2800,31 @@ export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
     err.write("build.wac: \{wasmPath}: \{wasmRead.isErr() ? "\{wasmRead.err()!}" : ""}\n".toBytes());
     return 1;
   }
-  string index = a.out + "/index.html";
-  // **The first frames, when the entry declares them**: what `drawPageFrames` wrote to `<out>/first.html` — in
-  // `buildPage`, or in its own step (`--draw`) for a builder in steps, between building the module and `--wrap`.
-  string first = "";
+  // **The pages, when the entry declares its first frames**: what `drawPageFrames` wrote to `<out>/frames.txt` — in
+  // `buildPage`, or in its own step (`--draw`) for a builder in steps, between building the module and `--wrap`. One
+  // page otherwise, at the site's root, with nothing drawn ahead of time.
+  Routed[] routes = [Routed("/", "", "", "")];
   if (framesOf(fs, a.entry)) {
-    string firstPath = a.out + "/first.html";
-    auto firstRead = flatten(fs.readFile(firstPath).wait());
-    if (firstRead.isErr()) {
-      err.write("build.wac: \{firstPath}: \{firstRead.err()!} — \{a.entry} declares its first frames, which --draw writes there\n".toBytes());
+    string framesPath = a.out + "/frames.txt";
+    auto framesRead = flatten(fs.readFile(framesPath).wait());
+    if (framesRead.isErr()) {
+      err.write("build.wac: \{framesPath}: \{framesRead.err()!} — \{a.entry} declares its first frames, which --draw writes there\n".toBytes());
       return 1;
     }
-    first = string.fromBytes(firstRead.ok()!);
+    Routed[]? read = routesOf(framesRead.ok()!);
+    if (read is null) { err.line("build.wac: \{framesPath} is not what --draw writes"); return 1; }
+    routes = read!;
   }
-  // Built with `--module-file`, the module is the `page.wasm` already beside `index.html`, named by its version.
-  string url = a.moduleFile ? "page.wasm?v=" + versionOf(wasm!) : "";
+  // Built with `--module-file`, the module is the one `page.wasm` at the site's root, named by its version, which
+  // every page fetches: one download however many pages a reader opens.
+  string version = a.moduleFile ? versionOf(wasm!) : "";
   string encoded = a.moduleFile ? "" : base64(wasm!);
-  string page = a.inPage ? inPageIndexFor(a.title, first, encoded, a.grants, url) : workerIndexFor(a.title, first, encoded, a.grants, url);
-  if (a.edge) { page = edgeToEdge(page); }
   if (a.appIcon != "") {
     auto icon = flatten(fs.readFile(a.appIcon).wait());
     if (icon.isErr()) {
       err.write("build.wac: \{a.appIcon}: \{icon.err()!}\n".toBytes());
       return 1;
     }
-    page = asApp(page, a.appColor, a.edge);
     string[] names = [a.out + "/" + APP_ICON, a.out + "/manifest.webmanifest", a.out + "/" + APP_WORKER];
     u8[][] bodies = [icon.ok()!, manifestOf(a.title, a.appColor).toBytes(), serviceWorker().toBytes()];
     for (i32 i = 0; i < names.len(); i++) {
@@ -2599,11 +2832,31 @@ export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
       if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
     }
   }
-  // **Said only once it is so.** This ignored what the write answered and printed the line below either way, so a
-  // builder whose disk refused `index.html` was told it had one — 100 KB lost to a line that said otherwise.
-  string wrote = written(fs, index, page.toBytes());
-  if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
-  out.line("\{index}: \{wasm!.len()} bytes of module" + (a.moduleFile ? ", in page.wasm beside it" : ""));
+  for (Routed r in routes) {
+    string up = upFrom(r.path);
+    string url = a.moduleFile ? up + "page.wasm?v=" + version : "";
+    // The program's own title for its page, if it gave one in its first turn; the build's otherwise.
+    PageHead h = PageHead(r.title != "" ? r.title : a.title, r.description, r.path, a.siteUrl == "" ? "" : siteRoot(a.siteUrl) + r.path);
+    string page = a.inPage ? inPageIndexFor(h, r.html, encoded, a.grants, url) : workerIndexFor(h, r.html, encoded, a.grants, url);
+    if (a.edge) { page = edgeToEdge(page); }
+    if (a.appIcon != "") { page = asApp(page, a.appColor, a.edge, up); }
+    string dir = a.out + (r.path == "/" ? "" : r.path);
+    if (r.path != "/") {
+      string made = madeDir(fs, dir);
+      if (made != "") { err.line("build.wac: \{made}"); return 1; }
+    }
+    // **Said only once it is so.** This ignored what the write answered and printed the line below either way, so a
+    // builder whose disk refused `index.html` was told it had one — 100 KB lost to a line that said otherwise.
+    string index = (r.path == "/" ? a.out + "/" : dir) + "index.html";
+    string wrote = written(fs, index, page.toBytes());
+    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  }
+  if (a.siteUrl != "") {
+    string wrote = written(fs, a.out + "/sitemap.xml", sitemapOf(a.siteUrl, routes).toBytes());
+    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  }
+  out.line("\{a.out}/index.html" + (routes.len() > 1 ? " and \{routes.len() - 1} page(s) more" : "") + ": \{wasm!.len()} bytes of module"
+           + (a.moduleFile ? ", in page.wasm beside it" : ""));
   return 0;
 }
 
@@ -2620,7 +2873,7 @@ string madeDir(Files fs, string dir) {
 }
 
 i32 usage(Output err) {
-  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--module-file] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
+  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--module-file] [--site-url <url>] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
   return 2;
 }
 

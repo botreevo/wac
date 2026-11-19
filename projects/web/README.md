@@ -226,7 +226,7 @@ for the clock and the sleeps it wakes, `paint` for frames, `answerValue`, `hand`
 ## Building one
 
     wac run --allow-read --allow-write --allow-run tools/build.wac \
-        <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--module-file] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
+        <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--module-file] [--site-url <url>] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
 
 `tools/build.wac` writes three files: `page.wac`, **the page's program as a module** — a `main(Sys sys)` that
 opens the page its host provides, runs your `main(Page page)`, and renders each time a view has something to
@@ -271,7 +271,7 @@ keep is removed, with the marks. A node kept is the node the reader may already 
 What the reader does before the program listens — clicks, keys, edits — is kept by a small script after `#app`
 (`earlyScript`, allowed by its hash) and handed to the program's listeners once the first batch has put them there,
 without dispatching it again; a field typed into early keeps what was typed. A frame in the browser that differs from the
-build's is mended rather than wrong, and said on the console: `wac: hydrated — 8 kept, 1 made, 1 removed`. A shadow root
+build's is mended rather than wrong, and said on the console: `wac: hydrated — 8 kept, 1 made, 1 removed, 2 changed`. A shadow root
 and a canvas's pixels are not markup, and are drawn when the module runs.
 
 The export is found by reading the entry file, not by compiling it — the program is compiled once, as the page's
@@ -287,6 +287,17 @@ was 1.5 MB, the megabyte of module downloaded once and cached. Pages that share 
 document says before the module has arrived — that it is seen, a click on the first frame — is held for the program and
 given to it when it starts. A page opened from a `file://` URL cannot fetch its module, so a page built this way is for
 serving; without the flag a page is still one file that works from anywhere.
+
+**A site of pages, one program**: a `Frame.on("/docs/a/", w, h, query)` is the page at that path, and the build writes
+each path's frames as a page of its own, `<out>/docs/a/index.html` — what a link to it loads, before any script, and
+what a search engine reads. `page.path()` is where the reader is on the site, from its root however deep the site is
+served — `/docs/a/` on `https://example.org/wac/docs/a/` — known before the first turn, so the program draws that page
+from its first frame. `page.title(…)` and `page.describe(…)` in that turn are the page's `<title>` and description.
+`page.routeLinks()` has a click on a link to a page of the site go there without loading again: the address changes,
+`onPath` hears the path, and Back and Forward are heard the same way; `page.navigate(path, push)` goes there from code.
+`hrefTo(from, to)` writes a link that works from any page of the site. With `--module-file` every page fetches the one
+`page.wasm` at the site's root, so a reader downloads it once. `--site-url <url>` gives each page its canonical address
+and writes `sitemap.xml`. `example/routes.wac` is a site of three pages; `test/routes_live.test.ts` follows it.
 
 **`--app <icon.png>` makes it an app to install**: beside `index.html` the build writes a manifest — the page's
 title as its name, standing alone (`display: standalone`), `--app-color` its bar — the icon, square and at least

@@ -78,7 +78,11 @@ of the desktop (step 2 of the handover in `https://git.voltrevo.com/notes.git`,
   page whose frame differs on purpose, `example/layouts.wac` one with two layouts. **For the wac website, built as
   wac-desktop** — fast first paint, on a phone too, is why it exists.
 - **Done:** `--module-file`: the module as `page.wasm` beside the page, fetched by its version, and what the document
-  says before it arrives held for the program. The first of the pieces the wac website needs for its docs to be pages of
-  the desktop (each route a page of its own, all sharing one module); next are the location before the first turn,
-  navigation by path, routes in `prerendered()`, and each page's title and description. `test/modulefile_live.test.ts`.
+  says before it arrives held for the program. `test/modulefile_live.test.ts`.
+- **Done:** a site of routes, for the wac website's docs to be pages of the desktop: `page.path()` before the first turn
+  (`PAGE_PATH`, answered at once as the location is), `navigate`, `routeLinks` and `onPath` (`PAGE_NAVIGATE`,
+  `PAGE_LINKS`; the document's `wacSiteBase`, `wacRouteOf`, its link and `popstate` listeners), `hrefTo`, `Frame.on` —
+  each route its own `index.html` (`drawPageFrames`, `frames.txt`, `wrapBuiltPage`) — and its title and description
+  (`PAGE_DESCRIBE`), `--site-url`'s canonical addresses and `sitemap.xml`. `test/routes_live.test.ts`. **The host's
+  `COUNT` must match `PAGE_COUNT`**: a request past it goes elsewhere, and only a browser test sees that.
 - **Next:** a program's description of itself, which needs a section wac's builder does not write yet.

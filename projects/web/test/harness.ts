@@ -63,8 +63,23 @@ export async function buildPage(entry: string, outDir: string, extra: string[] =
   }
   await Deno.mkdir(outDir, { recursive: true });
   await Deno.copyFile(`${ROOT}/${built}/index.html`, `${outDir}/index.html`);
-  // Built with `--module-file`, the page fetches its module from beside it.
+  // Built with `--module-file`, the page fetches its module from beside it; a site of routes has a page in each route's
+  // folder, and with `--site-url` a sitemap.
   if (extra.includes("--module-file")) await Deno.copyFile(`${ROOT}/${built}/page.wasm`, `${outDir}/page.wasm`);
+  await Deno.copyFile(`${ROOT}/${built}/sitemap.xml`, `${outDir}/sitemap.xml`).catch(() => {});
+  const pages = async (dir: string, rel: string): Promise<void> => {
+    for await (const e of Deno.readDir(`${ROOT}/${built}/${dir}`)) {
+      if (!e.isDirectory) continue;
+      const sub = dir === "" ? e.name : `${dir}/${e.name}`;
+      try {
+        await Deno.stat(`${ROOT}/${built}/${sub}/index.html`);
+        await Deno.mkdir(`${outDir}/${sub}`, { recursive: true });
+        await Deno.copyFile(`${ROOT}/${built}/${sub}/index.html`, `${outDir}/${sub}/index.html`);
+      } catch { /* a folder with no page */ }
+      await pages(sub, rel);
+    }
+  };
+  await pages("", "");
   for (const f of ["manifest.webmanifest", "icon.png", "sw.js"]) {
     if (extra.includes("--app")) await Deno.copyFile(`${ROOT}/${built}/${f}`, `${outDir}/${f}`);
     else await Deno.remove(`${ROOT}/${built}/${f}`).catch(() => {});

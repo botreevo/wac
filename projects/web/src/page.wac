@@ -44,7 +44,7 @@ export * as html from "./tags.wac";
 export { Element, ElementEvent, Listen } from "./element.wac";
 // `wac.page` itself, for whoever answers it — a desktop drawing a program into a window, or a test.
 export { PAGE_BATCH, PAGE_CAPABILITY, PAGE_ONE_AT_A_TIME, PAGE_VERSION, Change, batchOf, PAGE_MAKE, PAGE_MAKE_TEXT, PAGE_TEXT, PAGE_ATTR, PAGE_PROP, PAGE_MOVE, PAGE_REMOVE, PAGE_LISTEN, PAGE_FOCUS, PAGE_VALUE, PAGE_PIXELS, PAGE_PIXELS_IN,
-         PAGE_SCROLL, PAGE_SELECT, PAGE_TYPE_TEXT, PAGE_TITLE, PAGE_LOG, PAGE_DOWNLOAD, PAGE_EVENT, PAGE_FILE, PAGE_FRAME, PAGE_LOCATION, PAGE_SOUND, PAGE_PLAY, PAGE_STOP, PAGE_GAIN, PAGE_GO, PAGE_SURFACE, PAGE_FULLSCREEN, PAGE_ZONE, PAGE_VISIBLE, PAGE_BACK, PAGE_ZONE_NAME, PAGE_STORED, PAGE_STORE, HOST_SURFACE_NEW, HOST_SURFACE_DRAW, HOST_SURFACE_DRAW_IN, PAGE_COUNT, PAGE_WINDOW, Happened, PageLine, eventAnswer, happenedOf, highOf, lowOf, pair, putF64, getF64, quad, quadAt, when } from "./line.wac";
+         PAGE_SCROLL, PAGE_SELECT, PAGE_TYPE_TEXT, PAGE_TITLE, PAGE_LOG, PAGE_DOWNLOAD, PAGE_EVENT, PAGE_FILE, PAGE_FRAME, PAGE_LOCATION, PAGE_SOUND, PAGE_PLAY, PAGE_STOP, PAGE_GAIN, PAGE_GO, PAGE_SURFACE, PAGE_FULLSCREEN, PAGE_ZONE, PAGE_VISIBLE, PAGE_BACK, PAGE_ZONE_NAME, PAGE_STORED, PAGE_STORE, PAGE_PATH, PAGE_NAVIGATE, PAGE_LINKS, PAGE_DESCRIBE, HOST_SURFACE_NEW, HOST_SURFACE_DRAW, HOST_SURFACE_DRAW_IN, PAGE_COUNT, PAGE_WINDOW, Happened, PageLine, eventAnswer, happenedOf, highOf, lowOf, pair, putF64, getF64, quad, quadAt, when } from "./line.wac";
 export { Mounted, Ref, State, Ui, View } from "./view.wac";
 export { TestDoc, TestNode, TestSocket } from "./testdoc.wac";
 export { Prerender, drawFrames, drawing, markupOf } from "./prerender.wac";
@@ -94,11 +94,20 @@ export struct Size {
  * first whose query matches is the one a reader sees before the module has arrived, and the one the program adopts.
  */
 export struct Frame {
+  /** The page's path on its site (`Page.path`): `/` for the page at the root, `/docs/spec/` for one at a route. */
+  string path;
   i32 width;
   i32 height;
   string media;
 
-  Frame at(i32 width, i32 height, string media) { return Frame(width, height, media); }
+  /** The page at the site's root, in a window this size. */
+  Frame at(i32 width, i32 height, string media) { return Frame("/", width, height, media); }
+
+  /**
+   * **The page at `path`**, in a window this size: the build writes it as `<path>/index.html`, a page of its own — what a
+   * link to it loads, and what a search engine reads — all of a site's pages running the one module.
+   */
+  Frame on(string path, i32 width, i32 height, string media) { return Frame(path, width, height, media); }
 }
 
 /** A page: what the program is handed. */
@@ -145,6 +154,10 @@ export struct Page {
   Vec<fn<void(bool)>?> seers;
   /** The window's size when the page opened, as the host said in answer to finding the page; 0 by 0 if it did not. */
   Size opened;
+  /** **Where the reader is on the site** (`PAGE_PATH`): `/` until the host says, which it does before the first turn. */
+  string route;
+  /** Who hears each change of `route`, by slot, as `watchers` hear the location. */
+  Vec<fn<void(string)>?> routers;
 
   /**
    * **The page the program's host provides**, found by name: `Err` says why there is none — a program run
@@ -170,13 +183,33 @@ export struct Page {
     Vec<View> views = Vec.create();
     Vec<fn<void(string)>?> watchers = Vec.create();
     Vec<fn<void(bool)>?> seers = Vec.create();
-    Page p = Page(line, Runner.create(), Elements.create(line), views, sys, false, "", watchers, false, null, 0, "", seers, Size(0, 0));
+    Page p = Page(line, Runner.create(), Elements.create(line), views, sys, false, "", watchers, false, null, 0, "", seers, Size(0, 0),
+                  "", Vec.create());
     // A change held is a turn to end, whether or not a view has anything to render: a handler that only changed an
     // element of its own still has that change to send.
     line.onHeld = () => { p.wake(); };
     p.follow();
+    p.followPath();
     p.watch();
     return p;
+  }
+
+  /**
+   * **The path, asked for again each time it is answered** — `follow`'s twin for `PAGE_PATH`. A host that does not
+   * serve it faults it, and the page stays at `/`.
+   */
+  void followPath(this) {
+    Page page = this;
+    Ticket<Answer> t = this.line.path(this.route);
+    when(t, () => {
+      if (t.value().fault != FAULT_NONE()) { if (page.route == "") { page.route = "/"; } return; }
+      page.route = t.value().text;
+      for (i32 i = 0; i < page.routers.len(); i++) {
+        fn<void(string)>? w = page.routers.get(i);
+        if (w is not null) { w!(page.route); }
+      }
+      page.followPath();
+    });
   }
 
   /** **Whether the page is seen, asked for again each time it is answered** — `follow`'s twin for `PAGE_VISIBLE`. */
@@ -340,6 +373,42 @@ export struct Page {
    * desktop has no location of its own: its server refuses it.
    */
   void go(this, string where, bool push) { this.line.go(where, push); }
+
+  /**
+   * **Where the reader is on the page's site**: `/` at its root, `/docs/spec/` at that route — from the site's root,
+   * whatever folder it is served from. Known before the program's first turn, so the page draws what is at that path
+   * from its first frame (`Frame.on`). A page in a window of a desktop is at `/`.
+   */
+  string path(this) { return this.route == "" ? "/" : this.route; }
+
+  /**
+   * **The page goes to `path` on its site** without loading again — with `push`, a new place in the browser's history,
+   * which Back leaves; without, in place of this one — and `onPath` hears it.
+   */
+  void navigate(this, string path, bool push) {
+    // `path()` says it at once; who listens hears it from the host, which answers the path asked for (`followPath`), so
+    // each change is heard once whoever made it.
+    this.route = path;
+    this.line.navigate(path, push);
+  }
+
+  /** Call `f` with each new path — a link followed (`routeLinks`), `navigate`, Back and Forward; answers what stops it. */
+  fn<void()> onPath(this, fn<void(string)> f) {
+    i32 slot = this.routers.len();
+    this.routers.push(f);
+    Vec<fn<void(string)>?> rs = this.routers;
+    return () => { rs.set(slot, null); };
+  }
+
+  /**
+   * **Links to this site's pages are followed here** from now on: a click on one goes there without loading the page
+   * again, and `onPath` hears the path. Every page of the site is also a page of its own (`Frame.on`), so the same link
+   * works before the program runs, from a search engine and in a new tab. Write links with `hrefTo`.
+   */
+  void routeLinks(this) { this.line.links(true); }
+
+  /** What the page is, in a sentence: its description, which a search engine shows, and which a first frame carries. */
+  void describe(this, string text) { this.line.describe(text); }
 
   /** The browser's Back (`PAGE_BACK`): the history left as it was, and the place before this one heard as any new location. */
   void back(this) { this.line.back(); }
@@ -577,4 +646,32 @@ i32 digitsOf(string s) {
     n = n * 10 + ((c - '0') as i32);
   }
   return n;
+}
+
+/**
+ * **A link from the page at `from` to the one at `to`**, both paths on the site (`Page.path`), relative — so it works
+ * however deep the site is served, before the program runs as after: from `/docs/a/`, `/docs/b/` is `../b/`.
+ */
+export string hrefTo(string from, string to) {
+  string[] f = segmentsOf(from);
+  string[] t = segmentsOf(to);
+  i32 same = 0;
+  while (same < f.len() && same < t.len() && f[same] == t[same]) { same++; }
+  string out = "";
+  for (i32 i = same; i < f.len(); i++) { out = out + "../"; }
+  for (i32 i = same; i < t.len(); i++) { out = out + t[i] + "/"; }
+  return out == "" ? "./" : out;
+}
+
+/** A path's folders: `/docs/spec/` is `docs`, `spec`. */
+string[] segmentsOf(string path) {
+  Vec<string> out = Vec.create();
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 cut = rest.indexOf("/");
+    string part = cut < 0 ? rest : rest.slice(0, cut);
+    if (part != "") { out.push(part); }
+    rest = cut < 0 ? "" : rest.slice(cut + 1, rest.len());
+  }
+  return out.toArray();
 }

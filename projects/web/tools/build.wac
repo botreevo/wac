@@ -57,17 +57,11 @@ struct Asked {
    * page that keeps its own content clear of them with `env(safe-area-inset-…)`.
    */
   bool edge;
-  /**
-   * **The first frame in the page** (`--prerender`): the program run once at build time against a document of records
-   * (`Prerender`, in `src/prerender.wac`), and what it drew written into `#app`, so the reader sees it before the
-   * module has arrived — and the host adopts it rather than drawing it again (`documentSide`).
-   */
-  bool prerender;
 }
 
 /** The arguments, or a usage line in `title` and empty `entry` when they do not make sense. */
 Asked askedOf(string[] argv) {
-  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false, false);
+  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false);
   i32 argc = argv.len();
   string[] args = string[].filled(argc, "");
   for (i32 k = 0; k < argc; k++) { args[k] = argv[k]; }
@@ -92,7 +86,7 @@ Asked askedOf(string[] argv) {
       continue;
     }
     // Which steps to run is `buildPage`'s to read; the arguments are the same either way.
-    if (w == "--module-only" || w == "--wrap") {
+    if (w == "--module-only" || w == "--wrap" || w == "--draw") {
       i++;
       continue;
     }
@@ -111,11 +105,7 @@ Asked askedOf(string[] argv) {
       i++;
       continue;
     }
-    if (w == "--prerender") {
-      a.prerender = true;
-      i++;
-      continue;
-    }
+
     // `--grant read,write` rather than `--allow-read`: after the entry, `wac run` takes `--allow-…` as
     // a grant spelled in the wrong place and refuses it, which is right — those are the builder's own.
     if (w == "--grant" && i + 1 < argc) {
@@ -202,17 +192,20 @@ export string relativeTo(string from, string to) {
  * **It never returns while the page is open**: a page's program usually returns as soon as it has mounted its view,
  * and the page lives on in its handlers.
  */
-export string moduleFor(string entrySpec, string pageSpec, string spawn, bool dev) {
+export string moduleFor(string entrySpec, string pageSpec, string spawn, bool dev, bool frames) {
   string withoutPage = spawn != "" ? "      return await \{spawn}(sys);\n"
     : "      sys.stderr().line(\"this is a page, and its host has none: \" + why);\n      return 1;\n";
+  // **A page that draws its first frames** (`Frame`) draws them here too: run with no page, as the build runs it
+  // (`drawFrames`), it answers `--frames` and `--frame <k>` — so the module that is shipped is the one that drew them.
+  string drawing = frames ? "      if (drawing(sys.args())) { return drawFrames(sys, (Page p) => { program(p); }, prerendered()); }\n" : "";
   return "// Written by web's tools/build.wac — the page's program, as a module any host that provides `wac.page` runs.\n"
-       + "import { main as program" + (spawn != "" ? ", " + spawn : "") + " } from \"\{entrySpec}\";\n"
-       + "import { Page } from \"\{pageSpec}\";\n"
+       + "import { main as program" + (frames ? ", prerendered" : "") + (spawn != "" ? ", " + spawn : "") + " } from \"\{entrySpec}\";\n"
+       + "import { Page" + (frames ? ", drawFrames, drawing" : "") + " } from \"\{pageSpec}\";\n"
        + "import { Sys } from \"std\";\n\n"
        + "export async i32 main(Sys sys) {\n"
        + "  match (await Page.open(sys)) {\n"
        + "    Ok(page): { return await run(page); }\n"
-       + "    Err(why): {\n" + withoutPage + "    }\n"
+       + "    Err(why): {\n" + drawing + withoutPage + "    }\n"
        + "  }\n"
        + "}\n\n"
        + "async i32 run(Page page) {\n"
@@ -224,23 +217,68 @@ export string moduleFor(string entrySpec, string pageSpec, string spawn, bool de
 }
 
 /**
- * The module that draws the page's first frame at build time (`--prerender`): the program handed a page over a
- * document of records, as `moduleFor`'s `run` hands it the real one, and the markup that page's first batch left
- * written to standard output — then the program ended, whatever it was still waiting for.
+ * **Whether the entry file declares the frames to draw at build time**: `export Frame[] prerendered()`, read from
+ * its text rather than by compiling it — the build compiles the program once, as the page's module, and that module
+ * must name `prerendered` only if it is there. Declared anywhere but the entry file, it is not seen; named here and
+ * not exported, the one compile says so.
  */
-export string prerenderModuleFor(string entrySpec, string pageSpec) {
-  return "// Written by web's tools/build.wac — the page's first frame, drawn at build time (`--prerender`).\n"
-       + "import { main as program } from \"\{entrySpec}\";\n"
-       + "import { Prerender } from \"\{pageSpec}\";\n"
-       + "import { Sys } from \"std\";\n\n"
-       + "export i32 main(Sys sys) {\n"
-       + "  Prerender r = Prerender.create();\n"
-       + "  program(r.page);\n"
-       + "  sys.stdout().write(r.first().toBytes()).wait();\n"
-       // **Ended rather than returned**: a page's program is still waiting — on its next event, a frame, a timer — and
-       // a program that returns with work waiting has failed. That work is the browser's to finish.
-       + "  sys.exit(0);\n"
-       + "}\n";
+export bool declaresFrames(string source) {
+  u8[] b = source.toBytes();
+  i32 from = 0;
+  while (true) {
+    i32 at = indexFrom(source, "prerendered(", from);
+    if (at < 0) { return false; }
+    i32 line = at;
+    while (line > 0 && b[line - 1] != '\n') { line = line - 1; }
+    string before = source.slice(line, at);
+    if (before.indexOf("export") >= 0 && before.indexOf("Frame[]") >= 0 && before.indexOf("//") < 0) { return true; }
+    from = at + 1;
+  }
+}
+
+i32 indexFrom(string s, string what, i32 from) {
+  i32 at = s.slice(from, s.len()).indexOf(what);
+  return at < 0 ? 0 - 1 : from + at;
+}
+
+/**
+ * **What goes in `#app`, from the frames drawn** — each a media query and its markup, in the order the program gave
+ * them. One frame for any window is its markup, as it is. Several are each wrapped, `data-wac-frame` and the query
+ * beside it, after a stylesheet showing the first whose query matches: the browser picks the frame before any script
+ * runs, and the host keeps that one (`documentSide`), by the same rule, when the program starts.
+ */
+export string framesHtml(string[] media, string[] markup) {
+  if (media.len() == 1 && media[0] == "") { return markup[0]; }
+  // Later rules win, so the frames' rules go last to first: the first frame whose query matches is the one shown.
+  string css = "[data-wac-frame] { display: none; }";
+  for (i32 k = media.len() - 1; k >= 0; k--) {
+    string show = "[data-wac-frame] { display: none; } [data-wac-frame=\"\{k}\"] { display: contents; }";
+    css = css + (media[k] == "" ? " " + show : " @media " + cssSafe(media[k]) + " { " + show + " }");
+  }
+  string out = "<style data-wac-frames>" + css + "</style>";
+  for (i32 k = 0; k < media.len(); k++) {
+    out = out + "<div data-wac-frame=\"\{k}\" data-wac-media=\"" + attrSafe(media[k]) + "\">" + markup[k] + "</div>";
+  }
+  return out;
+}
+
+/** A media query as it may sit in a stylesheet: nothing in it can end the element. */
+string cssSafe(string s) {
+  i32 at = s.indexOf("<");
+  return at < 0 ? s : s.slice(0, at) + "\\3c " + cssSafe(s.slice(at + 1, s.len()));
+}
+
+/** A media query as an attribute value. */
+string attrSafe(string s) {
+  string out = "";
+  u8[] b = s.toBytes();
+  for (u8 c in b) {
+    if (c == '&') { out = out + "&amp;"; }
+    else if (c == '"') { out = out + "&quot;"; }
+    else if (c == '<') { out = out + "&lt;"; }
+    else { out = out + string.fromBytes([c]); }
+  }
+  return out;
 }
 
 /** `bytes` as base64, which is how the page carries its module: as text in an element the browser does not run. */
@@ -278,7 +316,7 @@ export string base64(u8[] bytes) {
  */
 export string programSide() {
   return """
-      const wacPageServer = (next, answer, post, where, site) => {
+      const wacPageServer = (next, answer, post, where, site, size) => {
         // **Where `wac.page`'s numbers start here** — above every request std numbers, below the 2^20 a parent
         // numbers the capabilities it provides from — and how many there are: `src/line.wac`'s `PAGE_COUNT`, which
         // a request asked directly rather than sent in a batch is routed by. It stayed at 23 while the changes after
@@ -641,7 +679,8 @@ export string programSide() {
             if (!allowed) {
               return answer(id, 9, "wac.page here is 1.0.0, which " + v + " does not allow", NONE, 0n, 0n, 0);
             }
-            return answer(id, 0, "1.0.0", NONE, BigInt(BASE), BigInt(COUNT), 0);
+            // The window's size when the page opened, `390x844`, which the program has before its first turn (`Page.size`).
+            return answer(id, 0, "1.0.0", size ? enc.encode(size) : NONE, BigInt(BASE), BigInt(COUNT), 0);
           }
           if (op === 68 && text === "wac.gpu") {
             // This host speaks 1.0.0, which `^1`, `^1.0`, `^1.0.0` and `1.0.0` allow.
@@ -1422,9 +1461,9 @@ export string moduleSide() {
       //
       // It holds what the build granted (`grants`), draws by sending `post` what the document applies, starts at
       // location `where`, and answers `receive` for what the document sends back.
-      const wacPage = (wasm, grants, post, where, site) => {
+      const wacPage = (wasm, grants, post, where, site, size) => {
         const me = { child: false, args: [], cwd: "/", post: null };
-        const top = wacRun(wasm, me, grants, (next, answer) => wacPageServer(next, answer, post, where, site), (text) => console.error(text));
+        const top = wacRun(wasm, me, grants, (next, answer) => wacPageServer(next, answer, post, where, site, size), (text) => console.error(text));
         return top === null ? () => {} : top.receive;
       };
       """;
@@ -1455,7 +1494,7 @@ export string documentSide() {
         // listener outside it, and the text field typed into is the one that matters (`Element.shadow`).
         const origin = (ev) => (ev.composedPath ? ev.composedPath()[0] : ev.target) ?? ev.target;
         root.addEventListener("input", (ev) => { origin(ev).__wacTyped = numbered(ev); }, true);
-        // **Hydration** (`src/prerender.wac`): a page built with `--prerender` arrives with its first frame already in
+        // **Hydration** (`src/prerender.wac`): a page whose entry declares its first frames arrives with one already in
         // `#app` — each element marked with its handle, `data-wac-h`, and each text node after a comment naming its.
         // Until the program's first batch has been applied, a handle it makes is matched to the node already there and
         // that node kept: moved only if it is not where the program puts it, an attribute set only if it differs. Then
@@ -1473,6 +1512,19 @@ export string documentSide() {
         // Each parent's last child the first batch put at its end.
         const lastPlaced = new Map();
         let kept = 0, made = 0;
+        // **One frame of several** (`framesHtml`): the first whose media query matches, by the rule the stylesheet
+        // showed it by, is the one kept — unwrapped into `#app` — and the others go before anything is read from it.
+        // The program is told the window's size at this same moment, and draws the layout the frame was drawn for.
+        if (hydrating) {
+          const frames = [...root.children].filter((n) => n.hasAttribute("data-wac-frame"));
+          if (frames.length > 0) {
+            const kept = frames.find((f) => { const q = f.getAttribute("data-wac-media") ?? ""; return q === "" || matchMedia(q).matches; })
+                      ?? frames[frames.length - 1];
+            for (const n of [...root.children]) if (n !== kept && (n.hasAttribute("data-wac-frame") || n.hasAttribute("data-wac-frames"))) n.remove();
+            while (kept.firstChild) root.insertBefore(kept.firstChild, kept);
+            kept.remove();
+          }
+        }
         if (hydrating) {
           const marks = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
           for (let n = marks.nextNode(); n; n = marks.nextNode()) {
@@ -2165,7 +2217,7 @@ export string workerIndexFor(string title, string first, string wasm, i32 grants
        + "  if (wacFromPage(e.data)) return;\n"
        + "  if (receive !== null) return receive(e.data);\n"
        + "  if (e.data[0] === \"module\") { receive = () => {}; return wacModule(e.data[1], e.data[2]); }\n"
-       + "  receive = wacPage(e.data[2], \{grants}, (m, transfer) => postMessage(m, transfer ?? []), e.data[1], e.data[3]);\n"
+       + "  receive = wacPage(e.data[2], \{grants}, (m, transfer) => postMessage(m, transfer ?? []), e.data[1], e.data[3], e.data[4]);\n"
        + "};\n</script>\n"
        + documentScript(documentSide() + brokerSide() + moduleBytes()
        + """
@@ -2177,7 +2229,7 @@ export string workerIndexFor(string title, string first, string wasm, i32 grants
          worker.onmessage = (e) => { if (!broker(worker, e.data)) apply(e.data); };
          worker.onerror = (e) => console.error(e.message);
          const wasm = wacModuleBytes();
-         worker.postMessage(["page", location.hash, wasm, location.protocol === "file:" ? null : location.href], [wasm.buffer]);
+         worker.postMessage(["page", location.hash, wasm, location.protocol === "file:" ? null : location.href, `${innerWidth}x${innerHeight}`], [wasm.buffer]);
          """)
        + "</body>\n</html>\n";
 }
@@ -2188,7 +2240,7 @@ export string inPageIndexFor(string title, string first, string wasm, i32 grants
        + documentScript(systemSide() + moduleSide() + programSide() + documentSide() + moduleBytes()
        + "let receive = null;\n"
        + "const apply = wacDocument(document.getElementById(\"app\"), (m) => receive(m));\n"
-       + "receive = wacPage(wacModuleBytes(), \{grants}, (m) => apply(m), location.hash, location.protocol === \"file:\" ? null : location.href);\n")
+       + "receive = wacPage(wacModuleBytes(), \{grants}, (m) => apply(m), location.hash, location.protocol === \"file:\" ? null : location.href, `${innerWidth}x${innerHeight}`);\n")
        + "</body>\n</html>\n";
 }
 
@@ -2392,13 +2444,58 @@ export i32 writePageModule(string[] argv, Output err, Output out, Files fs) {
   bool pagePath = a.pageSpec.len() > 0 && (a.pageSpec.slice(0, 1) == "." || a.pageSpec.slice(0, 1) == "/");
   string pageSpec = pagePath ? relativeTo(a.out, a.pageSpec) : a.pageSpec;
   string entrySpec = relativeTo(a.out, a.entry);
-  string wrote = written(fs, a.out + "/page.wac", moduleFor(entrySpec, pageSpec, a.spawn, a.dev).toBytes());
+  string wrote = written(fs, a.out + "/page.wac", moduleFor(entrySpec, pageSpec, a.spawn, a.dev, framesOf(fs, a.entry)).toBytes());
   if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
-  if (a.prerender) {
-    wrote = written(fs, a.out + "/prerender.wac", prerenderModuleFor(entrySpec, pageSpec).toBytes());
-    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
-  }
   return 0;
+}
+
+/** Whether `entry` declares its first frames (`declaresFrames`); an entry that cannot be read declares none. */
+bool framesOf(Files fs, string entry) {
+  u8[]? source = flatten(fs.readFile(entry).wait()).ok();
+  return source is not null && declaresFrames(string.fromBytes(source!));
+}
+
+/**
+ * **The first frames drawn**, by the module built at `<out>/page.wasm` run with no page: how many it has, then each,
+ * in a run of its own so nothing one leaves behind reaches the next — and what goes in `#app` written to
+ * `<out>/first.html` (`framesHtml`). It starts processes, so a builder in steps runs it as a step of its own (`--draw`).
+ */
+export i32 drawPageFrames(string[] argv, Output err, Output out, Files fs, Procs procs) {
+  Asked a = askedOf(argv);
+  if (a.entry == "" || a.out == "") { return usage(err); }
+  if (!framesOf(fs, a.entry)) { return 0; }
+  string wasm = a.out + "/page.wasm";
+  auto counted = ran(procs, a.wac, [wasm, "--frames"], err);
+  if (counted is null) { return 1; }
+  i32 n = 0;
+  for (u8 c in counted!) { if (c >= '0' && c <= '9') { n = n * 10 + ((c - '0') as i32); } }
+  if (n == 0) { err.line("build.wac: \{a.entry} declares no frames: prerendered() is empty"); return 1; }
+  string[] media = string[].filled(n, "");
+  string[] markup = string[].filled(n, "");
+  for (i32 k = 0; k < n; k++) {
+    auto drawn = ran(procs, a.wac, [wasm, "--frame", "\{k}"], err);
+    if (drawn is null) { return 1; }
+    string text = string.fromBytes(drawn!);
+    i32 nl = text.indexOf("\n");
+    media[k] = nl < 0 ? text : text.slice(0, nl);
+    markup[k] = nl < 0 ? "" : text.slice(nl + 1, text.len());
+  }
+  string wrote = written(fs, a.out + "/first.html", framesHtml(media, markup).toBytes());
+  if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  return 0;
+}
+
+/** What `wac <args>` wrote, or null — having said why — when it failed. */
+u8[]? ran(Procs procs, string wac, string[] args, Output err) {
+  auto r = flatten(procs.exec(wac, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? e = r.ok();
+  if (e is not null && e!.ok()) { return e!.stdout; }
+  if (e is not null) {
+    err.write(e!.stderr);
+    err.write(e!.stdout);
+  }
+  err.line("build.wac: drawing the first frames: \{wac} \{args[0]} \{args[1]}" + (r.isErr() ? ": \{r.err()!}" : ""));
+  return null;
 }
 
 /** The page around a module already built at `<out>/page.wasm`: `index.html`, and with `--app` the app's files. */
@@ -2413,14 +2510,14 @@ export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
     return 1;
   }
   string index = a.out + "/index.html";
-  // **The first frame, when there is one**: what running `<out>/prerender.wac` wrote, kept as `<out>/first.html` — by
-  // `buildPage`, or by whoever builds in steps, between `--module-only` and `--wrap`.
+  // **The first frames, when the entry declares them**: what `drawPageFrames` wrote to `<out>/first.html` — in
+  // `buildPage`, or in its own step (`--draw`) for a builder in steps, between building the module and `--wrap`.
   string first = "";
-  if (a.prerender) {
+  if (framesOf(fs, a.entry)) {
     string firstPath = a.out + "/first.html";
     auto firstRead = flatten(fs.readFile(firstPath).wait());
     if (firstRead.isErr()) {
-      err.write("build.wac: \{firstPath}: \{firstRead.err()!} — --prerender wraps the first frame `wac run \{a.out}/prerender.wac` writes there\n".toBytes());
+      err.write("build.wac: \{firstPath}: \{firstRead.err()!} — \{a.entry} declares its first frames, which --draw writes there\n".toBytes());
       return 1;
     }
     first = string.fromBytes(firstRead.ok()!);
@@ -2463,22 +2560,29 @@ string madeDir(Files fs, string dir) {
 }
 
 i32 usage(Output err) {
-  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --wrap] [--in-page] [--dev] [--edge] [--prerender] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
+  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
   return 2;
 }
 
 export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs procs) {
   bool moduleOnly = false;
   bool wrapOnly = false;
+  bool drawOnly = false;
   for (string w in argv) {
     if (w == "--module-only") { moduleOnly = true; }
     if (w == "--wrap") { wrapOnly = true; }
+    if (w == "--draw") { drawOnly = true; }
   }
-  if (moduleOnly && wrapOnly) {
-    err.write("build.wac: --module-only and --wrap are the two halves of a build; ask for one\n".toBytes());
+  i32 steps = 0;
+  if (moduleOnly) { steps++; }
+  if (wrapOnly) { steps++; }
+  if (drawOnly) { steps++; }
+  if (steps > 1) {
+    err.write("build.wac: --module-only, --draw and --wrap are steps of a build; ask for one\n".toBytes());
     return 2;
   }
   if (wrapOnly) { return wrapBuiltPage(argv, err, out, fs); }
+  if (drawOnly) { return drawPageFrames(argv, err, out, fs, procs); }
   i32 wrote = writePageModule(argv, err, out, fs);
   if (wrote != 0 || moduleOnly) { return wrote; }
   Asked a = askedOf(argv);
@@ -2493,20 +2597,8 @@ export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs proc
     if (builtRan.isErr()) { flatten(err.write("build.wac: \{a.wac}: \{builtRan.err()!}\n".toBytes()).wait()).isOk(); }
     return 1;
   }
-  if (a.prerender) {
-    auto drawnRan = flatten(procs.exec(a.wac, ["run", a.out + "/prerender.wac"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
-    Exec? drawn = drawnRan.ok();
-    if (drawn is null || !drawn!.ok()) {
-      if (drawn is not null) {
-        err.write(drawn!.stderr);
-        err.write(drawn!.stdout);
-      }
-      err.line("build.wac: the first frame could not be drawn ahead of time (--prerender)");
-      return 1;
-    }
-    string wrote = written(fs, a.out + "/first.html", drawn!.stdout);
-    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
-  }
+  i32 drew = drawPageFrames(argv, err, out, fs, procs);
+  if (drew != 0) { return drew; }
   return wrapBuiltPage(argv, err, out, fs);
 }
 

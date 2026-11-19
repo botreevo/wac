@@ -1,5 +1,6 @@
 // test-lane: browser — drives Chromium through Playwright, which needs -A
-// A page built with `--prerender`, in an actual browser: its first frame is in the HTML, and the program adopts it.
+// A page whose entry declares its first frames (`export Frame[] prerendered()`), in an actual browser: the frame is in
+// the HTML, and the program adopts it — and of two layouts, the one that fits the window is shown and kept.
 //
 // `test/wac/prerender_test.wac` checks the markup the build writes. What it cannot check is the host's half
 // (`documentSide` in `tools/build.wac`): that the page shows the frame before any script runs, that the program keeps
@@ -56,7 +57,7 @@ for (const mode of [[], ["--in-page"]]) {
       let browser;
       let http: { port: number; stop(): Promise<void> } | undefined;
       try {
-        await buildPage("example/todo.wac", dir, [...mode, "--prerender"]);
+        await buildPage("example/todofirst.wac", dir, mode);
         const port = (http = serve(dir)).port;
         browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
 
@@ -111,7 +112,7 @@ for (const mode of [[], ["--in-page"]]) {
       let browser;
       let http: { port: number; stop(): Promise<void> } | undefined;
       try {
-        await buildPage("example/todo.wac", dir, [...mode, "--prerender"]);
+        await buildPage("example/todofirst.wac", dir, mode);
         const port = (http = serve(dir)).port;
         browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
 
@@ -166,7 +167,7 @@ for (const mode of [[], ["--in-page"]]) {
       let browser;
       let http: { port: number; stop(): Promise<void> } | undefined;
       try {
-        await buildPage("example/drift.wac", dir, [...mode, "--prerender"]);
+        await buildPage("example/drift.wac", dir, mode);
         const port = (http = serve(dir)).port;
         browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
         const page = await browser.newPage();
@@ -183,6 +184,56 @@ for (const mode of [[], ["--in-page"]]) {
         await waitInPage(page, "true", null, { timeout: 100 });
         assertEquals(said.filter((l) => l.startsWith("wac: hydrated")), ["wac: hydrated — 8 kept, 1 made, 1 removed"],
                      "the drift is said");
+      } finally {
+        await browser?.close();
+        await http?.stop();
+        await Deno.remove(dir, { recursive: true });
+      }
+    },
+  });
+
+  Deno.test({
+    name: `of two layouts drawn at build time, the window's is shown before any script and kept${where}`,
+    ignore: cannotBecause !== "",
+    sanitizeResources: false,
+    sanitizeOps: false,
+    fn: async () => {
+      const { chromium } = await import("npm:playwright@1");
+      const dir = await Deno.makeTempDir({ prefix: "wac-hydratelive-" });
+      let browser;
+      let http: { port: number; stop(): Promise<void> } | undefined;
+      try {
+        await buildPage("example/layouts.wac", dir, mode);
+        const port = (http = serve(dir)).port;
+        browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
+        for (const [width, height, nav, size] of [[390, 844, "tabs", "390x844"], [1280, 800, "side", "1280x800"]] as const) {
+          // Before any script: the stylesheet shows the frame the window's width matches.
+          const still = await (await browser.newContext({ javaScriptEnabled: false, viewport: { width, height } })).newPage();
+          await still.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
+          assertEquals(await still.isVisible(`#${nav}`), true, `at ${width} wide, before any script, the ${nav} layout is shown`);
+          assertEquals(await still.locator("#layout").count(), 2, "both frames are in the page");
+
+          // With script: the same layout is kept, as the nodes that were parsed, and nothing drifted.
+          const page = await (await browser.newContext({ viewport: { width, height } })).newPage();
+          const said: string[] = [];
+          page.on("console", (m: { text(): string }) => said.push(m.text()));
+          await page.addInitScript(`document.addEventListener("DOMContentLoaded", () => {
+            window.__pre = document.getElementById("app").hasAttribute("data-wac-pre");
+            for (const el of document.querySelectorAll("#${nav}")) if (el.offsetParent !== null || el.getClientRects().length) el.__kept = true;
+          });`);
+          await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
+          await waitInPage(page, hydrated, null, { timeout: 30_000 });
+          assertEquals(await page.evaluate("window.__pre"), true, "the program had not run when the page was parsed");
+          assertEquals(await page.locator("#layout").count(), 1, "one frame is left");
+          assertEquals(await page.evaluate(`document.getElementById("${nav}").__kept === true`), true,
+                       `at ${width} wide, the ${nav} shown before any script is the node the program kept`);
+          assertEquals(await page.evaluate("document.querySelectorAll('[data-wac-frame], [data-wac-frames]').length"), 0,
+                       "no frame wrapper or its stylesheet is left");
+          // The text the program drew with the window's real size, where the frame said the size it was drawn at.
+          assertEquals(await page.textContent("#size"), `${width}x${height}`, "the program was told the window's size");
+          await waitInPage(page, "true", null, { timeout: 100 });
+          assertEquals(said.filter((l) => l.startsWith("wac: hydrated")), [], `nothing drifted: ${size} was drawn for this window`);
+        }
       } finally {
         await browser?.close();
         await http?.stop();

@@ -57,11 +57,18 @@ struct Asked {
    * page that keeps its own content clear of them with `env(safe-area-inset-…)`.
    */
   bool edge;
+  /**
+   * **The module as a file of its own** (`--module-file`): `page.wasm` beside `index.html`, fetched when the page
+   * starts, rather than carried in it as base64 — so pages that share a module share one download, which the browser
+   * caches, and `index.html` is only its first frame and its host. A page opened from a `file://` URL cannot fetch it:
+   * one built so is for serving.
+   */
+  bool moduleFile;
 }
 
 /** The arguments, or a usage line in `title` and empty `entry` when they do not make sense. */
 Asked askedOf(string[] argv) {
-  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false);
+  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false, false);
   i32 argc = argv.len();
   string[] args = string[].filled(argc, "");
   for (i32 k = 0; k < argc; k++) { args[k] = argv[k]; }
@@ -102,6 +109,11 @@ Asked askedOf(string[] argv) {
     }
     if (w == "--edge") {
       a.edge = true;
+      i++;
+      continue;
+    }
+    if (w == "--module-file") {
+      a.moduleFile = true;
       i++;
       continue;
     }
@@ -2207,8 +2219,8 @@ export string brokerClient() {
  * `file://` URL — and a **classic** worker: a module worker made from a blob is refused on a `file://` page, and a
  * `data:` one would lose the page's origin and the storage that goes with it.
  */
-export string workerIndexFor(string title, string first, string wasm, i32 grants) {
-  return head(title, first) + moduleElement(wasm)
+export string workerIndexFor(string title, string first, string wasm, i32 grants, string moduleUrl) {
+  return head(title, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
        + "<script type=\"text/plain\" id=\"wac-program\">\n" + systemSide() + programSide() + moduleSide()
        // The first message says who this worker is: the page's program, or a module a program started.
        + brokerClient()
@@ -2219,28 +2231,44 @@ export string workerIndexFor(string title, string first, string wasm, i32 grants
        + "  if (e.data[0] === \"module\") { receive = () => {}; return wacModule(e.data[1], e.data[2]); }\n"
        + "  receive = wacPage(e.data[2], \{grants}, (m, transfer) => postMessage(m, transfer ?? []), e.data[1], e.data[3], e.data[4]);\n"
        + "};\n</script>\n"
-       + documentScript(documentSide() + brokerSide() + moduleBytes()
+       + documentScript(documentSide() + brokerSide() + moduleBytes(moduleUrl)
        + """
          const source = document.getElementById("wac-program").textContent;
          const script = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
          const worker = new Worker(script);
          const broker = wacBroker(script);
-         const apply = wacDocument(document.getElementById("app"), (m, transfer) => worker.postMessage(m, transfer ?? []));
+         // **Held until the program is started**: the worker takes its first message for the one that starts it, and
+         // the document speaks first — whether it is seen — while the module may still be on its way.
+         let started = false;
+         const held = [];
+         const toProgram = (m, transfer) => { if (started) worker.postMessage(m, transfer ?? []); else held.push([m, transfer]); };
+         const apply = wacDocument(document.getElementById("app"), toProgram);
          worker.onmessage = (e) => { if (!broker(worker, e.data)) apply(e.data); };
          worker.onerror = (e) => console.error(e.message);
-         const wasm = wacModuleBytes();
-         worker.postMessage(["page", location.hash, wasm, location.protocol === "file:" ? null : location.href, `${innerWidth}x${innerHeight}`], [wasm.buffer]);
+         // The window's size as the document chose its frame by, now, whenever the module arrives.
+         const size = `${innerWidth}x${innerHeight}`;
+         wacModuleBytes().then((wasm) => {
+           worker.postMessage(["page", location.hash, wasm, location.protocol === "file:" ? null : location.href, size], [wasm.buffer]);
+           started = true;
+           for (const [m, transfer] of held) worker.postMessage(m, transfer ?? []);
+         }, (e) => console.error("wac: the page's module could not be loaded: " + e.message));
          """)
        + "</body>\n</html>\n";
 }
 
 /** The page, with the program on the page's own thread: the two halves joined directly. */
-export string inPageIndexFor(string title, string first, string wasm, i32 grants) {
-  return head(title, first) + moduleElement(wasm)
-       + documentScript(systemSide() + moduleSide() + programSide() + documentSide() + moduleBytes()
+export string inPageIndexFor(string title, string first, string wasm, i32 grants, string moduleUrl) {
+  return head(title, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
+       + documentScript(systemSide() + moduleSide() + programSide() + documentSide() + moduleBytes(moduleUrl)
        + "let receive = null;\n"
-       + "const apply = wacDocument(document.getElementById(\"app\"), (m) => receive(m));\n"
-       + "receive = wacPage(wacModuleBytes(), \{grants}, (m) => apply(m), location.hash, location.protocol === \"file:\" ? null : location.href, `${innerWidth}x${innerHeight}`);\n")
+       // What the document says before the program is started is held for it, as the worker's page does.
+       + "const held = [];\n"
+       + "const apply = wacDocument(document.getElementById(\"app\"), (m) => { if (receive !== null) receive(m); else held.push(m); });\n"
+       + "const size = `${innerWidth}x${innerHeight}`;\n"
+       + "wacModuleBytes().then((wasm) => {\n"
+       + "  receive = wacPage(wasm, \{grants}, (m) => apply(m), location.hash, location.protocol === \"file:\" ? null : location.href, size);\n"
+       + "  for (const m of held) receive(m);\n"
+       + "}, (e) => console.error(\"wac: the page's module could not be loaded: \" + e.message));\n")
        + "</body>\n</html>\n";
 }
 
@@ -2249,16 +2277,46 @@ string moduleElement(string wasm) {
   return "<script type=\"text/plain\" id=\"wac-module\">" + wasm + "</script>\n";
 }
 
-/** `wacModuleBytes()`: the module that element holds, as bytes. */
-string moduleBytes() {
+/**
+ * `wacModuleBytes()`: the page's module, as bytes, when they are here — from the element that holds it, or, built with
+ * `--module-file`, fetched from `url`, beside the page.
+ */
+string moduleBytes(string url) {
+  if (url != "") {
+    return "      const wacModuleBytes = () => fetch(new URL(\"" + url + "\", location.href)).then((r) => {\n"
+         + """
+        if (!r.ok) throw new Error(`${r.url}: ${r.status} ${r.statusText}`);
+        return r.arrayBuffer();
+      }).then((b) => new Uint8Array(b));
+      """;
+  }
   return """
       const wacModuleBytes = () => {
         const text = atob(document.getElementById("wac-module").textContent.trim());
         const bytes = new Uint8Array(text.length);
         for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
-        return bytes;
+        return Promise.resolve(bytes);
       };
       """;
+}
+
+/**
+ * **Which module a page was built with**, for its URL — `page.wasm?v=<this>` — so a browser that has an older
+ * `page.wasm` cached fetches the one this page's first frames and host were made for. FNV-1a, 32 bits, in hex: a name
+ * for a version, not a check of its bytes.
+ */
+export string versionOf(u8[] bytes) {
+  i64 h = 2166136261 as i64;
+  i64 prime = 16777619 as i64;
+  i64 mask = 4294967295 as i64;
+  for (u8 c in bytes) { h = ((h ^ (c as i64)) * prime) & mask; }
+  string digits = "0123456789abcdef";
+  string out = "";
+  for (i32 i = 0; i < 8; i++) {
+    i32 d = ((h >> ((28 - 4 * i) as i64)) & (15 as i64)) as! i32;
+    out = out + digits.slice(d, d + 1);
+  }
+  return out;
 }
 
 /**
@@ -2522,8 +2580,10 @@ export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
     }
     first = string.fromBytes(firstRead.ok()!);
   }
-  string encoded = base64(wasm!);
-  string page = a.inPage ? inPageIndexFor(a.title, first, encoded, a.grants) : workerIndexFor(a.title, first, encoded, a.grants);
+  // Built with `--module-file`, the module is the `page.wasm` already beside `index.html`, named by its version.
+  string url = a.moduleFile ? "page.wasm?v=" + versionOf(wasm!) : "";
+  string encoded = a.moduleFile ? "" : base64(wasm!);
+  string page = a.inPage ? inPageIndexFor(a.title, first, encoded, a.grants, url) : workerIndexFor(a.title, first, encoded, a.grants, url);
   if (a.edge) { page = edgeToEdge(page); }
   if (a.appIcon != "") {
     auto icon = flatten(fs.readFile(a.appIcon).wait());
@@ -2543,7 +2603,7 @@ export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
   // builder whose disk refused `index.html` was told it had one — 100 KB lost to a line that said otherwise.
   string wrote = written(fs, index, page.toBytes());
   if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
-  out.line("\{index}: \{wasm!.len()} bytes of module");
+  out.line("\{index}: \{wasm!.len()} bytes of module" + (a.moduleFile ? ", in page.wasm beside it" : ""));
   return 0;
 }
 
@@ -2560,7 +2620,7 @@ string madeDir(Files fs, string dir) {
 }
 
 i32 usage(Output err) {
-  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
+  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--module-file] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
   return 2;
 }
 

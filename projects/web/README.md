@@ -226,7 +226,7 @@ for the clock and the sleeps it wakes, `paint` for frames, `answerValue`, `hand`
 ## Building one
 
     wac run --allow-read --allow-write --allow-run tools/build.wac \
-        <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
+        <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--module-file] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--page <spec>] [--wac <binary>]
 
 `tools/build.wac` writes three files: `page.wac`, **the page's program as a module** — a `main(Sys sys)` that
 opens the page its host provides, runs your `main(Page page)`, and renders each time a view has something to
@@ -279,6 +279,14 @@ module, which must name `prerendered` only if it is there — so it must be decl
 draws the frames is the one that is shipped, and it carries the drawing: about 30 KB more for a page that exports
 frames, nothing for one that does not. Building in steps, `--draw` runs the built module to write `<out>/first.html`,
 between building `page.wasm` and `--wrap`, which reads it.
+
+**`--module-file` puts the module beside the page** rather than in it: `page.wasm`, which `index.html` fetches as
+`page.wasm?v=<version>` — the version a hash of its bytes (`versionOf`), so a browser with an older one cached fetches
+the one this page was built with. `index.html` is then its first frames and its host: for wac-desktop, 259 KB where it
+was 1.5 MB, the megabyte of module downloaded once and cached. Pages that share a module share that download. What the
+document says before the module has arrived — that it is seen, a click on the first frame — is held for the program and
+given to it when it starts. A page opened from a `file://` URL cannot fetch its module, so a page built this way is for
+serving; without the flag a page is still one file that works from anywhere.
 
 **`--app <icon.png>` makes it an app to install**: beside `index.html` the build writes a manifest — the page's
 title as its name, standing alone (`display: standalone`), `--app-color` its bar — the icon, square and at least

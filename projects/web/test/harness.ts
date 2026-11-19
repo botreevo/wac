@@ -36,7 +36,8 @@ export async function buildModule(entry: string, out: string): Promise<void> {
  * reports a confusing second failure about a file that is not there.
  */
 export async function buildPage(entry: string, outDir: string, extra: string[] = []): Promise<string> {
-  const name = entry.replace(/^.*\//, "").replace(/\.wac$/, "") + (extra.includes("--in-page") ? "-inpage" : "");
+  const name = entry.replace(/^.*\//, "").replace(/\.wac$/, "") + (extra.includes("--in-page") ? "-inpage" : "")
+    + (extra.includes("--module-file") ? "-modulefile" : "");
   const built = `.cache/pages/${name}`;
   let out: Deno.CommandOutput;
   try {
@@ -62,6 +63,8 @@ export async function buildPage(entry: string, outDir: string, extra: string[] =
   }
   await Deno.mkdir(outDir, { recursive: true });
   await Deno.copyFile(`${ROOT}/${built}/index.html`, `${outDir}/index.html`);
+  // Built with `--module-file`, the page fetches its module from beside it.
+  if (extra.includes("--module-file")) await Deno.copyFile(`${ROOT}/${built}/page.wasm`, `${outDir}/page.wasm`);
   for (const f of ["manifest.webmanifest", "icon.png", "sw.js"]) {
     if (extra.includes("--app")) await Deno.copyFile(`${ROOT}/${built}/${f}`, `${outDir}/${f}`);
     else await Deno.remove(`${ROOT}/${built}/${f}`).catch(() => {});

@@ -12,9 +12,9 @@ to single HTML files. The standalone **Archive Explorer** it grew from is built 
 
 ## Building it
 
-**Everything is pinned in `wac.lock`**: wac at `6f3ee4093` — the `wac` command should be built from that commit, and
+**Everything is pinned in `wac.lock`**: wac at `a1814151a` — the `wac` command should be built from that commit, and
 its packages are `import { json.parse } from "wac"` — and `web`, the page and its builder (the wac-web repository), at
-`d63440e` — and the wac IDE at `2811561`. All are public repositories at `https://github.com/voltrevo/`. `wac.json5` names each commit as the `ref` of
+`6d09161` — and the wac IDE at `cf4f5ab`. All are public repositories at `https://github.com/voltrevo/`. `wac.json5` names each commit as the `ref` of
 its dependencies (`wac`, `web`, `webbuild`), and `wac.lock` agrees. To move one, change its refs and the lock
 together — and rebuild `wac` when it is wac that moved; `tools/ci-build.sh` and `tools/wacbin.py` read the commits
 from `wac.lock`.
@@ -26,7 +26,7 @@ git clone https://github.com/voltrevo/wac.git ~/src/wac
 ```
 
 ```bash
-git -C ~/src/wac checkout 6f3ee40931c09aed8cdd66950cbb51b4954924b7
+git -C ~/src/wac checkout a1814151addb658707145db3e82fbdf228d3c934
 ```
 
 ```bash

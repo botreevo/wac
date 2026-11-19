@@ -24,9 +24,21 @@ good deal of it has landed upstream.
   the copy.
 - Comments explain *why*, in full sentences, as the existing ones do. Match the surrounding style.
 
+## A site built on it
+
+**The desktop is also a package** (`exports: './src/lib.wac'`): `Desktop`, with a `DeskSite` saying what a page of its
+own adds — `intro`, drawn on the wallpaper and at the top of a phone's home screen in every frame; `links` in the
+taskbar; whether a first visit opens the welcome note, on a desktop and on a phone — and `framesAt(path)`, the phone's
+and the desktop's first frames for a page, which such a page exports as its `prerendered()`. The wac website is one:
+its own entry imports this package by git, at the commits this repository pins, and its apps are the ones `wac task
+build` writes. The desktop's own page is `DeskSite.plain()`: nothing added. **The first frames are the desktop's own
+too**: a phone's and a desktop's (`src/desktop.wac`), shown by `phoneQuery`, which is `phoneAt`'s rule as CSS
+(`test/site_test.wac` holds them together), the layout chosen from `page.size()` before the first turn, a phone's home
+screen drawn from the first frame.
+
 ## Building and testing here
 
-wac is pinned to one commit, `84955c78c`, `web` (wac-web) to `ae67c62` and the wac IDE (`ide`) to `4546fbf`, in `wac.json5` and `wac.lock`; the `wac` command
+wac is pinned to one commit, `a1814151a`, `web` (wac-web) to `6d09161` and the wac IDE (`ide`) to `cf4f5ab`, in `wac.json5` and `wac.lock`; the `wac` command
 should be built from the wac commit (see README). Change a pin's refs and the lock together.
 
     sh tools/fill-cache.sh && wac task build && wac task test && wac task test:browser

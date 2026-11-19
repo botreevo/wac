@@ -7,12 +7,12 @@
 
 import { Result, Ticket, Vec } from "core";
 import { Element, ElementEvent, Listen, MOD_CTRL, MOD_META, Node, Page, Picked, Ref, Ui, html.b, html.button, html.div, html.input, html.label, html.span,
-         html.style, Site, siteFiles } from "web";
+         html.style, html.a, Site, siteFiles } from "web";
 import { Vfs, Got, Info, nowMillis, copyInto, filesystem, freeName, join, leafOf, moveInto, parentOf, usable, vfsOf } from "./vfs.wac";
 import { Files, MemoryStore, Mount } from "std";
 import { Desk, Drag, FileDrag, Win, SESSION, close, dragFilesTo, dragging, dropKey, dropOn, endDrag, find, focus, dragTo, hintRight,
          hover, minimise, moved, newDesk, open, pressFiles, restore, sessionOf, startMove, startResize, taskbarClick, toggleMax,
-         Consent, Hand, Picking, Placed, Start, handFor, PHONE_HEIGHT, PHONE_SIDEWAYS, PHONE_WIDTH, followTo, frontOf, goHome } from "./wm.wac";
+         Consent, Hand, Picking, Placed, Start, handFor, PHONE_HEIGHT, PHONE_SIDEWAYS, PHONE_WIDTH, followTo, frontOf, goHome, phoneAt } from "./wm.wac";
 import { TRASH, restoreFromTrash, toTrash, trashCount } from "./trash.wac";
 import { FilesApp, openPath } from "./files.wac";
 import { ProgramApp, launch } from "./program.wac";
@@ -26,6 +26,7 @@ import { startApp, startPlaced } from "./builtin.wac";
 import { Entry, Launcher, groups, launch as launchEntry, offered } from "./launcher.wac";
 import { demoZip, welcomeMd } from "./seed.wac";
 import { css } from "../style.wac";
+import { DeskLink, DeskSite } from "./site.wac";
 import { icon } from "../preview.wac";
 import { iconFor } from "../model.wac";
 import { plural } from "../browse.wac";
@@ -36,7 +37,7 @@ static i32 GRACE = 200;
 // ── starting up ─────────────────────────────────────────────────────────────
 
 /** Choose the disk, give a new one something to start with, and bring the last session back. */
-async void start(Page page, Desk d, fn<void()> bump, fn<void()> ready) {
+async void start(Page page, Desk d, DeskSite own, fn<void()> bump, fn<void()> ready) {
   // One filesystem for every window: the browser's storage if it is offered, memory if not — and, served over
   // http, `/site`: the site the desktop came from, read-only, which is where its own apps are (`builtin.wac`), and
   // `wac`, which the Terminal runs from there.
@@ -62,11 +63,15 @@ async void start(Page page, Desk d, fn<void()> bump, fn<void()> ready) {
       await fs.write("Desktop/Welcome.md", welcomeMd());
       await fs.write("Desktop/demo.zip", demoZip());
     }
-    startApp(d, "viewer", "Desktop/Welcome.md");
+    // A site may say its own welcome (`DeskSite.intro`), which the note would cover: on a phone, the whole of it.
+    if (d.phone ? own.welcomeOnPhone : own.welcome) { startApp(d, "viewer", "Desktop/Welcome.md"); }
   } else {
     restore(d, saved.value, (string app, string arg, Vec<Placed> at) => { startPlaced(d, app, arg, at); });
   }
   d.dirty = true;
+  // **The disk is another one now**: what read the one the desktop stood on until here — the phone's home screen,
+  // drawn from the first frame — reads this one.
+  d.fsRev++;
   ready();
   files(page, d, bump);
 }
@@ -395,7 +400,7 @@ Node WinBody(Ui ui, Desk d, Win w, Page page, fn<void()> bumpDesk, i32 fsRev, i3
  * **A phone's home screen**: every app the launcher offers, in its groups, as a phone shows them — a tap starts one —
  * and what is on the Desktop below, a tap opening it. The search above opens the launcher, to find an app by name.
  */
-Node PhoneHome(Ui ui, Desk d, fn<void()> bumpDesk, i32 fsRev) {
+Node PhoneHome(Ui ui, Desk d, fn<void()> bumpDesk, i32 fsRev, fn<Node(Ui)>? intro) {
   Icons s = ui.memo<Icons>("", () => Icons(Info[](), string[](), string[](), 0));
   auto version = ui.state(0);
   fn<void()> bump = () => { version.update((i32 v) => v + 1); };
@@ -423,7 +428,10 @@ Node PhoneHome(Ui ui, Desk d, fn<void()> bumpDesk, i32 fsRev) {
     files[i] = <button class="ptile" key={n} title={n} onclick={(ElementEvent ev) => { openPath(d, join("Desktop", n), dir); bumpDesk(); }}>
       <span class={"ptic c-\{ic}"}>{icon(ic, "lg")}</span><span class="ptname">{n}</span></button>;
   }
+  // **The home screen from the first frame**, what the site says on top: its apps are the launcher's, there before the
+  // disk is.
   return <div class="phome">
+    {intro is null ? Node.Text("") : <IntroSlot draw={intro!}/>}
     <button class="psearch" onclick={(ElementEvent e) => { d.launcher = true; d.query = ""; d.chosen = 0; bumpDesk(); }}>
       {icon("search", "sm")}<span>Search apps</span></button>
     {sections.toArray()}
@@ -502,7 +510,15 @@ export Node Clock(Ui ui, Page page) {
   return <span class="clock num" title="The page is not told your time zone">{two(mins / 60)}:{two(mins % 60)} <span class="tz">UTC</span></span>;
 }
 
-Node taskbar(Desk d, Page page, fn<void()> bump) {
+/**
+ * **What a site says first** (`DeskSite.intro`), in a component of its own, so what it draws keeps its own state — and,
+ * drawn the same before the desktop is ready and after, so it is in the first frame and kept.
+ */
+Node IntroSlot(Ui ui, fn<Node(Ui)> draw) {
+  return <div class="deskintro">{draw(ui)}</div>;
+}
+
+Node taskbar(Desk d, Page page, fn<void()> bump, bool ready, DeskLink[] links) {
   Node[] buttons = Node[].filled(d.wins.len(), Node.Text(""));
   for (i32 i = 0; i < d.wins.len(); i++) {
     Win w = d.wins.get(i);
@@ -515,14 +531,24 @@ Node taskbar(Desk d, Page page, fn<void()> bump) {
   return <div class="taskbar">
     <button class={d.launcher ? "tblaunch on" : "tblaunch"} title="Apps"
             onclick={(ElementEvent e) => { d.launcher = !d.launcher; d.query = ""; d.chosen = 0; bump(); }}>{icon("grid", "")}</button>
+    {linksOf(links)}
     <div class="tbwins">{buttons}</div>
-    <div class="tbright">
+    {ready ? <div class="tbright">
       <span class={d.fs.persistent ? "pill" : "pill warn"}
             title={d.fs.persistent ? "Your files are kept in this browser's storage." : "This page was opened from a file, so the browser gives it no storage: files are kept until the tab closes. Serve the page over http to keep them."}>
         {icon(d.fs.persistent ? "shield" : "alert", "sm")}{d.fs.persistent ? "Saved in this browser" : "Not saved"}</span>
       <Clock page={page}/>
-    </div>
+    </div> : Node.Text("")}
   </div>;
+}
+
+/** A site's links in the taskbar (`DeskSite.links`). */
+Node[] linksOf(DeskLink[] links) {
+  Node[] out = Node[].filled(links.len(), Node.Text(""));
+  for (i32 i = 0; i < links.len(); i++) {
+    out[i] = <a class="tblink" key={links[i].href} href={links[i].href} title={links[i].title}>{links[i].label}</a>;
+  }
+  return out;
 }
 
 // ── window frames ───────────────────────────────────────────────────────────
@@ -605,15 +631,21 @@ Node fullHandle(Desk d, Page page, fn<void()> bump) {
 
 // ── the desktop ─────────────────────────────────────────────────────────────
 
-export Node Desktop(Ui ui, Page page) {
+export Node Desktop(Ui ui, Page page, DeskSite site) {
   // A disk to stand on until `start` has chosen the real one, a moment later.
-  Desk d = ui.memo<Desk>("", () => newDesk(vfsOf(MemoryStore.create(page.sys.clock()).asUser("root"), false)));
+  // **A phone or a desktop from the first frame**, by the window's size when the page opened (`page.size()`): the frame
+  // drawn at build time for this window is the one the program draws. The size heard as it changes comes later.
+  Desk d = ui.memo<Desk>("", () => {
+    Desk n = newDesk(vfsOf(MemoryStore.create(page.sys.clock()).asUser("root"), false));
+    if (page.size().width > 0) { n.phone = phoneAt(page.size().width as f64, page.size().height as f64); }
+    return n;
+  });
   auto version = ui.state(0);
   auto ready = ui.state(false);
   fn<void()> bump = () => { version.update((i32 v) => v + 1); };
   if (d.launch is null) { d.launch = (Start s) => { launch(d, page, s, bump); }; }
   ui.effect("", () => {
-    start(page, d, bump, () => { ready.set(true); });
+    start(page, d, site, bump, () => { ready.set(true); });
     return () => { };
   });
   // **The browser's full screen**, for the desktop's whole page, asked for as a window is given full screen
@@ -635,7 +667,7 @@ export Node Desktop(Ui ui, Page page) {
       el!.on("resize", Listen.none(), (ElementEvent e) => {
         f64 ratio = ratioOf(e.value);
         f64 w = (e.x as f64) / ratio;
-        bool phone = w < (PHONE_WIDTH as f64) || ((e.y as f64) / ratio < (PHONE_HEIGHT as f64) && w < (PHONE_SIDEWAYS as f64));
+        bool phone = phoneAt(w, (e.y as f64) / ratio);
         if (phone == d.phone) { return; }
         d.phone = phone;
         d.front = 0 - 1;
@@ -713,7 +745,7 @@ export Node Desktop(Ui ui, Page page) {
       d.front = front;
     }
   }
-  return <div ref={whole} class={"desk" + (d.phone ? " phone" : "") + (d.full.win >= 0 ? " full" : "") + deskClasses(d.prefs) + (dragging || carrying ? " dragging" : "") + (carrying ? " carrying" : "") + cursor}
+  return <div ref={whole} class={"desk" + (ready.get() ? " ready" : "") + (d.phone ? " phone" : "") + (d.full.win >= 0 ? " full" : "") + deskClasses(d.prefs) + (dragging || carrying ? " dragging" : "") + (carrying ? " carrying" : "") + cursor}
               onpointermove={pressed ? (ElementEvent e) => {
                 if (d.fdrag is not null) {
                   if (dragFilesTo(d, e.x, e.y, (e.mods & (MOD_CTRL | MOD_META)) != 0)) { bump(); }
@@ -737,8 +769,10 @@ export Node Desktop(Ui ui, Page page) {
     <div class="sizer" ref={sizer}></div>
     <div class="area" onpointerdown={(ElementEvent e) => { if (d.launcher) { d.launcher = false; bump(); } }}
          onpointermove={carrying ? (ElementEvent e) => { hover(d, "Desktop", "the desktop"); } : null}>
-      {ready.get() ? (d.phone ? <PhoneHome d={d} bumpDesk={bump} fsRev={d.fsRev}/> : <DesktopIcons d={d} bumpDesk={bump} fsRev={d.fsRev} drop={drop}/>)
-                   : <div class="booting"><span class="spin"></span>Starting…</div>}
+      {d.phone || site.intro is null ? Node.Text("") : <IntroSlot draw={site.intro!}/>}
+      {d.phone ? <PhoneHome d={d} bumpDesk={bump} fsRev={d.fsRev} intro={site.intro}/>
+               : (ready.get() ? <DesktopIcons d={d} bumpDesk={bump} fsRev={d.fsRev} drop={drop}/>
+                              : <div class="booting"><span class="spin"></span>Starting…</div>)}
       {frames}
       {hint == 1 ? <div class="snapghost l"></div> : (hint == 2 ? <div class="snapghost r"></div> : (hint == 3 ? <div class="snapghost m"></div> : Node.Text("")))}
       {dragging && g!.mode == "move" ? <div class="edge-r" onpointermove={(ElementEvent e) => { hintRight(d); bump(); }}></div> : Node.Text("")}
@@ -750,7 +784,7 @@ export Node Desktop(Ui ui, Page page) {
                                    : Node.Text(""))}
     {ghost}
     {d.phone && d.recents ? recentsOf(d, bump) : Node.Text("")}
-    {d.phone ? phoneBar(d, page, bump) : taskbar(d, page, bump)}
+    {d.phone ? phoneBar(d, page, bump) : taskbar(d, page, bump, ready.get(), site.links)}
     {d.full.win >= 0 ? fullHandle(d, page, bump) : Node.Text("")}
     {d.picking is not null ? <Picker d={d} p={d.picking!} dir={d.picking!.dir} fsRev={d.fsRev} bumpDesk={bump}/> : Node.Text("")}
     {d.consent is not null ? <Consenting c={d.consent!}/> : Node.Text("")}

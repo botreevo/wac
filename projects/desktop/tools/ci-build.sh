@@ -37,7 +37,7 @@ if [ ! -x "$tool/wac" ] || [ "$(cat "$tool/commit" 2>/dev/null)" != "$commit" ];
     git -C "$top" archive "$commit" | tar -x -C "$src"
   fi
   mkdir -p "$tool"
-  (cd "$src" && ./bootstrap.sh --host nodejs -o "$tool/wac")
+  (cd "$src" && ./bootstrap.sh --host "${WAC_HOST:-nodejs}" -o "$tool/wac")
   echo "$commit" > "$tool/commit"
 fi
 export PATH="$tool:$PATH"

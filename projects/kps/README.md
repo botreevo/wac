@@ -47,7 +47,7 @@ costs the same (0.3 s, mostly ICE).
     wac task test
 
 During development the transport work is in a local wac checkout, and the page capability in a local wac-web one:
-`sh tools/dev-link.sh ~/src/wac ~/src/wac-web` makes the locked commits resolve to them.
+`sh tools/dev-link.sh` makes the locked wac and web commits resolve to `projects/wac` and `projects/web` here.
 
 A page that dials: `wac run --allow-read --allow-write --allow-run <wac-web>/tools/build.wac cmd/dialpage.wac <dir>
 --grant webrtc`, then open `<dir>/index.html#<address>` — or `node interop/js/page-dial.mjs <dir> <address>` to run it

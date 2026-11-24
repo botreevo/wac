@@ -2,7 +2,7 @@
 // through the `wac` command and nothing else.
 //
 // **The dependency is this checkout, put where `wac update` would put it.** The template maps `web` and
-// `webbuild` to this repository on GitHub, and fetching is the network — so instead of fetching,
+// `webbuild` to `projects/web` of wac's repository on GitHub, and fetching is the network — so instead of fetching,
 // the test writes the cache a fetch leaves behind (`$WAC_HOME/cache/git/<repo>/<commit>`, a plain checkout)
 // from the working tree, and a `wac.lock` naming that commit. What is under test is everything after the
 // fetch: resolving the two packages through the manifest and the lock, the builder run from the project,
@@ -14,7 +14,9 @@
 // to either in wac shows up here as a template that no longer resolves.
 import { ROOT, WAC } from "./harness.ts";
 
-const GIT = "https://github.com/voltrevo/wac-web.git";
+const GIT = "https://github.com/voltrevo/wac.git";
+/** Where this package is in that repository: a checkout of a commit is the whole repository, and the pin names this. */
+const SUBDIR = "./projects/web";
 /** A commit no fetch made: the cache entry is the test's own, so it cannot collide with a real one. */
 const COMMIT = "0000000000000000000000000000000000000001";
 
@@ -55,15 +57,16 @@ Deno.test("the template builds and tests outside the repository", async () => {
 
     // The fetch's result, from this checkout: the files a commit would carry — tracked, and new ones not ignored.
     const checkout = `${home}/cache/git/${escapeRepo(GIT)}/${COMMIT}`;
+    const here = `${checkout}/${SUBDIR.slice(2)}`;
     const copied = await sh(
-      `mkdir -p '${checkout}' && git ls-files -z --cached --others --exclude-standard | xargs -0 cp --parents -t '${checkout}'`, ROOT);
+      `mkdir -p '${here}' && git ls-files -z --cached --others --exclude-standard | xargs -0 cp --parents -t '${here}'`, ROOT);
     assert(copied.ok, `the package is in the cache — ${copied.said}`);
     const tpl = await sh(`mkdir -p '${project}' && cp -R template/. '${project}/'`, ROOT);
     assert(tpl.ok, `the template is copied — ${tpl.said}`);
     const lock = {
       imports: {
-        web: { git: GIT, ref: "master", commit: COMMIT },
-        webbuild: { git: GIT, ref: "master", subdir: "./tools", commit: COMMIT },
+        web: { git: GIT, ref: "master", subdir: SUBDIR, commit: COMMIT },
+        webbuild: { git: GIT, ref: "master", subdir: `${SUBDIR}/tools`, commit: COMMIT },
       },
     };
     await Deno.writeTextFile(`${project}/wac.lock`, JSON.stringify(lock, null, 2) + "\n");

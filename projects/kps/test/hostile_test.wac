@@ -1,0 +1,55 @@
+// A listener under fire: thousands of datagrams that are not KPS — random bytes, forged QUIC Initials full-size and
+// truncated, forged short headers, STUN-shaped junk, binding requests that do not know the certhash, DTLS-shaped
+// noise (`interop/py/hostile.py`) — and then real clients on both transports, which must still be served. Nothing a
+// stranger sends may stop the listener, and a probe that does not know the certhash must cost it nothing durable.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-net test/hostile_test.wac
+
+import { Check } from "./check.wac";
+import { flatten } from "core";
+import { ChildEnv, Exec, Launch, Procs, Sys } from "std";
+
+Exec sh(Procs procs, string script) {
+  return flatten(procs.exec("/bin/sh", ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+string out(Exec e) {
+  string a = string.fromBytes(e.stdout);
+  while (a.len() > 0 && a.slice(a.len() - 1, a.len()) == "\n") { a = a.slice(0, a.len() - 1); }
+  return a;
+}
+
+export string test_garbage_does_not_stop_the_listener(Sys sys) {
+  Check c = Check.create();
+  Procs procs = sys.procs();
+  sh(procs, "mkdir -p .tmp/hostile && rm -f .tmp/hostile/*.log");
+  Exec built = sh(procs, "wac build cmd/echo.wac -o .tmp/hostile/echo --allow-net --allow-read --allow-write --quiet 2>&1");
+  c.eqI32(built.status, 0, "the echo server builds: \{out(built)}");
+  sh(procs, "(timeout 300 wac .tmp/hostile/echo.wasm .tmp/hostile/id 41950 127.0.0.1 > .tmp/hostile/wac.log 2>&1 &)");
+  string addr = "";
+  for (i32 i = 0; i < 100 && addr.len() == 0; i++) {
+    addr = out(sh(procs, "grep -o 'kps [^ ]*' .tmp/hostile/wac.log | head -1 | cut -d' ' -f2; sleep 0.1"));
+  }
+  c.ok(addr.len() > 0, "the listener started");
+  if (addr.len() == 0) { return c.report(); }
+  string pid = out(sh(procs, "pgrep -f 'hostile/[e]cho.wasm' | head -1"));
+  string fdsBefore = out(sh(procs, "ls /proc/\{pid}/fd | wc -l"));
+
+  Exec fire = sh(procs, "python3 interop/py/hostile.py 127.0.0.1 41950 6000 2>&1; sleep 1");
+  c.eqStr(out(fire), "sent 6000", "6000 hostile datagrams went out");
+  c.eqStr(out(sh(procs, "pgrep -f 'hostile/[e]cho.wasm' | head -1")), pid, "the listener is still running");
+  c.eqStr(out(sh(procs, "grep -c trapped .tmp/hostile/wac.log")), "0", "and did not trap");
+
+  string dial = "interop/go/bin/kps-dial -addr '\{addr}'";
+  c.eqStr(out(sh(procs, "\{dial} -transport webrtc -message hello 2>/dev/null")), "hello", "a WebRTC client is served after it");
+  c.eqStr(out(sh(procs, "\{dial} -transport quic -message hello 2>/dev/null")), "hello", "and a QUIC client");
+  c.eqStr(out(sh(procs, "\{dial} -transport quic -repeat 100000 -message abcdefgh 2>/dev/null")), "echoed 800000 bytes OK",
+          "and a QUIC client moving 800 kB");
+  // Nothing the garbage did is still held: the forged Initials that got as far as admission time out, and the
+  // descriptors are what they were.
+  sh(procs, "sleep 3");
+  string fdsAfter = out(sh(procs, "ls /proc/\{pid}/fd | wc -l"));
+  c.eqStr(fdsAfter, fdsBefore, "no descriptors leaked (\{fdsBefore} before, \{fdsAfter} after)");
+  sh(procs, "pkill -f 'hostile/echo.wasm' || true");
+  return c.report();
+}

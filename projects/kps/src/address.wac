@@ -1,0 +1,143 @@
+// A KPS address — SPEC §2 and §3.
+//
+//     <ip>:<udp-port>:<certhash>          203.0.113.5:41108:uEiD…
+//     [<ipv6>]:<udp-port>:<certhash>      [2001:db8::1]:41108:uEiD…
+//
+// **The address is the whole of what a client knows about a server**: a UDP endpoint and the hash of the
+// certificate it will present. There is no name to resolve and no authority to ask, so a parser that is
+// lenient here is lenient about identity. Each refusal below is one the reference implementations make too
+// (`libs/js/packages/core/src/address.ts`, `libs/go/address.go`), and the tests hold this to them.
+//
+// The certhash is `u` (multibase: base64url, no padding) followed by a multihash: `0x12` (sha2-256), `0x20`
+// (32 bytes), and the digest of the certificate's DER — the same bytes a DTLS `a=fingerprint:sha-256` line
+// covers, which is what lets one certificate serve both transports.
+
+import { Result } from "core";
+import { codec.base64Encode, codec.base64Decode, codec.BASE64_URL, codec.hexEncodeUpper } from "wac";
+
+export struct Address {
+  /** The host, without brackets: `203.0.113.5` or `2001:db8::1`. */
+  string ip;
+  i32 port;
+  /** The certhash as written, multibase prefix and all. */
+  string certhash;
+
+  /** Whether the host is an IPv6 literal — it has a colon, which an IPv4 quad never does. */
+  bool v6(const this) { return this.ip.indexOf(":") >= 0; }
+
+  /** The 32-byte digest the certhash carries, or null if the certhash is not a sha2-256 multihash. */
+  u8[]? digest(const this) { return decodeCerthash(this.certhash); }
+}
+
+/**
+ * Parse an address, or say why it is not one.
+ *
+ * **The port is digits and nothing else.** `0x1bb`, `+443`, ` 443` and `1e3` are refused, as the reference
+ * parsers refuse them: a number another language's `parseInt` would have taken is a second reading of the
+ * same text, and an address with two readings names two endpoints.
+ *
+ * The certhash is checked only for being present. Whether it decodes is `digest()`'s question, because the
+ * spec separates the two (an address may carry a future multihash) and the dialer asks it before it sends
+ * anything.
+ */
+export Result<Address, string> parseAddress(string s) {
+  string ip = "";
+  string rest = "";
+  if (s.len() > 0 && s[0] == "[") {
+    i32 end = s.indexOf("]");
+    if (end < 0 || end + 1 >= s.len() || s[end + 1] != ":") { return Result.Err(malformed(s)); }
+    ip = s.slice(1, end);
+    rest = s.slice(end + 2, s.len());
+  } else {
+    i32 i = s.indexOf(":");
+    if (i < 0) { return Result.Err(malformed(s)); }
+    ip = s.slice(0, i);
+    rest = s.slice(i + 1, s.len());
+  }
+  i32 j = rest.indexOf(":");
+  if (j < 0) { return Result.Err(malformed(s)); }
+  string portText = rest.slice(0, j);
+  string certhash = rest.slice(j + 1, rest.len());
+  i32 port = decimalPort(portText);
+  if (port < 0) { return Result.Err("kps: bad port in address \{s}"); }
+  if (ip.len() == 0 || certhash.len() == 0) { return Result.Err(malformed(s)); }
+  return Result.Ok(Address(ip, port, certhash));
+}
+
+/** The address as text — the inverse of `parseAddress` for anything it accepted. */
+export string formatAddress(const Address a) {
+  string host = a.ip.indexOf(":") >= 0 ? "[" + a.ip + "]" : a.ip;
+  return "\{host}:\{a.port}:\{a.certhash}";
+}
+
+string malformed(string s) {
+  return "kps: malformed address \{s} (want ip:port:certhash or [ipv6]:port:certhash)";
+}
+
+/**
+ * 1–65535 from decimal digits, or -1.
+ *
+ * Leading zeros are accepted (`0443` is 443), as Go's `strconv.Atoi` and the JS `/^\d+$/` both accept them;
+ * refusing them here would make an address one implementation dials and another rejects. The digit count is
+ * capped before the arithmetic so a long run of digits cannot wrap round to a valid port.
+ */
+i32 decimalPort(string t) {
+  if (t.len() == 0 || t.len() > 10) { return -1; }
+  i64 v = 0 as i64;
+  u8[] b = t.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return -1; }
+    v = v * (10 as i64) + ((b[i] - '0') as i64);
+  }
+  if (v < (1 as i64) || v > (65535 as i64)) { return -1; }
+  return v as! i32;
+}
+
+/** The multibase prefix for base64url without padding. */
+static string MULTIBASE_BASE64URL = "u";
+/** sha2-256's multihash code and length. */
+static i32 MULTIHASH_SHA256 = 0x12;
+static i32 SHA256_LEN = 32;
+
+/**
+ * The digest inside a certhash, or null.
+ *
+ * Null for anything but `u` + base64url(0x12 0x20 + 32 bytes). Padding is refused: the multibase `u`
+ * alphabet is unpadded, so `=` is not a character of it, and accepting it would give one digest two
+ * spellings.
+ */
+export u8[]? decodeCerthash(string s) {
+  if (s.len() < 2 || s.slice(0, 1) != MULTIBASE_BASE64URL) { return null; }
+  string body = s.slice(1, s.len());
+  if (body.indexOf("=") >= 0 || body.indexOf("+") >= 0 || body.indexOf("/") >= 0) { return null; }
+  u8[]? raw = base64Decode(body.toBytes());
+  if (raw is null) { return null; }
+  u8[] b = raw!;
+  if (b.len() != 2 + SHA256_LEN) { return null; }
+  if (b[0] as i32 != MULTIHASH_SHA256 || b[1] as i32 != SHA256_LEN) { return null; }
+  u8[] digest = u8[].filled(SHA256_LEN, 0);
+  digest.copyFrom(b, 2, 0, SHA256_LEN);
+  return digest;
+}
+
+/** The certhash naming a 32-byte sha-256 digest. Traps on any other length — a caller bug, not input. */
+export string encodeCerthash(const u8[] digest) {
+  if (digest.len() != SHA256_LEN) { trap; }
+  u8[] mh = u8[].filled(2 + SHA256_LEN, 0);
+  mh[0] = MULTIHASH_SHA256 as@ u8;
+  mh[1] = SHA256_LEN as@ u8;
+  mh.copyFrom(digest, 0, 2, SHA256_LEN);
+  return MULTIBASE_BASE64URL + string.fromBytes(base64Encode(mh, BASE64_URL(), false));
+}
+
+/** The digest as an SDP `a=fingerprint:sha-256` value: upper-case hex pairs joined by colons. */
+export string sdpFingerprint(const u8[] digest) {
+  u8[] hex = hexEncodeUpper(digest);
+  u8[] out = u8[].filled(digest.len() == 0 ? 0 : digest.len() * 3 - 1, 0);
+  for (i32 i = 0; i < digest.len(); i++) {
+    out[i * 3] = hex[i * 2];
+    out[i * 3 + 1] = hex[i * 2 + 1];
+    if (i + 1 < digest.len()) { out[i * 3 + 2] = ':'; }
+  }
+  return string.fromBytes(out);
+}

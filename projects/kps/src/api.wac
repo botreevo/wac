@@ -1,0 +1,93 @@
+// The connection and stream a KPS program holds — SPEC §4, §6.1, §7, §9 — whatever transport carries them.
+//
+// **The transport is hidden.** A WebRTC connection and a QUIC connection are both a `Connection`, and their
+// streams both a `Stream`; each transport is a subtype overriding these methods, and nothing a program can call
+// says which it has (§6.4: the two must be indistinguishable to it).
+//
+// The methods that wait answer a `Ticket` rather than being `async`, because wac does not have async virtual
+// methods: each transport's override hands back the ticket of an `async` function of its own. `await` on one is
+// the same as on any other.
+//
+// A stream is unnamed, bidirectional, reliable, ordered bytes with no message boundaries. **A read ends in EOF if
+// and only if the peer finished its write half** (`closeWrite`); every other way a stream stops — a peer reset,
+// this end's cancelRead or close, the connection closing or failing — makes a read fail with a reason (§9.2), so
+// holding only a stream is enough to tell a finished one from an unfinished one.
+
+import { Result, Ticket } from "core";
+import { Code, Reason } from "./errors.wac";
+
+/** What a read gives: bytes, the end of the peer's writing, or why there will be no more. */
+export enum ReadResult {
+  Data(u8[] bytes),
+  End,
+  Failed(Reason reason),
+}
+
+/** How a stream or a connection ended: `ok` for an orderly close, else the reason. */
+export struct CloseInfo {
+  bool ok;
+  Reason reason;
+
+  CloseInfo clean() { return CloseInfo(true, Reason.of(Code.None)); }
+  CloseInfo because(Reason r) { return CloseInfo(false, r); }
+}
+
+/** A peer's UDP endpoint, as observed when the connection was established (§4). */
+export struct Endpoint {
+  string ip;
+  i32 port;
+}
+
+export struct Stream {
+  /** The next bytes the peer sent, `End` after its FIN, or `Failed`. Each call answers once; call again for more. */
+  virtual Ticket<ReadResult> read(this) { trap; }
+
+  /**
+   * Write all of `bytes`, waiting for the peer's credit as needed — backpressure is end to end, so a peer that
+   * stops reading eventually stops this. `Err` if the write half is finished, reset, stopped by the peer, or the
+   * connection has gone.
+   */
+  virtual Ticket<Result<bool, Reason>> write(this, u8[] bytes) { trap; }
+
+  /** Finish the write half: the peer reads EOF after every byte written before this. */
+  virtual void closeWrite(this) { trap; }
+
+  /** Stop wanting bytes. Further inbound bytes are dropped and the peer is asked to stop; reads fail. */
+  virtual void cancelRead(this, Reason reason) { trap; }
+
+  /** Abort the write half: the peer's reads fail with `reason` rather than ending. */
+  virtual void resetWrite(this, Reason reason) { trap; }
+
+  /** Both halves: with `Code.None` an orderly teardown, otherwise the peer sees a stream error. */
+  virtual void close(this, Reason reason) { trap; }
+
+  /** Settles when the stream has ended, saying how. */
+  virtual Ticket<CloseInfo> closed(this) { trap; }
+}
+
+export struct Connection {
+  /** A new stream to the peer, once the peer's stream-count credit allows one. */
+  virtual Ticket<Result<Stream, Reason>> openStream(this) { trap; }
+
+  /** The next stream the peer opened. */
+  virtual Ticket<Result<Stream, Reason>> acceptStream(this) { trap; }
+
+  /**
+   * Send one datagram: unreliable, unordered, best effort. `Err` with `Code.TooLarge` and the current limit
+   * when it does not fit — the limit depends on the transport and the path, so it is reported rather than fixed.
+   * Payloads up to about 1100 bytes fit on every connection.
+   */
+  virtual Result<bool, Reason> sendDatagram(this, u8[] bytes) { trap; }
+
+  /** The next datagram to arrive, from a bounded buffer that drops the oldest when full. */
+  virtual Ticket<Result<u8[], Reason>> receiveDatagram(this) { trap; }
+
+  /** Close the connection. The peer sees `reason`'s code as its close reason, best effort. */
+  virtual void close(this, Reason reason) { trap; }
+
+  /** Settles when the connection has ended, saying how. */
+  virtual Ticket<CloseInfo> closed(this) { trap; }
+
+  /** The peer's UDP endpoint. */
+  virtual Endpoint remote(const this) { trap; }
+}

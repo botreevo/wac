@@ -1,0 +1,449 @@
+// The WebRTC mapping engine, two of them back to back (test/pair.wac).
+//
+//     wac test test/engine_test.wac
+//
+// What two conforming ends must observe of each other: establishment by mutual HELLO, streams, EOF versus every
+// kind of error (§9.2), backpressure, the stream-count limit and retirement, datagrams, and the violations that
+// close a connection with `protocol-error`. A second implementation judges the same engine later — Chromium and
+// the reference listener, through a real data channel; this file is about the rules, with the wire in reach.
+
+import { Result, Ticket, Vec } from "core";
+import { Check } from "./check.wac";
+import { Pair, pair, settle, End } from "./pair.wac";
+import { WebrtcConn, WebrtcStream, Channel, MAX_DATAGRAM, HELLO_TIMEOUT_MS } from "../src/webrtc/conn.wac";
+import { Limits } from "../src/webrtc/flow.wac";
+import { Stream, ReadResult, CloseInfo } from "../src/api.wac";
+import { Code, Reason } from "../src/errors.wac";
+import { encodeData, encodeFin, encodeCode, encodeHello, encodeMaxData, encodeMaxStreamData, FRAME_RESET,
+         MAX_PAYLOAD, WIRE_VERSION } from "../src/webrtc/frame.wac";
+
+Limits roomy() { return Limits.defaults(); }
+
+/** A pair, established. */
+async Pair up(Limits la, Limits lb) {
+  Pair p = pair(la, lb);
+  await settle(p.wire);
+  return p;
+}
+
+string describe(ReadResult r) {
+  return match (r) {
+    Data(b): "data \{string.fromBytes(b)}",
+    End: "end",
+    Failed(why): "failed \{why.code.name()}",
+  };
+}
+
+/** Everything the stream will give until it ends, as text, and how it ended. */
+async string drain(Stream s, Pair p) {
+  string got = "";
+  while (true) {
+    Ticket<ReadResult> t = s.read();
+    await settle(p.wire);
+    ReadResult r = await t;
+    match (r) {
+      Data(b): { got += string.fromBytes(b); }
+      End: { return got + "|end"; }
+      Failed(why): { return got + "|failed " + why.code.name(); }
+    }
+  }
+}
+
+async Stream openOne(Pair p, WebrtcConn from, Check c) {
+  Ticket<Result<Stream, Reason>> t = from.openStream();
+  await settle(p.wire);
+  Result<Stream, Reason> r = await t;
+  c.ok(r.isOk(), "the stream opened");
+  return r.unwrap();
+}
+
+async Stream acceptOne(Pair p, WebrtcConn at, Check c) {
+  Ticket<Result<Stream, Reason>> t = at.acceptStream();
+  await settle(p.wire);
+  Result<Stream, Reason> r = await t;
+  c.ok(r.isOk(), "the stream was accepted");
+  return r.unwrap();
+}
+
+/**
+ * HELLOs cross and both ends are established; neither was before its peer's HELLO arrived.
+ *
+ * Would catch: establishing on sending HELLO alone, HELLO not sent when the control channel opens, and a HELLO
+ * that is not the 26 exact bytes of wire version 1 with this end's limits in it.
+ */
+export async string test_mutual_hello_establishes_both_ends() {
+  Check c = Check.create();
+  Pair p = pair(Limits(1000, 2000, 3), roomy());
+  c.eqI32(p.a.state, 0, "a is connecting until b's HELLO arrives");
+  c.eqI32(p.aControlSent.len(), 1, "a sent one control message the moment its channel was open");
+  c.eqI32(p.aControlSent.get(0).len(), 26, "HELLO is 26 bytes");
+  u8[] want = encodeHello(WIRE_VERSION, 1000 as i64, 2000 as i64, 3 as i64);
+  bool same = true;
+  for (i32 i = 0; i < 26; i++) { if (p.aControlSent.get(0)[i] != want[i]) { same = false; } }
+  c.ok(same, "carrying wire version 1 and a's own limits");
+  Ticket<Result<bool, Reason>> ea = p.a.established();
+  await settle(p.wire);
+  c.ok((await ea).isOk(), "a is established");
+  c.eqI32(p.a.state, 1, "a is open");
+  c.eqI32(p.b.state, 1, "and so is b");
+  return c.report();
+}
+
+/**
+ * A stream carries bytes one way, and the reader sees them then EOF — the write half having been finished — while
+ * the other direction is independent.
+ *
+ * Would catch: EOF reported before buffered bytes are read, a FIN that ends both directions, bytes reordered or
+ * lost across the frame split, and an accepted stream that is not the one opened.
+ */
+export async string test_a_stream_carries_bytes_then_eof_and_the_halves_are_independent() {
+  Check c = Check.create();
+  Pair p = await up(roomy(), roomy());
+  Stream sa = await openOne(p, p.a, c);
+  Stream sb = await acceptOne(p, p.b, c);
+  // Larger than one frame, so it is split, and with a pattern so reordering would show.
+  string big = "";
+  for (i32 i = 0; i < 2100; i++) { big += "\{i % 10}abcdefg"; }
+  Ticket<Result<bool, Reason>> w = sa.write(big.toBytes());
+  await settle(p.wire);
+  c.ok((await w).isOk(), "the write completed");
+  sa.closeWrite();
+  c.eqStr(await drain(sb, p), big + "|end", "b reads every byte in order, then EOF");
+  // b's write half is still open: the reverse direction works after a's FIN.
+  Ticket<Result<bool, Reason>> back = sb.write("pong".toBytes());
+  await settle(p.wire);
+  c.ok((await back).isOk(), "b can still write");
+  sb.closeWrite();
+  c.eqStr(await drain(sa, p), "pong|end", "and a reads it, then EOF");
+  return c.report();
+}
+
+/**
+ * §9.2's table, row by row: a peer reset is an error with its code; cancelRead makes the peer's writes fail and the
+ * peer answers RESET; close with a code is an error at the peer; a local cancelRead or close makes local reads
+ * fail, never end.
+ *
+ * Would catch: any of these reported as EOF — which is the confusion §9.2 exists to rule out — a code lost in
+ * transit, STOP_SENDING not answered with RESET, and writes that keep succeeding after the peer stopped reading.
+ */
+export async string test_every_terminal_condition_is_an_error_except_fin() {
+  Check c = Check.create();
+  Pair p = await up(roomy(), roomy());
+
+  Stream s1 = await openOne(p, p.a, c);
+  Stream r1 = await acceptOne(p, p.b, c);
+  s1.write("x".toBytes());
+  await settle(p.wire);
+  s1.resetWrite(Reason.of(Code.Timeout));
+  await settle(p.wire);
+  string got = await drain(r1, p);
+  c.ok(got == "x|failed timeout" || got == "|failed timeout", "a peer reset is an error with its code: \{got}");
+
+  Stream s2 = await openOne(p, p.a, c);
+  Stream r2 = await acceptOne(p, p.b, c);
+  r2.cancelRead(Reason.of(Code.PermissionDenied));
+  await settle(p.wire);
+  Ticket<Result<bool, Reason>> w = s2.write("late".toBytes());
+  await settle(p.wire);
+  Result<bool, Reason> wr = await w;
+  c.ok(wr.isErr(), "after the peer's cancelRead, writes fail");
+  if (wr.isErr()) { c.eqStr(wr.err()!.code.name(), "permission-denied", "with the peer's code"); }
+  c.eqStr(describe(await read1(r2, p)), "failed permission-denied", "and the local read fails rather than ends");
+
+  Stream s3 = await openOne(p, p.a, c);
+  Stream r3 = await acceptOne(p, p.b, c);
+  s3.close(Reason.of(Code.Cancelled));
+  await settle(p.wire);
+  c.eqStr(describe(await read1(r3, p)), "failed cancelled", "a coded close is an error at the peer");
+  c.eqStr(describe(await read1(s3, p)), "failed cancelled", "and locally");
+
+  Stream s4 = await openOne(p, p.a, c);
+  Stream r4 = await acceptOne(p, p.b, c);
+  s4.close(Reason.of(Code.None));
+  await settle(p.wire);
+  c.eqStr(describe(await read1(r4, p)), "end", "an uncoded close finishes the write half, so the peer reads EOF");
+  c.eqStr(describe(await read1(s4, p)), "failed closed", "but the local read half was cancelled, so it fails");
+  return c.report();
+}
+
+async ReadResult read1(Stream s, Pair p) {
+  Ticket<ReadResult> t = s.read();
+  await settle(p.wire);
+  return await t;
+}
+
+/**
+ * A reader that stops reading stops the writer once the windows are spent, and memory stays bounded; reading
+ * again lets the writer finish.
+ *
+ * Would catch: credit counted on arrival rather than on read (the writer never blocks and the buffer grows with
+ * it), credit never re-advertised (the writer blocks for ever), and a sender that overruns the peer's window.
+ */
+export async string test_backpressure_is_end_to_end_and_reading_resumes_the_writer() {
+  Check c = Check.create();
+  Pair p = await up(roomy(), Limits(1024, 4096, 10));
+  Stream sa = await openOne(p, p.a, c);
+  Stream sb = await acceptOne(p, p.b, c);
+  u8[] blob = u8[].filled(10000, 7);
+  Ticket<Result<bool, Reason>> w = sa.write(blob);
+  await settle(p.wire);
+  c.no(w.settled(), "the write is blocked: b has read nothing");
+  WebrtcStream wb = sb as! WebrtcStream;
+  c.ok(wb.inbufBytes <= 1024 as i64, "b holds at most its stream window: \{wb.inbufBytes}");
+  i64 total = 0 as i64;
+  while (total < 10000 as i64) {
+    match (await read1(sb, p)) {
+      Data(b): { total += b.len() as i64; }
+      End: { break; }
+      Failed(_): { break; }
+    }
+    c.ok(wb.inbufBytes <= 1024 as i64, "and never more while reading");
+  }
+  c.eqI64(total, 10000 as i64, "every byte arrives once the reader reads");
+  c.ok(w.settled() && (await w).isOk(), "and the write completes");
+  return c.report();
+}
+
+/**
+ * The same, the other way: the end that opened the stream reads past its window, so its MAX_STREAM_DATA has to
+ * travel on the channel the stream was given after it was made.
+ *
+ * Would catch: the opener's credit updates sent on the placeholder a stream starts on (the accepter writes one
+ * window and waits for ever) — what stalled a page's 3 MiB echo at exactly 1 MiB.
+ */
+export async string test_the_opener_returns_credit_on_the_channel_it_was_given() {
+  Check c = Check.create();
+  Pair p = await up(Limits(1024, 4096, 10), roomy());
+  Stream sa = await openOne(p, p.a, c);
+  Stream sb = await acceptOne(p, p.b, c);
+  Ticket<Result<bool, Reason>> w = sb.write(u8[].filled(10000, 9));
+  await settle(p.wire);
+  c.no(w.settled(), "the write is blocked: a has read nothing");
+  i64 total = 0 as i64;
+  while (total < 10000 as i64) {
+    match (await read1(sa, p)) {
+      Data(b): { total += b.len() as i64; }
+      End: { break; }
+      Failed(_): { break; }
+    }
+  }
+  c.eqI64(total, 10000 as i64, "every byte reaches the opener once it reads");
+  c.ok(w.settled() && (await w).isOk(), "and the accepter's write completes");
+  return c.report();
+}
+
+/**
+ * The stream count: an opener waits at the peer's limit and proceeds when a stream retires; the limit holds open,
+ * unaccepted and unread streams alike.
+ *
+ * Would catch: credit returned when a stream is accepted or merely closed rather than retired, the limit not
+ * enforced on the opener, and retirement never happening (the third open blocks for ever).
+ */
+export async string test_opening_waits_at_the_stream_limit_until_a_stream_retires() {
+  Check c = Check.create();
+  Pair p = await up(roomy(), Limits(1048576, 8388608, 2));
+  Stream s1 = await openOne(p, p.a, c);
+  Stream s2 = await openOne(p, p.a, c);
+  Ticket<Result<Stream, Reason>> third = p.a.openStream();
+  await settle(p.wire);
+  c.no(third.settled(), "the third open waits: b allows two");
+  Stream r1 = await acceptOne(p, p.b, c);
+  // Finish stream 1 both ways and drain it: wire-complete, closed, drained — retired.
+  s1.closeWrite();
+  r1.closeWrite();
+  await settle(p.wire);
+  c.no(third.settled(), "accepting and finishing is not retirement while bytes are unread");
+  await drain(r1, p);
+  await drain(s1, p);
+  await settle(p.wire);
+  c.ok(third.settled(), "once stream 1 retires, the third open proceeds");
+  if (third.settled()) { c.ok((await third).isOk(), "and succeeds"); }
+  return c.report();
+}
+
+/**
+ * Datagrams cross, a too-large one is refused with the limit, and the receive buffer drops the oldest when full.
+ */
+export async string test_datagrams_cross_and_the_limits_are_reported() {
+  Check c = Check.create();
+  Pair p = await up(roomy(), roomy());
+  c.ok(p.a.sendDatagram("ping".toBytes()).isOk(), "a datagram is sent");
+  Ticket<Result<u8[], Reason>> t = p.b.receiveDatagram();
+  await settle(p.wire);
+  c.eqStr(string.fromBytes((await t).unwrap()), "ping", "and received");
+  Result<bool, Reason> big = p.a.sendDatagram(u8[].filled(MAX_DATAGRAM + 1, 0));
+  c.ok(big.isErr(), "one byte over the limit is refused");
+  if (big.isErr()) {
+    c.eqStr(big.err()!.code.name(), "too-large", "as too-large");
+    c.ok(big.err()!.message.indexOf("\{MAX_DATAGRAM}") >= 0, "saying the limit: \{big.err()!.message}");
+  }
+  for (i32 i = 0; i < 300; i++) { p.a.sendDatagram("\{i}".toBytes()); }
+  await settle(p.wire);
+  Ticket<Result<u8[], Reason>> first = p.b.receiveDatagram();
+  await settle(p.wire);
+  c.eqStr(string.fromBytes((await first).unwrap()), "44", "of 300 unread, the oldest 44 were dropped");
+  return c.report();
+}
+
+
+/** How a connection ended, as `ok` or the code's name; "open" if it has not. */
+string endOf(WebrtcConn c) {
+  if (c.ended is null) { return "open"; }
+  return c.ended!.ok ? "ok" : c.ended!.reason.code.name();
+}
+
+/** The last control message a side sent, as hex. */
+string lastSent(Vec<u8[]> sent) { return sent.len() == 0 ? "" : hexOf(sent.get(sent.len() - 1)); }
+
+string hexOf(u8[] b) {
+  string digits = "0123456789abcdef";
+  string out = "";
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 v = b[i] as i32;
+    out += digits.slice(v >> 4, (v >> 4) + 1) + digits.slice(v & 15, (v & 15) + 1);
+  }
+  return out;
+}
+
+/**
+ * Each stream-level violation closes the connection with protocol-error at the end that saw it, which says so
+ * on the control channel — and the peer, reading that, ends with the same code.
+ *
+ * Would catch: a violation tolerated (DATA past the window buffered, a second terminal frame ignored), a violation
+ * closed with a different code or with no CONNECTION_CLOSE sent, and a peer that treats the close as clean.
+ */
+export async string test_stream_violations_close_the_connection_with_protocol_error() {
+  Check c = Check.create();
+  string[] names = ["DATA beyond the stream window", "DATA after FIN", "a second FIN", "an empty DATA frame",
+                    "an unknown frame type"];
+  for (i32 k = 0; k < names.len(); k++) {
+    Pair p = await up(roomy(), Limits(16, 4096, 10));
+    Stream sa = await openOne(p, p.a, c);
+    Stream sb = await acceptOne(p, p.b, c);
+    WebrtcStream wb = sb as! WebrtcStream;
+    if (k == 0) { wb.message(encodeData(u8[].filled(17, 1), 0, 17)); }
+    if (k == 1) { wb.message(encodeFin()); wb.message(encodeData(u8[].filled(1, 1), 0, 1)); }
+    if (k == 2) { wb.message(encodeFin()); wb.message(encodeFin()); }
+    if (k == 3) { wb.message([0 as u8] as u8[]); }
+    if (k == 4) { wb.message([9 as u8, 0 as u8] as u8[]); }
+    c.eqStr(endOf(p.b), "protocol-error", names[k] + ": the receiving end closes with protocol-error");
+    c.eqStr(lastSent(p.bControlSent), "0000000006", names[k] + ": and says so with CONNECTION_CLOSE(6)");
+    await settle(p.wire);
+    c.eqStr(endOf(p.a), "protocol-error", names[k] + ": the peer ends with the same code");
+    c.eqStr(describe(await read1(sa, p)), "failed protocol-error", names[k] + ": and its streams fail with it");
+  }
+  return c.report();
+}
+
+/**
+ * Control-channel rules: a second HELLO, a credit update before HELLO, an unknown wire version (unsupported, not
+ * protocol-error), a decreasing limit (ignored, not fatal), and a reserved channel lost.
+ */
+export async string test_control_violations_and_the_rules_that_are_not_violations() {
+  Check c = Check.create();
+  Pair p1 = await up(roomy(), roomy());
+  p1.b.controlMessage(encodeHello(WIRE_VERSION, 1 as i64, 1 as i64, 1 as i64));
+  c.eqStr(endOf(p1.b), "protocol-error", "a second HELLO");
+
+  Pair p2 = pair(roomy(), roomy());
+  p2.b.controlMessage(encodeMaxData(5 as i64));
+  c.eqStr(endOf(p2.b), "protocol-error", "MAX_DATA before HELLO");
+
+  Pair p3 = pair(roomy(), roomy());
+  p3.b.controlMessage(encodeHello(2, 1 as i64, 1 as i64, 1 as i64));
+  c.eqStr(endOf(p3.b), "unsupported", "a HELLO of wire version 2 is unsupported, with no downgrade");
+  c.eqStr(lastSent(p3.bControlSent), "0000000007", "and CONNECTION_CLOSE(7) says so");
+
+  Pair p4 = await up(roomy(), roomy());
+  i64 before = p4.a.flow.peerMaxData;
+  p4.a.controlMessage(encodeMaxData(before - (1 as i64)));
+  c.eqStr(endOf(p4.a), "open", "a MAX_DATA that would lower the limit is not a violation");
+  c.eqI64(p4.a.flow.peerMaxData, before, "and changes nothing");
+
+  Pair p5 = await up(roomy(), roomy());
+  p5.b.reservedLost("datagram");
+  c.eqStr(endOf(p5.b), "protocol-error", "losing a reserved channel while healthy is fatal");
+  await settle(p5.wire);
+  c.eqStr(endOf(p5.a), "protocol-error", "and the peer hears it");
+  return c.report();
+}
+
+/**
+ * The stream count is enforced on the receiver: a peer that opens one past the advertised limit is closed.
+ */
+export async string test_a_stream_past_the_advertised_limit_is_a_violation() {
+  Check c = Check.create();
+  Pair p = await up(roomy(), Limits(1048576, 8388608, 2));
+  Channel dummy = Channel(() => true, (u8[] m) => { }, () => 0 as i64, () => { });
+  c.ok(p.b.incomingChannel(dummy) is not null, "the first is within the limit");
+  c.ok(p.b.incomingChannel(dummy) is not null, "so is the second");
+  c.ok(p.b.incomingChannel(dummy) is null, "the third is refused");
+  c.eqStr(endOf(p.b), "protocol-error", "and closes the connection with protocol-error");
+  return c.report();
+}
+
+/**
+ * A stream whose channel arrives before the peer's HELLO is staged: counted, its DATA buffered, nothing surfaced —
+ * and surfaced, data intact, the moment the HELLO arrives.
+ *
+ * Would catch: such a stream rejected (a conforming peer's first stream is lost to a race SCTP permits), surfaced
+ * before establishment, or its early DATA dropped.
+ */
+export async string test_a_stream_that_beats_the_hello_is_staged_and_then_surfaced() {
+  Check c = Check.create();
+  Pair p = pair(roomy(), roomy());
+  p.wire.holdControl();
+  await settle(p.wire);
+  c.eqI32(p.a.state, 1, "a is established: b's HELLO reached it");
+  c.eqI32(p.b.state, 0, "b is not: a's HELLO is held back");
+  Stream sa = await openOne(p, p.a, c);
+  Ticket<Result<bool, Reason>> w = sa.write("early".toBytes());
+  sa.closeWrite();
+  Ticket<Result<Stream, Reason>> accepted = p.b.acceptStream();
+  await settle(p.wire);
+  c.no(accepted.settled(), "b surfaces nothing before a's HELLO");
+  c.eqI32(p.b.staged.len(), 1, "but has staged the stream");
+  p.wire.holdControlToB = false;
+  p.wire.releaseHeld();
+  await settle(p.wire);
+  c.ok(accepted.settled(), "with the HELLO in, the stream surfaces");
+  if (accepted.settled()) { c.eqStr(await drain((await accepted).unwrap(), p), "early|end", "with its early bytes"); }
+  return c.report();
+}
+
+/** Without a HELLO by the deadline, a connection times out — the pre-HELLO state is bounded (§8). */
+export async string test_no_hello_by_the_deadline_is_a_timeout() {
+  Check c = Check.create();
+  Pair p = pair(roomy(), roomy());
+  p.wire.holdControl();
+  await settle(p.wire);
+  p.b.tick(HELLO_TIMEOUT_MS - (1 as i64));
+  c.eqStr(endOf(p.b), "open", "a millisecond early, nothing happens");
+  p.b.tick(HELLO_TIMEOUT_MS);
+  c.eqStr(endOf(p.b), "timeout", "at the deadline, the connection times out");
+  return c.report();
+}
+
+/**
+ * Stream slots are recycled: twice the stream limit, opened and finished one after another, all open — Go's
+ * `TestWebRTCStreamSlots_RecycleAcrossManyStreams`, with an echo played by hand.
+ */
+export async string test_stream_slots_recycle_across_many_streams() {
+  Check c = Check.create();
+  Pair p = await up(roomy(), Limits(1048576, 8388608, 3));
+  for (i32 i = 0; i < 6; i++) {
+    Ticket<Result<Stream, Reason>> o = p.a.openStream();
+    await settle(p.wire);
+    if (!o.settled()) { c.fail("open \{i} of 6 waited: a slot was not reclaimed"); break; }
+    Stream s = (await o).unwrap();
+    Stream r = await acceptOne(p, p.b, c);
+    s.write("req-\{i}".toBytes());
+    s.closeWrite();
+    string got = await drain(r, p);
+    r.write(got.slice(0, got.len() - 4).toBytes());
+    r.closeWrite();
+    c.eqStr(await drain(s, p), "req-\{i}|end", "echo \{i}");
+    await settle(p.wire);
+  }
+  return c.report();
+}

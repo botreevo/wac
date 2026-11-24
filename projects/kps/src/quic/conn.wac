@@ -1,0 +1,301 @@
+// A KPS connection over QUIC — SPEC §5.3 and §6.3: wac's `quic.QuicConn` underneath, the KPS API on top.
+//
+// **No framing of our own.** A KPS stream is a QUIC bidirectional stream, closeWrite is FIN, resetWrite is
+// RESET_STREAM, cancelRead is STOP_SENDING, a datagram is a DATAGRAM frame, and a connection's close code is the
+// application code of a CONNECTION_CLOSE. Flow control is QUIC's: the engine advances its windows only as the
+// application reads (§6.3), and retires a peer's stream — returning its slot — only once both halves are done and
+// every byte has been read or discarded.
+//
+// What this file adds is the shape §6.4 asks for: the same results, in the same cases, that the WebRTC mapping
+// gives (`../webrtc/conn.wac`). A read ends in EOF only after the peer's FIN; every other way a stream stops is a
+// failure with a reason.
+//
+// The engine is driven by whoever owns the socket — the dialer, or the listener — through `QuicHost`: the owner
+// feeds datagrams and the clock to `receive` and `tick`, and sends what `take` answers. The application's calls
+// change the engine too, and `kick` tells the owner to send now rather than at its next tick.
+
+import { Map, Queue, Result, Ticket, hashI64, i64Eq } from "core";
+import { quic.QuicConn, quic.QuicEvent } from "wac";
+import { Connection, Stream, ReadResult, CloseInfo, Endpoint } from "../api.wac";
+import { Code, Reason, codeFromWire } from "../errors.wac";
+import { Wakeable } from "../webrtc/flow.wac";
+
+/** How many unacknowledged bytes a stream may have queued before a writer waits. */
+static i64 SEND_QUEUE = 1048576;
+static i32 DATAGRAM_QUEUE = 64;
+
+export struct QuicStream : Stream {
+  QuicKpsConn conn;
+  i64 id;
+  Wakeable readWake = Wakeable.create();
+  Wakeable writeWake = Wakeable.create();
+  Reason? readError = null;
+  Reason? peerStop = null;
+  bool writeClosed = false;
+  CloseInfo? ended = null;
+  Ticket<CloseInfo> endedTicket = Ticket<CloseInfo> { };
+
+  override Ticket<ReadResult> read(this) { return quicRead(this); }
+  override Ticket<Result<bool, Reason>> write(this, u8[] bytes) { return quicWrite(this, bytes); }
+
+  override void closeWrite(this) {
+    if (this.writeClosed) { return; }
+    this.writeClosed = true;
+    this.conn.q.finish(this.id);
+    this.conn.kick();
+  }
+
+  override void cancelRead(this, Reason reason) {
+    if (this.readError is not null) { return; }
+    this.readError = reason.code.isNone() ? Reason.of(Code.Cancelled) : reason;
+    this.conn.q.stopSending(this.id, this.readError!.code.wire());
+    this.readWake.wake();
+    this.conn.kick();
+  }
+
+  override void resetWrite(this, Reason reason) {
+    if (this.writeClosed) { return; }
+    this.writeClosed = true;
+    Reason r = reason.code.isNone() ? Reason.of(Code.Reset) : reason;
+    this.conn.q.resetStream(this.id, r.code.wire());
+    this.writeWake.wake();
+    this.conn.kick();
+  }
+
+  /** As the WebRTC mapping: no code is FIN and stop; a code resets the write half and stops with it. */
+  override void close(this, Reason reason) {
+    if (reason.code.isNone()) {
+      this.closeWrite();
+      this.cancelRead(Reason.of(Code.Closed));
+      return;
+    }
+    this.resetWrite(reason);
+    this.cancelRead(reason);
+  }
+
+  override Ticket<CloseInfo> closed(this) { return this.endedTicket; }
+
+  void settle(this, CloseInfo info) {
+    if (this.ended is not null) { return; }
+    this.ended = info;
+    this.endedTicket.resolve(info);
+    this.readWake.wake();
+    this.writeWake.wake();
+  }
+}
+
+async ReadResult quicRead(QuicStream s) {
+  while (true) {
+    if (s.readError is not null) { return ReadResult.Failed(s.readError!); }
+    QuicKpsConn c = s.conn;
+    u8[] got = c.q.read(s.id);
+    if (got.len() > 0) {
+      c.kick();                 // credit may have moved
+      return ReadResult.Data(got);
+    }
+    i32 st = c.q.recvState(s.id);
+    if (st == 1) { return ReadResult.End; }
+    if (st == 2) {
+      i64 code = c.q.resetCodeOf(s.id);
+      return ReadResult.Failed(Reason.of(code == 0 as i64 ? Code.Reset : codeFromWire(code)));
+    }
+    if (c.ended is not null) { return ReadResult.Failed(c.failure()); }
+    if (st == 3) { return ReadResult.Failed(Reason.saying(Code.NetworkError, "the stream is gone")); }
+    await s.readWake.wait();
+  }
+}
+
+async Result<bool, Reason> quicWrite(QuicStream s, u8[] bytes) {
+  while (true) {
+    QuicKpsConn c = s.conn;
+    if (s.peerStop is not null) { return Result.Err(s.peerStop!); }
+    if (s.writeClosed) { return Result.Err(Reason.saying(Code.Closed, "the write half is closed")); }
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    if (!c.q.hasStream(s.id)) { return Result.Err(Reason.saying(Code.NetworkError, "the stream is gone")); }
+    if (c.q.queued(s.id) < SEND_QUEUE) {
+      if (!c.q.write(s.id, bytes)) { return Result.Err(Reason.saying(Code.NetworkError, "the stream cannot be written")); }
+      c.kick();
+      return Result.Ok(true);
+    }
+    await s.writeWake.wait();
+  }
+}
+
+export struct QuicKpsConn : Connection {
+  QuicConn q;
+  /** Ask the socket's owner to send what the engine has now. */
+  fn<void()> kick;
+  Endpoint remoteEp;
+  Map<i64, QuicStream> streams = Map<i64, QuicStream>.create(hashI64, i64Eq);
+  Queue<QuicStream> incoming = Queue<QuicStream> { };
+  Queue<u8[]> datagrams = Queue<u8[]> { };
+  Wakeable acceptWake = Wakeable.create();
+  Wakeable datagramWake = Wakeable.create();
+  Wakeable openWake = Wakeable.create();
+  Wakeable establishWake = Wakeable.create();
+  bool established = false;
+  CloseInfo? ended = null;
+  Ticket<CloseInfo> endedTicket = Ticket<CloseInfo> { };
+
+  QuicKpsConn make(QuicConn q, Endpoint remote, fn<void()> kick) {
+    return QuicKpsConn { q: q, kick: kick, remoteEp: remote };
+  }
+
+  /** The engine's events, as state here; called by the owner after every `receive` and `tick`. */
+  void pump(this) {
+    for (QuicEvent e in this.q.events()) {
+      match (e) {
+        Connected: {
+          this.established = true;
+          this.establishWake.wake();
+        }
+        StreamOpened(id): {
+          QuicStream s = QuicStream { conn: this, id: id };
+          this.streams.set(id, s);
+          this.incoming.push(s);
+          this.acceptWake.wake();
+        }
+        Readable(id): {
+          QuicStream? s = this.streams.get(id);
+          if (s is not null) { s!.readWake.wake(); }
+        }
+        Writable(id): {
+          QuicStream? s = this.streams.get(id);
+          if (s is not null) { s!.writeWake.wake(); }
+        }
+        StreamReset(id, code): {
+          QuicStream? s = this.streams.get(id);
+          if (s is not null) { s!.readWake.wake(); }
+        }
+        StopSending(id, code): {
+          QuicStream? s = this.streams.get(id);
+          if (s is not null && s!.peerStop is null) {
+            s!.peerStop = Reason.of(code == 0 as i64 ? Code.Cancelled : codeFromWire(code));
+            s!.writeClosed = true;
+            s!.writeWake.wake();
+          }
+        }
+        StreamsAvailable: { this.openWake.wake(); }
+        Datagram(d): {
+          this.datagrams.push(d);
+          if (this.datagrams.len() > DATAGRAM_QUEUE) { this.datagrams.pop(); }
+          this.datagramWake.wake();
+        }
+        Closed(app, code, reason, remote): {
+          if (remote && app) {
+            this.teardown(code == 0 as i64 ? CloseInfo.clean() : CloseInfo.because(Reason.of(codeFromWire(code))));
+          } else if (remote) {
+            this.teardown(CloseInfo.because(Reason.saying(code == 0 as i64 ? Code.Closed : Code.ProtocolError,
+                                                          "the peer closed the connection: \{reason} (\{code})")));
+          } else if (reason == "idle timeout") {
+            this.teardown(CloseInfo.because(Reason.saying(Code.Timeout, "idle timeout")));
+          } else if (!app) {
+            this.teardown(CloseInfo.because(Reason.saying(Code.ProtocolError, "\{reason} (QUIC error \{code})")));
+          }
+        }
+      }
+    }
+    // Streams the engine retired are over: settled, and forgotten here.
+    i64[] ids = this.streams.keys();
+    for (i64 id in ids) {
+      if (!this.q.hasStream(id)) {
+        QuicStream s = this.streams.get(id)!;
+        i32 st = this.q.recvState(id);
+        s.settle(st == 2 ? CloseInfo.because(Reason.of(codeFromWire(this.q.resetCodeOf(id)))) : CloseInfo.clean());
+        this.streams.remove(id);
+        this.openWake.wake();
+      }
+    }
+  }
+
+  /** Settles when the handshake is done (`Ok`) or the connection ended first (`Err`). */
+  Ticket<Result<bool, Reason>> ready(this) { return quicEstablished(this); }
+
+  override Ticket<Result<Stream, Reason>> openStream(this) { return quicOpen(this); }
+  override Ticket<Result<Stream, Reason>> acceptStream(this) { return quicAccept(this); }
+
+  override Result<bool, Reason> sendDatagram(this, u8[] bytes) {
+    if (this.ended is not null) { return Result.Err(this.failure()); }
+    i32 max = this.q.maxDatagram();
+    if (bytes.len() > max) {
+      return Result.Err(Reason.saying(Code.TooLarge, "a datagram may carry at most \{max} bytes here"));
+    }
+    if (!this.q.sendDatagram(bytes)) { return Result.Err(Reason.saying(Code.NetworkError, "the datagram could not be queued")); }
+    this.kick();
+    return Result.Ok(true);
+  }
+
+  override Ticket<Result<u8[], Reason>> receiveDatagram(this) { return quicDatagram(this); }
+
+  override void close(this, Reason reason) {
+    if (this.ended is not null) { return; }
+    this.q.close(reason.code.wire(), "", this.q.lastActivity);
+    this.kick();
+    this.teardown(reason.code.isNone() ? CloseInfo.clean() : CloseInfo.because(reason));
+  }
+
+  override Ticket<CloseInfo> closed(this) { return this.endedTicket; }
+  override Endpoint remote(const this) { return this.remoteEp; }
+
+  Reason failure(this) {
+    if (this.ended is null) { return Reason.saying(Code.Closed, "the connection is closing"); }
+    return this.ended!.ok ? Reason.saying(Code.Closed, "the connection closed") : this.ended!.reason;
+  }
+
+  void teardown(this, CloseInfo info) {
+    if (this.ended is not null) { return; }
+    this.ended = info;
+    i64[] ids = this.streams.keys();
+    for (i64 id in ids) {
+      QuicStream s = this.streams.get(id)!;
+      if (s.readError is null) { s.readError = info.ok ? Reason.saying(Code.Closed, "the connection closed") : info.reason; }
+      s.settle(info);
+    }
+    this.streams = Map<i64, QuicStream>.create(hashI64, i64Eq);
+    this.acceptWake.wake();
+    this.datagramWake.wake();
+    this.openWake.wake();
+    this.establishWake.wake();
+    this.endedTicket.resolve(info);
+  }
+}
+
+async Result<bool, Reason> quicEstablished(QuicKpsConn c) {
+  while (true) {
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    if (c.established) { return Result.Ok(true); }
+    await c.establishWake.wait();
+  }
+}
+
+async Result<Stream, Reason> quicOpen(QuicKpsConn c) {
+  while (true) {
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    if (!c.established) { return Result.Err(Reason.saying(Code.Unsupported, "the connection is not established")); }
+    i64 id = c.q.openStream();
+    if (id >= 0 as i64) {
+      QuicStream s = QuicStream { conn: c, id: id };
+      c.streams.set(id, s);
+      return Result.Ok(s);
+    }
+    await c.openWake.wait();
+  }
+}
+
+async Result<Stream, Reason> quicAccept(QuicKpsConn c) {
+  while (true) {
+    QuicStream? s = c.incoming.pop();
+    if (s is not null) { return Result.Ok(s!); }
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    await c.acceptWake.wait();
+  }
+}
+
+async Result<u8[], Reason> quicDatagram(QuicKpsConn c) {
+  while (true) {
+    u8[]? d = c.datagrams.pop();
+    if (d is not null) { return Result.Ok(d!); }
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    await c.datagramWake.wait();
+  }
+}

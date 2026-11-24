@@ -1,0 +1,949 @@
+// Windows: where they are, which is on top, and how a drag moves or resizes one.
+//
+// **A window is a record, and the desktop draws the records.** Moving one changes four numbers; the
+// window's contents are a component of their own that a move does not touch, so dragging a Files window
+// over a 4,000-row listing costs what the frame costs.
+//
+// Stacking is a z number rather than the order windows sit in the document: raising a window must not
+// move its element, or an editor's caret and a listing's scroll position would go with it.
+
+import { Prefs, defaultPrefs } from "./prefs.wac";
+import { Buf, Ticket, Vec } from "core";
+import { Answer, Child } from "std";
+import { PageServer } from "web";
+import { Grants } from "./grants.wac";
+import { Vfs } from "./vfs.wac";
+import { json.JsonValue } from "wac";
+import { json.parse } from "wac";
+
+export struct Win {
+  i32 id;
+  /**
+   * Which app: "files", "viewer", "editor", "calc", "terminal", "allowed" — the Permissions window — "settings", or
+   * "program", a module from the disk, running.
+   */
+  string app;
+  /** What it shows: a path on the disk, for every app so far. Files keeps its current folder here. */
+  string arg;
+  string title;
+  string icon;
+  i32 x;
+  i32 y;
+  i32 w;
+  i32 h;
+  bool min;
+  bool max;
+  /** 0 floating, 1 the left half of the screen, 2 the right half. */
+  i32 snap;
+  i32 z;
+  /** Bumped when the window's contents must render again — a new `arg`, say. */
+  i32 rev;
+}
+
+export struct Drag {
+  i32 id;
+  /** "move", or the edges a resize moves: "e", "s", "se", "w", "n", "nw", "ne", "sw". */
+  string mode;
+  /** Whether the first pointer position has been seen; a resize starts measuring from it. */
+  bool started;
+  i32 px;
+  i32 py;
+  i32 x;
+  i32 y;
+  i32 w;
+  i32 h;
+  /** Where the window would snap if dropped now: 0 nowhere, 1 left, 2 right, 3 maximised. */
+  i32 hint;
+  /**
+   * Whether the pointer has gone anywhere yet. A press on a title bar is not yet a drag — it may be the
+   * first half of a click on the window's own buttons — so until it moves, nothing about the window
+   * changes; in particular it stays clickable, which a window being dragged is not.
+   */
+  bool moved;
+}
+
+/**
+ * Files being dragged: from a Files window or the desktop, to a folder, the desktop or the Trash.
+ *
+ * **Where the pointer is, is told by what it is over.** A page cannot ask which element is under a point,
+ * so every place that takes a drop listens for the pointer moving over it while a drag is on, and the
+ * innermost says first: a folder row before the listing it is in, the listing before its window, a window
+ * before the desktop behind it. The first to answer `claims` the move; the desktop, last to hear of it,
+ * clears the claim for the next one — and if nobody claimed it, the pointer is over nothing that takes a
+ * drop.
+ */
+export struct FileDrag {
+  /** What is dragged: paths on the disk. */
+  string[] paths;
+  /** Whether the pointer has gone far enough for this to be a drag rather than a click. */
+  bool moved;
+  bool started;
+  i32 px;
+  i32 py;
+  /** The pointer, on the desktop. */
+  i32 x;
+  i32 y;
+  /** The folder it would land in, if `hasOver`, and what to call that. */
+  bool hasOver;
+  string over;
+  string overName;
+  bool claimed;
+  /** Ctrl held: a copy rather than a move. */
+  bool copy;
+}
+
+export struct Desk {
+  Vec<Win> wins;
+  i32 nextId;
+  i32 topZ;
+  /** The window with the focus, or -1. */
+  i32 focused;
+  Vfs fs;
+  /** Bumped whenever the disk changes, so every window showing it looks again. */
+  i32 fsRev;
+  Drag? drag;
+  bool launcher;
+  /** The layout changed and has not been saved. */
+  bool dirty;
+  /**
+   * What is being opened, and what to say if it never finishes: a trap in the archive parsing cannot be
+   * caught, and a timer that finds this still set knows the work died (see `Model.trying`).
+   */
+  string trying;
+  string error;
+  string note;
+  FileDrag? fdrag;
+  /** Cut or copied, waiting to be pasted. */
+  string[] clip;
+  bool clipCut;
+  /** What the last delete put in the Trash, for the Undo beside its note. */
+  string[] undo;
+  /** The desktop's clipboard of text, which programs copy to and paste from through `wac.desktop`. */
+  string clipText;
+  /** How to hand each running program's window the files dropped on it. */
+  Vec<Hand> hands;
+  /** A program's request to choose a file, while the person is choosing: the picker shows over everything. */
+  Picking? picking;
+  /** A program asking for more than it was handed, while the person decides (`services.wac`). */
+  Consent? consent;
+  /** The programs running, each with its windows (`program.wac`). */
+  Vec<Running> running;
+  i32 nextRun;
+  /** Start a program — set once the desktop has a page to start programs from. */
+  fn<void(Start)>? launch;
+  /** Whether the desktop was served from a site, which is mounted at `/site` with the programs built with it. */
+  bool site;
+  /** A program changed the disk, and the windows showing it are about to look again (`program.wac`). */
+  bool lookSoon;
+  /** The launcher's search, the entry chosen with the keys, and the groups folded — kept with the session. */
+  string query;
+  i32 chosen;
+  Vec<string> folded;
+  /** What the person chose in Settings (`prefs.wac`). */
+  Prefs prefs;
+  /**
+   * **A phone's screen**: narrower than a desktop's, or too short for windows (`PHONE_WIDTH`). Every window fills it, the desktop's icons are a
+   * home screen of apps, and the taskbar is a phone's — the apps, home, and what is open.
+   */
+  bool phone;
+  /**
+   * On a phone, what the address says is in front — a window's id, 0 for the home screen, -1 not said yet — so that
+   * each app opened is a place in the browser's history, and Back goes to what was in front before it.
+   */
+  i32 front;
+  /** On a phone, the list of what is open, over everything, to go to or close. */
+  bool recents;
+  /** Where the desktop was served from, to give someone else (`share.wac`); "" opened from a file. */
+  string address;
+  /** The window filling the screen, if one is, and what decides whether a program may have it (`full.wac`). */
+  Full full;
+  /** **A site's apps** (`DeskSite.apps`, `site.wac`), as the launcher, the desktop's icons and its paths know them. */
+  Vec<SiteEntry> extra;
+}
+
+/**
+ * **One of a site's apps**, as the desktop keeps it: the window it opens is app `site:<id>`, and its pages are the paths
+ * that start with `prefix` — `/tour/hello/` is the Tour's window showing `hello`.
+ */
+export struct SiteEntry {
+  string id;
+  string group;
+  string icon;
+  string title;
+  string sub;
+  string prefix;
+  i32 w;
+  i32 h;
+  bool onDesktop;
+}
+
+/** The site's app a window is of — its `app` is `site:<id>` — if it is one. */
+export SiteEntry? siteOf(Desk d, string app) {
+  if (app.len() < 6 || app.slice(0, 5) != "site:") { return null; }
+  string id = app.slice(5, app.len());
+  for (i32 i = 0; i < d.extra.len(); i++) { if (d.extra.get(i).id == id) { return d.extra.get(i); } }
+  return null;
+}
+
+/** The path of the page a site's window shows: its app's prefix, then what it shows. */
+export string pathOf(SiteEntry e, string arg) { return arg == "" ? e.prefix : e.prefix + arg + "/"; }
+
+/**
+ * **A site's window opened on `arg`**, or the one it has brought to `arg` and forward: one window an app, which its
+ * pages are shown in, as a browser's tab shows a site's. On a screen `sw` by `sh`, it opens in the middle of it, clear
+ * of the icons; 0 by 0 when the screen is not known, and it opens where windows do.
+ */
+export Win openSite(Desk d, SiteEntry e, string arg, f64 sw, f64 sh) {
+  for (i32 i = 0; i < d.wins.len(); i++) {
+    Win w = d.wins.get(i);
+    if (w.app != "site:" + e.id) { continue; }
+    if (w.arg != arg) { w.arg = arg; w.rev++; }
+    focus(d, w.id);
+    return w;
+  }
+  Win w = open(d, "site:" + e.id, arg, e.title, e.icon);
+  w.w = e.w;
+  w.h = e.h;
+  if (sw > 0.0) {
+    i32 room = (sw as! i32) - 136;
+    w.w = e.w > room - 24 ? (room - 24 < MIN_W ? MIN_W : room - 24) : e.w;
+    w.x = 136 + (room - w.w) / 2;
+    i32 high = (sh as! i32) - 52;
+    w.h = e.h > high - 40 ? (high - 40 < MIN_H ? MIN_H : high - 40) : e.h;
+    w.y = (high - w.h) / 3;
+    if (w.y < 16) { w.y = 16; }
+  }
+  return w;
+}
+
+/**
+ * **The page at `path`, shown**: the window of the site's app whose prefix it starts with, on the rest of it — opened,
+ * or brought there and forward. Answers that window's id, or -1 for a path no app of the site has.
+ */
+export i32 showPath(Desk d, string path, f64 sw, f64 sh) {
+  for (i32 i = 0; i < d.extra.len(); i++) {
+    SiteEntry e = d.extra.get(i);
+    i32 n = e.prefix.len();
+    if (path.len() < n || path.slice(0, n) != e.prefix) { continue; }
+    string rest = path.slice(n, path.len());
+    if (rest.len() > 0 && rest.slice(rest.len() - 1, rest.len()) == "/") { rest = rest.slice(0, rest.len() - 1); }
+    return openSite(d, e, rest, sw, sh).id;
+  }
+  return 0 - 1;
+}
+
+/** **Where the address says the reader is**: the page of the site's window in front, or the site's root. */
+export string frontPath(Desk d) {
+  Win? w = find(d, d.focused);
+  if (w is null || w!.min) { return "/"; }
+  SiteEntry? e = siteOf(d, w!.app);
+  return e is null ? "/" : pathOf(e!, w!.arg);
+}
+
+/** **Back to the site's root**: its windows put away, so the address and the desktop agree. */
+export void homeSite(Desk d) {
+  for (i32 i = 0; i < d.wins.len(); i++) {
+    Win w = d.wins.get(i);
+    if (siteOf(d, w.app) is not null && !w.min) { minimise(d, w.id); }
+  }
+}
+
+/**
+ * **Full screen, the desktop's to give and its way out its own** (`full.wac`): which window fills the screen, the last
+ * tap or key in a window — a program is given full screen only just after one in its own window — and when it was
+ * last left, so a program cannot take it back without another.
+ */
+export struct Full {
+  /** The window filling the screen, or -1. */
+  i32 win;
+  i32 tappedWin;
+  f64 tappedAt;
+  /** When full screen began, and when it last ended — by the person or the desktop. */
+  f64 since;
+  f64 leftAt;
+  /** The bar the handle opens: the way out, and home. */
+  bool bar;
+  /** The browser's full screen asked for and not yet begun: what it says of an earlier one meanwhile is out of date. */
+  bool asking;
+  /** **The desktop as a whole fills the screen**, as the person chose in Settings — windows, taskbar and all. */
+  bool whole;
+  /** Whether the browser's full screen was last asked for or left: the desktop as a whole, or a window, wants it. */
+  bool shown;
+  /** Settings' "every time" has had its turn since the desktop opened: once left, it waits for the next opening. */
+  bool autoTried;
+  /** The browser's own full screen for the desktop's page, asked for or left — set by the desktop's view. */
+  fn<void(bool)>? screen;
+}
+
+/**
+ * Narrower than this, in CSS pixels, a screen is a phone's — or, shorter than `PHONE_HEIGHT` and narrower than
+ * `PHONE_SIDEWAYS`, a phone on its side; a desktop's window that is merely short stays a desktop.
+ */
+export static i32 PHONE_WIDTH = 700;
+
+/** Whether a screen `w` by `h` CSS pixels is a phone's (`PHONE_WIDTH`, `PHONE_HEIGHT`, `PHONE_SIDEWAYS`). */
+export bool phoneAt(f64 w, f64 h) {
+  return w < (PHONE_WIDTH as f64) || (h < (PHONE_HEIGHT as f64) && w < (PHONE_SIDEWAYS as f64));
+}
+
+/**
+ * **The same rule as a CSS media query**, for the frame drawn at build time (`prerendered` in `../desktop.wac`): the
+ * browser shows the phone's frame to the windows `phoneAt` says are phones, before the module has run to say so.
+ */
+export string phoneQuery() {
+  return "(max-width: \{PHONE_WIDTH - 1}.98px), (max-height: \{PHONE_HEIGHT - 1}.98px) and (max-width: \{PHONE_SIDEWAYS - 1}.98px)";
+}
+export static i32 PHONE_HEIGHT = 500;
+export static i32 PHONE_SIDEWAYS = 1000;
+
+/** What is in front: the focused window, if one is showing, or 0 — nothing, the home screen. */
+export i32 frontOf(Desk d) {
+  Win? w = find(d, d.focused);
+  return w is null || w!.min ? 0 : w!.id;
+}
+
+/** The home screen: every window put away, none closed. */
+export void goHome(Desk d) {
+  for (i32 i = 0; i < d.wins.len(); i++) { if (!d.wins.get(i).min) { minimise(d, d.wins.get(i).id); } }
+  d.focused = 0 - 1;
+}
+
+/**
+ * The address says `where` is in front — the browser's Back or Forward, on a phone: `w` and a window's id, which comes
+ * forward if it is still open, or nothing, the home screen. A window closed since is the home screen too.
+ */
+export void followTo(Desk d, string where) {
+  i32 id = 0;
+  if (where.len() > 1 && where.slice(0, 1) == "w") {
+    u8[] b = where.slice(1, where.len()).toBytes();
+    for (i32 i = 0; i < b.len(); i++) {
+      if (b[i] < '0' || b[i] > '9') { id = 0; break; }
+      id = id * 10 + (b[i] - '0') as i32;
+    }
+  }
+  if (id > 0 && find(d, id) is not null) { focus(d, id); } else { goHome(d); }
+  d.launcher = false;
+  d.recents = false;
+  d.front = frontOf(d);
+}
+
+/** Where a window goes, and how it was: what a session keeps of one, to put it back. */
+export struct Placed {
+  i32 x;
+  i32 y;
+  i32 w;
+  i32 h;
+  i32 snap;
+  bool min;
+  bool max;
+  bool focused;
+  /**
+   * Which of its program's windows it was, and its title then. The first window is found again by its slot; any
+   * other by its title — a program reopening its windows after a reload is handed slots in the order it opens them,
+   * which need not be the order they had, while the IDE's, say, are titled by their projects.
+   */
+  i32 slot;
+  string title;
+}
+
+/**
+ * How a program is started: its module, its arguments, and what it is handed besides its own folder and what it
+ * was allowed before. The desktop's own apps (`builtin.wac`) are started so; a module from the disk is handed
+ * nothing (`startOf`).
+ */
+export struct Start {
+  string path;
+  string[] args;
+  /** Granted for this run only: never remembered, and gone when the program ends. */
+  Grants given;
+  /** Its first window's size, `0` for the desktop's choice; its icon on the window and the taskbar. */
+  i32 width;
+  i32 height;
+  string icon;
+  /**
+   * Whether files dropped on its windows are its (its page's `nextFile`). A program from the disk might want them,
+   * so it has them; one of the desktop's own apps that does nothing with them leaves them to land on the desktop.
+   */
+  bool takesFiles;
+  /**
+   * Which of the desktop's own apps it is, and what it was opened on — `""` for a module from the disk. A session
+   * keeps a desktop app's window as these, and starts it again; a module from the disk is not started again.
+   */
+  string app;
+  string arg;
+  /** Where its windows go, when a session is putting them back; each used once. */
+  Vec<Placed> places;
+}
+
+/** A module from the disk, started as itself: no arguments, and nothing handed it. */
+export Start startOf(string path) { return Start(path, string[](), Grants.create(), 0, 0, "terminal", true, "", "", Vec.create()); }
+
+/** Where a session had window `slice` of a program, titled `title`: taken from `places`, or null. */
+Placed? placeFor(Vec<Placed> places, i32 slice, string title) {
+  for (i32 i = 0; i < places.len(); i++) {
+    Placed p = places.get(i);
+    if (slice == 0 ? p.slot == 0 : (p.slot != 0 && p.title == title)) {
+      places.remove(i);
+      return p;
+    }
+  }
+  return null;
+}
+
+/** How many windows a program may have open at once: its share of `wac.page`'s numbers is this many slices. */
+export static i32 MAX_WINDOWS = 16;
+/** A program's window slot that has not been opened, and one the person closed. */
+export static i32 NO_WINDOW = 0 - 1;
+export static i32 CLOSED_WINDOW = 0 - 2;
+
+/** A request for a window that has not drawn yet: answered through the window's server once it has. */
+export struct Pending {
+  i32 slice;
+  i32 k;
+  i64 a;
+  i64 b;
+  string text;
+  u8[] bytes;
+  Ticket<Answer> answer;
+}
+
+/**
+ * A program started from the disk: what it may reach, its process, and its windows — by slot, each the desktop's
+ * window for it (`NO_WINDOW`, `CLOSED_WINDOW`), the server drawing into it once it has drawn, and what waits for it.
+ */
+export struct Running {
+  i32 id;
+  string path;
+  /** What the picker and the notes call it: its first window's title, or its file's name until it has one. */
+  string title;
+  Grants grants;
+  /** How it was started, which a session keeps for one of the desktop's own apps. */
+  Start start;
+  Child? child;
+  Vec<i32> wins;
+  Vec<PageServer?> servers;
+  Vec<Pending> waiting;
+  /** Whether it has had a window at all — one that never has is a program with nothing to show. */
+  bool shown;
+  bool done;
+}
+
+/** Program `id`, if it is still running. */
+export Running? runningOf(Desk d, i32 id) {
+  for (i32 i = 0; i < d.running.len(); i++) { if (d.running.get(i).id == id) { return d.running.get(i); } }
+  return null;
+}
+
+/** Open the window in slot `slice` of program `r`, titled. Its body draws itself, and its requests wait until then. */
+export Win openWindowFor(Desk d, Running r, i32 slice, string title) {
+  // A window a session puts back arrives after the rest, as its program starts: it is not to take the focus from the
+  // window that had it unless it had it itself.
+  i32 before = d.focused;
+  Win w = open(d, "program", "\{r.id}/\{slice}", title, r.start.icon);
+  Placed? p = placeFor(r.start.places, slice, title);
+  if (p is not null) {
+    {
+      w.x = p!.x;
+      w.y = p!.y;
+      w.w = p!.w < MIN_W ? MIN_W : p!.w;
+      w.h = p!.h < MIN_H ? MIN_H : p!.h;
+      w.snap = p!.snap;
+      w.max = p!.max;
+      if (p!.min) { minimise(d, w.id); }
+      if (!p!.focused && before >= 0 && before != w.id) { focus(d, before); }
+    }
+  } else if (slice == 0) {
+    if (r.start.width > 0) { w.w = r.start.width; }
+    if (r.start.height > 0) { w.h = r.start.height; }
+  }
+  r.wins.set(slice, w.id);
+  r.shown = true;
+  return w;
+}
+
+/** A program window that takes the files dropped on it: `give` hands one over, as the page's `nextFile`. */
+export struct Hand {
+  i32 win;
+  fn<void(bool, string, u8[])> give;
+}
+
+/** The picker, open for a program: who asked and what for, the folder shown, and what to tell with the choice. */
+export struct Picking {
+  string who;
+  string what;
+  string dir;
+  /** The path chosen, from the disk's root — or `""` for nothing. */
+  fn<void(string)> chose;
+}
+
+/** A program asking to read `path` — and to change it, when `write` — and what to tell with the person's answer. */
+export struct Consent {
+  string who;
+  string path;
+  bool write;
+  fn<void(bool)> answer;
+}
+
+/** How to hand files to window `id`, if it is a program's that takes them. */
+export Hand? handFor(Desk d, i32 id) {
+  for (i32 i = 0; i < d.hands.len(); i++) { if (d.hands.get(i).win == id) { return d.hands.get(i); } }
+  return null;
+}
+
+export void dropHand(Desk d, i32 id) {
+  for (i32 i = 0; i < d.hands.len(); i++) {
+    if (d.hands.get(i).win == id) {
+      d.hands.remove(i);
+      return;
+    }
+  }
+}
+
+static i32 MIN_W = 320;
+static i32 MIN_H = 200;
+
+export Desk newDesk(Vfs fs) {
+  return Desk(Vec.create(), 1, 1, -1, fs, 0, null, false, false, "", "", "", null, string[](), false, string[](), "",
+              Vec.create(), null, null, Vec.create(), 1, null, false, false, "", 0, Vec.create(), defaultPrefs(), false, 0 - 1,
+              false, "", Full(0 - 1, 0 - 1, 0.0 - 1.0, 0.0, 0.0, false, false, false, false, false, null), Vec.create());
+}
+
+export Win? find(Desk d, i32 id) {
+  for (i32 i = 0; i < d.wins.len(); i++) { if (d.wins.get(i).id == id) { return d.wins.get(i); } }
+  return null;
+}
+
+/** Open a window — or, when one of `app` already shows `arg`, bring that one forward instead. */
+export Win open(Desk d, string app, string arg, string title, string icon) {
+  for (i32 i = 0; i < d.wins.len(); i++) {
+    Win w = d.wins.get(i);
+    if (w.app == app && (w.arg == arg || app == "calc") && app != "files" && app != "terminal") { focus(d, w.id); return w; }
+  }
+  // Each new window steps down and right from the last, and wraps before it walks off a laptop screen.
+  i32 n = d.wins.len() % 8;
+  bool wide = app == "files";
+  bool small = app == "calc";
+  // Clear of the desktop's column of icons, which is 120 pixels wide.
+  Win w = Win(d.nextId, app, arg, title, icon, 136 + n * 34, 36 + n * 30, wide ? 980 : (small ? 340 : 760),
+              wide ? 600 : (small ? 540 : 560), false, false, 0, 0, 0);
+  d.nextId++;
+  d.wins.push(w);
+  focus(d, w.id);
+  d.dirty = true;
+  return w;
+}
+
+export void focus(Desk d, i32 id) {
+  Win? w = find(d, id);
+  if (w is null) { return; }
+  d.launcher = false;
+  if (d.focused == id && w!.z == d.topZ && !w!.min) { return; }
+  d.topZ++;
+  w!.z = d.topZ;
+  w!.min = false;
+  d.focused = id;
+  d.dirty = true;
+}
+
+export void close(Desk d, i32 id) {
+  for (i32 i = 0; i < d.wins.len(); i++) {
+    if (d.wins.get(i).id == id) { d.wins.remove(i); break; }
+  }
+  if (d.focused == id) { d.focused = topmost(d); }
+  d.dirty = true;
+}
+
+export void minimise(Desk d, i32 id) {
+  Win? w = find(d, id);
+  if (w is null) { return; }
+  w!.min = true;
+  if (d.focused == id) { d.focused = topmost(d); }
+  d.dirty = true;
+}
+
+/** The visible window highest in the stack, or -1. */
+i32 topmost(Desk d) {
+  i32 best = -1;
+  i32 z = -1;
+  for (i32 i = 0; i < d.wins.len(); i++) {
+    Win w = d.wins.get(i);
+    if (!w.min && w.z > z) { z = w.z; best = w.id; }
+  }
+  return best;
+}
+
+export void toggleMax(Desk d, i32 id) {
+  Win? w = find(d, id);
+  if (w is null) { return; }
+  if (w!.max || w!.snap != 0) { w!.max = false; w!.snap = 0; } else { w!.max = true; }
+  focus(d, id);
+  d.dirty = true;
+}
+
+/** A taskbar button: bring a window forward, or put the window in front away. */
+export void taskbarClick(Desk d, i32 id) {
+  Win? w = find(d, id);
+  if (w is null) { return; }
+  if (!w!.min && d.focused == id) { minimise(d, id); } else { focus(d, id); }
+}
+
+// ── dragging ────────────────────────────────────────────────────────────────
+
+/** A title bar pressed at (`px`, `py`) on the desktop. */
+export void startMove(Desk d, i32 id, i32 px, i32 py) {
+  Win? w = find(d, id);
+  if (w is null) { return; }
+  focus(d, id);
+  d.drag = Drag(id, "move", true, px, py, w!.x, w!.y, w!.w, w!.h, 0, false);
+}
+
+/**
+ * An edge or a corner pressed at (`px`, `py`) on the desktop. A snapped window shows a size its record
+ * does not hold, so for one of those the next pointer move is where the resize is measured from instead.
+ */
+export void startResize(Desk d, i32 id, string edges, i32 px, i32 py) {
+  Win? w = find(d, id);
+  if (w is null) { return; }
+  focus(d, id);
+  bool exact = w!.snap == 0 && !w!.max;
+  d.drag = Drag(id, edges, exact, px, py, w!.x, w!.y, w!.w, w!.h, 0, false);
+}
+
+bool has(string s, string c) { return s.indexOf(c) >= 0; }
+
+/** The pointer is at (`px`, `py`) on the desktop. Answers whether anything moved. */
+export bool dragTo(Desk d, i32 px, i32 py) {
+  Drag? g = d.drag;
+  if (g is null) { return false; }
+  Win? found = find(d, g!.id);
+  if (found is null) { d.drag = null; return false; }
+  Win w = found!;
+  Drag dr = g!;
+  if (!dr.started) {
+    dr.started = true;
+    dr.px = px;
+    dr.py = py;
+    // A snapped or maximised window resizes from the size it shows, which is not its record's.
+    w.max = false;
+    w.snap = 0;
+    return false;
+  }
+  i32 dx = px - dr.px;
+  i32 dy = py - dr.py;
+  if (!dr.moved) {
+    if (dx * dx + dy * dy < 16) { return false; }
+    dr.moved = true;
+  }
+  if (dr.mode == "move") {
+    if (w.max || w.snap != 0) {
+      // Pulled out of a maximised or snapped place: it goes back to its own size, under the pointer.
+      if (dx * dx + dy * dy < 36) { return false; }
+      w.max = false;
+      w.snap = 0;
+      dr.x = px - w.w / 2;
+      dr.y = py - 16;
+      dr.px = px;
+      dr.py = py;
+      dx = 0;
+      dy = 0;
+    }
+    w.x = dr.x + dx;
+    w.y = dr.y + dy < 0 ? 0 : dr.y + dy;
+    dr.hint = py <= 2 ? 3 : (px <= 4 ? 1 : 0);
+  } else {
+    i32 x = dr.x;
+    i32 y = dr.y;
+    i32 ww = dr.w;
+    i32 hh = dr.h;
+    if (has(dr.mode, "e")) { ww = dr.w + dx; }
+    if (has(dr.mode, "s")) { hh = dr.h + dy; }
+    if (has(dr.mode, "w")) { ww = dr.w - dx; x = dr.x + dx; }
+    if (has(dr.mode, "n")) { hh = dr.h - dy; y = dr.y + dy; }
+    if (ww < MIN_W) { if (has(dr.mode, "w")) { x = x - (MIN_W - ww); } ww = MIN_W; }
+    if (hh < MIN_H) { if (has(dr.mode, "n")) { y = y - (MIN_H - hh); } hh = MIN_H; }
+    w.x = x;
+    w.y = y < 0 ? 0 : y;
+    w.w = ww;
+    w.h = hh;
+  }
+  return true;
+}
+
+/** The right edge was reached during a move: the desktop's width is the browser's, so it says when. */
+export void hintRight(Desk d) {
+  Drag? g = d.drag;
+  if ((g is not null) && g!.mode == "move") { g!.hint = 2; }
+}
+
+/** The pointer was let go. */
+export void endDrag(Desk d) {
+  Drag? g = d.drag;
+  d.drag = null;
+  if (g is null) { return; }
+  Win? w = find(d, g!.id);
+  if (w is null) { return; }
+  // Snapped or maximised, a window keeps the place it was dragged from, to go back to when it is restored.
+  if (g!.hint == 3) { w!.max = true; w!.x = g!.x; w!.y = g!.y; }
+  else if (g!.hint == 1 || g!.hint == 2) { w!.snap = g!.hint; w!.x = g!.x; w!.y = g!.y; }
+  d.dirty = true;
+}
+
+// ── dragging files ──────────────────────────────────────────────────────────
+
+/** A press on files that may become a drag of them. */
+export void pressFiles(Desk d, string[] paths) {
+  d.fdrag = FileDrag(paths, false, false, 0, 0, 0, 0, false, "", "", false, false);
+}
+
+/** Whether `path` is in the system a shell has mounted — `/bin`, `/dev`, `/proc` — which nothing may be written into. */
+export bool systemPath(string path) {
+  string[] mounts = ["bin", "dev", "proc"];
+  for (i32 i = 0; i < mounts.len(); i++) {
+    if (path == mounts[i] || (path.len() > mounts[i].len() && path.slice(0, mounts[i].len() + 1) == mounts[i] + "/")) { return true; }
+  }
+  return false;
+}
+
+/** Whether `paths` may be dropped in `dir`: not into where they are, nor into themselves. */
+export bool canDrop(string[] paths, string dir) {
+  if (paths.len() == 0 || systemPath(dir)) { return false; }
+  for (i32 i = 0; i < paths.len(); i++) {
+    string p = paths[i];
+    string parent = "";
+    u8[] b = p.toBytes();
+    for (i32 k = b.len() - 1; k >= 0; k--) { if (b[k] == '/') { parent = p.slice(0, k); break; } }
+    if (parent == dir) { return false; }
+    if (dir == p || (dir.len() > p.len() && dir.slice(0, p.len() + 1) == p + "/")) { return false; }
+  }
+  return true;
+}
+
+/** The pointer moved over a place that takes drops — `dir`, called `name` — or over nothing that does (`dir` null). */
+export void hover(Desk d, string? dir, string name) {
+  FileDrag? g = d.fdrag;
+  if ((g is null) || !g!.moved || g!.claimed) { return; }
+  g!.claimed = true;
+  g!.hasOver = (dir is not null) && canDrop(g!.paths, dir!);
+  g!.over = g!.hasOver ? dir! : "";
+  g!.overName = g!.hasOver ? name : "";
+}
+
+/** The pointer is at (`px`, `py`) on the desktop, after everything under it has had its say. */
+export bool dragFilesTo(Desk d, i32 px, i32 py, bool copy) {
+  FileDrag? g = d.fdrag;
+  if (g is null) { return false; }
+  FileDrag f = g!;
+  if (!f.started) { f.started = true; f.px = px; f.py = py; return false; }
+  if (!f.moved) {
+    i32 dx = px - f.px;
+    i32 dy = py - f.py;
+    if (dx * dx + dy * dy < 25) { return false; }
+    f.moved = true;
+  }
+  if (!f.claimed) { f.hasOver = false; f.over = ""; f.overName = ""; }
+  f.claimed = false;
+  f.x = px;
+  f.y = py;
+  f.copy = copy;
+  return true;
+}
+
+// ── the layout, saved ───────────────────────────────────────────────────────
+
+export static string SESSION = ".desktop/session.json";
+
+export void str(Buf b, string s) {
+  b.push('"');
+  u8[] bytes = s.toBytes();
+  for (i32 i = 0; i < bytes.len(); i++) {
+    u8 c = bytes[i];
+    if (c == '"' || c == '\\') { b.push('\\'); b.push(c); }
+    else if (c < 32) { b.pushStr("\\u00"); b.push("0123456789abcdef".toBytes()[(c >> 4) as i32]); b.push("0123456789abcdef".toBytes()[(c & 15) as i32]); }
+    else { b.push(c); }
+  }
+  b.push('"');
+}
+
+/** The windows as JSON. */
+export u8[] sessionOf(Desk d) {
+  Buf b = Buf.create();
+  b.pushStr("{\"windows\":[");
+  // Saved bottom to top, so reading them back in order restores the stacking.
+  i32[] order = i32[].filled(d.wins.len(), 0);
+  for (i32 i = 0; i < order.len(); i++) { order[i] = i; }
+  for (i32 i = 1; i < order.len(); i++) {
+    i32 k = order[i];
+    i32 j = i - 1;
+    while (j >= 0 && d.wins.get(order[j]).z > d.wins.get(k).z) { order[j + 1] = order[j]; j--; }
+    order[j + 1] = k;
+  }
+  i32 wrote = 0;
+  for (i32 i = 0; i < order.len(); i++) {
+    Win w = d.wins.get(order[i]);
+    // A program's window is its process's, which a reload does not bring back — except a window of one of the
+    // desktop's own apps, kept as the app and what it was opened on, which is started again, and which slot of it
+    // the window was: the app opens its windows again, and each goes back where it was.
+    string app = w.app;
+    string arg = w.arg;
+    i32 slot = 0;
+    if (app == "program") {
+      Running? r = programOf(d, w);
+      if (r is null || r!.start.app == "") { continue; }
+      slot = 0 - 1;
+      for (i32 k = 0; k < MAX_WINDOWS; k++) { if (r!.wins.get(k) == w.id) { slot = k; } }
+      if (slot < 0) { continue; }
+      app = "start:" + r!.start.app;
+      arg = r!.start.arg;
+    }
+    if (wrote > 0) { b.push(','); }
+    wrote++;
+    b.pushStr("{\"app\":"); str(b, app);
+    b.pushStr(",\"arg\":"); str(b, arg);
+    b.pushStr(",\"title\":"); str(b, w.title);
+    b.pushStr(",\"icon\":"); str(b, w.icon);
+    b.pushStr(",\"x\":\{w.x},\"y\":\{w.y},\"w\":\{w.w},\"h\":\{w.h},\"snap\":\{w.snap}");
+    b.pushStr(",\"min\":\{w.min ? "true" : "false"},\"max\":\{w.max ? "true" : "false"}");
+    if (slot != 0) { b.pushStr(",\"slot\":\{slot}"); }
+    b.pushStr(",\"focused\":\{d.focused == w.id ? "true" : "false"}}");
+  }
+  b.pushStr("],\"folded\":[");
+  for (i32 i = 0; i < d.folded.len(); i++) {
+    if (i > 0) { b.push(','); }
+    str(b, d.folded.get(i));
+  }
+  b.pushStr("]}");
+  return b.take();
+}
+
+i32 num(JsonValue o, string k, i32 otherwise) {
+  JsonValue? v = o.member(k);
+  if (v is null) { return otherwise; }
+  return match (v!) { Number(x, raw): x as~ i32, default: otherwise };
+}
+
+export string text(JsonValue o, string k) {
+  JsonValue? v = o.member(k);
+  if (v is null) { return ""; }
+  return match (v!) { Str(b): string.fromBytes(b), default: "" };
+}
+
+export bool flag(JsonValue o, string k) {
+  JsonValue? v = o.member(k);
+  if (v is null) { return false; }
+  return match (v!) { Bool(b): b, default: false };
+}
+
+/** The program whose window `w` is, from its `arg`, `<program>/<slot>`. */
+Running? programOf(Desk d, Win w) {
+  i32 cut = w.arg.indexOf("/");
+  if (cut < 0) { return null; }
+  i32 id = 0;
+  u8[] b = w.arg.slice(0, cut).toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return null; }
+    id = id * 10 + (b[i] as i32 - 48);
+  }
+  return runningOf(d, id);
+}
+
+/**
+ * Restore windows from saved JSON; answers how many came back. A damaged file restores nothing. One of the desktop's
+ * own apps is handed to `again` — the app, what it was opened on, and where each of its windows was — to start once
+ * more, after every other window is back.
+ */
+export i32 restore(Desk d, u8[] json, fn<void(string, string, Vec<Placed>)> again) {
+  Vec<string> apps = Vec.create();
+  Vec<string> args = Vec.create();
+  Vec<Vec<Placed>> placed = Vec.create();
+  JsonValue? doc = parse(json).ok();
+  if (doc is null) { return 0; }
+  // The launcher's groups folded.
+  JsonValue? fs = doc!.member("folded");
+  if (fs is not null) {
+    match (fs!) {
+      Array(items): {
+        for (i32 i = 0; i < items.len(); i++) {
+          match (items.get(i)) {
+            Str(b): { d.folded.push(string.fromBytes(b)); }
+            default: { }
+          }
+        }
+      }
+      default: { }
+    }
+  }
+  JsonValue? ws = doc!.member("windows");
+  if (ws is null) { return 0; }
+  i32 n = 0;
+  i32 focusId = -1;
+  match (ws!) {
+    Array(items): {
+      for (i32 i = 0; i < items.len(); i++) {
+        JsonValue o = items.get(i);
+        string app = text(o, "app");
+        if (app == "") { continue; }
+        // The desktop's own apps, and — from a session saved before they were programs — the windows they had then.
+        bool builtin = app == "viewer" || app == "editor" || app == "terminal" || app == "calc";
+        if (builtin || (app.len() > 6 && app.slice(0, 6) == "start:")) {
+          string which = builtin ? app : app.slice(6, app.len());
+          string on = app == "calc" ? "" : text(o, "arg");
+          Placed p = Placed(num(o, "x", 0), num(o, "y", 0), num(o, "w", 0), num(o, "h", 0), num(o, "snap", 0),
+                            flag(o, "min"), flag(o, "max"), flag(o, "focused"), num(o, "slot", 0), text(o, "title"));
+          i32 at = 0 - 1;
+          for (i32 k = 0; k < apps.len(); k++) { if (apps.get(k) == which && args.get(k) == on) { at = k; } }
+          if (at < 0) {
+            apps.push(which);
+            args.push(on);
+            placed.push(Vec.create());
+            at = apps.len() - 1;
+          }
+          placed.get(at).push(p);
+          n++;
+          continue;
+        }
+        Win w = open(d, app, text(o, "arg"), text(o, "title"), text(o, "icon"));
+        w.x = num(o, "x", w.x);
+        w.y = num(o, "y", w.y);
+        w.w = num(o, "w", w.w) < MIN_W ? MIN_W : num(o, "w", w.w);
+        w.h = num(o, "h", w.h) < MIN_H ? MIN_H : num(o, "h", w.h);
+        w.snap = num(o, "snap", 0);
+        w.max = flag(o, "max");
+        if (flag(o, "focused")) { focusId = w.id; }
+        if (flag(o, "min")) { minimise(d, w.id); }
+        n++;
+      }
+    }
+    default: { }
+  }
+  if (focusId >= 0) { focus(d, focusId); }
+  for (i32 k = 0; k < apps.len(); k++) { again(apps.get(k), args.get(k), placed.get(k)); }
+  d.dirty = false;
+  return n;
+}
+
+/**
+ * The drag as a window's contents need it: "" when there is none, `"*"` while one is over nothing that
+ * takes it, `"*=" + folder` while one is over a folder that does. A string, so a window redraws when it
+ * changes and not otherwise.
+ */
+export string dropKey(Desk d) {
+  FileDrag? g = d.fdrag;
+  if ((g is null) || !g!.moved) { return ""; }
+  return g!.hasOver ? "*=" + g!.over : "*";
+}
+
+export bool dragging(string drop) { return drop != ""; }
+export bool dropOn(string drop, string path) { return drop == "*=" + path; }
+
+/** `from` is now at `to`: every window showing it, or something inside it, follows. */
+export void moved(Desk d, string from, string to) {
+  for (i32 i = 0; i < d.wins.len(); i++) {
+    Win w = d.wins.get(i);
+    if (w.arg == from) { w.arg = to; }
+    else if (w.arg.len() > from.len() && w.arg.slice(0, from.len() + 1) == from + "/") { w.arg = to + w.arg.slice(from.len(), w.arg.len()); }
+    else { continue; }
+    if (w.app != "files" && w.app != "terminal") { u8[] b = w.arg.toBytes(); i32 k = b.len() - 1; while (k >= 0 && b[k] != '/') { k--; } w.title = w.arg.slice(k + 1, w.arg.len()); }
+    w.rev++;
+    d.dirty = true;
+  }
+}

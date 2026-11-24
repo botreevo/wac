@@ -1,0 +1,219 @@
+// Archive Explorer: drop a file, and look inside it.
+//
+// zip, tar, gzip and zstd open as folders — and so does an archive inside one of those, as deep as
+// they go. Everything happens in this tab: the page has no network, and nothing is kept once it closes.
+
+import { Ticket, Vec } from "core";
+import { ElementEvent, MOD_SHIFT, Node, Page, Picked, Ref, Ui, html.b, html.button, html.div, html.em, html.h1, html.h2,
+         html.header, html.i, html.input, html.nav, html.section, html.label, html.p, html.span, html.style } from "web";
+import { Archive, Entry } from "./archive.wac";
+import { css } from "./style.wac";
+import { Level, Model, emptyModel, goUp, hasFile, openFolder, openRoot, top } from "./model.wac";
+import { crumbs, folderPicker, listing, nested, picker, plural } from "./browse.wac";
+import { icon, preview } from "./preview.wac";
+
+/**
+ * How long without another file before a folder counts as all here. A folder's files arrive one at a
+ * time, each when the browser has read it, and nothing says which is the last.
+ */
+static i32 QUIET = 600;
+
+/** What to do instead, when dropping a folder cannot work; the error shows a button for it. */
+static string FOLDER_HINT = "Use Choose a folder instead, or serve the page (wac task serve).";
+
+/** An error, with a folder picker beside it when the error says to use one. */
+Node errorBox(Model m, string style) {
+  return <div class="error" style={style}>{icon("alert", "")}<span>{m.error}</span>
+    {m.error.indexOf(FOLDER_HINT) >= 0 ? folderPicker("btn", "Choose a folder") : Node.Text("")}</div>;
+}
+
+/** How long a file on its own waits to see whether others were dropped with it. */
+static i32 GRACE = 200;
+
+/**
+ * Each file dropped or picked, for as long as the page lives.
+ *
+ * **Files that arrive together open together.** A file named with a `/` is from a folder, and is
+ * gathered until a moment passes with no more; a file on its own waits a shorter moment, and if
+ * anything follows it — a folder dropped beside it, or more files — they all open as one folder.
+ *
+ * **This loop only gathers.** Opening can trap on a damaged file, and a loop that died while asking for
+ * the next file would leave its request first in the page's queue, to swallow whatever came next. So
+ * the opening is a task of its own, started and not awaited: when it dies, this goes on.
+ */
+async void files(Page page, Model m, fn<void()> bump) {
+  Vec<Picked> batch = Vec.create();
+  Ticket<Picked> next = page.nextFile();
+  while (true) {
+    if (batch.len() == 0) {
+      await next;
+    } else {
+      bool alone = batch.len() == 1 && batch.get(0).name.indexOf("/") < 0;
+      Ticket<f64> quiet = page.sleep(alone ? GRACE : QUIET);
+      await Ticket.any(next, quiet);
+      if (!next.settled()) {
+        Vec<Picked> done = batch;
+        batch = Vec.create();
+        if (alone) { openOne(page, m, bump, done.get(0)); } else { openBatch(page, m, done); bump(); }
+        continue;
+      }
+    }
+    Picked f = next.value();
+    next = page.nextFile();
+    batch.push(f);
+    m.error = "";
+    bool loneSoFar = batch.len() == 1 && f.name.indexOf("/") < 0;
+    m.busy = loneSoFar ? "Opening \{f.name}…" : "Reading \{plural(batch.len(), "file")}…";
+    bump();
+  }
+}
+
+/** One file on its own: an archive to open, or a file to show. */
+async void openOne(Page page, Model m, fn<void()> bump, Picked f) {
+  if (!f.ok) {
+    m.busy = "";
+    m.error = f.error.indexOf("dropped folder") >= 0
+      ? "This browser won't let a page opened from a file read a dropped folder. \{FOLDER_HINT}"
+      : "\{f.name} could not be read: \{f.error}";
+    bump();
+    return;
+  }
+  await page.painted();
+  m.trying = "\{f.name} could not be opened: its data is damaged or truncated";
+  openRoot(m, f.name, f.bytes);
+  m.trying = "";
+  m.busy = "";
+  if (hasFile(m) && m.error == "") { page.title("\{f.name} — Archive Explorer"); }
+  bump();
+}
+
+/** A gathered folder, opened: what was read becomes the folder, and what was not is counted. */
+void openBatch(Page page, Model m, Vec<Picked> batch) {
+  i32 failed = 0;
+  for (i32 i = 0; i < batch.len(); i++) { if (!batch.get(i).ok) { failed++; } }
+  string[] paths = string[].filled(batch.len() - failed, "");
+  u8[][] blobs = u8[][].filled(batch.len() - failed, u8[]());
+  i32 k = 0;
+  for (i32 i = 0; i < batch.len(); i++) {
+    Picked f = batch.get(i);
+    if (!f.ok) { continue; }
+    paths[k] = f.name;
+    blobs[k] = f.bytes;
+    k++;
+  }
+  m.busy = "";
+  if (paths.len() == 0) {
+    bool folder = false;
+    for (i32 i = 0; i < batch.len(); i++) { if (batch.get(i).error.indexOf("dropped folder") >= 0) { folder = true; } }
+    m.error = folder ? "This browser won't let a page opened from a file read a dropped folder. \{FOLDER_HINT}"
+                     : "Nothing in that folder could be read.";
+    return;
+  }
+  openFolder(m, paths, blobs, failed);
+  // A folder the browser would not list arrives as one failure among the rest: say what to do about it.
+  for (i32 i = 0; i < batch.len(); i++) {
+    if (!batch.get(i).ok && batch.get(i).error.indexOf("dropped folder") >= 0) {
+      m.error = "\{batch.get(i).name} wasn't read: this browser won't let a page opened from a file read a dropped folder. \{FOLDER_HINT}";
+    }
+  }
+  page.title("\{top(m).name} — Archive Explorer");
+}
+
+// ── Landing ─────────────────────────────────────────────────────────────────
+
+Node landing(Model m) {
+  return <div class="landing">
+    <div class="hero">
+      <span class="brand"><span class="dot"></span>Archive Explorer</span>
+      <h1 class="title">Look inside <em>any archive</em>.</h1>
+      <p class="lede">Browse zip, tar, gzip and zstd files like folders — and every archive inside them — without unpacking a thing.</p>
+      <div class="drop">
+        <div class="mark">{icon("archive", "")}</div>
+        <h2>Drop a file or folder anywhere on this page</h2>
+        <p>or pick one from your computer</p>
+        <div class="pick">{picker("btn primary big", "Choose a file")}{folderPicker("btn big", "Choose a folder")}</div>
+        <div class="chips"><span class="chip">ZIP</span><span class="chip">TAR</span><span class="chip">TAR.GZ</span>
+          <span class="chip">GZIP</span><span class="chip">ZSTD</span><span class="chip">JAR · APK · DOCX</span><span class="chip">+ any file or folder</span></div>
+      </div>
+      {m.error != "" ? errorBox(m, "") : Node.Text("")}
+      <div class="fine">{icon("shield", "sm")}Nothing leaves this tab. Built in wac, compiled to WebAssembly.</div>
+    </div>
+  </div>;
+}
+
+// ── Top bar ─────────────────────────────────────────────────────────────────
+
+Node topBar(Model m, fn<void()> bump) {
+  bool canUp = top(m).cwd != "" || m.levels.len() > 1;
+  return <header class="top">
+    <div class="logo">{icon("archive", "")}</div>
+    {canUp ? <button class="btn ghost icon" title="Up one level (Backspace)"
+                     onclick={(ElementEvent e) => { goUp(m); bump(); }}>{icon("up", "")}</button>
+           : Node.Text("")}
+    {crumbs(m, bump)}
+    <div class="actions">
+      {picker("btn", "Open")}
+      {folderPicker("btn", "Folder")}
+      <button class="btn ghost icon" title="Close"
+              onclick={(ElementEvent e) => { m.levels.clear(); m.error = ""; bump(); }}>{icon("close", "")}</button>
+    </div>
+  </header>;
+}
+
+// ── The page ────────────────────────────────────────────────────────────────
+
+Node app(Ui ui, Page page) {
+  Model m = ui.memo<Model>("", () => emptyModel());
+  auto version = ui.state(0);
+  fn<void()> bump = () => { version.update((i32 v) => v + 1); };
+  Ref cursorRef = ui.ref();
+  ui.effect("", () => {
+    files(page, m, bump);
+    return () => { };
+  });
+  // The watchdog: work that is still "in progress" when a timer gets to run has trapped. Say so, and
+  // render again. **Armed from an effect, once**: `ui.every` arms a timer each time it is called, and called as the
+  // component renders, every render added one more.
+  ui.effect("", () => ui.every(400, () => {
+    if (m.trying == "") { return; }
+    m.error = m.trying;
+    m.trying = "";
+    m.busy = "";
+    bump();
+  }));
+  // After a key moved the cursor, focus follows it — which also scrolls it into view.
+  ui.effect("\{version.get()}", () => {
+    if (m.focusCursor) {
+      m.focusCursor = false;
+      if (cursorRef.element() is not null) { cursorRef.element()!.focus(); }
+    }
+    return () => { };
+  });
+
+  Node busy = m.busy != ""
+    ? <div class="busy"><div class="card"><span class="spin"></span><span>{m.busy}</span></div></div>
+    : Node.Text("");
+
+  if (!hasFile(m)) {
+    return <div><style>{css()}</style>{landing(m)}{busy}</div>;
+  }
+  return <div>
+    <style>{css()}</style>
+    <div class="shell">
+      {topBar(m, bump)}
+      <div class="main">
+        {listing(m, page, bump, cursorRef)}
+        {preview(m, page, bump, (i32 i) => { nested(page, m, bump, i); })}
+      </div>
+    </div>
+    {m.error != "" ? errorBox(m, "position:fixed;bottom:18px;left:50%;transform:translateX(-50%);margin:0;z-index:5")
+                   : Node.Text("")}
+    {busy}
+  </div>;
+}
+
+export async i32 main(Page page) {
+  page.title("Archive Explorer");
+  page.mount((Ui ui) => app(ui, page));
+  return 0;
+}

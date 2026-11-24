@@ -1,0 +1,200 @@
+# What the desktop needs from wac
+
+The desktop is a tactical, DOM-only experiment, built in wac as an outside consumer of the wac
+repository. It is a page with windows, Files, a Viewer, an Editor, and a Terminal running box's
+`Session`. This note lists what it needs from wac, most important first.
+
+**Status at the commits the project pins (2026-11-02: wac `6f3ee4093`, `web` `d63440e`):** items 1 to 5 and 7 are
+merged, and so are 8 and 9 — the two wac fixes programs in windows needed. The page package is `web`, a repository
+of its own since 2026-10-29; what this list says of wac's `packages/web` is that repository now. The project has no
+patches and no vendored code but Paint's font (item 11) — it imports wac's packages as `import { json.parse } from "wac"`. From item 6,
+modifier keys in `prevent`, decoders that return errors, and the LICENSE are merged too.
+Still open: the reader's time zone, reproducible names (`0368c`), `wac update` through a mirror, the box
+gaps, and item 10, a compiler limit.
+
+## 1. Folder drops in `web` (merged)
+
+A page should receive the files of a dropped or picked folder, each named by its path inside the
+folder. Today a dropped folder arrives as one unreadable item.
+
+| Commit | Change |
+|---|---|
+| `704c0908` | Walk a dropped folder, and name every file from a folder (dropped, or picked with `<input webkitdirectory>`) by its path. A lone file is still just its name. |
+| `f7ff0795` | Read a dropped folder through a `FileSystemHandle` where the browser has one. On a `file://` page the entry API fails with `EncodingError`. |
+| `71bdb1fd` | If the browser refuses the handle, fall back to the entry API. If both fail, report "a dropped folder could not be listed", so the page can offer a picker. |
+| `0597a1e5` | Read a dropped *file* as a file, and walk only folders. Without this, single-file drops break in browsers that have no handle API, such as Brave. |
+
+The change is +59 −7 lines in three files: `tools/build.wac`, the `Picked` documentation in
+`src/page.wac`, and the package README. Real drops were tested in Chromium on `file://` and `http://`,
+with the handle API present, missing and refusing (18 cases).
+
+## 2. Merge the growable generic-instantiation table in `wacc` (merged, `63edaad6b`)
+
+**Commit:** `2a6ca392` (on master `638b4fc6a`), in `packages/wacc/src/emit.wac`, `Env.instantiate`.
+
+**Problem:** the emitter keeps a fixed-size table of generic instantiations. When a module names
+more than it has room for, the build fails with *"the emitter ran out of room for generic
+instantiations"*. Master at `638b4fc6a` still fails the desktop's build this way. The desktop reached the limit once it carried the shell, because the module is
+large, not because anything in it is wrong.
+
+**Change:** the table now doubles when full, like the lambda capture tables. The compiler still
+reaches a fixed point under `./bootstrap.sh`. The 3.4 MB desktop page builds with it.
+
+Because the fix is inside the compiler, the project's CI bootstraps `wac` from the pinned commit
+instead of using an installed one. That is part of why CI takes about two minutes.
+
+## 3. `import { … } from "wac"` (merged: `lib.wac`; the project's `vendor/` is gone)
+
+The project vendors 176 files (40,361 lines) from 19 packages, using `tools/vendor_wac.py`. The roots
+it needs are:
+
+- `box` (`Session`, `boxApplet`, `boxNames`)
+- `fs` (`Fs`, `mountSystem`)
+- `json`
+- `gzip` (inflate, CRC-32)
+- `zstd`
+- `crypto` (SHA-256)
+
+Once the wac root exports its packages, the vendored copy goes away and these become ordinary
+imports. A note for that work: `box/src/shrun.wac` and `box/src/lib/session.wac` are what an
+embedder actually imports, so they deserve a stable, exported name.
+
+## 4. Let the web host run a wasm module it is given (merged)
+
+**Merged 2026-10-28** as design/system/0015 steps 2 and 3, on the flat host ABI of 0013 step 6 rather than
+through exported page capabilities: `spawn` with a module's bytes starts a worker that drives the module from
+its own manifest and serves its requests, holding what it was handed; that module can `load` another and call
+it. What follows is the request as it was written.
+
+This is what a `wac` command, or any compiled program, needs to run inside the terminal. At the moment:
+
+- **`cli.spawn` ignores its bytes.** It starts another copy of the page
+  (`packages/web/tools/build.wac`, `spawn`: `new Worker(self.location.href)`). The page can therefore
+  run only the programs compiled into it. A `.wasm` on the disk found through `$WACPATH` cannot run,
+  although it runs on the other three hosts.
+- **`cli.load` always refuses** (`packages/web/src/system.wac:425`, `LoadedModule.of(-2, NOT_HERE)`).
+
+**Proposal:** add a generic child worker that instantiates the module it is handed and connects it
+to the same system half that a spawned page copy gets: arguments, streams, the filesystem relay and
+grants. `spawn` would choose between the page copy and the generic worker by what it is given. Then:
+
+- the desktop shell runs `$WACPATH` programs like the other hosts do;
+- an in-page `wac` can `run` and `test` what it compiles;
+- the page gets the same capability set as the other hosts.
+
+This probably overlaps with the more ambitious desktop in the wac repository, so it belongs in wac
+rather than in this project's patches.
+
+## 5. Spawn from the page, so `file://` gets processes (merged)
+
+**Merged 2026-10-28** as design/system/0015 decision 3: the page's own thread starts every child, for whichever
+worker asks, and hands parent and child the two ends of a `MessageChannel`. The terminal no longer runs box's
+programs inside the shell's worker on `file://`, and `^C` stops a program that never yields. What follows is the
+request as it was written.
+
+A page opened from a file has an opaque origin. A worker there may not start workers of its own:
+*"Failed to construct 'Worker': Script at 'blob:null/…' cannot be accessed from origin 'null'"*.
+The top-level page can still start workers.
+
+The desktop works around this by setting `sh.externalSpawnable = false` when running from a file.
+Box's programs then run inside the shell's worker. They work, but `^C` cannot stop one that loops.
+
+**Proposal:** route a worker's `spawn` request to the page's main thread and have it start the
+child there, as a sibling of the requesting worker. Streams relay through the page. This keeps
+processes, and `^C`, on `file://`.
+
+## 6. Smaller things a page needs
+
+- **Keys with modifiers in `prevent`.** `prevent` matches by key name only. A page cannot take Ctrl+S
+  (the Editor's save) or Ctrl+L (the terminal's clear) without also blocking plain `s` and `l`.
+  Something like `prevent="Ctrl+s Ctrl+l"` would cover it.
+- **The reader's time zone.** A page is told the time but not the offset, so the taskbar clock says
+  UTC. One number, the offset in minutes, would be enough.
+- **Recoverable decode errors.** The gzip and zstd decoders `trap` on bad input, and a trap cannot be
+  caught. The desktop detects a dead decode with a watchdog: work marks itself in progress, and a
+  timer that still sees the mark reports the failure. Result-returning entry points (`inflate` →
+  `Result<u8[], string>`, and the same for zstd frames) would remove that workaround.
+- **Reproducible builds** (filed as `0368c`). The module's debug names include the absolute path of the package cache
+  (`…root__wac_cache_git_…`). The same source built under a different `$WAC_HOME` therefore gives
+  different bytes, with the builder's home path inside. Names relative to the cache would fix it.
+- **`wac update` through a mirror.** Pins name GitHub, and development fetches them from git.voltrevo.com through
+  `git`'s `insteadOf` (`tools/use-mirror.sh`), which wac's own fetcher does not follow. The project fills the cache
+  with `git` instead (`tools/fill-cache.sh`, the same script as wac's). What would end it: `wac update` honouring
+  `git`'s URL rewriting, or fetching with `git`.
+- **Box gaps seen from the terminal:** `ls -l` reports "not implemented", and `ps` does not list the
+  shell that a `Session` started.
+- ~~**A LICENSE file.**~~ Done: MIT.
+
+## 7. `wac` inside the terminal (done)
+
+**Done 2026-10-28**, differently from what is below: not as an applet but as a module on the disk. wac's
+design/system/0013 step 6 made every module's boundary the same flat host ABI, so a page can drive any module
+it holds (0015, implemented in `packages/web`); the desktop's build compiles the `wac` command from the
+pinned commit and the page unpacks it to `/usr/bin/wac`. Neither of the two needs below turned out to be
+needed: the command is built from the package cache like any program, and it needs no packages of its own
+at run time for `check`, `build`, `run` and `test` of a program that imports only `std` and `core`. A
+program that imports a git dependency would still need the cache on the page's disk. The page is about
+5.4 MB of module when it landed, and 3.5 MB once wac's later work shrank every program; the estimate was 6–7. What follows is the plan as it was written.
+
+`packages/wac/src/wac.wac` is an ordinary `main(Sys)` program, and the compiler does no I/O, so a page
+can carry the command as one more applet. With items 3 and 4 in place:
+
+- `wac check`, `compile` and `build` work on the desktop's disk;
+- `run` and `test` work too.
+
+Two things are needed for it:
+
+- **The `wac` command importable from outside the repository.** This falls under item 3. For example,
+  the root could export `wac`'s `main` under a name.
+- **A way to give an in-page `wac` its packages without a network.** For example, `$WAC_HOME`
+  could be a folder on the page's disk that the page seeds.
+
+The expected cost is the page growing from 3.4 MB to about 6–7 MB. That has not been measured.
+
+## 8. `wac test` ran no test taking a `Sys` beside a `"wac"` import (merged, `3792c730d`)
+
+A test file importing a namespace member from `"wac"` — `import { fs.ProcTable } from "wac"`, as
+`test/desk_test.wac` does — had its tests taking a `Sys` dropped without a word when run alone ("0 passed"), and
+in a directory the generated harness named a `Sys` nothing imported. The adapter's parse could not read the member
+import; it reads it as two names now.
+
+## 9. A parent answers a provided capability's requests as each settles (merged, `ec212ae8a`)
+
+A program in a window keeps a `wac.page` request open for its next event. `std`'s parent answered a child's
+requests in turn, so that open request held up every other the window's program made. Each is answered when its
+answer settles now.
+
+## 10. A generic taking a lambda, in a large module (open)
+
+`web`'s `when` was `when<T>(Ticket<T> t, fn<void()> f)` for a moment, and the desktop stopped building: *"a lambda
+(this module has 902, 7 in a position the walk does not type yet)"* — the seven lambdas handed to `when` — while
+every smaller page that used it built. `web` takes a `TicketBase` instead (`ed87134`). No small reproduction yet:
+it needs a module the size of the desktop's.
+
+## 11. `raster`'s font through `from "wac"` (open)
+
+Paint's text tool draws with unscii-16, the bitmap font wac already carries as `packages/raster/src/font16.wac`
+(`glyphIndex`, `glyphWidth`, `glyphRow`). `lib.wac` does not export `raster`, and `packages/raster` has no
+`wac.json5` to import it by `subdir`, so the desktop copies that one generated file into
+`src/apps/paint/font16.wac` — the only vendored code it has. **Ask:** `export * as raster from …` in `lib.wac` (or a
+`wac.json5` in `packages/raster`), so Paint can `import { raster.glyphIndex } from "wac"` and the copy can go.
+
+## Summary
+
+| # | What | Where | State |
+|---|---|---|---|
+| 1 | Folder drops | `web` | merged |
+| 2 | Growable instantiation table | `wacc` | merged (`63edaad6b`) |
+| 3 | `from "wac"` | repo root | merged (`lib.wac`); the project's `vendor/` is gone |
+| 4 | Run a given module (`spawn` bytes, `load`) | `web` host | merged (design/system/0015 steps 2 and 3) |
+| 5 | Spawn via the page on `file://` | `web` host | merged (0015 decision 3) |
+| 6 | Modifier keys in `prevent` | `web` | merged; used for Ctrl+S, Ctrl+L, Ctrl+A |
+| 6 | Decoders return errors | `gzip`, `zstd` | merged; used |
+| 6 | LICENSE | repo root | merged (MIT) |
+| 6 | Reproducible names | build | filed, `0368c` |
+| 6 | Time zone, `wac update` through a mirror, box gaps | various | open |
+| 7 | `wac` in the terminal | this project | done: `/usr/bin/wac`, a module on the disk |
+| 8 | `Sys` tests beside a `"wac"` import | `wac test` | merged (`3792c730d`) |
+| 9 | A provided capability answered as it settles | `std` | merged (`ec212ae8a`) |
+| 10 | A generic taking a lambda, in a large module | `wacc` | open; worked around in `web` |
+| 11 | `raster`'s font through `from "wac"` | repo root | open; `font16.wac` copied into Paint meanwhile |

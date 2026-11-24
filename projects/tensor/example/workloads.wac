@@ -1,0 +1,103 @@
+// The benchmarks `bench.wac` runs in a browser and `metalbench.wac` on a Metal server: each workload, and how it is timed.
+//
+// Each benchmark runs once to warm up — a GPU compiles its programs then — and then as often as fits in about half a
+// second, timing to the moment its result has been read back, so a GPU's queued work is counted, not just its
+// submission. The digit model loads `mnist.weights` when it is given them; without them it runs with random weights,
+// in the same time.
+
+import { Result, Ticket } from "core";
+import { Device, Tensor, loadWeights } from "../src/lib.wac";
+import { Layer, Sequential, sparseSoftmaxCrossEntropy } from "../src/nn.wac";
+import { Adam } from "../src/optim.wac";
+import { digitModel } from "./mnist/mnist.wac";
+import { Gpt, GptConfig } from "./gpt/model.wac";
+
+/** The six, in the order `run` numbers them. */
+export Bench[] workloads() {
+  return [
+    Bench("Matrix product, 256 × 256", 2.0 * 256.0 * 256.0 * 256.0, "FLOP"),
+    Bench("Matrix product, 1024 × 1024", 2.0 * 1024.0 * 1024.0 * 1024.0, "FLOP"),
+    Bench("Digit model, one image", 1.0, "images"),
+    Bench("Digit model, batch of 500", 500.0, "images"),
+    Bench("Digit model, training step of 64", 64.0, "images"),
+    Bench("Tiny GPT, one forward pass of 16", 16.0, "tokens"),
+  ];
+}
+
+export struct Bench {
+  string name;
+  /** What one run does, for the throughput column: how many of `unit` it handles. */
+  f64 amount;
+  string unit;
+}
+
+/** Milliseconds per run of `f`, read back each time: once to warm up, then until half a second has passed. */
+export async f64 timeIt(fn<Ticket<f64>()> now, Device d, fn<Tensor()> f) {
+  Tensor w = d.tidy(f);
+  await w.values();
+  w.dispose();
+  i32 reps = 0;
+  f64 t0 = await now();
+  f64 elapsed = 0.0;
+  while (reps < 3 || (elapsed < 500.0 && reps < 200)) {
+    Tensor r = d.tidy(f);
+    await r.values();
+    r.dispose();
+    reps++;
+    // Through a local: `elapsed = (await now()) - t0` checks but does not emit (`docs/wac-asks.md`).
+    f64 t = await now();
+    elapsed = t - t0;
+  }
+  return elapsed / (reps as f64);
+}
+
+export f64 round1(f64 v) { return (v * 10.0).round() / 10.0; }
+
+export string fmtMs(f64 ms) { return ms < 10.0 ? "\{(ms * 100.0).round() / 100.0} ms" : "\{round1(ms)} ms"; }
+
+export string fmtRate(f64 perSecond, string unit) {
+  if (perSecond >= 1000000000.0) { return "\{round1(perSecond / 1000000000.0)} G\{unit}/s"; }
+  if (perSecond >= 1000000.0) { return "\{round1(perSecond / 1000000.0)} M\{unit}/s"; }
+  if (perSecond >= 1000.0) { return "\{round1(perSecond / 1000.0)} k\{unit}/s"; }
+  return "\{round1(perSecond)} \{unit}/s";
+}
+
+/** One benchmark on one device, as milliseconds per run. */
+export async f64 run(fn<Ticket<f64>()> now, Device d, i32 which, u8[] weights) {
+  if (which == 0 || which == 1) {
+    i32 n = which == 0 ? 256 : 1024;
+    Tensor a = d.uniform([n, n], -1.0, 1.0);
+    Tensor b = d.uniform([n, n], -1.0, 1.0);
+    f64 ms = await timeIt(now, d, () => a.matmul(b).sum([], false));
+    a.dispose();
+    b.dispose();
+    return ms;
+  }
+  Sequential m = digitModel(d);
+  if (weights.len() > 0) { loadWeights(m.params(), weights); }
+  if (which == 2 || which == 3) {
+    i32 batch = which == 2 ? 1 : 500;
+    Tensor x = d.uniform([batch, 28, 28, 1], 0.0, 1.0);
+    f64 ms = await timeIt(now, d, () => m.apply(x, false).softmax(-1));
+    x.dispose();
+    for (Tensor v in m.params()) { v.dispose(); }
+    return ms;
+  }
+  if (which == 4) {
+    Tensor x = d.uniform([64, 28, 28, 1], 0.0, 1.0);
+    Tensor y = d.vector(f32[].filled(64, 3.0));
+    Adam opt = Adam.create(0.001);
+    f64 ms = await timeIt(now, d, () => opt.minimize(() => sparseSoftmaxCrossEntropy(m.apply(x, true), y), m.params()));
+    x.dispose();
+    y.dispose();
+    for (Tensor v in m.params()) { v.dispose(); }
+    return ms;
+  }
+  for (Tensor v in m.params()) { v.dispose(); }
+  Gpt g = Gpt.create(d, GptConfig(27, 16, 64, 4, 2, 0.0));
+  Tensor idx = d.fill([1, 16], 3.0);
+  f64 ms = await timeIt(now, d, () => g.apply(idx, false));
+  for (Tensor v in g.params()) { v.dispose(); }
+  return ms;
+}
+

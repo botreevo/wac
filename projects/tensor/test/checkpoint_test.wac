@@ -1,0 +1,54 @@
+// Checkpoints: a model's weights out and back, into its own type or the other, and a wrong model refused untouched.
+
+import { Check } from "./check.wac";
+import { DType } from "../src/backend.wac";
+import { Device, Tensor, Variable } from "../src/tensor.wac";
+import { Activation, Dense, Layer, Sequential } from "../src/nn.wac";
+import { loadWeights, saveWeightsNow } from "../src/checkpoint.wac";
+import { toHalf } from "../src/half.wac";
+
+Sequential mlp(Device d, i32 hidden) {
+  return Sequential.of([Dense.create(d, 3, hidden, Activation.Relu), Dense.create(d, hidden, 2, Activation.Linear)]);
+}
+
+export string test_weights_round_trip() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  d.seed(1 as i64);
+  Sequential a = mlp(d, 4);
+  d.seed(2 as i64);
+  Sequential b = mlp(d, 4);
+  Tensor x = d.normal([5, 3], 0.0, 1.0);
+  u8[] saved = saveWeightsNow(a.params());
+  t.ok(loadWeights(b.params(), saved).isOk(), "loads into a model built the same way");
+  f32[] ya = a.apply(x, false).valuesNow();
+  t.values(b.apply(x, false), [5, 2], ya, 0.0, "the copy computes exactly what the original does");
+  // Into a half-precision model: each value rounded once.
+  Device h = Device.cpu();
+  h.dtype = DType.F16;
+  Sequential c = mlp(h, 4);
+  t.ok(loadWeights(c.params(), saved).isOk(), "loads into halves");
+  f32[] k = a.params()[0].valuesNow();
+  f32[] kh = c.params()[0].valuesNow();
+  for (i32 i = 0; i < k.len(); i++) { t.ok(kh[i] == toHalf(k[i]), "rounded to the nearest half at \{i}"); }
+  return t.report();
+}
+
+export string test_a_checkpoint_for_another_model_is_refused_and_changes_nothing() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  Sequential a = mlp(d, 4);
+  Sequential wider = mlp(d, 5);
+  f32[] before = wider.params()[0].valuesNow();
+  u8[] saved = saveWeightsNow(a.params());
+  auto r = loadWeights(wider.params(), saved);
+  t.ok(r.isErr(), "refused");
+  if (r.isErr()) { t.ok(r.err()!.indexOf("[3, 4] in the checkpoint and [3, 5] in the model") >= 0, "says which: \{r.err()!}"); }
+  f32[] after = wider.params()[0].valuesNow();
+  for (i32 i = 0; i < before.len(); i++) { t.ok(before[i] == after[i], "unchanged at \{i}"); }
+  t.ok(loadWeights(a.params(), [1, 2, 3] as u8[]).isErr(), "garbage is refused");
+  u8[] cut = u8[].filled(saved.len() - 4, 0 as u8);
+  cut.copyFrom(saved, 0, 0, cut.len());
+  t.ok(loadWeights(a.params(), cut).isErr(), "a truncated checkpoint is refused");
+  return t.report();
+}

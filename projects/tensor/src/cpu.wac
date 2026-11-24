@@ -1,0 +1,394 @@
+// The CPU backend: every kernel as plain loops over `f32[]`.
+//
+// **It is the reference, not the fast path.** Each kernel is the most direct reading of its definition in
+// `backend.wac`, and the GPU backend is tested by agreeing with it. Where speed is nearly free it is taken — an
+// operation is chosen once per kernel call, not once per element, and the matrix product runs its loops in the order
+// that reads memory forwards — and nowhere else.
+//
+// **An `F16` storage is an `f32[]` whose every element is a half**: each kernel computes as for `F32` and rounds its
+// result once (`made`), which is what the GPU does with halves packed two to a word. The memory the GPU saves is not
+// saved here; the reference is for the numbers.
+
+import { Ticket, math } from "core";
+import { Backend, Binary, Conv, DType, Reduce, Storage, Unary, sameDType } from "./backend.wac";
+import { toHalf } from "./half.wac";
+import { cos, sigmoid, sin, softplus, tanh } from "./scalar.wac";
+import { sizeOf } from "./shape.wac";
+
+export struct CpuStorage : Storage {
+  f32[] data;
+}
+
+f32 lift(f64 v) { return v as~ f32; }
+
+fn<f32(f32)> unaryFn(Unary op) {
+  match (op) {
+    Neg: { return (f32 x) => 0.0 - x; }
+    Abs: { return (f32 x) => x.abs(); }
+    Exp: { return (f32 x) => lift(math.exp(x as f64)); }
+    Expm1: { return (f32 x) => lift(math.expm1(x as f64)); }
+    Log: { return (f32 x) => lift(math.log(x as f64)); }
+    Log1p: { return (f32 x) => lift(math.log1p(x as f64)); }
+    Sqrt: { return (f32 x) => x.sqrt(); }
+    Rsqrt: { return (f32 x) => lift(1.0 / (x as f64).sqrt()); }
+    Square: { return (f32 x) => x * x; }
+    Reciprocal: { return (f32 x) => 1.0 / x; }
+    Sin: { return (f32 x) => lift(sin(x as f64)); }
+    Cos: { return (f32 x) => lift(cos(x as f64)); }
+    Tanh: { return (f32 x) => lift(tanh(x as f64)); }
+    Sigmoid: { return (f32 x) => lift(sigmoid(x as f64)); }
+    Relu: { return (f32 x) => x > 0.0 ? x : 0.0; }
+    Softplus: { return (f32 x) => lift(softplus(x as f64)); }
+    Sign: { return (f32 x) => x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : 0.0); }
+    Floor: { return (f32 x) => x.floor(); }
+    Ceil: { return (f32 x) => x.ceil(); }
+    Round: { return (f32 x) => x.round(); }
+    Step: { return (f32 x) => x > 0.0 ? 1.0 : 0.0; }
+  }
+}
+
+f32 truth(bool b) { return b ? 1.0 : 0.0; }
+
+fn<f32(f32, f32)> binaryFn(Binary op) {
+  match (op) {
+    Add: { return (f32 a, f32 b) => a + b; }
+    Sub: { return (f32 a, f32 b) => a - b; }
+    Mul: { return (f32 a, f32 b) => a * b; }
+    Div: { return (f32 a, f32 b) => a / b; }
+    Pow: { return (f32 a, f32 b) => lift(math.pow(a as f64, b as f64)); }
+    // NaN wins either way round, as TensorFlow's maximum and minimum have it.
+    Maximum: { return (f32 a, f32 b) => a != a || b != b ? a + b : (a > b ? a : b); }
+    Minimum: { return (f32 a, f32 b) => a != a || b != b ? a + b : (a < b ? a : b); }
+    Equal: { return (f32 a, f32 b) => truth(a == b); }
+    NotEqual: { return (f32 a, f32 b) => truth(a != b); }
+    Less: { return (f32 a, f32 b) => truth(a < b); }
+    LessEqual: { return (f32 a, f32 b) => truth(a <= b); }
+    Greater: { return (f32 a, f32 b) => truth(a > b); }
+    GreaterEqual: { return (f32 a, f32 b) => truth(a >= b); }
+  }
+}
+
+/**
+ * The offset `strides` reads at each index of shape `out`, in order. An odometer over the axes rather than a division
+ * per element, which is the difference that matters in a loop this hot.
+ */
+export i32[] offsetsOf(i32[] out, i32[] strides, i32 base) {
+  i32 n = sizeOf(out);
+  i32[] offs = i32[].filled(n, 0);
+  i32 rank = out.len();
+  i32[] idx = i32[].filled(rank, 0);
+  i32 off = base;
+  for (i32 i = 0; i < n; i++) {
+    offs[i] = off;
+    for (i32 d = rank - 1; d >= 0; d--) {
+      idx[d]++;
+      off += strides[d];
+      if (idx[d] < out[d]) { break; }
+      off -= strides[d] * out[d];
+      idx[d] = 0;
+    }
+  }
+  return offs;
+}
+
+/**
+ * When an operand read with `strides` over shape `out` is its own `size` elements repeated in order — strides that are
+ * row-major over some trailing axes and 0 before them — that size, so element i is read at i modulo it; 0 otherwise.
+ */
+i32 periodOf(i32[] out, i32[] strides) {
+  i32 expect = 1;
+  i32 d = out.len() - 1;
+  while (d >= 0 && (strides[d] == expect || out[d] == 1)) {
+    if (out[d] != 1) { expect *= out[d]; }
+    d--;
+  }
+  while (d >= 0) {
+    if (strides[d] != 0 && out[d] != 1) { return 0; }
+    d--;
+  }
+  return expect;
+}
+
+/** `count` matrices of `rows` by `cols`, each transposed. */
+f32[] transposedBatches(f32[] src, i32 count, i32 rows, i32 cols) {
+  f32[] out = f32[].filled(src.len(), 0.0);
+  for (i32 q = 0; q < count; q++) {
+    i32 base = q * rows * cols;
+    for (i32 r = 0; r < rows; r++) {
+      for (i32 c = 0; c < cols; c++) { out[base + c * rows + r] = src[base + r * cols + c]; }
+    }
+  }
+  return out;
+}
+
+export struct CpuBackend : Backend {
+  CpuBackend create() { return CpuBackend { }; }
+
+  f32[] of(this, Storage s) {
+    if (s.freed) { trap; }
+    return (s as! CpuStorage).data;
+  }
+
+  /** `data` as a storage of `dtype` — each element rounded to a half, in place, when that is `F16`. */
+  CpuStorage made(this, f32[] data, DType dtype) {
+    if (sameDType(dtype, DType.F16)) {
+      for (i32 i = 0; i < data.len(); i++) { data[i] = toHalf(data[i]); }
+    }
+    return CpuStorage { size: data.len(), dtype: dtype, data: data };
+  }
+
+  override string name(const this) { return "cpu"; }
+
+  override Storage upload(this, f32[] values, DType dtype) {
+    f32[] copy = f32[].filled(values.len(), 0.0);
+    copy.copyFrom(values, 0, 0, values.len());
+    return this.made(copy, dtype);
+  }
+
+  override Ticket<f32[]> download(this, Storage s) {
+    f32[] src = this.of(s);
+    f32[] copy = f32[].filled(src.len(), 0.0);
+    copy.copyFrom(src, 0, 0, src.len());
+    Ticket<f32[]> t;
+    t.resolve(copy);
+    return t;
+  }
+
+  override Storage fill(this, i32 n, f32 value, DType dtype) { return this.made(f32[].filled(n, value), dtype); }
+
+  override Storage cast(this, Storage x, DType to) {
+    f32[] a = this.of(x);
+    f32[] o = f32[].filled(a.len(), 0.0);
+    o.copyFrom(a, 0, 0, a.len());
+    return this.made(o, to);
+  }
+
+  // The collector frees the array; marking it is what makes a use after `free` trap here as it would on a GPU.
+  override void free(this, Storage s) { s.freed = true; }
+
+  override Storage unary(this, Unary op, Storage x) {
+    f32[] a = this.of(x);
+    fn<f32(f32)> f = unaryFn(op);
+    f32[] o = f32[].filled(a.len(), 0.0);
+    for (i32 i = 0; i < a.len(); i++) { o[i] = f(a[i]); }
+    return this.made(o, x.dtype);
+  }
+
+  override Storage binary(this, Binary op, Storage a, Storage b, i32[] out, i32[] sa, i32[] sb) {
+    f32[] x = this.of(a);
+    f32[] y = this.of(b);
+    fn<f32(f32, f32)> f = binaryFn(op);
+    i32 n = sizeOf(out);
+    f32[] o = f32[].filled(n, 0.0);
+    i32 pa = periodOf(out, sa);
+    i32 pb = periodOf(out, sb);
+    if (pa > 0 && pb > 0) {
+      // Each operand is its own elements over and over — the whole tensor, a bias row, a scalar — so its index is the
+      // output's modulo its size, and no table of offsets is needed. Almost every binary operation is one of these.
+      for (i32 i = 0; i < n; i++) { o[i] = f(x[i % pa], y[i % pb]); }
+      return this.made(o, a.dtype);
+    }
+    i32[] ia = offsetsOf(out, sa, 0);
+    i32[] ib = offsetsOf(out, sb, 0);
+    for (i32 i = 0; i < n; i++) { o[i] = f(x[ia[i]], y[ib[i]]); }
+    return this.made(o, a.dtype);
+  }
+
+  override Storage select(this, Storage c, Storage a, Storage b, i32[] out, i32[] sc, i32[] sa, i32[] sb) {
+    f32[] cv = this.of(c);
+    f32[] x = this.of(a);
+    f32[] y = this.of(b);
+    i32[] ic = offsetsOf(out, sc, 0);
+    i32[] ia = offsetsOf(out, sa, 0);
+    i32[] ib = offsetsOf(out, sb, 0);
+    f32[] o = f32[].filled(ic.len(), 0.0);
+    for (i32 i = 0; i < o.len(); i++) { o[i] = cv[ic[i]] != 0.0 ? x[ia[i]] : y[ib[i]]; }
+    return this.made(o, a.dtype);
+  }
+
+  override Storage reduce(this, Reduce op, Storage x, i32 outer, i32 inner) {
+    f32[] a = this.of(x);
+    f32[] o = f32[].filled(outer, 0.0);
+    for (i32 r = 0; r < outer; r++) {
+      i32 at = r * inner;
+      // Summed in f64: the GPU sums in f32, and the reference should be the closer of the two to the true total.
+      f64 acc = match (op) { Sum: 0.0, Prod: 1.0, Max: 0.0 - 1.0 / 0.0, Min: 1.0 / 0.0 };
+      bool nan = false;
+      for (i32 i = 0; i < inner; i++) {
+        f64 v = a[at + i] as f64;
+        if (v != v) { nan = true; }
+        acc = match (op) { Sum: acc + v, Prod: acc * v, Max: acc.max(v), Min: acc.min(v) };
+      }
+      o[r] = nan ? 0.0 / 0.0 : acc as~ f32;
+    }
+    return this.made(o, x.dtype);
+  }
+
+  override Storage argReduce(this, bool max, Storage x, i32 outer, i32 inner) {
+    f32[] a = this.of(x);
+    f32[] o = f32[].filled(outer, 0.0);
+    for (i32 r = 0; r < outer; r++) {
+      i32 at = r * inner;
+      i32 best = 0;
+      for (i32 i = 1; i < inner; i++) {
+        f32 v = a[at + i];
+        f32 b = a[at + best];
+        if (max ? v > b : v < b) { best = i; }
+      }
+      o[r] = best as~ f32;
+    }
+    return this.made(o, DType.F32);
+  }
+
+  override Storage matmul(this, Storage a, Storage b, i32 batch, i32 m, i32 k, i32 n, bool ta, bool tb,
+                          i32 aStride, i32 bStride) {
+    f32[] x = this.of(a);
+    // A transposed b is laid out again first, so the inner loop below always walks memory forwards: read with a stride
+    // of k, it was most of the time a backward pass took.
+    f32[] y = tb ? transposedBatches(this.of(b), bStride == 0 ? 1 : batch, n, k) : this.of(b);
+    f32[] o = f32[].filled(batch * m * n, 0.0);
+    // Element (i, p) of a and (p, j) of b, wherever transposition put them.
+    i32 aRow = ta ? 1 : k;
+    i32 aCol = ta ? m : 1;
+    i32 bRow = n;
+    for (i32 q = 0; q < batch; q++) {
+      i32 ab = q * aStride;
+      i32 bb = q * bStride;
+      i32 ob = q * m * n;
+      // Four rows of the output at a time, so each element of b's row is read once for four products rather than once
+      // for each; the rows left over go one at a time.
+      i32 i = 0;
+      while (i + 4 <= m) {
+        i32 o0 = ob + i * n;
+        i32 o1 = o0 + n;
+        i32 o2 = o1 + n;
+        i32 o3 = o2 + n;
+        for (i32 p = 0; p < k; p++) {
+          i32 ap = ab + i * aRow + p * aCol;
+          f32 a0 = x[ap];
+          f32 a1 = x[ap + aRow];
+          f32 a2 = x[ap + 2 * aRow];
+          f32 a3 = x[ap + 3 * aRow];
+          i32 yb = bb + p * bRow;
+          for (i32 j = 0; j < n; j++) {
+            f32 bv = y[yb + j];
+            o[o0 + j] += a0 * bv;
+            o[o1 + j] += a1 * bv;
+            o[o2 + j] += a2 * bv;
+            o[o3 + j] += a3 * bv;
+          }
+        }
+        i += 4;
+      }
+      while (i < m) {
+        i32 orow = ob + i * n;
+        for (i32 p = 0; p < k; p++) {
+          f32 av = x[ab + i * aRow + p * aCol];
+          i32 yb = bb + p * bRow;
+          for (i32 j = 0; j < n; j++) { o[orow + j] += av * y[yb + j]; }
+        }
+        i++;
+      }
+    }
+    return this.made(o, a.dtype);
+  }
+
+  override Storage gather(this, Storage x, i32[] out, i32[] strides, i32 offset) {
+    f32[] a = this.of(x);
+    i32[] offs = offsetsOf(out, strides, offset);
+    f32[] o = f32[].filled(offs.len(), 0.0);
+    for (i32 i = 0; i < o.len(); i++) { o[i] = a[offs[i]]; }
+    return this.made(o, x.dtype);
+  }
+
+  override Storage pad(this, Storage x, i32[] inShape, i32[] out, i32[] begin, f32 value) {
+    f32[] a = this.of(x);
+    f32[] o = f32[].filled(sizeOf(out), value);
+    // Each input element's place in the output: the output's strides, starting at `begin`.
+    i32[] os = i32[].filled(out.len(), 1);
+    i32 acc = 1;
+    i32 base = 0;
+    for (i32 d = out.len() - 1; d >= 0; d--) {
+      os[d] = acc;
+      base += begin[d] * acc;
+      acc *= out[d];
+    }
+    i32[] offs = offsetsOf(inShape, os, base);
+    for (i32 i = 0; i < a.len(); i++) { o[offs[i]] = a[i]; }
+    return this.made(o, x.dtype);
+  }
+
+  override Storage im2col(this, Storage x, Conv c, f32 padValue) {
+    f32[] a = this.of(x);
+    i32 cols = c.cols();
+    f32[] o = f32[].filled(c.rows() * cols, padValue);
+    for (i32 b = 0; b < c.n; b++) {
+      for (i32 oy = 0; oy < c.oh; oy++) {
+        for (i32 ox = 0; ox < c.ow; ox++) {
+          i32 row = ((b * c.oh + oy) * c.ow + ox) * cols;
+          for (i32 ky = 0; ky < c.kh; ky++) {
+            i32 iy = oy * c.sh + ky * c.dh - c.padTop;
+            if (iy < 0 || iy >= c.h) { continue; }
+            for (i32 kx = 0; kx < c.kw; kx++) {
+              i32 ix = ox * c.sw + kx * c.dw - c.padLeft;
+              if (ix < 0 || ix >= c.w) { continue; }
+              o.copyFrom(a, ((b * c.h + iy) * c.w + ix) * c.c, row + (ky * c.kw + kx) * c.c, c.c);
+            }
+          }
+        }
+      }
+    }
+    return this.made(o, x.dtype);
+  }
+
+  override Storage col2im(this, Storage cols, Conv c) {
+    f32[] a = this.of(cols);
+    i32 width = c.cols();
+    f32[] o = f32[].filled(c.n * c.h * c.w * c.c, 0.0);
+    for (i32 b = 0; b < c.n; b++) {
+      for (i32 oy = 0; oy < c.oh; oy++) {
+        for (i32 ox = 0; ox < c.ow; ox++) {
+          i32 row = ((b * c.oh + oy) * c.ow + ox) * width;
+          for (i32 ky = 0; ky < c.kh; ky++) {
+            i32 iy = oy * c.sh + ky * c.dh - c.padTop;
+            if (iy < 0 || iy >= c.h) { continue; }
+            for (i32 kx = 0; kx < c.kw; kx++) {
+              i32 ix = ox * c.sw + kx * c.dw - c.padLeft;
+              if (ix < 0 || ix >= c.w) { continue; }
+              i32 to = ((b * c.h + iy) * c.w + ix) * c.c;
+              i32 from = row + (ky * c.kw + kx) * c.c;
+              for (i32 ch = 0; ch < c.c; ch++) { o[to + ch] += a[from + ch]; }
+            }
+          }
+        }
+      }
+    }
+    return this.made(o, cols.dtype);
+  }
+
+  override Storage take(this, Storage table, i32 width, Storage indices, i32 n) {
+    f32[] t = this.of(table);
+    f32[] ix = this.of(indices);
+    i32 rows = t.len() / width;
+    f32[] o = f32[].filled(n * width, 0.0);
+    for (i32 i = 0; i < n; i++) {
+      i32 r = ix[i] as~ i32;
+      // An index outside the table reads zeros, as TensorFlow's GPU kernels do, rather than trapping on one backend only.
+      if (r < 0 || r >= rows) { continue; }
+      o.copyFrom(t, r * width, i * width, width);
+    }
+    return this.made(o, table.dtype);
+  }
+
+  override Storage scatterAdd(this, Storage values, i32 width, Storage indices, i32 n, i32 rows) {
+    f32[] v = this.of(values);
+    f32[] ix = this.of(indices);
+    f32[] o = f32[].filled(rows * width, 0.0);
+    for (i32 i = 0; i < n; i++) {
+      i32 r = ix[i] as~ i32;
+      if (r < 0 || r >= rows) { continue; }
+      for (i32 j = 0; j < width; j++) { o[r * width + j] += v[i * width + j]; }
+    }
+    return this.made(o, values.dtype);
+  }
+}

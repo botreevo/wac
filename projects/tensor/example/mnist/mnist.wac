@@ -1,0 +1,182 @@
+// MNIST: the 28×28 handwritten digits, read from LeCun's IDX files, and a small convolutional network for them.
+//
+// The same module is trained from a command line on the CPU (`train.wac`) and used in a page (`page.wac`), which can
+// load the weights that training wrote or train its own on WebGPU, and classifies digits drawn on a canvas — which
+// is why the preprocessing MNIST's own digits went through is here too (`centred`).
+
+import { Result, Vec } from "core";
+import { Device, Padding, Tensor } from "../../src/tensor.wac";
+import { Activation, Conv2d, Dense, Flatten, Layer, MaxPool, Sequential, accuracy, sparseSoftmaxCrossEntropy } from "../../src/nn.wac";
+
+export struct Digits {
+  /** `n` images of 784 pixels, row-major, each in [0, 1] with ink as 1. */
+  f32[] pixels;
+  /** Each image's digit, 0 to 9. */
+  f32[] labels;
+  i32 n;
+}
+
+i32 bigEndian(u8[] b, i32 at) {
+  return ((b[at] as i32) << 24) | ((b[at + 1] as i32) << 16) | ((b[at + 2] as i32) << 8) | (b[at + 3] as i32);
+}
+
+/** An IDX image file and its label file, checked — magic numbers 2051 and 2049, counts that agree, 28×28 images. */
+export Result<Digits, string> digitsOf(u8[] images, u8[] labels) {
+  if (images.len() < 16 || bigEndian(images, 0) != 2051) { return Result.Err("not an IDX image file"); }
+  if (labels.len() < 8 || bigEndian(labels, 0) != 2049) { return Result.Err("not an IDX label file"); }
+  i32 n = bigEndian(images, 4);
+  if (bigEndian(labels, 4) != n) { return Result.Err("\{n} images but \{bigEndian(labels, 4)} labels"); }
+  if (bigEndian(images, 8) != 28 || bigEndian(images, 12) != 28) { return Result.Err("images that are not 28×28"); }
+  if (images.len() != 16 + n * 784 || labels.len() != 8 + n) { return Result.Err("files whose sizes do not match their counts"); }
+  f32[] px = f32[].filled(n * 784, 0.0);
+  for (i32 i = 0; i < n * 784; i++) { px[i] = (images[16 + i] as f32) / 255.0; }
+  f32[] ls = f32[].filled(n, 0.0);
+  for (i32 i = 0; i < n; i++) { ls[i] = labels[8 + i] as f32; }
+  return Result.Ok(Digits(px, ls, n));
+}
+
+/**
+ * Two convolutions of 3×3, each followed by a ReLU and a 2×2 max pool — 28 → 14 → 7 — then a dense layer of 64 and
+ * the ten scores. 52,138 numbers: small enough to train an epoch on the CPU in a few minutes, and large enough to get
+ * about 99% right.
+ */
+export Sequential digitModel(Device d) {
+  return Sequential.of([
+    Conv2d.create(d, 1, 8, 3, 1, Padding.Same, Activation.Relu),
+    MaxPool.create(2, 2),
+    Conv2d.create(d, 8, 16, 3, 1, Padding.Same, Activation.Relu),
+    MaxPool.create(2, 2),
+    Flatten.create(),
+    Dense.create(d, 7 * 7 * 16, 64, Activation.Relu),
+    Dense.create(d, 64, 10, Activation.Linear),
+  ]);
+}
+
+/** Images `order[from]` up to `order[to]` as a batch `[b, 28, 28, 1]` and their labels `[b]`. */
+export Tensor[] batchOf(Device d, Digits ds, i32[] order, i32 from, i32 to) {
+  i32 b = to - from;
+  f32[] x = f32[].filled(b * 784, 0.0);
+  f32[] y = f32[].filled(b, 0.0);
+  for (i32 i = 0; i < b; i++) {
+    i32 k = order[from + i];
+    x.copyFrom(ds.pixels, k * 784, i * 784, 784);
+    y[i] = ds.labels[k];
+  }
+  return [d.tensor(x, [b, 28, 28, 1]), d.vector(y)];
+}
+
+/** 0 to n-1 in a random order, from the device's generator. */
+export i32[] shuffled(Device d, i32 n) {
+  i32[] order = i32[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { order[i] = i; }
+  for (i32 i = n - 1; i > 0; i--) {
+    i32 j = (d.random.uniform() * ((i + 1) as f64)) as~ i32;
+    if (j > i) { j = i; }
+    i32 t = order[i];
+    order[i] = order[j];
+    order[j] = t;
+  }
+  return order;
+}
+
+/** 0 to n-1 in order. */
+export i32[] inOrder(i32 n) {
+  i32[] order = i32[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { order[i] = i; }
+  return order;
+}
+
+/**
+ * How many of the first `count` images of `ds` the model gets right, as a fraction, a batch of `batch` at a time. Each
+ * batch is a read from the device, so on a GPU this waits.
+ */
+export async f32 accuracyOn(Device d, Sequential model, Digits ds, i32 count, i32 batch) {
+  i32[] order = inOrder(ds.n);
+  f64 right = 0.0;
+  for (i32 from = 0; from < count; from += batch) {
+    i32 to = from + batch < count ? from + batch : count;
+    Tensor acc = d.tidy(() => {
+      Tensor[] xy = batchOf(d, ds, order, from, to);
+      return accuracy(model.apply(xy[0], false), xy[1]);
+    });
+    right += ((await acc.values())[0] as f64) * ((to - from) as f64);
+    acc.dispose();
+  }
+  return (right / (count as f64)) as~ f32;
+}
+
+/** The ten probabilities for one image of 784 pixels. */
+export Tensor probabilities(Device d, Sequential model, f32[] image) {
+  return d.tidy(() => model.apply(d.tensor(image, [1, 28, 28, 1]), false).reshape([10]).softmax(0));
+}
+
+/**
+ * A drawing of `size` × `size` pixels, ink as 1, prepared as MNIST's digits were: the ink's bounding box scaled to fit
+ * 20×20 keeping its proportions, then placed in a 28×28 field so its centre of mass is at the centre. Without this a
+ * digit drawn small or off to one side looks like nothing the model was trained on. All zeros when there is no ink.
+ */
+export f32[] centred(f32[] drawing, i32 size) {
+  i32 top = size;
+  i32 bottom = -1;
+  i32 left = size;
+  i32 right = -1;
+  for (i32 y = 0; y < size; y++) {
+    for (i32 x = 0; x < size; x++) {
+      if (drawing[y * size + x] > 0.05) {
+        if (y < top) { top = y; }
+        if (y > bottom) { bottom = y; }
+        if (x < left) { left = x; }
+        if (x > right) { right = x; }
+      }
+    }
+  }
+  f32[] out = f32[].filled(784, 0.0);
+  if (bottom < 0) { return out; }
+  i32 bw = right - left + 1;
+  i32 bh = bottom - top + 1;
+  f64 scale = 20.0 / ((bw > bh ? bw : bh) as f64);
+  i32 sw = ((bw as f64) * scale).round() as~ i32;
+  i32 sh = ((bh as f64) * scale).round() as~ i32;
+  if (sw < 1) { sw = 1; }
+  if (sh < 1) { sh = 1; }
+  // Each target pixel the mean of the source pixels it covers: a box filter, which is what shrinking a stroke wants.
+  f32[] small = f32[].filled(sw * sh, 0.0);
+  for (i32 ty = 0; ty < sh; ty++) {
+    for (i32 tx = 0; tx < sw; tx++) {
+      i32 y0 = top + (ty * bh) / sh;
+      i32 y1 = top + ((ty + 1) * bh + sh - 1) / sh;
+      i32 x0 = left + (tx * bw) / sw;
+      i32 x1 = left + ((tx + 1) * bw + sw - 1) / sw;
+      f64 total = 0.0;
+      i32 count = 0;
+      for (i32 y = y0; y < y1 && y <= bottom; y++) {
+        for (i32 x = x0; x < x1 && x <= right; x++) {
+          total += drawing[y * size + x] as f64;
+          count++;
+        }
+      }
+      small[ty * sw + tx] = count == 0 ? 0.0 : (total / (count as f64)) as~ f32;
+    }
+  }
+  f64 mx = 0.0;
+  f64 my = 0.0;
+  f64 mass = 0.0;
+  for (i32 y = 0; y < sh; y++) {
+    for (i32 x = 0; x < sw; x++) {
+      f64 v = small[y * sw + x] as f64;
+      mx += v * (x as f64);
+      my += v * (y as f64);
+      mass += v;
+    }
+  }
+  i32 ox = (14.0 - mx / mass).round() as~ i32;
+  i32 oy = (14.0 - my / mass).round() as~ i32;
+  for (i32 y = 0; y < sh; y++) {
+    for (i32 x = 0; x < sw; x++) {
+      i32 X = x + ox;
+      i32 Y = y + oy;
+      if (X >= 0 && X < 28 && Y >= 0 && Y < 28) { out[Y * 28 + X] = small[y * sw + x]; }
+    }
+  }
+  return out;
+}

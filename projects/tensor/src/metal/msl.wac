@@ -1,0 +1,399 @@
+// The kernels as MSL, for a Metal server (`metal/server.swift`): the same definitions `../gpu/wgsl.wac` writes in WGSL,
+// over the same buffers and parameters (`../gpu/shaders.wac`), so one `GpuBackend` runs either.
+//
+// **Each program is one kernel, `k`**, its parameters in buffer 0 (`P(i)` reads the `i`th, `F(i)` the same bits as an
+// `f32`) and its inputs and output after, in the order a run binds them. The server compiles every program with fast
+// maths off: a NaN must survive `max`, and `x != x` must mean what it says.
+//
+// **Every buffer is read through `L_<name>(i)`, which answers a `float`**, a macro so a function's body reads like
+// the WGSL one's. An `F16` buffer is an array of `half` — the layout `GpuBackend` packs, two to a word with the even
+// element low, is exactly that on a little-endian GPU — and the arithmetic is `float` throughout.
+//
+// **An elementwise program is a function `value(…, i)`** — element `i` of the output — and a kernel around it that
+// writes the output in its type. For halves one invocation writes a pair, as the WGSL one must, because that is the
+// grid `GpuBackend.spread` asks for whichever language it speaks.
+
+import { Binary, DType, Reduce, Unary, sameDType } from "../backend.wac";
+import { Shaders } from "../gpu/shaders.wac";
+
+bool half(DType t) { return sameDType(t, DType.F16); }
+
+string elem(DType t) { return half(t) ? "half" : "float"; }
+
+string header() {
+  return """
+      #include <metal_stdlib>
+      using namespace metal;
+      #define P(i) (p[(i)])
+      #define F(i) (as_type<float>(p[(i)]))
+      static inline float infinity() { return as_type<float>(0x7f800000u); }
+      static inline float qnan() { return as_type<float>(0x7fc00000u); }
+
+      """;
+}
+
+/** The inputs as parameters of a function — `value`'s, and the kernel's when `bound`, each with its buffer index. */
+string params(string[] names, DType[] types, bool bound) {
+  string s = bound ? "constant int* p [[buffer(0)]]" : "constant int* p";
+  for (i32 k = 0; k < names.len(); k++) {
+    s += ", device const \{elem(types[k])}* \{names[k]}" + (bound ? " [[buffer(\{k + 1})]]" : "");
+  }
+  return s;
+}
+
+string args(string[] names) {
+  string s = "p";
+  for (string n in names) { s += ", " + n; }
+  return s;
+}
+
+string loaders(string[] names) {
+  string s = "";
+  for (string n in names) { s += "#define L_\{n}(i) (float(\{n}[(i)]))\n"; }
+  return s;
+}
+
+/** An elementwise program: `body` is the body of `value`, reading inputs through `L_`; `extra` is what it calls. */
+string elementwise(string[] names, DType[] types, DType out, string extra, string body) {
+  i32 o = names.len() + 1;
+  string common = header() + extra + loaders(names)
+                + "\nstatic float value(\{params(names, types, false)}, int i) {\n" + body + "\n}\n\n"
+                + "kernel void k(\{params(names, types, true)}, device \{elem(out)}* ys [[buffer(\{o})]],\n"
+                + "              uint3 gid [[thread_position_in_grid]], uint3 nwg [[threadgroups_per_grid]]) {\n";
+  if (half(out)) {
+    return common + """
+          int t = int(gid.x + gid.y * nwg.x * 64u);
+          int i = t * 2;
+          int n = P(0);
+          if (i >= n) { return; }
+        """ + "  ys[i] = half(value(\{args(names)}, i));\n"
+            + "  if (i + 1 < n) { ys[i + 1] = half(value(\{args(names)}, i + 1)); }\n}\n";
+  }
+  return common + """
+        int i = int(gid.x + gid.y * nwg.x * 64u);
+        if (i >= P(0)) { return; }
+      """ + "  ys[i] = value(\{args(names)}, i);\n}\n";
+}
+
+string unaryExpr(Unary op) {
+  match (op) {
+    Neg: { return "-v"; }
+    Abs: { return "abs(v)"; }
+    Exp: { return "exp(v)"; }
+    Expm1: {
+      return "select(exp(v) - 1.0f, v * (1.0f + v * (0.5f + v * (0.16666667f + v * 0.041666668f))), abs(v) < 0.01f)";
+    }
+    Log: { return "log(v)"; }
+    Log1p: { return "select(log(1.0f + v), v * (1.0f - v * (0.5f - v * (0.33333334f - v * 0.25f))), abs(v) < 0.01f)"; }
+    Sqrt: { return "sqrt(v)"; }
+    Rsqrt: { return "rsqrt(v)"; }
+    Square: { return "v * v"; }
+    Reciprocal: { return "1.0f / v"; }
+    Sin: { return "sin(v)"; }
+    Cos: { return "cos(v)"; }
+    Tanh: { return "tanh(clamp(v, -15.0f, 15.0f))"; }
+    Sigmoid: { return "1.0f / (1.0f + exp(-v))"; }
+    Relu: { return "max(v, 0.0f)"; }
+    Softplus: { return "max(v, 0.0f) + log(1.0f + exp(-abs(v)))"; }
+    Sign: { return "sign(v)"; }
+    Floor: { return "floor(v)"; }
+    Ceil: { return "ceil(v)"; }
+    // MSL's `round` takes a tie away from zero; `rint` takes it to the even neighbour, as TensorFlow and the CPU do.
+    Round: { return "rint(v)"; }
+    Step: { return "select(0.0f, 1.0f, v > 0.0f)"; }
+  }
+}
+
+string binaryExpr(Binary op) {
+  match (op) {
+    Add: { return "a + b"; }
+    Sub: { return "a - b"; }
+    Mul: { return "a * b"; }
+    Div: { return "a / b"; }
+    Pow: { return "powt(a, b)"; }
+    Maximum: { return "select(max(a, b), a + b, a != a || b != b)"; }
+    Minimum: { return "select(min(a, b), a + b, a != a || b != b)"; }
+    Equal: { return "select(0.0f, 1.0f, a == b)"; }
+    NotEqual: { return "select(0.0f, 1.0f, a != b)"; }
+    Less: { return "select(0.0f, 1.0f, a < b)"; }
+    LessEqual: { return "select(0.0f, 1.0f, a <= b)"; }
+    Greater: { return "select(0.0f, 1.0f, a > b)"; }
+    GreaterEqual: { return "select(0.0f, 1.0f, a >= b)"; }
+  }
+}
+
+/** `pow` with TensorFlow's answer for a negative base and a whole exponent, as `wgsl.wac`'s `powf` explains. */
+string powDefinition() {
+  return """
+      static float powt(float a, float b) {
+        if (b == 0.0f) { return 1.0f; }
+        if (a == 0.0f) { return b < 0.0f ? infinity() : 0.0f; }
+        float r = pow(abs(a), b);
+        if (a > 0.0f) { return r; }
+        if (fract(b) != 0.0f) { return qnan(); }
+        return fract(b * 0.5f) != 0.0f ? -r : r;
+      }
+
+      """;
+}
+
+/** The offsets an output index reads, for `n` operands whose strides follow the shape in the parameters. */
+string stridedLoop(i32 operands) {
+  string decl = "";
+  string step = "";
+  for (i32 k = 0; k < operands; k++) {
+    decl += "  int o\{k} = 0;\n";
+    step += "    o\{k} += c * P(2 + rank * \{k + 1} + d);\n";
+  }
+  return "  int rank = P(1);\n" + decl
+       + "  int rem = i;\n"
+       + "  for (int d = rank - 1; d >= 0; d--) {\n"
+       + "    int s = P(2 + d);\n"
+       + "    int c = rem % s;\n"
+       + "    rem = rem / s;\n"
+       + step
+       + "  }\n";
+}
+
+string convNames() {
+  return """
+        int H = P(2); int W = P(3); int C = P(4);
+        int KH = P(5); int KW = P(6); int SH = P(7); int SW = P(8); int DH = P(9); int DW = P(10);
+        int PT = P(11); int PL = P(12); int OH = P(13); int OW = P(14);
+        int COLS = KH * KW * C;
+      """;
+}
+
+/** `template` with every `key` in it replaced by `value`. */
+string substitute(string template, string key, string value) {
+  string out = "";
+  string rest = template;
+  i32 at = rest.indexOf(key);
+  while (at >= 0) {
+    out += rest.slice(0, at) + value;
+    rest = rest.slice(at + key.len(), rest.len());
+    at = rest.indexOf(key);
+  }
+  return out + rest;
+}
+
+string reduceIdentity(Reduce op) {
+  match (op) {
+    Sum: { return "0.0f"; }
+    Prod: { return "1.0f"; }
+    Max: { return "-infinity()"; }
+    Min: { return "infinity()"; }
+  }
+}
+
+string reduceCombine(Reduce op) {
+  match (op) {
+    Sum: { return "a + b"; }
+    Prod: { return "a * b"; }
+    Max: { return "max(a, b)"; }
+    Min: { return "min(a, b)"; }
+  }
+}
+
+/** The opening of a kernel that writes `F32`, with the one input `xs` and the builtins a per-row program uses. */
+string rowKernel(DType t) {
+  return header() + loaders(["xs"])
+       + "kernel void k(\{params(["xs"], [t], true)}, device float* ys [[buffer(2)]],\n"
+       + "              uint3 wid [[threadgroup_position_in_grid]], uint3 nwg [[threadgroups_per_grid]],\n"
+       + "              uint lid [[thread_index_in_threadgroup]]) {\n";
+}
+
+export struct Msl : Shaders {
+  override string fill(this, DType t) { return elementwise(string[](), DType[](), t, "", "  return F(1);"); }
+
+  override string cast(this, DType from, DType to) { return elementwise(["xs"], [from], to, "", "  return L_xs(i);"); }
+
+  override string unary(this, Unary op, DType t) {
+    return elementwise(["xs"], [t], t, "", "  float v = L_xs(i);\n  return " + unaryExpr(op) + ";");
+  }
+
+  override string binary(this, Binary op, DType t) {
+    return elementwise(["xa", "xb"], [t, t], t, powDefinition(),
+                       stridedLoop(2) + "  float a = L_xa(o0);\n  float b = L_xb(o1);\n  return " + binaryExpr(op) + ";");
+  }
+
+  override string select(this, DType cond, DType t) {
+    return elementwise(["xc", "xa", "xb"], [cond, t, t], t, "",
+                       stridedLoop(3) + "  if (L_xc(o0) != 0.0f) { return L_xa(o1); }\n  return L_xb(o2);");
+  }
+
+  override string gather(this, DType t) {
+    return elementwise(["xs"], [t], t, "", stridedLoop(1) + "  return L_xs(o0 + P(2 + rank * 2));");
+  }
+
+  override string pad(this, DType t) {
+    return elementwise(["xs"], [t], t, "", """
+          int rank = P(1);
+          int rem = i;
+          int src = 0;
+          int mul = 1;
+          bool inside = true;
+          for (int d = rank - 1; d >= 0; d--) {
+            int c = rem % P(2 + d);
+            rem = rem / P(2 + d);
+            int at = c - P(2 + rank * 2 + d);
+            int size = P(2 + rank + d);
+            if (at < 0 || at >= size) { inside = false; }
+            src += at * mul;
+            mul *= size;
+          }
+          if (inside) { return L_xs(src); }
+          return F(2 + rank * 3);
+        """);
+  }
+
+  override string im2col(this, DType t) {
+    return elementwise(["xs"], [t], t, "", convNames() + """
+          int col = i % COLS;
+          int row = i / COLS;
+          int ch = col % C;
+          int kx = (col / C) % KW;
+          int ky = col / (C * KW);
+          int ox = row % OW;
+          int oy = (row / OW) % OH;
+          int b = row / (OW * OH);
+          int iy = oy * SH + ky * DH - PT;
+          int ix = ox * SW + kx * DW - PL;
+          if (iy >= 0 && iy < H && ix >= 0 && ix < W) { return L_xs(((b * H + iy) * W + ix) * C + ch); }
+          return F(15);
+        """);
+  }
+
+  override string col2im(this, DType t) {
+    return elementwise(["xs"], [t], t, "", convNames() + """
+          int ch = i % C;
+          int ix = (i / C) % W;
+          int iy = (i / (C * W)) % H;
+          int b = i / (C * W * H);
+          float sum = 0.0f;
+          for (int ky = 0; ky < KH; ky++) {
+            int ty = iy + PT - ky * DH;
+            if (ty < 0 || ty % SH != 0 || ty / SH >= OH) { continue; }
+            for (int kx = 0; kx < KW; kx++) {
+              int tx = ix + PL - kx * DW;
+              if (tx < 0 || tx % SW != 0 || tx / SW >= OW) { continue; }
+              sum += L_xs(((b * OH + ty / SH) * OW + tx / SW) * COLS + (ky * KW + kx) * C + ch);
+            }
+          }
+          return sum;
+        """);
+  }
+
+  override string take(this, DType t, DType index) {
+    return elementwise(["table", "idx"], [t, index], t, "", """
+          int width = P(1);
+          int r = int(L_idx(i / width));
+          if (r >= 0 && r < P(2)) { return L_table(r * width + i % width); }
+          return 0.0f;
+        """);
+  }
+
+  override string scatterAdd(this, DType t, DType index) {
+    return elementwise(["vals", "idx"], [t, index], t, "", """
+          int width = P(1);
+          int r = i / width;
+          int c = i % width;
+          float sum = 0.0f;
+          for (int k = 0; k < P(2); k++) {
+            if (int(L_idx(k)) == r) { sum += L_vals(k * width + c); }
+          }
+          return sum;
+        """);
+  }
+
+  override string reduce(this, Reduce op, DType t) {
+    return substitute(substitute(rowKernel(t) + """
+          threadgroup float part[64];
+          int row = int(wid.x + wid.y * nwg.x);
+          int inner = P(1);
+          bool valid = row < P(0);
+          float acc = @IDENTITY@;
+          if (valid) {
+            for (int j = int(lid); j < inner; j += 64) { float a = acc; float b = L_xs(row * inner + j); acc = @COMBINE@; }
+          }
+          part[lid] = acc;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (uint s = 32u; s > 0u; s = s / 2u) {
+            if (lid < s) { float a = part[lid]; float b = part[lid + s]; part[lid] = @COMBINE@; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          if (lid == 0u && valid) { ys[row] = part[0]; }
+        }
+        """, "@COMBINE@", reduceCombine(op)), "@IDENTITY@", reduceIdentity(op));
+  }
+
+  override string argReduce(this, bool max, DType t) {
+    return substitute(rowKernel(t) + """
+          threadgroup float pv[64];
+          threadgroup int pix[64];
+          int row = int(wid.x + wid.y * nwg.x);
+          int inner = P(1);
+          bool valid = row < P(0);
+          float bv = 0.0f;
+          int bi = 2147483647;
+          if (valid) {
+            for (int j = int(lid); j < inner; j += 64) {
+              float v = L_xs(row * inner + j);
+              if (bi == 2147483647 || v @BETTER@ bv) { bv = v; bi = j; }
+            }
+          }
+          pv[lid] = bv;
+          pix[lid] = bi;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (uint s = 32u; s > 0u; s = s / 2u) {
+            if (lid < s) {
+              float ov = pv[lid + s];
+              int oi = pix[lid + s];
+              if (oi != 2147483647 && (pix[lid] == 2147483647 || ov @BETTER@ pv[lid] || (ov == pv[lid] && oi < pix[lid]))) {
+                pv[lid] = ov;
+                pix[lid] = oi;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          if (lid == 0u && valid) { ys[row] = float(pix[0]); }
+        }
+        """, "@BETTER@", max ? ">" : "<");
+  }
+
+  /** `wgsl.wac`'s sixteen-by-sixteen tiles, for halves: an `F32` product goes to Metal Performance Shaders instead. */
+  override string matmul(this, DType t) {
+    return header() + loaders(["xa", "xb"])
+         + "kernel void k(\{params(["xa", "xb"], [t, t], true)}, device float* ys [[buffer(3)]],\n"
+         + "              uint3 wid [[threadgroup_position_in_grid]], uint3 lid3 [[thread_position_in_threadgroup]]) {\n"
+         + """
+          threadgroup float tA[16][16];
+          threadgroup float tB[16][16];
+          int M = P(1); int K = P(2); int N = P(3);
+          bool transA = P(4) != 0; bool transB = P(5) != 0;
+          int q = int(wid.z);
+          int ab = q * P(6);
+          int bb = q * P(7);
+          int ly = int(lid3.y); int lx = int(lid3.x);
+          int row = int(wid.y) * 16 + ly;
+          int col = int(wid.x) * 16 + lx;
+          float sum = 0.0f;
+          int tiles = (K + 15) / 16;
+          for (int t = 0; t < tiles; t++) {
+            int ac = t * 16 + lx;
+            float av = 0.0f;
+            if (row < M && ac < K) { av = transA ? L_xa(ab + ac * M + row) : L_xa(ab + row * K + ac); }
+            tA[ly][lx] = av;
+            int br = t * 16 + ly;
+            float bv = 0.0f;
+            if (br < K && col < N) { bv = transB ? L_xb(bb + col * K + br) : L_xb(bb + br * N + col); }
+            tB[ly][lx] = bv;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int s = 0; s < 16; s++) { sum += tA[ly][s] * tB[s][lx]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          if (row < M && col < N) { ys[q * M * N + row * N + col] = sum; }
+        }
+        """;
+  }
+}

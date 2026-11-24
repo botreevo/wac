@@ -1,0 +1,82 @@
+// Train the digit model on MNIST's 60,000 training images, on the CPU, measure it on the 10,000 test images it never
+// saw, and write its weights for the page to load.
+//
+//     sh tools/fetch-mnist.sh
+//     wac run --allow-read --allow-write example/mnist/train.wac [epochs] [weights-out]
+//
+// An epoch is every training image once, in a new random order, 64 at a time.
+
+import { Sys } from "std";
+import { Result } from "core";
+import { Device, Tensor } from "../../src/tensor.wac";
+import { Layer, Sequential, sparseSoftmaxCrossEntropy } from "../../src/nn.wac";
+import { Adam } from "../../src/optim.wac";
+import { saveWeights } from "../../src/checkpoint.wac";
+import { Digits, accuracyOn, batchOf, digitModel, digitsOf, shuffled } from "./mnist.wac";
+
+async Result<Digits, string> load(Sys sys, string images, string labels) {
+  string dir = "example/mnist/data/";
+  Result<u8[], string> im = await sys.readFile(dir + images);
+  Result<u8[], string> lb = await sys.readFile(dir + labels);
+  if (im.isErr() || lb.isErr()) { return Result.Err("cannot read \{dir}\{images} — run sh tools/fetch-mnist.sh"); }
+  return digitsOf(im.ok()!, lb.ok()!);
+}
+
+i32 argOr(string[] args, i32 k, i32 fallback) {
+  if (args.len() <= k) { return fallback; }
+  i32 v = 0;
+  u8[] b = args[k].toBytes();
+  for (i32 i = 0; i < b.len(); i++) { v = v * 10 + ((b[i] as i32) - 48); }
+  return v;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  i32 epochs = argOr(args, 0, 1);
+  string out = args.len() > 1 ? args[1] : "example/mnist/mnist.weights";
+  Result<Digits, string> train = await load(sys, "train-images-idx3-ubyte", "train-labels-idx1-ubyte");
+  Result<Digits, string> test = await load(sys, "t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte");
+  if (train.isErr() || test.isErr()) {
+    sys.log(train.isErr() ? train.err()! : test.err()!);
+    return 1;
+  }
+  Digits tr = train.ok()!;
+  Digits te = test.ok()!;
+  Device d = Device.cpu();
+  d.seed(7 as i64);
+  Sequential model = digitModel(d);
+  i32 size = 0;
+  for (Tensor v in model.params()) { size += v.size(); }
+  sys.log("\{tr.n} training images, \{te.n} test images; a model of \{size} numbers");
+  Adam opt = Adam.create(0.002);
+  i32 batch = 64;
+  i32 steps = tr.n / batch;
+  i64 started = await sys.monotonicNanos();
+  for (i32 epoch = 0; epoch < epochs; epoch++) {
+    i32[] order = shuffled(d, tr.n);
+    f64 recent = 0.0;
+    for (i32 s = 0; s < steps; s++) {
+      Tensor loss = opt.minimize(() => {
+        Tensor[] xy = batchOf(d, tr, order, s * batch, (s + 1) * batch);
+        return sparseSoftmaxCrossEntropy(model.apply(xy[0], true), xy[1]);
+      }, model.params());
+      recent += loss.item() as f64;
+      loss.dispose();
+      if ((s + 1) % 100 == 0) {
+        f64 secs = ((await sys.monotonicNanos()) - started) as~ f64 / 1000000000.0;
+        sys.log("epoch \{epoch + 1}, step \{s + 1}/\{steps}: loss \{recent / 100.0}  (\{secs} s)");
+        recent = 0.0;
+      }
+    }
+    f32 acc = await accuracyOn(d, model, te, te.n, 500);
+    sys.log("epoch \{epoch + 1}: \{acc * 100.0}% of the test images right");
+  }
+  u8[] weights = await saveWeights(model.params());
+  Result<void, string> wrote = await sys.writeFile(out, weights);
+  if (wrote.isErr()) {
+    sys.log("cannot write \{out}: \{wrote.err()!}");
+    return 1;
+  }
+  sys.log("wrote \{out}: \{weights.len()} bytes");
+  return 0;
+}

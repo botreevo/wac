@@ -1,0 +1,181 @@
+// What a backend is asked to do: a small set of kernels every tensor operation is written in.
+//
+// **The kernels are few and know nothing of gradients, shapes as people write them, or broadcasting rules.** Each is
+// handed exactly the numbers it needs — the output's shape and a stride per axis for each operand — so the CPU backend
+// is a page of loops and the GPU backend a page of shaders, and everything above them (`tensor.wac`) is written once.
+// A transpose, a slice and a broadcast are all `gather` with different strides; a convolution is `im2col` and a matrix
+// product; pooling is `im2col` and a reduction. Adding an operation to the library almost never means adding a kernel.
+//
+// **Two element types, one arithmetic.** A tensor is `F32` or `F16`; every kernel computes in `f32` and rounds its result
+// to the output's type once, as mixed-precision training does — half the memory and bandwidth for an `F16` tensor, and
+// none of the error a sum accumulated in halves would gather. A kernel's output has its first input's type, except
+// `argReduce`, whose indices are always `F32`, and `cast`. An index tensor (`take`, `argMax`, `oneHot`) holds its
+// integers as floats: exact to 2^24 in `F32`, and to 2048 in `F16`.
+
+import { Ticket } from "core";
+
+export enum DType {
+  F32,
+  /** IEEE half precision, stored as halves and computed in `f32` (`half.wac`). */
+  F16,
+}
+
+export string dtypeName(DType t) { return match (t) { F32: "f32", F16: "f16" }; }
+
+export bool sameDType(DType a, DType b) { return dtypeName(a) == dtypeName(b); }
+
+export enum Unary {
+  Neg,
+  Abs,
+  Exp,
+  Expm1,
+  Log,
+  Log1p,
+  Sqrt,
+  Rsqrt,
+  Square,
+  Reciprocal,
+  Sin,
+  Cos,
+  Tanh,
+  Sigmoid,
+  Relu,
+  Softplus,
+  Sign,
+  Floor,
+  Ceil,
+  Round,
+  /** 1 where the input is above 0, else 0: the derivative of `relu`, and a mask. */
+  Step,
+}
+
+export enum Binary {
+  Add,
+  Sub,
+  Mul,
+  Div,
+  Pow,
+  Maximum,
+  Minimum,
+  /** 1 or 0, as are the five after it. */
+  Equal,
+  NotEqual,
+  Less,
+  LessEqual,
+  Greater,
+  GreaterEqual,
+}
+
+export enum Reduce {
+  Sum,
+  Max,
+  Min,
+  Prod,
+}
+
+/**
+ * Where a backend keeps a tensor's numbers: a CPU array, a GPU buffer. A tensor holds one and never looks inside;
+ * only the backend that made it does, and a backend handed another's traps — moving between devices is a download
+ * and an upload, said out loud (`Tensor.to`).
+ */
+export struct Storage {
+  /** How many elements. */
+  i32 size;
+  DType dtype;
+  /** Set by `Backend.free`, so a use after it traps rather than reading a buffer something else now owns. */
+  bool freed = false;
+  /**
+   * How many tensors hold it. A reshape is a new tensor over the same numbers, so disposing one of them must not free
+   * what the other still reads; the storage goes when the last holder is disposed.
+   */
+  i32 holders = 0;
+}
+
+/**
+ * A convolution's geometry, NHWC as TensorFlow lays images out: the input is `[n, h, w, c]`, the window `kh` by `kw`
+ * moved `sh`, `sw` at a time and spread by dilation `dh`, `dw`, the input padded by `padTop` and `padLeft` before the
+ * first window. `oh` and `ow` are the output's height and width. `im2col`'s rows are the `n·oh·ow` windows and its
+ * columns `(ky, kx, ch)` in that order — the order a `[kh, kw, c, f]` filter flattens to.
+ */
+export struct Conv {
+  i32 n;
+  i32 h;
+  i32 w;
+  i32 c;
+  i32 kh;
+  i32 kw;
+  i32 sh;
+  i32 sw;
+  i32 dh;
+  i32 dw;
+  i32 padTop;
+  i32 padLeft;
+  i32 oh;
+  i32 ow;
+
+  i32 rows(const this) { return this.n * this.oh * this.ow; }
+  i32 cols(const this) { return this.kh * this.kw * this.c; }
+}
+
+/**
+ * The kernels. Each method is `virtual` with a body that traps: a backend overrides all of them, and the trap is what
+ * a backend that forgot one meets, naming nothing but where it happened.
+ *
+ * Every kernel allocates its result and never writes to an input, so a storage is immutable once made — which is what
+ * lets a tape keep inputs for the backward pass without copying them. `free` is the one exception and is the caller's
+ * promise that nothing will read the storage again.
+ */
+export struct Backend {
+  virtual string name(const this) { return "none"; }
+
+  /** `values`, each rounded to `dtype`. */
+  virtual Storage upload(this, f32[] values, DType dtype) { trap; }
+  /** The numbers, as soon as they are available — at once on the CPU, after the queue drains on a GPU. */
+  virtual Ticket<f32[]> download(this, Storage s) { trap; }
+  virtual Storage fill(this, i32 n, f32 value, DType dtype) { trap; }
+  /** `x`'s values as `to`, each rounded when `to` is the narrower. */
+  virtual Storage cast(this, Storage x, DType to) { trap; }
+  virtual void free(this, Storage s) { trap; }
+
+  virtual Storage unary(this, Unary op, Storage x) { trap; }
+
+  /**
+   * `out[i] = a[ia] op b[ib]` over every index of shape `out`, where `ia` and `ib` are the index dotted with `sa`
+   * and `sb` — a stride of 0 is an axis that operand is broadcast along.
+   */
+  virtual Storage binary(this, Binary op, Storage a, Storage b, i32[] out, i32[] sa, i32[] sb) { trap; }
+
+  /** `out[i] = c[ic] != 0 ? a[ia] : b[ib]`, strided as `binary` is. */
+  virtual Storage select(this, Storage c, Storage a, Storage b, i32[] out, i32[] sc, i32[] sa, i32[] sb) { trap; }
+
+  /** Each of `outer` contiguous rows of `inner` numbers reduced to one. */
+  virtual Storage reduce(this, Reduce op, Storage x, i32 outer, i32 inner) { trap; }
+
+  /** The index of each row's largest (`max`) or smallest number — the first, on a tie — as `F32` whatever `x` is. */
+  virtual Storage argReduce(this, bool max, Storage x, i32 outer, i32 inner) { trap; }
+
+  /**
+   * `batch` matrix products `[m, k] · [k, n]`. `a`'s matrices are `aStride` apart and `b`'s `bStride` — 0 for one
+   * matrix shared by every product — and `ta`, `tb` say a matrix is stored transposed (`[k, m]`, `[n, k]`).
+   */
+  virtual Storage matmul(this, Storage a, Storage b, i32 batch, i32 m, i32 k, i32 n, bool ta, bool tb,
+                         i32 aStride, i32 bStride) { trap; }
+
+  /** `out[i] = x[offset + i·strides]` over every index of shape `out`: a transpose, slice or broadcast. */
+  virtual Storage gather(this, Storage x, i32[] out, i32[] strides, i32 offset) { trap; }
+
+  /** `x`, of shape `inShape`, placed at `begin` in a tensor of shape `out` whose other elements are `value`. */
+  virtual Storage pad(this, Storage x, i32[] inShape, i32[] out, i32[] begin, f32 value) { trap; }
+
+  /** Every window of the convolution `c` as a row; a window's element outside the input is `padValue`. */
+  virtual Storage im2col(this, Storage x, Conv c, f32 padValue) { trap; }
+
+  /** `im2col` undone by summing: each input element the total of every window element that read it. */
+  virtual Storage col2im(this, Storage cols, Conv c) { trap; }
+
+  /** Row `indices[i]` of a table of rows `width` wide, for each of `n` indices. */
+  virtual Storage take(this, Storage table, i32 width, Storage indices, i32 n) { trap; }
+
+  /** `take` undone by summing: a table of `rows` rows, each the total of the values whose index named it. */
+  virtual Storage scatterAdd(this, Storage values, i32 width, Storage indices, i32 n, i32 rows) { trap; }
+}

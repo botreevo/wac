@@ -1,0 +1,100 @@
+// Half precision: the conversions bit for bit, and `F16` tensors computing in `f32` and rounding once.
+
+import { Check } from "./check.wac";
+import { DType, dtypeName } from "../src/backend.wac";
+import { halfBits, halfValue, toHalf } from "../src/half.wac";
+import { Device, Gradients, Tensor, Variable } from "../src/tensor.wac";
+import { Activation, Dense, Layer, Sequential, sigmoidCrossEntropy } from "../src/nn.wac";
+import { Adam } from "../src/optim.wac";
+
+export string test_conversions_round_to_nearest_even() {
+  Check t = Check.create();
+  // Each against the bits IEEE 754 gives (checked with NumPy's float16).
+  f32[] vs = [1.0, -2.0, 65504.0, 65519.0, 65520.0, 0.33333334, 0.1, 1.00048828125, 1.00146484375,
+              0.000000059604645, 0.000000029802322, 0.00000004470348, 0.00006103515625, -0.0];
+  i32[] want = [0x3C00, 0xC000, 0x7BFF, 0x7BFF, 0x7C00, 0x3555, 0x2E66, 0x3C00, 0x3C02,
+                0x0001, 0x0000, 0x0001, 0x0400, 0x8000];
+  for (i32 i = 0; i < vs.len(); i++) {
+    i32 got = halfBits(vs[i]);
+    t.ok(got == want[i], "halfBits(\{vs[i]}) = \{got}, want \{want[i]}");
+  }
+  t.ok(halfBits(1.0 / 0.0) == 0x7C00, "infinity");
+  i32 nan = halfBits(0.0 / 0.0);
+  t.ok((nan & 0x7C00) == 0x7C00 && (nan & 0x3FF) != 0, "NaN stays NaN");
+  return t.report();
+}
+
+export string test_every_half_survives_the_round_trip() {
+  Check t = Check.create();
+  i32 bad = 0;
+  for (i32 h = 0; h < 65536; h++) {
+    bool isNan = (h & 0x7C00) == 0x7C00 && (h & 0x3FF) != 0;
+    if (!isNan && halfBits(halfValue(h)) != h) { bad++; }
+  }
+  t.ok(bad == 0, "\{bad} halves did not come back as themselves");
+  t.ok(halfValue(0x3555) == 0.333251953125, "a half's value is exact");
+  t.ok(halfValue(0x0001) == 0.000000059604644775390625, "the smallest subnormal");
+  return t.report();
+}
+
+export string test_half_tensors_round_each_result_once() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  d.dtype = DType.F16;
+  Tensor x = d.vector([0.1, 1.0, 3.0]);
+  t.ok(dtypeName(x.dtype()) == "f16", "made as the device's type");
+  t.values(x, [3], [0.0999755859375, 1.0, 3.0], 0.0, "rounded on the way in");
+  t.values(d.vector([1.0]).div(3.0), [1], [0.333251953125], 0.0, "a quotient rounded once");
+  t.values(x.mul(x), [3], [toHalf(0.0999755859375 * 0.0999755859375), 1.0, 9.0], 0.0, "a product");
+  t.values(d.vector([70000.0]), [1], [1.0 / 0.0], 0.0, "too large is infinity");
+  // 4096 halves summed: in halves the total would stop at 2048, where adding 1 rounds back down. Accumulated in f32.
+  t.values(d.ones([4096]).sum([], false), i32[](), [4096.0], 0.0, "a sum accumulates in f32");
+  t.values(d.ones([64, 64]).matmul(d.ones([64, 64])).slice([0, 0], [1, 1]), [1, 1], [64.0], 0.0, "and so does a product");
+  t.ok(dtypeName(x.argMax(0).dtype()) == "f32", "indices are f32 whatever they index");
+  t.ok(dtypeName(x.mul(2.0).dtype()) == "f16", "a number takes the tensor's type");
+  return t.report();
+}
+
+export string test_cast_and_its_gradient() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  Tensor w = d.vector([0.1, 2.0]);
+  Tensor h = w.cast(DType.F16);
+  t.values(h, [2], [0.0999755859375, 2.0], 0.0, "f32 to f16 rounds");
+  t.values(h.cast(DType.F32), [2], [0.0999755859375, 2.0], 0.0, "and back is exact");
+  t.ok(w.cast(DType.F32) is w, "a cast to its own type is the tensor itself");
+  // Mixed precision: f32 weights, the computation in halves, the gradient back in f32.
+  Gradients g = d.gradients(() => w.cast(DType.F16).square().sum([], false), [w]);
+  t.ok(dtypeName(g.grads[0].dtype()) == "f32", "the gradient has the weight's type");
+  t.values(g.grads[0], [2], [0.199951171875, 4.0], 0.0, "2w, computed in halves");
+  return t.report();
+}
+
+export string test_traps_two_types_do_not_mix() {
+  Device d = Device.cpu();
+  Tensor a = d.vector([1.0]);
+  Tensor b = d.tensorOf([1.0], [1], DType.F16);
+  return "\{a.add(b).item()}";
+}
+
+export string test_a_half_precision_model_learns_xor() {
+  Check t = Check.create();
+  Device d = Device.cpu();
+  d.dtype = DType.F16;
+  d.seed(7 as i64);
+  Tensor x = d.tensor([0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], [4, 2]);
+  Tensor y = d.tensor([0.0, 1.0, 1.0, 0.0], [4, 1]);
+  Sequential model = Sequential.of([Dense.create(d, 2, 8, Activation.Tanh), Dense.create(d, 8, 1, Activation.Linear)]);
+  t.ok(dtypeName(model.params()[0].dtype()) == "f16", "the weights are halves");
+  Adam opt = Adam.create(0.05);
+  f32 last = 0.0;
+  for (i32 step = 0; step < 300; step++) {
+    Tensor loss = opt.minimize(() => sigmoidCrossEntropy(model.apply(x, true), y), model.params());
+    last = loss.item();
+    loss.dispose();
+  }
+  t.ok(last < 0.1, "the loss fell to \{last}");
+  f32[] out = model.apply(x, false).sigmoid().valuesNow();
+  t.ok(out[0] < 0.2 && out[1] > 0.8 && out[2] > 0.8 && out[3] < 0.2, "xor: \{out[0]} \{out[1]} \{out[2]} \{out[3]}");
+  return t.report();
+}

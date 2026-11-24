@@ -1,0 +1,1010 @@
+// Tensors, the device they live on, and gradients.
+//
+// **The device is the context, and it is a value.** TensorFlow keeps a global engine — the backend, the tape, the
+// scope `tidy` disposes, the random state — and wac has no mutable globals, so all of that is a `Device` and every
+// tensor carries the one it was made on. An operation between tensors of two devices is refused rather than quietly
+// copied.
+//
+// **Every operation is a method** — `x.matmul(w).add(b).relu()` — and the arithmetic ones are operators too, so
+// `x * w + b` works where a scalar or a tensor fits either side. Nothing takes a default argument, because wac has
+// none: `sum([], false)` is every axis, not kept, said in full.
+//
+// **Gradients are a function of a function.** `device.gradients(() => loss(...), params)` runs the function with a
+// tape recording, walks the tape backwards, and answers the value and one gradient per tensor asked about. Each
+// operation's backward rule is written in tensor operations, so it runs on whatever backend the forward did and is
+// itself recorded when an outer tape is — a gradient of a gradient is two nested calls.
+//
+// **Memory is the caller's to give back, because a GPU's is not the collector's.** `device.tidy(() => …)` disposes
+// every tensor made inside it but the one it returns, as TensorFlow's `tidy` does; `t.dispose()` is the one at a
+// time form. On the CPU disposing is only bookkeeping, and forgetting to costs nothing but the check that catches a
+// use after it.
+
+import { Map, Ticket, Vec, hashI32, i32Eq, operators } from "core";
+import { Backend, Binary, Conv, DType, Reduce, Storage, Unary, dtypeName, sameDType } from "./backend.wac";
+import { CpuBackend } from "./cpu.wac";
+import { Random } from "./random.wac";
+import {
+  broadcastShapes, broadcastStrides, contains, copyShape, inversePermutation, normalizeAxes, normalizeAxis,
+  sameShape, shapeText, sizeOf, stridesOf,
+} from "./shape.wac";
+
+/** A backward rule: the gradient of each input, given the output's — `null` for an input it does not flow to. */
+
+
+struct Entry {
+  Tensor output;
+  Tensor[] inputs;
+  fn<Tensor?[](Tensor)> backward;
+}
+
+/** What one `gradients` call records: the operations reachable from the tensors it watches, in order. */
+struct Tape {
+  Map<i32, bool> tracked;
+  Vec<Entry> entries;
+
+  Tape create() { return Tape(Map.create(hashI32, i32Eq), Vec.create()); }
+  bool tracks(const this, Tensor t) { return this.tracked.has(t.id); }
+}
+
+/** A value and the gradient of it with respect to each tensor `gradients` was asked about, in that order. */
+export struct Gradients {
+  Tensor value;
+  Tensor[] grads;
+}
+
+export enum Padding {
+  /** Windows only where they fit wholly inside the input. */
+  Valid,
+  /** Padded so the output is the input's size divided by the stride, rounded up — TensorFlow's `'same'`. */
+  Same,
+}
+
+export struct Device {
+  Backend backend;
+  /**
+   * What new tensors are made as — by `tensor`, `zeros`, the random makers, and so every layer's weights. `F32` unless
+   * set: `d.dtype = DType.F16` before a model is made makes the whole model half precision. An operation's result has
+   * its inputs' type whatever this says.
+   */
+  DType dtype;
+  i32 lastId = 0;
+  Vec<Tape> tapes;
+  Vec<Vec<Tensor>> scopes;
+  Random random;
+
+  /** A device on `backend`, its random numbers seeded with 0. */
+  Device on(Backend backend) { return Device { backend: backend, dtype: DType.F32, tapes: Vec.create(), scopes: Vec.create(), random: Random.seeded(0 as i64) }; }
+  Device cpu() { return Device.on(CpuBackend.create()); }
+
+  string name(const this) { return this.backend.name(); }
+  void seed(this, i64 seed) { this.random = Random.seeded(seed); }
+
+  // ── Making tensors ────────────────────────────────────────────────────────────────────────────────────────────
+
+  /** A tensor holding `storage`, counted as one of its holders and as made in the innermost `tidy`. */
+  Tensor wrap(this, i32[] shape, Storage storage) {
+    if (storage.size != sizeOf(shape)) { trap; }
+    this.lastId++;
+    Tensor t = Tensor(this, shape, storage, this.lastId);
+    storage.holders++;
+    if (this.scopes.len() > 0) { this.scopes.last()!.push(t); }
+    return t;
+  }
+
+  /** `values` laid out row-major in `shape`. Traps when the two disagree on how many there are. */
+  Tensor tensor(this, f32[] values, i32[] shape) { return this.tensorOf(values, shape, this.dtype); }
+
+  /** `tensor`, as `dtype` rather than the device's default — each value rounded to it. */
+  Tensor tensorOf(this, f32[] values, i32[] shape, DType dtype) {
+    if (values.len() != sizeOf(shape)) { trap; }
+    return this.wrap(copyShape(shape), this.backend.upload(values, dtype));
+  }
+
+  Tensor scalar(this, f64 v) { return this.scalarOf(v, this.dtype); }
+  Tensor scalarOf(this, f64 v, DType dtype) { return this.fillOf(i32[](), v, dtype); }
+  Tensor vector(this, f32[] values) { return this.tensor(values, [values.len()]); }
+  Tensor fill(this, i32[] shape, f64 v) { return this.fillOf(shape, v, this.dtype); }
+  Tensor fillOf(this, i32[] shape, f64 v, DType dtype) {
+    return this.wrap(copyShape(shape), this.backend.fill(sizeOf(shape), v as~ f32, dtype));
+  }
+  Tensor zeros(this, i32[] shape) { return this.fill(shape, 0.0); }
+  Tensor ones(this, i32[] shape) { return this.fill(shape, 1.0); }
+
+  /** `start`, `start + step`, … up to and not including `stop`. */
+  Tensor range(this, f64 start, f64 stop, f64 step) {
+    i32 n = ((stop - start) / step).ceil() as~ i32;
+    if (n < 0) { n = 0; }
+    f32[] v = f32[].filled(n, 0.0);
+    for (i32 i = 0; i < n; i++) { v[i] = (start + step * (i as f64)) as~ f32; }
+    return this.tensor(v, [n]);
+  }
+
+  /** `n` evenly spaced from `start` to `stop`, both included. */
+  Tensor linspace(this, f64 start, f64 stop, i32 n) {
+    f32[] v = f32[].filled(n, 0.0);
+    for (i32 i = 0; i < n; i++) { v[i] = (n == 1 ? start : start + (stop - start) * (i as f64) / ((n - 1) as f64)) as~ f32; }
+    return this.tensor(v, [n]);
+  }
+
+  /** The `n` by `n` identity. */
+  Tensor eye(this, i32 n) {
+    f32[] v = f32[].filled(n * n, 0.0);
+    for (i32 i = 0; i < n; i++) { v[i * n + i] = 1.0; }
+    return this.tensor(v, [n, n]);
+  }
+
+  Tensor uniform(this, i32[] shape, f64 low, f64 high) {
+    f32[] v = f32[].filled(sizeOf(shape), 0.0);
+    for (i32 i = 0; i < v.len(); i++) { v[i] = (low + (high - low) * this.random.uniform()) as~ f32; }
+    return this.tensor(v, shape);
+  }
+
+  Tensor normal(this, i32[] shape, f64 mean, f64 stddev) {
+    f32[] v = f32[].filled(sizeOf(shape), 0.0);
+    for (i32 i = 0; i < v.len(); i++) { v[i] = (mean + stddev * this.random.normal()) as~ f32; }
+    return this.tensor(v, shape);
+  }
+
+  /** Normal, with anything more than two deviations out drawn again — how TensorFlow initialises most weights. */
+  Tensor truncatedNormal(this, i32[] shape, f64 mean, f64 stddev) {
+    f32[] v = f32[].filled(sizeOf(shape), 0.0);
+    for (i32 i = 0; i < v.len(); i++) {
+      f64 z = this.random.normal();
+      while (z > 2.0 || z < -2.0) { z = this.random.normal(); }
+      v[i] = (mean + stddev * z) as~ f32;
+    }
+    return this.tensor(v, shape);
+  }
+
+  /** A tensor that can be assigned to, which no `tidy` disposes: a model's weights. It takes `initial`'s numbers. */
+  Variable variable(this, Tensor initial, string name) {
+    this.lastId++;
+    Variable v = Variable(this, copyShape(initial.shape), initial.storage, this.lastId, name, true);
+    initial.storage.holders++;
+    return v;
+  }
+
+  // ── Scopes ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  void enter(this) { this.scopes.push(Vec.create()); }
+
+  /** Leave the innermost scope, disposing everything made in it but `keep` — which moves out to the scope around it. */
+  void leave(this, Tensor[] keep) {
+    Vec<Tensor> made = this.scopes.pop()!;
+    // While a tape records, what was made here may be an input the backward pass reads: it goes out to the scope
+    // around this one, which `gradients` always provides and disposes once the tape is walked.
+    if (this.recording() && this.scopes.len() > 0) {
+      this.scopes.last()!.extend(made);
+      return;
+    }
+    for (i32 i = 0; i < made.len(); i++) {
+      Tensor t = made.get(i);
+      bool kept = false;
+      for (Tensor k in keep) { if (k is t) { kept = true; } }
+      if (!kept) { t.dispose(); }
+    }
+    if (this.scopes.len() > 0) {
+      for (Tensor k in keep) {
+        if (!(k is Variable)) { this.scopes.last()!.push(k); }
+      }
+    }
+  }
+
+  /** Run `f`, disposing every tensor it made but the one it returns. */
+  Tensor tidy(this, fn<Tensor()> f) {
+    this.enter();
+    Tensor out = f();
+    this.leave([out]);
+    return out;
+  }
+
+  /** `tidy` for a function that returns several. */
+  Tensor[] tidyAll(this, fn<Tensor[]()> f) {
+    this.enter();
+    Tensor[] out = f();
+    this.leave(out);
+    return out;
+  }
+
+  /** `tidy` for a function that keeps nothing — a training step that only assigns to variables. */
+  void tidyVoid(this, fn<void()> f) {
+    this.enter();
+    f();
+    this.leave(Tensor[]());
+  }
+
+  // ── Gradients ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+  bool recording(const this) { return this.tapes.len() > 0; }
+
+  /** Note that `output` was computed from `inputs`, on every tape that tracks one of them. */
+  void record(this, Tensor output, Tensor[] inputs, fn<Tensor?[](Tensor)> backward) {
+    for (i32 i = 0; i < this.tapes.len(); i++) {
+      Tape tape = this.tapes.get(i);
+      bool reached = false;
+      for (Tensor x in inputs) { if (tape.tracks(x)) { reached = true; } }
+      if (reached) {
+        tape.tracked.set(output.id, true);
+        tape.entries.push(Entry(output, inputs, backward));
+      }
+    }
+  }
+
+  /**
+   * `f`'s value, and its gradient with respect to each of `wrt`. `f` must return a scalar — a loss — or the gradient is
+   * of its sum. A tensor in `wrt` that the value does not depend on has a gradient of zeros.
+   *
+   * Everything `f` and the backward pass made is disposed but the value and the gradients.
+   */
+  Gradients gradients(this, fn<Tensor()> f, Tensor[] wrt) {
+    this.enter();
+    Tape tape = Tape.create();
+    for (Tensor w in wrt) { tape.tracked.set(w.id, true); }
+    this.tapes.push(tape);
+    Tensor y = f();
+    this.tapes.pop();
+
+    Map<i32, Tensor> grads = Map.create(hashI32, i32Eq);
+    grads.set(y.id, this.fillOf(y.shape, 1.0, y.dtype()));
+    for (i32 i = tape.entries.len() - 1; i >= 0; i--) {
+      Entry e = tape.entries.get(i);
+      Tensor? dy = grads.get(e.output.id);
+      if (dy is null) { continue; }
+      Tensor?[] dx = e.backward(dy!);
+      for (i32 j = 0; j < e.inputs.len(); j++) {
+        Tensor x = e.inputs[j];
+        if (dx[j] is null || !tape.tracks(x)) { continue; }
+        Tensor? had = grads.get(x.id);
+        grads.set(x.id, had is null ? dx[j]! : had!.add(dx[j]!));
+      }
+    }
+
+    Tensor[] out = Tensor[].filled(wrt.len(), y);
+    for (i32 i = 0; i < wrt.len(); i++) {
+      Tensor? g = grads.get(wrt[i].id);
+      out[i] = g is null ? this.fillOf(wrt[i].shape, 0.0, wrt[i].dtype()) : g!;
+    }
+    Tensor[] keep = Tensor[].filled(wrt.len() + 1, y);
+    keep.copyFrom(out, 0, 1, out.len());
+    this.leave(keep);
+    return Gradients(y, out);
+  }
+}
+
+/** A number or a tensor, wherever an operation's other operand may be either. */
+
+
+export struct Tensor {
+  Device device;
+  i32[] shape;
+  Storage storage;
+  /** Which tensor this is, to a tape. */
+  i32 id;
+
+  i32 rank(const this) { return this.shape.len(); }
+  DType dtype(const this) { return this.storage.dtype; }
+  i32 size(const this) { return sizeOf(this.shape); }
+
+  /** The numbers, row-major, once the device has them ready. */
+  Ticket<f32[]> values(this) { return this.device.backend.download(this.storage); }
+
+  /** `values` on a device that answers at once — the CPU. Traps on one that would have to wait. */
+  f32[] valuesNow(this) {
+    Ticket<f32[]> t = this.values();
+    if (!t.settled()) { trap; }
+    return t.value();
+  }
+
+  /** The one number of a tensor with one element, at once. Traps on a GPU, which never answers at once. */
+  f32 item(this) {
+    if (this.size() != 1) { trap; }
+    return this.valuesNow()[0];
+  }
+
+  /** Give back what this tensor holds. Using it afterwards traps. */
+  void dispose(this) {
+    Storage s = this.storage;
+    if (s.freed) { return; }
+    s.holders--;
+    if (s.holders <= 0) { this.device.backend.free(s); }
+  }
+
+  string toString(this) {
+    f32[] v = this.valuesNow();
+    string s = "Tensor<\{dtypeName(this.dtype())}>\{shapeText(this.shape)} [";
+    for (i32 i = 0; i < v.len(); i++) {
+      if (i > 0) { s += ", "; }
+      if (i == 16) { s += "…"; break; }
+      s += "\{v[i]}";
+    }
+    return s + "]";
+  }
+
+  // ── The plumbing every operation shares ───────────────────────────────────────────────────────────────────────
+
+  Tensor made(this, i32[] shape, Storage s) { return this.device.wrap(shape, s); }
+
+  Tensor other(this, union<Tensor, f64> x) {
+    if (Tensor t matches x) {
+      if (!(t.device is this.device)) { return this.foreign(); }
+      // Two element types meet only through a `cast` the caller writes, as in TensorFlow: a silent widening would
+      // hide which precision an operation ran in.
+      if (!sameDType(t.dtype(), this.dtype())) { trap; }
+      return t;
+    }
+    // A number takes the tensor's type, so `half * 2.0` stays half.
+    if (f64 v matches x) { return this.device.scalarOf(v, this.dtype()); }
+    trap;
+  }
+
+  // A tensor from another device: refused, since a silent copy would hide a transfer that costs more than the operation.
+  Tensor foreign(this) { trap; }
+
+  void note(this, Tensor out, Tensor[] inputs, fn<Tensor?[](Tensor)> backward) {
+    if (this.device.recording()) { this.device.record(out, inputs, backward); }
+  }
+
+  /**
+   * This tensor's values as `to` — rounded, when `to` is the narrower. This tensor itself when it is `to` already. The
+   * gradient is cast back, so a half-precision computation over single-precision weights trains the weights.
+   */
+  Tensor cast(this, DType to) {
+    if (sameDType(to, this.dtype())) { return this; }
+    Tensor x = this;
+    Tensor y = this.made(copyShape(this.shape), this.device.backend.cast(this.storage, to));
+    this.note(y, [x], (Tensor dy) => [dy.cast(x.dtype())]);
+    return y;
+  }
+
+  /** The same numbers with no history: gradients stop here. */
+  Tensor detach(this) { return this.made(this.shape, this.storage); }
+
+  // ── Elementwise ───────────────────────────────────────────────────────────────────────────────────────────────
+
+  Tensor unary(this, Unary op) {
+    Tensor x = this;
+    Tensor y = this.made(copyShape(this.shape), this.device.backend.unary(op, this.storage));
+    this.note(y, [x], (Tensor dy) => [unaryGrad(op, x, y, dy)]);
+    return y;
+  }
+
+  Tensor neg(this) { return this.unary(Unary.Neg); }
+  Tensor abs(this) { return this.unary(Unary.Abs); }
+  Tensor exp(this) { return this.unary(Unary.Exp); }
+  Tensor expm1(this) { return this.unary(Unary.Expm1); }
+  Tensor log(this) { return this.unary(Unary.Log); }
+  Tensor log1p(this) { return this.unary(Unary.Log1p); }
+  Tensor sqrt(this) { return this.unary(Unary.Sqrt); }
+  Tensor rsqrt(this) { return this.unary(Unary.Rsqrt); }
+  Tensor square(this) { return this.unary(Unary.Square); }
+  Tensor reciprocal(this) { return this.unary(Unary.Reciprocal); }
+  Tensor sin(this) { return this.unary(Unary.Sin); }
+  Tensor cos(this) { return this.unary(Unary.Cos); }
+  Tensor tanh(this) { return this.unary(Unary.Tanh); }
+  Tensor sigmoid(this) { return this.unary(Unary.Sigmoid); }
+  Tensor relu(this) { return this.unary(Unary.Relu); }
+  Tensor softplus(this) { return this.unary(Unary.Softplus); }
+  Tensor sign(this) { return this.unary(Unary.Sign); }
+  Tensor floor(this) { return this.unary(Unary.Floor); }
+  Tensor ceil(this) { return this.unary(Unary.Ceil); }
+  Tensor round(this) { return this.unary(Unary.Round); }
+  /** 1 where above 0, else 0. */
+  Tensor step(this) { return this.unary(Unary.Step); }
+
+  Tensor binary(this, Binary op, union<Tensor, f64> rhs) {
+    Tensor a = this;
+    Tensor b = this.other(rhs);
+    i32[]? out = broadcastShapes(a.shape, b.shape);
+    if (out is null) { trap; }
+    Storage s = this.device.backend.binary(op, a.storage, b.storage, out!, broadcastStrides(a.shape, out!),
+                                           broadcastStrides(b.shape, out!));
+    Tensor y = this.made(out!, s);
+    this.note(y, [a, b], (Tensor dy) => binaryGrad(op, a, b, y, dy));
+    return y;
+  }
+
+  Tensor add(this, union<Tensor, f64> x) { return this.binary(Binary.Add, x); }
+  Tensor sub(this, union<Tensor, f64> x) { return this.binary(Binary.Sub, x); }
+  Tensor mul(this, union<Tensor, f64> x) { return this.binary(Binary.Mul, x); }
+  Tensor div(this, union<Tensor, f64> x) { return this.binary(Binary.Div, x); }
+  Tensor pow(this, union<Tensor, f64> x) { return this.binary(Binary.Pow, x); }
+  Tensor maximum(this, union<Tensor, f64> x) { return this.binary(Binary.Maximum, x); }
+  Tensor minimum(this, union<Tensor, f64> x) { return this.binary(Binary.Minimum, x); }
+  Tensor equal(this, union<Tensor, f64> x) { return this.binary(Binary.Equal, x); }
+  Tensor notEqual(this, union<Tensor, f64> x) { return this.binary(Binary.NotEqual, x); }
+  Tensor less(this, union<Tensor, f64> x) { return this.binary(Binary.Less, x); }
+  Tensor lessEqual(this, union<Tensor, f64> x) { return this.binary(Binary.LessEqual, x); }
+  Tensor greater(this, union<Tensor, f64> x) { return this.binary(Binary.Greater, x); }
+  Tensor greaterEqual(this, union<Tensor, f64> x) { return this.binary(Binary.GreaterEqual, x); }
+
+  Tensor [operators.add](this, union<Tensor, f64> x) { return this.add(x); }
+  Tensor [operators.subtract](this, union<Tensor, f64> x) { return this.sub(x); }
+  Tensor [operators.multiply](this, union<Tensor, f64> x) { return this.mul(x); }
+  Tensor [operators.divide](this, union<Tensor, f64> x) { return this.div(x); }
+  Tensor [operators.negate](this) { return this.neg(); }
+  Tensor [operators.addFromLeft](this, f64 x) { return this.add(x); }
+  Tensor [operators.subtractFromLeft](this, f64 x) { return this.device.scalarOf(x, this.dtype()).sub(this); }
+  Tensor [operators.multiplyFromLeft](this, f64 x) { return this.mul(x); }
+  Tensor [operators.divideFromLeft](this, f64 x) { return this.device.scalarOf(x, this.dtype()).div(this); }
+
+  /** `(this - x)²`. */
+  Tensor squaredDifference(this, union<Tensor, f64> x) { return this.sub(x).square(); }
+
+  /** Each element held within `[low, high]`. */
+  Tensor clip(this, f64 low, f64 high) { return this.maximum(low).minimum(high); }
+
+  /** `whenTrue` where this is non-zero and `whenFalse` elsewhere, all three broadcast together. No gradient flows to this. */
+  Tensor where(this, union<Tensor, f64> whenTrue, union<Tensor, f64> whenFalse) {
+    Tensor c = this;
+    // The two branches agree on a type, which a number among them takes; the condition may be any type.
+    Tensor a = branchOf(c, whenTrue, whenFalse);
+    Tensor b = a.other(whenFalse);
+    i32[]? ab = broadcastShapes(a.shape, b.shape);
+    if (ab is null) { trap; }
+    i32[]? out = broadcastShapes(c.shape, ab!);
+    if (out is null) { trap; }
+    Storage s = this.device.backend.select(c.storage, a.storage, b.storage, out!, broadcastStrides(c.shape, out!),
+                                           broadcastStrides(a.shape, out!), broadcastStrides(b.shape, out!));
+    Tensor y = this.made(out!, s);
+    this.note(y, [a, b], (Tensor dy) => {
+      Tensor zero = dy.device.scalarOf(0.0, dy.dtype());
+      return [c.where(dy, zero).sumTo(a.shape), c.where(zero, dy).sumTo(b.shape)];
+    });
+    return y;
+  }
+
+  // ── Activations ───────────────────────────────────────────────────────────────────────────────────────────────
+
+  Tensor leakyRelu(this, f64 alpha) { return this.greater(0.0).where(this, this.mul(alpha)); }
+  Tensor elu(this) { return this.greater(0.0).where(this, this.expm1()); }
+  Tensor selu(this) {
+    return this.greater(0.0).where(this, this.expm1().mul(1.6732632423543772)).mul(1.0507009873554805);
+  }
+  Tensor relu6(this) { return this.clip(0.0, 6.0); }
+  /** x·sigmoid(x). */
+  Tensor swish(this) { return this.mul(this.sigmoid()); }
+  /** The tanh approximation of x·Φ(x), as most transformer code computes it. */
+  Tensor gelu(this) {
+    // x·x², not x^3: `pow` costs a call to `math.pow` per element, and its gradient one for the exponent too.
+    Tensor inner = this.add(this.mul(this.square()).mul(0.044715)).mul(0.7978845608028654);
+    return this.mul(0.5).mul(inner.tanh().add(1.0));
+  }
+
+  /** `exp(x) / sum(exp(x))` along `axis`. */
+  Tensor softmax(this, i32 axis) {
+    Tensor shifted = this.sub(this.max([axis], true).detach());
+    Tensor e = shifted.exp();
+    return e.div(e.sum([axis], true));
+  }
+
+  Tensor logSoftmax(this, i32 axis) {
+    Tensor shifted = this.sub(this.max([axis], true).detach());
+    return shifted.sub(shifted.exp().sum([axis], true).log());
+  }
+
+  /** `log(sum(exp(x)))` along `axes`, without the overflow the direct form has. */
+  Tensor logSumExp(this, i32[] axes, bool keepDims) {
+    Tensor m = this.max(axes, true).detach();
+    Tensor r = this.sub(m).exp().sum(axes, true).log().add(m);
+    return keepDims ? r : r.squeeze(normalizeAxes(axes, this.rank()));
+  }
+
+  // ── Reductions ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * `op` over `axes` — every axis when the list is empty — with each reduced axis kept as size 1 when `keepDims`.
+   * The reduced axes are moved to the end first, when they are not there already, so the kernel only ever reduces
+   * contiguous rows.
+   */
+  Tensor reduce(this, Reduce op, i32[] axes, bool keepDims) {
+    Tensor x = this;
+    i32[] ax = normalizeAxes(axes, this.rank());
+    i32[] kept = i32[].filled(this.rank(), 1);
+    i32[] squeezed = i32[].filled(this.rank() - ax.len(), 0);
+    i32 inner = 1;
+    i32 j = 0;
+    for (i32 i = 0; i < this.rank(); i++) {
+      if (contains(ax, i)) { inner *= this.shape[i]; }
+      else { kept[i] = this.shape[i]; squeezed[j] = this.shape[i]; j++; }
+    }
+    Tensor rows = this.moveToEnd(ax);
+    Storage s = this.device.backend.reduce(op, rows.storage, sizeOf(squeezed), inner);
+    if (!(rows is this)) { rows.dispose(); }
+    Tensor y = this.made(keepDims ? kept : squeezed, s);
+    this.note(y, [x], (Tensor dy) => [reduceGrad(op, x, y, dy, kept, inner)]);
+    return y;
+  }
+
+  /** The axes `ax` moved to the end, in order: this tensor itself when they are already there. */
+  Tensor moveToEnd(this, i32[] ax) {
+    bool trailing = true;
+    for (i32 i = 0; i < ax.len(); i++) {
+      if (ax[i] != this.rank() - ax.len() + i) { trailing = false; }
+    }
+    if (trailing) { return this; }
+    i32[] perm = i32[].filled(this.rank(), 0);
+    i32 j = 0;
+    for (i32 i = 0; i < this.rank(); i++) { if (!contains(ax, i)) { perm[j] = i; j++; } }
+    for (i32 a in ax) { perm[j] = a; j++; }
+    return this.transposeRaw(perm);
+  }
+
+  Tensor sum(this, i32[] axes, bool keepDims) { return this.reduce(Reduce.Sum, axes, keepDims); }
+  Tensor max(this, i32[] axes, bool keepDims) { return this.reduce(Reduce.Max, axes, keepDims); }
+  Tensor min(this, i32[] axes, bool keepDims) { return this.reduce(Reduce.Min, axes, keepDims); }
+  Tensor prod(this, i32[] axes, bool keepDims) { return this.reduce(Reduce.Prod, axes, keepDims); }
+
+  Tensor mean(this, i32[] axes, bool keepDims) {
+    i32 n = 1;
+    for (i32 a in normalizeAxes(axes, this.rank())) { n *= this.shape[a]; }
+    return this.sum(axes, keepDims).div(n as f64);
+  }
+
+  /** The mean of the squared deviation from the mean. */
+  Tensor variance(this, i32[] axes, bool keepDims) {
+    Tensor m = this.mean(axes, true);
+    return this.sub(m).square().mean(axes, keepDims);
+  }
+
+  Tensor argMax(this, i32 axis) { return this.argReduce(true, axis); }
+  Tensor argMin(this, i32 axis) { return this.argReduce(false, axis); }
+
+  Tensor argReduce(this, bool max, i32 axis) {
+    i32 a = normalizeAxis(axis, this.rank());
+    Tensor rows = this.moveToEnd([a]);
+    i32[] out = i32[].filled(this.rank() - 1, 0);
+    i32 j = 0;
+    for (i32 i = 0; i < this.rank(); i++) { if (i != a) { out[j] = this.shape[i]; j++; } }
+    Storage s = this.device.backend.argReduce(max, rows.storage, sizeOf(out), this.shape[a]);
+    if (!(rows is this)) { rows.dispose(); }
+    return this.made(out, s);
+  }
+
+  /** The gradient's half of broadcasting: summed over every axis this was stretched along, back to `shape`. */
+  Tensor sumTo(this, i32[] shape) {
+    if (sameShape(this.shape, shape)) { return this; }
+    i32 lead = this.rank() - shape.len();
+    Vec<i32> axes = Vec.create();
+    for (i32 i = 0; i < this.rank(); i++) {
+      if (i < lead || (shape[i - lead] == 1 && this.shape[i] != 1)) { axes.push(i); }
+    }
+    if (axes.len() == 0) { return this.reshape(shape); }
+    return this.sum(axes.toArray(), false).reshape(shape);
+  }
+
+  // ── Shape ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /** The same numbers in a new shape, which may have one `-1` for the size the others leave. */
+  Tensor reshape(this, i32[] shape) {
+    Tensor x = this;
+    i32[] s = copyShape(shape);
+    i32 known = 1;
+    i32 hole = -1;
+    for (i32 i = 0; i < s.len(); i++) {
+      if (s[i] == -1) { hole = i; } else { known *= s[i]; }
+    }
+    if (hole >= 0) { s[hole] = known == 0 ? 0 : this.size() / known; }
+    if (sizeOf(s) != this.size()) { trap; }
+    Tensor y = this.made(s, this.storage);
+    this.note(y, [x], (Tensor dy) => [dy.reshape(x.shape)]);
+    return y;
+  }
+
+  Tensor flatten(this) { return this.reshape([this.size()]); }
+
+  /** A new axis of size 1 at `axis`. */
+  Tensor expandDims(this, i32 axis) {
+    i32 a = axis < 0 ? axis + this.rank() + 1 : axis;
+    i32[] s = i32[].filled(this.rank() + 1, 1);
+    for (i32 i = 0; i < this.rank(); i++) { s[i < a ? i : i + 1] = this.shape[i]; }
+    return this.reshape(s);
+  }
+
+  /** `axes` removed, each of which must be size 1 — or every size-1 axis, when the list is empty. */
+  Tensor squeeze(this, i32[] axes) {
+    Vec<i32> s = Vec.create();
+    for (i32 i = 0; i < this.rank(); i++) {
+      bool drop = axes.len() == 0 ? this.shape[i] == 1 : contains(normalizeAxes(axes, this.rank()), i);
+      if (drop && this.shape[i] != 1) { trap; }
+      if (!drop) { s.push(this.shape[i]); }
+    }
+    return this.reshape(s.toArray());
+  }
+
+  /** The axes in the order `perm` names them: `transpose([1, 0])` of a matrix is its transpose. */
+  Tensor transpose(this, i32[] perm) {
+    if (perm.len() != this.rank()) { trap; }
+    return this.transposeRaw(perm);
+  }
+
+  /** A matrix's transpose, or the last two axes of anything with more. */
+  Tensor t(this) {
+    i32[] perm = i32[].filled(this.rank(), 0);
+    for (i32 i = 0; i < this.rank(); i++) { perm[i] = i; }
+    perm[this.rank() - 1] = this.rank() - 2;
+    perm[this.rank() - 2] = this.rank() - 1;
+    return this.transposeRaw(perm);
+  }
+
+  Tensor transposeRaw(this, i32[] perm) {
+    Tensor x = this;
+    i32[] own = stridesOf(this.shape);
+    i32[] out = i32[].filled(perm.len(), 0);
+    i32[] strides = i32[].filled(perm.len(), 0);
+    for (i32 i = 0; i < perm.len(); i++) {
+      out[i] = this.shape[perm[i]];
+      strides[i] = own[perm[i]];
+    }
+    Tensor y = this.made(out, this.device.backend.gather(this.storage, out, strides, 0));
+    this.note(y, [x], (Tensor dy) => [dy.transposeRaw(inversePermutation(perm))]);
+    return y;
+  }
+
+  Tensor broadcastTo(this, i32[] shape) {
+    Tensor x = this;
+    i32[]? check = broadcastShapes(this.shape, shape);
+    if (check is null || !sameShape(check!, shape)) { trap; }
+    i32[] out = copyShape(shape);
+    Tensor y = this.made(out, this.device.backend.gather(this.storage, out, broadcastStrides(this.shape, out), 0));
+    this.note(y, [x], (Tensor dy) => [dy.sumTo(x.shape)]);
+    return y;
+  }
+
+  /** `size[i]` elements from `begin[i]` along each axis; a size of -1 runs to the end. */
+  Tensor slice(this, i32[] begin, i32[] size) {
+    Tensor x = this;
+    if (begin.len() != this.rank() || size.len() != this.rank()) { trap; }
+    i32[] own = stridesOf(this.shape);
+    i32[] out = i32[].filled(this.rank(), 0);
+    i32 offset = 0;
+    for (i32 i = 0; i < this.rank(); i++) {
+      out[i] = size[i] < 0 ? this.shape[i] - begin[i] : size[i];
+      if (begin[i] < 0 || begin[i] + out[i] > this.shape[i]) { trap; }
+      offset += begin[i] * own[i];
+    }
+    Tensor y = this.made(out, this.device.backend.gather(this.storage, out, own, offset));
+    i32[] b = copyShape(begin);
+    this.note(y, [x], (Tensor dy) => [dy.placeIn(x.shape, b, 0.0)]);
+    return y;
+  }
+
+  /** This tensor at `begin` in a tensor of `shape`, the rest `value`. `slice` undone. */
+  Tensor placeIn(this, i32[] shape, i32[] begin, f64 value) {
+    Tensor x = this;
+    i32[] out = copyShape(shape);
+    Tensor y = this.made(out, this.device.backend.pad(this.storage, this.shape, out, begin, value as~ f32));
+    i32[] b = copyShape(begin);
+    this.note(y, [x], (Tensor dy) => [dy.slice(b, x.shape)]);
+    return y;
+  }
+
+  /** `before[i]` and `after[i]` elements of `value` added either side of each axis. */
+  Tensor pad(this, i32[] before, i32[] after, f64 value) {
+    i32[] out = i32[].filled(this.rank(), 0);
+    for (i32 i = 0; i < this.rank(); i++) { out[i] = before[i] + this.shape[i] + after[i]; }
+    return this.placeIn(out, before, value);
+  }
+
+  /** The rows of this — along axis 0 — that `indices` name, in the shape `indices` has followed by a row's. */
+  Tensor take(this, Tensor indices) {
+    Tensor x = this;
+    i32 width = this.size() / this.shape[0];
+    i32[] out = i32[].filled(indices.rank() + this.rank() - 1, 0);
+    for (i32 i = 0; i < indices.rank(); i++) { out[i] = indices.shape[i]; }
+    for (i32 i = 1; i < this.rank(); i++) { out[indices.rank() + i - 1] = this.shape[i]; }
+    Storage s = this.device.backend.take(this.storage, width, indices.storage, indices.size());
+    Tensor y = this.made(out, s);
+    this.note(y, [x], (Tensor dy) => {
+      Storage back = dy.device.backend.scatterAdd(dy.storage, width, indices.storage, indices.size(), x.shape[0]);
+      return [dy.made(copyShape(x.shape), back)];
+    });
+    return y;
+  }
+
+  /** `take` along any axis. */
+  Tensor gather(this, Tensor indices, i32 axis) {
+    i32 a = normalizeAxis(axis, this.rank());
+    if (a == 0) { return this.take(indices); }
+    i32[] front = i32[].filled(this.rank(), 0);
+    front[0] = a;
+    for (i32 i = 1; i <= a; i++) { front[i] = i - 1; }
+    for (i32 i = a + 1; i < this.rank(); i++) { front[i] = i; }
+    Tensor taken = this.transpose(front).take(indices);
+    // `taken` is indices' axes, then the axes before `a`, then those after: put indices' axes back where `a` was.
+    i32 ir = indices.rank();
+    i32[] back = i32[].filled(taken.rank(), 0);
+    i32 j = 0;
+    for (i32 i = 0; i < a; i++) { back[j] = ir + i; j++; }
+    for (i32 i = 0; i < ir; i++) { back[j] = i; j++; }
+    for (i32 i = ir + a; i < taken.rank(); i++) { back[j] = i; j++; }
+    return taken.transpose(back);
+  }
+
+  /** `depth`-long rows of zeros with a 1 at each index this holds. */
+  Tensor oneHot(this, i32 depth) {
+    Tensor classes = this.device.range(0.0, depth as f64, 1.0).cast(this.dtype());
+    return this.expandDims(-1).equal(classes);
+  }
+
+  // ── Matrix products ───────────────────────────────────────────────────────────────────────────────────────────
+
+  Tensor matmul(this, Tensor b) { return this.matmulT(b, false, false); }
+
+  /**
+   * The product of the last two axes, either side read transposed when asked. The axes before them are a batch: equal
+   * on both sides, or absent on one, which then shares its one matrix with every product.
+   */
+  Tensor matmulT(this, Tensor rhs, bool ta, bool tb) {
+    Tensor a = this;
+    Tensor b = this.other(rhs);
+    if (a.rank() < 2 || b.rank() < 2) { trap; }
+    i32 m = ta ? a.shape[a.rank() - 1] : a.shape[a.rank() - 2];
+    i32 k = ta ? a.shape[a.rank() - 2] : a.shape[a.rank() - 1];
+    i32 kb = tb ? b.shape[b.rank() - 1] : b.shape[b.rank() - 2];
+    i32 n = tb ? b.shape[b.rank() - 2] : b.shape[b.rank() - 1];
+    if (k != kb || !sameDType(a.dtype(), b.dtype())) { trap; }
+    i32[] batchShape = a.rank() >= b.rank() ? a.shape : b.shape;
+    i32 batchRank = batchShape.len() - 2;
+    if (a.rank() > 2 && b.rank() > 2) {
+      if (a.rank() != b.rank()) { trap; }
+      for (i32 i = 0; i < batchRank; i++) { if (a.shape[i] != b.shape[i]) { trap; } }
+    }
+    i32 batch = 1;
+    for (i32 i = 0; i < batchRank; i++) { batch *= batchShape[i]; }
+    i32[] out = i32[].filled(batchRank + 2, 0);
+    for (i32 i = 0; i < batchRank; i++) { out[i] = batchShape[i]; }
+    out[batchRank] = m;
+    out[batchRank + 1] = n;
+    Storage s = this.device.backend.matmul(a.storage, b.storage, batch, m, k, n, ta, tb,
+                                           a.rank() > 2 ? m * k : 0, b.rank() > 2 ? k * n : 0);
+    Tensor y = this.made(out, s);
+    this.note(y, [a, b], (Tensor dy) => matmulGrad(a, b, ta, tb, dy));
+    return y;
+  }
+
+  /** The dot product of two vectors. */
+  Tensor dot(this, Tensor b) { return this.mul(b).sum([], false); }
+
+  // ── Convolution and pooling ───────────────────────────────────────────────────────────────────────────────────
+
+  /** Every window of `c` as a row of `im2col`'s matrix. */
+  Tensor patches(this, Conv c, f64 padValue) {
+    Tensor x = this;
+    Storage s = this.device.backend.im2col(this.storage, c, padValue as~ f32);
+    Tensor y = this.made([c.rows(), c.cols()], s);
+    this.note(y, [x], (Tensor dy) => [dy.made(copyShape(x.shape), dy.device.backend.col2im(dy.storage, c))]);
+    return y;
+  }
+
+  /**
+   * A 2-D convolution: this is `[n, h, w, c]`, `filter` is `[kh, kw, c, f]`, and the answer `[n, oh, ow, f]` — the
+   * layouts TensorFlow uses. `strides` and `dilations` are `[y, x]`.
+   */
+  Tensor conv2d(this, Tensor filter, i32[] strides, Padding padding, i32[] dilations) {
+    if (this.rank() != 4 || filter.rank() != 4 || filter.shape[2] != this.shape[3]) { trap; }
+    Conv c = geometry(this.shape, filter.shape[0], filter.shape[1], strides, padding, dilations);
+    Tensor cols = this.patches(c, 0.0);
+    Tensor flat = filter.reshape([c.cols(), filter.shape[3]]);
+    return cols.matmul(flat).reshape([c.n, c.oh, c.ow, filter.shape[3]]);
+  }
+
+  /**
+   * The transpose of `conv2d` — its gradient with respect to the image, and how a decoder grows one: each input pixel
+   * spread over a window of the output. `filter` is `[kh, kw, c, f]`, the filter of the convolution being transposed,
+   * so this has `f` channels and the answer `c`; `outShape` is the image that convolution would have read.
+   */
+  Tensor conv2dTranspose(this, Tensor filter, i32[] outShape, i32[] strides, Padding padding) {
+    Conv c = geometry(outShape, filter.shape[0], filter.shape[1], strides, padding, [1, 1]);
+    if (c.oh != this.shape[1] || c.ow != this.shape[2] || filter.shape[3] != this.shape[3] || filter.shape[2] != c.c) { trap; }
+    Tensor rows = this.reshape([c.rows(), this.shape[3]]);
+    Tensor cols = rows.matmulT(filter.reshape([c.cols(), filter.shape[3]]), false, true);
+    return cols.unpatches(c);
+  }
+
+  /** `patches` undone by summing: a `[rows, cols]` matrix of windows back into the image they cover. */
+  Tensor unpatches(this, Conv c) {
+    Tensor x = this;
+    Tensor y = this.made([c.n, c.h, c.w, c.c], this.device.backend.col2im(this.storage, c));
+    this.note(y, [x], (Tensor dy) => [dy.patches(c, 0.0)]);
+    return y;
+  }
+
+  /** The largest value in each window, per channel. */
+  Tensor maxPool(this, i32[] window, i32[] strides, Padding padding) {
+    Conv c = geometry(this.shape, window[0], window[1], strides, padding, [1, 1]);
+    return this.patches(c, -3.4028234663852886e38).reshape([c.n, c.oh, c.ow, c.kh * c.kw, c.c]).max([3], false);
+  }
+
+  /** The mean of each window, per channel — of the part inside the image, as TensorFlow counts it. */
+  Tensor avgPool(this, i32[] window, i32[] strides, Padding padding) {
+    Conv c = geometry(this.shape, window[0], window[1], strides, padding, [1, 1]);
+    Tensor total = this.patches(c, 0.0).reshape([c.n, c.oh, c.ow, c.kh * c.kw, c.c]).sum([3], false);
+    // How many pixels of each window are inside the image: the same windows, read from a field of ones.
+    Conv one = geometry([1, c.h, c.w, 1], c.kh, c.kw, strides, padding, [1, 1]);
+    Tensor counts = this.device.fillOf([1, c.h, c.w, 1], 1.0, this.dtype()).patches(one, 0.0).sum([1], false).reshape([1, c.oh, c.ow, 1]);
+    return total.div(counts);
+  }
+
+  // ── Joining and splitting ─────────────────────────────────────────────────────────────────────────────────────
+
+  /** This, then each of `rest`, along `axis`. */
+  Tensor concat(this, Tensor[] rest, i32 axis) {
+    i32 a = normalizeAxis(axis, this.rank());
+    i32[] out = copyShape(this.shape);
+    for (Tensor r in rest) { out[a] += r.shape[a]; }
+    i32[] begin = i32[].filled(this.rank(), 0);
+    Tensor acc = this.placeIn(out, begin, 0.0);
+    i32 at = this.shape[a];
+    for (Tensor r in rest) {
+      i32[] b = i32[].filled(this.rank(), 0);
+      b[a] = at;
+      acc = acc.add(r.placeIn(out, b, 0.0));
+      at += r.shape[a];
+    }
+    return acc;
+  }
+
+  /** Pieces `sizes[i]` long along `axis`. */
+  Tensor[] split(this, i32[] sizes, i32 axis) {
+    i32 a = normalizeAxis(axis, this.rank());
+    Tensor[] out = Tensor[].filled(sizes.len(), this);
+    i32 at = 0;
+    for (i32 i = 0; i < sizes.len(); i++) {
+      i32[] begin = i32[].filled(this.rank(), 0);
+      i32[] size = copyShape(this.shape);
+      begin[a] = at;
+      size[a] = sizes[i];
+      out[i] = this.slice(begin, size);
+      at += sizes[i];
+    }
+    return out;
+  }
+
+  /** Copies of this, `reps[i]` along each axis. */
+  Tensor tile(this, i32[] reps) {
+    // Each axis gets a new one in front of it, broadcast to the repetitions, and the two are then merged.
+    i32[] spread = i32[].filled(this.rank() * 2, 1);
+    i32[] target = i32[].filled(this.rank() * 2, 1);
+    i32[] out = i32[].filled(this.rank(), 1);
+    for (i32 i = 0; i < this.rank(); i++) {
+      spread[2 * i + 1] = this.shape[i];
+      target[2 * i] = reps[i];
+      target[2 * i + 1] = this.shape[i];
+      out[i] = reps[i] * this.shape[i];
+    }
+    return this.reshape(spread).broadcastTo(target).reshape(out);
+  }
+
+  /** This tensor's numbers on another device. */
+  async Tensor to(this, Device device) {
+    f32[] v = await this.values();
+    return device.tensorOf(v, this.shape, this.dtype());
+  }
+}
+
+/**
+ * A tensor whose numbers can be replaced: what a model's weights and an optimizer's state are. No `tidy` disposes one,
+ * and `assign` gives back the numbers it held.
+ */
+export struct Variable : Tensor {
+  string name;
+  bool trainable;
+
+  /** Take `value`'s numbers, which must be the same shape. `value` itself can be disposed afterwards. */
+  void assign(this, Tensor value) {
+    if (!sameShape(value.shape, this.shape) || !sameDType(value.dtype(), this.dtype())) { trap; }
+    Storage old = this.storage;
+    value.storage.holders++;
+    this.storage = value.storage;
+    old.holders--;
+    if (old.holders <= 0 && !old.freed) { this.device.backend.free(old); }
+  }
+}
+
+/** `x` as a tensor: itself, or a number in the type of `other` when that is a tensor, else of `c`. */
+Tensor branchOf(Tensor c, union<Tensor, f64> x, union<Tensor, f64> other) {
+  if (Tensor t matches x) {
+    if (!(t.device is c.device)) { trap; }
+    return t;
+  }
+  DType dt = c.dtype();
+  if (Tensor o matches other) { dt = o.dtype(); }
+  if (f64 v matches x) { return c.device.scalarOf(v, dt); }
+  trap;
+}
+
+/** A convolution's geometry as TensorFlow computes it: `shape` is the input's, `[n, h, w, c]`. */
+export Conv geometry(i32[] shape, i32 kh, i32 kw, i32[] strides, Padding padding, i32[] dilations) {
+  i32 h = shape[1];
+  i32 w = shape[2];
+  i32 ekh = (kh - 1) * dilations[0] + 1;
+  i32 ekw = (kw - 1) * dilations[1] + 1;
+  i32 oh = 0;
+  i32 ow = 0;
+  i32 top = 0;
+  i32 left = 0;
+  match (padding) {
+    Valid: {
+      oh = (h - ekh + strides[0]) / strides[0];
+      ow = (w - ekw + strides[1]) / strides[1];
+    }
+    Same: {
+      oh = (h + strides[0] - 1) / strides[0];
+      ow = (w + strides[1] - 1) / strides[1];
+      i32 ph = (oh - 1) * strides[0] + ekh - h;
+      i32 pw = (ow - 1) * strides[1] + ekw - w;
+      top = ph > 0 ? ph / 2 : 0;
+      left = pw > 0 ? pw / 2 : 0;
+    }
+  }
+  if (oh <= 0 || ow <= 0) { trap; }
+  return Conv(shape[0], h, w, shape[3], kh, kw, strides[0], strides[1], dilations[0], dilations[1], top, left, oh, ow);
+}
+
+// ── Backward rules ──────────────────────────────────────────────────────────────────────────────────────────────
+
+Tensor? unaryGrad(Unary op, Tensor x, Tensor y, Tensor dy) {
+  match (op) {
+    Neg: { return dy.neg(); }
+    Abs: { return dy.mul(x.sign()); }
+    Exp: { return dy.mul(y); }
+    Expm1: { return dy.mul(y.add(1.0)); }
+    Log: { return dy.div(x); }
+    Log1p: { return dy.div(x.add(1.0)); }
+    Sqrt: { return dy.div(y.mul(2.0)); }
+    Rsqrt: { return dy.mul(y.pow(3.0)).mul(0.5).neg(); }
+    Square: { return dy.mul(x).mul(2.0); }
+    Reciprocal: { return dy.mul(y.square()).neg(); }
+    Sin: { return dy.mul(x.cos()); }
+    Cos: { return dy.mul(x.sin()).neg(); }
+    Tanh: { return dy.mul(y.square().neg().add(1.0)); }
+    Sigmoid: { return dy.mul(y).mul(y.neg().add(1.0)); }
+    Relu: { return dy.mul(x.step()); }
+    Softplus: { return dy.mul(x.sigmoid()); }
+    // Piecewise constant: the gradient is zero wherever it exists.
+    default: { return null; }
+  }
+}
+
+Tensor?[] binaryGrad(Binary op, Tensor a, Tensor b, Tensor y, Tensor dy) {
+  Tensor?[] g = Tensor?[].defaulted(2);
+  match (op) {
+    Add: { g[0] = dy; g[1] = dy; }
+    Sub: { g[0] = dy; g[1] = dy.neg(); }
+    Mul: { g[0] = dy.mul(b); g[1] = dy.mul(a); }
+    Div: { g[0] = dy.div(b); g[1] = dy.mul(a).div(b.square()).neg(); }
+    Pow: {
+      g[0] = dy.mul(b).mul(a.pow(b.sub(1.0)));
+      // d/db a^b = a^b·log a, which only means something where a is positive.
+      Tensor positive = a.greater(0.0);
+      g[1] = positive.where(dy.mul(y).mul(positive.where(a, 1.0).log()), 0.0);
+    }
+    Maximum: { Tensor m = a.greaterEqual(b); g[0] = dy.mul(m); g[1] = dy.mul(m.neg().add(1.0)); }
+    Minimum: { Tensor m = a.lessEqual(b); g[0] = dy.mul(m); g[1] = dy.mul(m.neg().add(1.0)); }
+    // Comparisons are piecewise constant.
+    default: { return g; }
+  }
+  if (g[0] is not null) { g[0] = g[0]!.sumTo(a.shape); }
+  if (g[1] is not null) { g[1] = g[1]!.sumTo(b.shape); }
+  return g;
+}
+
+Tensor reduceGrad(Reduce op, Tensor x, Tensor y, Tensor dy, i32[] kept, i32 count) {
+  Tensor spread = dy.reshape(kept).broadcastTo(x.shape);
+  match (op) {
+    Sum: { return spread; }
+    Prod: { return spread.mul(y.reshape(kept)).div(x); }
+    // Every element equal to the extreme gets the gradient, as TensorFlow's max does.
+    default: { return spread.mul(x.equal(y.reshape(kept))); }
+  }
+}
+
+Tensor?[] matmulGrad(Tensor a, Tensor b, bool ta, bool tb, Tensor dy) {
+  Tensor da;
+  Tensor db;
+  if (!ta && !tb) { da = dy.matmulT(b, false, true); db = a.matmulT(dy, true, false); }
+  else if (!ta && tb) { da = dy.matmulT(b, false, false); db = dy.matmulT(a, true, false); }
+  else if (ta && !tb) { da = b.matmulT(dy, false, true); db = a.matmulT(dy, false, false); }
+  else { da = b.matmulT(dy, true, true); db = dy.matmulT(a, true, true); }
+  return [da.sumTo(a.shape), db.sumTo(b.shape)];
+}

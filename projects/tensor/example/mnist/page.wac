@@ -1,0 +1,289 @@
+// Draw a digit and watch a convolutional network read it. The network's weights are the ones `train.wac` wrote on the
+// CPU, loaded from the page's own site; or it trains its own here, on WebGPU, from MNIST's 60,000 training images.
+//
+// Built with `tools/build.wac` and served beside `mnist.weights` and the four MNIST files (`wac task mnist:build`).
+// `#test` in the address checks the GPU against the CPU — the loaded model's answers on test images, and ten training
+// steps from one seed — and puts the verdict in the title, which is what `tools/gpucheck.js` reads.
+
+import { Page, Site, Element, ElementEvent, Listen } from "web";
+import { Result } from "core";
+import { Device, Tensor } from "../../src/tensor.wac";
+import { gpuDevice } from "../../src/gpu/backend.wac";
+import { Layer, Sequential, sparseSoftmaxCrossEntropy } from "../../src/nn.wac";
+import { Adam } from "../../src/optim.wac";
+import { loadWeights, saveWeightsNow } from "../../src/checkpoint.wac";
+import { Digits, accuracyOn, batchOf, centred, digitModel, digitsOf, inOrder, probabilities, shuffled } from "./mnist.wac";
+
+/** The drawing's resolution: shown at twice this, and shrunk to 28×28 for the model. */
+static i32 SIDE = 140;
+
+async Result<Digits, string> fetchDigits(Site site, string images, string labels) {
+  Result<u8[], string> im = await site.get(images);
+  Result<u8[], string> lb = await site.get(labels);
+  if (im.isErr() || lb.isErr()) { return Result.Err("could not read \{images} from the site"); }
+  return digitsOf(im.ok()!, lb.ok()!);
+}
+
+/** Ink laid along a stroke from (x0, y0) to (x1, y1): a soft round brush stamped every pixel of the way. */
+void stroke(f32[] ink, f64 x0, f64 y0, f64 x1, f64 y1) {
+  f64 dx = x1 - x0;
+  f64 dy = y1 - y0;
+  i32 n = ((dx * dx + dy * dy).sqrt()).ceil() as~ i32;
+  if (n < 1) { n = 1; }
+  f64 r = 6.0;
+  for (i32 k = 0; k <= n; k++) {
+    f64 cx = x0 + dx * (k as f64) / (n as f64);
+    f64 cy = y0 + dy * (k as f64) / (n as f64);
+    i32 ylo = (cy - r - 1.0).floor() as~ i32;
+    i32 yhi = (cy + r + 1.0).ceil() as~ i32;
+    i32 xlo = (cx - r - 1.0).floor() as~ i32;
+    i32 xhi = (cx + r + 1.0).ceil() as~ i32;
+    for (i32 y = ylo; y <= yhi; y++) {
+      for (i32 x = xlo; x <= xhi; x++) {
+        if (x < 0 || y < 0 || x >= SIDE || y >= SIDE) { continue; }
+        f64 ex = (x as f64) - cx;
+        f64 ey = (y as f64) - cy;
+        f64 dist = (ex * ex + ey * ey).sqrt();
+        // Solid within r - 1, fading to nothing over the last pixel: edges that shrink to grey as MNIST's do.
+        f64 v = dist <= r - 1.0 ? 1.0 : (dist >= r ? 0.0 : r - dist);
+        f32 nv = v as~ f32;
+        if (nv > ink[y * SIDE + x]) { ink[y * SIDE + x] = nv; }
+      }
+    }
+  }
+}
+
+/** Grey values as RGBA, ink dark on light. */
+u8[] rgbaOf(f32[] v) {
+  u8[] out = u8[].filled(v.len() * 4, 255 as u8);
+  for (i32 i = 0; i < v.len(); i++) {
+    u8 g = (255.0 - (v[i] as f64).max(0.0).min(1.0) * 255.0) as~ u8;
+    out[i * 4] = g;
+    out[i * 4 + 1] = g;
+    out[i * 4 + 2] = g;
+  }
+  return out;
+}
+
+/** The GPU against the CPU: the loaded model on 1000 test images, and ten training steps from one seed. */
+async string selfTest(Device gpu, u8[] weights, Digits train, Digits test) {
+  Device cpu = Device.cpu();
+  Sequential cm = digitModel(cpu);
+  Sequential gm = digitModel(gpu);
+  if (loadWeights(cm.params(), weights).isErr() || loadWeights(gm.params(), weights).isErr()) { return "FAIL the weights did not load"; }
+  f32 ca = await accuracyOn(cpu, cm, test, 1000, 250);
+  f32 ga = await accuracyOn(gpu, gm, test, 1000, 250);
+  if (ca != ga) { return "FAIL the loaded model got \{ga} right on the GPU and \{ca} on the CPU"; }
+  if (!(ga > 0.97)) { return "FAIL the loaded model got only \{ga} of 1000 test images right"; }
+  Device[] both = [cpu, gpu];
+  f32[][] losses = f32[][].defaulted(2);
+  for (i32 k = 0; k < 2; k++) {
+    Device d = both[k];
+    d.seed(5 as i64);
+    Sequential m = digitModel(d);
+    Adam opt = Adam.create(0.002);
+    i32[] order = shuffled(d, train.n);
+    losses[k] = f32[].filled(10, 0.0);
+    for (i32 s = 0; s < 10; s++) {
+      Tensor l = opt.minimize(() => {
+        Tensor[] xy = batchOf(d, train, order, s * 64, (s + 1) * 64);
+        return sparseSoftmaxCrossEntropy(m.apply(xy[0], true), xy[1]);
+      }, m.params());
+      losses[k][s] = (await l.values())[0];
+      l.dispose();
+    }
+  }
+  for (i32 s = 0; s < 10; s++) {
+    f64 c = losses[0][s] as f64;
+    f64 g = losses[1][s] as f64;
+    f64 diff = c > g ? c - g : g - c;
+    if (!(diff <= 0.005 * c)) { return "FAIL training step \{s}: loss \{g} on the GPU, \{c} on the CPU"; }
+  }
+  return "PASS loaded model \{ga * 100.0}% on 1000 test images on both; 10 training steps agree, loss \{losses[0][0]} to \{losses[1][9]}";
+}
+
+export async i32 main(Page page) {
+  page.title("Digits");
+  Element root = page.root();
+  root.append("style").text("""
+      body { font: 15px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 16px; color: #1b1b1a; background: #fcfcfb; }
+      .row { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+      canvas.pad { width: 280px; height: 280px; border: 1px solid #ccc; border-radius: 8px; touch-action: none; cursor: crosshair; image-rendering: auto; }
+      canvas.seen { width: 112px; height: 112px; border: 1px solid #ddd; image-rendering: pixelated; }
+      .bars { display: grid; grid-template-columns: 1.2rem 1fr 3.2rem; gap: 4px 8px; align-items: center; min-width: 14rem; flex: 1; }
+      .bar { height: 14px; background: #2a78d6; border-radius: 0 4px 4px 0; width: 0; }
+      .best { font-weight: 700; }
+      .pct { font-variant-numeric: tabular-nums; text-align: right; color: #52514e; font-size: .85rem; }
+      button { font: inherit; margin: 8px 8px 0 0; }
+      .muted { color: #77756f; font-size: .9rem; }
+      """);
+  root.append("h1").text("Draw a digit");
+  Element where = root.append("p");
+  where.attr("class", "muted");
+  Element row = root.append("div");
+  row.attr("class", "row");
+  Element left = row.append("div");
+  Element pad = left.append("canvas");
+  pad.attr("class", "pad");
+  Element tools = left.append("div");
+  Element clear = tools.append("button");
+  clear.text("Clear");
+  Element trainHere = tools.append("button");
+  trainHere.text("Train a new model here");
+  Element middle = row.append("div");
+  middle.append("div").text("What the model sees");
+  Element seen = middle.append("canvas");
+  seen.attr("class", "seen");
+  Element bars = row.append("div");
+  bars.attr("class", "bars");
+  Element[] fills = Element[].filled(10, bars);
+  Element[] pcts = Element[].filled(10, bars);
+  Element[] digits = Element[].filled(10, bars);
+  for (i32 k = 0; k < 10; k++) {
+    digits[k] = bars.append("div");
+    digits[k].text("\{k}");
+    Element track = bars.append("div");
+    fills[k] = track.append("div");
+    fills[k].attr("class", "bar");
+    pcts[k] = bars.append("div");
+    pcts[k].attr("class", "pct");
+  }
+  Element status = root.append("p");
+  status.attr("id", "status");
+
+  f32[] ink = f32[].filled(SIDE * SIDE, 0.0);
+  pad.pixels(SIDE, SIDE, rgbaOf(ink));
+  seen.pixels(28, 28, rgbaOf(f32[].filled(784, 0.0)));
+
+  Result<Site, string> site = await Site.of(page.sys);
+  if (site.isErr()) {
+    where.text("This page reads its model and data from the site it was served from, and it has none: " + site.err()!);
+    return 1;
+  }
+  Device d = Device.cpu();
+  Result<Device, string> gpu = await gpuDevice(page.sys.host, (string s) => { page.log(s); });
+  if (gpu.isOk()) { d = gpu.ok()!; }
+  string device = gpu.isOk() ? "on the GPU, through WebGPU" : "on the CPU (no WebGPU here: " + gpu.err()! + ")";
+
+  if (page.location() == "test") {
+    if (gpu.isErr()) {
+      page.title("NO GPU: " + gpu.err()!);
+      return 1;
+    }
+    u8[] w = (await site.ok()!.get("mnist.weights")).orElse(u8[]());
+    Result<Digits, string> tr = await fetchDigits(site.ok()!, "train-images-idx3-ubyte", "train-labels-idx1-ubyte");
+    Result<Digits, string> te = await fetchDigits(site.ok()!, "t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte");
+    if (tr.isErr() || te.isErr()) {
+      page.title("FAIL " + (tr.isErr() ? tr.err()! : te.err()!));
+      return 1;
+    }
+    page.title(await selfTest(d, w, tr.ok()!, te.ok()!));
+    return 0;
+  }
+
+  // The training data is 55 MB, and a site may well not carry it: offer to train only where it does.
+  bool canTrain = (await site.ok()!.get("train-labels-idx1-ubyte")).isOk();
+  if (!canTrain) { trainHere.attr("style", "display: none"); }
+  Element back = root.append("p");
+  Element backLink = back.append("a");
+  backLink.text("← wac-tensor");
+  backLink.attr("href", "../");
+
+  Sequential model = digitModel(d);
+  bool ready = false;
+  Result<void, string> loaded = loadWeights(model.params(), (await site.ok()!.get("mnist.weights")).orElse(u8[]()));
+  if (loaded.isOk()) {
+    ready = true;
+    where.text("Using weights trained on the CPU by train.wac, running " + device + ".");
+  } else {
+    where.text("No trained weights on this site (" + loaded.err()! + "): train a model here first. It would run " + device + ".");
+  }
+
+  // Each stroke re-reads the drawing; the classification is a read from the device, so it waits on a GPU.
+  bool dirty = false;
+  bool drawing = false;
+  f64 lastX = 0.0;
+  f64 lastY = 0.0;
+  pad.on("pointerdown", Listen.keys("* capture"), (ElementEvent e) => {
+    drawing = true;
+    lastX = e.x as f64;
+    lastY = e.y as f64;
+    stroke(ink, lastX, lastY, lastX, lastY);
+    pad.pixels(SIDE, SIDE, rgbaOf(ink));
+    dirty = true;
+  });
+  pad.on("pointermove", Listen.keys("* capture"), (ElementEvent e) => {
+    if (!drawing) { return; }
+    stroke(ink, lastX, lastY, e.x as f64, e.y as f64);
+    lastX = e.x as f64;
+    lastY = e.y as f64;
+    pad.pixels(SIDE, SIDE, rgbaOf(ink));
+    dirty = true;
+  });
+  pad.on("pointerup", Listen.keys("* capture"), (ElementEvent e) => { drawing = false; });
+  clear.on("click", Listen.none(), (ElementEvent e) => {
+    for (i32 i = 0; i < ink.len(); i++) { ink[i] = 0.0; }
+    pad.pixels(SIDE, SIDE, rgbaOf(ink));
+    dirty = true;
+  });
+  bool wantTraining = false;
+  trainHere.on("click", Listen.none(), (ElementEvent e) => { wantTraining = true; });
+
+  while (true) {
+    if (wantTraining) {
+      wantTraining = false;
+      status.text("Reading MNIST from the site…");
+      Result<Digits, string> tr = await fetchDigits(site.ok()!, "train-images-idx3-ubyte", "train-labels-idx1-ubyte");
+      Result<Digits, string> te = await fetchDigits(site.ok()!, "t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte");
+      if (tr.isErr() || te.isErr()) {
+        status.text(tr.isErr() ? tr.err()! : te.err()!);
+        continue;
+      }
+      Digits train = tr.ok()!;
+      for (Tensor v in model.params()) { v.dispose(); }
+      d.seed(7 as i64);
+      model = digitModel(d);
+      ready = false;
+      Adam opt = Adam.create(0.002);
+      i32[] order = shuffled(d, train.n);
+      i32 steps = train.n / 64;
+      f64 started = page.now();
+      for (i32 s = 0; s < steps; s++) {
+        Tensor loss = opt.minimize(() => {
+          Tensor[] xy = batchOf(d, train, order, s * 64, (s + 1) * 64);
+          return sparseSoftmaxCrossEntropy(model.apply(xy[0], true), xy[1]);
+        }, model.params());
+        if ((s + 1) % 20 == 0 || s + 1 == steps) {
+          f32 l = (await loss.values())[0];
+          f64 rate = ((s + 1) as f64) * 1000.0 / (page.now() - started);
+          status.text("Training \{device}: step \{s + 1} of \{steps}, loss \{l}, \{rate.round()} steps a second");
+        }
+        loss.dispose();
+      }
+      f32 acc = await accuracyOn(d, model, te.ok()!, te.ok()!.n, 500);
+      ready = true;
+      where.text("Using a model trained here, " + device + ".");
+      status.text("Trained for one epoch: \{acc * 100.0}% of the 10,000 test images right.");
+      dirty = true;
+    }
+    if (dirty && ready) {
+      dirty = false;
+      f32[] input = centred(ink, SIDE);
+      seen.pixels(28, 28, rgbaOf(input));
+      Tensor p = probabilities(d, model, input);
+      f32[] probs = await p.values();
+      p.dispose();
+      bool empty = true;
+      for (f32 v in input) { if (v > 0.0) { empty = false; } }
+      i32 best = 0;
+      for (i32 k = 1; k < 10; k++) { if (probs[k] > probs[best]) { best = k; } }
+      for (i32 k = 0; k < 10; k++) {
+        f64 pct = empty ? 0.0 : (probs[k] as f64) * 100.0;
+        fills[k].attr("style", "width: \{pct.round()}%");
+        pcts[k].text(empty ? "" : "\{pct.round()}%");
+        digits[k].attr("class", !empty && k == best ? "best" : "");
+      }
+    }
+    await page.nextFrame();
+  }
+}

@@ -16,8 +16,10 @@ where it has one) from its directory. This file is only the rules that hold acro
   gate and CI run it: a pin to a commit that was rebased away, or to a branch that was never merged, builds on one
   machine and nowhere else. **So never rebase commits that are already pinned, and merge with merge commits** —
   a squash or rebase merge renames every commit in the branch, and every pin to one of them breaks.
-- **The top level does not grow.** `README.md`, `CLAUDE.md`, `.gitignore`, `.github/` and `projects/`; a new
-  project is a directory under `projects/`, and a new piece of shared tooling goes in `projects/repo`.
+- **The top level does not grow.** `README.md`, `CLAUDE.md`, `.gitignore`, `.github/` and `projects/`, and one
+  fixed exception: `bootstrap.sh`, which forwards to `projects/wac/bootstrap.sh` so that the install line from
+  before the move (`…/voltrevo/wac/master/bootstrap.sh`) keeps working. A new project is a directory under
+  `projects/`, and a new piece of shared tooling goes in `projects/repo`.
 
 ## Pushing
 
@@ -25,8 +27,9 @@ where it has one) from its directory. This file is only the rules that hold acro
   directory**: when a push is refused and the merge brings only other projects' work, it pushes the merge
   without running again, because nothing it tested can have changed. Without that, one project's twenty-minute
   suite would never land while another project is pushing.
-- Development happens on `https://git.voltrevo.com/wac.git`; the owner syncs the same commits to GitHub.
-  `sh projects/wac/tools/use-mirror.sh`, once per machine, makes `git` fetch GitHub's URLs from there.
+- **Work goes to GitHub**, `https://github.com/voltrevo/wac`. `git.voltrevo.com/wac.git` and the repositories
+  these projects came from are left as they were: older pins in other repositories still name them, and they
+  get no new work.
 
 ## The package cache
 

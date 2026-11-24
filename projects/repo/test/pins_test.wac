@@ -1,0 +1,161 @@
+// The pin check, against a repository built for it, and against this one.
+//
+// The fixture is the shape of the real move in miniature: a first commit with a project at the root, a second
+// that moves it into `projects/a`, a side branch that is never merged, and then a lock with one pin of each
+// kind. Exactly the bad ones must be reported, each by name — a check that reported everything, or nothing,
+// would pass a test that only counted.
+
+import { ChildEnv, Exec, Launch, Sys } from "std";
+import { Vec, flatten, strings } from "core";
+import { Repo, canonicalOf, normalUrl, pinsIn, problems, topOf } from "../src/pins.wac";
+
+string CANON() { return "https://github.com/voltrevo/wac.git"; }
+
+/** Run a shell script with `$1` set to `arg`; its trimmed output, or a line saying it failed. */
+string sh(Sys sys, string script, string arg) {
+  auto ran = flatten(sys.procs().exec("sh", ["-c", script, "sh", arg], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? e = ran.ok();
+  if (e is null) { return "FAILED: sh could not start"; }
+  if (e!.status != 0) { return "FAILED: \{string.fromBytes(e!.stderr)}"; }
+  return strings.trim(string.fromBytes(e!.stdout));
+}
+
+/** Build the fixture in a new temporary directory and say where, and what its commits are called. */
+string[] fixture(Sys sys) {
+  string script = """
+    set -e
+    d=$(mktemp -d)
+    g() { git -C "$d" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+    g init -q -b main
+    echo '{}' > "$d/wac.json5"; g add -A; g commit -q -m root
+    c0=$(g rev-parse HEAD)
+    mkdir -p "$d/projects/a"; g mv wac.json5 projects/a/wac.json5; g commit -q -m move
+    c1=$(g rev-parse HEAD)
+    g checkout -q -b side; echo x > "$d/projects/a/x"; g add -A; g commit -q -m side
+    s1=$(g rev-parse HEAD)
+    g checkout -q main
+    echo "$d $c0 $c1 $s1"
+  """;
+  string out = sh(sys, script, "");
+  return strings.split(out, " ");
+}
+
+string entry(string name, string git, string ref, string subdir, string commit) {
+  string sub = subdir == "" ? "" : ", \"subdir\": \"\{subdir}\"";
+  return "    \"\{name}\": { \"git\": \"\{git}\", \"ref\": \"\{ref}\"\{sub}, \"commit\": \"\{commit}\" }";
+}
+
+bool mentions(Vec<string> found, string name) {
+  for (i32 i = 0; i < found.len(); i++) { if (strings.contains(found.get(i), ": \{name} ")) { return true; } }
+  return false;
+}
+
+export string test_the_bad_pins_are_reported_and_only_those(Sys sys) {
+  string[] f = fixture(sys);
+  if (f.len() != 4) { return "the fixture did not build: \{strings.join(f, " ")}"; }
+  string dir = f[0];
+  string c0 = f[1];
+  string c1 = f[2];
+  string s1 = f[3];
+  string other = "1111111111111111111111111111111111111111";
+  string[] lines = [
+    entry("good", CANON(), c1, "./projects/a", c1),
+    entry("spelled", "HTTPS://GitHub.com/voltrevo/wac/", c1, "./projects/a", c1),
+    entry("beforemove", CANON(), c0, "", c0),
+    entry("external", "https://example.com/other.git", other, "", other),
+    entry("branchref", CANON(), "master", "./projects/a", c1),
+    entry("rebased", CANON(), s1, "./projects/a", s1),
+    entry("unknown", CANON(), other, "./projects/a", other),
+    entry("nosuchdir", CANON(), c1, "./projects/zz", c1),
+    entry("aftermove", CANON(), c1, "", c1),
+    entry("alias", "https://git.voltrevo.com/wac.git", c1, "./projects/a", c1),
+  ];
+  string lock = "{\n  \"imports\": {\n" + strings.join(lines, ",\n") + "\n  }\n}\n";
+  string madeDir = sh(sys, "mkdir -p \"$1/projects/b\"", dir);
+  if (strings.startsWith(madeDir, "FAILED")) { return madeDir; }
+  auto wrote = flatten(sys.files().writeFile("\{dir}/projects/b/wac.lock", lock.toBytes()).wait());
+  if (wrote.isErr()) { return "could not write the fixture's lock"; }
+  string made = sh(sys, """
+    set -e
+    git -C "$1" add -A
+    git -C "$1" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m lock
+    """, dir);
+  if (strings.startsWith(made, "FAILED")) { return made; }
+
+  Vec<string> found = problems(Repo(sys.procs(), sys.files(), dir), CANON(), ["projects"]);
+  string bad = "";
+  string[] wanted = ["branchref", "rebased", "unknown", "nosuchdir", "aftermove", "alias"];
+  string[] fine = ["good", "spelled", "beforemove", "external"];
+  for (i32 i = 0; i < wanted.len(); i++) {
+    if (!mentions(found, wanted[i])) { bad = bad + "\n  \{wanted[i]} was not reported"; }
+  }
+  for (i32 i = 0; i < fine.len(); i++) {
+    if (mentions(found, fine[i])) { bad = bad + "\n  \{fine[i]} was reported, and is fine"; }
+  }
+  if (found.len() != wanted.len()) { bad = bad + "\n  \{found.len()} problems, not \{wanted.len()}"; }
+  if (!mentions(found, "rebased") || !strings.contains(strings.join(vecToArray(found), "\n"), "not in this history")) {
+    bad = bad + "\n  the rebased pin is not reported as out of history";
+  }
+  sh(sys, "rm -rf \"$1\"", dir);
+  return bad == "" ? "" : "pins:" + bad + "\n  reported:\n    " + strings.join(vecToArray(found), "\n    ");
+}
+
+string[] vecToArray(Vec<string> v) {
+  string[] out = string[].filled(v.len(), "");
+  for (i32 i = 0; i < v.len(); i++) { out[i] = v.get(i); }
+  return out;
+}
+
+export string test_a_shallow_clone_is_refused_rather_than_misread(Sys sys) {
+  string[] f = fixture(sys);
+  if (f.len() != 4) { return "the fixture did not build"; }
+  string shallow = sh(sys, """
+    set -e
+    git clone -q --depth 1 "file://$1" "$1-shallow"
+    echo "$1-shallow"
+  """, f[0]);
+  if (strings.startsWith(shallow, "FAILED")) { return shallow; }
+  Vec<string> found = problems(Repo(sys.procs(), sys.files(), shallow), CANON(), ["projects"]);
+  sh(sys, "rm -rf \"$1\" \"$1-shallow\"", f[0]);
+  if (found.len() != 1 || !strings.contains(found.get(0), "shallow")) {
+    return "a shallow clone gave \{found.len()} problems: \{strings.join(vecToArray(found), "; ")}";
+  }
+  return "";
+}
+
+export string test_a_lock_is_read_as_wac_writes_it() {
+  string text = """
+{
+  "imports": {
+    "web": {
+      "git": "https://github.com/voltrevo/wac.git",
+      "ref": "097753ad23ebfd901bddd636b899ed8cde5368cb",
+      "subdir": "./projects/web",
+      "commit": "097753ad23ebfd901bddd636b899ed8cde5368cb"
+    },
+    "wac": { "git": "https://github.com/voltrevo/wac.git", "ref": "aaef775ca2d1d93f1706c520454cfadd0bf9d382", "commit": "aaef775ca2d1d93f1706c520454cfadd0bf9d382", "cid": "bafy" }
+  }
+}
+""";
+  auto pins = pinsIn("l", text);
+  if (pins.len() != 2) { return "\{pins.len()} pins, not 2"; }
+  if (pins.get(0).name != "web" || pins.get(0).subdir != "./projects/web") { return "the first is \{pins.get(0).name} at \{pins.get(0).subdir}"; }
+  if (pins.get(1).name != "wac" || pins.get(1).subdir != "" || pins.get(1).commit != "aaef775ca2d1d93f1706c520454cfadd0bf9d382") {
+    return "the second is \{pins.get(1).name} at '\{pins.get(1).subdir}' \{pins.get(1).commit}";
+  }
+  if (normalUrl("HTTPS://GitHub.com/voltrevo/wac.git/") != normalUrl("https://github.com/voltrevo/wac")) { return "normalUrl"; }
+  if (normalUrl("https://github.com/Voltrevo/wac") == normalUrl("https://github.com/voltrevo/wac")) { return "the path's case matters"; }
+  return "";
+}
+
+
+/** The canary that matters: this repository, as it is. Needs a full clone. */
+export string test_every_pin_in_this_repository_is_in_its_history(Sys sys) {
+  string top = topOf(sys.procs(), sys.files(), ".");
+  if (top == "") { return "not run from inside this repository"; }
+  Repo r = Repo(sys.procs(), sys.files(), top);
+  string canonical = canonicalOf(r);
+  if (canonical == "") { return "projects/repo/repository.txt is missing"; }
+  Vec<string> found = problems(r, canonical, ["projects"]);
+  return found.len() == 0 ? "" : strings.join(vecToArray(found), "\n");
+}

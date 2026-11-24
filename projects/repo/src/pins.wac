@@ -1,0 +1,207 @@
+// Pins into this repository must be in its history.
+//
+// A project here reaches a sibling only through a pin: a `wac.lock` entry naming this repository, a commit and
+// a `subdir`. A pin can only name a commit that existed before the commit holding it, so in ordinary work the
+// pinned commit is an ancestor, and pushing pushes it. What breaks that is a rebase — a pin bumped to C, then
+// `git pull --rebase` rewriting C as C′ under a pin that still says C — or a pin to a branch that was never
+// merged. Either way the commit exists on one machine and nowhere else, and every other checkout fails.
+//
+// So for every entry in every `wac.lock` under the paths asked about:
+//
+//   - **one naming this repository** (`repository.txt`, exactly that spelling) must name a commit that is an
+//     ancestor of HEAD, with `ref` equal to it, and a project — a `wac.json5` — at its `subdir` in that commit,
+//     or at the root when there is no `subdir` (a pin to a wac commit from before wac moved to `projects/wac`);
+//   - **one naming any other URL whose commit is in this repository** is this repository under another name —
+//     the git.voltrevo.com mirror, a proxy, a fork — and is refused, since it would otherwise skip the first check.
+//
+// A shallow clone cannot answer "is it an ancestor", and answering "no" would be a false alarm, so it is refused
+// as a whole and says so.
+
+import { ChildEnv, Exec, Files, Launch, Procs } from "std";
+import { Vec, flatten, strings } from "core";
+
+/** A repository on disk, and the means to ask git about it. */
+export struct Repo {
+  Procs procs;
+  Files files;
+  string dir;
+}
+
+struct Ran {
+  i32 status;
+  string out;
+  string err;
+}
+
+Ran git(Repo r, string[] args) {
+  string[] full = string[].filled(args.len() + 2, "");
+  full[0] = "-C";
+  full[1] = r.dir;
+  for (i32 i = 0; i < args.len(); i++) { full[i + 2] = args[i]; }
+  auto ran = flatten(r.procs.exec("git", full, u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? e = ran.ok();
+  if (e is null) { return Ran(-1, "", "git could not be started"); }
+  return Ran(e!.status, strings.trim(string.fromBytes(e!.stdout)), strings.trim(string.fromBytes(e!.stderr)));
+}
+
+/** One import, as a lock file writes it. */
+export struct Pin {
+  string lock;
+  string name;
+  string git;
+  string ref;
+  string subdir;
+  string commit;
+}
+
+/** The string value of `"key": "…"` inside `block`, or "". */
+string field(string block, string key) {
+  string k = "\"\{key}\"";
+  i32 at = block.indexOf(k);
+  if (at < 0) { return ""; }
+  i32 colon = strings.indexOfFrom(block, ":", at + k.len());
+  if (colon < 0) { return ""; }
+  i32 open = strings.indexOfFrom(block, "\"", colon);
+  if (open < 0) { return ""; }
+  i32 close = strings.indexOfFrom(block, "\"", open + 1);
+  if (close < 0) { return ""; }
+  return block.slice(open + 1, close);
+}
+
+/**
+ * Every import in a lock's text: each `{ … }` holding a `"git"`, named by the key before it.
+ *
+ * A scan rather than a JSON parser, so this project needs nothing but `core` and `std` and pins nothing. A lock
+ * is written by `wac`, one flat object per import, which is all the scan relies on.
+ */
+export Vec<Pin> pinsIn(string lock, string text) {
+  Vec<Pin> out = Vec.create();
+  i32 from = 0;
+  while (true) {
+    i32 at = strings.indexOfFrom(text, "\"git\"", from);
+    if (at < 0) { break; }
+    i32 open = strings.lastIndexOf(text.slice(0, at), "{");
+    i32 close = strings.indexOfFrom(text, "}", at);
+    if (open < 0 || close < 0) { break; }
+    string block = text.slice(open, close + 1);
+    // The name is the last quoted string before the brace: `"web": {`.
+    string before = strings.trimEnd(text.slice(0, open));
+    string name = "";
+    if (strings.endsWith(before, ":")) {
+      string key = strings.trimEnd(before.slice(0, before.len() - 1));
+      i32 q = strings.lastIndexOf(key.slice(0, key.len() - 1), "\"");
+      if (q >= 0) { name = key.slice(q + 1, key.len() - 1); }
+    }
+    out.push(Pin(lock, name, field(block, "git"), field(block, "ref"), field(block, "subdir"), field(block, "commit")));
+    from = close + 1;
+  }
+  return out;
+}
+
+/** A URL as it is compared: no trailing slash or `.git`, and a lower-case scheme and host. */
+export string normalUrl(string url) {
+  string u = strings.trim(url);
+  while (strings.endsWith(u, "/")) { u = u.slice(0, u.len() - 1); }
+  if (strings.endsWith(u, ".git")) { u = u.slice(0, u.len() - 4); }
+  i32 scheme = u.indexOf("://");
+  i32 path = scheme < 0 ? -1 : strings.indexOfFrom(u, "/", scheme + 3);
+  if (path < 0) { return strings.toLower(u); }
+  return strings.toLower(u.slice(0, path)) + u.slice(path, u.len());
+}
+
+bool isCommitName(string s) {
+  if (s.len() != 40) { return false; }
+  for (i32 i = 0; i < 40; i++) {
+    string c = s.slice(i, i + 1);
+    if (!((c >= "0" && c <= "9") || (c >= "a" && c <= "f"))) { return false; }
+  }
+  return true;
+}
+
+bool hasCommit(Repo r, string commit) {
+  return isCommitName(commit) && git(r, ["cat-file", "-e", "\{commit}^{commit}"]).status == 0;
+}
+
+/** Where a pin's project's manifest is, in the pinned commit. */
+string manifestOf(Pin p) {
+  string d = p.subdir;
+  while (strings.startsWith(d, "./")) { d = d.slice(2, d.len()); }
+  while (strings.endsWith(d, "/")) { d = d.slice(0, d.len() - 1); }
+  return d == "" ? "wac.json5" : "\{d}/wac.json5";
+}
+
+/** What is wrong with one pin; "" when nothing is. */
+export string problemWith(Repo r, string canonical, Pin p) {
+  string who = "\{p.lock}: \{p.name}";
+  if (normalUrl(p.git) != normalUrl(canonical)) {
+    if (hasCommit(r, p.commit)) {
+      return "\{who} names this repository as \{p.git}; pins into it are written \{canonical}";
+    }
+    return "";
+  }
+  if (!isCommitName(p.commit)) { return "\{who} has no commit; run wac update to write one"; }
+  if (p.ref != p.commit) {
+    return "\{who} has ref '\{p.ref}'; a pin into this repository names its commit, \{p.commit}";
+  }
+  if (!hasCommit(r, p.commit)) {
+    return "\{who} pins \{p.commit.slice(0, 12)}, which is not in this repository";
+  }
+  if (git(r, ["merge-base", "--is-ancestor", p.commit, "HEAD"]).status != 0) {
+    return "\{who} pins \{p.commit.slice(0, 12)}, which is not in this history (rebased, or from a branch that was not merged?)";
+  }
+  string at = manifestOf(p);
+  if (git(r, ["cat-file", "-e", "\{p.commit}:\{at}"]).status != 0) {
+    return "\{who} pins \{p.commit.slice(0, 12)} at \{p.subdir == "" ? "its root" : p.subdir}, where that commit has no \{at}";
+  }
+  return "";
+}
+
+/**
+ * Every problem with the pins in the `wac.lock` files git tracks under `paths`, one line each.
+ *
+ * Tracked files rather than a walk of the disk, so a stray lock in a build directory is not read, and the
+ * lock is read as the working tree has it: a gate checks the change it is about to push.
+ */
+export Vec<string> problems(Repo r, string canonical, string[] paths) {
+  Vec<string> out = Vec.create();
+  Ran shallow = git(r, ["rev-parse", "--is-shallow-repository"]);
+  if (shallow.status != 0) {
+    out.push("not a git repository at \{r.dir}: \{shallow.err}");
+    return out;
+  }
+  if (shallow.out == "true") {
+    out.push("this is a shallow clone, so whether a pin is in its history cannot be told; run git fetch --unshallow");
+    return out;
+  }
+  string[] args = string[].filled(paths.len() + 2, "");
+  args[0] = "ls-files";
+  args[1] = "--";
+  for (i32 i = 0; i < paths.len(); i++) { args[i + 2] = paths[i]; }
+  Ran listed = git(r, args);
+  string[] files = strings.split(listed.out, "\n");
+  for (i32 i = 0; i < files.len(); i++) {
+    string f = files[i];
+    if (!(f == "wac.lock" || strings.endsWith(f, "/wac.lock"))) { continue; }
+    // The working tree's copy: a gate checks the change it is about to push, committed or not.
+    u8[]? bytes = flatten(r.files.readFile("\{r.dir}/\{f}").wait()).ok();
+    if (bytes is null) { out.push("\{f}: unreadable"); continue; }
+    string text = string.fromBytes(bytes!);
+    Vec<Pin> pins = pinsIn(f, text);
+    for (i32 j = 0; j < pins.len(); j++) {
+      string p = problemWith(r, canonical, pins.get(j));
+      if (p != "") { out.push(p); }
+    }
+  }
+  return out;
+}
+
+/** The URL this repository is known by: `projects/repo/repository.txt` at the top of `r`. */
+export string canonicalOf(Repo r) {
+  u8[]? bytes = flatten(r.files.readFile("\{r.dir}/projects/repo/repository.txt").wait()).ok();
+  return bytes is null ? "" : strings.trim(string.fromBytes(bytes!));
+}
+
+/** The top of the working tree containing `dir`. */
+export string topOf(Procs procs, Files files, string dir) {
+  return git(Repo(procs, files, dir), ["rev-parse", "--show-toplevel"]).out;
+}

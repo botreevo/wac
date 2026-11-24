@@ -1,0 +1,158 @@
+// test-lane: browser — drives Chromium through Playwright, which needs -A
+// What a page can tell in an actual browser: `example/sense.wac` built as a page, resized, scrolled over and typed at.
+//
+// The size an element has on screen (`resize`), which way the wheel turned, and when a key was pressed by the
+// page's own clock are the host's to say: the document's `ResizeObserver`, a wheel's `deltaY`, and an event's
+// `timeStamp` counted from the same start as the clock a program in a worker reads. A clock counted from the
+// worker's own start would make every key seem to arrive before it was pressed, or long after.
+//
+// **Skipped loudly** when there is no browser, as `view_live.test.ts` is.
+
+import { buildPage, serve, waitInPage, findChromium } from "./harness.ts";
+
+// Found by `harness.ts` `findChromium`, which launches it by executable (wac `issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
+if (cannotBecause !== "") {
+  console.warn(`SKIPPING the sense live test: ${cannotBecause}.`);
+}
+
+for (const mode of [[], ["--in-page"]]) {
+  Deno.test({
+    name: `a page hears its size, the wheel and when a key was pressed${mode.length ? " — on the page's own thread" : " — in a worker"}`,
+    ignore: cannotBecause !== "",
+    sanitizeResources: false,
+    sanitizeOps: false,
+    fn: async () => {
+      const { chromium } = await import("npm:playwright@1");
+      const dir = await Deno.makeTempDir({ prefix: "wac-senselive-" });
+      let browser;
+      let http: { port: number; stop(): Promise<void> } | undefined;
+      try {
+        await buildPage("example/sense.wac", dir, ["--edge", "--app", "example/icon.png", "--app-color", "#123456", ...mode]);
+        // An app to install: its manifest, icon and service worker beside it, and named in its head.
+        const manifest = JSON.parse(await Deno.readTextFile(`${dir}/manifest.webmanifest`));
+        if (manifest.display !== "standalone" || manifest.theme_color !== "#123456" || manifest.icons[0].src !== "icon.png") {
+          throw new Error(`the manifest: ${JSON.stringify(manifest)}`);
+        }
+        await Deno.stat(`${dir}/icon.png`);
+        await Deno.stat(`${dir}/sw.js`);
+        // To the screen's edges, and shrunk by an on-screen keyboard rather than covered.
+        const index = await Deno.readTextFile(`${dir}/index.html`);
+        if (!index.includes("interactive-widget=resizes-content, viewport-fit=cover")) throw new Error("the viewport of an --edge page");
+        const port = (http = serve(dir)).port;
+        browser = await chromium.launch({ executablePath: CHROMIUM.executablePath, args: ["--no-proxy-server"] });
+        const page = await browser.newPage({ viewport: { width: 800, height: 600 }, deviceScaleFactor: 2, hasTouch: true });
+        await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
+        const text = (id: string) => `(document.getElementById(${JSON.stringify(id)})?.textContent ?? "")`;
+        await waitInPage(page, `document.getElementById("box") !== null`, null, { timeout: 30_000 });
+        // **The box measured on every poll, not once before the wait.** Taken once, the expected size was
+        // whatever the layout was at that instant; when it was still settling, the page went on to report the
+        // size it settled at, and the wait held out for one that no longer existed — this case timed out
+        // waiting for "1568x350" in two runs of five, on the page's own thread.
+        const sizeNow = `(() => { const r = document.getElementById("box").getBoundingClientRect();
+                                  return Math.round(r.width * 2) + "x" + Math.round(r.height * 2); })()`;
+        await waitInPage(page, `${text("size")} === ${sizeNow}`, null, { timeout: 10_000 });
+
+        // And after a resize, the new size: the page's report agrees with the box, and the box is not the size it was.
+        const before = await page.evaluate(sizeNow) as string;
+        await page.setViewportSize({ width: 500, height: 600 });
+        await waitInPage(page, `${text("size")} === ${sizeNow} && ${sizeNow} !== ${JSON.stringify(before)}`, null, { timeout: 10_000 });
+
+        const over = await page.evaluate(`(() => { const r = document.getElementById("wheel").getBoundingClientRect();
+                                                    return [r.left + r.width / 2, r.top + r.height / 2]; })()`) as number[];
+        await page.mouse.move(over[0], over[1]);
+        await page.mouse.wheel(0, 120);
+        await page.mouse.wheel(0, -40);
+        // Turned in the screen's pixels, and said in the page's: at two of one to the other, 120 down and 40 up is 40.
+        await waitInPage(page, `${text("wheel")} === "40"`, null, { timeout: 10_000 });
+
+        await page.click("#box");
+        await page.keyboard.press("ArrowLeft");
+        await waitInPage(page, `${text("key")} !== ""`, null, { timeout: 10_000 });
+        const key = await page.evaluate(text("key")) as string;
+        if (key !== "ArrowLeft on time") throw new Error(`the key, and when: ${key}`);
+
+        // Two fingers on the pad at once, each its own pointer; one slides off before it lifts, and is heard lifting.
+        const pad = await page.evaluate(`(() => { const r = document.getElementById("pad").getBoundingClientRect();
+                                                   return [r.left, r.top]; })()`) as number[];
+        const cdp = await page.context().newCDPSession(page);
+        const at = (x: number, y: number, id: number) => ({ x: pad[0] + x, y: pad[1] + y, id });
+        await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [at(30, 60, 1)] });
+        await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [at(30, 60, 1), at(200, 60, 2)] });
+        await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [at(30, 400, 1), at(200, 60, 2)] });
+        await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [at(200, 60, 2)] });
+        await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+        await waitInPage(page, `(${text("fingers")}.match(/;/g) ?? []).length === 4`, null, { timeout: 10_000 });
+        const felt = await page.evaluate(text("fingers")) as string;
+        const m = felt.match(/^down (\d+);down (\d+);up (\d+);up (\d+);$/);
+        if (!m || m[1] === m[2] || [m[3], m[4]].sort().join() !== [m[1], m[2]].sort().join()) {
+          throw new Error(`two fingers, each lifted, the one slid off too: ${felt}`);
+        }
+
+        // The canvas: in a worker, handed to the program's worker and drawn there, red, at its size; on the page's own
+        // thread, where nothing is handed over, drawn by the page.
+        if (mode.length === 0) {
+          await waitInPage(page, `document.getElementById("drawn")?.hasAttribute("data-wac-surface") === true`, null, { timeout: 10_000 });
+          const surface = Number(await page.evaluate(`document.getElementById("drawn").getAttribute("data-wac-surface")`));
+          let red = "";
+          for (let i = 0; i < 100 && red !== "255,0,0,255|4x2"; i++) {
+            for (const w of page.workers()) {
+              // As text: the worker's own, which Deno's types do not describe.
+              const got = await w.evaluate(`(() => { const c = self.wacSurfaceById?.get(${surface});
+                return c ? Array.from(c.getContext("2d").getImageData(3, 1, 1, 1).data).join() + "|" + c.width + "x" + c.height : ""; })()`) as string;
+              if (got !== "") red = got;
+            }
+            if (red !== "255,0,0,255|4x2") await new Promise((r) => setTimeout(r, 50));
+          }
+          if (red !== "255,0,0,255|4x2") throw new Error(`the canvas, drawn in the worker: ${red}`);
+        } else {
+          await waitInPage(page, `(() => { const c = document.getElementById("drawn"); return c !== null && c.width === 4
+            && c.getContext("2d").getImageData(3, 1, 1, 1).data.join() === "255,0,0,255"; })()`, null, { timeout: 10_000 });
+          if (await page.evaluate(`document.getElementById("drawn").hasAttribute("data-wac-surface")`)) throw new Error("handed over on the page's own thread");
+        }
+
+        // Full screen, asked for after a click: the browser's own, the box filling it, and the program told; asked
+        // again, left. Where the browser has none — an iPhone's — the box fills the window instead, said the same way.
+        await page.click("#full");
+        await waitInPage(page, `${text("filled")} === "full" && document.fullscreenElement === document.getElementById("box")`, null, { timeout: 10_000 });
+        await page.click("#full");
+        await waitInPage(page, `${text("filled")} === "not full" && document.fullscreenElement === null`, null, { timeout: 10_000 });
+        const noFullScreen = await browser.newPage({ viewport: { width: 400, height: 300 } });
+        await noFullScreen.addInitScript(`Object.defineProperty(Element.prototype, "requestFullscreen", { value: undefined })`);
+        await noFullScreen.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
+        await waitInPage(noFullScreen, `document.getElementById("full") !== null`, null, { timeout: 30_000 });
+        await noFullScreen.click("#full");
+        await waitInPage(noFullScreen, `${text("filled")} === "full" && (() => { const r = document.getElementById("box").getBoundingClientRect();
+          return r.left === 0 && r.top === 0 && r.width === 400 && r.height === 300; })()`, null, { timeout: 10_000 });
+        await noFullScreen.click("#full");
+        await waitInPage(noFullScreen, `${text("filled")} === "not full" && !document.getElementById("box").hasAttribute("data-wac-full")
+          && getComputedStyle(document.getElementById("box")).position === "static"`, null, { timeout: 10_000 });
+        await noFullScreen.close();
+
+        // A place added to the history: the program hears it, the address shows it, and the browser's Back leaves it.
+        await page.click("#deeper");
+        await waitInPage(page, `${text("where")} === "deeper" && location.hash === "#deeper"`, null, { timeout: 10_000 });
+        await page.goBack();
+        await waitInPage(page, `${text("where")} === "home" && location.hash === ""`, null, { timeout: 10_000 });
+        await page.goForward();
+        await waitInPage(page, `${text("where")} === "deeper"`, null, { timeout: 10_000 });
+
+        // Installed, it opens without the network: the service worker kept the page as it loaded.
+        const manifestLink = await page.evaluate(`document.querySelector('link[rel=manifest]')?.href ?? ""`) as string;
+        if (!manifestLink.endsWith("/manifest.webmanifest")) throw new Error(`no manifest named: ${manifestLink}`);
+        await page.evaluate(`navigator.serviceWorker.ready.then(() => true)`);
+        await page.reload({ waitUntil: "load" });
+        await waitInPage(page, `navigator.serviceWorker.controller !== null && document.getElementById("box") !== null`, null, { timeout: 30_000 });
+        await page.context().setOffline(true);
+        await page.reload({ waitUntil: "load" });
+        await waitInPage(page, `document.getElementById("box") !== null`, null, { timeout: 30_000 });
+        await page.context().setOffline(false);
+      } finally {
+        await browser?.close();
+        await http?.stop();
+        await Deno.remove(dir, { recursive: true });
+      }
+    },
+  });
+}

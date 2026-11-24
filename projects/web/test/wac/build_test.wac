@@ -1,0 +1,235 @@
+// The page builder's two steps that start no process — for a builder that may not spawn one, as reckon's sealed
+// machine. `--module-only` writes `page.wac` and stops; the caller builds it (`wac build page.wac -o page`) as a step
+// of its own; `--wrap` wraps the `page.wasm` that step made into `index.html`. The whole build is still the three
+// together (`template.test.ts` drives it). Over `sys.files()`, so the gate runs these with no grant: neither step
+// reads a file it did not write here.
+import { Files, Output, OutputFault, Sys } from "std";
+import { Result, Ticket, Vec, flatten } from "core";
+import { Routed, buildPage, declaresFrames, framesFileOf, framesHtml, routesOf, sitemapOf, upFrom, versionOf, wrapBuiltPage, writePageModule } from "../../tools";
+
+string fail(string why) { return why; }
+
+export string test_module_only_writes_the_page_module_and_stops(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/module";
+  fs.remove(out, true).wait();
+  i32 code = buildPage(["example/beep.wac", out, "--module-only"], sys.stderr(), sys.stdout(), fs, sys.procs());
+  if (code != 0) { return fail("--module-only answered \{code}"); }
+  string page = string.fromBytes(flatten(fs.readFile(out + "/page.wac").wait()).orElse(u8[]()));
+  if (page.indexOf("beep.wac") < 0) { return fail("page.wac does not import the program:\n" + page); }
+  if (flatten(fs.readFile(out + "/page.wasm").wait()).isOk()) { return fail("it built page.wasm, which is the caller's step"); }
+  if (flatten(fs.readFile(out + "/index.html").wait()).isOk()) { return fail("it wrote index.html, which is --wrap's"); }
+  fs.remove(out, true).wait();
+  return "";
+}
+
+export string test_wrap_wraps_a_module_built_elsewhere(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/wrap";
+  fs.remove(out, true).wait();
+  fs.mkdir(out, true).wait();
+  // A module somebody else built: its bytes are carried as they are, base64 inside the page.
+  u8[] wasm = [0, 97, 115, 109, 1, 0, 0, 0] as u8[];
+  fs.writeFile(out + "/page.wasm", wasm).wait();
+  i32 code = wrapBuiltPage(["example/beep.wac", out, "--title", "Wrapped"], sys.stderr(), sys.stdout(), fs);
+  if (code != 0) { return fail("--wrap answered \{code}"); }
+  string index = string.fromBytes(flatten(fs.readFile(out + "/index.html").wait()).orElse(u8[]()));
+  if (index.indexOf("AGFzbQEAAAA=") < 0) { return fail("index.html does not carry the module"); }
+  if (index.indexOf("<title>Wrapped</title>") < 0) { return fail("index.html lost the title"); }
+  fs.remove(out, true).wait();
+  return "";
+}
+
+export string test_wrap_without_a_module_says_so(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/none";
+  fs.remove(out, true).wait();
+  fs.mkdir(out, true).wait();
+  i32 code = writePageModule(["example/beep.wac", out], sys.stderr(), sys.stdout(), fs);
+  if (code != 0) { return fail("writing the module answered \{code}"); }
+  code = wrapBuiltPage(["example/beep.wac", out], sys.stderr(), sys.stdout(), fs);
+  if (code != 1) { return fail("--wrap with no page.wasm answered \{code}, not 1"); }
+  fs.remove(out, true).wait();
+  return "";
+}
+
+export string test_the_two_halves_are_not_asked_for_together(Sys sys) {
+  i32 code = buildPage(["example/beep.wac", ".cache/build-test/both", "--module-only", "--wrap"], sys.stderr(),
+                       sys.stdout(), sys.files(), sys.procs());
+  return code == 2 ? "" : fail("both halves answered \{code}, not 2");
+}
+
+/** What a run wrote to an `Output`, kept so a test can read it. */
+struct Heard {
+  Vec<string> said;
+  Output out;
+}
+
+Heard heard() {
+  Vec<string> said = Vec.create();
+  Output out = Output((u8[] b) => {
+    said.push(string.fromBytes(b));
+    Ticket<Result<void, OutputFault>> t;
+    t.resolve(Result.Ok());
+    return t;
+  }, () => {
+    Ticket<Result<void, OutputFault>> t;
+    t.resolve(Result.Ok());
+    return t;
+  });
+  return Heard(said, out);
+}
+
+string all(Heard h) {
+  string s = "";
+  for (i32 i = 0; i < h.said.len(); i++) { s = s + h.said.get(i); }
+  return s;
+}
+
+/**
+ * **A write the disk refuses fails the build, and says so** — it was ignored, and the line saying the page was written
+ * was printed anyway: a builder lost a 100 KB `index.html` to a run that reported success. Here the module is there to
+ * read and the directory refuses every write (`Files.readOnly`).
+ */
+export string test_wrap_fails_loudly_when_index_html_cannot_be_written(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/refused";
+  fs.remove(out, true).wait();
+  fs.mkdir(out, true).wait();
+  fs.writeFile(out + "/page.wasm", [0, 97, 115, 109, 1, 0, 0, 0] as u8[]).wait();
+  Heard err = heard();
+  Heard said = heard();
+  i32 code = wrapBuiltPage(["example/beep.wac", out], err.out, said.out, fs.readOnly());
+  if (code != 1) { return fail("a refused write answered \{code}, not 1"); }
+  if (all(err).indexOf(out + "/index.html") < 0) { return fail("the refusal did not name the file: \{all(err)}"); }
+  if (all(said).indexOf("bytes of module") >= 0) { return fail("it said the page was written: \{all(said)}"); }
+  if (flatten(fs.stat(out + "/index.html").wait()).isOk()) { return fail("index.html is there after all"); }
+  fs.remove(out, true).wait();
+  return "";
+}
+
+/** The same for the page's module, and for the directory it goes in. */
+export string test_module_only_fails_loudly_when_it_cannot_write(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/refused-module";
+  fs.remove(out, true).wait();
+  Heard err = heard();
+  i32 code = writePageModule(["example/beep.wac", out], err.out, sys.stdout(), fs.readOnly());
+  if (code != 1) { return fail("a refused directory answered \{code}, not 1"); }
+  if (all(err).indexOf(out) < 0) { return fail("the refusal did not name the directory: \{all(err)}"); }
+  return "";
+}
+
+// ── First frames, declared by an export ─────────────────────────────────────
+
+export string test_an_entry_declares_its_frames_by_exporting_them() {
+  if (!declaresFrames("import { Frame } from \"web\";\nexport Frame[] prerendered() { return []; }\n")) {
+    return fail("the export was not seen");
+  }
+  if (!declaresFrames("export Frame[]   prerendered() {")) { return fail("spacing hid the export"); }
+  if (declaresFrames("Frame[] prerendered() { return []; }")) { return fail("a function not exported declares nothing"); }
+  if (declaresFrames("// export Frame[] prerendered() {\n")) { return fail("a comment declares nothing"); }
+  if (declaresFrames("export i32 main(Page page) { return 0; }")) { return fail("a page that says nothing of frames declares none"); }
+  if (!declaresFrames("x();\n// above\nexport Frame[] prerendered() {")) { return fail("a comment on an earlier line hid it"); }
+  return "";
+}
+
+export string test_one_frame_for_any_window_is_its_markup() {
+  string got = framesHtml([""], ["<p data-wac-h=\"1\">x</p>"]);
+  if (got != "<p data-wac-h=\"1\">x</p>") { return fail("one frame was wrapped: " + got); }
+  return "";
+}
+
+export string test_several_frames_are_wrapped_after_a_stylesheet_showing_the_first_that_matches() {
+  string got = framesHtml(["(max-width: 699.98px)", ""], ["<p>narrow</p>", "<p>wide</p>"]);
+  if (got.indexOf("<div data-wac-frame=\"0\" data-wac-media=\"(max-width: 699.98px)\"><p>narrow</p></div>") < 0) {
+    return fail("the narrow frame is not wrapped with its query: " + got);
+  }
+  if (got.indexOf("<div data-wac-frame=\"1\" data-wac-media=\"\"><p>wide</p></div>") < 0) { return fail("the wide frame: " + got); }
+  // The catch-all's rule comes before the narrow one's, so a narrow window, matching both, shows the narrow frame.
+  i32 any = got.indexOf("[data-wac-frame=\"1\"] { display: contents; }");
+  i32 narrow = got.indexOf("@media (max-width: 699.98px) {");
+  if (any < 0 || narrow < 0 || any > narrow) { return fail("the first frame's rule must come last: " + got); }
+  if (got.indexOf("<style data-wac-frames>") != 0) { return fail("the stylesheet comes first: " + got); }
+  string evil = framesHtml(["(x) </style><b>", ""], ["a", "b"]);
+  if (evil.indexOf("</style><b>") >= 0) { return fail("a query ended the stylesheet: " + evil); }
+  return "";
+}
+
+// ── The module as a file of its own ─────────────────────────────────────────
+
+export string test_a_module_file_is_fetched_beside_the_page_by_its_version(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/module-file";
+  fs.remove(out, true).wait();
+  fs.mkdir(out, true).wait();
+  u8[] wasm = [0, 97, 115, 109, 1, 0, 0, 0] as u8[];
+  fs.writeFile(out + "/page.wasm", wasm).wait();
+  i32 code = wrapBuiltPage(["example/beep.wac", out, "--module-file"], sys.stderr(), sys.stdout(), fs);
+  if (code != 0) { return fail("--wrap --module-file answered \{code}"); }
+  string index = string.fromBytes(flatten(fs.readFile(out + "/index.html").wait()).orElse(u8[]()));
+  if (index.indexOf("id=\"wac-module\"") >= 0) { return fail("index.html still carries the module"); }
+  if (index.indexOf("AGFzbQEAAAA=") >= 0) { return fail("index.html holds the module's base64"); }
+  if (index.indexOf("page.wasm?v=" + versionOf(wasm)) < 0) { return fail("index.html does not fetch page.wasm by its version"); }
+  fs.remove(out, true).wait();
+  return "";
+}
+
+export string test_a_modules_version_is_its_fnv_in_hex() {
+  if (versionOf(u8[]()) != "811c9dc5") { return fail("nothing: " + versionOf(u8[]())); }
+  string v = versionOf([0, 97, 115, 109, 1, 0, 0, 0] as u8[]);
+  if (v != "28bd3d43") { return fail("an empty module: " + v); }
+  if (versionOf([1] as u8[]) == versionOf([2] as u8[])) { return fail("two modules, one version"); }
+  return "";
+}
+
+// ── A site of routes ────────────────────────────────────────────────────────
+
+export string test_the_pages_drawn_are_read_back_as_they_were_written() {
+  Routed[] routes = [Routed("/", "Home", "The site.", "<p>home é</p>"), Routed("/docs/a/", "A", "", "<p>a\nb</p>")];
+  Routed[]? back = routesOf(framesFileOf(routes));
+  if (back is null) { return fail("not read back"); }
+  if (back!.len() != 2) { return fail("\{back!.len()} pages read back"); }
+  for (i32 i = 0; i < 2; i++) {
+    Routed a = routes[i];
+    Routed b = back![i];
+    if (a.path != b.path || a.title != b.title || a.description != b.description || a.html != b.html) {
+      return fail("page \{i} read back as " + b.path + " | " + b.title + " | " + b.description + " | " + b.html);
+    }
+  }
+  if (routesOf("something else".toBytes()) is not null) { return fail("anything else was read as pages"); }
+  return "";
+}
+
+export string test_a_page_finds_the_sites_root_and_the_sitemap_names_each_page() {
+  if (upFrom("/") != "" || upFrom("/docs/a/") != "../../" || upFrom("/docs/") != "../") { return fail("the way back to the root"); }
+  string map = sitemapOf("https://example.org/site/", [Routed("/", "", "", ""), Routed("/docs/a/", "", "", "")]);
+  if (map.indexOf("<loc>https://example.org/site/</loc>") < 0 || map.indexOf("<loc>https://example.org/site/docs/a/</loc>") < 0) {
+    return fail("the sitemap: " + map);
+  }
+  return "";
+}
+
+export string test_each_route_is_a_page_of_its_own_sharing_the_module(Sys sys) {
+  Files fs = sys.files();
+  string out = ".cache/build-test/routes";
+  fs.remove(out, true).wait();
+  fs.mkdir(out, true).wait();
+  u8[] wasm = [0, 97, 115, 109, 1, 0, 0, 0] as u8[];
+  fs.writeFile(out + "/page.wasm", wasm).wait();
+  Routed[] routes = [Routed("/", "Home", "The site.", "<p>home</p>"), Routed("/docs/a/", "A <&>", "About A.", "<p>a</p>")];
+  fs.writeFile(out + "/frames.txt", framesFileOf(routes)).wait();
+  i32 code = wrapBuiltPage(["example/routes.wac", out, "--module-file", "--site-url", "https://example.org/site"], sys.stderr(), sys.stdout(), fs);
+  if (code != 0) { return fail("--wrap answered \{code}"); }
+  string a = string.fromBytes(flatten(fs.readFile(out + "/docs/a/index.html").wait()).orElse(u8[]()));
+  if (a.indexOf("<title>A &lt;&amp;&gt;</title>") < 0) { return fail("the page's own title, as text"); }
+  if (a.indexOf("<meta name=\"description\" content=\"About A.\">") < 0) { return fail("its description"); }
+  if (a.indexOf("<link rel=\"canonical\" href=\"https://example.org/site/docs/a/\">") < 0) { return fail("its address"); }
+  if (a.indexOf("<div id=\"app\" data-wac-route=\"/docs/a/\" data-wac-pre>") < 0) { return fail("its route, for the host to find the site's root by"); }
+  if (a.indexOf("\"../../page.wasm?v=" + versionOf(wasm) + "\"") < 0) { return fail("the module, from the site's root"); }
+  string home = string.fromBytes(flatten(fs.readFile(out + "/index.html").wait()).orElse(u8[]()));
+  if (home.indexOf("<title>Home</title>") < 0 || home.indexOf("<div id=\"app\" data-wac-pre>") < 0) { return fail("the root page, at no route"); }
+  if (flatten(fs.readFile(out + "/sitemap.xml").wait()).isErr()) { return fail("no sitemap"); }
+  fs.remove(out, true).wait();
+  return "";
+}

@@ -1,0 +1,651 @@
+// A page driven with no browser: `TestDoc` answers its `wac.page` requests, and the answers — events, sleeps,
+// frames, values, locations — are given by hand. What a browser adds is the document, and `tools/build.wac`'s
+// host is the whole of that — so what a program can ask of a page, and every order in which things can arrive,
+// is tested here. The view over the elements is `view_test.wac`'s.
+
+import { Check } from "./check.wac";
+import { Result, Ticket, Vec } from "core";
+import { Element, ElementEvent, Listen, Node, Page, Runner, TestDoc, Ui } from "../../src/page.wac";
+import { html.button, html.p } from "../../src/page.wac";
+
+/** How many times `said` holds `what`. */
+i32 count(string said, string what) {
+  i32 n = 0;
+  i32 at = said.indexOf(what);
+  while (at >= 0) {
+    n++;
+    string rest = said.slice(at + what.len(), said.len());
+    i32 next = rest.indexOf(what);
+    at = next < 0 ? 0 - 1 : at + what.len() + next;
+  }
+  return n;
+}
+
+/** The handle numbers this file's programs make, in the order they make them. */
+i32 UP() { return 1; }
+i32 QUIT() { return 2; }
+i32 SHOWN() { return 3; }
+
+async i32 clicks(Page page) {
+  Element up = page.root().append("button");
+  Element quit = page.root().append("button");
+  Element shown = page.root().append("b");
+  page.root().listen("click", Listen.none());
+  i32 n = 0;
+  while (true) {
+    ElementEvent e = await page.root().next();
+    if (e.target.id == UP()) {
+      n += 1;
+      shown.text("\{n}");
+    }
+    if (e.target.id == QUIT()) { return n; }
+  }
+}
+
+Ticket<i32> startClicks(Page page) {
+  schedule page.take;
+  return clicks(page);
+}
+
+export string test_the_program_runs_until_it_waits_and_each_event_runs_it_on() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Ticket<i32> done = startClicks(page);
+  t.eqStr(doc.said, "make 1 button\nmake 2 button\nmake 3 b\nlisten 0 click\n", "it ran to its first wait");
+  t.isFalse(done.settled(), "and is waiting");
+  doc.said = "";
+  doc.event(1, "click", UP(), 0, "", 0, 0, 0, 0 - 1, 0 - 1);
+  doc.event(2, "click", SHOWN(), 0, "", 0, 0, 0, 0 - 1, 0 - 1);
+  doc.event(3, "click", UP(), 0, "", 0, 0, 0, 0 - 1, 0 - 1);
+  t.eqStr(doc.said, "text 3 1\ntext 3 2\n", "each click ran it on, there and then");
+  doc.event(4, "click", QUIT(), 0, "", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isTrue(done.settled(), "quit finished it");
+  t.eqI32(done.value(), 2, "with the count");
+  return t.report();
+}
+
+async i32 early(Element listened) {
+  // Events delivered before anything waits are kept, in order.
+  ElementEvent a = await listened.next();
+  ElementEvent b = await listened.next();
+  return a.value.len() * 10 + b.value.len();
+}
+
+export string test_events_that_arrive_before_a_wait_are_kept_in_order() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  page.root().listen("input", Listen.none());
+  doc.event(1, "input", 0, 0, "abc", 0, 0, 0, 0 - 1, 0 - 1);
+  doc.event(2, "input", 0, 0, "de", 0, 0, 0, 0 - 1, 0 - 1);
+  Ticket<i32> done = early(page.root());
+  // Nothing was scheduled for these: both tickets were already settled.
+  page.drain();
+  t.isTrue(done.wait().isOk(), "it finished");
+  t.eqI32(done.value(), 32, "a then b");
+  return t.report();
+}
+
+async i32 sleeper(Page page) {
+  page.log("before");
+  f64 at = await page.sleep(250);
+  page.log("after \{at as~ i32}");
+  await page.sleep(10);
+  return 7;
+}
+
+Ticket<i32> startSleeper(Page page) {
+  schedule page.take;
+  return sleeper(page);
+}
+
+export string test_a_sleep_waits_for_its_timer() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Ticket<i32> done = startSleeper(page);
+  t.eqStr(doc.said, "log before\nsleep 250\n", "it asked for a sleep and waited");
+  doc.advance(249);
+  t.eqStr(doc.said, "log before\nsleep 250\n", "not yet");
+  doc.advance(1);
+  t.eqStr(doc.said, "log before\nsleep 250\nlog after 250\nsleep 10\n",
+          "the sleep ran it on, answering the time it woke");
+  doc.advance(5);
+  t.isFalse(done.settled(), "the second sleep is not over");
+  doc.advance(5);
+  t.isTrue(done.settled(), "the second sleep finished it");
+  t.eqI32(done.value(), 7, "with its answer");
+  return t.report();
+}
+
+async i32 helper(Element listened) {
+  ElementEvent e = await listened.next();
+  return e.value.len();
+}
+
+async i32 nested(Element listened) {
+  // A machine waiting on another machine waiting on an event: settling the event runs both.
+  i32 a = await helper(listened);
+  i32 b = await helper(listened);
+  return a * 10 + b;
+}
+
+Ticket<i32> startNested(Page page) {
+  schedule page.take;
+  page.root().listen("input", Listen.none());
+  return nested(page.root());
+}
+
+export string test_a_wait_on_a_wait_runs_on_through_both() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Ticket<i32> done = startNested(page);
+  doc.event(1, "input", 0, 0, "abcd", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isFalse(done.settled(), "one event in, one to go");
+  doc.event(2, "input", 0, 0, "xy", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isTrue(done.settled(), "the second finished both");
+  t.eqI32(done.value(), 42, "4 then 2");
+  return t.report();
+}
+
+async i32 eventOrTick(Page page) {
+  // The shape of an animation: whichever comes first, an event or the next frame.
+  Element quit = page.root().append("button");
+  page.root().listen("click", Listen.none());
+  i32 ticks = 0;
+  Ticket<ElementEvent> ev = page.root().next();
+  Ticket<f64> tick = page.sleep(30);
+  while (true) {
+    await Ticket.any(ev, tick);
+    if (tick.settled()) {
+      ticks += 1;
+      tick = page.sleep(30);
+    }
+    if (ev.settled()) {
+      ElementEvent e = ev.value();
+      if (e.target.id == quit.id) { return ticks; }
+      ev = page.root().next();
+    }
+  }
+}
+
+Ticket<i32> startEventOrTick(Page page) {
+  schedule page.take;
+  return eventOrTick(page);
+}
+
+export string test_waiting_on_whichever_comes_first() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Ticket<i32> done = startEventOrTick(page);
+  t.eqI32(count(doc.said, "sleep 30"), 1, "one tick asked for");
+  doc.advance(30);
+  t.eqI32(count(doc.said, "sleep 30"), 2, "the tick ran it on, and it asked for the next");
+  doc.event(1, "click", 0, 0, "", 0, 0, 0, 0 - 1, 0 - 1);
+  t.eqI32(count(doc.said, "sleep 30"), 2, "an event ran it on without a tick");
+  doc.advance(30);
+  doc.event(2, "click", 1, 0, "", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isTrue(done.settled(), "quit finished it");
+  t.eqI32(done.value(), 2, "after two frames");
+  return t.report();
+}
+
+async i32 bothArrived(Element listened) {
+  (ElementEvent, ElementEvent) both = await Ticket.all(listened.next(), listened.next());
+  return both.0.value.len() * 10 + both.1.value.len();
+}
+
+Ticket<i32> startBoth(Page page) {
+  schedule page.take;
+  page.root().listen("input", Listen.none());
+  return bothArrived(page.root());
+}
+
+export string test_waiting_on_all_of_several() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Ticket<i32> done = startBoth(page);
+  doc.event(1, "input", 0, 0, "abc", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isFalse(done.settled(), "one of two");
+  doc.event(2, "input", 0, 0, "de", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isTrue(done.settled(), "both");
+  t.eqI32(done.value(), 32, "in order");
+  return t.report();
+}
+
+async i32 asks(Page page) {
+  Element what = page.root().append("input");
+  Element who = page.root().append("input");
+  string a = await what.value();
+  string b = await who.value();
+  return a.len() * 10 + b.len();
+}
+
+Ticket<i32> startAsks(Page page) {
+  schedule page.take;
+  return asks(page);
+}
+
+export string test_an_elements_value_is_waited_for() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Ticket<i32> done = startAsks(page);
+  t.eqStr(doc.said, "make 1 input\nmake 2 input\nvalue 1\n", "it asked, and waits for the answer");
+  doc.answerValue(0, "hello");
+  t.eqStr(doc.said, "make 1 input\nmake 2 input\nvalue 1\nvalue 2\n", "the answer ran it on");
+  doc.answerValue(0, "late");
+  t.isFalse(done.settled(), "a second answer to a read already answered is dropped");
+  doc.answerValue(1, "ab");
+  t.isTrue(done.settled(), "both answered");
+  t.eqI32(done.value(), 52, "in order");
+  return t.report();
+}
+
+/** A count kept in a `Vec` and pushed to in place: the page does not follow, and a checking page says so. */
+Node Tally(Ui ui) {
+  auto seen = ui.state(Vec<i32>.create());
+  return <p>{seen.get().len()}<button onclick={(ElementEvent e) => { seen.get().push(1); }}>+</button></p>;
+}
+
+export string test_a_checking_page_logs_what_its_view_does_not_show() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  page.checking = true;
+  schedule page.take;
+  page.mount((Ui ui) => <Tally/>);
+  page.turn();
+  t.isTrue(doc.said.indexOf("view check") < 0, "nothing to say at first: " + doc.said);
+  // The button is the fourth handle: the root's `p`, its text, then the button.
+  doc.event(1, "click", 3, 3, "", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isTrue(doc.said.indexOf("log view check: Tally renders the text \"1\" where the page shows \"0\"") >= 0,
+           "the page logged the component whose state changed without a set: " + doc.said);
+  return t.report();
+}
+
+/** The route a page shows, as a component follows it: the location when it mounted, then each change. */
+Node Route(Ui ui, Page page) {
+  auto at = ui.state(page.location());
+  ui.effect("", () => page.onLocation((string where) => { at.set(where); }));
+  return <p>{at.get()}</p>;
+}
+
+export string test_the_location_is_the_hash_the_host_said_and_each_change_reaches_who_watches() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  doc.go("#/stack/oracles");
+  t.eqStr(page.location(), "/stack/oracles", "without its #");
+  schedule page.take;
+  page.mount((Ui ui) => <Route page={page}/>);
+  page.turn();
+  t.eqStr(doc.shown(0), "/stack/oracles", "a component starts from it");
+  string heard = "";
+  fn<void()> stop = page.onLocation((string where) => { heard = heard + where + ";"; });
+  doc.go("#/spec");
+  t.eqStr(doc.shown(0), "/spec", "and renders again when it changes");
+  stop();
+  doc.go("");
+  t.eqStr(heard, "/spec;", "a watcher stopped hears nothing more");
+  t.eqStr(page.location(), "", "an empty hash is the empty location");
+  t.eqStr(doc.shown(0), "", "the component heard that too");
+  return t.report();
+}
+
+/** A clock that stops while nobody can see it, as a component follows that: seen, then each change. */
+Node Seen(Ui ui, Page page) {
+  auto on = ui.state(page.visible());
+  ui.effect("", () => page.onVisible((bool v) => { on.set(v); }));
+  return <p>{on.get() ? "seen" : "away"}</p>;
+}
+
+export string test_whether_the_page_is_seen_is_what_the_host_said_and_each_change_reaches_who_watches() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  t.isTrue(page.visible(), "a page is seen until the host says otherwise");
+  schedule page.take;
+  page.mount((Ui ui) => <Seen page={page}/>);
+  page.turn();
+  t.eqStr(doc.shown(0), "seen", "a component starts from it");
+  string heard = "";
+  fn<void()> stop = page.onVisible((bool v) => { heard = heard + (v ? "1" : "0") + ";"; });
+  doc.see(false);
+  t.isFalse(page.visible(), "out of sight once the host says so");
+  t.eqStr(doc.shown(0), "away", "and the component renders again");
+  doc.see(true);
+  stop();
+  doc.see(false);
+  t.eqStr(heard, "0;1;", "a watcher hears each change until it is stopped");
+  return t.report();
+}
+
+export string test_the_readers_zone_is_the_hosts_answer_for_the_moment_asked_about() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  t.eqI32(page.zoneAt(0 as i64), 0, "UTC until the host says otherwise");
+  doc.zone = 0 - 300;
+  t.eqI32(page.zoneAt(1700000000000 as i64), 0 - 300, "minutes ahead of UTC, behind being negative");
+  return t.report();
+}
+
+export string test_an_element_scrolls_itself_or_a_named_element_under_it_into_view() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Element box = page.root().append("div");
+  page.root().scrollToId("oracles");
+  t.eqStr(doc.scrolled, "0 oracles", "the element under the root with that id");
+  box.scrollIntoView();
+  t.eqStr(doc.scrolled, "1 ", "the element itself");
+  return t.report();
+}
+
+/** A text field the user has typed `text` into, with the caret placed at `start`..`end`. */
+Element typedField(TestDoc doc, Page page, string text, i32 start, i32 end) {
+  Element field = page.root().append("textarea");
+  doc.fire(field.id, "input", text);
+  doc.caret(field.id, start, end);
+  return field;
+}
+
+export string test_an_event_in_a_text_field_says_where_the_caret_is() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Element field = typedField(doc, page, "abcdef", 2, 4);
+  Element box = page.root().append("div");
+  string heard = "";
+  field.on("keydown", Listen.none(), (ElementEvent e) => { heard = heard + "field \{e.selStart}-\{e.selEnd};"; });
+  box.on("click", Listen.none(), (ElementEvent e) => { heard = heard + "box \{e.selStart}-\{e.selEnd};"; });
+  doc.fire(field.id, "keydown", "x");
+  doc.fire(box.id, "click", "");
+  t.eqStr(heard, "field 2-4;box -1--1;", "a text field's selection, and -1 where there is none");
+  return t.report();
+}
+
+export string test_select_moves_the_caret_unless_the_user_typed_since() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Element field = typedField(doc, page, "abcdef", 0, 0);
+  field.on("keydown", Listen.none(), (ElementEvent e) => { });
+  doc.fire(field.id, "keydown", "x");
+  field.select(1, 3);
+  t.eqI32(doc.at(field.id).selStart, 1, "the selection's start");
+  t.eqI32(doc.at(field.id).selEnd, 3, "and its end");
+  // Typed after the last event the program saw — it does not listen for input — so a caret placed now would put
+  // the next key in the wrong place.
+  doc.fire(field.id, "input", "abcdefg");
+  field.select(0, 0);
+  t.eqI32(doc.at(field.id).selStart, 7, "a select behind the typing does not land");
+  return t.report();
+}
+
+export string test_typed_text_lands_at_the_caret_and_an_input_follows() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  Element field = typedField(doc, page, "ifx", 2, 2);
+  string heard = "";
+  // An editor's Tab: the key is the program's, and the indent goes in as the user would have typed it.
+  field.on("keydown", Listen.keys("Tab"), (ElementEvent e) => { if (e.value == "Tab") { field.typeText("  "); } });
+  field.on("input", Listen.none(), (ElementEvent e) => { heard = heard + e.value + "@\{e.selStart};"; });
+  doc.fire(field.id, "keydown", "Tab");
+  t.eqStr(doc.valueOf(field.id), "if  x", "typed at the caret");
+  t.eqStr(heard, "if  x@4;", "and an input followed, after the handler, with the caret past what was typed");
+  // Over a selection, which it replaces.
+  doc.caret(field.id, 0, 2);
+  field.typeText("while");
+  t.eqStr(doc.valueOf(field.id), "while  x", "the selection is replaced");
+  t.eqI32(doc.at(field.id).selStart, 5, "and the caret follows what was typed");
+  return t.report();
+}
+
+export string test_typed_text_does_not_land_over_typing_the_program_has_not_seen() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  // Typed into before the program saw any event from it.
+  Element field = typedField(doc, page, "ab", 2, 2);
+  field.typeText("X");
+  t.eqStr(doc.valueOf(field.id), "ab", "lost rather than misplaced");
+  return t.report();
+}
+
+export string test_a_program_finds_its_page_by_name_on_its_own_host() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Runner r = Runner.create();
+  schedule r.take;
+  Ticket<Result<Page, string>> found = Page.open(doc.sys!);
+  r.drain();
+  t.isTrue(found.settled(), "the host answered the lookup");
+  bool ok = false;
+  match (found.value()) {
+    Ok(p): { ok = true; p.title("found"); }
+    Err(why): { t.fail("no page: " + why); }
+  }
+  t.isTrue(ok, "a page");
+  t.eqStr(doc.said, "title found\n", "whose requests go to that host");
+  return t.report();
+}
+
+export string test_a_batched_page_sends_its_changes_together_at_the_end_of_its_turn() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.batched();
+  Page page = doc.page();
+  Ticket<i32> done = startClicks(page);
+  // `clicks` made three elements and listened, then waited: the turn is not over until the page says so.
+  t.eqStr(doc.said, "", "nothing has arrived while the turn runs");
+  page.turn();
+  t.eqStr(doc.said, "batch 4\nmake 1 button\nmake 2 button\nmake 3 b\nlisten 0 click\n", "then all four, as one request");
+  doc.said = "";
+  doc.event(1, "click", UP(), 0, "", 0, 0, 0, 0 - 1, 0 - 1);
+  t.eqStr(doc.said, "batch 1\ntext 3 1\n", "an event's turn sends what it changed");
+  return t.report();
+}
+
+async i32 readsAfterMaking(Page page) {
+  Element field = page.root().append("input");
+  string v = await field.value();
+  return v.len();
+}
+
+Ticket<i32> startReads(Page page) {
+  schedule page.take;
+  return readsAfterMaking(page);
+}
+
+export string test_a_batched_page_sends_what_it_holds_before_it_asks() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.batched();
+  Page page = doc.page();
+  Ticket<i32> done = startReads(page);
+  t.eqStr(doc.said, "batch 1\nmake 1 input\nvalue 1\n", "the element it reads is made before the read");
+  doc.answerValue(0, "abc");
+  t.isTrue(done.settled(), "the answer ran it on");
+  t.eqI32(done.value(), 3, "with the value");
+  return t.report();
+}
+
+/** **Full screen is asked for**, by the element to fill it, and left the same way: the host decides, and says. */
+export string test_an_element_asks_to_fill_the_screen_and_to_leave_it() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  schedule page.take;
+  Element box = page.root().append("div");
+  box.fullScreen(true);
+  page.turn();
+  box.fullScreen(false);
+  page.turn();
+  t.isTrue(doc.said.indexOf("fullscreen \{box.id} on\nfullscreen \{box.id} off\n") >= 0, "asked, then left: " + doc.said);
+  return t.report();
+}
+
+/**
+ * **A page goes somewhere new**: added to the history, it hears where it went as any new location, and Back returns
+ * it to where it was; in place of where it is, Back passes it by.
+ */
+export string test_a_page_goes_somewhere_and_back_returns_it() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  schedule page.take;
+  page.turn();
+  string heard = "";
+  page.onLocation((string where) => { heard = heard + where + ";"; });
+  page.go("apps/3", true);
+  page.turn();
+  t.isTrue(doc.said.indexOf("go apps/3 push\n") >= 0, "asked for: " + doc.said);
+  t.eqStr(page.location(), "apps/3", "there");
+  page.go("apps/4", false);
+  page.turn();
+  t.eqStr(page.location(), "apps/4", "and, in its place, there");
+  doc.back();
+  page.turn();
+  t.eqStr(page.location(), "", "Back: where it was before the place added");
+  t.eqStr(heard, "apps/3;apps/4;;", "each heard");
+  return t.report();
+}
+
+/** **Two fingers at once are two pointers**: each pointer event says which, so a page can follow both. */
+export string test_each_pointer_event_says_which_pointer() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  schedule page.take;
+  Element pad = page.root().append("div");
+  string heard = "";
+  pad.on("pointerdown", Listen.keys("* capture"), (ElementEvent e) => { heard = heard + "down \{e.pointer};"; });
+  pad.on("pointerup", Listen.keys("* capture"), (ElementEvent e) => { heard = heard + "up \{e.pointer};"; });
+  pad.on("pointercancel", Listen.keys("* capture"), (ElementEvent e) => { heard = heard + "cancel \{e.pointer};"; });
+  pad.on("click", Listen.none(), (ElementEvent e) => { heard = heard + "click \{e.pointer};"; });
+  page.turn();
+  t.isTrue(doc.said.indexOf("listen \{pad.id} pointerdown") >= 0, "listened for: " + doc.said);
+  doc.pointerEvent(1, "pointerdown", pad.id, pad.id, 10, 10, 7);
+  page.turn();
+  doc.pointerEvent(2, "pointerdown", pad.id, pad.id, 50, 10, 9);
+  page.turn();
+  doc.pointerEvent(3, "pointerup", pad.id, pad.id, 10, 10, 7);
+  page.turn();
+  doc.pointerEvent(4, "pointercancel", pad.id, pad.id, 50, 10, 9);
+  page.turn();
+  doc.event(5, "click", pad.id, pad.id, "", 0, 0, 0, 0 - 1, 0 - 1);
+  page.turn();
+  t.eqStr(heard, "down 7;down 9;up 7;cancel 9;click -1;", "each pointer by its own number, and an event that is no pointer's -1");
+  return t.report();
+}
+
+export string test_a_location_the_host_answers_at_once_is_where_the_page_starts() {
+  Check t = Check.create();
+  // The browser's host answers the page's first request for its location inside that request, as this one does
+  // when it is already somewhere. Waited for with `whenSettled` alone, an answer that early was never heard.
+  TestDoc doc = TestDoc.create();
+  doc.go("#/spec/strings");
+  Page page = doc.page();
+  t.eqStr(page.location(), "/spec/strings", "the page starts where the host is");
+  doc.go("#/tour");
+  t.eqStr(page.location(), "/tour", "and follows it from there");
+  return t.report();
+}
+
+async f64 whenKeyed(Page page) {
+  page.root().listen("keydown", Listen.none());
+  ElementEvent e = await page.root().next();
+  return e.at;
+}
+
+/**
+ * **An event says when it happened**, by the page's own clock, so a program can tell how long one took to reach it —
+ * a game, how long a key takes to show.
+ */
+export string test_an_event_says_when_it_happened_by_the_pages_clock() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  schedule page.take;
+  Ticket<f64> at = whenKeyed(page);
+  doc.advance(1234);
+  doc.event(1, "keydown", 0, 0, "ArrowLeft", 0, 0, 0, 0 - 1, 0 - 1);
+  t.isTrue(at.settled(), "the key was heard");
+  t.isTrue(at.value() == page.now() && at.value() >= 1234.0, "stamped with the time it happened: \{at.value()}");
+  return t.report();
+}
+
+async string remembers(Page page) {
+  string? before = await page.stored("autonag2.token");
+  page.store("seen", "yes");
+  page.unstore("gone");
+  return (before ?? "(none)") + " " + page.zoneName();
+}
+
+Ticket<string> startRemembers(Page page) {
+  schedule page.take;
+  return remembers(page);
+}
+
+export string test_the_page_reads_and_writes_its_store_and_knows_its_zone_by_name() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  doc.storage.set("autonag2.token", "abc");
+  doc.storage.set("gone", "x");
+  doc.zoneName = "Europe/Paris";
+  Page page = doc.page();
+  schedule page.take;
+  Ticket<string> done = startRemembers(page);
+  page.drain();
+  t.isTrue(done.settled(), "the read was answered");
+  t.eqStr(done.value(), "abc Europe/Paris", "what was stored before it ran, and the zone");
+  t.eqStr(doc.storage.get("seen") ?? "", "yes", "stored");
+  t.isTrue(doc.storage.get("gone") is null, "removed");
+  return t.report();
+}
+
+export string test_back_returns_to_where_the_program_went_from() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  page.go("add-timer", true);
+  t.eqStr(page.location(), "add-timer", "went");
+  page.back();
+  t.eqStr(doc.location, "", "and came back");
+  t.eqStr(page.location(), "", "which the program heard");
+  return t.report();
+}
+
+async string audioAsked(Page page) {
+  string before = await page.audioState();
+  Result<string, string> resumed = await page.resumeAudio();
+  string after = await page.audioState();
+  return before + " " + (resumed.isOk() ? resumed.unwrap() : "refused") + " " + after;
+}
+
+Ticket<string> startAudioAsked(Page page) {
+  schedule page.take;
+  return audioAsked(page);
+}
+
+/**
+ * **The audio is resumed by the program asking, and by nothing else** (`PAGE_AUDIO`): suspended until `resumeAudio`,
+ * which answers the state the host settled on — and the host heard one resume, the program's.
+ */
+export string test_the_audio_runs_only_once_the_program_resumes_it() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  schedule page.take;
+  Ticket<string> done = startAudioAsked(page);
+  page.drain();
+  t.isTrue(done.settled(), "the questions were answered");
+  t.eqStr(done.value(), "suspended running running", "suspended, resumed, running");
+  t.eqI32(count(doc.said, "audio resume\n"), 1, "one resume, the program's");
+  return t.report();
+}

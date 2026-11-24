@@ -1,0 +1,177 @@
+// `wac.origin`: the server a page was served from, spoken to — requests of any method, and WebSockets.
+//
+// **The page's own origin, and nothing wider.** A web app's server is usually where its page came from: its API
+// beside its files, so the page asks `/devices/me` and opens `/instances/…/ws` with no address of its own. That is
+// what this is for, and all it reaches: a path on the origin, never a URL, so no request leaves for anywhere the
+// page's own policy (`connect-src 'self'`) does not already allow. `wac.site` is narrower — a GET of a file under the
+// page's folder — and stays its own capability, so a program can be handed one and not the other.
+//
+// **A request is answered whole**: its status, its header fields, its body. A browser decides some of what goes
+// out (cookies of the origin, `Origin`, `User-Agent`) and refuses to let a page set others; a field it refuses is
+// dropped by it, not here. Nothing is answered before the whole body has arrived.
+//
+// **A socket is a handle and a queue.** `open` answers once the socket is open, or why it never was; `next` answers
+// the next message, or that the socket closed — each in the order the server sent them, whether or not the program
+// was waiting when they arrived. A program that stops reading leaves messages queued in its host, which is the
+// browser's own behaviour for a WebSocket it is not reading either.
+
+import { Answer, FAULT_NONE, OP_CAPABILITY, Sys, ask } from "std";
+import { Result, Ticket } from "core";
+
+export string ORIGIN_CAPABILITY() { return "wac.origin"; }
+export string ORIGIN_VERSION() { return "1.0.0"; }
+
+/** `text` "METHOD /path", `bytes` the fields then the body (`requestBytes`) → `n` status, `text` fields, `bytes` body. */
+export static i32 ORIGIN_FETCH = 0;
+/** `text` a path → `n` the socket, once it is open. */
+export static i32 ORIGIN_OPEN = 1;
+/** `a` the socket, `b` 1 for binary, `bytes` the message: sent, answered at once. */
+export static i32 ORIGIN_SEND = 2;
+/** `a` the socket → the next message: `flags` 0 text, 1 binary, 2 closed (`n` the code, `text` the reason). */
+export static i32 ORIGIN_NEXT = 3;
+/** `a` the socket: closed by this end, `n` the code and `text` the reason sent with it. */
+export static i32 ORIGIN_CLOSE = 4;
+/** How many request numbers the capability takes. */
+export static i32 ORIGIN_COUNT = 5;
+
+/** A message's kind, as `ORIGIN_NEXT` answers it in `flags`. */
+export static i32 MESSAGE_TEXT = 0;
+export static i32 MESSAGE_BINARY = 1;
+export static i32 MESSAGE_CLOSED = 2;
+
+/** A response, whole. */
+export struct Reply {
+  i32 status;
+  /** Its fields as the browser gives them: lower-case names, one `name: value` a line. */
+  string headers;
+  u8[] body;
+
+  /** The first field of that name, or "" when there is none. Names are compared without regard to case. */
+  string header(this, string name) {
+    string want = lower(name) + ": ";
+    string rest = this.headers;
+    while (rest.len() > 0) {
+      i32 nl = rest.indexOf("\n");
+      string line = nl < 0 ? rest : rest.slice(0, nl);
+      rest = nl < 0 ? "" : rest.slice(nl + 1, rest.len());
+      if (line.len() >= want.len() && lower(line.slice(0, want.len())) == want) { return line.slice(want.len(), line.len()); }
+    }
+    return "";
+  }
+
+  string text(this) { return string.fromBytes(this.body); }
+}
+
+string lower(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] >= 'A' && b[i] <= 'Z') { b[i] = b[i] + 32; } }
+  return string.fromBytes(b);
+}
+
+/** What arrived on a socket. */
+export enum Message {
+  Text(string text),
+  Binary(u8[] bytes),
+  /** The socket is closed — by the server, by this end, or because the connection was lost — and says nothing more. */
+  Closed(i32 code, string reason),
+}
+
+/**
+ * A request's fields and body as one buffer: the fields' length (four bytes, little-endian), the fields, each
+ * `Name: value` and a newline, then the body. A host reads it with `requestParts`.
+ */
+export u8[] requestBytes(string[] headers, const u8[] body) {
+  string h = "";
+  for (string line in headers) { h = h + line + "\n"; }
+  u8[] hb = h.toBytes();
+  u8[] out = u8[].filled(4 + hb.len() + body.len(), 0);
+  out[0] = (hb.len() & 255) as! u8;
+  out[1] = ((hb.len() >> 8) & 255) as! u8;
+  out[2] = ((hb.len() >> 16) & 255) as! u8;
+  out[3] = ((hb.len() >> 24) & 255) as! u8;
+  out.copyFrom(hb, 0, 4, hb.len());
+  out.copyFrom(body, 0, 4 + hb.len(), body.len());
+  return out;
+}
+
+/** A request's buffer apart again: its fields, one a line, and its body. For a host written in wac. */
+export struct RequestParts {
+  string headers;
+  u8[] body;
+}
+
+export RequestParts requestParts(const u8[] b) {
+  if (b.len() < 4) { return RequestParts("", u8[]()); }
+  i32 n = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16) | ((b[3] as i32) << 24);
+  if (n < 0 || 4 + n > b.len()) { return RequestParts("", u8[]()); }
+  u8[] h = u8[].filled(n, 0);
+  h.copyFrom(b, 4, 0, n);
+  u8[] body = u8[].filled(b.len() - 4 - n, 0);
+  body.copyFrom(b, 4 + n, 0, body.len());
+  return RequestParts(string.fromBytes(h), body);
+}
+
+/** The origin this program's page was served from. */
+export struct Origin {
+  Sys sys;
+  i32 base;
+  /** The origin, `https://app.example`, as the host says it. */
+  string address;
+
+  /** The origin, if the program's host has one; `Err` says why not — a page opened from a file has none. */
+  async Result<Origin, string> of(Sys sys) {
+    Answer found = await ask(sys.host, OP_CAPABILITY(), 0 as i64, 0 as i64, ORIGIN_CAPABILITY(), "^1".toBytes());
+    if (found.fault != FAULT_NONE()) { return Result.Err(found.text); }
+    return Result.Ok(Origin(sys, found.n as~ i32, string.fromBytes(found.bytes)));
+  }
+
+  /**
+   * `method` on `path` — which starts with `/`, and may carry a query — with `headers` (`Name: value` each) and
+   * `body`: the response, whatever its status, or why there is none.
+   */
+  async Result<Reply, string> request(this, string method, string path, string[] headers, u8[] body) {
+    Answer a = await ask(this.sys.host, this.base + ORIGIN_FETCH, 0 as i64, 0 as i64, method + " " + path, requestBytes(headers, body));
+    if (a.fault != FAULT_NONE()) { return Result.Err(a.text); }
+    return Result.Ok(Reply(a.n as~ i32, a.text, a.bytes));
+  }
+
+  /** A WebSocket to `path` on the origin, once it is open, or why it did not open. */
+  async Result<OriginSocket, string> open(this, string path) {
+    Answer a = await ask(this.sys.host, this.base + ORIGIN_OPEN, 0 as i64, 0 as i64, path, u8[]());
+    if (a.fault != FAULT_NONE()) { return Result.Err(a.text); }
+    return Result.Ok(OriginSocket(this, a.n as~ i32, false));
+  }
+}
+
+/** An open WebSocket to the origin. */
+export struct OriginSocket {
+  Origin origin;
+  i32 id;
+  /** Whether `next` has answered that it closed. */
+  bool ended;
+
+  /** Sends a text message; `Err` when the socket is closed. */
+  async Result<void, string> send(this, string text) { return await this.sendBytes(text.toBytes(), false); }
+
+  async Result<void, string> sendBytes(this, u8[] bytes, bool binary) {
+    Answer a = await ask(this.origin.sys.host, this.origin.base + ORIGIN_SEND, this.id as i64, binary ? 1 as i64 : 0 as i64, "", bytes);
+    if (a.fault != FAULT_NONE()) { return Result.Err(a.text); }
+    return Result.Ok();
+  }
+
+  /** The next message, or `Closed` — which every call after it answers again. */
+  async Message next(this) {
+    if (this.ended) { return Message.Closed(1006, "closed"); }
+    Answer a = await ask(this.origin.sys.host, this.origin.base + ORIGIN_NEXT, this.id as i64, 0 as i64, "", u8[]());
+    if (a.fault != FAULT_NONE()) { this.ended = true; return Message.Closed(1006, a.text); }
+    if (a.flags == MESSAGE_TEXT) { return Message.Text(string.fromBytes(a.bytes)); }
+    if (a.flags == MESSAGE_BINARY) { return Message.Binary(a.bytes); }
+    this.ended = true;
+    return Message.Closed(a.n as~ i32, a.text);
+  }
+
+  /** Closes it from this end. A `next` waiting answers `Closed`. */
+  void close(this) {
+    ask(this.origin.sys.host, this.origin.base + ORIGIN_CLOSE, this.id as i64, 1000 as i64, "", u8[]());
+  }
+}

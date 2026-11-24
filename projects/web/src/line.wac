@@ -1,0 +1,456 @@
+// `wac.page`: a page as requests to a host, and the program's end of them.
+//
+// **A page is a capability, not a thing the program is built around** (the desktop handover's design point 5).
+// A program finds it by name — `capability(host, "wac.page", "^1")` — and is answered with a range of request
+// numbers, one per operation below. Whoever answers them draws: a standalone page's host into the document
+// (`tools/build.wac`), a desktop into one of its windows, a test into records (`testdoc.wac`). The program
+// cannot tell which, and the same module runs under all three.
+//
+// **Changes wait for nothing, and travel together.** They are held and sent as one `PAGE_BATCH` — at the end of the
+// program's turn, and before anything the program asks, so a read sees every change made before it — and the
+// host answers the batch at once. One request a turn rather than one a change, which is what a page in a desktop's
+// window costs most, its requests crossing to the desktop; and a request, not a `host.tell`, because only what a
+// program asks is routed to a parent that provides the capability. A host that wants each change as it is made —
+// a test, reading the document after every call — says so in its answer to the lookup (`PAGE_ONE_AT_A_TIME`), and
+// is sent each change as a request nobody answers. **Everything that comes back is an answer** to a request the
+// program made: an element's value, the next event, the next frame, the next file handed over, the next change of
+// location. The program keeps one request outstanding for each stream (`Elements.follow`, `Page.follow`), and
+// asks again when it is answered — so a host never calls a program that did not ask, and a host that never
+// answers, which is what a page with no document is, costs nothing.
+//
+// **The clock and timers are not here.** They are `std`'s (`OP_MONOTONIC_NANOS`, `OP_SLEEP_MILLIS`), which every
+// host answers itself: a program in a desktop's window sleeps on its own host, not through the desktop.
+//
+// Each operation's fields, in `a`, `b`, `text` and `bytes`. A handle is an `i32` in `a`'s low half; an operation
+// that must not land over typing the program has not seen (`prop`, `select`, `typeText`) carries the number of
+// the last event the program saw in `a`'s high half. Two `i32`s in one field are `pair(high, low)`.
+
+import { Answer, Host, ask } from "std";
+import { Buf, Ticket, TicketBase, Vec } from "core";
+
+/** The capability's name, and the version this package speaks. */
+export string PAGE_CAPABILITY() { return "wac.page"; }
+export string PAGE_VERSION() { return "1.7.0"; }
+
+/** `a` handle, `b` pair(parent, before — -1 for last), `text` tag. */
+export static i32 PAGE_MAKE = 0;
+/** `a` handle, `b` pair(parent, before), `text` the text. */
+export static i32 PAGE_MAKE_TEXT = 1;
+/** `a` handle, `text`: everything under it replaced with text, or a text node's text. */
+export static i32 PAGE_TEXT = 2;
+/** `a` handle, `b` 1 to set and 0 to remove, `text` name, `bytes` value. */
+export static i32 PAGE_ATTR = 3;
+/** `a` pair(seen, handle), `text` name — `value`, `checked` or `selected` — `bytes` value. */
+export static i32 PAGE_PROP = 4;
+/** `a` handle, `b` the handle to go before, -1 for last. */
+export static i32 PAGE_MOVE = 5;
+/** `a` handle: it and everything under it go, and their handles with them. */
+export static i32 PAGE_REMOVE = 6;
+/** `a` handle, `text` kind, `bytes` the defaults to prevent (`Listen.prevent`). */
+export static i32 PAGE_LISTEN = 7;
+/** `a` handle. */
+export static i32 PAGE_FOCUS = 8;
+/** `a` handle → `text`: its value as the document has it now. */
+export static i32 PAGE_VALUE = 9;
+/** `a` handle, `b` pair(w, h), `bytes` rgba: all of a canvas, sized to match. */
+export static i32 PAGE_PIXELS = 10;
+/** `a` handle, `b` four 16-bit fields x, y, w, h from the top, `bytes` rgba: a corner of a canvas. */
+export static i32 PAGE_PIXELS_IN = 11;
+/** `a` handle, `text` the `id` attribute of an element under it to scroll to, or `""` for the element itself. */
+export static i32 PAGE_SCROLL = 12;
+/** `a` pair(seen, handle), `b` pair(start, end): a text field's selection. */
+export static i32 PAGE_SELECT = 13;
+/** `a` pair(seen, handle), `text`: typed into a text field at its caret. */
+export static i32 PAGE_TYPE_TEXT = 14;
+/** `text`: the page's title. */
+export static i32 PAGE_TITLE = 15;
+/** `text`: a line for the console. */
+export static i32 PAGE_LOG = 16;
+/** `text` name, `bytes`: offered to the user as a file. */
+export static i32 PAGE_DOWNLOAD = 17;
+/**
+ * → the next event on an element the program listens to: `n` pair(listener, target), `m` pair(x, y), `flags` the
+ * modifier bits, `text` the value, `bytes` twenty bytes — the event's number, the caret's start and end, each a
+ * little-endian `i32`, and when it happened, in microseconds by the page's clock, a little-endian `i64` — then the
+ * kind.
+ */
+export static i32 PAGE_EVENT = 18;
+/** → the next file the user hands over: `text` its name, `bytes` its contents — or, with `flags` 1, why it could not be read. */
+export static i32 PAGE_FILE = 19;
+/** → nothing, before the next paint. */
+export static i32 PAGE_FRAME = 20;
+/** `text` the location the program knows → `text` the location, once it is not that: the hash, without its `#`. */
+export static i32 PAGE_LOCATION = 21;
+/**
+ * `a` how many changes, `bytes` each of them — the operation's number as a byte, `a` and `b` as eight bytes each,
+ * then `text` and `bytes` each as a four-byte length and that many bytes, all little-endian — to be done in order.
+ * → nothing, at once. What `PageLine.flush` sends, and `batchOf` reads.
+ */
+export static i32 PAGE_BATCH = 22;
+/**
+ * `a` the sound's number, `b` its sample rate, `bytes` its samples — one channel, each a little-endian `i16`: a sound
+ * the page can play from now on, kept until the page is gone. Sent once, played as often as the program likes.
+ */
+export static i32 PAGE_SOUND = 23;
+/**
+ * `a` pair(voice, sound), `b` pair(volume in thousandths, 1 to loop and 0 to play once): the sound, playing as that
+ * voice. A voice's number is the program's to choose, as a handle's is. `bytes`, when there are any, are two
+ * little-endian `f64`s: when to start, in milliseconds by the page's clock (`Page.now`) — 0, or a time gone, for now
+ * — and how far into the sound, in seconds. Voices started for the same moment start together, to the sample.
+ */
+export static i32 PAGE_PLAY = 24;
+/** `a` the voice: stopped, if it is still playing. */
+export static i32 PAGE_STOP = 25;
+/** `a` the voice, `b` pair(volume in thousandths, milliseconds to get there): its volume, changed smoothly. */
+export static i32 PAGE_GAIN = 26;
+/**
+ * `text` a location — the hash, without its `#` — and `a` 1 to add it to the browser's history, so Back returns from
+ * it, or 0 to take the place of the location there is. The program hears it as any new location (`PAGE_LOCATION`).
+ */
+export static i32 PAGE_GO = 27;
+/**
+ * `a` a canvas's handle, `b` pair(a child's handle, a surface's key): **the canvas drawn from now on by a worker, not
+ * through the document** — handed over (`transferControlToOffscreen`) to the worker that made surface `key`
+ * (`HOST_SURFACE_NEW`): this program's own, or, from a server forwarding a child's page (`PageServer`), that child's,
+ * by the handle its parent spawned it as; -1 for this program. What the canvas showed is its surface's from then on,
+ * and pixels sent for it the usual way are not drawn.
+ */
+export static i32 PAGE_SURFACE = 28;
+/**
+ * `a` an element's handle, `b` 1 for full screen and 0 to leave it: **asked, not done** — the host decides. A browser
+ * page fills the screen with the element where the browser lets it, which is only just after a tap or a key, and fills
+ * the window with it where the browser has no full screen; a server forwarding a child's page asks whoever it serves
+ * (`PageServer.whenFullScreen`), and refuses without one. Either way the element's `fullscreenchange` listeners hear
+ * what happened, and when — the person leaving it with Back or Escape too — `"1"` while full and `""` once not.
+ */
+export static i32 PAGE_FULLSCREEN = 29;
+/**
+ * `a` a moment, in milliseconds since the epoch → `n` **how far the reader's local time is ahead of UTC then**, in
+ * minutes: 60 in Paris in winter, -300 in New York. Answered at once. A moment rather than "now" because the answer
+ * changes with daylight saving, and a program dating something it saved last month wants last month's offset. The
+ * zone is the reader's, which is why it is the page's to answer: a command line's `Sys` has no reader to ask.
+ */
+export static i32 PAGE_ZONE = 30;
+/**
+ * `text` whether the program thinks the page is seen — `"1"`, or `""` when it has never been told — → `text` whether
+ * it is, once that is not what the program knows: `"1"` while it is on screen, `"0"` once it is not — a tab in the
+ * background, a phone's screen off, the page being left. A program saves what it has when it hears `"0"`, since it
+ * may never hear anything again.
+ */
+export static i32 PAGE_VISIBLE = 31;
+/**
+ * **The browser's Back**: the place before this one in the history, as the person's own Back button would go — so an
+ * app's own "back" leaves the history as it was rather than adding to it. The program hears where it went as any new
+ * location (`PAGE_LOCATION`).
+ */
+export static i32 PAGE_BACK = 32;
+/**
+ * → `text` **the reader's time zone**, by name — `Europe/Paris` — as the browser knows it, or `UTC` where it does not.
+ * Answered at once. What `PAGE_ZONE` cannot say: a program keeping a time of day in the reader's zone, to recur at 9:00
+ * there across daylight saving, has to name the zone.
+ */
+export static i32 PAGE_ZONE_NAME = 33;
+/**
+ * `text` a key → `text` **what the page stored under it** (`PAGE_STORE`), answered with `flags` 1 when nothing is.
+ * The page's own small store, kept by the browser for its origin — `localStorage` — so a value stored before survives
+ * a reload, and one stored by an earlier program on the same origin, written in JavaScript, is read here too.
+ */
+export static i32 PAGE_STORED = 34;
+/** `text` a key, `bytes` a value: stored under it; with `a` 1, what is stored under it removed. */
+export static i32 PAGE_STORE = 35;
+/**
+ * **The page's audio**, as the browser holds it. `a` 0 → `text` its state: `"suspended"`, `"running"`, `"interrupted"`
+ * (Safari, while another app has the speaker) or `"closed"` — the browser's own `AudioContext.state`. `a` 1 → a resume,
+ * answered once the browser has settled it: `text` the state then, and with `flags` 1 and `bytes` the browser's reason
+ * when it refused. Nothing resumes the audio on its own; a program asks, from a gesture's handler — a browser allows it
+ * only while a gesture is recent — or when the page is seen again (`PAGE_VISIBLE`).
+ */
+export static i32 PAGE_AUDIO = 36;
+/**
+ * `text` the path the program knows → `text` the page's path, once it is not that: where the reader is on the page's
+ * site, from its root — `/docs/spec/` — whatever folder the site is served from. Answered at once, as the location is,
+ * so the program has it before its first turn and draws the page that path is (`Frame.on`).
+ */
+export static i32 PAGE_PATH = 37;
+/**
+ * `text` a path on the site, `a` 1 to add it to the browser's history and 0 to take the place of this one: the page
+ * goes there without loading again, and the program hears it as any new path (`PAGE_PATH`).
+ */
+export static i32 PAGE_NAVIGATE = 38;
+/**
+ * `a` 1: a click on a link to a page of this site goes there without loading again — the browser's history moved, and
+ * the program told the new path (`PAGE_PATH`) — rather than loading that page. A link elsewhere, one opened in a new
+ * tab and one to download are the browser's, as ever.
+ */
+export static i32 PAGE_LINKS = 39;
+/** `text`: what the page is, in a sentence — its `<meta name="description">`, which a search engine shows. */
+export static i32 PAGE_DESCRIBE = 40;
+/** How many request numbers the capability takes. */
+export static i32 PAGE_COUNT = 41;
+
+/**
+ * **A surface: a canvas a worker draws itself**, rather than sending every frame's pixels to the document — and, in
+ * a window of a desktop, through the desktop's worker on the way. Requests every browser worker answers itself, at
+ * once: numbered among a host's own, below where a parent numbers what it provides, so a child's go to its own worker
+ * and never its parent's. A host that answers none of them — a test's, a page on the page's own thread — leaves a
+ * canvas drawn the usual way.
+ *
+ * `HOST_SURFACE_NEW` → `n` a key for a surface this worker will draw, once a canvas is handed to it (`PAGE_SURFACE`).
+ */
+export static i32 HOST_SURFACE_NEW = 900001;
+/**
+ * `a` a surface's key, `b` pair(w, h), `bytes` rgba: all of it drawn, sized to match; faulted until its canvas has
+ * arrived, which keeps them to draw when it does.
+ */
+export static i32 HOST_SURFACE_DRAW = 900002;
+/** `a` a surface's key, `b` quad(x, y, w, h), `bytes` rgba: drawn with its corner at (x, y), as `PAGE_PIXELS_IN`. */
+export static i32 HOST_SURFACE_DRAW_IN = 900003;
+/**
+ * **How far apart a desktop's windows' slices of `wac.page` are**: more than `PAGE_COUNT`, so a request added later
+ * does not move every window but the first — a program and the desktop it runs in are built separately, and each
+ * finds its windows' requests where the other put them for as long as both agree on this.
+ */
+export static i32 PAGE_WINDOW = 64;
+
+/** In the `flags` of the host's answer to the lookup: send each change as it is made, not batched. */
+export static i32 PAGE_ONE_AT_A_TIME = 1;
+
+/**
+ * Run `f` once `t` has settled — now, if it has. **`whenSettled` alone never runs for a ticket already settled**, and
+ * a host may answer inside the request that asked: the browser's host answers a location at once, and a
+ * `PageServer` an event it already heard. Waited for with `whenSettled`, those answers were never heard.
+ *
+ * **Over `TicketBase`, not generic**: as `when<T>`, the lambdas handed to it were ones the compiler could not yet type
+ * in a module as large as a desktop's, and the desktop stopped building ("a lambda in a position the walk does not
+ * type yet") while every page here still built.
+ */
+export void when(TicketBase t, fn<void()> f) {
+  if (t.settled()) {
+    f();
+    return;
+  }
+  t.whenSettled(f);
+}
+
+/** Two `i32`s in one `i64`: `high` in the top half. */
+export i64 pair(i32 high, i32 low) { return ((high as i64) << 32) | ((low as i64) & (4294967295 as i64)); }
+// `as@` keeps the bits: a half that was -1 comes back -1, where `as~` would give the nearest `i32` to 4294967295.
+export i32 highOf(i64 v) { return (v >> 32) as@ i32; }
+export i32 lowOf(i64 v) { return v as@ i32; }
+
+/** An `f64` as eight little-endian bytes at `at` — `PAGE_PLAY`'s when and how far in. */
+export void putF64(u8[] b, i32 at, f64 v) {
+  u64 bits = f64.toBits(v);
+  for (i32 k = 0; k < 8; k++) { b[at + k] = ((bits >> (((8 * k) as i64) as@ u64)) & (255 as u64)) as@ u8; }
+}
+
+export f64 getF64(u8[] b, i32 at) {
+  u64 bits = 0 as u64;
+  for (i32 k = 0; k < 8; k++) { bits = bits | ((b[at + k] as u64) << (((8 * k) as i64) as@ u64)); }
+  return f64.fromBits(bits);
+}
+
+/** Four 16-bit fields in one `i64`, `x` at the top — `PAGE_PIXELS_IN`'s corner and size. */
+export i64 quad(i32 x, i32 y, i32 w, i32 h) {
+  return ((x as i64) << 48) | ((y as i64) << 32) | ((w as i64) << 16) | (h as i64);
+}
+export i32 quadAt(i64 v, i32 k) { return ((v >> ((48 - 16 * k) as i64)) & (65535 as i64)) as~ i32; }
+
+/** Something that happened on an element, as the document said it. */
+export struct Happened {
+  i32 seq;
+  string kind;
+  i32 target;
+  i32 listener;
+  string value;
+  i32 x;
+  i32 y;
+  i32 mods;
+  i32 selStart;
+  i32 selEnd;
+  /** When it happened, in milliseconds by the page's clock (`Page.now`). */
+  f64 at;
+  /** Which pointer — a finger, the mouse, a pen — for a pointer event; -1 for anything else. */
+  i32 pointer;
+}
+
+void putI32(u8[] b, i32 at, i32 v) {
+  for (i32 k = 0; k < 4; k++) { b[at + k] = ((v >> (8 * k)) & 255) as~ u8; }
+}
+
+i32 getI32(u8[] b, i32 at) {
+  i32 v = 0;
+  for (i32 k = 0; k < 4; k++) { v = v | ((b[at + k] as i32) << (8 * k)); }
+  return v;
+}
+
+/** An event as `PAGE_EVENT` answers it — for a host written in wac, which is a desktop or a test. */
+export Answer eventAnswer(Happened h) {
+  u8[] kind = h.kind.toBytes();
+  u8[] b = u8[].filled(24 + kind.len(), 0 as u8);
+  putI32(b, 0, h.seq);
+  putI32(b, 4, h.selStart);
+  putI32(b, 8, h.selEnd);
+  i64 micros = (h.at * 1000.0) as~ i64;
+  putI32(b, 12, lowOf(micros));
+  putI32(b, 16, highOf(micros));
+  putI32(b, 20, h.pointer);
+  b.copyFrom(kind, 0, 24, kind.len());
+  return Answer(0, h.value, b, pair(h.listener, h.target), pair(h.x, h.y), h.mods);
+}
+
+/** `PAGE_EVENT`'s answer read back. A short one is a host's mistake, and reads as an event nobody listens to. */
+export Happened happenedOf(Answer a) {
+  if (a.bytes.len() < 24) { return Happened(0, "", 0 - 1, 0 - 1, "", 0, 0, 0, 0 - 1, 0 - 1, 0.0, 0 - 1); }
+  u8[] k = u8[].filled(a.bytes.len() - 24, 0 as u8);
+  k.copyFrom(a.bytes, 24, 0, k.len());
+  string kind = string.fromBytes(k);
+  i64 micros = pair(getI32(a.bytes, 16), getI32(a.bytes, 12));
+  return Happened(getI32(a.bytes, 0), kind, lowOf(a.n), highOf(a.n), a.text, highOf(a.m), lowOf(a.m), a.flags,
+                  getI32(a.bytes, 4), getI32(a.bytes, 8), (micros as~ f64) / 1000.0, getI32(a.bytes, 20));
+}
+
+/** One change, as a batch carries it. */
+export struct Change {
+  i32 op;
+  i64 a;
+  i64 b;
+  string text;
+  u8[] bytes;
+}
+
+void putI64(Buf b, i64 v) {
+  b.pushU32(lowOf(v) as@ u32);
+  b.pushU32(highOf(v) as@ u32);
+}
+
+i64 getI64(u8[] b, i32 at) { return pair(getI32(b, at + 4), getI32(b, at)); }
+
+/** A `PAGE_BATCH`'s changes, in order — for a host written in wac. One cut short ends the list where it stops. */
+export Change[] batchOf(u8[] bytes) {
+  Vec<Change> out = Vec.create();
+  i32 at = 0;
+  while (at + 21 <= bytes.len()) {
+    i32 op = bytes[at] as i32;
+    i64 a = getI64(bytes, at + 1);
+    i64 b = getI64(bytes, at + 9);
+    i32 tlen = getI32(bytes, at + 17);
+    if (tlen < 0 || at + 21 + tlen + 4 > bytes.len()) { break; }
+    u8[] t = u8[].filled(tlen, 0 as u8);
+    t.copyFrom(bytes, at + 21, 0, tlen);
+    i32 blen = getI32(bytes, at + 21 + tlen);
+    i32 from = at + 25 + tlen;
+    if (blen < 0 || from + blen > bytes.len()) { break; }
+    u8[] body = u8[].filled(blen, 0 as u8);
+    body.copyFrom(bytes, from, 0, blen);
+    out.push(Change(op, a, b, string.fromBytes(t), body));
+    at = from + blen;
+  }
+  return out.toArray();
+}
+
+/** The program's end of `wac.page`: the host, where the capability's numbers start, and the changes held. */
+export struct PageLine {
+  Host host;
+  i32 base;
+  /** Whether changes are held and sent together; false for a host that answered `PAGE_ONE_AT_A_TIME`. */
+  bool batched;
+  Buf held;
+  i32 count;
+  /** Told when a change is held and none was before — so whoever ends the turn knows one has something to send. */
+  fn<void()>? onHeld;
+
+  /** The line to the capability that starts at `base` on `host`, as the host's answer to the lookup asked (`flags`). */
+  PageLine of(Host host, i32 base, i32 flags) {
+    return PageLine(host, base, (flags & PAGE_ONE_AT_A_TIME) == 0, Buf.create(), 0, null);
+  }
+
+  void tell(this, i32 op, i64 a, i64 b, string text, u8[] bytes) {
+    if (!this.batched) {
+      this.host.tell(this.base + op, a, b, text, bytes);
+      return;
+    }
+    this.held.push(op as@ u8);
+    putI64(this.held, a);
+    putI64(this.held, b);
+    u8[] t = text.toBytes();
+    this.held.pushU32(t.len() as@ u32);
+    this.held.pushAll(t);
+    this.held.pushU32(bytes.len() as@ u32);
+    this.held.pushAll(bytes);
+    this.count++;
+    if (this.count == 1 && this.onHeld is not null) { this.onHeld!(); }
+  }
+
+  /** Send what is held, as one batch. Nothing, when nothing is. */
+  void flush(this) {
+    if (this.count == 0) { return; }
+    u8[] bytes = this.held.bytes();
+    i32 n = this.count;
+    this.held = Buf.create();
+    this.count = 0;
+    ask(this.host, this.base + PAGE_BATCH, n as i64, 0 as i64, "", bytes);
+  }
+
+  /** Ask, once every change made before it has gone. */
+  Ticket<Answer> ask(this, i32 op, i64 a, i64 b, string text, u8[] bytes) {
+    this.flush();
+    return ask(this.host, this.base + op, a, b, text, bytes);
+  }
+
+  void make(this, i32 id, i32 parent, string tag, i32 before) { this.tell(PAGE_MAKE, id as i64, pair(parent, before), tag, u8[]()); }
+  void makeText(this, i32 id, i32 parent, string text, i32 before) {
+    this.tell(PAGE_MAKE_TEXT, id as i64, pair(parent, before), text, u8[]());
+  }
+  void text(this, i32 id, string text) { this.tell(PAGE_TEXT, id as i64, 0 as i64, text, u8[]()); }
+  void attr(this, i32 id, string name, string value, bool present) {
+    this.tell(PAGE_ATTR, id as i64, (present ? 1 : 0) as i64, name, value.toBytes());
+  }
+  void prop(this, i32 id, string name, string value, i32 seen) { this.tell(PAGE_PROP, pair(seen, id), 0 as i64, name, value.toBytes()); }
+  void move(this, i32 id, i32 before) { this.tell(PAGE_MOVE, id as i64, before as i64, "", u8[]()); }
+  void remove(this, i32 id) { this.tell(PAGE_REMOVE, id as i64, 0 as i64, "", u8[]()); }
+  void listen(this, i32 id, string kind, string prevent) { this.tell(PAGE_LISTEN, id as i64, 0 as i64, kind, prevent.toBytes()); }
+  void focus(this, i32 id) { this.tell(PAGE_FOCUS, id as i64, 0 as i64, "", u8[]()); }
+  void pixels(this, i32 id, i32 w, i32 h, u8[] rgba) { this.tell(PAGE_PIXELS, id as i64, pair(w, h), "", rgba); }
+  void pixelsIn(this, i32 id, i32 x, i32 y, i32 w, i32 h, u8[] rgba) { this.tell(PAGE_PIXELS_IN, id as i64, quad(x, y, w, h), "", rgba); }
+  void scroll(this, i32 id, string named) { this.tell(PAGE_SCROLL, id as i64, 0 as i64, named, u8[]()); }
+  void select(this, i32 id, i32 start, i32 end, i32 seen) { this.tell(PAGE_SELECT, pair(seen, id), pair(start, end), "", u8[]()); }
+  void typeText(this, i32 id, string text, i32 seen) { this.tell(PAGE_TYPE_TEXT, pair(seen, id), 0 as i64, text, u8[]()); }
+  void title(this, string t) { this.tell(PAGE_TITLE, 0 as i64, 0 as i64, t, u8[]()); }
+  void go(this, string where, bool push) { this.tell(PAGE_GO, (push ? 1 : 0) as i64, 0 as i64, where, u8[]()); }
+  void fullScreen(this, i32 id, bool on) { this.tell(PAGE_FULLSCREEN, id as i64, (on ? 1 : 0) as i64, "", u8[]()); }
+  void surface(this, i32 id, i32 child, i32 key) { this.tell(PAGE_SURFACE, id as i64, pair(child, key), "", u8[]()); }
+  void log(this, string line) { this.tell(PAGE_LOG, 0 as i64, 0 as i64, line, u8[]()); }
+  void download(this, string name, u8[] bytes) { this.tell(PAGE_DOWNLOAD, 0 as i64, 0 as i64, name, bytes); }
+  void sound(this, i32 id, i32 rate, u8[] samples) { this.tell(PAGE_SOUND, id as i64, rate as i64, "", samples); }
+  void play(this, i32 voice, i32 sound, i32 thousandths, bool loop) {
+    this.tell(PAGE_PLAY, pair(voice, sound), pair(thousandths, loop ? 1 : 0), "", u8[]());
+  }
+  void stop(this, i32 voice) { this.tell(PAGE_STOP, voice as i64, 0 as i64, "", u8[]()); }
+  void playAt(this, i32 voice, i32 sound, i32 thousandths, bool loop, f64 at, f64 offset) {
+    u8[] when = u8[].filled(16, 0 as u8);
+    putF64(when, 0, at);
+    putF64(when, 8, offset);
+    this.tell(PAGE_PLAY, pair(voice, sound), pair(thousandths, loop ? 1 : 0), "", when);
+  }
+  void gain(this, i32 voice, i32 thousandths, i32 ms) { this.tell(PAGE_GAIN, voice as i64, pair(thousandths, ms), "", u8[]()); }
+
+  Ticket<Answer> value(this, i32 id) { return this.ask(PAGE_VALUE, id as i64, 0 as i64, "", u8[]()); }
+  Ticket<Answer> event(this) { return this.ask(PAGE_EVENT, 0 as i64, 0 as i64, "", u8[]()); }
+  Ticket<Answer> file(this) { return this.ask(PAGE_FILE, 0 as i64, 0 as i64, "", u8[]()); }
+  Ticket<Answer> frame(this) { return this.ask(PAGE_FRAME, 0 as i64, 0 as i64, "", u8[]()); }
+  Ticket<Answer> location(this, string known) { return this.ask(PAGE_LOCATION, 0 as i64, 0 as i64, known, u8[]()); }
+  Ticket<Answer> path(this, string known) { return this.ask(PAGE_PATH, 0 as i64, 0 as i64, known, u8[]()); }
+  void navigate(this, string path, bool push) { this.tell(PAGE_NAVIGATE, (push ? 1 : 0) as i64, 0 as i64, path, u8[]()); }
+  void links(this, bool on) { this.tell(PAGE_LINKS, (on ? 1 : 0) as i64, 0 as i64, "", u8[]()); }
+  void describe(this, string text) { this.tell(PAGE_DESCRIBE, 0 as i64, 0 as i64, text, u8[]()); }
+  Ticket<Answer> zone(this, i64 ms) { return this.ask(PAGE_ZONE, ms, 0 as i64, "", u8[]()); }
+  Ticket<Answer> visible(this, string known) { return this.ask(PAGE_VISIBLE, 0 as i64, 0 as i64, known, u8[]()); }
+  void back(this) { this.tell(PAGE_BACK, 0 as i64, 0 as i64, "", u8[]()); }
+  Ticket<Answer> zoneName(this) { return this.ask(PAGE_ZONE_NAME, 0 as i64, 0 as i64, "", u8[]()); }
+  Ticket<Answer> stored(this, string key) { return this.ask(PAGE_STORED, 0 as i64, 0 as i64, key, u8[]()); }
+  void store(this, string key, string value) { this.tell(PAGE_STORE, 0 as i64, 0 as i64, key, value.toBytes()); }
+  void unstore(this, string key) { this.tell(PAGE_STORE, 1 as i64, 0 as i64, key, u8[]()); }
+  /** The audio's state, or with `resume` a resume of it (`PAGE_AUDIO`). */
+  Ticket<Answer> audio(this, bool resume) { return this.ask(PAGE_AUDIO, (resume ? 1 : 0) as i64, 0 as i64, "", u8[]()); }
+}

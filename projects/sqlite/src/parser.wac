@@ -1,0 +1,1412 @@
+// SQL text into statements: the part of SQLite's grammar that applications built on it use.
+
+import { Result, Vec, Map, hashString, stringEq } from "core";
+import { atof } from "./fp.wac";
+import { SqlError } from "./error.wac";
+import { Value } from "./value.wac";
+import { Token, tokenize, upper, lower, T_IDENT, T_STRING, T_INTEGER, T_FLOAT, T_BLOB, T_PARAM, T_OP, T_EOF } from "./lexer.wac";
+import { Cte, CreateTrigger, ForeignKeyDef, FrameBound, WindowSpec, NamedWindow, Expr, ResultCol, Source, OrderTerm, Select, ColumnDef, TableConstraint, CreateTable, IndexCol,
+         CreateIndex, Assign, Upsert, Insert, Update, Delete, Stmt, JOIN_FIRST, JOIN_INNER, JOIN_LEFT,
+         JOIN_CROSS, JOIN_RIGHT, JOIN_FULL, OR_ABORT, OR_IGNORE, OR_REPLACE, OR_FAIL, OR_ROLLBACK } from "./ast.wac";
+
+// Words that end a clause, so cannot be taken as an alias written without AS.
+static string[] CLAUSE_WORDS = [
+  "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "EXCEPT", "INTERSECT", "JOIN",
+  "LEFT", "RIGHT", "FULL", "INNER", "CROSS", "NATURAL", "OUTER", "ON", "USING", "SET", "VALUES", "RETURNING", "WINDOW",
+  "SELECT", "AS", "DO", "DEFAULT", "AND", "OR", "NOT", "IS", "IN", "LIKE", "GLOB", "BETWEEN", "COLLATE",
+  "ESCAPE", "THEN", "WHEN", "ELSE", "END", "ASC", "DESC", "NULLS", "INDEXED",
+];
+
+export i32 hexDigit(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  return c - 'A' + 10;
+}
+
+// A decimal integer's value, or null when it does not fit an i64 (SQLite then reads it as a real).
+export i64? decimalI64(string s) {
+  u8[] b = s.toBytes();
+  u64 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    u64 d = (b[i] - '0') as u64;
+    if (v > (18446744073709551615 - d) / 10) { return null; }
+    v = v * 10 + d;
+  }
+  if (v > 9223372036854775807) { return null; }
+  return v as@ i64;
+}
+
+bool isZero(const Expr e) {
+  match (e) {
+    Lit(v): { match (v) { Int(i): { return i == 0; } default: { return false; } } }
+    default: { return false; }
+  }
+}
+
+// Whether an expression calls a function anywhere in it (SQLite's EP_HasFunc).
+bool hasCall(const Expr e) { return callsWhere(e, (string n) => true); }
+
+// Whether an expression calls a function whose name `pick` accepts, at any depth.
+export bool callsWhere(const Expr e, fn<bool(string)> pick) {
+  match (e) {
+    Call(name, args, star, distinct): {
+      if (pick(name)) { return true; }
+      for (i32 i = 0; i < args.len(); i++) { if (callsWhere(args[i], pick)) { return true; } }
+      return false;
+    }
+    Unary(op, x): { return callsWhere(x, pick); }
+    Binary(op, l, r): { return callsWhere(l, pick) || callsWhere(r, pick); }
+    IsNull(x, n): { return callsWhere(x, pick); }
+    Between(x, lo, hi, n): { return callsWhere(x, pick) || callsWhere(lo, pick) || callsWhere(hi, pick); }
+    InList(x, items, n): {
+      if (callsWhere(x, pick)) { return true; }
+      for (i32 i = 0; i < items.len(); i++) { if (callsWhere(items[i], pick)) { return true; } }
+      return false;
+    }
+    InSelect(x, sub, n): { return callsWhere(x, pick); }
+    Case(base, whens, thens, other): {
+      if (base is not null && callsWhere(base!, pick)) { return true; }
+      if (other is not null && callsWhere(other!, pick)) { return true; }
+      for (i32 i = 0; i < whens.len(); i++) {
+        if (callsWhere(whens[i], pick) || callsWhere(thens[i], pick)) { return true; }
+      }
+      return false;
+    }
+    Cast(x, t): { return callsWhere(x, pick); }
+    Collate(x, c): { return callsWhere(x, pick); }
+    default: { return false; }
+  }
+}
+
+// The functions whose answer can change between calls with the same arguments, which an index,
+// a CHECK constraint or a generated column may not use.
+export bool nondeterministic(string name) {
+  return name == "random" || name == "randomblob" || name == "changes" || name == "total_changes" ||
+         name == "last_insert_rowid";
+}
+
+// A real literal's value, read as SQLite reads it (fp.wac's port of sqlite3AtoF).
+export f64 parseF64(string s) { return atof(s); }
+
+export struct Parser {
+  Token[] toks;
+  i32 pos;
+  string sql;
+  i32 maxParam;
+  Map<string, i32> named;
+  bool[] lastDesc;   // the directions nameList last read, which only a PRIMARY KEY keeps
+  bool lastTemp;     // whether the name qualifiedName last read was qualified by temp
+  i32 lastNameStart; // where that name itself began, after any schema: CREATE text is stored without one
+
+  Parser over(Token[] toks, string sql) {
+    return Parser(toks, 0, sql, 0, Map.create(hashString, stringEq), bool[](), false, 0);
+  }
+
+  Token peek(this) { return this.toks[this.pos]; }
+
+  Token peekAt(this, i32 k) {
+    i32 i = this.pos + k;
+    return this.toks[i < this.toks.len() ? i : this.toks.len() - 1];
+  }
+
+  Token advance(this) {
+    Token t = this.toks[this.pos];
+    if (t.kind != T_EOF) { this.pos++; }
+    return t;
+  }
+
+  bool isKwAt(this, i32 k, string kw) {
+    Token t = this.peekAt(k);
+    return t.kind == T_IDENT && !t.quoted && upper(t.text) == kw;
+  }
+
+  bool isKw(this, string kw) { return this.isKwAt(0, kw); }
+
+  bool eatKw(this, string kw) {
+    if (this.isKw(kw)) { this.pos++; return true; }
+    return false;
+  }
+
+  bool isOp(this, string op) {
+    Token t = this.peek();
+    return t.kind == T_OP && t.text == op;
+  }
+
+  bool eatOp(this, string op) {
+    if (this.isOp(op)) { this.pos++; return true; }
+    return false;
+  }
+
+  SqlError fail(this, string what) {
+    Token t = this.peek();
+    string near = t.kind == T_EOF ? "end of input" : "\"" + this.sql.slice(t.start, t.end) + "\"";
+    return SqlError.syntax("\{what} near \{near}");
+  }
+
+  Result<void, SqlError> expectKw(this, string kw) {
+    if (!this.eatKw(kw)) { return Result.Err(this.fail("expected \{kw}")); }
+    return Result.Ok();
+  }
+
+  Result<void, SqlError> expectOp(this, string op) {
+    if (!this.eatOp(op)) { return Result.Err(this.fail("expected \"\{op}\"")); }
+    return Result.Ok();
+  }
+
+  bool isClauseWord(this) {
+    Token t = this.peek();
+    if (t.kind != T_IDENT || t.quoted) { return false; }
+    string u = upper(t.text);
+    // like(…) and glob(…) are functions as well as operators.
+    if ((u == "LIKE" || u == "GLOB") && this.pos + 1 < this.toks.len() && this.toks[this.pos + 1].text == "(") { return false; }
+    for (string w in CLAUSE_WORDS) { if (w == u) { return true; } }
+    return false;
+  }
+
+  // A name: an identifier, quoted or not, or a string literal where SQLite tolerates one.
+  Result<string, SqlError> name(this) {
+    Token t = this.peek();
+    if (t.kind == T_IDENT || t.kind == T_STRING) { this.pos++; return Result.Ok(t.text); }
+    return Result.Err(this.fail("expected a name"));
+  }
+
+  // `schema.name`, keeping only the name: there is one schema, "main".
+  Result<string, SqlError> qualifiedName(this) {
+    this.lastNameStart = this.peek().start;
+    string n = try this.name();
+    if (this.isOp(".")) {
+      string schema = lower(n);
+      if (schema != "main" && schema != "temp") { return Result.Err(SqlError("error", "unknown database \{n}")); }
+      this.pos++;
+      this.lastNameStart = this.peek().start;
+      n = try this.name();
+      if (schema == "temp") {
+        this.lastTemp = true;
+        // The temporary schema's own table.
+        if (lower(n) == "sqlite_schema" || lower(n) == "sqlite_master") { n = "sqlite_temp_schema"; }
+      }
+    }
+    return Result.Ok(n);
+  }
+
+  Result<string[], SqlError> nameList(this) {
+    try this.expectOp("(");
+    Vec<string> out;
+    Vec<bool> desc;
+    while (true) {
+      out.push(try this.name());
+      // An indexed column in a constraint may carry a collation and an order, which a uniqueness
+      // constraint does not need to remember.
+      if (this.eatKw("COLLATE")) { try this.name(); }
+      bool d = false;
+      if (!this.eatKw("ASC")) { d = this.eatKw("DESC"); }
+      desc.push(d);
+      if (!this.eatOp(",")) { break; }
+    }
+    try this.expectOp(")");
+    this.lastDesc = desc.toArray();
+    return Result.Ok(out.toArray());
+  }
+
+  // ── expressions ────────────────────────────────────────────────────────
+
+  Result<Expr, SqlError> expr(this) { return this.orExpr(); }
+
+  Result<Expr, SqlError> orExpr(this) {
+    Expr l = try this.andExpr();
+    while (this.eatKw("OR")) { l = Expr.Binary("OR", l, try this.andExpr()); }
+    return Result.Ok(l);
+  }
+
+  Result<Expr, SqlError> andExpr(this) {
+    Expr l = try this.notExpr();
+    while (this.eatKw("AND")) {
+      Expr r = try this.notExpr();
+      // SQLite folds `x AND 0` to 0 as it parses, before x's names are resolved, so `a AND 0` is 0 even
+      // where there is no column a — unless either side calls a function. Doing the same keeps what is
+      // refused the same.
+      if ((isZero(l) || isZero(r)) && !hasCall(l) && !hasCall(r)) { l = Expr.Lit(Value.Int(0)); }
+      else { l = Expr.Binary("AND", l, r); }
+    }
+    return Result.Ok(l);
+  }
+
+  Result<Expr, SqlError> notExpr(this) {
+    if (this.isKw("NOT") && !this.isKwAt(1, "EXISTS")) {
+      this.pos++;
+      return Result.Ok(Expr.Unary("NOT", try this.notExpr()));
+    }
+    return this.equality();
+  }
+
+  Result<Expr, SqlError> equality(this) {
+    Expr l = try this.comparison();
+    while (true) {
+      Token t = this.peek();
+      if (t.kind == T_OP && (t.text == "=" || t.text == "==" || t.text == "!=" || t.text == "<>")) {
+        this.pos++;
+        string op = t.text == "==" ? "=" : (t.text == "<>" ? "!=" : t.text);
+        l = Expr.Binary(op, l, try this.comparison());
+        continue;
+      }
+      if (this.eatKw("ISNULL")) { l = Expr.IsNull(l, false); continue; }
+      if (this.eatKw("NOTNULL")) { l = Expr.IsNull(l, true); continue; }
+      if (this.isKw("NOT") && this.isKwAt(1, "NULL")) { this.pos += 2; l = Expr.IsNull(l, true); continue; }
+      if (this.eatKw("IS")) {
+        bool neg = this.eatKw("NOT");
+        if (this.eatKw("DISTINCT")) {
+          try this.expectKw("FROM");
+          neg = !neg;
+        }
+        if (this.eatKw("NULL")) { l = Expr.IsNull(l, neg); continue; }
+        l = Expr.Binary(neg ? "IS NOT" : "IS", l, try this.comparison());
+        continue;
+      }
+      bool neg = false;
+      if (this.isKw("NOT") && (this.isKwAt(1, "IN") || this.isKwAt(1, "LIKE") || this.isKwAt(1, "GLOB") ||
+                               this.isKwAt(1, "BETWEEN"))) {
+        this.pos++;
+        neg = true;
+      }
+      if (this.eatKw("IN")) {
+        l = try this.inRest(l, neg);
+        continue;
+      }
+      if (this.isKw("LIKE") || this.isKw("GLOB")) {
+        string op = upper(this.advance().text);
+        Expr pat = try this.comparison();
+        Expr e;
+        if (this.eatKw("ESCAPE")) {
+          e = Expr.Call(lower(op), [pat, l, try this.comparison()], false, false);
+        } else {
+          e = Expr.Binary(op, l, pat);
+        }
+        l = neg ? Expr.Unary("NOT", e) : e;
+        continue;
+      }
+      if (this.eatKw("BETWEEN")) {
+        Expr lo = try this.comparison();
+        try this.expectKw("AND");
+        Expr hi = try this.comparison();
+        l = Expr.Between(l, lo, hi, neg);
+        continue;
+      }
+      if (neg) { return Result.Err(this.fail("expected IN, LIKE, GLOB or BETWEEN")); }
+      return Result.Ok(l);
+    }
+  }
+
+  Result<Expr, SqlError> inRest(this, Expr l, bool neg) {
+    try this.expectOp("(");
+    if (this.isKw("SELECT") || this.isKw("VALUES") || this.isKw("WITH")) {
+      Select s = try this.select();
+      try this.expectOp(")");
+      return Result.Ok(Expr.InSelect(l, s, neg));
+    }
+    Vec<Expr> items;
+    if (!this.isOp(")")) {
+      while (true) {
+        items.push(try this.expr());
+        if (!this.eatOp(",")) { break; }
+      }
+    }
+    try this.expectOp(")");
+    return Result.Ok(Expr.InList(l, items.toArray(), neg));
+  }
+
+  Result<Expr, SqlError> comparison(this) {
+    Expr l = try this.bitwise();
+    while (true) {
+      Token t = this.peek();
+      if (t.kind == T_OP && (t.text == "<" || t.text == "<=" || t.text == ">" || t.text == ">=")) {
+        this.pos++;
+        l = Expr.Binary(t.text, l, try this.bitwise());
+      } else {
+        return Result.Ok(l);
+      }
+    }
+  }
+
+  Result<Expr, SqlError> bitwise(this) {
+    Expr l = try this.additive();
+    while (true) {
+      Token t = this.peek();
+      if (t.kind == T_OP && (t.text == "&" || t.text == "|" || t.text == "<<" || t.text == ">>")) {
+        this.pos++;
+        l = Expr.Binary(t.text, l, try this.additive());
+      } else {
+        return Result.Ok(l);
+      }
+    }
+  }
+
+  Result<Expr, SqlError> additive(this) {
+    Expr l = try this.multiplicative();
+    while (true) {
+      Token t = this.peek();
+      if (t.kind == T_OP && (t.text == "+" || t.text == "-")) {
+        this.pos++;
+        l = Expr.Binary(t.text, l, try this.multiplicative());
+      } else {
+        return Result.Ok(l);
+      }
+    }
+  }
+
+  Result<Expr, SqlError> multiplicative(this) {
+    Expr l = try this.concat();
+    while (true) {
+      Token t = this.peek();
+      if (t.kind == T_OP && (t.text == "*" || t.text == "/" || t.text == "%")) {
+        this.pos++;
+        l = Expr.Binary(t.text, l, try this.concat());
+      } else {
+        return Result.Ok(l);
+      }
+    }
+  }
+
+  Result<Expr, SqlError> concat(this) {
+    Expr l = try this.unary();
+    while (true) {
+      Token t = this.peek();
+      if (t.kind == T_OP && (t.text == "||" || t.text == "->" || t.text == "->>")) {
+        this.pos++;
+        l = Expr.Binary(t.text, l, try this.unary());
+      } else {
+        return Result.Ok(l);
+      }
+    }
+  }
+
+  Result<Expr, SqlError> unary(this) {
+    Token t = this.peek();
+    if (t.kind == T_OP && (t.text == "-" || t.text == "+" || t.text == "~")) {
+      this.pos++;
+      // The one integer whose magnitude is past i64: it exists only negated.
+      Token n = this.peek();
+      if (t.text == "-" && n.kind == T_INTEGER && n.text == "9223372036854775808") {
+        this.pos++;
+        return Result.Ok(Expr.Lit(Value.Int(-9223372036854775807 - 1)));
+      }
+      return Result.Ok(Expr.Unary(t.text, try this.unary()));
+    }
+    Expr e = try this.primary();
+    while (this.eatKw("COLLATE")) { e = Expr.Collate(e, lower(try this.name())); }
+    return Result.Ok(e);
+  }
+
+  Expr param(this, Token t) {
+    if (t.text == "?") {
+      this.maxParam++;
+      return Expr.Param(this.maxParam);
+    }
+    if (t.text.slice(0, 1) == "?") {
+      i32 n = decimalI64(t.text.slice(1, t.text.len()))! as! i32;
+      if (n > this.maxParam) { this.maxParam = n; }
+      return Expr.Param(n);
+    }
+    i32? known = this.named.get(t.text);
+    if (known is not null) { return Expr.Param(known!); }
+    this.maxParam++;
+    this.named.set(t.text, this.maxParam);
+    return Expr.Param(this.maxParam);
+  }
+
+  Result<Expr, SqlError> primary(this) {
+    Token t = this.peek();
+    if (t.kind == T_INTEGER) {
+      this.pos++;
+      if (t.text.len() > 2 && (t.text.slice(0, 2) == "0x" || t.text.slice(0, 2) == "0X")) {
+        if (t.text.len() > 18) { return Result.Err(SqlError.syntax("hex literal too big: \{t.text}")); }
+        u8[] b = t.text.toBytes();
+        i64 v = 0;
+        for (i32 i = 2; i < b.len(); i++) { v = (v << 4) | (hexDigit(b[i] as i32) as i64); }
+        return Result.Ok(Expr.Lit(Value.Int(v)));
+      }
+      i64? v = decimalI64(t.text);
+      if (v is null) { return Result.Ok(Expr.Lit(Value.Real(parseF64(t.text)))); }
+      return Result.Ok(Expr.Lit(Value.Int(v!)));
+    }
+    if (t.kind == T_FLOAT) { this.pos++; return Result.Ok(Expr.Lit(Value.Real(parseF64(t.text)))); }
+    if (t.kind == T_STRING) { this.pos++; return Result.Ok(Expr.Lit(Value.Text(t.text))); }
+    if (t.kind == T_BLOB) {
+      this.pos++;
+      u8[] h = t.text.toBytes();
+      u8[] out = u8[].filled(h.len() / 2, 0);
+      for (i32 i = 0; i < out.len(); i++) {
+        out[i] = ((hexDigit(h[2 * i] as i32) << 4) | hexDigit(h[2 * i + 1] as i32)) as@ u8;
+      }
+      return Result.Ok(Expr.Lit(Value.Blob(out)));
+    }
+    if (t.kind == T_PARAM) { this.pos++; return Result.Ok(this.param(t)); }
+    if (this.eatOp("(")) {
+      if (this.isKw("SELECT") || this.isKw("VALUES") || this.isKw("WITH")) {
+        Select s = try this.select();
+        try this.expectOp(")");
+        return Result.Ok(Expr.Subquery(s));
+      }
+      Expr e = try this.expr();
+      if (this.eatOp(",")) {
+        Vec<Expr> items;
+        items.push(e);
+        while (true) {
+          items.push(try this.expr());
+          if (!this.eatOp(",")) { break; }
+        }
+        try this.expectOp(")");
+        return Result.Ok(Expr.Vector(items.toArray()));
+      }
+      try this.expectOp(")");
+      return Result.Ok(e);
+    }
+    if (t.kind != T_IDENT || this.isClauseWord()) { return Result.Err(this.fail("expected an expression")); }
+    if (!t.quoted) {
+      string u = upper(t.text);
+      if (u == "NULL") { this.pos++; return Result.Ok(Expr.Lit(Value.Null)); }
+      if (u == "TRUE") { this.pos++; return Result.Ok(Expr.Lit(Value.Int(1))); }
+      if (u == "FALSE") { this.pos++; return Result.Ok(Expr.Lit(Value.Int(0))); }
+      if (u == "CURRENT_TIMESTAMP" || u == "CURRENT_DATE" || u == "CURRENT_TIME") {
+        this.pos++;
+        return Result.Ok(Expr.Call(lower(u), Expr[](), false, false));
+      }
+      if (u == "CAST" && this.peekAt(1).kind == T_OP && this.peekAt(1).text == "(") {
+        this.pos += 2;
+        Expr e = try this.expr();
+        try this.expectKw("AS");
+        string ty = try this.typeName();
+        try this.expectOp(")");
+        return Result.Ok(Expr.Cast(e, ty));
+      }
+      if (u == "CASE") { this.pos++; return this.caseRest(); }
+      // RAISE(IGNORE) and RAISE(ABORT|FAIL|ROLLBACK, message), in a trigger.
+      if (u == "RAISE" && this.peekAt(1).kind == T_OP && this.peekAt(1).text == "(") {
+        this.pos += 2;
+        string kind = upper(this.advance().text);
+        if (kind != "IGNORE" && kind != "ABORT" && kind != "FAIL" && kind != "ROLLBACK") {
+          return Result.Err(this.fail("expected IGNORE, ABORT, FAIL or ROLLBACK"));
+        }
+        Vec<Expr> args;
+        args.push(Expr.Lit(Value.Text(kind)));
+        if (kind != "IGNORE") {
+          try this.expectOp(",");
+          args.push(try this.expr());
+        }
+        try this.expectOp(")");
+        return Result.Ok(Expr.Call("raise", args.toArray(), false, false));
+      }
+      if (u == "EXISTS" || (u == "NOT" && this.isKwAt(1, "EXISTS"))) {
+        bool neg = u == "NOT";
+        this.pos += neg ? 2 : 1;
+        try this.expectOp("(");
+        Select s = try this.select();
+        try this.expectOp(")");
+        return Result.Ok(Expr.Exists(s, neg));
+      }
+    }
+    this.pos++;
+    if (this.eatOp("(")) {
+      bool distinct = this.eatKw("DISTINCT");
+      if (this.eatOp("*")) {
+        try this.expectOp(")");
+        return this.callRest(lower(t.text), Expr[](), true, false, OrderTerm[]());
+      }
+      Vec<Expr> args;
+      if (!this.isOp(")")) {
+        while (true) {
+          args.push(try this.expr());
+          if (!this.eatOp(",")) { break; }
+        }
+      }
+      OrderTerm[] order = OrderTerm[]();
+      if (this.eatKw("ORDER")) {
+        try this.expectKw("BY");
+        order = try this.orderTerms();
+      }
+      try this.expectOp(")");
+      return this.callRest(lower(t.text), args.toArray(), false, distinct, order);
+    }
+    if (this.isOp(".") && this.peekAt(1).kind == T_IDENT) {
+      this.pos++;
+      Token c = this.advance();
+      if (this.isOp(".") && this.peekAt(1).kind == T_IDENT) {
+        // schema.table.column
+        this.pos++;
+        Token c2 = this.advance();
+        return Result.Ok(Expr.Col(c.text, c2.text));
+      }
+      return Result.Ok(Expr.Col(t.text, c.text));
+    }
+    return Result.Ok(Expr.Col(null, t.text));
+  }
+
+  // What may follow a call's parentheses: FILTER (WHERE …) and OVER.
+  Result<Expr, SqlError> callRest(this, string name, Expr[] args, bool star, bool distinct, OrderTerm[] order) {
+    Expr? filter = null;
+    if (this.eatKw("FILTER")) {
+      try this.expectOp("(");
+      try this.expectKw("WHERE");
+      filter = try this.expr();
+      try this.expectOp(")");
+    }
+    WindowSpec? over = null;
+    if (this.eatKw("OVER")) {
+      if (this.eatOp("(")) {
+        over = try this.windowSpec();
+        try this.expectOp(")");
+      } else {
+        over = WindowSpec { base: try this.name(), partition: Expr[](), order: OrderTerm[]() };
+      }
+    }
+    if (filter is null && over is null && order.len() == 0) { return Result.Ok(Expr.Call(name, args, star, distinct)); }
+    return Result.Ok(Expr.AggCall(name, args, star, distinct, filter, order, over));
+  }
+
+  // The inside of OVER ( … ) or WINDOW w AS ( … ).
+  Result<WindowSpec, SqlError> windowSpec(this) {
+    WindowSpec w = WindowSpec { partition: Expr[](), order: OrderTerm[]() };
+    if (this.peek().kind == T_IDENT && !this.isKw("PARTITION") && !this.isKw("ORDER") && !this.isKw("ROWS") &&
+        !this.isKw("RANGE") && !this.isKw("GROUPS")) {
+      w.base = this.advance().text;
+    }
+    if (this.eatKw("PARTITION")) {
+      try this.expectKw("BY");
+      Vec<Expr> ps;
+      while (true) {
+        ps.push(try this.expr());
+        if (!this.eatOp(",")) { break; }
+      }
+      w.partition = ps.toArray();
+    }
+    if (this.eatKw("ORDER")) {
+      try this.expectKw("BY");
+      w.order = try this.orderTerms();
+    }
+    if (this.isKw("ROWS") || this.isKw("RANGE") || this.isKw("GROUPS")) {
+      w.units = upper(this.advance().text);
+      if (this.eatKw("BETWEEN")) {
+        w.start = try this.frameBound();
+        try this.expectKw("AND");
+        w.end = try this.frameBound();
+      } else {
+        w.start = try this.frameBound();
+        w.end = FrameBound("CURRENT ROW", null);
+      }
+      if (this.eatKw("EXCLUDE")) {
+        if (this.eatKw("NO")) { try this.expectKw("OTHERS"); w.exclude = "NO OTHERS"; }
+        else if (this.eatKw("CURRENT")) { try this.expectKw("ROW"); w.exclude = "CURRENT ROW"; }
+        else if (this.eatKw("GROUP")) { w.exclude = "GROUP"; }
+        else { try this.expectKw("TIES"); w.exclude = "TIES"; }
+      }
+    }
+    return Result.Ok(w);
+  }
+
+  Result<FrameBound, SqlError> frameBound(this) {
+    if (this.eatKw("UNBOUNDED")) {
+      if (this.eatKw("PRECEDING")) { return Result.Ok(FrameBound("UNBOUNDED PRECEDING", null)); }
+      try this.expectKw("FOLLOWING");
+      return Result.Ok(FrameBound("UNBOUNDED FOLLOWING", null));
+    }
+    if (this.eatKw("CURRENT")) {
+      try this.expectKw("ROW");
+      return Result.Ok(FrameBound("CURRENT ROW", null));
+    }
+    Expr n = try this.expr();
+    if (this.eatKw("PRECEDING")) { return Result.Ok(FrameBound("PRECEDING", n)); }
+    try this.expectKw("FOLLOWING");
+    return Result.Ok(FrameBound("FOLLOWING", n));
+  }
+
+  Result<Expr, SqlError> caseRest(this) {
+    Expr? base = null;
+    if (!this.isKw("WHEN")) { base = try this.expr(); }
+    Vec<Expr> whens;
+    Vec<Expr> thens;
+    while (this.eatKw("WHEN")) {
+      whens.push(try this.expr());
+      try this.expectKw("THEN");
+      thens.push(try this.expr());
+    }
+    if (whens.len() == 0) { return Result.Err(this.fail("expected WHEN")); }
+    Expr? otherwise = null;
+    if (this.eatKw("ELSE")) { otherwise = try this.expr(); }
+    try this.expectKw("END");
+    return Result.Ok(Expr.Case(base, whens.toArray(), thens.toArray(), otherwise));
+  }
+
+  // A type name: one or more words, then optionally `(n)` or `(n, m)`, kept as written.
+  Result<string, SqlError> typeName(this) {
+    string out = "";
+    while (this.peek().kind == T_IDENT && !this.isConstraintWord()) {
+      if (out != "") { out += " "; }
+      out += this.advance().text;
+    }
+    if (out != "" && this.isOp("(")) {
+      i32 s = this.peek().start;
+      this.pos++;
+      while (!this.isOp(")") && this.peek().kind != T_EOF) { this.pos++; }
+      try this.expectOp(")");
+      out += this.sql.slice(s, this.toks[this.pos - 1].end);
+    }
+    return Result.Ok(out);
+  }
+
+  bool isConstraintWord(this) {
+    return this.isKw("CONSTRAINT") || this.isKw("PRIMARY") || this.isKw("NOT") || this.isKw("NULL") ||
+           this.isKw("UNIQUE") || this.isKw("CHECK") || this.isKw("DEFAULT") || this.isKw("COLLATE") ||
+           this.isKw("REFERENCES") || this.isKw("GENERATED") || this.isKw("AS");
+  }
+
+  // ── SELECT ─────────────────────────────────────────────────────────────
+
+  // WITH [RECURSIVE] name [(cols)] AS [NOT] [MATERIALIZED] (select), …
+  Result<Cte[], SqlError> withClause(this) {
+    Vec<Cte> out;
+    while (true) {
+      string name = try this.name();
+      string[]? cols = null;
+      if (this.isOp("(")) { cols = try this.nameList(); }
+      try this.expectKw("AS");
+      if (this.eatKw("NOT")) { try this.expectKw("MATERIALIZED"); } else { this.eatKw("MATERIALIZED"); }
+      try this.expectOp("(");
+      Select sel = try this.select();
+      try this.expectOp(")");
+      out.push(Cte(name, cols, sel));
+      if (!this.eatOp(",")) { break; }
+    }
+    return Result.Ok(out.toArray());
+  }
+
+  Result<Select, SqlError> select(this) {
+    Cte[] with = Cte[]();
+    bool recursive = false;
+    if (this.eatKw("WITH")) {
+      recursive = this.eatKw("RECURSIVE");
+      with = try this.withClause();
+    }
+    Select first = try this.selectCore();
+    first.with = with;
+    first.recursive = recursive;
+    Select cur = first;
+    while (true) {
+      string? op = null;
+      if (this.eatKw("UNION")) { op = this.eatKw("ALL") ? "UNION ALL" : "UNION"; }
+      else if (this.eatKw("INTERSECT")) { op = "INTERSECT"; }
+      else if (this.eatKw("EXCEPT")) { op = "EXCEPT"; }
+      if (op is null) { break; }
+      Select next = try this.selectCore();
+      cur.compound = op;
+      cur.next = next;
+      cur = next;
+    }
+    // ORDER BY and LIMIT apply to the whole compound; they are kept on the first select.
+    if (this.eatKw("ORDER")) {
+      try this.expectKw("BY");
+      first.orderBy = try this.orderTerms();
+    }
+    if (this.eatKw("LIMIT")) {
+      first.limit = try this.expr();
+      if (this.eatKw("OFFSET")) { first.offset = try this.expr(); }
+      else if (this.eatOp(",")) {
+        // LIMIT a, b means OFFSET a LIMIT b.
+        first.offset = first.limit;
+        first.limit = try this.expr();
+      }
+    }
+    return Result.Ok(first);
+  }
+
+  Result<OrderTerm[], SqlError> orderTerms(this) {
+    Vec<OrderTerm> out;
+    while (true) {
+      Expr e = try this.expr();
+      bool desc = false;
+      if (this.eatKw("DESC")) { desc = true; } else { this.eatKw("ASC"); }
+      i32 nulls = 0;
+      if (this.eatKw("NULLS")) {
+        if (this.eatKw("FIRST")) { nulls = 1; } else { try this.expectKw("LAST"); nulls = 2; }
+      }
+      out.push(OrderTerm(e, desc, nulls));
+      if (!this.eatOp(",")) { break; }
+    }
+    return Result.Ok(out.toArray());
+  }
+
+  Result<Select, SqlError> selectCore(this) {
+    Select s = Select { };
+    if (this.eatKw("VALUES")) {
+      s.values = try this.valuesRows();
+      return Result.Ok(s);
+    }
+    try this.expectKw("SELECT");
+    if (this.eatKw("DISTINCT")) { s.distinct = true; } else { this.eatKw("ALL"); }
+    s.cols = try this.resultCols();
+    if (this.eatKw("FROM")) { s.from = try this.sources(); }
+    if (this.eatKw("WHERE")) { s.where = try this.expr(); }
+    if (this.eatKw("GROUP")) {
+      try this.expectKw("BY");
+      Vec<Expr> g;
+      while (true) {
+        g.push(try this.expr());
+        if (!this.eatOp(",")) { break; }
+      }
+      s.groupBy = g.toArray();
+    }
+    if (this.eatKw("HAVING")) { s.having = try this.expr(); }
+    if (this.eatKw("WINDOW")) {
+      Vec<NamedWindow> ws;
+      while (true) {
+        string wn = try this.name();
+        try this.expectKw("AS");
+        try this.expectOp("(");
+        ws.push(NamedWindow(wn, try this.windowSpec()));
+        try this.expectOp(")");
+        if (!this.eatOp(",")) { break; }
+      }
+      s.windows = ws.toArray();
+    }
+    return Result.Ok(s);
+  }
+
+  Result<Expr[][], SqlError> valuesRows(this) {
+    Vec<Expr[]> rows;
+    while (true) {
+      try this.expectOp("(");
+      Vec<Expr> row;
+      while (true) {
+        row.push(try this.expr());
+        if (!this.eatOp(",")) { break; }
+      }
+      try this.expectOp(")");
+      rows.push(row.toArray());
+      if (!this.eatOp(",")) { break; }
+    }
+    return Result.Ok(rows.toArray());
+  }
+
+  Result<ResultCol[], SqlError> resultCols(this) {
+    Vec<ResultCol> out;
+    while (true) {
+      if (this.eatOp("*")) {
+        out.push(ResultCol(null, "", null, "*"));
+      } else if (this.peek().kind == T_IDENT && this.peekAt(1).kind == T_OP && this.peekAt(1).text == "." &&
+                 this.peekAt(2).kind == T_OP && this.peekAt(2).text == "*") {
+        string t = this.advance().text;
+        this.pos += 2;
+        out.push(ResultCol(null, t, null, t + ".*"));
+      } else {
+        i32 from = this.peek().start;
+        Expr e = try this.expr();
+        string text = this.sql.slice(from, this.toks[this.pos - 1].end);
+        string? alias = null;
+        if (this.eatKw("AS")) { alias = try this.name(); }
+        else if ((this.peek().kind == T_IDENT && !this.isClauseWord()) || this.peek().kind == T_STRING) {
+          alias = this.advance().text;
+        }
+        out.push(ResultCol(e, null, alias, text));
+      }
+      if (!this.eatOp(",")) { break; }
+    }
+    return Result.Ok(out.toArray());
+  }
+
+  Result<Source, SqlError> source(this, i32 join) {
+    Source s = Source { join: join };
+    if (this.eatOp("(")) {
+      s.sub = try this.select();
+      try this.expectOp(")");
+    } else {
+      s.table = try this.qualifiedName();
+      if (this.eatOp("(")) {
+        Vec<Expr> args;
+        if (!this.isOp(")")) {
+          while (true) {
+            args.push(try this.expr());
+            if (!this.eatOp(",")) { break; }
+          }
+        }
+        try this.expectOp(")");
+        s.args = args.toArray();
+      }
+    }
+    if (this.eatKw("AS")) { s.alias = try this.name(); }
+    else if (this.peek().kind == T_IDENT && !this.isClauseWord()) { s.alias = this.advance().text; }
+    if (this.eatKw("INDEXED")) { try this.expectKw("BY"); try this.name(); }
+    else if (this.isKw("NOT") && this.isKwAt(1, "INDEXED")) { this.pos += 2; }
+    return Result.Ok(s);
+  }
+
+  Result<Source[], SqlError> sources(this) {
+    Vec<Source> out;
+    out.push(try this.source(JOIN_FIRST));
+    while (true) {
+      i32 join = -1;
+      bool natural = false;
+      if (this.eatOp(",")) { join = JOIN_CROSS; }
+      else {
+        natural = this.eatKw("NATURAL");
+        if (this.eatKw("JOIN")) { join = JOIN_INNER; }
+        else if (this.isKw("INNER") || this.isKw("CROSS")) {
+          join = this.isKw("INNER") ? JOIN_INNER : JOIN_CROSS;
+          this.pos++;
+          try this.expectKw("JOIN");
+        } else if (this.isKw("LEFT") || this.isKw("RIGHT") || this.isKw("FULL")) {
+          string kind = upper(this.advance().text);
+          this.eatKw("OUTER");
+          try this.expectKw("JOIN");
+          join = kind == "LEFT" ? JOIN_LEFT : (kind == "RIGHT" ? JOIN_RIGHT : JOIN_FULL);
+        } else if (natural) {
+          return Result.Err(this.fail("expected JOIN"));
+        }
+      }
+      if (join < 0) { break; }
+      Source s = try this.source(join);
+      s.natural = natural;
+      if (this.eatKw("ON")) { s.on = try this.expr(); }
+      else if (this.eatKw("USING")) { s.usingCols = try this.nameList(); }
+      out.push(s);
+    }
+    return Result.Ok(out.toArray());
+  }
+
+  // ── statements ─────────────────────────────────────────────────────────
+
+  Result<Stmt, SqlError> statement(this) {
+    if (this.isKw("WITH")) {
+      // A WITH before INSERT, UPDATE or DELETE belongs to that statement; before SELECT, to the select.
+      i32 save = this.pos;
+      this.pos++;
+      bool recursive = this.eatKw("RECURSIVE");
+      Cte[] with = try this.withClause();
+      if (this.isKw("INSERT") || this.isKw("REPLACE")) {
+        Insert i = try this.insert();
+        i.with = with;
+        i.recursive = recursive;
+        return Result.Ok(Stmt.InsertStmt(i));
+      }
+      if (this.eatKw("UPDATE")) {
+        Update u = try this.update();
+        u.with = with;
+        u.recursive = recursive;
+        return Result.Ok(Stmt.UpdateStmt(u));
+      }
+      if (this.eatKw("DELETE")) {
+        Delete d = try this.delete();
+        d.with = with;
+        d.recursive = recursive;
+        return Result.Ok(Stmt.DeleteStmt(d));
+      }
+      this.pos = save;
+    }
+    if (this.isKw("SELECT") || this.isKw("VALUES") || this.isKw("WITH")) { return Result.Ok(Stmt.SelectStmt(try this.select())); }
+    if (this.isKw("INSERT") || this.isKw("REPLACE")) { return Result.Ok(Stmt.InsertStmt(try this.insert())); }
+    if (this.eatKw("UPDATE")) { return Result.Ok(Stmt.UpdateStmt(try this.update())); }
+    if (this.eatKw("DELETE")) { return Result.Ok(Stmt.DeleteStmt(try this.delete())); }
+    if (this.eatKw("CREATE")) { return this.create(); }
+    if (this.eatKw("DROP")) {
+      string kind = upper(this.advance().text);
+      if (kind != "TABLE" && kind != "INDEX" && kind != "VIEW" && kind != "TRIGGER") { return Result.Err(SqlError.unsupported("DROP \{kind}")); }
+      bool ifExists = false;
+      if (this.eatKw("IF")) { try this.expectKw("EXISTS"); ifExists = true; }
+      return Result.Ok(Stmt.DropStmt(kind, try this.qualifiedName(), ifExists));
+    }
+    if (this.eatKw("ALTER")) { return this.alter(); }
+    if (this.eatKw("BEGIN")) {
+      if (!this.eatKw("DEFERRED") && !this.eatKw("IMMEDIATE")) { this.eatKw("EXCLUSIVE"); }
+      this.eatKw("TRANSACTION");
+      return Result.Ok(Stmt.BeginStmt);
+    }
+    if (this.eatKw("COMMIT") || this.eatKw("END")) { this.eatKw("TRANSACTION"); return Result.Ok(Stmt.CommitStmt); }
+    if (this.eatKw("ROLLBACK")) {
+      this.eatKw("TRANSACTION");
+      if (this.eatKw("TO")) {
+        this.eatKw("SAVEPOINT");
+        return Result.Ok(Stmt.RollbackToStmt(try this.name()));
+      }
+      return Result.Ok(Stmt.RollbackStmt);
+    }
+    if (this.eatKw("SAVEPOINT")) { return Result.Ok(Stmt.SavepointStmt(try this.name())); }
+    if (this.eatKw("RELEASE")) {
+      this.eatKw("SAVEPOINT");
+      return Result.Ok(Stmt.ReleaseStmt(try this.name()));
+    }
+    if (this.eatKw("ANALYZE")) {
+      string? n = null;
+      if (this.peek().kind == T_IDENT && !this.isClauseWord()) { n = try this.qualifiedName(); }
+      return Result.Ok(Stmt.AnalyzeStmt(n));
+    }
+    if (this.eatKw("REINDEX")) {
+      string? n = null;
+      if (this.peek().kind == T_IDENT && !this.isClauseWord()) { n = try this.qualifiedName(); }
+      return Result.Ok(Stmt.ReindexStmt(n));
+    }
+    if (this.eatKw("VACUUM")) {
+      if (this.peek().kind == T_IDENT && !this.isKw("INTO")) { try this.name(); }
+      if (this.isKw("INTO")) { return Result.Err(SqlError.unsupported("VACUUM INTO")); }
+      return Result.Ok(Stmt.VacuumStmt);
+    }
+    if (this.eatKw("PRAGMA")) {
+      string n = lower(try this.qualifiedName());
+      Expr? v = null;
+      if (this.eatOp("=")) { v = try this.pragmaValue(); }
+      else if (this.eatOp("(")) { v = try this.pragmaValue(); try this.expectOp(")"); }
+      return Result.Ok(Stmt.PragmaStmt(n, v));
+    }
+    return Result.Err(this.fail("expected a statement"));
+  }
+
+  // A pragma's value may be a bare word (`journal_mode=WAL`), which is text rather than a column.
+  Result<Expr, SqlError> pragmaValue(this) {
+    Token t = this.peek();
+    if (t.kind == T_IDENT) { this.pos++; return Result.Ok(Expr.Lit(Value.Text(t.text))); }
+    return this.expr();
+  }
+
+  i32 orAction(this) {
+    if (!this.eatKw("OR")) { return -1; }
+    if (this.eatKw("IGNORE")) { return OR_IGNORE; }
+    if (this.eatKw("REPLACE")) { return OR_REPLACE; }
+    if (this.eatKw("FAIL")) { return OR_FAIL; }
+    if (this.eatKw("ROLLBACK")) { return OR_ROLLBACK; }
+    this.eatKw("ABORT");
+    return OR_ABORT;
+  }
+
+  Result<ResultCol[]?, SqlError> returning(this) {
+    if (!this.eatKw("RETURNING")) { return Result.Ok(null); }
+    return Result.Ok(try this.resultCols());
+  }
+
+  Result<Insert, SqlError> insert(this) {
+    Insert ins = Insert { table: "" };
+    if (this.eatKw("REPLACE")) { ins.orAction = OR_REPLACE; }
+    else {
+      this.pos++;
+      ins.orAction = this.orAction();
+    }
+    try this.expectKw("INTO");
+    ins.table = try this.qualifiedName();
+    if (this.eatKw("AS")) { try this.name(); }
+    if (this.isOp("(")) { ins.cols = try this.nameList(); }
+    if (this.eatKw("DEFAULT")) {
+      try this.expectKw("VALUES");
+      ins.defaultValues = true;
+    } else {
+      ins.source = try this.select();
+    }
+    Vec<Upsert> ups;
+    while (this.isKw("ON") && this.isKwAt(1, "CONFLICT")) {
+      this.pos += 2;
+      Upsert u = Upsert { };
+      if (this.isOp("(")) {
+        u.target = try this.nameList();
+        if (this.eatKw("WHERE")) { u.targetWhere = try this.expr(); }
+      }
+      try this.expectKw("DO");
+      if (this.eatKw("NOTHING")) {
+        u.doNothing = true;
+      } else {
+        try this.expectKw("UPDATE");
+        try this.expectKw("SET");
+        u.sets = try this.assignments();
+        if (this.eatKw("WHERE")) { u.where = try this.expr(); }
+      }
+      ups.push(u);
+    }
+    ins.upserts = ups.toArray();
+    ins.returning = try this.returning();
+    return Result.Ok(ins);
+  }
+
+  Result<Assign[], SqlError> assignments(this) {
+    Vec<Assign> out;
+    while (true) {
+      string[] cols;
+      if (this.isOp("(")) { cols = try this.nameList(); } else { cols = [try this.name()]; }
+      try this.expectOp("=");
+      out.push(Assign(cols, try this.expr()));
+      if (!this.eatOp(",")) { break; }
+    }
+    return Result.Ok(out.toArray());
+  }
+
+  Result<Update, SqlError> update(this) {
+    i32 orAct = this.orAction();
+    string t = try this.qualifiedName();
+    string? alias = null;
+    if (this.eatKw("AS")) { alias = try this.name(); }
+    if (this.eatKw("INDEXED")) { try this.expectKw("BY"); try this.name(); }
+    else if (this.isKw("NOT") && this.isKwAt(1, "INDEXED")) { this.pos += 2; }
+    try this.expectKw("SET");
+    Assign[] sets = try this.assignments();
+    Source[]? from = null;
+    if (this.eatKw("FROM")) { from = try this.sources(); }
+    Expr? where = null;
+    if (this.eatKw("WHERE")) { where = try this.expr(); }
+    return Result.Ok(Update { table: t, orAction: orAct, sets: sets, where: where, returning: try this.returning(),
+                              alias: alias, from: from });
+  }
+
+  Result<Delete, SqlError> delete(this) {
+    try this.expectKw("FROM");
+    string t = try this.qualifiedName();
+    Expr? where = null;
+    if (this.eatKw("WHERE")) { where = try this.expr(); }
+    return Result.Ok(Delete { table: t, where: where, returning: try this.returning() });
+  }
+
+  Result<Stmt, SqlError> alter(this) {
+    try this.expectKw("TABLE");
+    string t = try this.qualifiedName();
+    if (this.eatKw("ADD")) {
+      this.eatKw("COLUMN");
+      i32 s = this.peek().start;
+      ColumnDef c = try this.columnDef();
+      string text = this.sql.slice(s, this.toks[this.pos - 1].end);
+      return Result.Ok(Stmt.AddColumnStmt(t, c, text));
+    }
+    if (this.eatKw("RENAME")) {
+      if (this.eatKw("TO")) { return Result.Ok(Stmt.RenameTableStmt(t, try this.name())); }
+      this.eatKw("COLUMN");
+      string from = try this.name();
+      try this.expectKw("TO");
+      return Result.Ok(Stmt.RenameColumnStmt(t, from, try this.name()));
+    }
+    if (this.eatKw("DROP")) {
+      this.eatKw("COLUMN");
+      return Result.Ok(Stmt.DropColumnStmt(t, try this.name()));
+    }
+    return Result.Err(this.fail("expected ADD, RENAME or DROP"));
+  }
+
+  Result<Stmt, SqlError> create(this) {
+    i32 begin = this.toks[this.pos - 1].start;
+    this.lastTemp = false;
+    bool temp = this.eatKw("TEMP") || this.eatKw("TEMPORARY");
+    if (temp && !(this.isKw("TABLE") || this.isKw("VIEW") || this.isKw("TRIGGER"))) { return Result.Err(this.fail("expected TABLE, VIEW or TRIGGER")); }
+    Stmt made = try this.createInner();
+    if (temp || this.lastTemp) { return Result.Ok(Stmt.TempStmt(made)); }
+    return Result.Ok(made);
+  }
+
+  Result<Stmt, SqlError> createInner(this) {
+    bool unique = this.eatKw("UNIQUE");
+    if (this.eatKw("INDEX")) { return Result.Ok(Stmt.CreateIndexStmt(try this.createIndex(unique))); }
+    if (unique) { return Result.Err(this.fail("expected INDEX")); }
+    if (this.eatKw("TABLE")) { return Result.Ok(Stmt.CreateTableStmt(try this.createTable())); }
+    if (this.eatKw("VIEW")) {
+      bool ine = this.ifNotExists();
+      i32 nameStart = this.peek().start;
+      string n = try this.qualifiedName();
+      nameStart = this.lastNameStart;
+      string[]? cols = null;
+      if (this.isOp("(")) { cols = try this.nameList(); }
+      try this.expectKw("AS");
+      Select sel = try this.select();
+      string sql = "CREATE VIEW " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
+      return Result.Ok(Stmt.CreateViewStmt(n, ine, cols, sel, sql));
+    }
+    if (this.eatKw("TRIGGER")) { return Result.Ok(Stmt.CreateTriggerStmt(try this.createTrigger())); }
+    if (this.isKw("VIRTUAL")) {
+      return Result.Err(SqlError.unsupported("CREATE \{upper(this.peek().text)}"));
+    }
+    return Result.Err(this.fail("expected TABLE or INDEX"));
+  }
+
+  Result<CreateTrigger, SqlError> createTrigger(this) {
+    bool ine = this.ifNotExists();
+    i32 nameStart = this.peek().start;
+    string n = try this.qualifiedName();
+    nameStart = this.lastNameStart;
+    string timing = "BEFORE";
+    if (this.eatKw("BEFORE")) { timing = "BEFORE"; }
+    else if (this.eatKw("AFTER")) { timing = "AFTER"; }
+    else if (this.eatKw("INSTEAD")) { try this.expectKw("OF"); timing = "INSTEAD OF"; }
+    string event = "";
+    string[] ofCols = string[]();
+    if (this.eatKw("DELETE")) { event = "DELETE"; }
+    else if (this.eatKw("INSERT")) { event = "INSERT"; }
+    else if (this.eatKw("UPDATE")) {
+      event = "UPDATE";
+      if (this.eatKw("OF")) {
+        Vec<string> cs;
+        while (true) {
+          cs.push(try this.name());
+          if (!this.eatOp(",")) { break; }
+        }
+        ofCols = cs.toArray();
+      }
+    } else {
+      return Result.Err(this.fail("expected DELETE, INSERT or UPDATE"));
+    }
+    try this.expectKw("ON");
+    string t = try this.qualifiedName();
+    if (this.eatKw("FOR")) {
+      try this.expectKw("EACH");
+      try this.expectKw("ROW");
+    }
+    Expr? when = null;
+    if (this.eatKw("WHEN")) { when = try this.expr(); }
+    try this.expectKw("BEGIN");
+    Vec<Stmt> body;
+    while (!this.isKw("END")) {
+      if (this.peek().kind == T_EOF) { return Result.Err(this.fail("expected END")); }
+      body.push(try this.statement());
+      try this.expectOp(";");
+    }
+    this.pos++;
+    string sql = "CREATE TRIGGER " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
+    return Result.Ok(CreateTrigger(n, ine, timing, event, ofCols, t, when, body.toArray(), sql));
+  }
+
+  bool ifNotExists(this) {
+    if (this.isKw("IF") && this.isKwAt(1, "NOT") && this.isKwAt(2, "EXISTS")) { this.pos += 3; return true; }
+    return false;
+  }
+
+  Result<CreateIndex, SqlError> createIndex(this, bool unique) {
+    bool ine = this.ifNotExists();
+    i32 nameStart = this.peek().start;
+    string n = try this.qualifiedName();
+    nameStart = this.lastNameStart;
+    try this.expectKw("ON");
+    string t = try this.qualifiedName();
+    try this.expectOp("(");
+    Vec<IndexCol> cols;
+    while (true) {
+      // A term is a column name, or any expression (an index on an expression).
+      i32 at = this.pos;
+      Token c = this.peek();
+      Expr e = try this.expr();
+      IndexCol ic = IndexCol { name: "", desc: false };
+      match (e) {
+        Col(tb, nm): { if (tb is null) { ic.name = nm; } else { ic.expr = e as Expr; } }
+        Collate(inner, coll): {
+          ic.collate = coll;
+          match (inner) { Col(tb, nm): { if (tb is null) { ic.name = nm; } else { ic.expr = inner as Expr; } } default: { ic.expr = inner as Expr; } }
+        }
+        default: { ic.expr = e as Expr; }
+      }
+      if (c.kind == T_STRING && ic.expr is not null) {
+        // A string literal as a term names a column, as SQLite has always allowed.
+        match (e) { Lit(v): { ic.expr = null; ic.name = c.text; } default: {} }
+      }
+      if (this.eatKw("DESC")) { ic.desc = true; } else { this.eatKw("ASC"); }
+      cols.push(ic);
+      if (!this.eatOp(",")) { break; }
+    }
+    try this.expectOp(")");
+    Expr? where = null;
+    if (this.eatKw("WHERE")) { where = try this.expr(); }
+    string sql = (unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ") + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
+    return Result.Ok(CreateIndex(n, t, unique, ine, cols.toArray(), where, sql));
+  }
+
+  Result<ColumnDef, SqlError> columnDef(this) {
+    ColumnDef c = ColumnDef { name: try this.name(), typeName: "" };
+    c.typeName = try this.typeName();
+    while (true) {
+      if (this.eatKw("CONSTRAINT")) { try this.name(); }
+      if (this.eatKw("PRIMARY")) {
+        try this.expectKw("KEY");
+        c.primaryKey = true;
+        if (this.eatKw("DESC")) { c.pkDesc = true; } else { this.eatKw("ASC"); }
+        c.pkConflict = try this.conflictClause();
+        if (this.eatKw("AUTOINCREMENT")) { c.autoincrement = true; }
+      } else if (this.isKw("NOT") && this.isKwAt(1, "NULL")) {
+        this.pos += 2;
+        c.notNull = true;
+        c.notNullConflict = try this.conflictClause();
+      } else if (this.eatKw("NULL")) {
+        try this.conflictClause();
+      } else if (this.eatKw("UNIQUE")) {
+        c.unique = true;
+        c.uniqueConflict = try this.conflictClause();
+      } else if (this.eatKw("CHECK")) {
+        try this.expectOp("(");
+        Expr e = try this.expr();
+        try this.expectOp(")");
+        Vec<Expr> cs = Vec.fromArray(c.checks);
+        cs.push(e);
+        c.checks = cs.toArray();
+      } else if (this.eatKw("DEFAULT")) {
+        if (this.isOp("(")) {
+          this.pos++;
+          i32 from = this.peek().start;
+          c.dflt = try this.expr();
+          c.dfltText = this.sql.slice(from, this.toks[this.pos - 1].end);
+          try this.expectOp(")");
+        } else {
+          i32 from = this.peek().start;
+          if (this.isOp("-") || this.isOp("+")) { c.dflt = try this.unary(); } else { c.dflt = try this.primary(); }
+          c.dfltText = this.sql.slice(from, this.toks[this.pos - 1].end);
+        }
+      } else if (this.eatKw("COLLATE")) {
+        c.collate = lower(try this.name());
+      } else if (this.eatKw("REFERENCES")) {
+        c.fk = try this.foreignKeyRest();
+      } else if (this.isKw("GENERATED") || this.isKw("AS")) {
+        if (this.eatKw("GENERATED")) { try this.expectKw("ALWAYS"); }
+        try this.expectKw("AS");
+        try this.expectOp("(");
+        c.generated = try this.expr();
+        try this.expectOp(")");
+        if (this.eatKw("STORED")) { c.stored = true; } else { this.eatKw("VIRTUAL"); }
+      } else {
+        break;
+      }
+    }
+    return Result.Ok(c);
+  }
+
+  // A constraint's ON CONFLICT: its resolution, or -1 when there is none.
+  Result<i32, SqlError> conflictClause(this) {
+    if (!(this.isKw("ON") && this.isKwAt(1, "CONFLICT"))) { return Result.Ok(-1); }
+    this.pos += 2;
+    if (this.eatKw("ROLLBACK")) { return Result.Ok(OR_ROLLBACK); }
+    if (this.eatKw("ABORT")) { return Result.Ok(OR_ABORT); }
+    if (this.eatKw("FAIL")) { return Result.Ok(OR_FAIL); }
+    if (this.eatKw("IGNORE")) { return Result.Ok(OR_IGNORE); }
+    if (this.eatKw("REPLACE")) { return Result.Ok(OR_REPLACE); }
+    return Result.Err(this.fail("expected a conflict resolution"));
+  }
+
+  Result<void, SqlError> skipParens(this) {
+    try this.expectOp("(");
+    i32 depth = 1;
+    while (depth > 0) {
+      Token t = this.advance();
+      if (t.kind == T_EOF) { return Result.Err(this.fail("unbalanced parentheses")); }
+      if (t.kind == T_OP && t.text == "(") { depth++; }
+      if (t.kind == T_OP && t.text == ")") { depth--; }
+    }
+    return Result.Ok();
+  }
+
+  // What follows REFERENCES. The keys are enforced only while PRAGMA foreign_keys is on, which is
+  // SQLite's default too.
+  Result<ForeignKeyDef, SqlError> foreignKeyRest(this) {
+    ForeignKeyDef fk = ForeignKeyDef { parent: try this.name(), parentCols: string[]() };
+    if (this.isOp("(")) { fk.parentCols = try this.nameList(); }
+    while (true) {
+      if (this.eatKw("ON")) {
+        bool del = this.eatKw("DELETE");
+        if (!del) { try this.expectKw("UPDATE"); }
+        string action = "NO ACTION";
+        if (this.eatKw("SET")) {
+          if (this.eatKw("NULL")) { action = "SET NULL"; } else { try this.expectKw("DEFAULT"); action = "SET DEFAULT"; }
+        } else if (this.eatKw("CASCADE")) { action = "CASCADE"; }
+        else if (this.eatKw("RESTRICT")) { action = "RESTRICT"; }
+        else { try this.expectKw("NO"); try this.expectKw("ACTION"); }
+        if (del) { fk.onDelete = action; } else { fk.onUpdate = action; }
+      } else if (this.eatKw("MATCH")) {
+        try this.name();
+      } else if (this.isKw("DEFERRABLE") || (this.isKw("NOT") && this.isKwAt(1, "DEFERRABLE"))) {
+        bool never = this.eatKw("NOT");
+        this.pos++;
+        bool deferred = false;
+        if (this.eatKw("INITIALLY")) { deferred = this.eatKw("DEFERRED"); if (!deferred) { this.eatKw("IMMEDIATE"); } }
+        fk.deferred = deferred && !never;
+      } else {
+        return Result.Ok(fk);
+      }
+    }
+  }
+
+  Result<CreateTable, SqlError> createTable(this) {
+    bool ine = this.ifNotExists();
+    i32 nameStart = this.peek().start;
+    string n = try this.qualifiedName();
+    nameStart = this.lastNameStart;
+    if (this.eatKw("AS")) {
+      Select sel = try this.select();
+      return Result.Ok(CreateTable(n, ine, ColumnDef[](), TableConstraint[](), false, "", false, sel));
+    }
+    try this.expectOp("(");
+    Vec<ColumnDef> cols;
+    Vec<TableConstraint> cons;
+    while (true) {
+      if (this.eatKw("CONSTRAINT")) { try this.name(); }
+      if (this.eatKw("PRIMARY")) {
+        try this.expectKw("KEY");
+        string[] names = try this.nameList();
+        bool[] desc = this.lastDesc;
+        bool auto = this.eatKw("AUTOINCREMENT");
+        i32 oc = try this.conflictClause();
+        cons.push(TableConstraint(auto ? "PRIMARY KEY AUTOINCREMENT" : "PRIMARY KEY", names, null, null, desc, oc));
+      } else if (this.eatKw("UNIQUE")) {
+        string[] names = try this.nameList();
+        cons.push(TableConstraint("UNIQUE", names, null, null, bool[](), try this.conflictClause()));
+      } else if (this.eatKw("CHECK")) {
+        try this.expectOp("(");
+        Expr e = try this.expr();
+        try this.expectOp(")");
+        cons.push(TableConstraint("CHECK", string[](), e, null, bool[](), -1));
+      } else if (this.eatKw("FOREIGN")) {
+        try this.expectKw("KEY");
+        string[] fcols = try this.nameList();
+        try this.expectKw("REFERENCES");
+        cons.push(TableConstraint("FOREIGN KEY", fcols, null, try this.foreignKeyRest(), bool[](), -1));
+      } else {
+        if (cons.len() > 0) { return Result.Err(this.fail("a column after a table constraint")); }
+        cols.push(try this.columnDef());
+      }
+      if (!this.eatOp(",")) { break; }
+    }
+    try this.expectOp(")");
+    bool withoutRowid = false;
+    bool strict = false;
+    while (true) {
+      if (this.eatKw("WITHOUT")) {
+        try this.expectKw("ROWID");
+        withoutRowid = true;
+      } else if (this.eatKw("STRICT")) {
+        strict = true;
+      } else {
+        break;
+      }
+      if (!this.eatOp(",")) { break; }
+    }
+    string sql = "CREATE TABLE " + this.sql.slice(nameStart, this.toks[this.pos - 1].end);
+    return Result.Ok(CreateTable(n, ine, cols.toArray(), cons.toArray(), withoutRowid, sql, strict, null));
+  }
+}
+
+export struct Parsed {
+  Stmt stmt;
+  i32 params;        // how many parameters the statement takes
+  string? rest;      // the text after this statement, when there is any
+}
+
+// One statement from the front of `sql`. A trailing `;` is consumed, and whatever follows is `rest`.
+export Result<Parsed, SqlError> parseOne(string sql) {
+  Token[] toks = try tokenize(sql);
+  Parser p = Parser.over(toks, sql);
+  while (p.eatOp(";")) { }
+  Stmt s = try p.statement();
+  if (p.peek().kind != T_EOF && !p.isOp(";")) { return Result.Err(p.fail("unexpected text")); }
+  while (p.eatOp(";")) { }
+  string? rest = null;
+  if (p.peek().kind != T_EOF) { rest = sql.slice(p.peek().start, sql.len()); }
+  return Result.Ok(Parsed(s, p.maxParam, rest));
+}
+
+export Result<Expr, SqlError> parseExpr(string sql) {
+  Token[] toks = try tokenize(sql);
+  Parser p = Parser.over(toks, sql);
+  Expr e = try p.expr();
+  if (p.peek().kind != T_EOF) { return Result.Err(p.fail("unexpected text")); }
+  return Result.Ok(e);
+}
+
+// True when nothing but whitespace, comments and semicolons is left.
+export bool isBlank(string sql) {
+  match (tokenize(sql)) {
+    Ok(toks): {
+      for (Token t in toks) { if (t.kind != T_EOF && !(t.kind == T_OP && t.text == ";")) { return false; } }
+      return true;
+    }
+    Err(e): { return false; }
+  }
+}

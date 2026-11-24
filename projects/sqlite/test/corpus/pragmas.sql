@@ -1,0 +1,13 @@
+PRAGMA journal_mode;
+PRAGMA journal_mode = WAL;
+PRAGMA journal_mode;
+CREATE TABLE p (x);
+INSERT INTO p VALUES (1);
+PRAGMA user_version = 7;
+PRAGMA user_version;
+BEGIN;
+PRAGMA journal_mode = DELETE;
+PRAGMA journal_mode = WAL;
+COMMIT;
+PRAGMA journal_mode = WAL;
+SELECT * FROM p;

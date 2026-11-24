@@ -1,0 +1,15 @@
+PRAGMA encoding;
+PRAGMA encoding = 'UTF-16';
+PRAGMA encoding;
+PRAGMA encoding = 'utf-16be';
+PRAGMA encoding;
+PRAGMA encoding = 'bogus';
+CREATE TABLE t (a TEXT, b);
+PRAGMA encoding = 'UTF-8';
+PRAGMA encoding;
+INSERT INTO t VALUES ('é😀x', 'plain'), ('', x'0041'), ('日本語', NULL);
+SELECT a, length(a), hex(a), octet_length(a), typeof(a) FROM t;
+SELECT CAST(a AS BLOB), CAST(b AS TEXT), hex(CAST(b AS TEXT)) FROM t;
+SELECT upper(a), substr(a, 2, 1), instr(a, 'x'), a || '!' FROM t;
+CREATE INDEX t_a ON t (a);
+SELECT a FROM t WHERE a > 'a' ORDER BY a;

@@ -1,0 +1,108 @@
+// Databases the real SQLite wrote (tools/fixtures.py), read here and compared with its own dump of them;
+// then written back by this library and read again.
+
+import { Buf, Vec, flatten } from "core";
+import { Sys } from "std";
+import { Check } from "./check.wac";
+import { Database, openBytes, toBytes } from "../src/database.wac";
+import { Table, RowCursor, SchemaEntry } from "../src/schema.wac";
+import { sqlLiteral, formatReal } from "../src/format.wac";
+import { Value } from "../src/value.wac";
+import { SqliteFile } from "../src/file.wac";
+
+string dump(Database db) {
+  Buf out = Buf.create();
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (e.kind != "table") { continue; }
+    out.pushStr("table " + e.name + "\n");
+    Table t = db.table(e.name)!;
+    RowCursor c = t.cursor();
+    for (bool more = c.first(); more; more = c.next()) {
+      out.pushStr(sqlLiteral(Value.Int(c.row().rowid)));
+      Value[] vals = c.row().vals;
+      for (i32 c = 0; c < vals.len(); c++) { out.pushStr("|" + sqlLiteral(vals[c])); }
+      out.pushStr("\n");
+    }
+  }
+  return out.toStr();
+}
+
+string firstDifference(string a, string b) {
+  if (a == b) { return ""; }
+  i32 line = 1;
+  i32 start = 0;
+  i32 n = a.len() < b.len() ? a.len() : b.len();
+  for (i32 i = 0; i < n; i++) {
+    if (a.toBytes()[i] != b.toBytes()[i]) { break; }
+    if (a.slice(i, i + 1) == "\n") { line++; start = i + 1; }
+  }
+  i32 ea = a.slice(start, a.len()).indexOf("\n");
+  i32 eb = b.slice(start, b.len()).indexOf("\n");
+  string la = a.slice(start, ea < 0 ? a.len() : start + ea);
+  string lb = b.slice(start, eb < 0 ? b.len() : start + eb);
+  return "line \{line}: got [\{la}] want [\{lb}]";
+}
+
+Database load(Sys sys, string path) {
+  u8[] bytes = flatten(sys.files().readFile(path).wait()).unwrap();
+  match (openBytes(bytes)) {
+    Ok(db): { return db; }
+    Err(e): { trap path + ": " + e.describe(); }
+  }
+}
+
+string matchesDump(Sys sys, string name) {
+  Database db = load(sys, "test/data/" + name + ".db");
+  string want = string.fromBytes(flatten(sys.files().readFile("test/data/" + name + ".txt").wait()).unwrap());
+  string d = firstDifference(dump(db), want);
+  return d == "" ? "" : name + ": " + d + "\n";
+}
+
+export string test_reads_what_sqlite_wrote(Sys sys) {
+  return matchesDump(sys, "small") + matchesDump(sys, "big") + matchesDump(sys, "big4k");
+}
+
+string roundTrips(Sys sys, string name) {
+  Database db = load(sys, "test/data/" + name + ".db");
+  string before = dump(db);
+  u8[] bytes = toBytes(db);
+  Database again = Database.empty();
+  match (openBytes(bytes)) { Ok(x): { again = x; } Err(e): { return name + ": " + e.describe() + "\n"; } }
+  string d = firstDifference(dump(again), before);
+  return d == "" ? "" : name + " after a write: " + d + "\n";
+}
+
+// A WAL-mode database whose log holds committed transactions after a restart, stale frames from before
+// it, and a transaction that never committed: what SQLite reads from the pair, this reads too.
+export string test_reads_through_the_write_ahead_log(Sys sys) {
+  match (SqliteFile.open(sys.files(), "test/data/wal.db")) {
+    Ok(f): {
+      string want = string.fromBytes(flatten(sys.files().readFile("test/data/wal.txt").wait()).unwrap());
+      string d = firstDifference(dump(f.conn.db), want);
+      if (d != "") { return "wal: " + d; }
+      if (!f.conn.db.wal) { return "wal: not in WAL mode"; }
+      return "";
+    }
+    Err(e): { return "wal: " + e.describe(); }
+  }
+}
+
+export string test_what_it_writes_it_reads_back(Sys sys) {
+  return roundTrips(sys, "small") + roundTrips(sys, "big") + roundTrips(sys, "big4k");
+}
+
+export string test_reals_print_as_sqlite_prints_them() {
+  Check t = Check.create();
+  t.eqStr(formatReal(2.0), "2.0", "2.0");
+  t.eqStr(formatReal(1.0 / 3.0), "0.333333333333333", "a third");
+  t.eqStr(formatReal(0.1), "0.1", "0.1");
+  t.eqStr(formatReal(-0.25), "-0.25", "-0.25");
+  t.eqStr(formatReal(1e20), "1.0e+20", "1e20");
+  t.eqStr(formatReal(123456789012345.0), "123456789012345.0", "fifteen digits");
+  t.eqStr(formatReal(1234567890123456.0), "1.23456789012346e+15", "sixteen digits");
+  t.eqStr(formatReal(0.0001), "0.0001", "1e-4");
+  t.eqStr(formatReal(0.00001), "1.0e-05", "1e-5");
+  t.eqStr(formatReal(100.0), "100.0", "100");
+  return t.report();
+}

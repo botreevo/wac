@@ -1,0 +1,195 @@
+// Reading a database image: the header, and table and index b-trees walked in key order.
+//
+// The image is the whole file in memory. std has no random-access file reads, and the databases this is
+// for are small, so a file is read whole and written whole; see writer.wac for the other half.
+
+import { Result, Vec } from "core";
+import { SqlError } from "./error.wac";
+import { Value } from "./value.wac";
+import { decodeRecord, decodeRecordIn } from "./record.wac";
+import { be16, be32, readVarint, Varint, sliceBytes } from "./bytes.wac";
+
+export static string MAGIC = "SQLite format 3\0";
+
+export struct Header {
+  i32 pageSize;
+  i32 reserved;
+  i64 pageCount;
+  i64 changeCounter;
+  i64 schemaCookie;
+  i64 userVersion;
+  i64 applicationId;
+  bool wal = false;      // file format versions 2: the database is in WAL mode
+  i32 autoVacuum = 0;    // 0 none, 1 full, 2 incremental
+  i32 encoding = 1;      // 1 UTF-8, 2 UTF-16le, 3 UTF-16be
+
+  i32 usable(const this) { return this.pageSize - this.reserved; }
+}
+
+export struct Image {
+  u8[] data;
+  Header header;
+
+  i32 pageOffset(const this, i64 page) { return ((page - 1) * (this.header.pageSize as i64)) as! i32; }
+
+  // Where a page's b-tree header starts: page 1 carries the 100-byte file header first.
+  i32 btreeOffset(const this, i64 page) { return this.pageOffset(page) + (page == 1 ? 100 : 0); }
+}
+
+export Result<Image, SqlError> openImage(u8[] data) {
+  Header h = try readHeader(data, data.len() as i64);
+  return Result.Ok(Image(data, h));
+}
+
+// The header at the start of a database of `fileSize` bytes; `data` need hold only its first 100.
+export Result<Header, SqlError> readHeader(const u8[] data, i64 fileSize) {
+  if (data.len() < 100) { return Result.Err(SqlError.corrupt("file is shorter than a header")); }
+  u8[] m = MAGIC.toBytes();
+  for (i32 i = 0; i < 16; i++) {
+    if (data[i] != m[i]) { return Result.Err(SqlError.corrupt("not a SQLite database")); }
+  }
+  i32 ps = be16(data, 16);
+  if (ps == 1) { ps = 65536; }
+  if (ps < 512 || ps > 65536 || (ps & (ps - 1)) != 0) {
+    return Result.Err(SqlError.corrupt("bad page size \{ps}"));
+  }
+  if (data[18] > 2 || data[19] > 2) {
+    return Result.Err(SqlError.unsupported("file format version \{data[18] as i32}/\{data[19] as i32}"));
+  }
+  i64 enc = be32(data, 56);
+  if (enc > 3) { return Result.Err(SqlError.corrupt("unknown text encoding \{enc}")); }
+  i64 count = be32(data, 28);
+  i64 fromSize = fileSize / (ps as i64);
+  // A header count is trusted only when the "version valid for" number matches the change counter, which
+  // is SQLite's own rule: an old writer may have grown the file without updating it.
+  if (count == 0 || be32(data, 92) != be32(data, 24) || count > fromSize) { count = fromSize; }
+  return Result.Ok(Header(ps, data[20] as i32, count, be32(data, 24), be32(data, 40), signed32(be32(data, 60)), signed32(be32(data, 68)), data[18] == 2,
+                          be32(data, 52) == 0 ? 0 : (be32(data, 64) != 0 ? 2 : 1), enc == 0 ? 1 : enc as! i32));
+}
+
+// The largest payload kept on a page, and the least, for a page kind (SQLite's X and M).
+export i32 maxLocal(i32 usable, bool table) {
+  return table ? usable - 35 : ((usable - 12) * 64 / 255) - 23;
+}
+
+export i32 minLocal(i32 usable) { return ((usable - 12) * 32 / 255) - 23; }
+
+// How much of a payload of `p` bytes stays in the cell.
+export i32 localSize(i32 usable, bool table, i64 p) {
+  i32 x = maxLocal(usable, table);
+  if (p <= x as i64) { return p as! i32; }
+  i32 m = minLocal(usable);
+  i32 k = m + ((p - m as i64) % ((usable - 4) as i64)) as! i32;
+  return k <= x ? k : m;
+}
+
+struct Walk {
+  const Image img;
+  i32 depth;
+}
+
+Result<u8[], SqlError> payloadAt(const Image img, i32 at, i64 size, bool table) {
+  if (size < 0 || size > 1000000000) { return Result.Err(SqlError.corrupt("payload size \{size}")); }
+  i32 usable = img.header.usable();
+  i32 local = localSize(usable, table, size);
+  if (at + local > img.data.len()) { return Result.Err(SqlError.corrupt("cell runs off the file")); }
+  if (local as i64 == size) { return Result.Ok(sliceBytes(img.data, at, at + local)); }
+  u8[] out = u8[].filled(size as! i32, 0);
+  out.copyFrom(img.data, at, 0, local);
+  i32 got = local;
+  i64 next = be32(img.data, at + local);
+  i32 hops = 0;
+  while (got < out.len()) {
+    if (next < 2 || next > img.header.pageCount || hops > 1000000) {
+      return Result.Err(SqlError.corrupt("bad overflow chain"));
+    }
+    i32 off = img.pageOffset(next);
+    i32 n = out.len() - got < usable - 4 ? out.len() - got : usable - 4;
+    out.copyFrom(img.data, off + 4, got, n);
+    got += n;
+    next = be32(img.data, off);
+    hops++;
+  }
+  return Result.Ok(out);
+}
+
+export struct RawRow {
+  i64 rowid;
+  u8[] payload;
+}
+
+Result<void, SqlError> checkPage(const Image img, i64 page, i32 depth) {
+  if (page < 1 || page > img.header.pageCount) { return Result.Err(SqlError.corrupt("page \{page} out of range")); }
+  if (depth > 40) { return Result.Err(SqlError.corrupt("b-tree too deep")); }
+  return Result.Ok();
+}
+
+Result<void, SqlError> walkTable(const Image img, i64 page, i32 depth, Vec<RawRow> out) {
+  try checkPage(img, page, depth);
+  i32 h = img.btreeOffset(page);
+  i32 base = img.pageOffset(page);
+  i32 kind = img.data[h] as i32;
+  i32 n = be16(img.data, h + 3);
+  if (kind == 13) {
+    for (i32 i = 0; i < n; i++) {
+      i32 at = base + be16(img.data, h + 8 + 2 * i);
+      Varint size = readVarint(img.data, at);
+      Varint rowid = readVarint(img.data, at + size.size);
+      u8[] p = try payloadAt(img, at + size.size + rowid.size, size.value, true);
+      out.push(RawRow(rowid.value, p));
+    }
+    return Result.Ok();
+  }
+  if (kind != 5) { return Result.Err(SqlError.corrupt("page \{page} is not a table page (\{kind})")); }
+  for (i32 i = 0; i < n; i++) {
+    i32 at = base + be16(img.data, h + 12 + 2 * i);
+    try walkTable(img, be32(img.data, at), depth + 1, out);
+  }
+  return walkTable(img, be32(img.data, h + 8), depth + 1, out);
+}
+
+// Every row of a table b-tree, in rowid order.
+export Result<Vec<RawRow>, SqlError> readTable(const Image img, i64 root) {
+  Vec<RawRow> out;
+  try walkTable(img, root, 0, out);
+  return Result.Ok(out);
+}
+
+Result<void, SqlError> walkIndex(const Image img, i64 page, i32 depth, Vec<u8[]> out) {
+  try checkPage(img, page, depth);
+  i32 h = img.btreeOffset(page);
+  i32 base = img.pageOffset(page);
+  i32 kind = img.data[h] as i32;
+  i32 n = be16(img.data, h + 3);
+  if (kind != 10 && kind != 2) { return Result.Err(SqlError.corrupt("page \{page} is not an index page (\{kind})")); }
+  bool leaf = kind == 10;
+  for (i32 i = 0; i < n; i++) {
+    i32 at = base + be16(img.data, h + (leaf ? 8 : 12) + 2 * i);
+    if (!leaf) {
+      try walkIndex(img, be32(img.data, at), depth + 1, out);
+      at += 4;
+    }
+    Varint size = readVarint(img.data, at);
+    out.push(try payloadAt(img, at + size.size, size.value, false));
+  }
+  if (!leaf) { try walkIndex(img, be32(img.data, h + 8), depth + 1, out); }
+  return Result.Ok();
+}
+
+// Every key of an index b-tree, in key order, as raw records.
+export Result<Vec<u8[]>, SqlError> readIndex(const Image img, i64 root) {
+  Vec<u8[]> out;
+  try walkIndex(img, root, 0, out);
+  return Result.Ok(out);
+}
+
+export Result<Value[], SqlError> decode(const u8[] payload) { return decodeIn(payload, 1); }
+
+export Result<Value[], SqlError> decodeIn(const u8[] payload, i32 enc) {
+  Value[]? v = decodeRecordIn(payload, enc);
+  if (v is null) { return Result.Err(SqlError.corrupt("malformed record")); }
+  return Result.Ok(v!);
+}
+
+// A 32-bit header field that SQLite reads as signed (user_version, application_id).
+export i64 signed32(i64 v) { return v >= 0x80000000 ? v - 0x100000000 : v; }

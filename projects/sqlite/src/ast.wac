@@ -1,0 +1,267 @@
+// What the parser produces. Names are kept as written; comparisons against them fold case where SQLite
+// does.
+
+import { Value } from "./value.wac";
+
+export enum Expr {
+  Lit(Value v),
+  // A parameter, by its 1-based number: `?` takes the next one, `?3` names one, and `:name` gets a
+  // number from its first appearance, as in SQLite.
+  Param(i32 n),
+  Col(string? table, string name),
+  Unary(string op, Expr e),            // "-", "+", "~", "NOT"
+  Binary(string op, Expr l, Expr r),   // upper case for words: "AND", "OR", "LIKE", "GLOB", "IS", "IS NOT"
+  IsNull(Expr e, bool negated),
+  Between(Expr e, Expr lo, Expr hi, bool negated),
+  InList(Expr e, Expr[] items, bool negated),
+  InSelect(Expr e, Select s, bool negated),
+  Call(string name, Expr[] args, bool star, bool distinct),   // name in lower case
+  // A call with FILTER, an ORDER BY among its arguments, or OVER: an aggregate so qualified, or a window
+  // function.
+  AggCall(string name, Expr[] args, bool star, bool distinct, Expr? filter, OrderTerm[] order, WindowSpec? over),
+  Case(Expr? base, Expr[] whens, Expr[] thens, Expr? otherwise),
+  Cast(Expr e, string type),
+  Subquery(Select s),
+  Exists(Select s, bool negated),
+  Collate(Expr e, string collation),
+  Vector(Expr[] items),                // a row value: (a, b, …)
+}
+
+// One end of a window frame: UNBOUNDED PRECEDING, n PRECEDING, CURRENT ROW, n FOLLOWING,
+// UNBOUNDED FOLLOWING.
+export struct FrameBound {
+  string kind;
+  Expr? n;
+}
+
+// OVER (base PARTITION BY … ORDER BY … frame). `units` is ROWS, RANGE or GROUPS, null for the default frame.
+export struct WindowSpec {
+  string? base;
+  Expr[] partition;
+  OrderTerm[] order;
+  string? units;
+  FrameBound? start;
+  FrameBound? end;
+  string exclude = "NO OTHERS";
+}
+
+export struct NamedWindow {
+  string name;
+  WindowSpec spec;
+}
+
+export struct ResultCol {
+  Expr? expr;        // null for `*` and `t.*`
+  string? star;      // "" for `*`, the table for `t.*`
+  string? alias;
+  string text = "";  // the expression as written, which names an unaliased column
+}
+
+export static i32 JOIN_FIRST = 0;
+export static i32 JOIN_INNER = 1;
+export static i32 JOIN_LEFT = 2;
+export static i32 JOIN_CROSS = 3;
+export static i32 JOIN_RIGHT = 4;
+export static i32 JOIN_FULL = 5;
+
+export struct Source {
+  string? table;
+  Select? sub;
+  string? alias;
+  i32 join = 0;
+  Expr? on;
+  string[] usingCols;
+  bool natural = false;
+  Expr[]? args;         // a table-valued function's arguments: json_each(…), json_tree(…)
+}
+
+export struct OrderTerm {
+  Expr expr;
+  bool desc = false;
+  i32 nulls = 0;        // 0 default, 1 NULLS FIRST, 2 NULLS LAST
+}
+
+// A common table expression: WITH name(cols) AS (select).
+export struct Cte {
+  string name;
+  string[]? cols;
+  Select sel;
+}
+
+export struct Select {
+  Cte[] with;
+  bool recursive = false;  // WITH RECURSIVE
+  NamedWindow[] windows;
+  bool distinct = false;
+  ResultCol[] cols;
+  Source[] from;
+  Expr? where;
+  Expr[] groupBy;
+  Expr? having;
+  OrderTerm[] orderBy;
+  Expr? limit;
+  Expr? offset;
+  // A compound: this select's rows, then `op` with `next`'s. Order and limit belong to the last.
+  string? compound;   // "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
+  Select? next;
+  Expr[][]? values;   // a VALUES list standing where a select would
+}
+
+// REFERENCES parent [(cols)] [ON DELETE action] [ON UPDATE action] [DEFERRABLE INITIALLY DEFERRED].
+export struct ForeignKeyDef {
+  string parent;
+  string[] parentCols;     // empty: the parent's primary key
+  string onDelete = "NO ACTION";
+  string onUpdate = "NO ACTION";
+  bool deferred = false;
+}
+
+export struct ColumnDef {
+  string name;
+  string typeName;
+  bool primaryKey = false;
+  bool pkDesc = false;
+  bool autoincrement = false;
+  bool notNull = false;
+  bool unique = false;
+  Expr? dflt;
+  string dfltText = "";  // the default as written, without enclosing parentheses: PRAGMA table_info shows it
+  string? collate;
+  Expr[] checks;
+  ForeignKeyDef? fk;
+  Expr? generated;   // GENERATED ALWAYS AS (…)
+  bool stored = false;
+  // Each constraint's ON CONFLICT, or -1.
+  i32 pkConflict = -1;
+  i32 notNullConflict = -1;
+  i32 uniqueConflict = -1;
+}
+
+export struct TableConstraint {
+  string kind;       // "PRIMARY KEY", "PRIMARY KEY AUTOINCREMENT", "UNIQUE", "CHECK", "FOREIGN KEY"
+  string[] cols;
+  Expr? check;
+  ForeignKeyDef? fk;
+  bool[] desc;       // a PRIMARY KEY's columns' directions, which a WITHOUT ROWID table is ordered by
+  i32 onConflict;    // its ON CONFLICT, or -1
+}
+
+export struct CreateTable {
+  string name;
+  bool ifNotExists = false;
+  ColumnDef[] cols;
+  TableConstraint[] constraints;
+  bool withoutRowid = false;
+  string sql;        // what sqlite_schema stores
+  bool strict = false;
+  Select? asSelect;  // CREATE TABLE … AS SELECT
+}
+
+export struct IndexCol {
+  string name;
+  bool desc = false;
+  string? collate;
+  Expr? expr;        // an indexed expression, when the term is not a bare column
+}
+
+export struct CreateIndex {
+  string name;
+  string table;
+  bool unique = false;
+  bool ifNotExists = false;
+  IndexCol[] cols;
+  Expr? where;
+  string sql;
+}
+
+export struct Assign {
+  string[] cols;     // one, or several for `(a, b) = (…)`
+  Expr value;
+}
+
+export struct Upsert {
+  string[] target;
+  Expr? targetWhere;
+  bool doNothing = false;
+  Assign[] sets;
+  Expr? where;
+}
+
+export static i32 OR_ABORT = 0;
+export static i32 OR_IGNORE = 1;
+export static i32 OR_REPLACE = 2;
+export static i32 OR_FAIL = 3;
+export static i32 OR_ROLLBACK = 4;
+
+export struct Insert {
+  Cte[] with;
+  bool recursive = false;
+  string table = "";
+  string[]? cols;
+  i32 orAction = -1;   // -1 when the statement names none, and each constraint's own applies
+  Select? source;     // VALUES lists arrive as a Select with `values`
+  bool defaultValues = false;
+  Upsert[] upserts;
+  ResultCol[]? returning;
+}
+
+export struct Update {
+  Cte[] with;
+  bool recursive = false;
+  string table;
+  i32 orAction = -1;   // -1 when the statement names none, and each constraint's own applies
+  Assign[] sets;
+  Expr? where;
+  ResultCol[]? returning;
+  string? alias;
+  Source[]? from;      // UPDATE … FROM
+}
+
+export struct Delete {
+  Cte[] with;
+  bool recursive = false;
+  string table;
+  Expr? where;
+  ResultCol[]? returning;
+}
+
+// CREATE TRIGGER: when it fires (BEFORE, AFTER, INSTEAD OF), on what (DELETE, INSERT, UPDATE [OF cols]),
+// a WHEN condition, and its statements.
+export struct CreateTrigger {
+  string name;
+  bool ifNotExists = false;
+  string timing;
+  string event;
+  string[] ofCols;
+  string table;
+  Expr? when;
+  Stmt[] body;
+  string sql;
+}
+
+export enum Stmt {
+  CreateTableStmt(CreateTable c),
+  CreateIndexStmt(CreateIndex c),
+  CreateTriggerStmt(CreateTrigger t),
+  CreateViewStmt(string name, bool ifNotExists, string[]? cols, Select sel, string sql),
+  DropStmt(string kind, string name, bool ifExists),    // kind "TABLE" or "INDEX"
+  InsertStmt(Insert i),
+  SelectStmt(Select s),
+  UpdateStmt(Update u),
+  DeleteStmt(Delete d),
+  AddColumnStmt(string table, ColumnDef col, string colSql),
+  RenameTableStmt(string table, string to),
+  RenameColumnStmt(string table, string from, string to),
+  DropColumnStmt(string table, string col),
+  BeginStmt,
+  CommitStmt,
+  RollbackStmt,
+  SavepointStmt(string name),
+  ReleaseStmt(string name),
+  RollbackToStmt(string name),
+  PragmaStmt(string name, Expr? value),
+  VacuumStmt,
+  AnalyzeStmt(string? name),
+  TempStmt(Stmt inner),     // CREATE TEMP …, or CREATE … temp.name: the object lives only in this connection
+  ReindexStmt(string? name),
+}

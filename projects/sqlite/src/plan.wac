@@ -1,0 +1,140 @@
+// Bound queries: expressions whose names are resolved to a source and a column, and selects ready to run.
+
+import { Vec } from "core";
+import { Value } from "./value.wac";
+import { Select } from "./ast.wac";
+import { Table, Row } from "./schema.wac";
+
+export enum Node {
+  NLit(Value v),
+  NParam(i32 n),
+  // A column of a source, `depth` scopes out (0 is this select). Column -1 is the rowid.
+  NCol(i32 depth, i32 src, i32 col, i32 aff, i32 coll),
+  NCollate(Node e, i32 coll),              // an explicit COLLATE
+  NUnary(string op, Node e),
+  NArith(string op, Node l, Node r),       // + - * / %
+  NBits(string op, Node l, Node r),        // & | << >>
+  NConcat(Node l, Node r),
+  NCompare(string op, Node l, Node r),     // = != < <= > >= IS, IS NOT
+  NAnd(Node l, Node r),
+  NOr(Node l, Node r),
+  NNot(Node e),
+  NIsNull(Node e, bool neg),
+  NBetween(Node e, Node lo, Node hi, bool neg),
+  NIn(Node e, Node[] items, bool neg),
+  NInRows(Node e, SelectPlan sub, bool neg),
+  NCall(string name, i32 fid, Node[] args, bool[] isJson),
+  NLike(Node value, Node pattern, bool glob),
+  NAgg(i32 slot),
+  NWin(i32 slot),
+  NCase(Node? base, Node[] whens, Node[] thens, Node? otherwise),
+  NCast(Node e, i32 aff),
+  NSub(SelectPlan sub),
+  NSubCol(SelectPlan sub, i32 col),               // one column of a subquery's first row, for row values
+  NInRowsVec(Node[] e, SelectPlan sub, bool neg), // (a, b) IN (SELECT x, y …)
+  NExists(SelectPlan sub, bool neg),
+  NResult(i32 i),                          // ORDER BY naming an output column
+}
+
+// A source in a FROM clause: a table, or the rows of a subquery held as one.
+export struct BoundSource {
+  string name;          // lower case: the alias, or the table's name
+  Table table;
+  i32 join;
+  Node? on;
+  bool isSub = false;
+  string[] hidden;      // USING and NATURAL columns of the right side, which `*` shows once
+  TableFn? call;        // a table-valued function, whose rows are made for each row before it
+}
+
+// json_each or json_tree in FROM, with its arguments, which may name the sources before it.
+export struct TableFn {
+  string name;     // json_each, json_tree, pragma_…, or a correlated subquery
+  Node[] args;
+  i32 visible;     // the columns `*` shows; the rest (json_each's json and root, a pragma's arg and schema) are hidden
+  SelectPlan? sub; // a subquery in FROM that reads an enclosing query: run again for each of its rows
+}
+
+export static i32 AGG_COUNT = 0;
+export static i32 AGG_SUM = 1;      // sum, total and avg accumulate alike
+export static i32 AGG_MINMAX = 2;
+export static i32 AGG_CONCAT = 3;
+export static i32 AGG_JSON_ARRAY = 4;
+export static i32 AGG_JSON_OBJECT = 5;
+export static i32 AGG_PERCENTILE = 6;   // median, percentile, percentile_cont, percentile_disc
+
+export struct AggSpec {
+  string name;
+  i32 kind = 0;
+  Node[] args;
+  bool distinct = false;
+  bool star = false;
+  Node? filter;            // FILTER (WHERE …)
+  Node[] order;            // an ORDER BY among the arguments: group_concat(x ORDER BY y)
+  bool[] orderDesc;
+  bool jsonArg = false;    // the value argument is JSON text from a JSON function
+}
+
+// A window function in a select: what it computes, over which partition, in which order, over which
+// frame. Bounds of n PRECEDING or FOLLOWING carry n.
+export struct WinSpec {
+  string name;
+  AggSpec agg;             // the function and its arguments, as an aggregate would have them
+  Node[] partition;
+  Node[] order;
+  bool[] desc;
+  i32[] nulls;
+  i32[] orderColl;
+  string units;            // ROWS, RANGE or GROUPS
+  string startKind;
+  Node? startN;
+  string endKind;
+  Node? endN;
+  string exclude;
+}
+
+// A condition that can narrow a source, found once per plan: `column op other`, where `other` is
+// computable before the source is read.
+export struct ProbeSpec {
+  i32 col;          // -1 for the rowid
+  string op;
+  Node other;
+  i32 colAff;
+  i32 coll;         // the comparison's collation; an index helps only when it sorts by the same
+}
+
+export struct SelectPlan {
+  Select ast;
+  BoundSource[] srcs;
+  Node? where;
+  Node[] results;
+  string[] names;
+  bool aggregate = false;
+  // A lone min() or max() gives the bare columns its row; GROUP BY terms used in the output still show
+  // the group's key, from its first row, kept after the aggregate's value (NAgg slots 1 and on).
+  bool keyed = false;
+  Vec<AggSpec> aggs;
+  Vec<WinSpec> wins;
+  Node[] groupBy;
+  Node? having;
+  Node[] order;
+  bool[] desc;
+  i32[] orderColl;
+  i32[] nulls;
+  Node? limit;
+  Node? offset;
+  bool distinct = false;
+  string? compound;
+  SelectPlan? next;
+  Node[][]? values;
+  Vec<Value[]>? cache;
+  bool hasRight = false;       // a RIGHT or FULL JOIN: WHERE waits until every row is joined
+  ProbeSpec[][] probeSpecs;    // per source, built the first time it is read
+  bool[] probeBuilt;
+}
+
+// What a statement leaves behind: the rows a SELECT (or RETURNING) produced, and what a change did.
+export struct Rows {
+  string[] columns;
+  Vec<Value[]> rows;
+}

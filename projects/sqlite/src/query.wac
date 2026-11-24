@@ -1,0 +1,2775 @@
+// Binding and running queries: names resolved against the schema, expressions evaluated, and SELECT
+// executed as nested loops over tables, using an index or the rowid when a condition allows.
+
+import { Result, Vec, Map, hashBytes, bytesEq, hashI64, i64Eq } from "core";
+import { SqlError } from "./error.wac";
+import { Value, compareValues, compareColl, collated, collationId, COLL_BINARY, sameValue } from "./value.wac";
+import { encodeRecord, toUtf16, fromUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
+import { Cte, WindowSpec, NamedWindow, FrameBound, Expr, Select, Source, ResultCol, OrderTerm, JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
+         JOIN_RIGHT, JOIN_FULL } from "./ast.wac";
+import { Table, Row, RowCursor, Index, Column, View, SchemaEntry, ForeignKey, affinityOf, rowsTable, AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
+import { Cursor, KeyCmp, whole } from "./btree.wac";
+import { Database, isKeyIndex } from "./database.wac";
+import { jsonEachRows, JSON_EACH_COLS } from "./jsoneach.wac";
+import { pragmaRows } from "./pragma.wac";
+import { Node, BoundSource, TableFn, AggSpec, WinSpec, SelectPlan, ProbeSpec, Rows, AGG_COUNT, AGG_SUM, AGG_MINMAX, AGG_CONCAT,
+         AGG_JSON_ARRAY, AGG_JSON_OBJECT, AGG_PERCENTILE } from "./plan.wac";
+import { AFF_NONE, intPrefix, wholeNumber, applyAffinity, comparable, arith, bitwise, negate, compareOp, truth, boolValue, isNull,
+         textOf, toInt, toReal, toNumeric, castTo, exactInt } from "./ops.wac";
+import { callScalar, functionId, F_COALESCE, F_IFNULL, F_IIF, F_HEX, F_OCTET_LENGTH, knownFunction, returnsJson, FnEnv, likeMatch, likeMatchCase, likeBytes, globMatch, codepoints } from "./functions.wac";
+import { lower } from "./lexer.wac";
+import { Json, parseJson, jsonText, jsonOf, escape, toJsonb, fromJsonb } from "./json.wac";
+
+// What a statement runs with: the database, its parameters, and the function environment.
+// A common table expression in scope while a statement runs, and its rows once computed: SQLite
+// computes each once per statement.
+export struct CteDef {
+  string name;           // lower case
+  string[]? cols;
+  Select sel;
+  bool recursive;
+  Table? rows;
+  bool busy = false;
+}
+
+export struct Exec {
+  Database db;
+  Value[] params;
+  FnEnv env;
+  Vec<CteDef> ctes;
+  // While a trigger runs: NEW and OLD, as a scope outside every select of its statements.
+  Scope? triggerScope;
+  Ctx? triggerCtx;
+  // The last pattern LIKE saw, as bytes: the pattern is almost always the same for every row.
+  string lastPattern = "";
+  u8[] lastPatternBytes;
+
+  string? lastNeedle;   // set when the pattern is `%needle%` and the needle has no letters or wildcards
+
+  u8[] patternBytes(this, string p) {
+    if (p != this.lastPattern || this.lastPatternBytes.len() != p.len()) {
+      this.lastPattern = p;
+      this.lastPatternBytes = p.toBytes();
+      this.lastNeedle = needleOf(this.lastPatternBytes);
+    }
+    return this.lastPatternBytes;
+  }
+}
+
+string? needleOf(const u8[] b) {
+  if (b.len() < 2 || b[0] != '%' || b[b.len() - 1] != '%') { return null; }
+  for (i32 i = 1; i < b.len() - 1; i++) {
+    u8 c = b[i];
+    if (c == '%' || c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80) { return null; }
+  }
+  u8[] mid = u8[].filled(b.len() - 2, 0);
+  mid.copyFrom(b, 1, 0, b.len() - 2);
+  return string.fromBytes(mid);
+}
+
+// A row's generated columns, computed from the others in column order, as often as there are generated
+// columns so one may read another whatever their order.
+export Result<void, SqlError> fillGenerated(Table t, Row r, Database db) {
+  Exec x = Exec { db: db, params: Value[](), env: FnEnv { nowMillis: 0, changes: 0, totalChanges: 0, lastInsertRowid: 0,
+                  randomBytes: u8[].filled(8, 0), randomAt: 0 }, ctes: Vec.create() };
+  Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)], null, null, false);
+  Ctx c = Ctx([r as Row?], null, null, null, null);
+  i32 passes = 0;
+  for (i32 i = 0; i < t.cols.len(); i++) { if (t.cols[i].gen is not null) { passes++; } }
+  for (i32 pass = 0; pass < passes; pass++) {
+    for (i32 i = 0; i < t.cols.len(); i++) {
+      if (t.cols[i].gen is null) { continue; }
+      Node n = try bindExpr(t.cols[i].gen!, sc, x);
+      r.vals[i] = applyAffinity(try eval(n, c, x), t.cols[i].affinity);
+    }
+  }
+  return Result.Ok();
+}
+
+// The context a statement's outermost select runs in: none, or a trigger's NEW and OLD, which the
+// select's scope has outside it.
+export Ctx topCtx(Exec x) { return x.triggerCtx ?? Ctx(Row?[](), null, null, null, null); }
+
+// Names visible to an expression: this select's sources, then the enclosing selects'.
+export struct Scope {
+  BoundSource[] srcs;
+  Scope? outer;
+  SelectPlan? plan;     // where aggregates register
+  bool aggOk = false;
+}
+
+export struct Ctx {
+  Row?[] rows;
+  Ctx? outer;
+  Value[]? aggs;
+  Value[]? result;
+  Value[]? wins;      // window functions' values for this row
+}
+
+static string[] AGGREGATES = ["count", "sum", "total", "avg", "group_concat", "string_agg", "json_group_array",
+                               "median", "percentile", "percentile_cont", "percentile_disc",
+                               "jsonb_group_array", "jsonb_group_object",
+                              "json_group_object"];
+
+bool isAggregate(string name, i32 nargs) {
+  if ((name == "min" || name == "max") && nargs == 1) { return true; }
+  for (string a in AGGREGATES) { if (a == name) { return true; } }
+  return false;
+}
+
+SqlError err(string m) { return SqlError("error", m); }
+
+// ── binding ────────────────────────────────────────────────────────────────
+
+Result<Node, SqlError> bindColumn(string? table, string name, Scope s0) {
+  string n = lower(name);
+  (const Scope)? s = s0;
+  i32 depth = 0;
+  while (s is not null) {
+    i32 foundSrc = -1;
+    i32 foundCol = -2;
+    for (i32 i = 0; i < s!.srcs.len(); i++) {
+      const BoundSource b = s!.srcs[i];
+      if (table is not null && b.name != lower(table!)) { continue; }
+      // A USING or NATURAL column, named bare, is the left side's.
+      if (table is null && isHidden(b, n)) { continue; }
+      i32 c = b.table.colIndex(n);
+      if (c < 0) {
+        // Not a column; the rowid's names reach the rowid when no column has taken them, and a
+        // WITHOUT ROWID table has none, but for the engine's own name for it.
+        if (b.isSub) { continue; }
+        if (n != ROWID_INTERNAL && (b.table.withoutRowid || (n != "rowid" && n != "oid" && n != "_rowid_"))) { continue; }
+        c = -1;
+      }
+      if (foundSrc >= 0) { return Result.Err(err("ambiguous column name: \{name}")); }
+      foundSrc = i;
+      foundCol = c;
+    }
+    if (foundSrc >= 0) {
+      const BoundSource b = s!.srcs[foundSrc];
+      i32 aff = AFF_INTEGER;
+      i32 coll = 0;
+      if (foundCol >= 0) {
+        aff = b.isSub ? AFF_NONE : b.table.cols[foundCol].affinity;
+        coll = b.table.cols[foundCol].coll;
+        if (b.table.rowidAlias == foundCol) { aff = AFF_INTEGER; }
+      }
+      Node col = Node.NCol(depth, foundSrc, foundCol, aff, coll);
+      if (table is null && foundCol >= 0) { col = usingMerged(s!.srcs, depth, foundSrc, n, col); }
+      return Result.Ok(col);
+    }
+    if (table is not null) {
+      bool known = false;
+      for (i32 i = 0; i < s!.srcs.len(); i++) { if (s!.srcs[i].name == lower(table!)) { known = true; } }
+      if (known) { return Result.Err(err("no such column: \{table!}.\{name}")); }
+    }
+    s = s!.outer;
+    depth++;
+  }
+  if (table is not null) { return Result.Err(err("no such column: \{table!}.\{name}")); }
+  return Result.Err(err("no such column: \{name}"));
+}
+
+// A USING or NATURAL column named bare: the left side's, except that a RIGHT or FULL join on it can
+// give rows the left side has none for, so there it is the first of the sides that has a value.
+Node usingMerged(const BoundSource[] srcs, i32 depth, i32 left, string n, Node base) {
+  Node out = base;
+  for (i32 k = left + 1; k < srcs.len(); k++) {
+    const BoundSource b = srcs[k];
+    if (!isHidden(b, n) || (b.join != JOIN_RIGHT && b.join != JOIN_FULL)) { continue; }
+    i32 rc = b.table.colIndex(n);
+    if (rc < 0) { continue; }
+    Node right = Node.NCol(depth, k, rc, b.isSub ? AFF_NONE : b.table.cols[rc].affinity, b.table.cols[rc].coll);
+    out = Node.NCall("coalesce", functionId("coalesce"), [out, right], [false, false]);
+  }
+  return out;
+}
+
+Result<Node[], SqlError> bindAll(const Expr[] es, Scope s, Exec x) {
+  Node[] out = Node[].filled(es.len(), Node.NLit(Value.Null));
+  for (i32 i = 0; i < es.len(); i++) { out[i] = try bindExpr(es[i], s, x); }
+  return Result.Ok(out);
+}
+
+bool exprIsJson(const Expr e) {
+  match (e) {
+    Call(name, args, star, distinct): { return returnsJson(name); }
+    Binary(op, l, r): { return op == "->"; }
+    default: { return false; }
+  }
+}
+
+// ── row values ─────────────────────────────────────────────────────────────
+
+SqlError rowMisused() { return err("row value misused"); }
+
+// The parts of a row value: a (…, …) list, or a subquery of more than one column. Null for a scalar.
+export Result<Node[]?, SqlError> rowParts(const Expr e, Scope s, Exec x) {
+  match (e) {
+    Vector(items): { return Result.Ok((try bindAll(items, s, x)) as Node[]?); }
+    Subquery(sub): {
+      SelectPlan p = try planSelect(sub, s, x);
+      if (p.names.len() < 2) { return Result.Ok(null); }
+      Node[] out = Node[].filled(p.names.len(), Node.NLit(Value.Null));
+      for (i32 i = 0; i < out.len(); i++) { out[i] = Node.NSubCol(p, i); }
+      return Result.Ok(out as Node[]?);
+    }
+    default: { return Result.Ok(null); }
+  }
+}
+
+bool isRow(const Expr e) {
+  match (e) {
+    Vector: { return true; }
+    Subquery(sub): { return sub.cols.len() > 1 || (sub.cols.len() == 1 && sub.cols[0].star is not null); }
+    default: { return false; }
+  }
+}
+
+// Two row values compared, as the scalar comparisons that give SQLite's answer, NULLs included:
+// equal when every pair is; ordered by the first pair that differs.
+Result<Node, SqlError> rowCompare(string op, const Expr l, const Expr r, Scope s, Exec x) {
+  Node[]? a0 = try rowParts(l, s, x);
+  Node[]? b0 = try rowParts(r, s, x);
+  // A starred subquery that turned out to have one column is a scalar after all.
+  if (a0 is null && b0 is null) { return Result.Ok(Node.NCompare(op, try bindExpr(l, s, x), try bindExpr(r, s, x))); }
+  if (a0 is null || b0 is null || a0!.len() != b0!.len()) { return Result.Err(rowMisused()); }
+  Node[] a = a0!;
+  Node[] b = b0!;
+  i32 n = a.len();
+  if (op == "=" || op == "!=" || op == "IS" || op == "IS NOT") {
+    string each = op == "IS" || op == "IS NOT" ? "IS" : "=";
+    Node all = Node.NCompare(each, a[0], b[0]);
+    for (i32 i = 1; i < n; i++) { all = Node.NAnd(all, Node.NCompare(each, a[i], b[i])); }
+    return Result.Ok(op == "=" || op == "IS" ? all : Node.NNot(all));
+  }
+  string strict = op == "<=" ? "<" : (op == ">=" ? ">" : op);
+  Node res = Node.NCompare(op, a[n - 1], b[n - 1]);
+  for (i32 i = n - 2; i >= 0; i--) {
+    res = Node.NOr(Node.NCompare(strict, a[i], b[i]), Node.NAnd(Node.NCompare("=", a[i], b[i]), res));
+  }
+  return Result.Ok(res);
+}
+
+export Result<Node, SqlError> bindExpr(const Expr e, Scope s, Exec x) {
+  match (e) {
+    Vector: { return Result.Err(rowMisused()); }
+    Lit(v): { return Result.Ok(Node.NLit(v)); }
+    Param(n): { return Result.Ok(Node.NParam(n)); }
+    Col(t, name): { return bindColumn(t, name, s); }
+    Unary(op, a): {
+      Node n = try bindExpr(a, s, x);
+      if (op == "NOT") { return Result.Ok(Node.NNot(n)); }
+      return Result.Ok(Node.NUnary(op, n));
+    }
+    Binary(op, l, r): {
+      bool cmp = op == "=" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "IS" || op == "IS NOT";
+      if (cmp && (isRow(l) || isRow(r))) { return rowCompare(op, l, r, s, x); }
+      Node a = try bindExpr(l, s, x);
+      Node b = try bindExpr(r, s, x);
+      if (op == "AND") { return Result.Ok(Node.NAnd(a, b)); }
+      if (op == "OR") { return Result.Ok(Node.NOr(a, b)); }
+      if (op == "=" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "IS" || op == "IS NOT") {
+        return Result.Ok(Node.NCompare(op, a, b));
+      }
+      if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") { return Result.Ok(Node.NArith(op, a, b)); }
+      if (op == "&" || op == "|" || op == "<<" || op == ">>") { return Result.Ok(Node.NBits(op, a, b)); }
+      if (op == "||") { return Result.Ok(Node.NConcat(a, b)); }
+      if (op == "LIKE") { return Result.Ok(Node.NLike(a, b, false)); }
+      if (op == "GLOB") { return Result.Ok(Node.NLike(a, b, true)); }
+      if (op == "->" || op == "->>") { return Result.Ok(Node.NCall(op, functionId(op), [a, b], [false, false])); }
+      return Result.Err(err("unknown operator \{op}"));
+    }
+    IsNull(a, neg): { return Result.Ok(Node.NIsNull(try bindExpr(a, s, x), neg)); }
+    Between(a, lo, hi, neg): {
+      if (isRow(a)) {
+        Node both = Node.NAnd(try rowCompare(">=", a, lo, s, x), try rowCompare("<=", a, hi, s, x));
+        return Result.Ok(neg ? Node.NNot(both) : both);
+      }
+      return Result.Ok(Node.NBetween(try bindExpr(a, s, x), try bindExpr(lo, s, x), try bindExpr(hi, s, x), neg));
+    }
+    InList(a, items, neg): {
+      if (isRow(a)) {
+        // (a, b) IN ((1, 2), (3, 4)): equal to any of them, with IN's NULLs.
+        if (items.len() == 0) { return Result.Ok(Node.NLit(Value.Int(neg ? 1 : 0))); }
+        Node any = try rowCompare("=", a, items[0], s, x);
+        for (i32 i = 1; i < items.len(); i++) { any = Node.NOr(any, try rowCompare("=", a, items[i], s, x)); }
+        return Result.Ok(neg ? Node.NNot(any) : any);
+      }
+      return Result.Ok(Node.NIn(try bindExpr(a, s, x), try bindAll(items, s, x), neg));
+    }
+    InSelect(a, sub, neg): {
+      SelectPlan p = try planSelect(sub, s, x);
+      if (isRow(a)) {
+        Node[] parts = (try rowParts(a, s, x))!;
+        if (parts.len() != p.names.len()) { return Result.Err(err("sub-select returns \{p.names.len()} columns - expected \{parts.len()}")); }
+        return Result.Ok(Node.NInRowsVec(parts, p, neg));
+      }
+      if (p.names.len() != 1) { return Result.Err(err("sub-select returns \{p.names.len()} columns - expected 1")); }
+      return Result.Ok(Node.NInRows(try bindExpr(a, s, x), p, neg));
+    }
+    Call(name, args, star, distinct): {
+      if (isAggregate(name, args.len())) { return makeAgg(name, args, star, distinct, null, OrderTerm[](), s, x); }
+      if (star) { return Result.Err(err("wrong number of arguments to function \{name}()")); }
+      if (name == "raise") {
+        if (x.triggerScope is null) { return Result.Err(err("RAISE() may only be used within a trigger-program")); }
+        return Result.Ok(Node.NCall(name, -1, try bindAll(args, s, x), bool[].filled(args.len(), false)));
+      }
+      if (!knownFunction(name, args.len())) {
+        return Result.Err(err(knownFunction(name, -99) ? "wrong number of arguments to function \{name}()" : "no such function: \{name}"));
+      }
+      bool[] js = bool[].filled(args.len(), false);
+      for (i32 i = 0; i < args.len(); i++) { js[i] = exprIsJson(args[i]); }
+      return Result.Ok(Node.NCall(name, functionId(name), try bindAll(args, s, x), js));
+    }
+    AggCall(name, args, star, distinct, filter, order, over): {
+      if (over is not null) { return makeWindow(name, args, star, distinct, filter, over!, s, x); }
+      if (!isAggregate(name, args.len())) {
+        string what = filter is not null ? "FILTER" : "ORDER BY";
+        return Result.Err(err("\{what} may not be used with non-aggregate \{name}()"));
+      }
+      return makeAgg(name, args, star, distinct, filter, order, s, x);
+    }
+    Case(base, whens, thens, otherwise): {
+      Node? b = null;
+      if (base is not null) { b = try bindExpr(base!, s, x); }
+      Node? o = null;
+      if (otherwise is not null) { o = try bindExpr(otherwise!, s, x); }
+      return Result.Ok(Node.NCase(b, try bindAll(whens, s, x), try bindAll(thens, s, x), o));
+    }
+    Cast(a, ty): { return Result.Ok(Node.NCast(try bindExpr(a, s, x), affinityOf(ty))); }
+    Subquery(sub): {
+      SelectPlan p = try planSelect(sub, s, x);
+      return Result.Ok(Node.NSub(p));
+    }
+    Exists(sub, neg): { return Result.Ok(Node.NExists(try planSelect(sub, s, x), neg)); }
+    Collate(a, coll): {
+      i32 id = collationId(coll);
+      if (id < 0) { return Result.Err(err("no such collation sequence: \{coll}")); }
+      return Result.Ok(Node.NCollate(try bindExpr(a, s, x), id));
+    }
+  }
+}
+
+Result<AggSpec, SqlError> aggSpec(string name, const Expr[] args, bool star, bool distinct, const Expr? filter,
+                                 const OrderTerm[] order, Scope s, Exec x) {
+  if (name == "count" && args.len() > 1) { return Result.Err(err("wrong number of arguments to function count()")); }
+  if ((name == "sum" || name == "total" || name == "avg" || name == "json_group_array" || name == "jsonb_group_array") && args.len() != 1) {
+    return Result.Err(err("wrong number of arguments to function \{name}()"));
+  }
+  if ((name == "json_group_object" || name == "jsonb_group_object") && args.len() != 2) { return Result.Err(err("wrong number of arguments to function \{name}()")); }
+  if ((name == "median" && args.len() != 1) || (name.indexOf("percentile") == 0 && args.len() != 2)) {
+    return Result.Err(err("wrong number of arguments to function \{name}()"));
+  }
+  // An aggregate's arguments are row expressions; an aggregate inside one is a misuse.
+  Scope inner = Scope(s.srcs, s.outer, s.plan, false);
+  Node[] bound = try bindAll(args, inner, x);
+  i32 kind = AGG_COUNT;
+  if (name == "sum" || name == "total" || name == "avg") { kind = AGG_SUM; }
+  else if (name == "min" || name == "max") { kind = AGG_MINMAX; }
+  else if (name == "group_concat" || name == "string_agg") { kind = AGG_CONCAT; }
+  else if (name == "json_group_array" || name == "jsonb_group_array") { kind = AGG_JSON_ARRAY; }
+  else if (name == "json_group_object" || name == "jsonb_group_object") { kind = AGG_JSON_OBJECT; }
+  else if (name == "median" || name.indexOf("percentile") == 0) { kind = AGG_PERCENTILE; }
+  Node? f = null;
+  if (filter is not null) { f = try bindExpr(filter!, inner, x); }
+  Node[] ord = Node[].filled(order.len(), Node.NLit(Value.Null));
+  bool[] od = bool[].filled(order.len(), false);
+  for (i32 i = 0; i < order.len(); i++) {
+    ord[i] = try bindExpr(order[i].expr, inner, x);
+    od[i] = order[i].desc;
+  }
+  bool js = false;
+  i32 vi = kind == AGG_JSON_OBJECT ? 1 : 0;
+  if (vi < args.len()) { js = exprIsJson(args[vi]); }
+  return Result.Ok(AggSpec { name: name, kind: kind, args: bound, distinct: distinct, star: star, filter: f,
+                             order: ord, orderDesc: od, jsonArg: js });
+}
+
+Result<Node, SqlError> makeAgg(string name, const Expr[] args, bool star, bool distinct, const Expr? filter,
+                               const OrderTerm[] order, Scope s, Exec x) {
+  if (!s.aggOk || s.plan is null) { return Result.Err(err("misuse of aggregate function \{name}()")); }
+  AggSpec a = try aggSpec(name, args, star, distinct, filter, order, s, x);
+  SelectPlan p = s.plan!;
+  p.aggs.push(a);
+  return Result.Ok(Node.NAgg(p.aggs.len() - 1));
+}
+
+static string[] WINDOW_ONLY = ["row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead",
+                               "first_value", "last_value", "nth_value"];
+
+bool isWindowOnly(string name) {
+  for (string w in WINDOW_ONLY) { if (w == name) { return true; } }
+  return false;
+}
+
+// A window spec with its base window's parts filled in: the base gives the partition, and the order
+// and frame when this one has none.
+Result<WindowSpec, SqlError> resolveWindow(const WindowSpec w, const SelectPlan p) {
+  if (w.base is null) { return Result.Ok(w as WindowSpec); }
+  const NamedWindow[] named = p.ast.windows;
+  for (i32 i = 0; i < named.len(); i++) {
+    if (lower(named[i].name) != lower(w.base!)) { continue; }
+    WindowSpec b = try resolveWindow(named[i].spec, p);
+    WindowSpec out = WindowSpec { partition: b.partition, order: b.order, units: b.units, start: b.start, end: b.end,
+                                  exclude: b.exclude };
+    if (w.partition.len() > 0) { return Result.Err(err("cannot override PARTITION clause of window \{w.base!}")); }
+    if (w.order.len() > 0) { out.order = w.order as OrderTerm[]; }
+    if (w.units is not null) {
+      out.units = w.units;
+      out.start = w.start as FrameBound?;
+      out.end = w.end as FrameBound?;
+      out.exclude = w.exclude;
+    }
+    return Result.Ok(out);
+  }
+  return Result.Err(err("no such window: \{w.base!}"));
+}
+
+Result<Node, SqlError> makeWindow(string name, const Expr[] args, bool star, bool distinct, const Expr? filter,
+                                  const WindowSpec over, Scope s, Exec x) {
+  if (!s.aggOk || s.plan is null) { return Result.Err(err("misuse of window function \{name}()")); }
+  if (!isWindowOnly(name) && !isAggregate(name, args.len())) {
+    return Result.Err(err("\{name}() may not be used as a window function"));
+  }
+  SelectPlan p = s.plan!;
+  WindowSpec w = try resolveWindow(over, p);
+  // The function's arguments, partition and order are row (or group) expressions.
+  Scope sc = Scope(s.srcs, s.outer, s.plan, true);
+  AggSpec a = AggSpec { name: name, args: try bindAll(args, sc, x), distinct: distinct, star: star, order: Node[](),
+                        orderDesc: bool[]() };
+  if (isAggregate(name, args.len())) {
+    // A window aggregate's arguments may hold the query's own aggregates, so they bind in the group scope.
+    a = try aggSpec(name, args, star, distinct, filter, OrderTerm[](), Scope(s.srcs, s.outer, s.plan, true), x);
+  }
+  Node[] part = try bindAll(w.partition, sc, x);
+  Node[] ord = Node[].filled(w.order.len(), Node.NLit(Value.Null));
+  bool[] desc = bool[].filled(w.order.len(), false);
+  i32[] nulls = i32[].filled(w.order.len(), 0);
+  i32[] colls = i32[].filled(w.order.len(), 0);
+  for (i32 i = 0; i < ord.len(); i++) {
+    ord[i] = try bindExpr(w.order[i].expr, sc, x);
+    desc[i] = w.order[i].desc;
+    nulls[i] = w.order[i].nulls;
+    colls[i] = ownColl(ord[i]);
+  }
+  Scope none = Scope(BoundSource[](), s.outer, null, false);
+  string units = w.units ?? (w.order.len() > 0 ? "RANGE" : "ROWS");
+  string sk = w.start is null ? "UNBOUNDED PRECEDING" : w.start!.kind;
+  string ek = w.end is null ? (w.order.len() > 0 ? "CURRENT ROW" : "UNBOUNDED FOLLOWING") : w.end!.kind;
+  Node? sn = null;
+  Node? en = null;
+  if (w.start is not null && w.start!.n is not null) { sn = try bindExpr(w.start!.n!, none, x); }
+  if (w.end is not null && w.end!.n is not null) { en = try bindExpr(w.end!.n!, none, x); }
+  if (units == "RANGE" && (sn is not null || en is not null) && ord.len() != 1) {
+    return Result.Err(err("RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY term"));
+  }
+  p.wins.push(WinSpec(name, a, part, ord, desc, nulls, colls, units, sk, sn, ek, en, w.exclude));
+  return Result.Ok(Node.NWin(p.wins.len() - 1));
+}
+
+// ── evaluation ─────────────────────────────────────────────────────────────
+
+// The collation a comparison uses, SQLite's way: an explicit COLLATE on the left, then on the right,
+// then the left operand's column's, then the right's; BINARY when none says.
+export i32 explicitColl(const Node n) {
+  return match (n) { NCollate(e, coll): coll, default: -1 };
+}
+
+export i32 columnColl(const Node n) {
+  return match (n) { NCol(d, s, c, aff, coll): coll, NCollate(e, coll): coll, default: -1 };
+}
+
+export i32 cmpColl(const Node l, const Node r) {
+  i32 a = explicitColl(l);
+  if (a >= 0) { return a; }
+  a = explicitColl(r);
+  if (a >= 0) { return a; }
+  a = columnColl(l);
+  if (a >= 0) { return a; }
+  a = columnColl(r);
+  return a >= 0 ? a : COLL_BINARY;
+}
+
+// The collation an expression sorts and groups by on its own.
+export i32 ownColl(const Node n) {
+  i32 c = columnColl(n);
+  return c >= 0 ? c : COLL_BINARY;
+}
+
+Value compareOpColl(string op, const Value a, const Value b, i32 coll) {
+  if (coll == COLL_BINARY) { return compareOp(op, a, b); }
+  return compareOp(op, collated(a, coll), collated(b, coll));
+}
+
+export i32 nodeAff(const Node n) {
+  return match (n) { NCol(d, s, c, aff, coll): aff, NCast(e, aff): aff, NCollate(e, coll): nodeAff(e), default: AFF_NONE };
+}
+
+Result<Value, SqlError> colValue(Ctx c, i32 depth, i32 src, i32 col, Exec x) {
+  Ctx cur = c;
+  bool usedTrigger = false;
+  for (i32 d = 0; d < depth; d++) {
+    if (cur.outer is null) {
+      // Past the outermost select is the trigger's NEW and OLD, when a trigger is running.
+      if (x.triggerCtx is null || usedTrigger) { return Result.Ok(Value.Null); }
+      cur = x.triggerCtx!;
+      usedTrigger = true;
+      continue;
+    }
+    cur = cur.outer!;
+  }
+  if (src >= cur.rows.len()) { return Result.Ok(Value.Null); }
+  Row? r = cur.rows[src];
+  if (r is null) { return Result.Ok(Value.Null); }
+  if (col < 0) { return Result.Ok(Value.Int(r!.rowid)); }
+  return Result.Ok(r!.vals[col]);
+}
+
+export Result<Value, SqlError> eval(const Node n, Ctx c, Exec x) {
+  match (n) {
+    NLit(v): { return Result.Ok(v as Value); }
+    NParam(i): { return Result.Ok(i >= 1 && i <= x.params.len() ? x.params[i - 1] : Value.Null); }
+    NCol(depth, src, col, aff, coll): { return colValue(c, depth, src, col, x); }
+    NCollate(e, coll): { return eval(e, c, x); }
+    NUnary(op, e): {
+      Value v = try eval(e, c, x);
+      if (isNull(v)) { return Result.Ok(Value.Null); }
+      if (op == "-") { return Result.Ok(negate(v)); }
+      if (op == "~") { return Result.Ok(Value.Int(~intPrefix(v))); }
+      return Result.Ok(v);
+    }
+    NArith(op, l, r): { return Result.Ok(arith(op, try eval(l, c, x), try eval(r, c, x))); }
+    NBits(op, l, r): { return Result.Ok(bitwise(op, try eval(l, c, x), try eval(r, c, x))); }
+    NConcat(l, r): {
+      Value a = try eval(l, c, x);
+      Value b = try eval(r, c, x);
+      if (isNull(a) || isNull(b)) { return Result.Ok(Value.Null); }
+      return Result.Ok(Value.Text(textOf(a) + textOf(b)));
+    }
+    NCompare(op, l, r): {
+      Value a = try eval(l, c, x);
+      Value b = try eval(r, c, x);
+      Value[] ab = comparable(a, nodeAff(l), b, nodeAff(r));
+      if (op == "IS" || op == "IS NOT") {
+        bool same = (isNull(ab[0]) && isNull(ab[1])) ||
+                    (!isNull(ab[0]) && !isNull(ab[1]) && compareColl(ab[0], ab[1], cmpColl(l, r)) == 0);
+        return Result.Ok(boolValue(op == "IS" ? same : !same));
+      }
+      return Result.Ok(compareOpColl(op, ab[0], ab[1], cmpColl(l, r)));
+    }
+    NAnd(l, r): {
+      i32 a = truth(try eval(l, c, x));
+      if (a == 0) { return Result.Ok(Value.Int(0)); }
+      i32 b = truth(try eval(r, c, x));
+      if (b == 0) { return Result.Ok(Value.Int(0)); }
+      if (a < 0 || b < 0) { return Result.Ok(Value.Null); }
+      return Result.Ok(Value.Int(1));
+    }
+    NOr(l, r): {
+      i32 a = truth(try eval(l, c, x));
+      if (a == 1) { return Result.Ok(Value.Int(1)); }
+      i32 b = truth(try eval(r, c, x));
+      if (b == 1) { return Result.Ok(Value.Int(1)); }
+      if (a < 0 || b < 0) { return Result.Ok(Value.Null); }
+      return Result.Ok(Value.Int(0));
+    }
+    NNot(e): {
+      i32 a = truth(try eval(e, c, x));
+      return Result.Ok(a < 0 ? Value.Null : Value.Int(a == 1 ? 0 : 1));
+    }
+    NIsNull(e, neg): {
+      bool z = isNull(try eval(e, c, x));
+      return Result.Ok(boolValue(neg ? !z : z));
+    }
+    NBetween(e, lo, hi, neg): {
+      Value v = try eval(e, c, x);
+      Value a = try eval(lo, c, x);
+      Value b = try eval(hi, c, x);
+      Value[] va = comparable(v, nodeAff(e), a, nodeAff(lo));
+      Value[] vb = comparable(v, nodeAff(e), b, nodeAff(hi));
+      Value ge = compareOpColl(">=", va[0], va[1], cmpColl(e, lo));
+      Value le = compareOpColl("<=", vb[0], vb[1], cmpColl(e, hi));
+      i32 t1 = truth(ge);
+      i32 t2 = truth(le);
+      i32 t = (t1 == 0 || t2 == 0) ? 0 : ((t1 < 0 || t2 < 0) ? -1 : 1);
+      if (t < 0) { return Result.Ok(Value.Null); }
+      return Result.Ok(boolValue(neg ? t == 0 : t == 1));
+    }
+    NIn(e, items, neg): {
+      Value v = try eval(e, c, x);
+      if (isNull(v)) { return Result.Ok(items.len() == 0 ? boolValue(neg) : Value.Null); }
+      bool sawNull = false;
+      for (i32 i = 0; i < items.len(); i++) {
+        Value it = try eval(items[i], c, x);
+        if (isNull(it)) { sawNull = true; continue; }
+        // Only the left side's affinity applies to an IN list, unlike `=`.
+        Value[] ab = comparable(v, nodeAff(e), it, AFF_NONE);
+        if (compareColl(ab[0], ab[1], cmpColl(e, items[i])) == 0) { return Result.Ok(boolValue(!neg)); }
+      }
+      return Result.Ok(sawNull ? Value.Null : boolValue(neg));
+    }
+    NInRows(e, sub, neg): {
+      Value v = try eval(e, c, x);
+      Vec<Value[]> rows = try subRows(sub, c, x);
+      if (isNull(v)) { return Result.Ok(rows.len() == 0 ? boolValue(neg) : Value.Null); }
+      bool sawNull = false;
+      for (i32 i = 0; i < rows.len(); i++) {
+        Value it = rows.get(i)[0];
+        if (isNull(it)) { sawNull = true; continue; }
+        // The subquery's column has its own affinity (a column with no type has BLOB's), unlike a list.
+        Value[] ab = comparable(v, nodeAff(e), it, sub.results.len() > 0 ? nodeAff(sub.results[0]) : AFF_NONE);
+        i32 coll = cmpColl(e, sub.results.len() > 0 ? sub.results[0] : Node.NLit(Value.Null));
+        if (compareColl(ab[0], ab[1], coll) == 0) { return Result.Ok(boolValue(!neg)); }
+      }
+      return Result.Ok(sawNull ? Value.Null : boolValue(neg));
+    }
+    NCall(name, fid, args, isJson): {
+      // Short-circuiting functions evaluate only what they need.
+      if (fid == F_COALESCE || fid == F_IFNULL) {
+        for (i32 i = 0; i < args.len(); i++) {
+          Value v = try eval(args[i], c, x);
+          if (!isNull(v)) { return Result.Ok(v); }
+        }
+        return Result.Ok(Value.Null);
+      }
+      if (fid == F_IIF) {
+        i32 t = truth(try eval(args[0], c, x));
+        return eval(t == 1 ? args[1] : args[2], c, x);
+      }
+      Value[] vals = Value[].filled(args.len(), Value.Null);
+      for (i32 i = 0; i < args.len(); i++) { vals[i] = try eval(args[i], c, x); }
+      if (fid < 0 && name == "raise") {
+        // Carried out as an error the trigger's runner understands; its code says which kind.
+        string kind = textOf(vals[0]);
+        return Result.Err(SqlError("raise-" + lower(kind), vals.len() > 1 ? textOf(vals[1]) : ""));
+      }
+      // In a UTF-16 database hex() and octet_length() see text as its UTF-16 bytes.
+      if (x.db.encoding != ENC_UTF8 && (fid == F_HEX || fid == F_OCTET_LENGTH) && vals.len() == 1) {
+        match (vals[0]) {
+          Text(s): { vals[0] = Value.Blob(toUtf16(s, x.db.encoding == ENC_UTF16BE)); }
+          default: {}
+        }
+      }
+      return callScalar(name, fid, vals, isJson, x.env);
+    }
+    NLike(value, pattern, glob): {
+      Value v = try eval(value, c, x);
+      Value p = try eval(pattern, c, x);
+      if (isNull(v) || isNull(p)) { return Result.Ok(Value.Null); }
+      if (!glob && x.env.caseSensitiveLike) {
+        return Result.Ok(boolValue(likeMatchCase(codepoints(textOf(p)), 0, codepoints(textOf(v)), 0, -1, false)));
+      }
+      if (!glob) {
+        string pat = textOf(p);
+        x.patternBytes(pat);
+        string text = textOf(v);
+        // `%needle%` with nothing case can change, which is the usual search: a substring test.
+        if (x.lastNeedle is not null) { return Result.Ok(boolValue(text.indexOf(x.lastNeedle!) >= 0)); }
+        return Result.Ok(boolValue(likeBytes(x.lastPatternBytes, text.toBytes(), -1)));
+      }
+      i32[] pc = codepoints(textOf(p));
+      i32[] vc = codepoints(textOf(v));
+      return Result.Ok(boolValue(globMatch(pc, 0, vc, 0)));
+    }
+    NAgg(slot): {
+      if (c.aggs is null) { return Result.Err(err("misuse of aggregate")); }
+      return Result.Ok(c.aggs![slot]);
+    }
+    NWin(slot): {
+      if (c.wins is null) { return Result.Err(err("misuse of window function")); }
+      return Result.Ok(c.wins![slot]);
+    }
+    NCase(base, whens, thens, otherwise): {
+      Value? b = null;
+      if (base is not null) { b = try eval(base!, c, x); }
+      for (i32 i = 0; i < whens.len(); i++) {
+        Value w = try eval(whens[i], c, x);
+        bool hit = false;
+        if (b is not null) {
+          Value[] ab = comparable(b!, nodeAff(base!), w, nodeAff(whens[i]));
+          hit = !isNull(ab[0]) && !isNull(ab[1]) && compareColl(ab[0], ab[1], cmpColl(base!, whens[i])) == 0;
+        } else {
+          hit = truth(w) == 1;
+        }
+        if (hit) { return eval(thens[i], c, x); }
+      }
+      if (otherwise is not null) { return eval(otherwise!, c, x); }
+      return Result.Ok(Value.Null);
+    }
+    NCast(e, aff): {
+      Value v = try eval(e, c, x);
+      // In a UTF-16 database text and blobs convert through UTF-16 bytes.
+      if (x.db.encoding != ENC_UTF8) {
+        match (v) {
+          Text(s): { if (aff == AFF_BLOB) { return Result.Ok(Value.Blob(toUtf16(s, x.db.encoding == ENC_UTF16BE))); } }
+          Blob(b): { if (aff == AFF_TEXT) { return Result.Ok(Value.Text(fromUtf16(b, 0, b.len(), x.db.encoding == ENC_UTF16BE))); } }
+          default: {}
+        }
+      }
+      return Result.Ok(castTo(v, aff));
+    }
+    NSub(sub): {
+      Vec<Value[]> rows = try subRows(sub, c, x);
+      if (rows.len() == 0) { return Result.Ok(Value.Null); }
+      return Result.Ok(rows.get(0)[0]);
+    }
+    NSubCol(sub, col): {
+      Vec<Value[]> rows = try subRows(sub, c, x);
+      if (rows.len() == 0) { return Result.Ok(Value.Null); }
+      return Result.Ok(rows.get(0)[col]);
+    }
+    NInRowsVec(es, sub, neg): {
+      Value[] vs = Value[].filled(es.len(), Value.Null);
+      for (i32 i = 0; i < es.len(); i++) { vs[i] = try eval(es[i], c, x); }
+      Vec<Value[]> rows = try subRows(sub, c, x);
+      bool sawNull = false;
+      for (i32 r = 0; r < rows.len(); r++) {
+        Value[] row = rows.get(r);
+        bool equal = true;
+        bool unknown = false;
+        for (i32 i = 0; i < es.len() && equal; i++) {
+          if (isNull(vs[i]) || isNull(row[i])) { unknown = true; continue; }
+          Value[] ab = comparable(vs[i], nodeAff(es[i]), row[i], i < sub.results.len() ? nodeAff(sub.results[i]) : AFF_NONE);
+          i32 coll = cmpColl(es[i], i < sub.results.len() ? sub.results[i] : Node.NLit(Value.Null));
+          if (compareColl(ab[0], ab[1], coll) != 0) { equal = false; }
+        }
+        if (equal && !unknown) { return Result.Ok(boolValue(!neg)); }
+        if (equal) { sawNull = true; }
+      }
+      return Result.Ok(sawNull ? Value.Null : boolValue(neg));
+    }
+    NExists(sub, neg): {
+      Vec<Value[]> rows = try subRows(sub, c, x);
+      return Result.Ok(boolValue(neg ? rows.len() == 0 : rows.len() > 0));
+    }
+    NResult(i): {
+      if (c.result is null) { return Result.Ok(Value.Null); }
+      return Result.Ok(c.result![i]);
+    }
+  }
+}
+
+// A subquery's rows: computed once when it does not depend on the row it is evaluated for.
+Result<Vec<Value[]>, SqlError> subRows(SelectPlan sub, Ctx c, Exec x) {
+  if (sub.cache is not null) { return Result.Ok(sub.cache!); }
+  Vec<Value[]> rows = try runPlan(sub, c, x);
+  if (!dependsOnOuter(sub)) { sub.cache = rows; }
+  return Result.Ok(rows);
+}
+
+// ── references ─────────────────────────────────────────────────────────────
+
+// Which sources of this select (depth 0) an expression reads, as a bit set, and whether it reaches out
+// of this select at all. Bit 31 stands for "something this cannot place", which keeps it to the end.
+export i32 refs(const Node n, i32 depth) {
+  match (n) {
+    NCol(d, s, c, aff, coll): {
+      if (d != depth) { return d > depth ? 0 : 0; }
+      return s < 30 ? 1 << s : 1 << 30;
+    }
+    NUnary(op, e): { return refs(e, depth); }
+    NArith(op, l, r): { return refs(l, depth) | refs(r, depth); }
+    NBits(op, l, r): { return refs(l, depth) | refs(r, depth); }
+    NConcat(l, r): { return refs(l, depth) | refs(r, depth); }
+    NCompare(op, l, r): { return refs(l, depth) | refs(r, depth); }
+    NAnd(l, r): { return refs(l, depth) | refs(r, depth); }
+    NOr(l, r): { return refs(l, depth) | refs(r, depth); }
+    NNot(e): { return refs(e, depth); }
+    NIsNull(e, neg): { return refs(e, depth); }
+    NBetween(e, lo, hi, neg): { return refs(e, depth) | refs(lo, depth) | refs(hi, depth); }
+    NIn(e, items, neg): {
+      i32 m = refs(e, depth);
+      for (i32 i = 0; i < items.len(); i++) { m = m | refs(items[i], depth); }
+      return m;
+    }
+    NInRows(e, sub, neg): { return refs(e, depth) | planRefs(sub, depth + 1); }
+    NCall(name, fid, args, js): {
+      i32 m = 0;
+      for (i32 i = 0; i < args.len(); i++) { m = m | refs(args[i], depth); }
+      return m;
+    }
+    NLike(v, p, g): { return refs(v, depth) | refs(p, depth); }
+    NAgg: { return 1 << 30; }
+    NWin: { return 1 << 30; }
+    NCase(base, whens, thens, otherwise): {
+      i32 m = base is null ? 0 : refs(base!, depth);
+      for (i32 i = 0; i < whens.len(); i++) { m = m | refs(whens[i], depth) | refs(thens[i], depth); }
+      if (otherwise is not null) { m = m | refs(otherwise!, depth); }
+      return m;
+    }
+    NCast(e, aff): { return refs(e, depth); }
+    NCollate(e, coll): { return refs(e, depth); }
+    NSub(sub): { return planRefs(sub, depth + 1); }
+    NExists(sub, neg): { return planRefs(sub, depth + 1); }
+    NSubCol(sub, col): { return planRefs(sub, depth + 1); }
+    NInRowsVec(es, sub, neg): {
+      i32 m = planRefs(sub, depth + 1);
+      for (i32 i = 0; i < es.len(); i++) { m = m | refs(es[i], depth); }
+      return m;
+    }
+    default: { return 0; }
+  }
+}
+
+// What a nested select reads from the select `depth` levels out of it.
+i32 planRefs(const SelectPlan p, i32 depth) {
+  i32 m = 0;
+  if (p.where is not null) { m = m | refs(p.where!, depth); }
+  for (i32 i = 0; i < p.results.len(); i++) { m = m | refs(p.results[i], depth); }
+  for (i32 i = 0; i < p.srcs.len(); i++) {
+    if (p.srcs[i].on is not null) { m = m | refs(p.srcs[i].on!, depth); }
+    if (p.srcs[i].call is not null) {
+      const Node[] args = p.srcs[i].call!.args;
+      for (i32 k = 0; k < args.len(); k++) { m = m | refs(args[k], depth); }
+      // A subquery in FROM sees from where this query does, a level the same as this one's.
+      if (p.srcs[i].call!.sub is not null) { m = m | planRefs(p.srcs[i].call!.sub!, depth); }
+    }
+  }
+  if (p.having is not null) { m = m | refs(p.having!, depth); }
+  for (i32 i = 0; i < p.order.len(); i++) { m = m | refs(p.order[i], depth); }
+  for (i32 i = 0; i < p.groupBy.len(); i++) { m = m | refs(p.groupBy[i], depth); }
+  for (i32 i = 0; i < p.aggs.len(); i++) {
+    const Node[] args = p.aggs.get(i).args;
+    for (i32 k = 0; k < args.len(); k++) { m = m | refs(args[k], depth); }
+  }
+  if (p.next is not null) { m = m | planRefs(p.next!, depth); }
+  return m;
+}
+
+// True when anything in the plan reads a select outside it.
+bool dependsOnOuter(const SelectPlan p) {
+  for (i32 d = 1; d < 8; d++) { if (planRefs(p, d) != 0) { return true; } }
+  return false;
+}
+
+// ── planning ───────────────────────────────────────────────────────────────
+
+// A table holding a subquery's rows, so it can be a source like any other.
+Table tableOfRows(string name, const string[] names, Vec<Value[]> rows) {
+  Column[] cols = Column[].defaulted(names.len());
+  for (i32 i = 0; i < names.len(); i++) { cols[i] = Column(names[i], "", AFF_BLOB, false, null, 0, null, false, "", -1); }
+  Vec<Row> rs;
+  for (i32 i = 0; i < rows.len(); i++) { rs.push(Row((i + 1) as i64, rows.get(i), null)); }
+  return rowsTable(name, cols, rs);
+}
+
+string defaultName(const ResultCol rc) {
+  if (rc.alias is not null) { return rc.alias!; }
+  match (rc.expr!) {
+    Col(t, name): { return name; }
+    default: { return rc.text; }
+  }
+}
+
+export Result<SelectPlan, SqlError> planSelect(const Select s, Scope? outer0, Exec x) {
+  Scope? outer = outer0 ?? x.triggerScope;
+  if (s.with.len() == 0) { return planSelectBody(s, outer, x); }
+  i32 depth = pushCtes(s.with, s.recursive, x);
+  Result<SelectPlan, SqlError> r = planSelectBody(s, outer, x);
+  popCtes(x, depth);
+  return r;
+}
+
+// Brings a WITH clause's tables into scope; answers the depth to restore.
+export i32 pushCtes(const Cte[] with, bool recursive, Exec x) {
+  i32 depth = x.ctes.len();
+  for (i32 i = 0; i < with.len(); i++) {
+    x.ctes.push(CteDef { name: lower(with[i].name), cols: with[i].cols as string[]?, sel: with[i].sel as Select,
+                         recursive: recursive, rows: null });
+  }
+  return depth;
+}
+
+export void popCtes(Exec x, i32 depth) {
+  while (x.ctes.len() > depth) { x.ctes.pop(); }
+}
+
+export struct Named {
+  Table table;
+  bool derived;   // computed rows (a CTE, a view, sqlite_schema) rather than a stored table
+}
+
+// What a name in FROM means: a CTE in scope, then a table, then a view, then the schema table.
+export Result<Named, SqlError> resolveTable(string name, Exec x) {
+  string n = lower(name);
+  for (i32 i = x.ctes.len() - 1; i >= 0; i--) {
+    CteDef c = x.ctes.get(i);
+    if (c.name != n) { continue; }
+    if (c.rows is null) {
+      if (c.busy) {
+        return Result.Err(err(c.recursive ? "circular reference: \{name}" : "no such table: \{name}"));
+      }
+      c.busy = true;
+      // A CTE sees the CTEs before it, and itself only when recursive; not what comes after.
+      i32 keep = x.ctes.len();
+      Vec<CteDef> hidden;
+      while (x.ctes.len() > i + 1) { hidden.push(x.ctes.pop()!); }
+      Result<Table, SqlError> r = materializeCte(c, x);
+      for (i32 k = hidden.len() - 1; k >= 0; k--) { x.ctes.push(hidden.get(k)); }
+      c.busy = false;
+      c.rows = try r;
+    }
+    return Result.Ok(Named(c.rows!, true));
+  }
+  Table? t = x.db.table(name);
+  if (t is not null) { return Result.Ok(Named(t!, false)); }
+  View? v = x.db.view(name);
+  if (v is not null) {
+    // A view's query does not see the CTEs of the statement that names it.
+    Vec<CteDef> saved = x.ctes;
+    x.ctes = Vec.create();
+    Result<SelectPlan, SqlError> pr = planSelect(v!.sel, null, x);
+    x.ctes = saved;
+    SelectPlan sp = try pr;
+    x.ctes = Vec.create();
+    Result<Vec<Value[]>, SqlError> rr = runPlan(sp, topCtx(x), x);
+    x.ctes = saved;
+    Vec<Value[]> rows = try rr;
+    string[] names = try namesFor(v!.cols, sp.names, name);
+    return Result.Ok(Named(tableOfRows(v!.name, names, rows), true));
+  }
+  if (n == "sqlite_schema" || n == "sqlite_master") { return Result.Ok(Named(schemaTable(x.db, false), true)); }
+  if (n == "sqlite_temp_schema" || n == "sqlite_temp_master") { return Result.Ok(Named(schemaTable(x.db, true), true)); }
+  return Result.Err(err("no such table: \{name}"));
+}
+
+Result<string[], SqlError> namesFor(string[]? cols, string[] names, string what) {
+  if (cols is null) { return Result.Ok(names); }
+  if (cols!.len() != names.len()) {
+    return Result.Err(err("table \{what} has \{names.len()} values for \{cols!.len()} columns"));
+  }
+  return Result.Ok(cols!);
+}
+
+// The name the engine itself reaches a row's rowid by, which SQL text cannot spell unquoted, and which
+// a WITHOUT ROWID table answers too.
+export static string ROWID_INTERNAL = " rowid";
+
+// sqlite_schema as rows: type, name, tbl_name, rootpage, sql.
+// With `temp`, the temporary objects' sqlite_temp_schema instead.
+Table schemaTable(Database db, bool temp) {
+  Vec<Value[]> rows;
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (isKeyIndex(db, e) || db.isTemp(e) != temp) { continue; }
+    Value sql = Value.Null;
+    i64 root = db.rootOf(e);
+    if (e.kind == "table") { sql = Value.Text(db.table(e.name)!.sql); }
+    else if (e.kind == "index") {
+      Index ix = db.index(e.name)!;
+      if (ix.sql is not null) { sql = Value.Text(ix.sql!); }
+    } else if (e.kind == "view") { sql = Value.Text(db.view(e.name)!.sql); }
+    else if (e.kind == "trigger") { sql = Value.Text(db.trigger(e.name)!.def.sql); }
+    rows.push([Value.Text(e.kind), Value.Text(e.name), Value.Text(e.table), Value.Int(root), sql]);
+  }
+  return tableOfRows(temp ? "sqlite_temp_schema" : "sqlite_schema", ["type", "name", "tbl_name", "rootpage", "sql"], rows);
+}
+
+// Splits a compound select into its members, without the ORDER BY and LIMIT that belong to the whole.
+Vec<Select> members(const Select s) {
+  Vec<Select> out;
+  (const Select)? cur = s;
+  while (cur is not null) {
+    Select m = Select { with: Cte[](), cols: cur!.cols as ResultCol[], from: cur!.from as Source[],
+                        where: cur!.where, groupBy: cur!.groupBy as Expr[], having: cur!.having,
+                        orderBy: OrderTerm[](), values: cur!.values as Expr[][]?, distinct: cur!.distinct };
+    out.push(m);
+    cur = cur!.next;
+  }
+  return out;
+}
+
+Vec<string> ops(const Select s) {
+  Vec<string> out;
+  (const Select)? cur = s;
+  while (cur is not null && cur!.compound is not null) { out.push(cur!.compound!); cur = cur!.next; }
+  return out;
+}
+
+bool selectNames(const Select s, string n) {
+  (const Select)? cur = s;
+  while (cur is not null) {
+    for (i32 i = 0; i < cur!.from.len(); i++) {
+      const Source f = cur!.from[i];
+      if (f.table is not null && lower(f.table!) == n) { return true; }
+      if (f.sub is not null && selectNames(f.sub!, n)) { return true; }
+    }
+    cur = cur!.next;
+  }
+  return false;
+}
+
+Result<Table, SqlError> materializeCte(CteDef c, Exec x) {
+  if (!c.recursive || !selectNames(c.sel, c.name)) {
+    SelectPlan sp = try planSelect(c.sel, null, x);
+    Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
+    return Result.Ok(tableOfRows(c.name, try namesFor(c.cols, sp.names, c.name), rows));
+  }
+  // Recursive: the members before the first that names the CTE give the starting rows; each round runs
+  // the recursive members over the rows the last round added, until a round adds none — SQLite's queue,
+  // taken a generation at a time, which yields the same rows in the same order.
+  Vec<Select> ms = members(c.sel);
+  Vec<string> os = ops(c.sel);
+  i32 first = 0;
+  while (first < ms.len() && !selectNames(ms.get(first), c.name)) { first++; }
+  if (first == 0) { return Result.Err(err("recursive reference in a subquery: \{c.name}")); }
+  if (first == ms.len()) { return Result.Err(err("circular reference")); }
+  bool distinct = false;
+  for (i32 i = first - 1; i < os.len(); i++) { if (os.get(i) == "UNION") { distinct = true; } }
+  if (c.sel.orderBy.len() > 0) { return Result.Err(SqlError.unsupported("ORDER BY in a recursive CTE")); }
+  Ctx none = Ctx(Row?[](), null, null, null, null);
+  i64 limit = -1;
+  if (c.sel.limit is not null) {
+    Node ln = try bindExpr(c.sel.limit!, Scope(BoundSource[](), null, null, false), x);
+    limit = toInt(try eval(ln, none, x));
+  }
+  i64 offset = 0;
+  if (c.sel.offset is not null) {
+    Node on = try bindExpr(c.sel.offset!, Scope(BoundSource[](), null, null, false), x);
+    offset = toInt(try eval(on, none, x));
+  }
+  Vec<Value[]> all;
+  Map<u8[], bool> seen = Map.create(hashBytes, bytesEq);
+  string[] names = string[]();
+  Vec<Value[]> batch;
+  for (i32 i = 0; i < first; i++) {
+    SelectPlan sp = try planSelect(ms.get(i), null, x);
+    if (names.len() == 0) { names = try namesFor(c.cols, sp.names, c.name); }
+    Vec<Value[]> rows = try runPlan(sp, none, x);
+    for (i32 k = 0; k < rows.len(); k++) {
+      if (distinct) {
+        u8[] key = keyBytes(rows.get(k));
+        if (seen.has(key)) { continue; }
+        seen.set(key, true);
+      }
+      batch.push(rows.get(k));
+    }
+  }
+  i64 want = limit < 0 ? -1 : limit + (offset > 0 ? offset : 0);
+  while (batch.len() > 0) {
+    for (i32 k = 0; k < batch.len(); k++) {
+      if (want >= 0 && (all.len() as i64) >= want) { break; }
+      all.push(batch.get(k));
+    }
+    if (want >= 0 && (all.len() as i64) >= want) { break; }
+    Table working = tableOfRows(c.name, names, batch);
+    CteDef self = CteDef { name: c.name, cols: null, sel: c.sel, recursive: false, rows: working };
+    x.ctes.push(self);
+    Vec<Value[]> next;
+    for (i32 i = first; i < ms.len(); i++) {
+      Result<SelectPlan, SqlError> pr = planSelect(ms.get(i), null, x);
+      match (pr) {
+        Ok(sp): {
+          if (sp.names.len() != names.len()) {
+            x.ctes.pop();
+            return Result.Err(err("SELECTs to the left and right of UNION do not have the same number of result columns"));
+          }
+          match (runPlan(sp, none, x)) {
+            Ok(rows): {
+              for (i32 k = 0; k < rows.len(); k++) {
+                if (distinct) {
+                  u8[] key = keyBytes(rows.get(k));
+                  if (seen.has(key)) { continue; }
+                  seen.set(key, true);
+                }
+                next.push(rows.get(k));
+              }
+            }
+            Err(e): { x.ctes.pop(); return Result.Err(e); }
+          }
+        }
+        Err(e): { x.ctes.pop(); return Result.Err(e); }
+      }
+    }
+    x.ctes.pop();
+    batch = next;
+  }
+  Vec<Value[]> out;
+  for (i32 i = offset > 0 ? offset as! i32 : 0; i < all.len(); i++) { out.push(all.get(i)); }
+  return Result.Ok(tableOfRows(c.name, names, out));
+}
+
+Result<SelectPlan, SqlError> planSelectBody(const Select s, Scope? outer, Exec x) {
+  SelectPlan p = SelectPlan { ast: s as Select, srcs: BoundSource[](), results: Node[](), names: string[](),
+                              groupBy: Node[](), order: Node[](), desc: bool[](), nulls: i32[](),
+                              probeSpecs: ProbeSpec[][](), probeBuilt: bool[]() };
+  // VALUES (…), (…): rows of expressions with no sources.
+  if (s.values is not null) {
+    Scope sc = Scope(BoundSource[](), outer, p, false);
+    const Expr[][] vs = s.values!;
+    Node[][] rows = Node[][].defaulted(vs.len());
+    for (i32 i = 0; i < vs.len(); i++) {
+      if (vs[i].len() != vs[0].len()) { return Result.Err(err("all VALUES must have the same number of terms")); }
+      rows[i] = try bindAll(vs[i], sc, x);
+    }
+    p.values = rows;
+    string[] names = string[].filled(vs[0].len(), "");
+    for (i32 i = 0; i < names.len(); i++) { names[i] = "column\{i + 1}"; }
+    p.names = names;
+  } else {
+    // Sources.
+    Vec<BoundSource> srcs;
+    for (i32 i = 0; i < s.from.len(); i++) {
+      const Source f = s.from[i];
+      if (f.sub is not null) {
+        SelectPlan sp = try planSelect(f.sub!, outer, x);
+        string nm = f.alias ?? "subquery_\{i}";
+        if (dependsOnOuter(sp)) {
+          // It reads an enclosing query's row, so it is made again for each.
+          Table empty = tableOfRows(nm, sp.names, Vec.create());
+          srcs.push(BoundSource(lower(nm), empty, f.join, null, true, string[](), TableFn("subquery", Node[](), sp.names.len(), sp)));
+        } else {
+          Vec<Value[]> rows = try runPlan(sp, topCtx(x), x);
+          srcs.push(BoundSource(lower(nm), tableOfRows(nm, sp.names, rows), f.join, null, true, string[](), null));
+        }
+      } else if (f.args is not null || isPragmaTable(f.table!, x)) {
+        string tvf = lower(f.table!);
+        string[] colNames = string[].filled(JSON_EACH_COLS.len(), "");
+        for (i32 c = 0; c < colNames.len(); c++) { colNames[c] = JSON_EACH_COLS[c]; }
+        i32 visible = 8;
+        if (tvf.indexOf("pragma_") == 0) {
+          Rows? shape = pragmaRows(tvf.slice(7, tvf.len()), x.db, "");
+          if (shape is null) { return Result.Err(err("no such table-valued function: \{f.table!}")); }
+          // A pragma's columns, then its argument and schema, hidden.
+          visible = shape!.columns.len();
+          string[] all = string[].filled(visible + 2, "");
+          all.copyFrom(shape!.columns, 0, 0, visible);
+          all[visible] = "arg";
+          all[visible + 1] = "schema";
+          colNames = all;
+        } else if (tvf != "json_each" && tvf != "json_tree") {
+          return Result.Err(err("no such table-valued function: \{f.table!}"));
+        }
+        if (f.args is not null && f.args!.len() > 2) { return Result.Err(err("too many arguments on \{tvf}() - max 2")); }
+        Column[] cols = Column[].filled(colNames.len(), Column("", "", 0, false, null, 0, null, false, "", -1));
+        for (i32 c = 0; c < cols.len(); c++) { cols[c] = Column(colNames[c], "", 0, false, null, 0, null, false, "", -1); }
+        Table t = rowsTable(tvf, cols, Vec.create());
+        srcs.push(BoundSource(lower(f.alias ?? tvf), t, f.join, null, true, string[](), TableFn(tvf, Node[](), visible, null)));
+      } else {
+        Named nt = try resolveTable(f.table!, x);
+        srcs.push(BoundSource(lower(f.alias ?? f.table!), nt.table, f.join, null, nt.derived, string[](), null));
+      }
+    }
+    p.srcs = srcs.toArray();
+    Scope sc = Scope(p.srcs, outer, p, false);
+    for (i32 i = 0; i < s.from.len(); i++) {
+      const Source f = s.from[i];
+      if (f.args is not null && p.srcs[i].call is not null) { p.srcs[i].call!.args = try bindAll(f.args!, sc, x); }
+      if (f.on is not null) { p.srcs[i].on = try bindExpr(f.on!, sc, x); }
+      if (f.join == JOIN_RIGHT || f.join == JOIN_FULL) { p.hasRight = true; }
+      string[] usingCols = f.usingCols as string[];
+      if (f.natural) {
+        // NATURAL: every column this source shares with one before it.
+        Vec<string> common;
+        for (i32 c = 0; c < p.srcs[i].table.cols.len(); c++) {
+          string cn = p.srcs[i].table.cols[c].name;
+          for (i32 k = 0; k < i; k++) { if (p.srcs[k].table.colIndex(cn) >= 0) { common.push(cn); break; } }
+        }
+        usingCols = common.toArray();
+      }
+      if (usingCols.len() > 0) {
+        Vec<string> hidden;
+        for (string col in usingCols) { hidden.push(lower(col)); }
+        p.srcs[i].hidden = hidden.toArray();
+        Node? on = null;
+        for (string col in usingCols) {
+          i32 left = -1;
+          for (i32 k = 0; k < i; k++) { if (p.srcs[k].table.colIndex(col) >= 0) { left = k; break; } }
+          i32 rc = p.srcs[i].table.colIndex(col);
+          if (left < 0 || rc < 0) { return Result.Err(err("cannot join using column \{col} - column not present in both tables")); }
+          i32 lc = p.srcs[left].table.colIndex(col);
+          Node eq = Node.NCompare("=", Node.NCol(0, left, lc, p.srcs[left].table.cols[lc].affinity, p.srcs[left].table.cols[lc].coll),
+                                       Node.NCol(0, i, rc, p.srcs[i].table.cols[rc].affinity, p.srcs[i].table.cols[rc].coll));
+          on = on is null ? eq : Node.NAnd(on!, eq);
+        }
+        p.srcs[i].on = on;
+      }
+    }
+    // Result columns, with stars expanded.
+    Vec<Node> results;
+    Vec<string> names;
+    Scope rsc = Scope(p.srcs, outer, p, true);
+    for (i32 i = 0; i < s.cols.len(); i++) {
+      const ResultCol rc = s.cols[i];
+      if (rc.star is not null) {
+        bool any = false;
+        for (i32 k = 0; k < p.srcs.len(); k++) {
+          if (rc.star! != "" && p.srcs[k].name != lower(rc.star!)) { continue; }
+          any = true;
+          Table t = p.srcs[k].table;
+          for (i32 c = 0; c < t.cols.len(); c++) {
+            if (rc.star! == "" && isHidden(p.srcs[k], t.cols[c].name)) { continue; }
+            // json_each's json and root columns are hidden: named, they answer, but `*` leaves them out.
+            if (p.srcs[k].call is not null && c >= p.srcs[k].call!.visible) { continue; }
+            Node col = Node.NCol(0, k, c, p.srcs[k].isSub ? AFF_NONE : t.cols[c].affinity, t.cols[c].coll);
+            if (rc.star! == "") { col = usingMerged(p.srcs, 0, k, lower(t.cols[c].name), col); }
+            results.push(col);
+            names.push(t.cols[c].name);
+          }
+        }
+        if (!any) {
+          return Result.Err(err(rc.star! == "" ? "no tables specified" : "no such table: \{rc.star!}"));
+        }
+        continue;
+      }
+      results.push(try bindExpr(rc.expr!, rsc, x));
+      names.push(defaultName(rc));
+    }
+    p.results = results.toArray();
+    p.names = names.toArray();
+    if (s.where is not null) { p.where = try bindExpr(s.where!, sc, x); }
+    // GROUP BY may name an output column by its alias, as SQLite allows.
+    Node[] gb = Node[].filled(s.groupBy.len(), Node.NLit(Value.Null));
+    for (i32 i = 0; i < s.groupBy.len(); i++) {
+      i32 alias = aliasIndex(s.groupBy[i], s.cols, p.srcs);
+      if (alias >= 0) { gb[i] = try bindExpr(s.cols[alias].expr!, sc, x); }
+      else { gb[i] = try bindExpr(s.groupBy[i], sc, x); }
+    }
+    p.groupBy = gb;
+    if (s.having is not null) { p.having = try bindExpr(s.having!, rsc, x); }
+    p.aggregate = p.aggs.len() > 0 || p.groupBy.len() > 0;
+    if (s.having is not null && !p.aggregate) { return Result.Err(err("a GROUP BY clause is required before HAVING")); }
+    p.distinct = s.distinct;
+  }
+  // A compound's parts are planned on their own; order and limit then apply to the whole.
+  if (s.compound is not null) {
+    p.compound = s.compound;
+    Select nextAst = s.next! as Select;
+    SelectPlan np = try planSelect(nextAst, outer, x);
+    if (np.names.len() != p.names.len()) {
+      return Result.Err(err("SELECTs to the left and right of \{s.compound!} do not have the same number of result columns"));
+    }
+    p.next = np;
+  }
+  try planOrder(p, s, outer, x);
+  if (p.aggregate && p.groupBy.len() > 0 && p.aggs.len() == 1 && p.aggs.get(0).kind == AGG_MINMAX) {
+    p.keyed = true;
+    for (i32 i = 0; i < p.results.len(); i++) { p.results[i] = keyed(p.results[i], p.groupBy, 1); }
+    if (p.having is not null) { p.having = keyed(p.having!, p.groupBy, 1); }
+    for (i32 i = 0; i < p.order.len(); i++) { p.order[i] = keyed(p.order[i], p.groupBy, 1); }
+  }
+  Scope none = Scope(BoundSource[](), outer, null, false);
+  if (s.limit is not null) { p.limit = try bindExpr(s.limit!, none, x); }
+  if (s.offset is not null) { p.offset = try bindExpr(s.offset!, none, x); }
+  return Result.Ok(p);
+}
+
+bool isHidden(const BoundSource b, string name) {
+  string n = lower(name);
+  for (string h in b.hidden) { if (h == n) { return true; } }
+  return false;
+}
+
+// The output column an expression names by alias, when it is a bare name that no source has.
+i32 aliasIndex(const Expr e, const ResultCol[] cols, const BoundSource[] srcs) {
+  match (e) {
+    Col(t, name): {
+      if (t is not null) { return -1; }
+      string n = lower(name);
+      for (i32 k = 0; k < srcs.len(); k++) { if (srcs[k].table.colIndex(n) >= 0) { return -1; } }
+      for (i32 i = 0; i < cols.len(); i++) {
+        if (cols[i].alias is not null && lower(cols[i].alias!) == n) { return i; }
+      }
+      return -1;
+    }
+    default: { return -1; }
+  }
+}
+
+Result<void, SqlError> planOrder(SelectPlan p, const Select s, Scope? outer, Exec x) {
+  i32 n = s.orderBy.len();
+  Node[] order = Node[].filled(n, Node.NLit(Value.Null));
+  bool[] desc = bool[].filled(n, false);
+  i32[] nulls = i32[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) {
+    const OrderTerm t = s.orderBy[i];
+    desc[i] = t.desc;
+    nulls[i] = t.nulls;
+    // A number names an output column by position.
+    match (t.expr) {
+      Lit(v): {
+        match (v) {
+          Int(k): {
+            if (k < 1 || k > p.names.len() as i64) {
+              return Result.Err(err("\{i + 1}th ORDER BY term out of range - should be between 1 and \{p.names.len()}"));
+            }
+            order[i] = Node.NResult((k - 1) as! i32);
+            continue;
+          }
+          default: {}
+        }
+      }
+      default: {}
+    }
+    // An alias names an output column; in a compound, so does any column name.
+    i32 hit = -1;
+    match (t.expr) {
+      Col(tb, name): {
+        if (tb is null) {
+          for (i32 k = 0; k < s.cols.len(); k++) {
+            if (s.cols[k].alias is not null && lower(s.cols[k].alias!) == lower(name)) { hit = k; break; }
+          }
+          if (hit < 0 && (p.compound is not null || p.values is not null)) {
+            for (i32 k = 0; k < p.names.len(); k++) { if (lower(p.names[k]) == lower(name)) { hit = k; break; } }
+          }
+        }
+      }
+      default: {}
+    }
+    if (hit >= 0) { order[i] = Node.NResult(hit); continue; }
+    if (p.compound is not null || p.values is not null) {
+      return Result.Err(err("\{i + 1}th ORDER BY term does not match any column in the result set"));
+    }
+    order[i] = try bindExpr(t.expr, Scope(p.srcs, outer, p, true), x);
+  }
+  p.order = order;
+  p.desc = desc;
+  p.nulls = nulls;
+  i32[] oc = i32[].filled(n, COLL_BINARY);
+  for (i32 i = 0; i < n; i++) {
+    match (order[i]) {
+      NResult(j): { if (j < p.results.len()) { oc[i] = ownColl(p.results[j]); } }
+      default: { oc[i] = ownColl(order[i]); }
+    }
+  }
+  p.orderColl = oc;
+  p.aggregate = p.aggregate || p.aggs.len() > 0;
+  return Result.Ok();
+}
+
+// ── access paths ───────────────────────────────────────────────────────────
+
+// A condition that narrows source k: `column op value`, the value computable from earlier sources.
+struct Probe {
+  i32 col;          // -1 for the rowid
+  string op;        // = < <= > >=
+  Value v;
+  i32 coll;
+}
+
+string flip(string op) {
+  if (op == "<") { return ">"; }
+  if (op == "<=") { return ">="; }
+  if (op == ">") { return "<"; }
+  if (op == ">=") { return "<="; }
+  return op;
+}
+
+// The probe value as the column will compare it: numeric for a numeric column, text for a text one.
+Value probeValue(const Value v, i32 vAff, i32 colAff) {
+  return comparable(Value.Int(0), colAff, v, vAff)[1];
+}
+
+void conjuncts(const Node n, Vec<Node> out) {
+  match (n) {
+    NAnd(l, r): { conjuncts(l, out); conjuncts(r, out); }
+    default: { out.push(n as Node); }
+  }
+}
+
+ProbeSpec[] probeSpecsFor(const SelectPlan p, i32 k, const Vec<Node> conds) {
+  Vec<ProbeSpec> out;
+  i32 earlier = (1 << k) - 1;
+  const Table t = p.srcs[k].table;
+  for (i32 i = 0; i < conds.len(); i++) {
+    match (conds.get(i)) {
+      NCompare(op, l, r): {
+        if (op != "=" && op != "<" && op != "<=" && op != ">" && op != ">=") { continue; }
+        for (i32 side = 0; side < 2; side++) {
+          const Node colSide = side == 0 ? l : r;
+          const Node other = side == 0 ? r : l;
+          match (colSide) {
+            NCol(d, s, col, aff, coll): {
+              if (d != 0 || s != k) { continue; }
+              if ((refs(other, 0) & ~earlier) != 0) { continue; }
+              i32 colAff = col < 0 || col == t.rowidAlias ? AFF_INTEGER : aff;
+              out.push(ProbeSpec(col == t.rowidAlias ? -1 : col, side == 0 ? op : flip(op), other as Node, colAff,
+                                 cmpColl(side == 0 ? l : r, side == 0 ? r : l)));
+            }
+            default: {}
+          }
+        }
+      }
+      default: {}
+    }
+  }
+  return out.toArray();
+}
+
+// The conditions that may narrow source k: its ON, and for an inner join the WHERE's too.
+Vec<Node> usableConds(const SelectPlan p, i32 k, const Vec<Node> where) {
+  Vec<Node> usable;
+  if (p.srcs[k].on is not null) { conjuncts(p.srcs[k].on!, usable); }
+  if (p.srcs[k].join != JOIN_LEFT && p.srcs[k].join != JOIN_FULL && !p.hasRight) {
+    for (i32 i = 0; i < where.len(); i++) { usable.push(where.get(i)); }
+  }
+  return usable;
+}
+
+Result<Vec<Probe>, SqlError> probesFor(SelectPlan p, i32 k, const Vec<Node> where, Ctx c, Exec x) {
+  if (p.probeBuilt.len() != p.srcs.len()) {
+    p.probeSpecs = ProbeSpec[][].defaulted(p.srcs.len());
+    p.probeBuilt = bool[].filled(p.srcs.len(), false);
+  }
+  if (!p.probeBuilt[k]) {
+    p.probeSpecs[k] = probeSpecsFor(p, k, usableConds(p, k, where));
+    p.probeBuilt[k] = true;
+  }
+  ProbeSpec[] specs = p.probeSpecs[k];
+  Vec<Probe> out;
+  for (i32 i = 0; i < specs.len(); i++) {
+    ProbeSpec sp = specs[i];
+    Value v = try eval(sp.other, c, x);
+    if (isNull(v)) { continue; }
+    out.push(Probe(sp.col, sp.op, probeValue(v, nodeAff(sp.other), sp.colAff), sp.coll));
+  }
+  return Result.Ok(out);
+}
+
+// How a source's rows will be read: in rowid order between two rowids, or through an index between two
+// bounds, possibly backwards.
+struct Access {
+  Index? ix;
+  i64 loId;         // the rowids read, both included, when there is no index
+  i64 hiId;
+  Bound? lo;        // the index's entries read: from `lo` (null: its first) to before `hi` (null: its end)
+  Bound? hi;
+  bool reverse;
+  bool ordered;     // the order delivered is the ORDER BY's
+  bool none;        // a probe that can match nothing
+}
+
+static i64 MIN_ID = -9223372036854775807 - 1;
+static i64 MAX_ID = 9223372036854775807;
+
+// A place among an index's entries: before the first that begins with `key` or comes after it, or with
+// `after`, after the last that begins with it.
+struct Bound {
+  Value[] key;
+  bool after;
+}
+
+// Which of two places comes first.
+i32 boundCmp(Index ix, Bound a, Bound b) {
+  i32 n = a.key.len() < b.key.len() ? a.key.len() : b.key.len();
+  for (i32 i = 0; i < n; i++) {
+    i32 c = ix.compareAt(i, a.key[i], b.key[i]);
+    if (c != 0) { return i < ix.desc.len() && ix.desc[i] ? -c : c; }
+  }
+  if (a.key.len() == b.key.len()) { return (a.after ? 1 : 0) - (b.after ? 1 : 0); }
+  // A shorter key's place is outside the longer's: before it, or with `after`, after it.
+  if (a.key.len() < b.key.len()) { return a.after ? 1 : -1; }
+  return b.after ? -1 : 1;
+}
+
+Access tableAccess(i64 lo, i64 hi, bool reverse, bool ordered, bool none) {
+  return Access(null, lo, hi, null, null, reverse, ordered, none);
+}
+
+Access indexAccess(Index ix, Bound? lo, Bound? hi, bool reverse, bool ordered) {
+  return Access(ix, MIN_ID, MAX_ID, lo, hi, reverse, ordered, false);
+}
+
+// The rows an access path reads, one at a time.
+struct Scan {
+  Table t;
+  Access a;
+  RowCursor rc;
+  Cursor? ic;
+  bool begun = false;
+  bool done = false;
+  KeyCmp? loCmp = null;    // the bounds as comparisons of an entry's bytes
+  KeyCmp? hiCmp = null;
+
+  Scan open(Table t, Access a) {
+    Cursor? ic = a.ix is null ? null : a.ix!.cursor() as Cursor?;
+    Scan sc = Scan { t: t, a: a, rc: t.cursor(), ic: ic };
+    if (a.ix is not null) {
+      Index ix = a.ix!;
+      if (a.lo is not null) { sc.loCmp = a.lo!.after ? ix.prefixTo(a.lo!.key) : ix.cmpTo(a.lo!.key); }
+      if (a.hi is not null) { sc.hiCmp = a.hi!.after ? ix.prefixTo(a.hi!.key) : ix.cmpTo(a.hi!.key); }
+    }
+    return sc;
+  }
+
+  // The next row, or null at the end. A row an index names that is not in the table is passed over.
+  Row? next(this) {
+    while (!this.done) {
+      bool ok = false;
+      if (this.ic is null) {
+        if (!this.begun) {
+          this.begun = true;
+          if (!this.a.reverse) { ok = this.rc.seek(this.a.loId); }
+          else if (this.a.hiId == MAX_ID || !this.rc.seek(this.a.hiId + 1)) { ok = this.rc.last(); }
+          else { ok = this.rc.prev(); }
+        } else {
+          ok = this.a.reverse ? this.rc.prev() : this.rc.next();
+        }
+        if (!ok) { this.done = true; return null; }
+        i64 id = this.rc.rowid();
+        if (id < this.a.loId || id > this.a.hiId) { this.done = true; return null; }
+        return this.rc.row();
+      }
+      Index ix = this.a.ix!;
+      Cursor c = this.ic!;
+      if (!this.begun) {
+        this.begun = true;
+        if (!this.a.reverse) {
+          ok = this.a.lo is null ? c.first() : this.seekTo(this.a.lo!);
+        } else if (this.a.hi is null || !this.seekTo(this.a.hi!)) {
+          ok = c.last();
+        } else {
+          ok = c.prev();
+        }
+      } else {
+        ok = this.a.reverse ? c.prev() : c.next();
+      }
+      if (!ok) { this.done = true; return null; }
+      if (!this.within(c.payload)) { this.done = true; return null; }
+      i64? id = ix.rowidOf(c.payload);
+      if (id is not null) {
+        Row? r = this.t.get(id!);
+        if (r is not null) { return r; }
+      }
+    }
+    return null;
+  }
+
+  bool seekTo(this, Bound b) {
+    return b.after ? this.a.ix!.seekAfter(this.ic!, b.key) : this.a.ix!.seekFrom(this.ic!, b.key);
+  }
+
+  // Whether an entry lies between the bounds: from `lo` on, and before `hi`.
+  bool within(this, u8[] rec) {
+    if (this.loCmp is not null) {
+      i32 c = whole(this.loCmp!, rec);
+      if (this.a.lo!.after ? c <= 0 : c < 0) { return false; }
+    }
+    if (this.hiCmp is not null) {
+      i32 c = whole(this.hiCmp!, rec);
+      if (this.a.hi!.after ? c > 0 : c >= 0) { return false; }
+    }
+    return true;
+  }
+}
+
+bool isInt(const Value v) { return match (v) { Int: true, default: false }; }
+
+i64 intOf(const Value v) { return match (v) { Int(i): i, default: 0 as i64 }; }
+
+// The order the first source's rows are wanted in, when an access path might deliver it: the ORDER BY of
+// a plain select, or for a lone min()/max() over a column, that column — read in order, the first row
+// with a value is the answer.
+struct Wanted {
+  Node[] order;
+  bool[] desc;
+  i32[] nulls;
+  i32[] colls;
+  bool minMax;
+}
+
+Wanted? wantedOrder(const SelectPlan p) {
+  if (p.srcs.len() != 1 || p.distinct || p.compound is not null) { return null; }
+  if (!p.aggregate) {
+    if (p.order.len() == 0) { return null; }
+    return Wanted(p.order as Node[], p.desc as bool[], p.nulls as i32[], p.orderColl as i32[], false);
+  }
+  if (p.groupBy.len() != 0 || p.aggs.len() != 1 || p.having is not null) { return null; }
+  const AggSpec a = p.aggs.get(0);
+  if ((a.name != "min" && a.name != "max") || a.args.len() != 1 || a.distinct) { return null; }
+  match (a.args[0]) {
+    NCol(d, src, col, aff, coll): {
+      if (d != 0 || src != 0) { return null; }
+      // Ascending puts NULLs first, which min() skips; descending puts them last.
+      return Wanted([a.args[0] as Node], [a.name == "max"], [0], [ownColl(a.args[0])], true);
+    }
+    default: { return null; }
+  }
+}
+
+// Whether reading `ix` from column `from` on gives the wanted order, and in which direction.
+// 0: no; 1: forwards; 2: backwards.
+i32 orderFromIndex(const Wanted w, const Index ix, i32 from) {
+  if (w.order.len() == 0 || w.order.len() > ix.cols.len() - from) { return 0; }
+  i32 dir = 0;
+  for (i32 i = 0; i < w.order.len(); i++) {
+    if (w.nulls[i] != 0) { return 0; }
+    match (w.order[i]) {
+      NCol(d, s, col, aff, coll): {
+        if (d != 0 || s != 0 || col != ix.cols[from + i]) { return 0; }
+      }
+      default: { return 0; }
+    }
+    if (i < w.colls.len() && w.colls[i] != ix.colls[from + i]) { return 0; }
+    i32 want = (w.desc[i] != ix.desc[from + i]) ? 2 : 1;
+    if (dir == 0) { dir = want; } else if (dir != want) { return 0; }
+  }
+  return dir;
+}
+
+i32 orderFromRowid(const Wanted w, const Table t) {
+  if (w.order.len() != 1 || w.nulls[0] != 0) { return 0; }
+  match (w.order[0]) {
+    NCol(d, s, col, aff, coll): {
+      if (d != 0 || s != 0 || (col != -1 && col != t.rowidAlias)) { return 0; }
+      return w.desc[0] ? 2 : 1;
+    }
+    default: { return 0; }
+  }
+}
+
+// Whether this select's ORDER BY may be satisfied by the first source's access path.
+bool orderable(const SelectPlan p) {
+  return p.srcs.len() == 1 && !p.aggregate && !p.distinct && p.compound is null && p.order.len() > 0;
+}
+
+Result<Access, SqlError> chooseAccess(SelectPlan p, i32 k, const Vec<Node> conds, Ctx c, Exec x) {
+  Table t = p.srcs[k].table;
+  Vec<Probe> probes = try probesFor(p, k, conds, c, x);
+  Wanted? w = k == 0 ? wantedOrder(p) : null;
+  bool wantOrder = w is not null;
+  // The rowid, exactly.
+  for (i32 i = 0; i < probes.len(); i++) {
+    Probe pr = probes.get(i);
+    if (pr.col == -1 && pr.op == "=") {
+      Value v = pr.v;
+      match (pr.v) { Real(r): { i64? e = exactInt(r); if (e is not null) { v = Value.Int(e!); } } default: {} }
+      if (!isInt(v)) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+      return Result.Ok(tableAccess(intOf(v), intOf(v), false, true, false));
+    }
+  }
+  // The best index: the most leading columns fixed by equality, then a range on the next.
+  Index? best = null;
+  i32 bestScore = 0;
+  Index[] all = x.db.indexesOf(t.name);
+  Vec<Index> plain;
+  for (i32 i = 0; i < all.len(); i++) { if (!all[i].special()) { plain.push(all[i]); } }
+  Index[] ixs = plain.toArray();
+  if (p.srcs[k].isSub || !t.stored()) { ixs = Index[](); }
+  for (i32 j = 0; j < ixs.len(); j++) {
+    Index ix = ixs[j];
+    i32 eq = 0;
+    while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=", ix.colls[eq]) >= 0) { eq++; }
+    bool range = eq < ix.cols.len() && !ix.desc[eq] && hasRange(probes, ix.cols[eq], ix.colls[eq]);
+    i32 score = eq * 4 + (range ? 2 : 0);
+    if (wantOrder && orderFromIndex(w!, ix, eq) != 0) { score++; }
+    if (score > bestScore) { best = ix; bestScore = score; }
+  }
+  // A range on the rowid beats a range on an index with nothing fixed by equality: it reads the table
+  // directly, and it is what SQLite chooses.
+  bool rowidRange = false;
+  for (i32 i = 0; i < probes.len(); i++) { if (probes.get(i).col == -1 && probes.get(i).op != "=") { rowidRange = true; } }
+  if (rowidRange && bestScore < 4) { best = null; }
+  if (best is not null && bestScore >= 2) {
+    Index ix = best!;
+    i32 eq = 0;
+    while (eq < ix.cols.len() && findProbe(probes, ix.cols[eq], "=", ix.colls[eq]) >= 0) { eq++; }
+    Value[] key = Value[].filled(eq, Value.Null);
+    for (i32 i = 0; i < eq; i++) { key[i] = probes.get(findProbe(probes, ix.cols[i], "=", ix.colls[i])).v; }
+    Bound lo = Bound(key, false);
+    Bound hi = Bound(key, true);
+    if (eq < ix.cols.len() && !ix.desc[eq]) {
+      i32 col = ix.cols[eq];
+      // NULLs sort first, and a range never includes them.
+      bool bounded = false;
+      for (i32 i = 0; i < probes.len(); i++) {
+        Probe pr = probes.get(i);
+        if (pr.col != col || pr.op == "=" || pr.coll != ix.colls[eq]) { continue; }
+        Value[] k2 = Value[].filled(eq + 1, Value.Null);
+        k2.copyFrom(key, 0, 0, eq);
+        k2[eq] = pr.v;
+        if (pr.op == ">" || pr.op == ">=") {
+          Bound b = Bound(k2, pr.op == ">");
+          if (boundCmp(ix, b, lo) > 0) { lo = b; }
+        } else {
+          Bound b = Bound(k2, pr.op == "<=");
+          if (boundCmp(ix, b, hi) < 0) { hi = b; }
+          bounded = true;
+        }
+      }
+      if (bounded) {
+        Value[] kn = Value[].filled(eq + 1, Value.Null);
+        kn.copyFrom(key, 0, 0, eq);
+        Bound afterNulls = Bound(kn, true);
+        if (boundCmp(ix, afterNulls, lo) > 0) { lo = afterNulls; }
+      }
+    }
+    i32 dir = wantOrder ? orderFromIndex(w!, ix, eq) : 0;
+    if (boundCmp(ix, hi, lo) <= 0) { return Result.Ok(tableAccess(0, -1, false, dir != 0, true)); }
+    return Result.Ok(indexAccess(ix, eq == 0 && lo.key.len() == 0 ? null : lo as Bound?, eq == 0 && hi.key.len() == 0 ? null : hi as Bound?, dir == 2, dir != 0));
+  }
+  // A WITHOUT ROWID table is read in its key's order, as the file holds it.
+  if (t.withoutRowid && !p.srcs[k].isSub && t.stored()) {
+    Index pk = x.db.index(t.pkIndex)!;
+    i32 d2 = wantOrder ? orderFromIndex(w!, pk, 0) : 0;
+    return Result.Ok(indexAccess(pk, null, null, d2 == 2, d2 != 0));
+  }
+  // A range of rowids.
+  i64 lo = MIN_ID;
+  i64 hi = MAX_ID;
+  for (i32 i = 0; i < probes.len(); i++) {
+    Probe pr = probes.get(i);
+    if (pr.col != -1 || pr.op == "=") { continue; }
+    Value v = pr.v;
+    if (!isInt(v)) {
+      match (v) { Real(r): {} default: { continue; } }
+    }
+    f64 bound = toReal(v);
+    if (pr.op == ">" || pr.op == ">=") {
+      if (bound >= 9.3e18) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+      if (bound < -9.3e18) { continue; }
+      i64 b = bound.ceil() as~ i64;
+      if (pr.op == ">" && (b as~ f64) == bound) {
+        if (b == MAX_ID) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+        b++;
+      }
+      if (b > lo) { lo = b; }
+    } else {
+      if (bound < -9.3e18) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+      if (bound >= 9.3e18) { continue; }
+      i64 b = bound.floor() as~ i64;
+      if (pr.op == "<" && (b as~ f64) == bound) {
+        if (b == MIN_ID) { return Result.Ok(tableAccess(0, -1, false, true, true)); }
+        b--;
+      }
+      if (b < hi) { hi = b; }
+    }
+  }
+  i32 dir = wantOrder ? orderFromRowid(w!, t) : 0;
+  if (hi < lo) { return Result.Ok(tableAccess(0, -1, false, dir != 0, true)); }
+  // An index can still deliver the order when nothing narrows the rows.
+  if (dir == 0 && wantOrder && lo == MIN_ID && hi == MAX_ID) {
+    for (i32 j = 0; j < ixs.len(); j++) {
+      i32 d2 = orderFromIndex(w!, ixs[j], 0);
+      if (d2 != 0) { return Result.Ok(indexAccess(ixs[j], null, null, d2 == 2, true)); }
+    }
+  }
+  return Result.Ok(tableAccess(lo, hi, dir == 2, dir != 0, false));
+}
+
+i32 findProbe(const Vec<Probe> probes, i32 col, string op, i32 coll) {
+  for (i32 i = 0; i < probes.len(); i++) {
+    if (probes.get(i).col == col && probes.get(i).op == op && probes.get(i).coll == coll) { return i; }
+  }
+  return -1;
+}
+
+bool hasRange(const Vec<Probe> probes, i32 col, i32 coll) {
+  for (i32 i = 0; i < probes.len(); i++) {
+    if (probes.get(i).col == col && probes.get(i).op != "=" && probes.get(i).coll == coll) { return true; }
+  }
+  return false;
+}
+
+// ── running ────────────────────────────────────────────────────────────────
+
+struct AggState {
+  i64 count = 0;
+  bool anyReal = false;
+  i64 sumI = 0;
+  f64 sumR = 0.0;
+  bool overflow = false;
+  Value? best;
+  string text = "";
+  bool any = false;
+  Map<u8[], bool>? seen;
+  Vec<Value[]>? items;     // for an aggregate with ORDER BY: each row's order keys, then its arguments
+  Vec<f64>? nums;          // median and the percentiles: every value
+  f64 frac = -1.0;         // and the fraction asked for, from 0 to 1
+}
+
+struct Group {
+  Row?[] rep;
+  AggState[] states;
+}
+
+// Gathers what the loops produce: output rows with their sort keys, or groups.
+struct Sink {
+  bool minMaxStop;   // a lone min()/max() read in order: the first value found is the answer
+  bool done;
+  Vec<Value[]> rows;
+  Vec<Value[]> keys;
+  i32 stopAt;        // -1: keep going
+  Map<u8[], i32> groupIndex;
+  Vec<Group> groups;
+  Vec<Value[]> groupKeys;
+  Vec<Ctx> pend;     // with window functions: each row's context, held until the windows are computed
+  Vec<Map<i64, bool>> hits;   // per source: the rows a RIGHT or FULL JOIN matched
+}
+
+// A key for hashing values that compare equal: integral reals as integers.
+export u8[] keyBytes(const Value[] vals) {
+  Value[] v = Value[].filled(vals.len(), Value.Null);
+  for (i32 i = 0; i < vals.len(); i++) {
+    v[i] = vals[i];
+    match (vals[i]) {
+      Real(r): { i64? e = exactInt(r); if (e is not null) { v[i] = Value.Int(e!); } }
+      default: {}
+    }
+  }
+  return encodeRecord(v);
+}
+
+Row?[] copyRows(Row?[] rows) {
+  Row?[] out = Row?[].defaulted(rows.len());
+  for (i32 i = 0; i < rows.len(); i++) { out[i] = rows[i]; }
+  return out;
+}
+
+Result<void, SqlError> emit(SelectPlan p, Ctx c, Exec x, Sink sink) {
+  if (p.aggregate) {
+    Value[] gk = Value[].filled(p.groupBy.len(), Value.Null);
+    for (i32 i = 0; i < gk.len(); i++) { gk[i] = try eval(p.groupBy[i], c, x); }
+    // Values equal under the grouping expression's collation fall in one group.
+    Value[] ck = Value[].filled(gk.len(), Value.Null);
+    for (i32 i = 0; i < gk.len(); i++) { ck[i] = collated(gk[i], ownColl(p.groupBy[i])); }
+    u8[] kb = keyBytes(ck);
+    i32? gi = sink.groupIndex.get(kb);
+    Group g;
+    if (gi is null) {
+      AggState[] st = AggState[].defaulted(p.aggs.len());
+      g = Group(copyRows(c.rows), st);
+      sink.groupIndex.set(kb, sink.groups.len());
+      sink.groups.push(g);
+      sink.groupKeys.push(gk);
+    } else {
+      g = sink.groups.get(gi!);
+    }
+    bool repFromBest = p.aggs.len() == 1 && p.aggs.get(0).kind == AGG_MINMAX;
+    bool improved = false;
+    for (i32 i = 0; i < p.aggs.len(); i++) {
+      if (try step(p.aggs.get(i), g.states[i], c, x)) { improved = true; }
+    }
+    // A bare column takes the group's first row, as SQLite 3.53 does — unless a lone min() or max()
+    // says which row it comes from.
+    if (repFromBest && improved) { g.rep = copyRows(c.rows); }
+    if (sink.minMaxStop && g.states[0].best is not null) { sink.done = true; }
+    return Result.Ok();
+  }
+  if (p.wins.len() > 0) {
+    sink.pend.push(Ctx(copyRows(c.rows), c.outer, null, null, null));
+    return Result.Ok();
+  }
+  Value[] out = Value[].filled(p.results.len(), Value.Null);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = try eval(p.results[i], c, x); }
+  try pushRow(p, c, x, sink, out);
+  return Result.Ok();
+}
+
+Result<void, SqlError> pushRow(SelectPlan p, Ctx c, Exec x, Sink sink, Value[] out) {
+  Value[] keys = Value[].filled(p.order.len(), Value.Null);
+  Ctx kc = Ctx(c.rows, c.outer, c.aggs, out, c.wins);
+  for (i32 i = 0; i < keys.len(); i++) { keys[i] = try eval(p.order[i], kc, x); }
+  sink.rows.push(out);
+  sink.keys.push(keys);
+  return Result.Ok();
+}
+
+// Feeds one row into an aggregate. Answers whether a min or max changed, for the bare columns.
+Result<bool, SqlError> step(const AggSpec a, AggState s, Ctx c, Exec x) {
+  if (a.filter is not null && truth(try eval(a.filter!, c, x)) != 1) { return Result.Ok(false); }
+  if (a.star) { s.count++; return Result.Ok(false); }
+  Value[] args = Value[].filled(a.args.len(), Value.Null);
+  for (i32 i = 0; i < args.len(); i++) { args[i] = try eval(a.args[i], c, x); }
+  if (a.order.len() > 0) {
+    // Kept until the group is complete, then fed in order.
+    Value[] item = Value[].filled(a.order.len() + args.len(), Value.Null);
+    for (i32 i = 0; i < a.order.len(); i++) { item[i] = try eval(a.order[i], c, x); }
+    for (i32 i = 0; i < args.len(); i++) { item[a.order.len() + i] = args[i]; }
+    if (s.items is null) { s.items = Vec<Value[]>.create(); }
+    s.items!.push(item);
+    return Result.Ok(false);
+  }
+  return stepValues(a, s, args);
+}
+
+// Feeds one row's argument values into an aggregate. Answers whether a min or max changed.
+Result<bool, SqlError> stepValues(const AggSpec a, AggState s, const Value[] args) {
+  if (a.star || args.len() == 0) { s.count++; return Result.Ok(false); }
+  Value v = args[0];
+  if (a.kind == AGG_JSON_ARRAY || a.kind == AGG_JSON_OBJECT) {
+    // These keep NULLs, as JSON null.
+    string member = "";
+    if (a.kind == AGG_JSON_OBJECT) {
+      match (v) {
+        Text(k): { member = "\"" + escape(k) + "\":"; }
+        Null: { return Result.Ok(false); }
+        default: { return Result.Err(err("json_group_object() labels must be TEXT")); }
+      }
+      v = args[1];
+    }
+    Json j = jsonOf(v);
+    if (a.jsonArg) { match (v) { Text(t): { Json? pj = parseJson(t); if (pj is not null) { j = pj!; } } default: {} } }
+    // A blob is JSONB, or cannot be held.
+    match (v) {
+      Blob(b): {
+        Json? pj = fromJsonb(b);
+        if (pj is null) { return Result.Err(err("JSON cannot hold BLOB values")); }
+        j = pj!;
+      }
+      default: {}
+    }
+    s.text = s.any ? s.text + "," + member + jsonText(j) : member + jsonText(j);
+    s.any = true;
+    s.count++;
+    return Result.Ok(false);
+  }
+  if (isNull(v)) { return Result.Ok(false); }
+  if (a.distinct) {
+    if (s.seen is null) { s.seen = Map<u8[], bool>.create(hashBytes, bytesEq); }
+    u8[] k = keyBytes([v]);
+    if (s.seen!.has(k)) { return Result.Ok(false); }
+    s.seen!.set(k, true);
+  }
+  s.count++;
+  string n = a.name;
+  if (a.kind == AGG_PERCENTILE) {
+    // As SQLite's percentile extension: numbers only (text is not converted), and one fraction for
+    // every row.
+    f64 x = 0.0;
+    match (v) {
+      Int(i): { x = i as~ f64; }
+      Real(r): { x = r; }
+      default: { return Result.Err(err("input to \{n}() is not numeric")); }
+    }
+    f64 frac = 0.5;
+    if (n != "median") {
+      f64 scale = n == "percentile" ? 100.0 : 1.0;
+      bool ok = false;
+      match (applyAffinity(args[1], AFF_NUMERIC)) {
+        Int(i): { frac = (i as~ f64) / scale; ok = true; }
+        Real(r): { frac = r / scale; ok = true; }
+        default: {}
+      }
+      if (!ok || frac < 0.0 || frac > 1.0) {
+        return Result.Err(err("the fraction argument to \{n}() is not between 0.0 and \{n == "percentile" ? "100.0" : "1.0"}"));
+      }
+      if (s.frac >= 0.0 && s.frac != frac) {
+        return Result.Err(err("the fraction argument to \{n}() is not the same for all input rows"));
+      }
+    }
+    s.frac = frac;
+    if (s.nums is null) { s.nums = Vec<f64>.create(); }
+    s.nums!.push(x);
+    return Result.Ok(false);
+  }
+  if (a.kind == AGG_SUM) {
+    // Anything but an integer makes the sum a real — text included, unless it reads as an integer
+    // ('3' does, 'x' does not), which is SQLite's sqlite3_value_numeric_type.
+    Value num = v as Value;
+    match (v) {
+      // Text reads as the number it spells, keeping '2.0' a real; text that is no number stays text.
+      Text(t): { Value? w = wholeNumber(t); if (w is not null) { num = w!; } }
+      default: {}
+    }
+    match (num) { Int: {} default: { s.anyReal = true; } }
+    num = toNumeric(num);
+    match (num) {
+      Int(i): {
+        i64 sum = s.sumI + i;
+        if ((s.sumI >= 0 && i >= 0 && sum < 0) || (s.sumI < 0 && i < 0 && sum >= 0)) { s.overflow = true; }
+        s.sumI = sum;
+        s.sumR = s.sumR + (i as~ f64);
+      }
+      Real(r): { s.anyReal = true; s.sumR = s.sumR + r; }
+      default: {}
+    }
+    return Result.Ok(false);
+  }
+  if (a.kind == AGG_MINMAX) {
+    if (s.best is null) { s.best = v; return Result.Ok(true); }
+    i32 cmp = compareColl(v, s.best!, ownColl(a.args[0]));
+    if ((n == "max" && cmp > 0) || (n == "min" && cmp < 0)) { s.best = v; return Result.Ok(true); }
+    return Result.Ok(false);
+  }
+  if (a.kind == AGG_CONCAT) {
+    string sep = ",";
+    if (args.len() > 1) { sep = isNull(args[1]) ? "" : textOf(args[1]); }
+    else if (n == "string_agg") { return Result.Err(err("string_agg() needs two arguments")); }
+    s.text = s.any ? s.text + sep + textOf(v) : textOf(v);
+    s.any = true;
+  }
+  return Result.Ok(false);
+}
+
+Result<Value, SqlError> finish(const AggSpec a, AggState s0) {
+  AggState s = s0;
+  if (s0.items is not null) {
+    // An ORDER BY among the arguments: the rows, sorted, through a fresh state.
+    Value[][] items = s0.items!.toArray();
+    sortItems(a, items);
+    s = AggState { };
+    for (i32 i = 0; i < items.len(); i++) {
+      Value[] args = Value[].filled(items[i].len() - a.order.len(), Value.Null);
+      args.copyFrom(items[i], a.order.len(), 0, args.len());
+      try stepValues(a, s, args);
+    }
+  }
+  string n = a.name;
+  if (a.kind == AGG_JSON_ARRAY || a.kind == AGG_JSON_OBJECT) {
+    string text = a.kind == AGG_JSON_ARRAY ? "[" + s.text + "]" : "{" + s.text + "}";
+    if (n.indexOf("jsonb") == 0) { return Result.Ok(Value.Blob(toJsonb(parseJson(text) ?? Json.JNull))); }
+    return Result.Ok(Value.Text(text));
+  }
+  if (n == "count") { return Result.Ok(Value.Int(s.count)); }
+  if (n == "sum") {
+    if (s.count == 0) { return Result.Ok(Value.Null); }
+    if (s.anyReal) { return Result.Ok(Value.Real(s.sumR)); }
+    if (s.overflow) { return Result.Err(err("integer overflow")); }
+    return Result.Ok(Value.Int(s.sumI));
+  }
+  if (n == "total") { return Result.Ok(Value.Real(s.sumR)); }
+  if (n == "avg") { return Result.Ok(s.count == 0 ? Value.Null : Value.Real(s.sumR / (s.count as~ f64))); }
+  if (n == "min" || n == "max") { return Result.Ok(s.best ?? Value.Null); }
+  if (a.kind == AGG_PERCENTILE) {
+    if (s.nums is null || s.nums!.len() == 0) { return Result.Ok(Value.Null); }
+    f64[] v = s.nums!.toArray();
+    sortReals(v);
+    // The position between two values, interpolated, or for percentile_disc the lower of them.
+    f64 ix = s.frac * ((v.len() - 1) as f64);
+    i32 i1 = ix as~ i32;
+    if (n == "percentile_disc") { return Result.Ok(Value.Real(v[i1])); }
+    i32 i2 = ix == (i1 as f64) || i1 == v.len() - 1 ? i1 : i1 + 1;
+    return Result.Ok(Value.Real(v[i1] + (v[i2] - v[i1]) * (ix - (i1 as f64))));
+  }
+  return Result.Ok(s.any ? Value.Text(s.text) : Value.Null);
+}
+
+void sortItems(const AggSpec a, Value[][] items) {
+  // Insertion into a stable merge would do as well; groups are small enough for a simple stable sort.
+  for (i32 i = 1; i < items.len(); i++) {
+    Value[] cur = items[i];
+    i32 j = i - 1;
+    while (j >= 0 && itemBefore(a, cur, items[j])) { items[j + 1] = items[j]; j--; }
+    items[j + 1] = cur;
+  }
+}
+
+bool itemBefore(const AggSpec a, const Value[] x, const Value[] y) {
+  for (i32 i = 0; i < a.order.len(); i++) {
+    i32 c = compareValues(x[i], y[i]);
+    if (c != 0) { return a.orderDesc[i] ? c > 0 : c < 0; }
+  }
+  return false;
+}
+
+// The nested loops, from source k inward. Answers false when the sink has enough rows.
+// A pragma read as a table without arguments (FROM pragma_collation_list), when no table has the name.
+bool isPragmaTable(string name, Exec x) {
+  string n = lower(name);
+  return n.indexOf("pragma_") == 0 && x.db.table(n) is null && x.db.view(n) is null;
+}
+
+// A table-valued function's rows, for its arguments as the rows before it make them.
+Result<void, SqlError> fillCall(BoundSource src, Ctx c, Exec x) {
+  TableFn f = src.call!;
+  Vec<Value[]> made;
+  if (f.sub is not null) {
+    // Its outer scope is this query's: it runs in the context this query's row is in.
+    made = try runPlan(f.sub!, c.outer ?? topCtx(x), x);
+  } else if (f.name.indexOf("pragma_") == 0) {
+    // A pragma's rows, each with the argument it was given and the schema.
+    Value arg = f.args.len() > 0 ? try eval(f.args[0], c, x) : Value.Null;
+    Rows? r = pragmaRows(f.name.slice(7, f.name.len()), x.db, isNull(arg) ? "" : textOf(arg));
+    if (r is not null) {
+      for (i32 i = 0; i < r!.rows.len(); i++) {
+        Value[] row = Value[].filled(f.visible + 2, Value.Null);
+        row.copyFrom(r!.rows.get(i), 0, 0, f.visible);
+        row[f.visible] = arg;
+        row[f.visible + 1] = Value.Null;
+        made.push(row);
+      }
+    }
+  } else {
+    if (f.args.len() == 0) { return Result.Err(err("wrong number of arguments to \{src.table.name}")); }
+    Value input = try eval(f.args[0], c, x);
+    Value? path = f.args.len() > 1 ? (try eval(f.args[1], c, x)) as Value? : null;
+    made = try jsonEachRows(f.name == "json_tree", input, path);
+  }
+  Vec<Row> rows = Vec.withCapacity(made.len());
+  for (i32 i = 0; i < made.len(); i++) { rows.push(Row((i + 1) as i64, made.get(i), null)); }
+  src.table.rows = rows;
+  return Result.Ok();
+}
+
+Result<bool, SqlError> loop(SelectPlan p, i32 k, Ctx c, Exec x, Sink sink, const Vec<Node>[] levels, const Vec<Node> conds) {
+  if (k == p.srcs.len()) {
+    const Vec<Node> fin = levels[k];
+    for (i32 i = 0; i < fin.len(); i++) { if (truth(try eval(fin.get(i), c, x)) != 1) { return Result.Ok(true); } }
+    try emit(p, c, x, sink);
+    return Result.Ok(!sink.done && (sink.stopAt < 0 || sink.rows.len() < sink.stopAt));
+  }
+  BoundSource src = p.srcs[k];
+  if (src.call is not null) { try fillCall(src, c, x); }
+  // Conditions that may narrow this source: its ON, and for an inner join the WHERE's too.
+  Access a = try chooseAccess(p, k, conds, c, x);
+  bool matched = false;
+  if (!a.none) {
+    Scan scan = Scan.open(src.table, a);
+    while (true) {
+      Row? r = scan.next();
+      if (r is null) { break; }
+      c.rows[k] = r;
+      if (src.on is not null && truth(try eval(src.on!, c, x)) != 1) { continue; }
+      bool pass = true;
+      const Vec<Node> here = levels[k];
+      for (i32 f = 0; f < here.len(); f++) {
+        if (truth(try eval(here.get(f), c, x)) != 1) { pass = false; break; }
+      }
+      if (!pass) { continue; }
+      matched = true;
+      if (src.join == JOIN_RIGHT || src.join == JOIN_FULL) { sink.hits.get(k).set(r!.rowid, true); }
+      if (!(try loop(p, k + 1, c, x, sink, levels, conds))) { c.rows[k] = null; return Result.Ok(false); }
+    }
+  }
+  if (!matched && (src.join == JOIN_LEFT || src.join == JOIN_FULL)) {
+    c.rows[k] = null;
+    if (!(try loop(p, k + 1, c, x, sink, levels, conds))) { return Result.Ok(false); }
+  }
+  c.rows[k] = null;
+  return Result.Ok(true);
+}
+
+i32 compareKeys(const SelectPlan p, const Value[] a, const Value[] b) {
+  for (i32 i = 0; i < a.len(); i++) {
+    bool an = isNull(a[i]);
+    bool bn = isNull(b[i]);
+    i32 c = 0;
+    if (an || bn) {
+      if (an && bn) { continue; }
+      // NULLs come first ascending and last descending, unless the term says otherwise.
+      bool nullsFirst = p.nulls[i] == 0 ? !p.desc[i] : p.nulls[i] == 1;
+      c = an ? (nullsFirst ? -1 : 1) : (nullsFirst ? 1 : -1);
+      return c;
+    }
+    c = i < p.orderColl.len() ? compareColl(a[i], b[i], p.orderColl[i]) : compareValues(a[i], b[i]);
+    if (c != 0) { return p.desc[i] ? -c : c; }
+  }
+  return 0;
+}
+
+// A stable merge sort of rows by their keys.
+void sortRows(const SelectPlan p, Vec<Value[]> rows, Vec<Value[]> keys) {
+  i32 n = rows.len();
+  if (n < 2) { return; }
+  i32[] idx = i32[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { idx[i] = i; }
+  i32[] tmp = i32[].filled(n, 0);
+  i32 width = 1;
+  i32[] src = idx;
+  i32[] dst = tmp;
+  while (width < n) {
+    for (i32 lo = 0; lo < n; lo += 2 * width) {
+      i32 mid = lo + width < n ? lo + width : n;
+      i32 hi = lo + 2 * width < n ? lo + 2 * width : n;
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) {
+        if (compareKeys(p, keys.get(src[j]), keys.get(src[i])) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        k++;
+      }
+      while (i < mid) { dst[k] = src[i]; i++; k++; }
+      while (j < hi) { dst[k] = src[j]; j++; k++; }
+    }
+    i32[] s = src;
+    src = dst;
+    dst = s;
+    width *= 2;
+  }
+  Value[][] r2 = Value[][].defaulted(n);
+  Value[][] k2 = Value[][].defaulted(n);
+  for (i32 i = 0; i < n; i++) { r2[i] = rows.get(src[i]); k2[i] = keys.get(src[i]); }
+  rows.clear();
+  keys.clear();
+  for (i32 i = 0; i < n; i++) { rows.push(r2[i]); keys.push(k2[i]); }
+}
+
+Result<i64, SqlError> limitValue(Node? n, Ctx c, Exec x, i64 dflt) {
+  if (n is null) { return Result.Ok(dflt); }
+  Value v = try eval(n!, c, x);
+  match (applyAffinity(v, AFF_INTEGER)) {
+    Int(i): { return Result.Ok(i); }
+    default: { return Result.Err(err("datatype mismatch")); }
+  }
+}
+
+// One select's rows, before a compound combines them: unordered unless `ordered` is set.
+Result<Sink, SqlError> runCore(SelectPlan p, Ctx outer, Exec x, i64 stopAt) {
+  Sink sink = Sink(false, false, Vec.create(), Vec.create(), -1, Map.create(hashBytes, bytesEq), Vec.create(), Vec.create(),
+                   Vec.create(), Vec.create());
+  if (p.values is not null) {
+    Ctx c = Ctx(Row?[](), outer, null, null, null);
+    const Node[][] vs = p.values!;
+    for (i32 i = 0; i < vs.len(); i++) {
+      Value[] out = Value[].filled(vs[i].len(), Value.Null);
+      for (i32 k = 0; k < out.len(); k++) { out[k] = try eval(vs[i][k], c, x); }
+      try pushRow(p, c, x, sink, out);
+    }
+    return Result.Ok(sink);
+  }
+  Ctx c = Ctx(Row?[].defaulted(p.srcs.len()), outer, null, null, null);
+  // Split WHERE into conditions and file each at the innermost source it reads, so a failing row is
+  // dropped before the loops go deeper. A condition reading a LEFT JOIN's source waits for the end, where
+  // the missing row has been made NULL.
+  Vec<Node> conds;
+  if (p.where is not null) { conjuncts(p.where!, conds); }
+  Vec<Node>[] levels = Vec<Node>[].defaulted(p.srcs.len() + 1);
+  i32 leftMask = 0;
+  for (i32 k = 0; k < p.srcs.len(); k++) {
+    if (p.srcs[k].join == JOIN_LEFT || p.srcs[k].join == JOIN_FULL) { leftMask = leftMask | (1 << k); }
+    sink.hits.push(Map<i64, bool>.create(hashI64, i64Eq));
+  }
+  // With a RIGHT or FULL JOIN any source may come out NULL, so every condition waits for the end.
+  if (p.hasRight) { leftMask = -1; }
+  for (i32 i = 0; i < conds.len(); i++) {
+    i32 m = refs(conds.get(i), 0);
+    i32 level = 0;
+    for (i32 k = 0; k < p.srcs.len(); k++) { if ((m & (1 << k)) != 0) { level = k; } }
+    if ((m & leftMask) != 0 || (m & (1 << 30)) != 0) { level = p.srcs.len(); }
+    levels[level].push(conds.get(i));
+  }
+  // Without an ORDER BY to satisfy, or with one the access path delivers, the loops can stop early.
+  if (!p.aggregate && !p.distinct && p.compound is null && stopAt >= 0 && p.wins.len() == 0) {
+    if (p.order.len() == 0) { sink.stopAt = stopAt as! i32; }
+    else if (orderable(p)) {
+      Access a = try chooseAccess(p, 0, conds, c, x);
+      if (a.ordered) { sink.stopAt = stopAt as! i32; }
+    }
+  }
+  Wanted? w = wantedOrder(p);
+  if (w is not null && w!.minMax) {
+    Access a = try chooseAccess(p, 0, conds, c, x);
+    if (a.ordered) { sink.minMaxStop = true; }
+  }
+  if (p.srcs.len() == 0) {
+    bool pass = true;
+    const Vec<Node> fin = levels[0];
+    for (i32 i = 0; i < fin.len(); i++) { if (truth(try eval(fin.get(i), c, x)) != 1) { pass = false; } }
+    if (pass) { try emit(p, c, x, sink); }
+  } else {
+    try loop(p, 0, c, x, sink, levels, conds);
+    // The rows of a RIGHT or FULL JOIN's source that met nothing, with everything before them NULL.
+    for (i32 k = 0; k < p.srcs.len(); k++) {
+      if (p.srcs[k].join != JOIN_RIGHT && p.srcs[k].join != JOIN_FULL) { continue; }
+      Table t = p.srcs[k].table;
+      RowCursor rc = t.cursor();
+      bool more = rc.first();
+      for (; more; more = rc.next()) {
+        Row r = rc.row();
+        if (sink.hits.get(k).has(r.rowid)) { continue; }
+        for (i32 j = 0; j < c.rows.len(); j++) { c.rows[j] = null; }
+        c.rows[k] = r;
+        try loop(p, k + 1, c, x, sink, levels, conds);
+      }
+    }
+  }
+  if (p.aggregate) {
+    if (sink.groups.len() == 0 && p.groupBy.len() == 0) {
+      sink.groups.push(Group(Row?[].defaulted(p.srcs.len()), AggState[].defaulted(p.aggs.len())));
+    }
+    for (i32 gi = 0; gi < sink.groups.len(); gi++) {
+      Group g = sink.groups.get(gi);
+      i32 nk = p.keyed ? p.groupBy.len() : 0;
+      Value[] aggs = Value[].filled(p.aggs.len() + nk, Value.Null);
+      for (i32 i = 0; i < p.aggs.len(); i++) { aggs[i] = try finish(p.aggs.get(i), g.states[i]); }
+      for (i32 i = 0; i < nk; i++) { aggs[p.aggs.len() + i] = sink.groupKeys.get(gi)[i]; }
+      Ctx gc = Ctx(g.rep, outer, aggs, null, null);
+      if (p.having is not null && truth(try eval(p.having!, gc, x)) != 1) { continue; }
+      if (p.wins.len() > 0) { sink.pend.push(gc); continue; }
+      Value[] out = Value[].filled(p.results.len(), Value.Null);
+      for (i32 i = 0; i < out.len(); i++) { out[i] = try eval(p.results[i], gc, x); }
+      try pushRow(p, gc, x, sink, out);
+    }
+  }
+  // Window functions are computed over all the rows (or groups) at once, then each row is finished.
+  if (p.wins.len() > 0) {
+    i32[] seq = i32[].filled(sink.pend.len(), 0);
+    for (i32 i = 0; i < seq.len(); i++) { seq[i] = i; }
+    // The rows come out in the order the windows leave them, as SQLite's do.
+    Value[][] wv = try computeWindows(p, sink.pend, x, seq);
+    for (i32 q = 0; q < seq.len(); q++) {
+      i32 i = seq[q];
+      Ctx pc = sink.pend.get(i);
+      Ctx wc = Ctx(pc.rows, pc.outer, pc.aggs, null, wv[i]);
+      Value[] out = Value[].filled(p.results.len(), Value.Null);
+      for (i32 k = 0; k < out.len(); k++) { out[k] = try eval(p.results[k], wc, x); }
+      try pushRow(p, wc, x, sink, out);
+    }
+  }
+  return Result.Ok(sink);
+}
+
+// ── window functions ───────────────────────────────────────────────────────
+
+i32 compareWinOrder(const WinSpec w, const Value[] a, const Value[] b) {
+  for (i32 i = 0; i < a.len(); i++) {
+    bool an = isNull(a[i]);
+    bool bn = isNull(b[i]);
+    if (an || bn) {
+      if (an && bn) { continue; }
+      bool nullsFirst = w.nulls[i] == 0 ? !w.desc[i] : w.nulls[i] == 1;
+      return an ? (nullsFirst ? -1 : 1) : (nullsFirst ? 1 : -1);
+    }
+    i32 c = compareColl(a[i], b[i], w.orderColl[i]);
+    if (c != 0) { return w.desc[i] ? -c : c; }
+  }
+  return 0;
+}
+
+i32 compareParts(const Value[] a, const Value[] b) {
+  for (i32 i = 0; i < a.len(); i++) {
+    i32 c = compareValues(a[i], b[i]);
+    if (c != 0) { return c; }
+  }
+  return 0;
+}
+
+Result<i64, SqlError> frameOffset(Node? n, Exec x) {
+  if (n is null) { return Result.Ok(0); }
+  Value v = try eval(n!, topCtx(x), x);
+  match (applyAffinity(v, AFF_INTEGER)) {
+    Int(i): { if (i >= 0) { return Result.Ok(i); } }
+    default: {}
+  }
+  return Result.Err(err("frame starting offset must be a non-negative integer"));
+}
+
+// Each row's value of every window function in the plan.
+// Every window function's value for every row. As SQLite does, the windows are taken from the last
+// written to the first, each sorting (stably) the rows as the one before left them, by its partition
+// and order: so a window with neither, or a function that reads rows in partition order (lag, ntile,
+// first_value over ()), sees them in the order of the windows after it. `order` comes in as the rows'
+// own order and goes out as the order the first window leaves, which is the order of the output.
+Result<Value[][], SqlError> computeWindows(SelectPlan p, Vec<Ctx> rows, Exec x, i32[] order) {
+  i32 n = rows.len();
+  Value[][] out = Value[][].defaulted(n);
+  for (i32 i = 0; i < n; i++) { out[i] = Value[].filled(p.wins.len(), Value.Null); }
+  for (i32 w = p.wins.len() - 1; w >= 0; w--) {
+    WinSpec ws = p.wins.get(w);
+    Value[][] part = Value[][].defaulted(n);
+    Value[][] ord = Value[][].defaulted(n);
+    Value[][] args = Value[][].defaulted(n);
+    bool[] pass = bool[].filled(n, true);
+    for (i32 i = 0; i < n; i++) {
+      Ctx c = rows.get(i);
+      part[i] = Value[].filled(ws.partition.len(), Value.Null);
+      for (i32 k = 0; k < ws.partition.len(); k++) { part[i][k] = try eval(ws.partition[k], c, x); }
+      ord[i] = Value[].filled(ws.order.len(), Value.Null);
+      for (i32 k = 0; k < ws.order.len(); k++) { ord[i][k] = try eval(ws.order[k], c, x); }
+      args[i] = Value[].filled(ws.agg.args.len(), Value.Null);
+      for (i32 k = 0; k < ws.agg.args.len(); k++) { args[i][k] = try eval(ws.agg.args[k], c, x); }
+      if (ws.agg.filter is not null) { pass[i] = truth(try eval(ws.agg.filter!, c, x)) == 1; }
+    }
+    // Rows in partition order, then window order; stable, so ties keep the order they came in.
+    i32[] idx = i32[].filled(n, 0);
+    idx.copyFrom(order, 0, 0, n);
+    for (i32 i = 1; i < n; i++) {
+      i32 cur = idx[i];
+      i32 j = i - 1;
+      while (j >= 0) {
+        i32 c = compareParts(part[cur], part[idx[j]]);
+        if (c == 0) { c = compareWinOrder(ws, ord[cur], ord[idx[j]]); }
+        if (c >= 0) { break; }
+        idx[j + 1] = idx[j];
+        j--;
+      }
+      idx[j + 1] = cur;
+    }
+    i64 startN = try frameOffset(ws.startN, x);
+    i64 endN = try frameOffset(ws.endN, x);
+    i32 ps = 0;
+    while (ps < n) {
+      i32 pe = ps + 1;
+      while (pe < n && compareParts(part[idx[pe]], part[idx[ps]]) == 0) { pe++; }
+      i32 m = pe - ps;
+      // Peer groups: rows equal in the window's order.
+      i32[] gid = i32[].filled(m, 0);
+      Vec<i32> gStart;
+      Vec<i32> gEnd;
+      for (i32 j = 0; j < m; j++) {
+        if (j > 0 && compareWinOrder(ws, ord[idx[ps + j]], ord[idx[ps + j - 1]]) == 0) { gid[j] = gid[j - 1]; }
+        else {
+          gid[j] = gStart.len();
+          if (j > 0) { gEnd.push(j - 1); }
+          gStart.push(j);
+        }
+      }
+      gEnd.push(m - 1);
+      AggState? running = null;
+      i32 runEnd = -1;
+      bool incremental = ws.startKind == "UNBOUNDED PRECEDING" && ws.exclude == "NO OTHERS" && !ws.agg.distinct;
+      for (i32 j = 0; j < m; j++) {
+        i32 row = idx[ps + j];
+        Value v = Value.Null;
+        string f = ws.name;
+        i32 g = gid[j];
+        if (f == "row_number") { v = Value.Int((j + 1) as i64); }
+        else if (f == "rank") { v = Value.Int((gStart.get(g) + 1) as i64); }
+        else if (f == "dense_rank") { v = Value.Int((g + 1) as i64); }
+        else if (f == "percent_rank") {
+          v = Value.Real(m > 1 ? (gStart.get(g) as f64) / ((m - 1) as f64) : 0.0);
+        } else if (f == "cume_dist") {
+          v = Value.Real(((gEnd.get(g) + 1) as f64) / (m as f64));
+        } else if (f == "ntile") {
+          i64 buckets = 0;
+          if (args[row].len() > 0) { match (applyAffinity(args[row][0], AFF_INTEGER)) { Int(b): { buckets = b; } default: {} } }
+          if (buckets <= 0) { return Result.Err(err("argument of ntile must be a positive integer")); }
+          i64 q = (m as i64) / buckets;
+          i64 r = (m as i64) % buckets;
+          i64 jj = j as i64;
+          if (q == 0) { v = Value.Int(jj + 1); }
+          else if (jj < r * (q + 1)) { v = Value.Int(jj / (q + 1) + 1); }
+          else { v = Value.Int((jj - r * (q + 1)) / q + r + 1); }
+        } else if (f == "lag" || f == "lead") {
+          i64 off = 1;
+          if (args[row].len() > 1) { off = toInt(args[row][1]); }
+          i64 k = f == "lag" ? (j as i64) - off : (j as i64) + off;
+          if (k >= 0 && k < m as i64) { v = args[idx[ps + (k as! i32)]][0]; }
+          else if (args[row].len() > 2) { v = args[row][2]; }
+        } else {
+          // Frame functions: first_value, last_value, nth_value, and the aggregates.
+          i32 fs = 0;
+          i32 fe = m - 1;
+          if (ws.units == "ROWS") {
+            fs = rowsBound(ws.startKind, startN, j, m);
+            fe = rowsBound(ws.endKind, endN, j, m);
+          } else if (ws.units == "GROUPS") {
+            fs = groupsBound(ws.startKind, startN, g, gStart, gEnd, true, m);
+            fe = groupsBound(ws.endKind, endN, g, gStart, gEnd, false, m);
+          } else {
+            fs = rangeBound(ws, ws.startKind, startN, j, m, ps, idx, ord, gStart, gEnd, g, true);
+            fe = rangeBound(ws, ws.endKind, endN, j, m, ps, idx, ord, gStart, gEnd, g, false);
+          }
+          if (fs < 0) { fs = 0; }
+          if (fe > m - 1) { fe = m - 1; }
+          if (f == "first_value" || f == "last_value" || f == "nth_value") {
+            i64 want = 1;
+            if (f == "nth_value") {
+              match (applyAffinity(args[row].len() > 1 ? args[row][1] : Value.Null, AFF_INTEGER)) {
+                Int(b): { want = b; }
+                default: { want = 0; }
+              }
+              if (want <= 0) { return Result.Err(err("second argument to nth_value must be a positive integer")); }
+            }
+            Vec<i32> inFrame;
+            for (i32 k = fs; k <= fe; k++) { if (!excluded(ws.exclude, k, j, gid)) { inFrame.push(k); } }
+            if (inFrame.len() > 0) {
+              if (f == "first_value") { v = args[idx[ps + inFrame.get(0)]][0]; }
+              else if (f == "last_value") { v = args[idx[ps + inFrame.get(inFrame.len() - 1)]][0]; }
+              else if (want <= inFrame.len() as i64) { v = args[idx[ps + inFrame.get((want - 1) as! i32)]][0]; }
+            }
+          } else if (incremental) {
+            // A frame that starts at the partition's start only grows: add the new rows to a running total.
+            if (running is null) { running = AggState { }; }
+            while (runEnd < fe) {
+              runEnd++;
+              i32 r2 = idx[ps + runEnd];
+              if (pass[r2]) { try stepValues(ws.agg, running!, args[r2]); }
+            }
+            v = try finish(ws.agg, running!);
+          } else {
+            AggState st = AggState { };
+            for (i32 k = fs; k <= fe; k++) {
+              if (excluded(ws.exclude, k, j, gid)) { continue; }
+              i32 r2 = idx[ps + k];
+              if (pass[r2]) { try stepValues(ws.agg, st, args[r2]); }
+            }
+            v = try finish(ws.agg, st);
+          }
+        }
+        out[row][w] = v;
+      }
+      ps = pe;
+    }
+    // The next window takes the rows in the order this one left them.
+    order.copyFrom(idx, 0, 0, n);
+  }
+  return Result.Ok(out);
+}
+
+bool excluded(string exclude, i32 k, i32 j, const i32[] gid) {
+  if (exclude == "CURRENT ROW") { return k == j; }
+  if (exclude == "GROUP") { return gid[k] == gid[j]; }
+  if (exclude == "TIES") { return k != j && gid[k] == gid[j]; }
+  return false;
+}
+
+i32 rowsBound(string kind, i64 n, i32 j, i32 m) {
+  if (kind == "UNBOUNDED PRECEDING") { return 0; }
+  if (kind == "UNBOUNDED FOLLOWING") { return m - 1; }
+  if (kind == "CURRENT ROW") { return j; }
+  i64 v = kind == "PRECEDING" ? (j as i64) - n : (j as i64) + n;
+  if (v < -1) { return -1; }
+  if (v > m as i64) { return m; }
+  return v as! i32;
+}
+
+i32 groupsBound(string kind, i64 n, i32 g, const Vec<i32> gs, const Vec<i32> ge, bool start, i32 m) {
+  if (kind == "UNBOUNDED PRECEDING") { return 0; }
+  if (kind == "UNBOUNDED FOLLOWING") { return m - 1; }
+  i64 t = g as i64;
+  if (kind == "PRECEDING") { t = t - n; }
+  if (kind == "FOLLOWING") { t = t + n; }
+  if (t < 0) { return start ? 0 : -1; }
+  if (t >= gs.len() as i64) { return start ? m : m - 1; }
+  return start ? gs.get(t as! i32) : ge.get(t as! i32);
+}
+
+// RANGE bounds: by peers for CURRENT ROW, and by value for n PRECEDING or FOLLOWING on the single
+// ORDER BY term.
+i32 rangeBound(const WinSpec ws, string kind, i64 n, i32 j, i32 m, i32 ps, const i32[] idx, const Value[][] ord,
+               const Vec<i32> gs, const Vec<i32> ge, i32 g, bool start) {
+  if (kind == "UNBOUNDED PRECEDING") { return 0; }
+  if (kind == "UNBOUNDED FOLLOWING") { return m - 1; }
+  if (kind == "CURRENT ROW") { return start ? gs.get(g) : ge.get(g); }
+  Value cur = ord[idx[ps + j]][0];
+  if (isNull(cur)) { return start ? gs.get(g) : ge.get(g); }
+  // Shifted toward the start of the ordering for PRECEDING, toward its end for FOLLOWING.
+  f64 delta = n as~ f64;
+  bool towardStart = kind == "PRECEDING";
+  f64 c = toReal(cur);
+  f64 target = (towardStart != ws.desc[0]) ? c - delta : c + delta;
+  if (start) {
+    for (i32 k = 0; k < m; k++) {
+      Value kv = ord[idx[ps + k]][0];
+      if (isNull(kv)) { continue; }
+      f64 x = toReal(kv);
+      if (ws.desc[0] ? x <= target : x >= target) { return k; }
+    }
+    return m;
+  }
+  for (i32 k = m - 1; k >= 0; k--) {
+    Value kv = ord[idx[ps + k]][0];
+    if (isNull(kv)) { continue; }
+    f64 x = toReal(kv);
+    if (ws.desc[0] ? x >= target : x <= target) { return k; }
+  }
+  return -1;
+}
+
+i32 compareRows(const Value[] a, const Value[] b) {
+  for (i32 i = 0; i < a.len() && i < b.len(); i++) {
+    i32 c = compareValues(a[i], b[i]);
+    if (c != 0) { return c; }
+  }
+  return 0;
+}
+
+// The distinct rows, in order, as SQLite's UNION, INTERSECT and EXCEPT produce them: through a sorted
+// temporary index, where a row equal to one already there replaces it — so the last of equal rows (3.0
+// after 3) is the one kept.
+Vec<Value[]> sortedSet(Vec<Value[]> rows) {
+  i32 n = rows.len();
+  Value[][] a = rows.toArray();
+  Value[][] tmp = Value[][].defaulted(n);
+  i32 width = 1;
+  Value[][] src = a;
+  Value[][] dst = tmp;
+  while (width < n) {
+    for (i32 lo = 0; lo < n; lo += 2 * width) {
+      i32 mid = lo + width < n ? lo + width : n;
+      i32 hi = lo + 2 * width < n ? lo + 2 * width : n;
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) {
+        if (compareRows(src[j], src[i]) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        k++;
+      }
+      while (i < mid) { dst[k] = src[i]; i++; k++; }
+      while (j < hi) { dst[k] = src[j]; j++; k++; }
+    }
+    Value[][] sw = src;
+    src = dst;
+    dst = sw;
+    width *= 2;
+  }
+  Vec<Value[]> out;
+  for (i32 i = 0; i < n; i++) {
+    if (i + 1 < n && compareRows(src[i], src[i + 1]) == 0) { continue; }
+    out.push(src[i]);
+  }
+  return out;
+}
+
+// Each row with its columns as their collations see them, for finding duplicates.
+u8[] collKey(const Value[] row, const i32[] colls) {
+  if (colls.len() == 0) { return keyBytes(row); }
+  Value[] v = Value[].filled(row.len(), Value.Null);
+  for (i32 i = 0; i < row.len(); i++) { v[i] = i < colls.len() ? collated(row[i], colls[i]) : row[i]; }
+  return keyBytes(v);
+}
+
+i32[] resultColls(const SelectPlan p) {
+  i32[] out = i32[].filled(p.results.len(), COLL_BINARY);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ownColl(p.results[i]); }
+  return out;
+}
+
+void dedupe(Vec<Value[]> rows, Vec<Value[]> keys, const i32[] colls) {
+  Map<u8[], bool> seen = Map.create(hashBytes, bytesEq);
+  Vec<Value[]> r2;
+  Vec<Value[]> k2;
+  for (i32 i = 0; i < rows.len(); i++) {
+    u8[] k = collKey(rows.get(i), colls);
+    if (seen.has(k)) { continue; }
+    seen.set(k, true);
+    r2.push(rows.get(i));
+    k2.push(keys.get(i));
+  }
+  rows.clear();
+  keys.clear();
+  for (i32 i = 0; i < r2.len(); i++) { rows.push(r2.get(i)); keys.push(k2.get(i)); }
+}
+
+// Every row a plan produces, ordered and limited.
+export Result<Vec<Value[]>, SqlError> runPlan(SelectPlan p, Ctx outer, Exec x) {
+  Ctx none = Ctx(Row?[](), outer, null, null, null);
+  i64 limit = try limitValue(p.limit, none, x, -1);
+  i64 offset = try limitValue(p.offset, none, x, 0);
+  if (offset < 0) { offset = 0; }
+  i64 stopAt = limit < 0 ? -1 : limit + offset;
+  Sink first = try runCore(p, outer, x, p.distinct ? -1 : stopAt);
+  Vec<Value[]> rows = first.rows;
+  Vec<Value[]> keys = first.keys;
+  if (p.distinct) { dedupe(rows, keys, resultColls(p)); }
+  // A compound: combine the parts left to right.
+  (const SelectPlan)? part = p;
+  while (part!.compound is not null) {
+    string op = part!.compound!;
+    SelectPlan nextPlan = part!.next! as SelectPlan;
+    Sink s2 = try runCore(nextPlan, outer, x, -1);
+    if (nextPlan.distinct) { dedupe(s2.rows, s2.keys, resultColls(nextPlan)); }
+    if (op == "UNION ALL") {
+      for (i32 i = 0; i < s2.rows.len(); i++) { rows.push(s2.rows.get(i)); keys.push(rekey(p, s2.rows.get(i))); }
+    } else if (op == "UNION") {
+      for (i32 i = 0; i < s2.rows.len(); i++) { rows.push(s2.rows.get(i)); }
+      rows = sortedSet(rows);
+      keys = Vec.create();
+      for (i32 i = 0; i < rows.len(); i++) { keys.push(rekey(p, rows.get(i))); }
+    } else {
+      Map<u8[], bool> other = Map.create(hashBytes, bytesEq);
+      for (i32 i = 0; i < s2.rows.len(); i++) { other.set(keyBytes(s2.rows.get(i)), true); }
+      Vec<Value[]> left = sortedSet(rows);
+      Vec<Value[]> r2;
+      Vec<Value[]> k2;
+      for (i32 i = 0; i < left.len(); i++) {
+        bool inOther = other.has(keyBytes(left.get(i)));
+        if ((op == "INTERSECT") == inOther) { r2.push(left.get(i)); k2.push(rekey(p, left.get(i))); }
+      }
+      rows = r2;
+      keys = k2;
+    }
+    part = nextPlan;
+  }
+  if (p.compound is not null) {
+    // Keys of the first part were computed from its own rows; every key is an output column here.
+    for (i32 i = 0; i < rows.len(); i++) { keys.set(i, rekey(p, rows.get(i))); }
+  }
+  // Rows an index delivered in order are sorted again, which is cheap on sorted input and keeps the
+  // ordering decided in one place.
+  if (p.order.len() > 0) { sortRows(p, rows, keys); }
+  if (offset > 0 || limit >= 0) {
+    Vec<Value[]> out;
+    for (i32 i = offset as! i32; i < rows.len(); i++) {
+      if (limit >= 0 && (out.len() as i64) >= limit) { break; }
+      out.push(rows.get(i));
+    }
+    return Result.Ok(out);
+  }
+  return Result.Ok(rows);
+}
+
+Value[] rekey(const SelectPlan p, const Value[] row) {
+  Value[] k = Value[].filled(p.order.len(), Value.Null);
+  for (i32 i = 0; i < k.len(); i++) {
+    match (p.order[i]) { NResult(j): { k[i] = row[j]; } default: {} }
+  }
+  return k;
+}
+
+export Result<Rows, SqlError> query(const Select s, Exec x) {
+  SelectPlan p = try planSelect(s, null, x);
+  Vec<Value[]> rows = try runPlan(p, topCtx(x), x);
+  return Result.Ok(Rows(p.names, rows));
+}
+
+// Sorts reals ascending (a merge sort: these come one per row of a group).
+void sortReals(f64[] a) {
+  if (a.len() < 2) { return; }
+  f64[] tmp = f64[].filled(a.len(), 0.0);
+  i32 width = 1;
+  while (width < a.len()) {
+    for (i32 lo = 0; lo < a.len(); lo += 2 * width) {
+      i32 mid = lo + width < a.len() ? lo + width : a.len();
+      i32 hi = lo + 2 * width < a.len() ? lo + 2 * width : a.len();
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) { if (a[j] < a[i]) { tmp[k] = a[j]; j++; } else { tmp[k] = a[i]; i++; } k++; }
+      while (i < mid) { tmp[k] = a[i]; i++; k++; }
+      while (j < hi) { tmp[k] = a[j]; j++; k++; }
+    }
+    a.copyFrom(tmp, 0, 0, a.len());
+    width *= 2;
+  }
+}
+
+// ── GROUP BY terms in the output ───────────────────────────────────────────
+
+// Whether two bound expressions are the same expression.
+bool sameNode(const Node a, const Node b) {
+  match (a) {
+    NCol(d, s, c, aff, coll): { match (b) { NCol(d2, s2, c2, aff2, coll2): { return d == d2 && s == s2 && c == c2; } default: { return false; } } }
+    NLit(v): { match (b) { NLit(v2): { return sameValue(v, v2); } default: { return false; } } }
+    NParam(n): { match (b) { NParam(n2): { return n == n2; } default: { return false; } } }
+    NUnary(op, e): { match (b) { NUnary(op2, e2): { return op == op2 && sameNode(e, e2); } default: { return false; } } }
+    NArith(op, l, r): { match (b) { NArith(op2, l2, r2): { return op == op2 && sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NBits(op, l, r): { match (b) { NBits(op2, l2, r2): { return op == op2 && sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NConcat(l, r): { match (b) { NConcat(l2, r2): { return sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NCompare(op, l, r): { match (b) { NCompare(op2, l2, r2): { return op == op2 && sameNode(l, l2) && sameNode(r, r2); } default: { return false; } } }
+    NCast(e, aff): { match (b) { NCast(e2, aff2): { return aff == aff2 && sameNode(e, e2); } default: { return false; } } }
+    NCollate(e, coll): { match (b) { NCollate(e2, coll2): { return coll == coll2 && sameNode(e, e2); } default: { return false; } } }
+    NIsNull(e, neg): { match (b) { NIsNull(e2, neg2): { return neg == neg2 && sameNode(e, e2); } default: { return false; } } }
+    NCall(name, fid, args, js): {
+      match (b) {
+        NCall(name2, fid2, args2, js2): {
+          if (name != name2 || args.len() != args2.len()) { return false; }
+          for (i32 i = 0; i < args.len(); i++) { if (!sameNode(args[i], args2[i])) { return false; } }
+          return true;
+        }
+        default: { return false; }
+      }
+    }
+    default: { return false; }
+  }
+}
+
+// An expression with each GROUP BY term in it read from the group's key (NAgg slot base + i). A term
+// that is a bare column is not: SQLite reads columns from the min() or max() row, keys or not.
+Node keyed(const Node n, const Node[] keys, i32 base) {
+  for (i32 i = 0; i < keys.len(); i++) {
+    bool column = match (keys[i]) { NCol: true, default: false };
+    if (!column && sameNode(n, keys[i])) { return Node.NAgg(base + i); }
+  }
+  match (n) {
+    NUnary(op, e): { return Node.NUnary(op, keyed(e, keys, base)); }
+    NArith(op, l, r): { return Node.NArith(op, keyed(l, keys, base), keyed(r, keys, base)); }
+    NBits(op, l, r): { return Node.NBits(op, keyed(l, keys, base), keyed(r, keys, base)); }
+    NConcat(l, r): { return Node.NConcat(keyed(l, keys, base), keyed(r, keys, base)); }
+    NCompare(op, l, r): { return Node.NCompare(op, keyed(l, keys, base), keyed(r, keys, base)); }
+    NAnd(l, r): { return Node.NAnd(keyed(l, keys, base), keyed(r, keys, base)); }
+    NOr(l, r): { return Node.NOr(keyed(l, keys, base), keyed(r, keys, base)); }
+    NNot(e): { return Node.NNot(keyed(e, keys, base)); }
+    NCast(e, aff): { return Node.NCast(keyed(e, keys, base), aff); }
+    NIsNull(e, neg): { return Node.NIsNull(keyed(e, keys, base), neg); }
+    NCall(name, fid, args, js): {
+      Node[] a = Node[].filled(args.len(), Node.NLit(Value.Null));
+      for (i32 i = 0; i < args.len(); i++) { a[i] = keyed(args[i], keys, base); }
+      return Node.NCall(name, fid, a, js as bool[]);
+    }
+    default: { return n as Node; }
+  }
+}

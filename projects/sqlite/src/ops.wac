@@ -1,0 +1,338 @@
+// SQLite's value semantics: conversions between storage classes, affinity, arithmetic and comparison.
+
+import { Value, compareValues } from "./value.wac";
+import { formatReal, realText } from "./format.wac";
+import { decimalI64, parseF64 } from "./parser.wac";
+import { AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL } from "./schema.wac";
+
+// No affinity at all: what an expression that is not a column or a CAST has. Distinct from BLOB, which a
+// column declared BLOB (or with no type) has.
+export static i32 AFF_NONE = -1;
+
+bool isSpace(u8 c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 12 || c == 11; }
+
+bool digit(u8 c) { return c >= '0' && c <= '9'; }
+
+// How far a number reaches from the start of `b` (after leading space), and whether it is a real.
+struct Scan {
+  i32 start;
+  i32 end;       // 0 digits read is end == start
+  bool real;
+}
+
+Scan scanNumber(u8[] b) {
+  i32 i = 0;
+  while (i < b.len() && isSpace(b[i])) { i++; }
+  i32 start = i;
+  if (i < b.len() && (b[i] == '+' || b[i] == '-')) { i++; }
+  i32 digits = 0;
+  while (i < b.len() && digit(b[i])) { i++; digits++; }
+  bool real = false;
+  if (i < b.len() && b[i] == '.') {
+    i32 j = i + 1;
+    i32 frac = 0;
+    while (j < b.len() && digit(b[j])) { j++; frac++; }
+    if (digits + frac > 0) { real = true; i = j; digits += frac; }
+  }
+  if (digits == 0) { return Scan(start, start, false); }
+  if (i < b.len() && (b[i] == 'e' || b[i] == 'E')) {
+    i32 j = i + 1;
+    if (j < b.len() && (b[j] == '+' || b[j] == '-')) { j++; }
+    if (j < b.len() && digit(b[j])) {
+      while (j < b.len() && digit(b[j])) { j++; }
+      i = j;
+      real = true;
+    }
+  }
+  return Scan(start, i, real);
+}
+
+Value numberOf(string text, bool real) {
+  string t = text;
+  bool neg = false;
+  if (t.slice(0, 1) == "+" || t.slice(0, 1) == "-") { neg = t.slice(0, 1) == "-"; t = t.slice(1, t.len()); }
+  if (!real) {
+    if (neg && t == "9223372036854775808") { return Value.Int(-9223372036854775807 - 1); }
+    i64? v = decimalI64(t);
+    if (v is not null) { return Value.Int(neg ? 0 - v! : v!); }
+  }
+  f64 r = parseF64(t);
+  return Value.Real(neg ? -r : r);
+}
+
+// The text as a number when all of it is one (surrounding space allowed), else null. This is what
+// NUMERIC affinity and the comparison rules use.
+export Value? wholeNumber(string s) {
+  u8[] b = s.toBytes();
+  Scan sc = scanNumber(b);
+  if (sc.end == sc.start) { return null; }
+  i32 i = sc.end;
+  while (i < b.len() && isSpace(b[i])) { i++; }
+  if (i != b.len()) { return null; }
+  return numberOf(s.slice(sc.start, sc.end), sc.real);
+}
+
+// The longest numeric prefix of the text, or 0: what arithmetic does to text.
+export Value numericPrefix(string s) {
+  u8[] b = s.toBytes();
+  Scan sc = scanNumber(b);
+  if (sc.end == sc.start) { return Value.Int(0); }
+  return numberOf(s.slice(sc.start, sc.end), sc.real);
+}
+
+// A real that is exactly an integer in i64's range, as that integer.
+export i64? exactInt(f64 r) {
+  if (r != r || r < -9223372036854775808.0 || r >= 9223372036854775808.0) { return null; }
+  f64 t = r.trunc();
+  if (t != r) { return null; }
+  return t as~ i64;
+}
+
+export string textOf(const Value v) {
+  return match (v) {
+    Null: "",
+    Int(i): "\{i}",
+    Real(r): realText(r),
+    Text(s): s,
+    Blob(b): string.fromBytes(b as u8[]),
+  };
+}
+
+export Value toNumeric(const Value v) {
+  return match (v) {
+    Text(s): numericPrefix(s),
+    Blob(b): numericPrefix(string.fromBytes(b as u8[])),
+    Null: Value.Null,
+    default: v as Value,
+  };
+}
+
+export i64 toInt(const Value v) {
+  return match (toNumeric(v)) {
+    Int(i): i,
+    Real(r): r != r ? 0 as i64 : r.trunc() as~ i64,
+    default: 0 as i64,
+  };
+}
+
+export f64 toReal(const Value v) {
+  return match (toNumeric(v)) {
+    Int(i): i as~ f64,
+    Real(r): r,
+    default: 0.0,
+  };
+}
+
+// Applies a column's affinity to a value being stored in it.
+export Value applyAffinity(const Value v, i32 aff) {
+  if (aff == AFF_TEXT) {
+    return match (v) { Int: Value.Text(textOf(v)), Real: Value.Text(textOf(v)), default: v as Value };
+  }
+  if (aff == AFF_NUMERIC || aff == AFF_INTEGER) {
+    match (v) {
+      Text(s): {
+        Value? n = wholeNumber(s);
+        if (n is null) { return v as Value; }
+        match (n!) {
+          Real(r): {
+            i64? i = exactInt(r);
+            if (i is not null) { return Value.Int(i!); }
+          }
+          default: {}
+        }
+        return n!;
+      }
+      Real(r): {
+        i64? i = exactInt(r);
+        return i is null ? v as Value : Value.Int(i!);
+      }
+      default: { return v as Value; }
+    }
+  }
+  if (aff == AFF_REAL) {
+    match (v) {
+      Int(i): { return Value.Real(i as~ f64); }
+      Text(s): {
+        Value? n = wholeNumber(s);
+        if (n is null) { return v as Value; }
+        return Value.Real(toReal(n!));
+      }
+      default: { return v as Value; }
+    }
+  }
+  return v as Value;
+}
+
+// CAST(v AS type), whose rules differ from affinity's: text that is not a number becomes 0 under a
+// numeric cast instead of staying text.
+export Value castTo(const Value v, i32 aff) {
+  match (v) { Null: { return Value.Null; } default: {} }
+  if (aff == AFF_TEXT) { return Value.Text(textOf(v)); }
+  if (aff == AFF_BLOB) {
+    return match (v) { Blob: v as Value, default: Value.Blob(textOf(v).toBytes()) };
+  }
+  // To INTEGER, text counts only as far as its leading integer ('1e2' is 1) and a real truncates.
+  if (aff == AFF_INTEGER) { return Value.Int(intPrefix(v)); }
+  if (aff == AFF_REAL) { return Value.Real(toReal(v)); }
+  // To NUMERIC, a number stays as it is; text becomes its number, an integer when it has no fraction.
+  match (v) { Int: { return v as Value; } Real: { return v as Value; } default: {} }
+  Value n = toNumeric(v);
+  match (n) {
+    Real(r): {
+      i64? i = exactInt(r);
+      if (i is not null) { return Value.Int(i!); }
+    }
+    default: {}
+  }
+  return n;
+}
+
+export bool isNull(const Value v) { return match (v) { Null: true, default: false }; }
+
+// A value as a condition: null stays unknown, so the answer is a tri-state: 1 true, 0 false, -1 null.
+export i32 truth(const Value v) {
+  return match (v) {
+    Null: -1,
+    Int(i): i != 0 ? 1 : 0,
+    Real(r): r != 0.0 ? 1 : 0,
+    default: toReal(v) != 0.0 ? 1 : 0,
+  };
+}
+
+export Value boolValue(bool b) { return Value.Int(b ? 1 : 0); }
+
+// Prepares two operands for comparison by the affinities of the expressions they came from.
+export Value[] comparable(const Value a, i32 affA, const Value b, i32 affB) {
+  Value x = a as Value;
+  Value y = b as Value;
+  bool numA = affA == AFF_INTEGER || affA == AFF_REAL || affA == AFF_NUMERIC;
+  bool numB = affB == AFF_INTEGER || affB == AFF_REAL || affB == AFF_NUMERIC;
+  if (numA && !numB) { y = applyAffinity(y, AFF_NUMERIC); }
+  else if (numB && !numA) { x = applyAffinity(x, AFF_NUMERIC); }
+  else if (affA == AFF_TEXT && affB == AFF_NONE) { y = applyAffinity(y, AFF_TEXT); }
+  else if (affB == AFF_TEXT && affA == AFF_NONE) { x = applyAffinity(x, AFF_TEXT); }
+  return [x, y];
+}
+
+bool addOverflows(i64 a, i64 b) {
+  i64 s = a + b;
+  return (a >= 0 && b >= 0 && s < 0) || (a < 0 && b < 0 && s >= 0);
+}
+
+bool mulOverflows(i64 a, i64 b) {
+  if (a == 0 || b == 0) { return false; }
+  if ((a == -1 && b == -9223372036854775807 - 1) || (b == -1 && a == -9223372036854775807 - 1)) { return true; }
+  i64 p = a * b;
+  return p / b != a;
+}
+
+// + - * / % on two values. Integers stay integers unless they overflow; division by zero is NULL.
+export Value arith(string op, const Value a, const Value b) {
+  if (isNull(a) || isNull(b)) { return Value.Null; }
+  Value x = toNumeric(a);
+  Value y = toNumeric(b);
+  match (x) {
+    Int(i): {
+      match (y) {
+        Int(j): {
+          if (op == "+") { return addOverflows(i, j) ? Value.Real((i as~ f64) + (j as~ f64)) : Value.Int(i + j); }
+          if (op == "-") {
+            if (j == -9223372036854775807 - 1) { return Value.Real((i as~ f64) - (j as~ f64)); }
+            return addOverflows(i, 0 - j) ? Value.Real((i as~ f64) - (j as~ f64)) : Value.Int(i - j);
+          }
+          if (op == "*") { return mulOverflows(i, j) ? Value.Real((i as~ f64) * (j as~ f64)) : Value.Int(i * j); }
+          if (j == 0) { return Value.Null; }
+          if (i == -9223372036854775807 - 1 && j == -1) {
+            return op == "/" ? Value.Real(9223372036854775808.0) : Value.Int(0);
+          }
+          return op == "/" ? Value.Int(i / j) : Value.Int(i % j);
+        }
+        default: {}
+      }
+    }
+    default: {}
+  }
+  if (op == "%") {
+    // SQLite takes both sides as integers — text only as far as its leading integer, so '1e2' is 1 —
+    // and answers a real when either side was one.
+    i64 i = intPrefix(a);
+    i64 j = intPrefix(b);
+    if (j == 0) { return Value.Null; }
+    i64 m = j == -1 ? 0 : i % j;
+    return Value.Real(m as~ f64);
+  }
+  f64 p = toReal(x);
+  f64 q = toReal(y);
+  if (op == "+") { return Value.Real(p + q); }
+  if (op == "-") { return Value.Real(p - q); }
+  if (op == "*") { return Value.Real(p * q); }
+  if (q == 0.0) { return Value.Null; }
+  return Value.Real(p / q);
+}
+
+export Value bitwise(string op, const Value a, const Value b) {
+  if (isNull(a) || isNull(b)) { return Value.Null; }
+  i64 x = intPrefix(a);
+  i64 y = intPrefix(b);
+  if (op == "&") { return Value.Int(x & y); }
+  if (op == "|") { return Value.Int(x | y); }
+  if (op == "<<" || op == ">>") {
+    bool left = op == "<<";
+    // A negative count shifts the other way; one past -64 (including the most negative i64, whose
+    // negation would overflow) is as good as 64.
+    if (y < 0) { left = !left; y = y > -64 ? 0 - y : 64; }
+    if (y >= 64) { return Value.Int(left || x >= 0 ? 0 : -1); }
+    i32 n = y as! i32;
+    return Value.Int(left ? x << n : x >> n);
+  }
+  return Value.Null;
+}
+
+// The integer SQLite's integer conversion reads: a real truncated, text up to the end of its leading
+// integer (no fraction or exponent).
+export i64 intPrefix(const Value v) {
+  match (v) {
+    Int(i): { return i; }
+    Real(r): { return r != r ? 0 as i64 : r.trunc() as~ i64; }
+    Null: { return 0; }
+    default: {
+      string s = textOf(v);
+      u8[] b = s.toBytes();
+      i32 i = 0;
+      while (i < b.len() && isSpace(b[i])) { i++; }
+      i32 st = i;
+      if (i < b.len() && (b[i] == '+' || b[i] == '-')) { i++; }
+      while (i < b.len() && digit(b[i])) { i++; }
+      if (i == st) { return 0; }
+      match (numberOf(s.slice(st, i), false)) {
+        Int(n): { return n; }
+        Real(r): { return r < 0.0 ? -9223372036854775807 - 1 : 9223372036854775807; }
+        default: { return 0; }
+      }
+    }
+  }
+}
+
+export Value negate(const Value v) {
+  match (toNumeric(v)) {
+    Int(i): { return i == -9223372036854775807 - 1 ? Value.Real(9223372036854775808.0) : Value.Int(0 - i); }
+    Real(r): { return Value.Real(-r); }
+    default: { return Value.Null; }
+  }
+}
+
+// A comparison operator over values already made comparable. NULL on either side is NULL.
+export Value compareOp(string op, const Value a, const Value b) {
+  if (isNull(a) || isNull(b)) { return Value.Null; }
+  i32 c = compareValues(a, b);
+  if (op == "=") { return boolValue(c == 0); }
+  if (op == "!=") { return boolValue(c != 0); }
+  if (op == "<") { return boolValue(c < 0); }
+  if (op == "<=") { return boolValue(c <= 0); }
+  if (op == ">") { return boolValue(c > 0); }
+  return boolValue(c >= 0);
+}
+
+export string typeName(const Value v) {
+  return match (v) { Null: "null", Int: "integer", Real: "real", Text: "text", Blob: "blob" };
+}

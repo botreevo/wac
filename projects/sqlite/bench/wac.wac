@@ -1,0 +1,157 @@
+// The benchmark workloads (bench/workloads.md) through wac-sqlite.
+//     wac build bench/wac.wac -o dist/bench && wac dist/bench.wasm -- 20000
+
+import { Sys } from "std";
+import { Buf } from "core";
+import { Connection } from "../src/engine.wac";
+import { Value } from "../src/value.wac";
+import { Rows } from "../src/plan.wac";
+import { decimalI64 } from "../src/parser.wac";
+
+struct Bench {
+  Sys sys;
+  Connection c;
+  i64 t0;
+  u32 digest;
+
+  i64 now(this) { return this.sys.clock().monotonicNanos().wait().unwrap().unwrap(); }
+
+  void start(this) { this.digest = 2166136261; this.t0 = this.now(); }
+
+  void feed(this, string s) {
+    u8[] b = s.toBytes();
+    for (i32 i = 0; i < b.len(); i++) {
+      this.digest = (this.digest ^ (b[i] as u32)) * 16777619;
+    }
+  }
+
+  void rows(this, Rows r) {
+    for (i32 i = 0; i < r.rows.len(); i++) {
+      Value[] v = r.rows.get(i);
+      for (i32 k = 0; k < v.len(); k++) {
+        match (v[k]) {
+          Null: { this.feed("N|"); }
+          Int(n): { this.feed("\{n}|"); }
+          Real(x): { this.feed("R|"); }
+          Text(s): { this.feed(s + "|"); }
+          Blob(b): { this.feed("B|"); }
+        }
+      }
+      this.feed("\n");
+    }
+  }
+
+  Rows q(this, string sql, Value[] params) {
+    match (this.c.execute(sql, params)) {
+      Ok(r): { return r; }
+      Err(e): { trap sql + ": " + e.describe(); }
+    }
+  }
+
+  void done(this, string name) {
+    i64 ns = this.now() - this.t0;
+    this.sys.stdout().line("{\"name\":\"\{name}\",\"ms\":\{ns / 1000000}.\{(ns / 1000) % 1000},\"digest\":\{this.digest}}").wait();
+  }
+}
+
+static string[] TYPES = ["TimerAdded", "TimerCompleted", "TimerRecurred", "TimerExpiryUpdated", "EventSkipped", "TimerRemoved"];
+
+export i32 main(Sys sys) {
+  string[] args = sys.args();
+  i32 n = args.len() > 0 ? decimalI64(args[0])! as! i32 : 20000;
+  Bench b = Bench(sys, Connection.memory(), 0, 0);
+
+  b.start();
+  b.q("CREATE TABLE instances (id TEXT PRIMARY KEY, nickname TEXT NOT NULL)", Value[]());
+  b.q("CREATE TABLE events (id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, payload TEXT NOT NULL, timestamp INTEGER NOT NULL, UNIQUE (instance_id, seq))", Value[]());
+  b.q("CREATE INDEX events_by_instance_seq ON events(instance_id, seq)", Value[]());
+  b.q("BEGIN", Value[]());
+  for (i32 i = 0; i < 8; i++) {
+    b.q("INSERT INTO instances VALUES (?, ?)", [Value.Text("i\{i}"), Value.Text("instance \{i}")]);
+  }
+  for (i32 i = 0; i < n; i++) {
+    b.q("INSERT INTO events (id, instance_id, seq, type, payload, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        [Value.Text("e\{i}"), Value.Text("i\{i % 8}"), Value.Int((i / 8 + 1) as i64), Value.Text(TYPES[i % 6]),
+         Value.Text("{\"id\":\"t\{i % 97}\",\"n\":\{i}}"), Value.Int(1700000000000 + (i as i64) * 7)]);
+  }
+  b.q("COMMIT", Value[]());
+  b.done("insert");
+
+  b.start();
+  for (i32 k = 0; k < 10000; k++) {
+    b.rows(b.q("SELECT payload FROM events WHERE id = ?", [Value.Text("e\{(k * 7919) % n}")]));
+  }
+  b.done("point lookup x10000");
+
+  b.start();
+  i32 per = n / 8;
+  for (i32 k = 0; k < 1000; k++) {
+    i32 lo = (k * 37) % (per > 50 ? per - 50 : 1);
+    b.rows(b.q("SELECT id, seq FROM events WHERE instance_id = ? AND seq >= ? AND seq < ? ORDER BY seq",
+               [Value.Text("i\{k % 8}"), Value.Int(lo as i64), Value.Int((lo + 50) as i64)]));
+  }
+  b.done("index range x1000");
+
+  b.start();
+  for (i32 k = 0; k < 10000; k++) {
+    b.rows(b.q("SELECT MAX(seq) FROM events WHERE instance_id = ?", [Value.Text("i\{k % 8}")]));
+  }
+  b.done("max by index x10000");
+
+  b.start();
+  for (i32 k = 0; k < 1000; k++) {
+    b.rows(b.q("SELECT id FROM events WHERE instance_id = ? ORDER BY seq DESC LIMIT 10", [Value.Text("i\{k % 8}")]));
+  }
+  b.done("order by limit x1000");
+
+  b.start();
+  for (i32 k = 0; k < 20; k++) {
+    b.rows(b.q("SELECT count(*) FROM events WHERE json_extract(payload, '$.id') = ?", [Value.Text("t\{k}")]));
+  }
+  b.done("json scan x20");
+
+  b.start();
+  for (i32 k = 0; k < 20; k++) {
+    b.rows(b.q("SELECT type, count(*), sum(timestamp), max(seq) FROM events GROUP BY type ORDER BY type", Value[]()));
+  }
+  b.done("group by x20");
+
+  b.start();
+  for (i32 k = 0; k < 20; k++) {
+    b.rows(b.q("SELECT i.nickname, count(*) FROM events e JOIN instances i ON i.id = e.instance_id WHERE e.type = ? GROUP BY i.nickname ORDER BY 1",
+               [Value.Text(TYPES[k % 6])]));
+  }
+  b.done("join + group x20");
+
+  b.start();
+  for (i32 k = 0; k < 200; k++) {
+    b.rows(b.q("SELECT count(*) FROM events WHERE payload LIKE ?", [Value.Text("%\"n\":\{k}1%")]));
+  }
+  b.done("like scan x200");
+
+  b.start();
+  b.q("BEGIN", Value[]());
+  for (i32 k = 0; k < 2000; k++) {
+    b.q("UPDATE events SET payload = json_set(payload, '$.x', ?) WHERE id = ?", [Value.Int(k as i64), Value.Text("e\{(k * 31) % n}")]);
+  }
+  b.q("COMMIT", Value[]());
+  b.rows(b.q("SELECT count(*), sum(length(payload)) FROM events", Value[]()));
+  b.done("update x2000");
+
+  b.start();
+  b.q("DELETE FROM events WHERE seq % 5 = 0", Value[]());
+  b.rows(b.q("SELECT count(*) FROM events", Value[]()));
+  b.done("delete 20%");
+
+  b.start();
+  u8[] img = b.c.image();
+  b.feed("\{img.len() > 0}");
+  b.done("serialize");
+
+  b.start();
+  Connection c2 = Connection.openImage(img).unwrap();
+  b.c = c2;
+  b.rows(b.q("SELECT count(*), max(seq) FROM events", Value[]()));
+  b.done("deserialize");
+  return 0;
+}

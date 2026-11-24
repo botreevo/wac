@@ -1,0 +1,269 @@
+// The pragmas that describe the schema: table_info, index_list, foreign_key_list and the rest, answered
+// as SQLite answers them, row for row.
+//
+// What the schema structures do not keep (a default's text, which terms of an index are expressions)
+// is read again from the CREATE text, as SQLite itself reads it.
+
+import { Vec, Result } from "core";
+import { Value, compareValues } from "./value.wac";
+import { SqlError } from "./error.wac";
+import { Table, Column, Index, Row, RowCursor, ForeignKey, SchemaEntry } from "./schema.wac";
+import { Database } from "./database.wac";
+import { Stmt, CreateTable, CreateIndex, ColumnDef, IndexCol } from "./ast.wac";
+import { parseOne } from "./parser.wac";
+import { Rows } from "./plan.wac";
+import { lower } from "./lexer.wac";
+import { applyAffinity, isNull } from "./ops.wac";
+
+static string[] COLL_NAMES = ["BINARY", "NOCASE", "RTRIM"];
+
+ColumnDef[]? columnDefs(Table t) {
+  match (parseOne(t.sql)) {
+    Ok(p): { match (p.stmt) { CreateTableStmt(c): { return c.cols as ColumnDef[]?; } default: { return null; } } }
+    Err(e): { return null; }
+  }
+}
+
+IndexCol[]? indexCols(Index ix) {
+  if (ix.sql is null) { return null; }
+  match (parseOne(ix.sql!)) {
+    Ok(p): { match (p.stmt) { CreateIndexStmt(c): { return c.cols as IndexCol[]?; } default: { return null; } } }
+    Err(e): { return null; }
+  }
+}
+
+// The column's place in the primary key, counting from 1, or 0.
+i64 pkPosition(Table t, i32 col) {
+  if (col == t.rowidAlias) { return 1; }
+  for (i32 k = 0; k < t.pk.len(); k++) { if (t.pk[k] == col) { return (k + 1) as i64; } }
+  return 0;
+}
+
+// table_info, or with `extended` table_xinfo, which adds generated columns and a `hidden` column
+// (2 for a VIRTUAL generated column, 3 for a STORED one).
+export Rows tableInfo(Database d, string name, bool extended) {
+  Vec<Value[]> rows;
+  Table? t0 = d.table(name);
+  string[] names = extended ? ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"]
+                            : ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+  if (t0 is null) { return Rows(names, rows); }
+  Table t = t0!;
+  ColumnDef[]? defs = columnDefs(t);
+  i64 cid = 0;
+  for (i32 i = 0; i < t.cols.len(); i++) {
+    Column c = t.cols[i];
+    i64 hidden = c.gen is null ? 0 : (c.stored ? 3 : 2);
+    if (hidden != 0 && !extended) { continue; }
+    Value dflt = Value.Null;
+    if (defs is not null && i < defs!.len() && defs![i].dflt is not null) { dflt = Value.Text(defs![i].dfltText); }
+    Value[] row = [Value.Int(extended ? i as i64 : cid), Value.Text(c.name), Value.Text(c.typeName),
+                   Value.Int(c.notNull ? 1 : 0), dflt, Value.Int(pkPosition(t, i))];
+    if (extended) {
+      Value[] r2 = Value[].filled(7, Value.Null);
+      r2.copyFrom(row, 0, 0, 6);
+      r2[6] = Value.Int(hidden);
+      row = r2;
+    }
+    rows.push(row);
+    cid++;
+  }
+  return Rows(names, rows);
+}
+
+// Whether a constraint's index is the primary key's.
+bool isPkIndex(Table t, Index ix) {
+  if (ix.sql is not null) { return false; }
+  if (t.withoutRowid) { return lower(t.pkIndex) == lower(ix.name); }
+  if (t.rowidAlias >= 0 || t.pk.len() != ix.cols.len()) { return false; }
+  for (i32 i = 0; i < t.pk.len(); i++) { if (t.pk[i] != ix.cols[i]) { return false; } }
+  return true;
+}
+
+// index_list: the table's indexes, the newest first.
+export Rows indexList(Database d, string name) {
+  Vec<Value[]> rows;
+  Table? t = d.table(name);
+  if (t is not null) {
+    Index[] ixs = d.indexesOf(t!.name);
+    for (i32 i = ixs.len() - 1; i >= 0; i--) {
+      Index ix = ixs[i];
+      string origin = ix.sql is not null ? "c" : (isPkIndex(t!, ix) ? "pk" : "u");
+      rows.push([Value.Int((ixs.len() - 1 - i) as i64), Value.Text(ix.name), Value.Int(ix.unique ? 1 : 0),
+                 Value.Text(origin), Value.Int(ix.pred is not null ? 1 : 0)]);
+    }
+  }
+  return Rows(["seq", "name", "unique", "origin", "partial"], rows);
+}
+
+// index_info, or with `extended` index_xinfo, which adds each term's order, collation and whether it is
+// part of the key, then the columns the index carries after its key: the rowid, or a WITHOUT ROWID
+// table's key columns (and, for that key's own index, every other column).
+export Rows indexInfo(Database d, string name, bool extended) {
+  Vec<Value[]> rows;
+  string[] names = extended ? ["seqno", "cid", "name", "desc", "coll", "key"] : ["seqno", "cid", "name"];
+  Index? ix0 = d.index(name);
+  if (ix0 is null) { return Rows(names, rows); }
+  Index ix = ix0!;
+  Table t = d.table(ix.table)!;
+  IndexCol[]? terms = indexCols(ix);
+  for (i32 i = 0; i < ix.cols.len(); i++) {
+    bool expr = terms is not null && i < terms!.len() && terms![i].expr is not null;
+    i64 cid = expr ? -2 : ix.cols[i] as i64;
+    Value nm = expr ? Value.Null : Value.Text(t.cols[ix.cols[i]].name);
+    if (!extended) { rows.push([Value.Int(i as i64), Value.Int(cid), nm]); continue; }
+    rows.push([Value.Int(i as i64), Value.Int(cid), nm, Value.Int(ix.desc[i] ? 1 : 0),
+               Value.Text(COLL_NAMES[ix.colls[i]]), Value.Int(1)]);
+  }
+  if (!extended) { return Rows(names, rows); }
+  i32 seq = ix.cols.len();
+  if (!t.withoutRowid) {
+    rows.push([Value.Int(seq as i64), Value.Int(-1), Value.Null, Value.Int(0), Value.Text("BINARY"), Value.Int(0)]);
+    return Rows(names, rows);
+  }
+  Index pk = d.index(t.pkIndex)!;
+  bool own = lower(pk.name) == lower(ix.name);
+  for (i32 c = 0; c < (own ? t.cols.len() : pk.cols.len()); c++) {
+    i32 col = own ? c : pk.cols[c];
+    bool held = false;
+    if (ix.keyFn is null) { for (i32 k in ix.cols) { if (k == col) { held = true; } } }
+    if (held) { continue; }
+    bool desc = !own && pk.desc[c];
+    rows.push([Value.Int(seq as i64), Value.Int(col as i64), Value.Text(t.cols[col].name), Value.Int(desc ? 1 : 0),
+               Value.Text(COLL_NAMES[t.cols[col].coll]), Value.Int(0)]);
+    seq++;
+  }
+  return Rows(names, rows);
+}
+
+// foreign_key_list: one row per column of each foreign key, the last declared numbered 0.
+export Rows foreignKeyList(Database d, string name) {
+  Vec<Value[]> rows;
+  Table? t = d.table(name);
+  if (t is not null) {
+    ForeignKey[] fks = t!.fks;
+    for (i32 i = fks.len() - 1; i >= 0; i--) {
+      ForeignKey fk = fks[i];
+      for (i32 k = 0; k < fk.cols.len(); k++) {
+        Value to = k < fk.parentCols.len() ? Value.Text(fk.parentCols[k]) : Value.Null;
+        rows.push([Value.Int((fks.len() - 1 - i) as i64), Value.Int(k as i64), Value.Text(fk.parent),
+                   Value.Text(t!.cols[fk.cols[k]].name), to, Value.Text(fk.onUpdate), Value.Text(fk.onDelete),
+                   Value.Text("NONE")]);
+      }
+    }
+  }
+  return Rows(["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"], rows);
+}
+
+// foreign_key_check: each child row whose key names no parent row. A foreign key whose parent columns
+// are neither the parent's primary key nor a unique index is an error, as in SQLite.
+export Result<Rows, SqlError> foreignKeyCheck(Database d, string? only) {
+  Vec<Value[]> rows;
+  for (i32 e = 0; e < d.order.len(); e++) {
+    SchemaEntry se = d.order.get(e);
+    if (se.kind != "table") { continue; }
+    if (only is not null && lower(only!) != lower(se.name)) { continue; }
+    Table t = d.table(se.name)!;
+    // Foreign keys by id, the last declared first, as SQLite numbers them; their parents' keys checked.
+    i32 n = t.fks.len();
+    Vec<ForeignKey> fks;
+    Vec<Table?> parents;
+    Vec<i32[]> keys;
+    for (i32 i = n - 1; i >= 0; i--) {
+      ForeignKey fk = t.fks[i];
+      Table? parent = d.table(fk.parent);
+      i32[] pcols = i32[]();
+      if (parent is not null) {
+        i32[]? found = parentKey(d, parent!, fk);
+        if (found is null) {
+          return Result.Err(SqlError("error", "foreign key mismatch - \"\{t.name}\" referencing \"\{parent!.name}\""));
+        }
+        pcols = found!;
+      }
+      fks.push(fk);
+      parents.push(parent);
+      keys.push(pcols);
+    }
+    // One pass over the rows, each checked against every foreign key in turn.
+    RowCursor tc = t.cursor();
+    for (bool more = tc.first(); more; more = tc.next()) {
+      Row row = tc.row();
+      for (i32 id = 0; id < fks.len(); id++) {
+        ForeignKey fk = fks.get(id);
+        bool anyNull = false;
+        for (i32 c in fk.cols) { if (isNull(row.vals[c])) { anyNull = true; } }
+        if (anyNull) { continue; }
+        Table? parent = parents.get(id);
+        if (parent is not null && hasParent(parent!, keys.get(id), fk, row)) { continue; }
+        rows.push([Value.Text(t.name), Value.Int(row.rowid), Value.Text(fk.parent), Value.Int(id as i64)]);
+      }
+    }
+  }
+  return Result.Ok(Rows(["table", "rowid", "parent", "fkid"], rows));
+}
+
+// The parent's columns a foreign key refers to, when they are its primary key or a unique index.
+i32[]? parentKey(Database d, Table p, ForeignKey fk) {
+  if (fk.parentCols.len() == 0) {
+    if (p.rowidAlias >= 0) { return [p.rowidAlias]; }
+    if (p.pk.len() == fk.cols.len()) { return p.pk; }
+    return null;
+  }
+  i32[] cols = i32[].filled(fk.parentCols.len(), 0);
+  for (i32 i = 0; i < cols.len(); i++) {
+    cols[i] = p.colIndex(fk.parentCols[i]);
+    if (cols[i] < 0) { return null; }
+  }
+  if (cols.len() == 1 && cols[0] == p.rowidAlias) { return cols; }
+  Index[] ixs = d.indexesOf(p.name);
+  for (Index ix in ixs) {
+    if (!ix.unique || ix.pred is not null || ix.keyFn is not null || ix.cols.len() != cols.len()) { continue; }
+    bool same = true;
+    for (i32 c in cols) {
+      bool there = false;
+      for (i32 k in ix.cols) { if (k == c) { there = true; } }
+      if (!there) { same = false; }
+    }
+    if (same) { return cols; }
+  }
+  return null;
+}
+
+bool hasParent(Table p, const i32[] pcols, ForeignKey fk, Row child) {
+  RowCursor pc = p.cursor();
+  for (bool more = pc.first(); more; more = pc.next()) {
+    Row pr = pc.row();
+    bool all = true;
+    for (i32 k = 0; k < pcols.len() && all; k++) {
+      Value want = applyAffinity(child.vals[fk.cols[k]], p.cols[pcols[k]].affinity);
+      if (compareValues(pr.vals[pcols[k]], want) != 0) { all = false; }
+    }
+    if (all) { return true; }
+  }
+  return false;
+}
+
+export Rows collationList() {
+  Vec<Value[]> rows;
+  rows.push([Value.Int(0), Value.Text("RTRIM")]);
+  rows.push([Value.Int(1), Value.Text("NOCASE")]);
+  rows.push([Value.Int(2), Value.Text("BINARY")]);
+  return Rows(["seq", "name"], rows);
+}
+
+export Rows databaseList() {
+  Vec<Value[]> rows;
+  rows.push([Value.Int(0), Value.Text("main"), Value.Text("")]);
+  return Rows(["seq", "name", "file"], rows);
+}
+
+// The pragmas that can be read as tables (pragma_table_info('t') and the like): their rows for an
+// argument, or null for a pragma that is not one of them.
+export Rows? pragmaRows(string name, Database d, string arg) {
+  if (name == "table_info" || name == "table_xinfo") { return tableInfo(d, arg, name == "table_xinfo"); }
+  if (name == "index_list") { return indexList(d, arg); }
+  if (name == "index_info" || name == "index_xinfo") { return indexInfo(d, arg, name == "index_xinfo"); }
+  if (name == "foreign_key_list") { return foreignKeyList(d, arg); }
+  if (name == "collation_list") { return collationList(); }
+  if (name == "database_list") { return databaseList(); }
+  return null;
+}

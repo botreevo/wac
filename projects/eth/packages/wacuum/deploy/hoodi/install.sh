@@ -3,7 +3,7 @@
 # drives it, beside a reference node (geth) it takes the state from and is checked against. Ubuntu 24.04, as root,
 # once; again to upgrade (it pulls and rebuilds, and keeps /etc/eth/hoodi.env and the data).
 #
-#     sh install.sh LIGHTHOUSE_VERSION [WAC_ETH_URL]       # e.g. v8.0.0 — the current release on the day
+#     sh install.sh LIGHTHOUSE_VERSION [WAC_REPO_URL]       # e.g. v8.0.0 — the current release on the day
 #
 # What runs (each a systemd unit, every RPC on 127.0.0.1):
 #
@@ -13,12 +13,13 @@
 #     lighthouse-wacuum    Lighthouse driving wacuum          p2p 9002    http 5053
 #
 # Two consensus clients because each execution client needs its own. Layout: /opt/wac (the compiler at
-# wac-eth's pin), /opt/wac-eth (this repository), /data/{geth,lighthouse-geth,lighthouse-wacuum,wacuum}, and
+# wac-eth's pin), /opt/wac-eth (wac-eth: projects/eth of /opt/wac-repo,
+# wac's repository), /data/{geth,lighthouse-geth,lighthouse-wacuum,wacuum}, and
 # /etc/eth: the JWT secrets, Hoodi's genesis (as geth has it built in), its bootnodes, and hoodi.env — the
 # settings wacuum runs with (heap, cache, history, checkpoint URL), kept across reinstalls.
 set -eu
-lighthouse=${1:?usage: sh install.sh LIGHTHOUSE_VERSION [WAC_ETH_URL]}
-repo=${2:-https://git.voltrevo.com/wac-eth.git}
+lighthouse=${1:?usage: sh install.sh LIGHTHOUSE_VERSION [WAC_REPO_URL]}
+repo=${2:-https://github.com/voltrevo/wac.git}
 [ "$(id -u)" -eq 0 ] || { echo "install.sh: run as root" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -75,9 +76,15 @@ chmod 644 /etc/eth/hoodi-genesis.json /etc/eth/hoodi-bootnodes.txt 2>/dev/null |
 [ -f /etc/eth/hoodi.env ] || install -m 644 "$here/hoodi.env" /etc/eth/hoodi.env
 
 # wac-eth, then wac at exactly the commit wac-eth's wac.lock pins, then wacuum built once into an executable.
-[ -d /opt/wac-eth/.git ] || git clone "$repo" /opt/wac-eth
+# wac-eth is projects/eth of wac's repository (since 2026-11-24). The repository goes to /opt/wac-repo, whole: its pins
+# into itself are filled out of its own history (tools/deps.sh). /opt/wac-eth is a link to projects/eth in it, so the
+# units and scripts that name /opt/wac-eth are unchanged. A machine installed before has /opt/wac-eth as a clone of
+# wac-eth; that is kept, as /opt/wac-eth.before-monorepo, not deleted.
+if [ -d /opt/wac-eth ] && [ ! -L /opt/wac-eth ]; then mv /opt/wac-eth /opt/wac-eth.before-monorepo; fi
+[ -d /opt/wac-repo/.git ] || git clone "$repo" /opt/wac-repo
 # Owned by the service user after the first install; root's git refuses such a checkout unless told it is safe.
-git -c safe.directory=/opt/wac-eth -C /opt/wac-eth pull --ff-only
+git -c safe.directory=/opt/wac-repo -C /opt/wac-repo pull --ff-only
+ln -sfn /opt/wac-repo/projects/eth /opt/wac-eth
 pin=$(tr '\n' ' ' < /opt/wac-eth/wac.lock | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
 [ -n "$pin" ] || { echo "install.sh: no wac commit in wac.lock" >&2; exit 1; }
 [ -d /opt/wac/.git ] || git clone "${WAC_URL:-https://github.com/voltrevo/wac.git}" /opt/wac
@@ -90,9 +97,12 @@ fi
 git -C /opt/wac checkout --detach "$pin"
 # Built beside the old one and renamed over it: the running units hold /usr/local/bin/wac open, and a copy onto a
 # running executable fails (Text file busy), which stopped an upgrade here with the units up.
-(cd /opt/wac && ./bootstrap.sh -o /usr/local/bin/wac.new)
+# A pin from before wac moved into projects/wac has it at the root; one from after, at projects/wac.
+src=/opt/wac
+if [ -f /opt/wac/projects/wac/bootstrap.sh ]; then src=/opt/wac/projects/wac; fi
+(cd "$src" && ./bootstrap.sh -o /usr/local/bin/wac.new)
 mv -f /usr/local/bin/wac.new /usr/local/bin/wac
-chown -R wacuum:wacuum /opt/wac-eth
+chown -R wacuum:wacuum /opt/wac-repo
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth && sh tools/deps.sh'
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac test --allow-read test'
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && mkdir -p dist && wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum.new && mv -f dist/wacuum.new dist/wacuum'

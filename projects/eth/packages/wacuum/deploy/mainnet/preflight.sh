@@ -64,10 +64,11 @@ for port in 30303 9000; do
   else pass "port $port is free"; fi
 done
 
-# What install.sh and reference.sh fetch, and the checkpoint Lighthouse starts from. git.voltrevo.com is where
-# wac-eth comes from: an answer of 401 there means the box needs credentials for it (or pass install.sh a URL).
+# What install.sh and reference.sh fetch, and the checkpoint Lighthouse starts from. wac-eth is projects/eth of wac's
+# repository on GitHub; git.voltrevo.com still serves older pins GitHub lacks (wac's own lock pins web there), and an
+# answer of 401 there means the box needs credentials for it.
 for url in https://github.com/voltrevo/wac.git/info/refs?service=git-upload-pack https://sh.rustup.rs https://static.rust-lang.org https://index.crates.io/config.json \
-           "$checkpoint" https://git.voltrevo.com/wac-eth.git/info/refs?service=git-upload-pack; do
+           "$checkpoint" https://git.voltrevo.com/wac.git/info/refs?service=git-upload-pack; do
   code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$url")
   case "$code" in
     2*|3*) pass "outbound: $url ($code)" ;;
@@ -76,8 +77,8 @@ for url in https://github.com/voltrevo/wac.git/info/refs?service=git-upload-pack
   esac
 done
 
-# Every commit the install fetches, fetched now, with this machine's own credentials: wac-eth (WAC_ETH_URL), wac at
-# the commit wac-eth's wac.lock pins, and each import wac's own lock pins (wac-web). A github.com/voltrevo pin is tried
+# Every commit the install fetches, fetched now, with this machine's own credentials: wac's repository (WAC_REPO_URL),
+# wac at the commit projects/eth's wac.lock pins, and each import wac's own lock pins (wac-web). A github.com/voltrevo pin is tried
 # on GitHub and then on git.voltrevo.com, as install.sh and tools/deps.sh fetch it. git.voltrevo.com is not public:
 # without read credentials there (docs/mainnet.md, "Access to the pinned commits"), a pin GitHub lacks cannot be had.
 tmp=$(mktemp -d)
@@ -96,10 +97,10 @@ fetchable() {
 pinOf() { tr '\n' ' ' < "$2" | sed -n "s/.*\"$1\" *: *{[^}]*\"commit\" *: *\"\([0-9a-f]\{40\}\)\".*/\1/p"; }
 urlOf() { tr '\n' ' ' < "$2" | sed -n "s/.*\"$1\" *: *{[^}]*\"git\" *: *\"\([^\"]*\)\".*/\1/p"; }
 
-ethUrl=${WAC_ETH_URL:-https://git.voltrevo.com/wac-eth.git}
-if GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "$ethUrl" "$tmp/wac-eth" 2>/dev/null; then
-  pass "pinned: wac-eth from $ethUrl"
-  wacPin=$(pinOf wac "$tmp/wac-eth/wac.lock")
+repoUrl=${WAC_REPO_URL:-https://github.com/voltrevo/wac.git}
+if GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "$repoUrl" "$tmp/wac-repo" 2>/dev/null; then
+  pass "pinned: wac-eth, as projects/eth of $repoUrl"
+  wacPin=$(pinOf wac "$tmp/wac-repo/projects/eth/wac.lock")
   wacUrl=${WAC_URL:-https://github.com/voltrevo/wac.git}
   from=$(fetchable "$wacUrl" "$wacPin")
   if [ -n "$from" ]; then
@@ -119,7 +120,7 @@ if GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "$ethUrl" "$tmp/wac-eth" 2>/dev/
     fail "pinned: wac $wacPin is at neither $wacUrl nor git.voltrevo.com (from here) — see docs/mainnet.md, \"Access to the pinned commits\""
   fi
 else
-  fail "pinned: wac-eth cannot be cloned from $ethUrl (from here) — see docs/mainnet.md, \"Access to the pinned commits\""
+  fail "pinned: wac's repository cannot be cloned from $repoUrl (from here) — see docs/mainnet.md, \"Access to the pinned commits\""
 fi
 
 [ "$failed" -eq 0 ] && echo "preflight: ready" || echo "preflight: not ready — see the FAIL lines"

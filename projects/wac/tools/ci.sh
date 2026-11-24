@@ -13,9 +13,7 @@ if [ "${CI:-}" = "true" ]; then
   sudo apt-get update -qq
   sudo apt-get install -y -qq coturn iproute2 openssh-client openssh-server >/dev/null
   sudo mkdir -p /run/sshd
-  # aioice<0.13: the WebRTC oracles call parse_message(…, integrity_key=…), which 0.13.0 removed (0.12.1 is the last
-  # to have it). gatedeps.sh's own hint, `pip install aioice`, now installs a release they cannot use.
-  pip install -q "aioice<0.13" aiortc google-crc32c
+  pip install -q aioice aiortc google-crc32c
   deno run -A npm:playwright@1 install --with-deps chromium
   (cd site && npm ci --no-audit --no-fund)
   (cd bootstrap/rust && cargo build --release --quiet)

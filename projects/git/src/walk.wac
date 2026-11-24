@@ -1,0 +1,209 @@
+// Which commits are new: reachable from some tips and not from others, found without walking whole histories.
+//
+// Both questions a server asks are this one. A fetch: what do the wants reach that the client's common commits do
+// not? A push: what does the new tip reach that the existing refs do not, so that only those need checking? The
+// first version answered both by collecting *every* commit behind the uninteresting side — the whole history,
+// for each fetch and each push — which on a 2,000-commit repository was most of a fetch's two seconds and a push's
+// five.
+//
+// This is `git rev-list A --not B`'s walk: both sides in one queue, newest commit first, marks of "uninteresting"
+// carried down to parents, and the walk ends as soon as nothing interesting is left in the queue. Everything
+// interesting behind that point is behind an uninteresting commit too.
+//
+// **Clock skew can only make it send more.** A commit popped as interesting and later found to be uninteresting is
+// dropped from the answer at the end. One that is never found out is sent although the other side has it — wasted
+// bytes, never a missing object. The walk never stops while anything interesting is queued, so nothing the other
+// side lacks is left out.
+
+import { Vec, Map, hashBytes, bytesEq } from "core";
+import { Got } from "../vendor/wac/packages/git/src/pack.wac";
+import { ParsedTag, parseTag } from "../vendor/wac/packages/git/src/commit.wac";
+import { CommitHead, scanCommit } from "./scan.wac";
+import { Store, readObject } from "./store.wac";
+
+export struct Walked {
+  /** The new commits, in the order the walk met them: newest first, near enough. */
+  Vec<u8[]> commits;
+  /** Each new commit's root tree, in the same order. */
+  Vec<u8[]> trees;
+  /** Uninteresting commits that a new commit names as a parent: what the new history was built on. */
+  Vec<u8[]> boundary;
+}
+
+struct Node {
+  u8[] name;
+  i64 when;
+  Vec<u8[]> parents;
+  u8[] tree;
+  bool uninteresting;
+  bool queued;
+}
+
+/** A max-heap of nodes by commit time. */
+struct Heap {
+  Vec<Node> items;
+}
+
+void heapPush(Heap h, Node n) {
+  h.items.push(n);
+  i32 i = h.items.len() - 1;
+  while (i > 0) {
+    i32 up = (i - 1) / 2;
+    if (h.items.get(up).when >= h.items.get(i).when) { break; }
+    Node t = h.items.get(up);
+    h.items.set(up, h.items.get(i));
+    h.items.set(i, t);
+    i = up;
+  }
+}
+
+Node heapPop(Heap h) {
+  Node top = h.items.get(0);
+  Node last = h.items.pop()!;
+  i32 n = h.items.len();
+  if (n == 0) { return top; }
+  h.items.set(0, last);
+  i32 i = 0;
+  while (true) {
+    i32 l = i * 2 + 1;
+    i32 r = l + 1;
+    i32 best = i;
+    if (l < n && h.items.get(l).when > h.items.get(best).when) { best = l; }
+    if (r < n && h.items.get(r).when > h.items.get(best).when) { best = r; }
+    if (best == i) { break; }
+    Node t = h.items.get(best);
+    h.items.set(best, h.items.get(i));
+    h.items.set(i, t);
+    i = best;
+  }
+  return top;
+}
+
+struct Walk {
+  Store s;
+  Map<u8[], Node> nodes;
+  Heap heap;
+  /** Interesting nodes in the queue: the walk ends when this reaches zero. */
+  i32 live;
+}
+
+/** The commit `name` names, through any tags, as a node — read once, or null when it is not a commit here. */
+async Node? nodeOf(Walk w, u8[] name0) {
+  u8[] name = name0;
+  for (i32 hop = 0; hop < 16; hop++) {
+    Node? seen = w.nodes.get(name);
+    if (seen is not null) { return seen; }
+    match ((await readObject(w.s, name))) {
+      Absent(why): { return null; }
+      Found(kind, data): {
+        if (kind == 4) {
+          match (parseTag(data)) {
+            Unreadable(why): { return null; }
+            Annotated(t): { name = t.object; continue; }
+          }
+        }
+        if (kind != 1) { return null; }
+        CommitHead? c = scanCommit(data);
+        if (c is null) { return null; }
+        Node n = Node(name, c!.when, c!.parents, c!.tree, false, false);
+        w.nodes.set(name, n);
+        return n;
+      }
+    }
+  }
+  return null;
+}
+
+void enqueue(Walk w, Node n) {
+  if (n.queued) { return; }
+  n.queued = true;
+  if (!n.uninteresting) { w.live = w.live + 1; }
+  heapPush(w.heap, n);
+}
+
+/** Mark `n` uninteresting; if it was waiting in the queue as interesting, the queue has one fewer. */
+void markUninteresting(Walk w, Node n, bool inQueue) {
+  if (n.uninteresting) { return; }
+  n.uninteresting = true;
+  if (inQueue) { w.live = w.live - 1; }
+}
+
+/**
+ * The commits reachable from `wants` and not from `haves`. Names that are not commits here — a tag is followed
+ * to its commit — are skipped: a missing `have` only means the walk cannot use it.
+ */
+export async Walked newCommits(Store s, Vec<u8[]> wants, Vec<u8[]> haves) {
+  Walk w = Walk(s, Map.create(hashBytes, bytesEq), Heap(Vec.create()), 0);
+  // Popped and not yet known to be reachable from a `have`: still being decided.
+  Map<u8[], bool> popped = Map.create(hashBytes, bytesEq);
+  Vec<Node> out = Vec.create();
+
+  for (i32 i = 0; i < haves.len(); i++) {
+    Node? n = await nodeOf(w, haves.get(i));
+    if (n is not null) { n!.uninteresting = true; enqueue(w, n!); }
+  }
+  for (i32 i = 0; i < wants.len(); i++) {
+    Node? n = await nodeOf(w, wants.get(i));
+    if (n is not null) { enqueue(w, n!); }
+  }
+
+  while (w.live > 0 && w.heap.items.len() > 0) {
+    Node n = heapPop(w.heap);
+    n.queued = false;
+    if (!n.uninteresting) {
+      w.live = w.live - 1;
+      out.push(n);
+    }
+    for (i32 k = 0; k < n.parents.len(); k++) {
+      Node? p = await nodeOf(w, n.parents.get(k));
+      // A parent that is not here is a shallow edge: there is nothing behind it to walk.
+      if (p is null) { continue; }
+      if (n.uninteresting) {
+        bool waiting = p!.queued;
+        markUninteresting(w, p!, waiting);
+        // Already popped as interesting? It is dropped from the answer below.
+        if (!waiting && !popped.has(p!.name)) { enqueue(w, p!); }
+        else if (!waiting && popped.has(p!.name)) { carryDown(w, p!); }
+      } else if (!p!.queued && !popped.has(p!.name)) {
+        enqueue(w, p!);
+      }
+    }
+    popped.set(n.name, true);
+  }
+
+  Walked res = Walked(Vec.create(), Vec.create(), Vec.create());
+  Map<u8[], bool> onBoundary = Map.create(hashBytes, bytesEq);
+  for (i32 i = 0; i < out.len(); i++) {
+    Node n = out.get(i);
+    if (n.uninteresting) { continue; }
+    res.commits.push(n.name);
+    res.trees.push(n.tree);
+    for (i32 k = 0; k < n.parents.len(); k++) {
+      Node? p = w.nodes.get(n.parents.get(k));
+      if (p is not null && p!.uninteresting && !onBoundary.has(p!.name)) {
+        onBoundary.set(p!.name, true);
+        res.boundary.push(p!.name);
+      }
+    }
+  }
+  return res;
+}
+
+/**
+ * A commit already popped as interesting has turned out to be uninteresting (clock skew put it before a
+ * descendant of a `have`). Its known descendants-in-the-walk are marked too, so they are not sent; anything not
+ * yet read stays unknown, and at worst is sent although the other side has it.
+ */
+void carryDown(Walk w, Node start) {
+  Vec<Node> stack = Vec.create();
+  stack.push(start);
+  while (stack.len() > 0) {
+    Node n = stack.pop()!;
+    for (i32 k = 0; k < n.parents.len(); k++) {
+      Node? p = w.nodes.get(n.parents.get(k));
+      if (p is null || p!.uninteresting) { continue; }
+      markUninteresting(w, p!, p!.queued);
+      stack.push(p!);
+    }
+  }
+}

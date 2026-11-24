@@ -1,0 +1,93 @@
+// `src/serve.wac` without a socket or a repository: the parts of the server that are decisions about bytes.
+//
+// What the server does to repositories is judged by real git, in `test/e2e.sh` — clones checked by
+// `git fsck --strict`, pushes read back with `git rev-parse`. This is the rest: which ref names a push may
+// create, how a v2 request is taken apart, and how a pack is cut into side-band packets, each of which git
+// would only report as a vague failure if it were wrong.
+
+import { T } from "../vendor/wac/packages/wactest/src/assert.wac";
+import { Buf } from "core";
+import { Pkt, readPkt, writeText, flushPkt } from "../vendor/wac/packages/git/src/pktline.wac";
+import { Commanded, advertiseV2, errPkt, parseCommand, refNameOk } from "../src/serve.wac";
+
+export string test_a_ref_name_must_stay_under_refs_and_be_one_git_would_make() {
+  T t = T.create();
+  string[] good = ["refs/heads/main", "refs/heads/feature/x", "refs/tags/v1.0", "refs/heads/a-b_c", "refs/notes/commits"];
+  for (string n in good) { t.isTrue(refNameOk(n), "\{n} is a ref name"); }
+  // Each of these is refused by `git check-ref-format`, and several would reach outside refs/ on disk.
+  string[] bad = [
+    "HEAD", "main", "refs/heads/../../config", "refs/heads/a..b", "refs/heads/.hidden", "refs/heads/x.lock",
+    "refs/heads/x/", "refs/heads/x.", "refs/heads/a b", "refs/heads/a~1", "refs/heads/a^", "refs/heads/a:b",
+    "refs/heads/a?", "refs/heads/a*", "refs/heads/a[", "refs/heads/a\\b", "refs/heads/a@{1}", "refs/heads//x",
+    "refs/heads/\u{7f}", "refs/heads/a\nb", "refs/", "refs/heads/x.lock/y"
+  ];
+  for (string n in bad) { t.isFalse(refNameOk(n), "\{n} is refused"); }
+  return t.report();
+}
+
+export string test_a_v2_request_is_its_command_its_capabilities_and_its_arguments() {
+  T t = T.create();
+  Buf b = Buf.create();
+  b.pushAll(writeText("command=fetch\n"));
+  b.pushAll(writeText("agent=git/2.43.0\n"));
+  b.pushAll(writeText("object-format=sha1\n"));
+  b.pushAll("0001".toBytes());
+  b.pushAll(writeText("thin-pack\n"));
+  b.pushAll(writeText("want 0123456789012345678901234567890123456789\n"));
+  b.pushAll(writeText("done\n"));
+  b.pushAll(flushPkt());
+  match (parseCommand(b.take())) {
+    Bad(why): { t.fail("refused: \{why}"); }
+    Is(c): {
+      t.isTrue(c.name == "fetch", "the command");
+      t.eqI32(c.caps.len(), 2, "two capability lines before the delimiter");
+      t.eqI32(c.args.len(), 3, "three arguments after it");
+      t.isTrue(c.args.get(1) == "want 0123456789012345678901234567890123456789", "an argument loses its newline");
+    }
+  }
+  Buf none = Buf.create();
+  none.pushAll(writeText("agent=x\n"));
+  none.pushAll(flushPkt());
+  t.isTrue(parseCommand(none.take()) is Commanded.Bad, "a request with no command is refused");
+  return t.report();
+}
+
+export string test_the_v2_advertisement_says_version_2_first_and_ends_with_a_flush() {
+  T t = T.create();
+  u8[] ad = advertiseV2();
+  i32[] pos = [0];
+  match (readPkt(ad, pos)) {
+    Line(p): { t.isTrue(string.fromBytes(p) == "version 2\n", "the first line is the version"); }
+    Flush: { t.fail("a flush first"); }
+    Delim: { t.fail("a delimiter first"); }
+    ResponseEnd: { t.fail("a response end first"); }
+    Done: { t.fail("empty"); }
+    Broken(why): { t.fail(why); }
+  }
+  bool sawFetch = false;
+  bool sawLsRefs = false;
+  bool ended = false;
+  while (!ended) {
+    match (readPkt(ad, pos)) {
+      Line(p): {
+        string l = string.fromBytes(p);
+        if (l == "fetch\n") { sawFetch = true; }
+        if (l == "ls-refs\n") { sawLsRefs = true; }
+      }
+      Flush: { ended = true; t.eqI32(pos[0], ad.len(), "nothing after the flush"); }
+      Delim: { t.fail("a delimiter in the advertisement"); ended = true; }
+      ResponseEnd: { ended = true; }
+      Done: { t.fail("no flush at the end"); ended = true; }
+      Broken(why): { t.fail(why); ended = true; }
+    }
+  }
+  t.isTrue(sawFetch && sawLsRefs, "it offers fetch and ls-refs");
+  return t.report();
+}
+
+export string test_an_error_is_one_ERR_packet_and_a_flush() {
+  T t = T.create();
+  u8[] e = errPkt("no");
+  t.isTrue(string.fromBytes(e) == "000bERR no\n0000", "ERR, then flush: \{string.fromBytes(e)}");
+  return t.report();
+}

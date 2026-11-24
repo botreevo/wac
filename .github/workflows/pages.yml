@@ -1,114 +1,106 @@
-name: Deploy to GitHub Pages
+name: Pages
 
-# **The site is a wac program's output.** `site/wac/build.wac` writes every page as HTML into
-# `site/dist/`, reading the figures it quotes from the tree as it is at this commit. The demos are
-# built beside those pages, and the React app that still holds the playground goes into
-# `site/dist/playground/`.
-#
-# The demos are whole wac applications — each a self-contained page with the wasm inside it — built
-# from `packages/box` and `packages/platform`. They used to be committed: a
-# megabyte of generated HTML in git, refreshed whenever somebody remembered, which is to say
-# usually stale.
-#
-# This used to check out two repositories side by side, because the packages and the compiler lived
-# apart and the import map pointed at a sibling checkout. They are one repository now, so the two
-# sync steps take no path and every step runs from the root.
-#
-# **A demo that will not build fails the deploy.** A site that advertises three demos and serves
-# three 404s is worse than a site that did not deploy.
+# One site for the repository: wac's at the root, and every other project with a tools/site.sh under /<name>/
+# (the desktop at /desktop/). Each site builds in a job of its own, with the wac its project pins. **A site whose
+# build fails keeps its last good build** — the newest earlier `site-<name>` artifact — so one project's broken
+# build neither takes down another's site nor publishes something broken.
 
 on:
   push:
-    branches: [main, master]
+    branches: [master]
   workflow_dispatch:
 
 permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  build:
+  sites:
     runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.list.outputs.projects }}
     steps:
       - uses: actions/checkout@v4
+      - id: list
+        run: |
+          list=$(ls projects | while read -r p; do [ -f "projects/$p/tools/site.sh" ] && echo "$p"; done)
+          echo "projects=$(printf '%s\n' $list | jq -R . | jq -cs 'map(select(. != ""))')" >> "$GITHUB_OUTPUT"
 
+  site:
+    needs: sites
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.sites.outputs.projects) }}
+    runs-on: ubuntu-latest
+    name: site ${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      # **The git imports `wac.lock` pins, before anything builds.** `web` stopped being `packages/web` on
-      # 2026-10-29 and is a git dependency, and `wac` resolves one only from its package cache — which on a
-      # fresh runner is empty, so the demos failed at `import { buildPage } from "webbuild"` and nothing
-      # deployed after 2026-10-28. The pins name GitHub, where these repositories are public, so plain
-      # `git` fetches them with no credentials; the script skips a commit already cached.
-      - name: Fill the package cache
-        run: sh tools/fill-cache.sh
-      # The demos are build output from `packages/box` and `packages/platform`, not source, so they
-      # are built here rather than committed — a megabyte of generated HTML in git was stale by the
-      # next day. Both of these used to take the path of a sibling checkout; the merge made them
-      # local.
-      # First, because it builds the `wac` command the next step runs — with Deno, since this machine
-      # has no cargo — into `.cache/wac-deno`.
-      - name: Build the demos
-        run: deno run -A site/tools/syncDemos.ts
-      - name: Build the site
-        run: .cache/wac-deno run --allow-read --allow-write site/wac/build.wac site/dist
-      # The compiler as a file the page can import: reference-built (that is the bootstrap) with wacc's
-      # own bindgen writing the JavaScript. Build output like the demos, and for the same reason.
-      # `--import-map` is load-bearing: `site/package.json` puts this subtree in an npm resolution
-      # scope, so the bare `wac/` specifier in `harness/wacFiles.ts` — which only this script reaches
-      # — resolves as an npm package and fails with `Import "wac/wacLex.ts" not a dependency`.
-      # Without the flag this step fails, no `wacc-api.js` is written, and the playground falls back
-      # to the reference compiler in production without saying so. See `issues/system/0146`.
-      - name: Build the wacc asset
-        run: deno run -A --import-map deno.json site/tools/syncWacc.ts
-
-      - uses: actions/setup-node@v4
+      - id: pin
+        run: |
+          p=projects/${{ matrix.project }}
+          c=""
+          [ -f "$p/wac.lock" ] && c=$(tr '\n' ' ' < "$p/wac.lock" | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
+          echo "commit=$c" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/wac
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: site/package-lock.json
-      - working-directory: site
-        run: npm ci
-      # **This produces the asset; it is not a refresh.** `site/public/wacc-sources.json` and
-      # `wacc-glue.js` are gitignored, like `wacc-api.js` beside them, because both are exactly
-      # reproducible from `packages/wacc/src` and stale the moment it changes.
-      #
-      # They were committed until 2026-08-17 and had been stale for six days — eleven of the
-      # compiler's fifteen sources — because `site/package.json`'s `build` script is the only place
-      # the regeneration lived and this workflow calls `tsc -b` and `vite build` directly. A copy in
-      # git plus a deploy that stopped refreshing it is `issues/system/0146` exactly. There is no
-      # copy now, so the failure mode is a step that fails loudly here rather than a page quietly
-      # serving last week's compiler.
-      #
-      # After `npm ci`, because it shells out to the site's own `tsc`.
-      - name: Build the bootstrap demo's copy of the compiler
-        working-directory: site
-        run: deno run -A ../tools/syncBootstrap.ts
-      - working-directory: site
-        run: npx tsc -b
-      - working-directory: site
-        run: BASE_URL="/${{ github.event.repository.name }}/" npx vite build
-      # After the build, because one of these talks to the *emitted* worker chunk rather than to
-      # the TypeScript. The rest compile and run every snippet the page shows, which is the same
-      # reasoning as building the demos here: a page that advertises working code and serves
-      # broken code is worse than a page that did not deploy.
-      - name: Check the site's own code
-        run: deno test -A --unstable-sloppy-imports --no-check site/tools/site.test.ts
-      - uses: actions/upload-pages-artifact@v3
+          commit: ${{ steps.pin.outputs.commit }}
+      - run: sh projects/${{ matrix.project }}/tools/site.sh "$RUNNER_TEMP/site"
+        env:
+          BASE_URL: /${{ github.event.repository.name }}/${{ matrix.project != 'wac' && format('{0}/', matrix.project) || '' }}
+      - uses: actions/upload-artifact@v4
         with:
-          path: site/dist
+          name: site-${{ matrix.project }}
+          path: ${{ runner.temp }}/site
+          include-hidden-files: true
 
   deploy:
-    needs: build
+    needs: [sites, site]
+    if: always() && needs.sites.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: built
+      - name: Assemble, with last good builds for any that failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PROJECTS: ${{ needs.sites.outputs.projects }}
+        run: |
+          set -eu
+          mkdir -p out
+          for p in $(echo "$PROJECTS" | jq -r '.[]'); do
+            d="built/site-$p"
+            if [ ! -d "$d" ]; then
+              id=$(gh api "repos/$REPO/actions/artifacts?name=site-$p&per_page=1" --jq '.artifacts[0].id // empty')
+              if [ -z "$id" ]; then echo "::warning::$p's site did not build and has no earlier build; left out"; continue; fi
+              echo "::warning::$p's site did not build; publishing its last good build (artifact $id)"
+              mkdir -p "$d" && gh api "repos/$REPO/actions/artifacts/$id/zip" > "$p.zip" && unzip -q "$p.zip" -d "$d"
+            fi
+            if [ "$p" = wac ]; then cp -R "$d/." out/; else mkdir -p "out/$p" && cp -R "$d/." "out/$p/"; fi
+          done
+          touch out/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
       - id: deployment
         uses: actions/deploy-pages@v4

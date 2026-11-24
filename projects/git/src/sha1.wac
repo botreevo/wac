@@ -1,0 +1,127 @@
+// SHA-1, streaming, for hashing packs and objects at the rate a server needs.
+//
+// wac's `crypto` SHA-1 is written to be read: an 80-word schedule allocated per block, the round function chosen
+// by a branch every round, and input copied a byte at a time into a block buffer. Every object name and every
+// pack trailer is a SHA-1, and a 40 MB clone's trailer alone took a third of a second.
+//
+// This is the same function: the schedule is sixteen words reused in place, each group of twenty rounds is its own
+// loop with its function and constant fixed, and whole blocks are hashed straight out of the input.
+// `test/sha1_test.wac` holds it to wac's implementation and to the published vectors.
+
+export struct Hash {
+  u32[] h;
+  u32[] w;
+  u8[] buf;
+  i32 pending;
+  i64 total;
+
+  Hash create() {
+    u32[] h = u32[].filled(5, 0);
+    h[0] = 1732584193 as! u32;
+    h[1] = 4023233417 as! u32;
+    h[2] = 2562383102 as! u32;
+    h[3] = 271733878 as! u32;
+    h[4] = 3285377520 as! u32;
+    return Hash(h, u32[].filled(16, 0), u8[].filled(64, 0), 0, 0 as i64);
+  }
+
+  void update(this, u8[] data) { this.updateRange(data, 0, data.len()); }
+
+  void updateRange(this, u8[] data, i32 from, i32 count) {
+    i32 at = from;
+    i32 end = from + count;
+    this.total += count as i64;
+    if (this.pending > 0) {
+      while (at < end && this.pending < 64) {
+        this.buf[this.pending] = data[at];
+        this.pending++;
+        at++;
+      }
+      if (this.pending < 64) { return; }
+      compress(this.h, this.w, this.buf, 0);
+      this.pending = 0;
+    }
+    while (end - at >= 64) {
+      compress(this.h, this.w, data, at);
+      at = at + 64;
+    }
+    while (at < end) {
+      this.buf[this.pending] = data[at];
+      this.pending++;
+      at++;
+    }
+  }
+
+  u8[] finish(this) {
+    i64 bits = this.total * 8;
+    u8[] pad = u8[].filled(this.pending < 56 ? 64 - this.pending : 128 - this.pending, 0);
+    pad[0] = 0x80;
+    for (i32 i = 0; i < 8; i++) {
+      pad[pad.len() - 1 - i] = ((bits >> ((i * 8) as i64)) & 255) as@ u8;
+    }
+    i64 keep = this.total;
+    this.update(pad);
+    this.total = keep;
+    u8[] out = u8[].filled(20, 0);
+    for (i32 i = 0; i < 5; i++) {
+      u32 v = this.h[i];
+      out[i * 4] = (v >> 24) as@ u8;
+      out[i * 4 + 1] = (v >> 16) as@ u8;
+      out[i * 4 + 2] = (v >> 8) as@ u8;
+      out[i * 4 + 3] = v as@ u8;
+    }
+    return out;
+  }
+}
+
+/** The SHA-1 of `data`. */
+export u8[] sha1Of(u8[] data) {
+  Hash h = Hash.create();
+  h.update(data);
+  return h.finish();
+}
+
+/** One 64-byte block of `d` at `at` into the state. `w` is sixteen words of scratch, reused. */
+void compress(u32[] h, u32[] w, u8[] d, i32 at) {
+  for (i32 i = 0; i < 16; i++) {
+    i32 p = at + i * 4;
+    w[i] = ((d[p] as u32) << 24) | ((d[p + 1] as u32) << 16) | ((d[p + 2] as u32) << 8) | (d[p + 3] as u32);
+  }
+  u32 a = h[0];
+  u32 b = h[1];
+  u32 c = h[2];
+  u32 dd = h[3];
+  u32 e = h[4];
+  u32 k1 = 1518500249 as! u32;
+  u32 k2 = 1859775393 as! u32;
+  u32 k3 = 2400959708 as! u32;
+  u32 k4 = 3395469782 as! u32;
+  for (i32 i = 0; i < 80; i++) {
+    u32 x = 0;
+    if (i < 16) {
+      x = w[i];
+    } else {
+      // The schedule as a ring of sixteen: word i depends on i-3, i-8, i-14 and i-16.
+      u32 v = w[(i - 3) & 15] ^ w[(i - 8) & 15] ^ w[(i - 14) & 15] ^ w[i & 15];
+      x = (v << 1) | (v >> 31);
+      w[i & 15] = x;
+    }
+    u32 f = 0;
+    u32 k = 0;
+    if (i < 20) { f = (b & c) | (~b & dd); k = k1; }
+    else if (i < 40) { f = b ^ c ^ dd; k = k2; }
+    else if (i < 60) { f = (b & c) | (b & dd) | (c & dd); k = k3; }
+    else { f = b ^ c ^ dd; k = k4; }
+    u32 t = ((a << 5) | (a >> 27)) + f + e + k + x;
+    e = dd;
+    dd = c;
+    c = (b << 30) | (b >> 2);
+    b = a;
+    a = t;
+  }
+  h[0] += a;
+  h[1] += b;
+  h[2] += c;
+  h[3] += dd;
+  h[4] += e;
+}

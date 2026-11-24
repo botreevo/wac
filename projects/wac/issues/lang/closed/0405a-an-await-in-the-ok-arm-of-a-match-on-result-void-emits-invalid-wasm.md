@@ -1,0 +1,41 @@
+# 0405a — an `await` in the `Ok` arm of a match on a `Result<void, E>` emits a module the engine refuses
+
+- **Status:** closed 2026-11-10 (cloud) — `asynclower.wac`'s `splitMatch` makes a binding the arm never reads `_`; `spec/cases/0889`
+- **Reported by:** agent-a
+- **Date:** 2026-10-27
+- **Kind:** bug
+- **Symptom:** invalid wasm
+
+## Reproduction
+
+```wac
+import { Result } from "core";
+struct Gone { string m; }
+async Result<void, Gone> act(bool ok) { return ok ? Result.Ok() : Result.Err(Gone("x")); }
+async void say(string s) { }
+export async i32 main() {
+  match (await act(false)) {
+    Ok(v): { await say("w"); }
+    Err(e): { }
+  }
+  return 4;
+}
+```
+
+Expected: exits 4.
+Actual: *the module … was rejected by the engine — this is a compiler bug*. Deno names it: *Compiling function
+"$lambda$0/6:…" failed: not enough arguments on the stack for array.set (need 3, got 2)*.
+
+`Result<i32, Gone>` in place of `Result<void, Gone>` runs, as does the same match with no `await` in the `Ok` arm, so it
+looks like the arm's `void` binding being saved into the machine's frame across the `await`. Binding the result to a
+local first and matching that fails the same way.
+
+## Notes
+
+Found with `std`'s `Output.write`, which answers `Result<void, OutputFault>`: matching a write and then awaiting a line
+on the diagnostic output is the obvious way to report what happened, and every `Files` change answers a `Result<void, …>`
+too.
+
+## Fix
+
+A suspending `match` copies each arm binding into a local of its own name, so it is hoisted like any local; for `Ok(v)` on a `Result<void, E>` that local was a cell of `void`, which the engine refused. A binding the arm never reads (`mentions`, which counts what a rename of it would touch) is now `_` — a synthetic token added for it — and binds nothing. Leaving it under its own name was tried first and trapped at run time: a binding is a local of the state that dispatches, which the flattening does not keep.

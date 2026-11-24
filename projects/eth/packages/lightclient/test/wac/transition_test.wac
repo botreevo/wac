@@ -1,0 +1,111 @@
+// Following the chain across forks: Ethereum's fork-transition and legacy-data sync cases (minimal config), each under
+// its own fork schedule.
+//
+//   - transitions (Bellatrix→Capella, Capella→Deneb, Deneb→Electra, and two- and three-fork spans): a store on one
+//     fork takes updates, is upgraded at an `upgrade_store` step, and then takes both older updates (upgraded as they
+//     arrive) and the new fork's;
+//   - legacy data: a store already on a later fork, initialized from an older fork's bootstrap and fed an older
+//     fork's update.
+//
+// Every step's finalized and optimistic headers must match, beacon root and execution root alike. What the data
+// "is" comes only from each step's fork digest, mapped back through the schedule's versions, as a client on the
+// network would have to.
+
+import { wactest.T } from "wac";
+import { wactest.hex } from "wac";
+import { wactest.Loaded, wactest.json } from "wac";
+import { Sys } from "std";
+import { json.JsonValue, json.JsonArray, json.JsonObject } from "wac";
+import { codec.hexDecoded as decoded } from "wac";
+import { Store, initializeStoreWith, upgradeStore, processUpdateFrom, forceUpdate, headerSlot,
+         headerBeaconRoot } from "../../src/store.wac";
+import { Schedule } from "../../src/schedule.wac";
+import { executionRootAt } from "../../src/upgrade.wac";
+import { ALTAIR } from "../../../ssz/src/forks.wac";
+
+static string MANIFEST = "packages/ssz/test/fixtures.json";
+
+u8[] un(string h) { return decoded(h.len() >= 2 && h.slice(0, 2) == "0x" ? h.slice(2, h.len()) : h); }
+
+i64 num(string s) {
+  if (s == "18446744073709551615") { return -1 as i64; }
+  u8[] b = s.toBytes();
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { break; }
+    v = v * (10 as i64) + ((b[i] as i32 - '0') as i64);
+  }
+  return v;
+}
+
+/** The header as the checks state it; a store still in Altair's layout has no execution root, and its checks state none. */
+string said(Store s, u8[] header) {
+  if (s.fork == ALTAIR()) { return "\{headerSlot(header)}@0x\{hex(headerBeaconRoot(header))}/"; }
+  u8[]? e = executionRootAt(s.schedule, s.fork, header);
+  return "\{headerSlot(header)}@0x\{hex(headerBeaconRoot(header))}/0x\{hex(e ?? u8[].filled(32, 0))}";
+}
+
+string wanted(JsonValue step, string which) {
+  JsonValue? h = step.member("checks")?.member(which);
+  if (h is null) { return ""; }
+  return (h!.member("slot")?.text() ?? "") + "@" + (h!.member("beacon_root")?.text() ?? "") + "/"
+    + (h!.member("execution_root")?.text() ?? "");
+}
+
+export string test_the_store_follows_the_chain_across_forks(Sys sys) {
+  T t = T.create();
+  Loaded f = json(sys.stderr(), sys.files(), sys.procs(), "ssz", "light_client_sync_transitions_minimal", MANIFEST);
+  t.isTrue(f.ok, f.error);
+  if (!f.ok) { return t.report(); }
+  JsonArray? cases = f.doc.member("cases")?.array();
+  if (cases is null) { t.fail("no cases"); return t.report(); }
+  i32 steps = 0;
+  i32 upgrades = 0;
+  for (i32 i = 0; i < cases!.len(); i++) {
+    JsonValue c = cases!.get(i);
+    string name = (c.member("phase")?.text() ?? "") + "/" + (c.member("case")?.text() ?? "");
+    JsonArray? es = c.member("fork_epochs")?.array();
+    JsonValue? meta = c.member("meta");
+    JsonArray? ss = c.member("steps")?.array();
+    JsonObject? updates = c.member("updates")?.object();
+    if (es is null || meta is null || ss is null || updates is null) { t.fail("\{name}: incomplete"); continue; }
+    i64[] epochs = i64[].filled(es!.len(), 0 as i64);
+    for (i32 k = 0; k < epochs.len(); k++) { epochs[k] = num(es!.get(k).text() ?? ""); }
+    Schedule sched = Schedule.minimal(epochs);
+    u8[] gvr = un(meta!.member("genesis_validators_root")?.text() ?? "");
+    i32 bootLayout = sched.layoutOfDigest(un(meta!.member("bootstrap_fork_digest")?.text() ?? ""), gvr);
+    i32 storeLayout = sched.layoutOfDigest(un(meta!.member("store_fork_digest")?.text() ?? ""), gvr);
+    t.isTrue(bootLayout >= 0 && storeLayout >= bootLayout, "\{name}: digests name forks (\{bootLayout}, \{storeLayout})");
+    Store? store = initializeStoreWith(sched, bootLayout, un(meta!.member("trusted_block_root")?.text() ?? ""),
+                                       un(c.member("bootstrap")?.text() ?? ""));
+    t.isTrue(store is not null, "\{name}: the bootstrap did not initialize a store");
+    if (store is null) { continue; }
+    upgradeStore(store!, storeLayout);
+    for (i32 j = 0; j < ss!.len(); j++) {
+      JsonValue s = ss!.get(j);
+      string kind = s.member("kind")?.text() ?? "";
+      string at = "\{name} step \{j} (\{kind})";
+      if (kind == "process_update") {
+        i32 layout = sched.layoutOfDigest(un(s.member("update_fork_digest")?.text() ?? ""), gvr);
+        string which = s.member("update")?.text() ?? "";
+        t.isTrue(processUpdateFrom(store!, un(updates!.getStr(which)?.text() ?? ""), layout,
+                                   num(s.member("current_slot")?.text() ?? ""), gvr),
+                 "\{at}: a valid update (layout \{layout}) was rejected");
+      } else if (kind == "upgrade_store") {
+        upgradeStore(store!, sched.layoutOfDigest(un(s.member("store_fork_digest")?.text() ?? ""), gvr));
+        upgrades++;
+      } else if (kind == "force_update") {
+        forceUpdate(store!, num(s.member("current_slot")?.text() ?? ""));
+      } else {
+        t.fail("\{at}: unhandled"); continue;
+      }
+      t.eqStr(said(store!, store!.finalizedHeader), wanted(s, "finalized_header"), "\{at}: finalized");
+      t.eqStr(said(store!, store!.optimisticHeader), wanted(s, "optimistic_header"), "\{at}: optimistic");
+      steps++;
+    }
+  }
+  t.eqI32(cases!.len(), 15, "cases");
+  t.eqI32(upgrades, 3, "upgrade_store steps");
+  t.isTrue(steps >= 30, "steps run: \{steps}");
+  return t.report();
+}

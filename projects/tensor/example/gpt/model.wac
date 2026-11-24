@@ -1,0 +1,183 @@
+// A tiny GPT: a character-level transformer language model, and what training and sampling one needs.
+//
+// The architecture is GPT-2's at toy size — token and position embeddings, pre-norm transformer blocks, a final layer
+// norm and a linear head over the vocabulary — trained to predict each next byte of a text from the ones before it.
+// The same module is trained from a command line on the CPU (`train.wac`) and in a page on WebGPU (`page.wac`).
+
+import { Vec } from "core";
+import { Device, Tensor, Variable } from "../../src/tensor.wac";
+import { Activation, Dense, Layer, LayerNorm, TransformerBlock, sparseSoftmaxCrossEntropy } from "../../src/nn.wac";
+
+/** The bytes a text uses, each given a token number: a vocabulary of what is there, not of all 256. */
+export struct Vocab {
+  /** Token → byte. */
+  u8[] bytes;
+  /** Byte → token, or -1 for a byte the text never used. */
+  i32[] tokens;
+
+  Vocab of(u8[] text) {
+    bool[] seen = bool[].filled(256, false);
+    for (u8 b in text) { seen[b as i32] = true; }
+    i32[] tokens = i32[].filled(256, -1);
+    Vec<u8> bytes = Vec.create();
+    for (i32 b = 0; b < 256; b++) {
+      if (seen[b]) {
+        tokens[b] = bytes.len();
+        bytes.push(b as@ u8);
+      }
+    }
+    return Vocab(bytes.toArray(), tokens);
+  }
+
+  i32 size(const this) { return this.bytes.len(); }
+
+  /** A text as token numbers; a byte outside the vocabulary becomes token 0. */
+  f32[] encode(this, u8[] text) {
+    f32[] out = f32[].filled(text.len(), 0.0);
+    for (i32 i = 0; i < text.len(); i++) {
+      i32 t = this.tokens[text[i] as i32];
+      out[i] = (t < 0 ? 0 : t) as~ f32;
+    }
+    return out;
+  }
+}
+
+export struct GptConfig {
+  i32 vocab;
+  /** The longest text the model reads at once. */
+  i32 context;
+  i32 width;
+  i32 heads;
+  i32 layers;
+  f64 dropout;
+}
+
+export struct Gpt : Layer {
+  GptConfig config;
+  Variable tokens;
+  Variable positions;
+  TransformerBlock[] blocks;
+  LayerNorm norm;
+  Dense head;
+
+  Gpt create(Device d, GptConfig c) {
+    TransformerBlock[] blocks = TransformerBlock[].filled(c.layers, TransformerBlock.create(d, c.width, c.heads, c.dropout));
+    for (i32 i = 1; i < c.layers; i++) { blocks[i] = TransformerBlock.create(d, c.width, c.heads, c.dropout); }
+    // Embeddings start small, as GPT-2's do: a normal of deviation 0.02.
+    Tensor te = d.normal([c.vocab, c.width], 0.0, 0.02);
+    Tensor pe = d.normal([c.context, c.width], 0.0, 0.02);
+    Gpt g = Gpt(c, d.variable(te, "tokens"), d.variable(pe, "positions"), blocks, LayerNorm.create(d, c.width),
+                Dense.create(d, c.width, c.vocab, Activation.Linear));
+    te.dispose();
+    pe.dispose();
+    return g;
+  }
+
+  /** Token numbers `[batch, time]`, time at most the context, → logits `[batch, time, vocab]`. */
+  override Tensor apply(this, Tensor idx, bool training) {
+    i32 t = idx.shape[1];
+    if (t > this.config.context) { trap; }
+    Tensor h = this.tokens.take(idx).add(this.positions.slice([0, 0], [t, this.config.width]));
+    for (TransformerBlock b in this.blocks) { h = b.apply(h, training); }
+    return this.head.apply(this.norm.apply(h, training), training);
+  }
+
+  override Variable[] params(this) {
+    Vec<Variable> all = Vec.create();
+    all.push(this.tokens);
+    all.push(this.positions);
+    for (TransformerBlock b in this.blocks) { for (Variable v in b.params()) { all.push(v); } }
+    for (Variable v in this.norm.params()) { all.push(v); }
+    for (Variable v in this.head.params()) { all.push(v); }
+    return all.toArray();
+  }
+
+  /** How many numbers the model has. */
+  i32 size(this) {
+    i32 n = 0;
+    for (Variable v in this.params()) { n += v.size(); }
+    return n;
+  }
+
+  /** The mean cross-entropy of predicting each token of `y` from the ones of `x` up to it. */
+  Tensor loss(this, Tensor x, Tensor y, bool training) {
+    return sparseSoftmaxCrossEntropy(this.apply(x, training), y);
+  }
+}
+
+/**
+ * The lines of `text` in a random order. For a list like `names.txt`, whose long tail is alphabetical, so that a
+ * model with the previous name in its context learns that the next one starts the same way — and the last tenth, held
+ * out to measure, would be the end of the alphabet rather than names like the rest.
+ */
+export u8[] shuffledLines(u8[] text, Device d) {
+  Vec<u8[]> lines = Vec.create();
+  i32 start = 0;
+  for (i32 i = 0; i <= text.len(); i++) {
+    if (i == text.len() || text[i] == 10) {
+      if (i > start) {
+        u8[] line = u8[].filled(i - start, 0 as u8);
+        line.copyFrom(text, start, 0, i - start);
+        lines.push(line);
+      }
+      start = i + 1;
+    }
+  }
+  for (i32 i = lines.len() - 1; i > 0; i--) {
+    i32 j = (d.random.uniform() * ((i + 1) as f64)) as~ i32;
+    if (j > i) { j = i; }
+    u8[] t = lines.get(i);
+    lines.set(i, lines.get(j));
+    lines.set(j, t);
+  }
+  Vec<u8> out = Vec.create();
+  for (i32 i = 0; i < lines.len(); i++) {
+    for (u8 b in lines.get(i)) { out.push(b); }
+    out.push(10 as u8);
+  }
+  return out.toArray();
+}
+
+/** `batch` windows of `time` tokens from random places in `data`, and the same windows one token on. */
+export Tensor[] batchOf(Device d, f32[] data, i32 batch, i32 time) {
+  f32[] x = f32[].filled(batch * time, 0.0);
+  f32[] y = f32[].filled(batch * time, 0.0);
+  for (i32 b = 0; b < batch; b++) {
+    i32 at = (d.random.uniform() * ((data.len() - time - 1) as f64)) as~ i32;
+    x.copyFrom(data, at, b * time, time);
+    y.copyFrom(data, at + 1, b * time, time);
+  }
+  return [d.tensor(x, [batch, time]), d.tensor(y, [batch, time])];
+}
+
+/**
+ * `n` bytes the model writes after `prompt`, each drawn from its prediction with the logits divided by `temperature`
+ * — below 1 more predictable, above 1 more surprising. Each byte is a read from the device, so on a GPU this waits.
+ */
+export async u8[] sample(Gpt m, Vocab v, Device d, u8[] prompt, i32 n, f64 temperature) {
+  Vec<i32> tokens = Vec.create();
+  for (f32 t in v.encode(prompt)) { tokens.push(t as~ i32); }
+  if (tokens.len() == 0) { tokens.push(0); }
+  Vec<u8> out = Vec.create();
+  for (i32 k = 0; k < n; k++) {
+    i32 t = tokens.len() < m.config.context ? tokens.len() : m.config.context;
+    f32[] window = f32[].filled(t, 0.0);
+    for (i32 i = 0; i < t; i++) { window[i] = tokens.get(tokens.len() - t + i) as~ f32; }
+    Tensor probs = d.tidy(() => {
+      Tensor logits = m.apply(d.tensor(window, [1, t]), false);
+      return logits.slice([0, t - 1, 0], [1, 1, v.size()]).reshape([v.size()]).div(temperature).softmax(0);
+    });
+    f32[] p = await probs.values();
+    probs.dispose();
+    f64 r = d.random.uniform();
+    i32 pick = p.len() - 1;
+    f64 acc = 0.0;
+    for (i32 i = 0; i < p.len(); i++) {
+      acc += p[i] as f64;
+      if (r < acc) { pick = i; break; }
+    }
+    tokens.push(pick);
+    out.push(v.bytes[pick]);
+  }
+  return out.toArray();
+}

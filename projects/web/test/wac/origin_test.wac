@@ -1,0 +1,88 @@
+// `wac.origin` against a test document serving it: requests answered whole, a socket's messages in both directions
+// and in order whether or not the program was waiting, and its close.
+
+import { Check } from "./check.wac";
+import { Result, Ticket, Vec } from "core";
+import { Message, Origin, OriginSocket, Page, Reply, TestDoc } from "../../src/page.wac";
+
+async string talk(Page page) {
+  Result<Origin, string> found = await Origin.of(page.sys);
+  if (found.isErr()) { return "no origin: " + found.err()!; }
+  Origin o = found.unwrap();
+  string out = o.address + ";";
+  match (await o.request("POST", "/devices/request?x=1", ["Content-Type: application/json", "Authorization: Bearer t"], "{\"a\":1}".toBytes())) {
+    Ok(r): { out = out + "\{r.status} " + r.header("Content-Type") + " " + r.text() + ";"; }
+    Err(e): { out = out + "err " + e + ";"; }
+  }
+  match (await o.open("/instances/i/ws")) {
+    Err(e): { return out + "no socket: " + e; }
+    Ok(s): {
+      await s.send("hello");
+      while (true) {
+        match (await s.next()) {
+          Text(t): {
+            out = out + "got " + t + ";";
+            if (t == "bye") { s.close(); }
+          }
+          Binary(b): { out = out + "binary;"; }
+          Closed(code, why): { return out + "closed \{code} " + why; }
+        }
+      }
+    }
+  }
+}
+
+Ticket<string> start(Page page) {
+  schedule page.take;
+  return talk(page);
+}
+
+export string test_the_origin_is_asked_and_its_socket_talks_both_ways() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  string heard = "";
+  doc.serving((string method, string path, string headers, u8[] body) => {
+    heard = method + " " + path + " | " + headers + "| " + string.fromBytes(body);
+    return Reply(201, "content-type: application/json\n", "{\"ok\":true}".toBytes());
+  });
+  doc.onSend = (i32 id, string text) => { doc.socketSay(id, "echo " + text); };
+  Page page = doc.page();
+  // The program's continuations run on the page's scheduler, here as in a host.
+  schedule page.take;
+  Ticket<string> done = start(page);
+  page.drain();
+  t.eqStr(heard, "POST /devices/request?x=1 | Content-Type: application/json\nAuthorization: Bearer t\n| {\"a\":1}", "the request, whole");
+  t.eqStr(doc.said, "fetch POST /devices/request?x=1\nsocket /instances/i/ws\n", "what the program asked");
+  t.eqI32(doc.sockets.len(), 1, "one socket");
+  t.eqStr(doc.sockets.get(0).sent.get(0), "hello", "what it sent");
+  t.isFalse(done.settled(), "it waits on the socket");
+  // Two at once: the second waits in the queue until the program asks again.
+  doc.socketSay(0, "one");
+  doc.socketSay(0, "bye");
+  t.isTrue(done.settled(), "bye made it close its end");
+  t.eqStr(done.value(), "http://test.example;201 application/json {\"ok\":true};got echo hello;got one;got bye;closed 1000 ",
+          "every message in order, then the close");
+  return t.report();
+}
+
+async string noOrigin(Page page) {
+  Result<Origin, string> found = await Origin.of(page.sys);
+  return found.isErr() ? found.err()! : "found";
+}
+
+Ticket<string> startNone(Page page) {
+  schedule page.take;
+  return noOrigin(page);
+}
+
+export string test_a_document_serving_nothing_has_no_origin() {
+  Check t = Check.create();
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  schedule page.take;
+  Ticket<string> done = startNone(page);
+  page.drain();
+  t.isTrue(done.settled(), "answered at once");
+  t.eqStr(done.value(), "no capability wac.origin in a test document", "and says so");
+  return t.report();
+}

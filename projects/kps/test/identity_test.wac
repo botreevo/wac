@@ -1,0 +1,117 @@
+// The listener's identity: made, written, read back, and judged by openssl.
+//
+//     wac test --allow-read --allow-write --allow-run test/identity_test.wac
+
+import { Check, hex, unhex } from "./check.wac";
+import { Identity, makeIdentity, parseIdentity, loadOrCreateIdentity } from "../src/identity.wac";
+import { decodeCerthash } from "../src/address.wac";
+import { flatten } from "core";
+import { Exec, ChildEnv, Launch, Procs, Sys } from "std";
+
+Exec sh(Procs procs, string script) {
+  return flatten(procs.exec("/bin/sh", ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+string out(Exec e) {
+  string s = string.fromBytes(e.stdout);
+  while (s.len() > 0 && s.slice(s.len() - 1, s.len()) == "\n") { s = s.slice(0, s.len() - 1); }
+  return s;
+}
+
+Identity fixed(i32 salt) {
+  u8[] key = u8[].filled(32, 0);
+  u8[] serial = u8[].filled(16, 0);
+  u8[] nonce = u8[].filled(32, 0);
+  for (i32 i = 0; i < 32; i++) { key[i] = ((i * 7 + salt) & 0xFF) as@ u8; nonce[i] = ((i * 3 + 5) & 0xFF) as@ u8; }
+  for (i32 i = 0; i < 16; i++) { serial[i] = ((i * 19 + 1) & 0xFF) as@ u8; }
+  return makeIdentity(key, serial, nonce, 1785888000 as i64)!;
+}
+
+/**
+ * openssl reads the identity file, and the sha-256 it computes is the certhash's digest.
+ *
+ * Would catch: a certificate block openssl cannot parse, a key block it cannot parse, a key that is not the
+ * certificate's (openssl's public keys differ), an empty subject written as anything else, and a certhash that
+ * hashes something other than the DER openssl sees — which is the number every client pins.
+ */
+export string test_openssl_reads_the_identity_file_and_agrees_on_its_hash(Sys sys) {
+  Check c = Check.create();
+  Identity id = fixed(11);
+  string dir = out(sh(sys.procs(), "mktemp -d"));
+  sys.files().writeFile("\{dir}/id.pem", id.pem()).wait();
+
+  Exec fp = sh(sys.procs(), "openssl x509 -in \{dir}/id.pem -noout -fingerprint -sha256 | tr -d ':' | sed 's/.*=//' | tr A-F a-f");
+  c.eqI32(fp.status, 0, "openssl reads the certificate");
+  u8[]? digest = decodeCerthash(id.certhash());
+  c.ok(digest is not null, "our certhash decodes");
+  if (digest is not null) { c.eqStr(out(fp), hex(digest!), "openssl's sha-256 is the certhash's digest"); }
+
+  Exec certPub = sh(sys.procs(), "openssl x509 -in \{dir}/id.pem -noout -pubkey");
+  Exec keyPub = sh(sys.procs(), "openssl ec -in \{dir}/id.pem -pubout 2>/dev/null");
+  c.eqI32(keyPub.status, 0, "openssl reads the key from the same file");
+  c.eqStr(out(keyPub), out(certPub), "and its public half is the certificate's");
+
+  Exec subj = sh(sys.procs(), "openssl x509 -in \{dir}/id.pem -noout -subject -issuer");
+  c.eqStr(out(subj), "subject=\nissuer=", "subject and issuer are empty");
+  sh(sys.procs(), "rm -rf \{dir}");
+  return c.report();
+}
+
+/**
+ * The file round-trips, and a file whose halves do not belong together is refused.
+ *
+ * Would catch: a reader that takes the first block whatever its label, that does not check the key against
+ * the certificate (two listeners' halves would start a server no client can complete DTLS with), or that
+ * accepts a file missing either half.
+ */
+export string test_an_identity_file_round_trips_and_mismatched_halves_are_refused() {
+  Check c = Check.create();
+  Identity a = fixed(11);
+  Identity b = fixed(99);
+  match (parseIdentity(a.pem())) {
+    Ok(back): {
+      c.eqStr(back.certhash(), a.certhash(), "the certhash survives the file");
+      c.eqBytes(back.key, a.key, "and so does the key");
+    }
+    Err(why): { c.fail("our own file did not parse: \{why}"); }
+  }
+  c.no(a.certhash() == b.certhash(), "two keys, two certhashes");
+  string mixed = string.fromBytes(a.pem());
+  string other = string.fromBytes(b.pem());
+  string keyA = mixed.slice(mixed.indexOf("-----BEGIN EC"), mixed.len());
+  string certB = other.slice(0, other.indexOf("-----BEGIN EC"));
+  c.ok(parseIdentity((certB + keyA).toBytes()).isErr(), "b's certificate with a's key is refused");
+  c.ok(parseIdentity(keyA.toBytes()).isErr(), "a key alone is refused");
+  c.ok(parseIdentity(certB.toBytes()).isErr(), "a certificate alone is refused");
+  return c.report();
+}
+
+/**
+ * Made once, then loaded: the second start gets the first start's certhash, and the file is private.
+ *
+ * Would catch: an identity made afresh each start (the address would change on every restart), a file or a
+ * directory readable by others, a temporary file left behind, and a corrupt file silently replaced — which would
+ * change the address too, without a word.
+ */
+export async string test_the_identity_is_made_once_kept_private_and_never_replaced(Sys sys) {
+  Check c = Check.create();
+  string dir = out(sh(sys.procs(), "mktemp -d")) + "/kps";
+  string first = "";
+  match (await loadOrCreateIdentity(sys, dir, "identity.pem")) {
+    Ok(id): { first = id.certhash(); }
+    Err(why): { c.fail("first start: \{why}"); return c.report(); }
+  }
+  match (await loadOrCreateIdentity(sys, dir, "identity.pem")) {
+    Ok(id): { c.eqStr(id.certhash(), first, "the second start loads the first start's identity"); }
+    Err(why): { c.fail("second start: \{why}"); }
+  }
+  c.eqStr(out(sh(sys.procs(), "stat -c %a \{dir}/identity.pem")), "600", "the file is 0600");
+  c.eqStr(out(sh(sys.procs(), "stat -c %a \{dir}")), "700", "its directory is 0700");
+  c.eqStr(out(sh(sys.procs(), "ls \{dir}")), "identity.pem", "and nothing else is left there");
+
+  sys.files().writeFile("\{dir}/identity.pem", "not a certificate\n".toBytes()).wait();
+  c.ok((await loadOrCreateIdentity(sys, dir, "identity.pem")).isErr(), "a corrupt file is an error");
+  c.eqStr(out(sh(sys.procs(), "cat \{dir}/identity.pem")), "not a certificate", "and is left as it was");
+  sh(sys.procs(), "rm -rf \{dir}/..");
+  return c.report();
+}

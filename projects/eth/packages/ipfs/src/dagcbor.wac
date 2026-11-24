@@ -1,0 +1,207 @@
+// DAG-CBOR, the subset records need: maps with text keys, lists, byte strings, text, integers, booleans, null and
+// links (CBOR tag 42). Written the one deterministic way DAG-CBOR allows — minimal lengths, map keys sorted by
+// length and then bytewise, no indefinite lengths — and read strictly: anything else is refused, floats included
+// (DAG-CBOR permits 64-bit floats; nothing here needs one, and refusing them keeps every record exactly comparable).
+
+import { Result } from "core";
+import { Out, In, compare } from "./bytes.wac";
+import { Cid, readCid } from "./cid.wac";
+
+export enum Value {
+  Int(i64 v),
+  Bytes(u8[] b),
+  Text(string s),
+  List(Value[] items),
+  Dict(string[] keys, Value[] vals),
+  Link(Cid cid),
+  Bool(bool b),
+  Null,
+}
+
+void head(Out o, i32 major, i64 n) {
+  u8 m = (major << 5) as@ u8;
+  if (n < (24 as i64)) { o.byte(m | (n as@ u8)); return; }
+  if (n < (256 as i64)) { o.byte(m | 24); o.byte(n as@ u8); return; }
+  if (n < (65536 as i64)) { o.byte(m | 25); o.byte((n >> (8 as i64)) as@ u8); o.byte(n as@ u8); return; }
+  if (n < (4294967296 as i64)) {
+    o.byte(m | 26);
+    for (i32 s = 24; s >= 0; s -= 8) { o.byte((n >> (s as i64)) as@ u8); }
+    return;
+  }
+  o.byte(m | 27);
+  for (i32 s = 56; s >= 0; s -= 8) { o.byte((n >> (s as i64)) as@ u8); }
+}
+
+void enc(Out o, Value v) {
+  match (v) {
+    Int(n): { if (n >= (0 as i64)) { head(o, 0, n); } else { head(o, 1, (0 as i64) - n - (1 as i64)); } }
+    Bytes(b): { head(o, 2, b.len() as i64); o.all(b); }
+    Text(s): { u8[] t = s.toBytes(); head(o, 3, t.len() as i64); o.all(t); }
+    List(items): { head(o, 4, items.len() as i64); for (i32 i = 0; i < items.len(); i++) { enc(o, items[i]); } }
+    Dict(keys, vals): {
+      i32[] order = keyOrder(keys);
+      head(o, 5, keys.len() as i64);
+      for (i32 i = 0; i < order.len(); i++) {
+        u8[] k = keys[order[i]].toBytes();
+        head(o, 3, k.len() as i64); o.all(k);
+        enc(o, vals[order[i]]);
+      }
+    }
+    Link(c): {
+      head(o, 6, 42 as i64);
+      u8[] b = c.bytes();
+      head(o, 2, (b.len() + 1) as i64); o.byte(0); o.all(b);
+    }
+    Bool(b): { o.byte(b ? 0xf5 : 0xf4); }
+    Null: { o.byte(0xf6); }
+  }
+}
+
+/** DAG-CBOR's key order: shorter first, then bytewise. */
+bool keyBefore(string a, string b) {
+  if (a.len() != b.len()) { return a.len() < b.len(); }
+  return compare(a.toBytes(), b.toBytes()) < 0;
+}
+
+i32[] keyOrder(string[] keys) {
+  i32[] order = i32[].filled(keys.len(), 0);
+  for (i32 i = 0; i < keys.len(); i++) {
+    i32 j = i;
+    while (j > 0 && keyBefore(keys[i], keys[order[j - 1]])) { order[j] = order[j - 1]; j--; }
+    order[j] = i;
+  }
+  return order;
+}
+
+export u8[] encode(Value v) {
+  Out o = Out.create();
+  enc(o, v);
+  return o.bytes();
+}
+
+i64 readHead(In r, u8 first) {
+  u8 info = first & 31;
+  if (info < 24) { return info as i64; }
+  i32 n = info == 24 ? 1 : info == 25 ? 2 : info == 26 ? 4 : info == 27 ? 8 : 0;
+  if (n == 0) { r.fail("CBOR: an indefinite or reserved length"); return 0 as i64; }
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < n; i++) { v = (v << (8 as i64)) | (r.byte() as i64); }
+  i64 min = n == 1 ? 24 as i64 : n == 2 ? 256 as i64 : n == 4 ? 65536 as i64 : 4294967296 as i64;
+  if (v < min) { r.fail("CBOR: a length or integer that is not minimally encoded"); }
+  if (v < (0 as i64)) { r.fail("CBOR: an integer past 63 bits"); }
+  return v;
+}
+
+Value dec(In r, i32 depth) {
+  if (depth > 64) { r.fail("CBOR: nested past 64 levels"); return Value.Null; }
+  u8 first = r.byte();
+  if (r.bad != "") { return Value.Null; }
+  i32 major = (first >> 5) as i32;
+  if (major == 7) {
+    if (first == 0xf4) { return Value.Bool(false); }
+    if (first == 0xf5) { return Value.Bool(true); }
+    if (first == 0xf6) { return Value.Null; }
+    r.fail("CBOR: a float or simple value, which these records never hold");
+    return Value.Null;
+  }
+  i64 n = readHead(r, first);
+  if (r.bad != "") { return Value.Null; }
+  if (major == 0) { return Value.Int(n); }
+  if (major == 1) { return Value.Int((0 as i64) - n - (1 as i64)); }
+  if (major == 2) { return Value.Bytes(r.take(n as! i32)); }
+  if (major == 3) { return Value.Text(string.fromBytes(r.take(n as! i32))); }
+  if (major == 4) {
+    if (n > (r.end - r.at) as i64) { r.fail("CBOR: a list longer than the input"); return Value.Null; }
+    Value[] items = Value[].filled(n as! i32, Value.Null);
+    for (i32 i = 0; i < items.len(); i++) { items[i] = dec(r, depth + 1); }
+    return Value.List(items);
+  }
+  if (major == 5) {
+    if (n > (r.end - r.at) as i64) { r.fail("CBOR: a map longer than the input"); return Value.Null; }
+    string[] keys = string[].defaulted(n as! i32);
+    Value[] vals = Value[].filled(n as! i32, Value.Null);
+    for (i32 i = 0; i < keys.len(); i++) {
+      Value k = dec(r, depth + 1);
+      match (k) {
+        Text(s): { keys[i] = s; }
+        Int(_): { r.fail("CBOR: a map key that is not text"); }
+        Bytes(_): { r.fail("CBOR: a map key that is not text"); }
+        List(_): { r.fail("CBOR: a map key that is not text"); }
+        Dict(_, _): { r.fail("CBOR: a map key that is not text"); }
+        Link(_): { r.fail("CBOR: a map key that is not text"); }
+        Bool(_): { r.fail("CBOR: a map key that is not text"); }
+        Null: { r.fail("CBOR: a map key that is not text"); }
+      }
+      if (i > 0 && !keyBefore(keys[i - 1], keys[i])) { r.fail("CBOR: map keys out of DAG-CBOR order, or repeated"); }
+      vals[i] = dec(r, depth + 1);
+    }
+    return Value.Dict(keys, vals);
+  }
+  if (major == 6) {
+    if (n != (42 as i64)) { r.fail("CBOR: tag \{n}; only 42 (a link) is DAG-CBOR"); return Value.Null; }
+    u8 bf = r.byte();
+    if ((bf >> 5) != 2) { r.fail("CBOR: a link that is not a byte string"); return Value.Null; }
+    i64 len = readHead(r, bf);
+    u8[] b = r.take(len as! i32);
+    if (r.bad != "") { return Value.Null; }
+    if (b.len() < 1 || b[0] != 0) { r.fail("CBOR: a link without its leading zero byte"); return Value.Null; }
+    In cr = In.span(b, 1, b.len());
+    match (readCid(cr)) {
+      Err(e): { r.fail("CBOR: \{e}"); return Value.Null; }
+      Ok(c): {
+        if (!cr.done()) { r.fail("CBOR: bytes after a link's CID"); }
+        return Value.Link(c);
+      }
+    }
+  }
+  r.fail("CBOR: major type \{major}");
+  return Value.Null;
+}
+
+export Result<Value, string> decode(u8[] b) {
+  In r = In.of(b);
+  Value v = dec(r, 0);
+  if (r.bad != "") { return Result.Err(r.bad); }
+  if (!r.done()) { return Result.Err("CBOR: bytes after the value"); }
+  return Result.Ok(v);
+}
+
+// ---------------------------------------------------------------- reading records
+
+export Value? field(Value v, string key) {
+  match (v) {
+    Dict(keys, vals): { for (i32 i = 0; i < keys.len(); i++) { if (keys[i] == key) { return vals[i]; } } return null; }
+    Int(_): { return null; }
+    Bytes(_): { return null; }
+    Text(_): { return null; }
+    List(_): { return null; }
+    Link(_): { return null; }
+    Bool(_): { return null; }
+    Null: { return null; }
+  }
+}
+
+export string? textOf(Value? v) {
+  if (v is null) { return null; }
+  return match (v!) { Text(s): s, Int(_): null, Bytes(_): null, List(_): null, Dict(_, _): null, Link(_): null, Bool(_): null, Null: null };
+}
+
+export Cid? linkOf(Value? v) {
+  if (v is null) { return null; }
+  return match (v!) { Link(c): c, Int(_): null, Bytes(_): null, Text(_): null, List(_): null, Dict(_, _): null, Bool(_): null, Null: null };
+}
+
+export u8[]? bytesOf(Value? v) {
+  if (v is null) { return null; }
+  return match (v!) { Bytes(b): b, Int(_): null, Text(_): null, List(_): null, Dict(_, _): null, Link(_): null, Bool(_): null, Null: null };
+}
+
+export i64? intOf(Value? v) {
+  if (v is null) { return null; }
+  return match (v!) { Int(n): n, Bytes(_): null, Text(_): null, List(_): null, Dict(_, _): null, Link(_): null, Bool(_): null, Null: null };
+}
+
+export Value[]? listOf(Value? v) {
+  if (v is null) { return null; }
+  return match (v!) { List(xs): xs, Int(_): null, Bytes(_): null, Text(_): null, Dict(_, _): null, Link(_): null, Bool(_): null, Null: null };
+}

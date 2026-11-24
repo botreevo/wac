@@ -1,0 +1,372 @@
+// The fault numbering exists **four** times, and only two of them were ever compared.
+//
+// `packages/platform/test/wac/faultsagree_test.wac` makes `host/faults.ts` and `std/platform.wac` agree,
+// and says why: the numbers are a shared constant with a copy on each side of a bridge neither can
+// import across. That argument is right and it stops one file short of the two Rust hosts, which have
+// a third and fourth copy in `fault_of`.
+//
+// **The cost of that showed on 2026-08-17.** The V8 host's `fault_of` had four arms where the
+// wasmtime host's had ten, so reading a directory answered `FAULT_OTHER` on the primary platform and
+// `FAULT_IS_DIR` on the second — a category a caller acts on, arriving as "something went wrong" with
+// the host's message as the only information. Nothing noticed because the differential that shows it,
+// `packages/fs/test/wac/host_test.wac`, ran on the Deno host only; the first run of its wac port
+// failed on exactly that line.
+//
+// So this reads both Rust sources and requires them to say the same thing. It is a source scan, which
+// is a weak instrument in general — but the thing being compared *is* two pieces of source that no
+// program can import from each other, and a scan that finds nothing where a match is required fails
+// rather than passing, which is the shape that makes one safe.
+//
+// `issues/system/0132` is the conformance tier this belongs in.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Denied, Exec, NotGranted, NotRepresentable, Refused, ChildEnv, Env, Files, Launch, Net, Output, Procs, Sys, Socket } from "std";
+import { has, isSpace, trimmed } from "../../../wactest/src/strings.wac";
+import { flatten } from "core";
+
+static string V8_HOST = "native/v8/src/main.rs";
+static string WASMTIME_HOST = "native/src/main.rs";
+
+string read(Output err, Files fs, string path) {
+  auto rRead = flatten(fs.readFile(path).wait());
+  u8[]? r = rRead.ok();
+  if ((r is null)) {
+    err.line("platform: cannot read \{path} — \{rRead.isErr() ? "\{rRead.err()!}" : ""}");
+    trap;
+  }
+  return string.fromBytes(r!);
+}
+
+/** The lines of `s`, trimmed, with the empty ones dropped. */
+string[] lines(string s) {
+  string[] out = string[].filled(16384, "");
+  i32 n = 0;
+  i32 from = 0;
+  for (i32 i = 0; i <= s.len() && n < out.len(); i++) {
+    if (i < s.len() && s.slice(i, i + 1) != "\n") { continue; }
+    string line = trimmed(s.slice(from, i));
+    if (line != "") { out[n] = line; n = n + 1; }
+    from = i + 1;
+  }
+  string[] exact = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { exact[i] = out[i]; }
+  return exact;
+}
+
+bool startsWith(string s, string p) { return s.len() >= p.len() && s.slice(0, p.len()) == p; }
+
+/**
+ * Every `X => FAULT_Y` arm inside `fn fault_of`, as `"X=>FAULT_Y"` with the whitespace gone.
+ *
+ * Bounded by the next line beginning `fn ` rather than by brace counting, which a comment containing
+ * a brace would defeat. A file where that boundary is not found returns nothing, and the caller
+ * fails on the count — an empty extraction must never read as agreement.
+ */
+string[] armsOf(string source) {
+  string[] all = lines(source);
+  string[] out = string[].filled(64, "");
+  i32 n = 0;
+  bool inside = false;
+  for (i32 i = 0; i < all.len(); i++) {
+    if (startsWith(all[i], "fn fault_of")) { inside = true; continue; }
+    if (!inside) { continue; }
+    if (startsWith(all[i], "fn ") || startsWith(all[i], "/// The fault a failed")) { break; }
+    // Only the mapping arms: a line with `=>` and a `FAULT_` on its right.
+    i32 arrow = all[i].indexOf("=>");
+    if (arrow < 0) { continue; }
+    if (all[i].indexOf("FAULT_") < 0) { continue; }
+    // The wildcard arm opens a nested match on `raw_os_error`, which is a mapping too — but its left
+    // side is an errno rather than a kind, and both hosts spell those the same way, so the whole line
+    // is compared as written.
+    if (n < out.len()) { out[n] = squeezed(all[i]); n = n + 1; }
+  }
+  string[] exact = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { exact[i] = out[i]; }
+  return exact;
+}
+
+/** A line with every space removed and a trailing comma dropped, so formatting cannot differ. */
+string squeezed(string line) {
+  string out = "";
+  for (i32 i = 0; i < line.len(); i++) {
+    string c = line.slice(i, i + 1);
+    if (c != " " && c != "\t") { out = out + c; }
+  }
+  if (out.len() > 0 && out.slice(out.len() - 1, out.len()) == ",") {
+    out = out.slice(0, out.len() - 1);
+  }
+  return out;
+}
+
+/**
+ * The two Rust hosts classify an error the same way.
+ *
+ * Not "the V8 host has at least what the other has" — the same set, both directions. A category one
+ * host knows and the other does not is a divergence whichever way round it is, and the direction it
+ * happened in this time was the one nobody would have guessed: the primary platform was the poorer.
+ */
+export string test_the_two_rust_hosts_classify_an_error_the_same_way(Sys sys) {
+  Output err = sys.stderr();
+  Files fs = sys.files();
+  T t = T.create();
+  string[] v8 = armsOf(read(err, fs, V8_HOST));
+  string[] wasmtime = armsOf(read(err, fs, WASMTIME_HOST));
+
+  // The extraction has to have found something, or every comparison below holds vacuously — which is
+  // exactly how a source scan goes quietly wrong.
+  t.isTrue(v8.len() >= 7, "\{V8_HOST}: found \{v8.len()}" +
+           " mapping arms in fault_of, which is too few to be the whole function");
+  t.isTrue(wasmtime.len() >= 7, "\{WASMTIME_HOST}: found \{wasmtime.len()}" +
+           " mapping arms in fault_of, which is too few to be the whole function");
+  if (v8.len() < 7 || wasmtime.len() < 7) { return t.report(); }
+
+  for (i32 i = 0; i < v8.len(); i++) {
+    t.isTrue(has(wasmtime, v8[i]),
+             "the V8 host maps `\{v8[i]}` and the wasmtime host does not");
+  }
+  for (i32 i = 0; i < wasmtime.len(); i++) {
+    t.isTrue(has(v8, wasmtime[i]),
+             "the wasmtime host maps `\{wasmtime[i]}` and the V8 host does not");
+  }
+  return t.report();
+}
+
+/**
+ * And the constants themselves are the same numbers.
+ *
+ * The arms above compare names; this compares what the names mean. Inserting a category in one host
+ * and shifting everything above it is the failure `faultsagree_test.wac` describes for the other two
+ * copies, and it is available here in the same way.
+ */
+export string test_the_two_rust_hosts_number_the_faults_the_same_way(Sys sys) {
+  Output err = sys.stderr();
+  Files fs = sys.files();
+  T t = T.create();
+  string[] v8 = constantsOf(read(err, fs, V8_HOST));
+  string[] wasmtime = constantsOf(read(err, fs, WASMTIME_HOST));
+  t.isTrue(v8.len() >= 8, "\{V8_HOST}: found \{v8.len()} FAULT_ constants");
+  t.isTrue(wasmtime.len() >= 8, "\{WASMTIME_HOST}: found \{wasmtime.len()}" +
+           " FAULT_ constants");
+  if (v8.len() < 8 || wasmtime.len() < 8) { return t.report(); }
+  for (i32 i = 0; i < v8.len(); i++) {
+    t.isTrue(has(wasmtime, v8[i]),
+             "the V8 host declares `\{v8[i]}` and the wasmtime host does not");
+  }
+  for (i32 i = 0; i < wasmtime.len(); i++) {
+    t.isTrue(has(v8, wasmtime[i]),
+             "the wasmtime host declares `\{wasmtime[i]}` and the V8 host does not");
+  }
+  return t.report();
+}
+
+/** Every `const FAULT_X: i32 = N;`, squeezed — so a renumbering shows as a mismatch. */
+string[] constantsOf(string source) {
+  string[] all = lines(source);
+  string[] out = string[].filled(32, "");
+  i32 n = 0;
+  for (i32 i = 0; i < all.len() && n < out.len(); i++) {
+    if (!startsWith(all[i], "const FAULT_")) { continue; }
+    out[n] = squeezed(all[i]);
+    n = n + 1;
+  }
+  string[] exact = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { exact[i] = out[i]; }
+  return exact;
+}
+
+/**
+ * A refused connection has its own category, and the two Rust sources above cannot say whether it does.
+ *
+ * **The checks above read source text; this one connects.** They compare the two `fault_of`s to each
+ * other, which is the right guard for "the hosts agree" and no guard at all for "and the answer is
+ * right" -- two tables with the same missing arm agree perfectly. Until 2026-08-25 both were missing
+ * the same four: every `FAULT_*` code was about a filesystem, so a refused connection, a host with no
+ * route and one that never answered all arrived as `FAULT_OTHER`, and the source comparison was green
+ * throughout. `issues/system/0255c`.
+ *
+ * Port 1 on loopback, because nothing listens there and *connecting* needs no privilege -- only
+ * binding does. A closed port on loopback is refused rather than dropped on every Unix, which is what
+ * makes this an assertion rather than a race.
+ */
+export string test_a_refused_connection_is_refused_and_not_merely_failed(Sys sys) {
+  Net net = sys.net();
+  T t = T.create();
+  auto sDial = flatten(net.connect("127.0.0.1", 1).wait());
+  Socket? s = sDial.ok();
+  if (s is not null) {
+    s!.close();
+    t.isTrue(false, "something is listening on 127.0.0.1:1, so this cannot test a refusal");
+    return t.report();
+  }
+  // A run with no network grant would answer `NotGranted` and fail the assertion below for a reason
+  // that is nothing to do with the subject -- so it is named rather than left to look wrong.
+  auto e = sDial.err()!;
+  if (e is NotGranted) {
+    t.isTrue(false, "this run was not granted the network, so it cannot see how a dial failed");
+    return t.report();
+  }
+  t.isTrue(e is Refused, "a refused dial is its own category, not Other — got \{e}");
+  // The host's own sentence follows the words — "(os error 111)" on the Rust hosts — so the claim is
+  // about how it starts.
+  t.isTrue("\{e}".indexOf("Connection refused") == 0, "and it opens with the words strerror uses — got \{e}");
+  return t.report();
+}
+
+/**
+ * A path the *operating system* refuses arrives as `FAULT_DENIED`, not as absence.
+ *
+ * **The tests above read `fault_of`'s source; this one runs it.** Comparing the two hosts' arms
+ * catches a table that has drifted, and cannot catch a table that is wrong in both — so the arm that
+ * matters most is worth exercising rather than counting. `PermissionDenied → FAULT_DENIED` is that
+ * arm: `FAULT_NOT_FOUND` is what a caller acts on by creating the file, and answering it about
+ * something that is plainly there is the failure this whole family exists to prevent.
+ *
+ * `packages/box/test/wac/unnameable_test.wac` makes the same claim on the Deno host and reaches it through
+ * `/proc`, which Deno's `--allow-read` does not cover — a route with no equivalent here, since a
+ * `wac app` artefact has one permission layer rather than two. A directory with no execute bit is the
+ * portable way to ask: the grant allows it and the kernel does not.
+ *
+ * **Not the same as `FAULT_NOT_GRANTED`**, which is this program's own capability world refusing
+ * before anything is attempted. This is the machine refusing something the program was allowed to try.
+ */
+export string test_a_path_the_system_refuses_is_denied_rather_than_absent(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = "\{flatten(env.cwd().wait()).unwrap()}/.cache/hostfaults-denied";
+  fs.remove(dir, true).wait();
+  fs.mkdir(dir, true).wait();
+  auto wrote = flatten(fs.writeFile("\{dir}/inside.txt", "here\n".toBytes()).wait());
+  t.isTrue(wrote.isOk(), "the fixture was written — \{wrote.isErr() ? "\{wrote.err()!}" : ""}");
+  if (wrote.isErr()) { return t.report(); }
+
+  // No execute bit, so the kernel refuses to walk into it. `chmod` through the shell because the
+  // fixture must not go through the `Files` under test.
+  auto lockedRan = flatten(procs.exec("/bin/sh", ["-c", "chmod 000 '\{dir}'"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? locked = lockedRan.ok();
+  t.isTrue((locked is not null) && locked!.status == 0, "the directory was locked");
+  if ((locked is null) || locked!.status != 0) { return t.report(); }
+
+  auto r = flatten(fs.readFile("\{dir}/inside.txt").wait());
+  auto s = flatten(fs.stat("\{dir}/inside.txt").wait());
+
+  // The control, asked of the system rather than of `Files`: `cat` through the locked directory must be refused too, or
+  // this machine refuses nothing (running as root) and there is no denial to tell from absence.
+  Exec? probe = flatten(procs.exec("cat", ["\{dir}/inside.txt"], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+
+  // Unlocked before the assertions, so a failure does not leave a directory the suite cannot remove.
+  procs.exec("/bin/sh", ["-c", "chmod 755 '\{dir}'"], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+
+  if ((probe is not null) && probe!.status == 0) {
+    fs.remove(dir, true).wait();
+    t.skip("a mode-000 directory refuses nothing on this machine (running as root?), so there is no denial to see");
+    return t.report();
+  }
+  t.isTrue(r.isErr(), "reading through a locked directory failed");
+  if (r.isErr()) {
+    t.isTrue(r.err()! is Denied, "and the fault says denied rather than \{r.err()!}");
+  }
+  // **The `stat` half is the one a script acts on.** A `test -e` built on a `stat` that answered
+  // "absent" would tell a script the file is not there, and the script would go on to create it.
+  t.isTrue(s.isErr(), "and does not claim it exists, which it cannot know");
+  if (s.isErr()) {
+    t.isTrue(s.err()! is Denied, "stat says denied rather than \{s.err()!}");
+  }
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * A name this host cannot *hold* is not reported as absence either.
+ *
+ * The same claim as the test above, about the other way a host loses a file that is plainly there.
+ * `Stat`'s own doc in `std/platform.wac` promises `FAULT_NOT_REPRESENTABLE` for "a file `ls` has just
+ * listed", and until 2026-09-01 nothing ran it: the V8 host answered `exists=false fault=0` — absent,
+ * and no fault to say why — for a file whose name it had itself mangled on the way to the syscall.
+ * `issues/system/0295c`.
+ *
+ * **The assertion is deliberately not "every host answers 6", and that is the finding.** The issue
+ * says both Rust hosts have this bug; measured, only one does. The wasmtime host holds a path as
+ * bytes and passes it through unchanged, so it *can* name the file and answers `exists=true` — and a
+ * test demanding the fault would have failed the one host that was right, or worse, been "fixed" by
+ * making it reclassify a genuine `NotFound` on any path containing U+FFFD. So what is required here
+ * is the property that holds on every host: **either you can name it, or you say you cannot.** The
+ * third answer — absent, no fault, about a file on the disk — is the one a caller acts on by
+ * creating the file, and it is the only one this forbids.
+ *
+ * Three hosts were measured against this fixture; all three satisfy it and they do not agree on how:
+ * Deno and V8 mangle the name and answer `fault=6`, wasmtime holds it and answers `exists=true`.
+ */
+export string test_a_name_this_host_cannot_hold_is_not_reported_absent(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = "\{flatten(env.cwd().wait()).unwrap()}/.cache/hostfaults-unnameable";
+  procs.exec("/bin/sh", ["-c", "rm -rf '\{dir}'"], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  fs.mkdir(dir, true).wait();
+
+  // A raw `0xFF` byte: a name the filesystem holds happily and UTF-8 cannot spell. Made through the
+  // shell because a wac string cannot carry it *to* `writeFile` on a host that would mangle it on the
+  // way out — which is the thing under test, so the fixture must not go through it.
+  auto madeRan = flatten(procs.exec("/bin/sh", ["-c", "cd '\{dir}' && touch \"$(printf 'bad-\\377-name')\""], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? made = madeRan.ok();
+  t.isTrue((made is not null) && made!.status == 0,
+           "the fixture was made — \{(made is not null) ? string.fromBytes(made!.stderr) : "\{madeRan.err()!}"}");
+  if ((made is null) || made!.status != 0) { return t.report(); }
+
+  string[]? listed = flatten(fs.readDir(dir).wait()).ok();
+  t.isTrue(!(listed is null), "and the directory listed");
+  if (listed is null) { return t.report(); }
+  string[] names = listed!;
+  // A floor, so a listing that came back empty cannot pass by having nothing to check.
+  t.eqI32(names.len(), 1, "the listing has exactly the one fixture in it");
+
+  for (i32 i = 0; i < names.len(); i++) {
+    auto s = flatten(fs.stat("\{dir}/\{names[i]}").wait());
+    t.isTrue(s.isOk() || s.err()! is NotRepresentable,
+             "a file that is on the disk came back as "
+               + (s.isOk() ? "present" : "\{s.err()!}") + " — a caller acts on that by creating it");
+  }
+
+  procs.exec("/bin/sh", ["-c", "rm -rf '\{dir}'"], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  return t.report();
+}
+
+/**
+ * **Both hosts must hand the seed the same ceiling**, which is `issues/system/0257c`'s ruling: a host
+ * may implement *running a module* and must not implement the *command surface*. `--allow-run` is
+ * read by the wac-side command; what a host decides is the ceiling the program then narrows.
+ *
+ * The v8 host has set all five since `0264c`. The wasmtime host set none — it passed the seed's own
+ * manifest through — so `run` was never granted and `Cli.exec` was **refused for every program** on
+ * that host while working on the other. `issues/system/0313b`, and it hid a measurement first: a
+ * probe read 0 of 3 on both arms there, control included, which looks like a broken instrument.
+ *
+ * A source scan, for the same reason the two above are: these are Rust sources that no wac program
+ * can import, and a scan that finds *nothing* where a match is required fails rather than passes.
+ * Counting the five names rather than matching a block, so reformatting cannot quietly satisfy it.
+ */
+export string test_the_two_rust_hosts_hand_the_seed_the_same_grants(Sys sys) {
+  Output err = sys.stderr();
+  Files fs = sys.files();
+  T t = T.create();
+  string v8 = read(err, fs, V8_HOST);
+  string wasmtime = read(err, fs, WASMTIME_HOST);
+
+  string[] names = ["read", "write", "env", "net", "run"];
+  for (string grant in names) {
+    bool inV8 = v8.indexOf("grants.\{grant} = true") >= 0
+             || v8.indexOf("\{grant}: true") >= 0;
+    bool inNative = wasmtime.indexOf("grants.\{grant} = true") >= 0
+                 || wasmtime.indexOf("\{grant}: true") >= 0;
+    t.isTrue(inV8 == inNative,
+             "the hosts disagree about granting `" + grant + "` to the seed: v8 "
+               + (inV8 ? "does" : "does not") + ", wasmtime "
+               + (inNative ? "does" : "does not")
+               + " — issues/system/0313b is what that costs");
+  }
+  return t.report();
+}

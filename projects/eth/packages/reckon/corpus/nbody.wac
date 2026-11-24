@@ -1,0 +1,114 @@
+// Float-heavy work, for what canonical NaNs cost: the classic five-body simulation (the Sun and the four giant
+// planets), then a matrix product. Almost every instruction in the hot loops is a float operation the rewrite
+// guards. The result is printed bit for bit, so the machine's output also says the two engines agree.
+//
+// The step count is the first argument (default 200000), so tools/machine.sh can run it short and a benchmark long.
+import { Sys } from "std";
+
+string hex64(u64 b) {
+  string digits = "0123456789abcdef";
+  string out = "";
+  for (i32 i = 15; i >= 0; i--) {
+    i32 d = ((b >> ((i * 4) as@ u32 as u64)) & (15 as u64)) as~ i32;
+    out += digits.slice(d, d + 1);
+  }
+  return out;
+}
+
+struct Bodies {
+  f64[] x;
+  f64[] y;
+  f64[] z;
+  f64[] vx;
+  f64[] vy;
+  f64[] vz;
+  f64[] m;
+}
+
+Bodies solar() {
+  f64 pi = 3.141592653589793;
+  f64 mass = 4.0 * pi * pi;
+  f64 days = 365.24;
+  Bodies b = Bodies(
+    [0.0, 4.84143144246472090e+00, 8.34336671824457987e+00, 1.28943695621391310e+01, 1.53796971148509165e+01],
+    [0.0, -1.16032004402742839e+00, 4.12479856412430479e+00, -1.51111514016986312e+01, -2.59193146099879641e+01],
+    [0.0, -1.03622044471123109e-01, -4.03523417114321381e-01, -2.23307578892655734e-01, 1.79258772950371181e-01],
+    [0.0, 1.66007664274403694e-03 * days, -2.76742510726862411e-03 * days, 2.96460137564761618e-03 * days, 2.68067772490389322e-03 * days],
+    [0.0, 7.69901118419740425e-03 * days, 4.99852801234917238e-03 * days, 2.37847173959480950e-03 * days, 1.62824170038242295e-03 * days],
+    [0.0, -6.90460016972063023e-05 * days, 2.30417297573763929e-05 * days, -2.96589568540237556e-05 * days, -9.51592254519715870e-05 * days],
+    [mass, 9.54791938424326609e-04 * mass, 2.85885980666130812e-04 * mass, 4.36624404335156298e-05 * mass, 5.15138902046611451e-05 * mass]);
+  f64 px = 0.0;
+  f64 py = 0.0;
+  f64 pz = 0.0;
+  for (i32 i = 0; i < 5; i++) { px += b.vx[i] * b.m[i]; py += b.vy[i] * b.m[i]; pz += b.vz[i] * b.m[i]; }
+  b.vx[0] = -px / mass;
+  b.vy[0] = -py / mass;
+  b.vz[0] = -pz / mass;
+  return b;
+}
+
+void advance(Bodies b, f64 dt) {
+  for (i32 i = 0; i < 5; i++) {
+    for (i32 j = i + 1; j < 5; j++) {
+      f64 dx = b.x[i] - b.x[j];
+      f64 dy = b.y[i] - b.y[j];
+      f64 dz = b.z[i] - b.z[j];
+      f64 d2 = dx * dx + dy * dy + dz * dz;
+      f64 mag = dt / (d2 * d2.sqrt());
+      b.vx[i] -= dx * b.m[j] * mag; b.vy[i] -= dy * b.m[j] * mag; b.vz[i] -= dz * b.m[j] * mag;
+      b.vx[j] += dx * b.m[i] * mag; b.vy[j] += dy * b.m[i] * mag; b.vz[j] += dz * b.m[i] * mag;
+    }
+  }
+  for (i32 i = 0; i < 5; i++) { b.x[i] += dt * b.vx[i]; b.y[i] += dt * b.vy[i]; b.z[i] += dt * b.vz[i]; }
+}
+
+f64 energy(Bodies b) {
+  f64 e = 0.0;
+  for (i32 i = 0; i < 5; i++) {
+    e += 0.5 * b.m[i] * (b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i] + b.vz[i] * b.vz[i]);
+    for (i32 j = i + 1; j < 5; j++) {
+      f64 dx = b.x[i] - b.x[j];
+      f64 dy = b.y[i] - b.y[j];
+      f64 dz = b.z[i] - b.z[j];
+      e -= b.m[i] * b.m[j] / (dx * dx + dy * dy + dz * dz).sqrt();
+    }
+  }
+  return e;
+}
+
+/** The trace of A·A for an n×n matrix of smooth values: a triple loop of multiply-adds. */
+f64 matrix(i32 n) {
+  f64[] a = f64[].filled(n * n, 0.0);
+  for (i32 i = 0; i < n; i++) { for (i32 j = 0; j < n; j++) { a[i * n + j] = ((i * 7 + j * 3) % 11) as f64 / 10.0 - 0.5; } }
+  f64 trace = 0.0;
+  for (i32 i = 0; i < n; i++) {
+    for (i32 j = 0; j < n; j++) {
+      f64 s = 0.0;
+      for (i32 k = 0; k < n; k++) { s += a[i * n + k] * a[k * n + j]; }
+      if (i == j) { trace += s; }
+    }
+  }
+  return trace;
+}
+
+i32 number(string s, i32 fallback) {
+  if (s.len() == 0) { return fallback; }
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < 48 || b[i] > 57) { return fallback; }
+    n = n * 10 + (b[i] as i32) - 48;
+  }
+  return n;
+}
+
+export i32 main(Sys sys) {
+  string[] args = sys.args();
+  i32 steps = number(args.len() > 0 ? args[0] : "", 200000);
+  Bodies b = solar();
+  sys.log("energy before \{hex64(f64.toBits(energy(b)))}");
+  for (i32 s = 0; s < steps; s++) { advance(b, 0.01); }
+  sys.log("energy after \{steps} steps \{hex64(f64.toBits(energy(b)))}");
+  sys.log("trace \{hex64(f64.toBits(matrix(120)))}");
+  return 0;
+}

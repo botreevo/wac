@@ -1,0 +1,158 @@
+// The client role, against the server role, in one process: `ClientPeer` under a controlling `Session`, `Peer`
+// under an answering one, and the datagrams carried between them by hand — loss and reordering included.
+//
+// Each end pins the other's certificate, so a handshake that completes here has checked both fingerprints, the
+// ServerKeyExchange's signature and the client's CertificateVerify. What a foreign server makes of this client is
+// `kps`'s question (wac-kps dials pion and libdatachannel listeners with it); this is the protocol agreeing with
+// itself, which is the cheaper failure to find first.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Vec } from "core";
+import { Session, ChannelEvent } from "../../src/session.wac";
+import { Association } from "../../src/association.wac";
+import { Peer } from "../../src/peer.wac";
+import { ClientPeer } from "../../src/peer.wac";
+import { Consent } from "../../src/ice.wac";
+import { hexColons } from "../../src/sdp.wac";
+import { sha256 } from "../../../crypto/src/sha256.wac";
+import { anonymousP256 } from "../../../tls/src/x509gen.wac";
+
+static string UFRAG = "kpsUfrag";
+static string PWD = "a-password-both-ends-know-0123";
+
+u8[] bytes(i32 n, i32 seed) {
+  u8[] out = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { out[i] = ((i * 37 + seed * 101 + 11) & 0x7F) as@ u8; }
+  return out;
+}
+
+u8[] certOf(u8[] key, i32 seed) {
+  return anonymousP256(bytes(8, seed), 1700000000000 as i64, 1900000000000 as i64, key, bytes(32, seed + 50));
+}
+
+struct Ends {
+  Session client;
+  Session server;
+  Vec<ChannelEvent> clientSaw;
+  Vec<ChannelEvent> serverSaw;
+}
+
+Ends ends(bool pinRight) {
+  u8[] ck = bytes(32, 1);
+  u8[] sk = bytes(32, 2);
+  u8[] ccert = certOf(ck, 1);
+  u8[] scert = certOf(sk, 2);
+  ClientPeer cp = ClientPeer.of(ccert, ck, bytes(32, 3), bytes(32, 4), bytes(32, 5));
+  Peer sp = Peer.of(scert, sk, bytes(32, 6), bytes(32, 7), bytes(32, 8), bytes(8, 9));
+  string serverPrint = pinRight ? hexColons(sha256(scert)) : hexColons(sha256(ccert));
+  Session client = Session.of(cp, Association.create(true, 0x1234567, 1000, 131072), Consent.of(5000 as i64, 30000 as i64, 0 as i64),
+                              UFRAG, PWD, UFRAG, PWD, serverPrint);
+  client.dtlsClient = true;
+  Session server = Session.of(sp, Association.create(false, 0x7654321, 5000, 131072), Consent.of(5000 as i64, 30000 as i64, 0 as i64),
+                              UFRAG, PWD, UFRAG, PWD, hexColons(sha256(ccert)));
+  client.negotiate(0, true, -1);
+  server.negotiate(0, true, -1);
+  return Ends(client, server, Vec<ChannelEvent>.create(), Vec<ChannelEvent>.create());
+}
+
+/**
+ * Carry datagrams until both ends are quiet, ticking each at 10 ms steps. `drop` names datagrams to lose, counted
+ * across both directions from 1 — so a test can lose the first ClientHello, or the server's flight.
+ */
+i64 run(Ends e, u8[][] first, i64 start, i64 until, i32[] drop) {
+  Vec<u8[]> toServer = Vec<u8[]>.create();
+  Vec<u8[]> toClient = Vec<u8[]>.create();
+  for (u8[] d in first) { toServer.push(d); }
+  i32 n = 0;
+  u8[] cip = [127 as u8, 0 as u8, 0 as u8, 1 as u8];
+  i64 now = start;
+  while (now < until) {
+    Vec<u8[]> s = toServer;
+    toServer = Vec<u8[]>.create();
+    for (i32 i = 0; i < s.len(); i++) {
+      n++;
+      bool lost = false;
+      for (i32 x in drop) { if (x == n) { lost = true; } }
+      if (lost) { continue; }
+      for (u8[] d in e.server.receive(s.get(i), cip, 5000, now)) { toClient.push(d); }
+    }
+    Vec<u8[]> c = toClient;
+    toClient = Vec<u8[]>.create();
+    for (i32 i = 0; i < c.len(); i++) {
+      n++;
+      bool lost = false;
+      for (i32 x in drop) { if (x == n) { lost = true; } }
+      if (lost) { continue; }
+      for (u8[] d in e.client.receive(c.get(i), cip, 6000, now)) { toServer.push(d); }
+    }
+    now += 10 as i64;
+    for (u8[] d in e.client.tick(now)) { toServer.push(d); }
+    for (u8[] d in e.server.tick(now)) { toClient.push(d); }
+    for (ChannelEvent ev in e.client.events()) { e.clientSaw.push(ev); }
+    for (ChannelEvent ev in e.server.events()) { e.serverSaw.push(ev); }
+  }
+  return now;
+}
+
+bool sawUp(Vec<ChannelEvent> v) {
+  for (i32 i = 0; i < v.len(); i++) {
+    bool up = match (v.get(i)) { Up: true, default: false };
+    if (up) { return true; }
+  }
+  return false;
+}
+
+string messages(Vec<ChannelEvent> v) {
+  string out = "";
+  for (i32 i = 0; i < v.len(); i++) {
+    match (v.get(i)) {
+      Message(id, binary, data): { out += "\{id}:\{string.fromBytes(data)};"; }
+      default: { }
+    }
+  }
+  return out;
+}
+
+export string test_a_client_session_dials_a_server_session_and_a_channel_carries_both_ways() {
+  T t = T.create();
+  Ends e = ends(true);
+  u8[][] first = e.client.connect(bytes(20, 12), 0 as i64);
+  t.eqI32(first.len(), 1, "connect sends one check");
+  i64 now = run(e, first, 0 as i64, 3000 as i64, i32[]());
+  t.isTrue(e.client.iceUp, "the check was answered");
+  t.isTrue(e.client.peer.peerAuthenticated(), "the client's handshake finished with a server that signed its key");
+  t.isTrue(e.server.peer.peerAuthenticated(), "and the server's with a client that proved its certificate");
+  t.isTrue(sawUp(e.clientSaw), "the client's association came up");
+  t.isTrue(sawUp(e.serverSaw), "and the server's");
+
+  u8[][] out = e.client.send(0, "from the client".toBytes(), true, now);
+  now = run(e, out, now, now + 500 as i64, i32[]());
+  t.eqStr(messages(e.serverSaw), "0:from the client;", "a negotiated channel carries the client's message");
+  Vec<u8[]> opened = Vec<u8[]>.create();
+  i32 id = e.client.open("kps", true, -1, now, opened);
+  t.eqI32(id % 2, 0, "the DTLS client opens even stream ids");
+  u8[][] more = e.client.send(id, "on a channel it opened".toBytes(), true, now);
+  for (u8[] d in more) { opened.push(d); }
+  now = run(e, opened.toArray(), now, now + 500 as i64, i32[]());
+  t.isTrue(messages(e.serverSaw).indexOf("\{id}:on a channel it opened;") >= 0, "and a DCEP channel it opened: \{messages(e.serverSaw)}");
+  return t.report();
+}
+
+export string test_the_handshake_survives_lost_flights() {
+  T t = T.create();
+  // Datagram 1 is the first check, 3 the first ClientHello: losing both leaves the timers to recover.
+  Ends e = ends(true);
+  run(e, e.client.connect(bytes(20, 13), 0 as i64), 0 as i64, 8000 as i64, [1, 3, 6]);
+  t.isTrue(e.client.peer.peerAuthenticated() && e.server.peer.peerAuthenticated(), "both ends finish the handshake");
+  t.isTrue(sawUp(e.clientSaw) && sawUp(e.serverSaw), "and both associations come up");
+  return t.report();
+}
+
+export string test_a_server_whose_certificate_is_not_the_pinned_one_gets_nothing() {
+  T t = T.create();
+  Ends e = ends(false);
+  i64 now = run(e, e.client.connect(bytes(20, 14), 0 as i64), 0 as i64, 3000 as i64, i32[]());
+  t.isFalse(sawUp(e.clientSaw), "the client's association never comes up");
+  t.eqI32(e.client.send(0, "secret".toBytes(), true, now).len(), 0, "and nothing is sent to the wrong server");
+  return t.report();
+}

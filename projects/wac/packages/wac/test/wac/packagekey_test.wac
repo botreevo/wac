@@ -1,0 +1,66 @@
+// One source is one module, wherever a machine keeps its package cache. `issues/lang/0458e`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/wac/test/wac/packagekey_test.wac
+//
+// A file a package mapping reached is keyed by its checkout, `<WAC_HOME>/cache/git/<repository>/<commit>/<path>`, and
+// a name a package's type is bound under was spelled from that whole key — so a module exporting such a type named
+// `$WAC_HOME` in its exports, and two machines built two modules. Here one project imports a package that declares
+// `Thing`, declares a `Thing` of its own (two of one name is when a name is file-qualified) and exports both; the
+// package sits in two caches under different homes, filled by hand so nothing is fetched, and the builds must agree.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { binaryPath, freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+
+static string URL = "https://example.invalid/pkg.git";
+static string ESCAPED = "https%3A%2F%2Fexample.invalid%2Fpkg.git";
+static string COMMIT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+string said(Exec r) { return string.fromBytes(r.stdout) + string.fromBytes(r.stderr); }
+
+/** The package, as a cache under `home` holds it. */
+void cached(Files fs, T t, string home) {
+  string at = "\{home}/cache/git/\{ESCAPED}/\{COMMIT}";
+  t.eqStr(putFile(fs, "\{at}/wac.json5", "{ exports: './lib.wac' }\n"), "", "the package's manifest");
+  t.eqStr(putFile(fs, "\{at}/lib.wac", "export struct Thing { i32 n; }\n"), "", "the package");
+}
+
+async u8[] built(Sys sys, T t, string proj, string home, string out) {
+  Exec r = (await sys.procs().exec(binaryPath(sys.env()), ["build", "lib.wac", "-o", out, "--no-cache"], u8[](),
+                                   ChildEnv.inherited().set("WAC_HOME", home), Launch(proj, false, false, false, false))).unwrap();
+  t.eqI32(r.status, 0, "build under \{home} — \{said(r)}");
+  return (await sys.files().readFile("\{out}.wasm")).orElse(u8[]());
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export async string test_a_package_type_is_named_the_same_under_any_wac_home(Sys sys) {
+  T t = T.create();
+  Files fs = sys.files();
+  string dir = scratch(sys.env(), "packagekey");
+  t.eqStr(freshDir(fs, dir), "", "a scratch directory");
+  cached(fs, t, "\{dir}/one");
+  cached(fs, t, "\{dir}/somewhere/else/two");
+  string proj = "\{dir}/proj";
+  t.eqStr(putFile(fs, "\{proj}/wac.json5", "{ imports: { pkg: { git: '\{URL}', ref: '\{COMMIT}' } } }\n"), "", "wac.json5");
+  t.eqStr(putFile(fs, "\{proj}/wac.lock",
+                  "{ \"imports\": { \"pkg\": { \"git\": \"\{URL}\", \"ref\": \"\{COMMIT}\", \"commit\": \"\{COMMIT}\" } } }\n"),
+          "", "wac.lock");
+  t.eqStr(putFile(fs, "\{proj}/lib.wac",
+                  "import { Thing as PkgThing } from \"pkg\";\nstruct Thing { i32 m; }\n" +
+                  "export PkgThing theirs() { return PkgThing(1); }\nexport Thing ours() { return Thing(2); }\n"), "", "lib.wac");
+  u8[] a = await built(sys, t, proj, "\{dir}/one", "\{dir}/a/m");
+  u8[] b = await built(sys, t, proj, "\{dir}/somewhere/else/two", "\{dir}/b/m");
+  t.isTrue(a.len() > 0, "the first build wrote a module");
+  string text = string.fromBytes(a);
+  // The control: the package's `Thing` is file-qualified, so its tag is in play at all.
+  t.isTrue(contains(text, "\{COMMIT}_lib_new"), "the package's Thing is named from its repository and commit");
+  t.isFalse(contains(text, "cache_git"), "and not from where the cache is");
+  t.isTrue(same(a, b), "the same module under two homes");
+  return t.report();
+}

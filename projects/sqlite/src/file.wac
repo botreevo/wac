@@ -1,0 +1,398 @@
+// A database in a file, read a page at a time and written a page at a time.
+//
+// **Reading.** Opening reads the header and sqlite_schema; after that a page is read from the file when
+// a statement needs it (std's `Files.openRandom`), and the pager keeps a bounded number of them. A file
+// of any size opens in the same small memory.
+//
+// **Writing.** A commit writes only the pages the transaction changed, as SQLite does in its default
+// journal mode (DELETE): first a rollback journal beside the file, holding each of those pages as it
+// was, synced; then the pages over the file, synced; then the journal is deleted, which is the moment
+// the transaction is committed. The journal is in SQLite's own format, so after a crash either SQLite or
+// this library puts the old pages back (a "hot" journal, played back on opening).
+//
+// **What still needs memory** is a transaction's changed pages, until it commits; WITHOUT ROWID and
+// TEMP tables (see database.wac); and VACUUM, or any commit to an auto-vacuum database, which builds a
+// whole new image and writes it through a temporary file renamed over this one.
+//
+// The calls block until the file operations finish (`Ticket.wait`), which keeps the interface the same
+// as the in-memory Connection's.
+//
+// **Other processes.** Before each statement outside a transaction, the header's change counter is read
+// again; when another connection has committed since, the database is read afresh from the file, so a
+// server sees what an admin tool beside it wrote. SQLite's locks are still not taken: two programs
+// writing at the same moment would lose one side's changes, and one reading while a commit is being
+// written could see half of it (a commit in progress is noticed by its journal, and waited out by
+// reading the old view).
+//
+// A database in WAL mode may have a log beside it holding committed transactions the file does not yet
+// have. Opening reads the log (which SQLite keeps short) and lays its pages over the file's. Before the
+// first write, the file is brought up to date with exactly those pages (a checkpoint) and only then is
+// the log removed, so a crash at any point leaves either the log over the old file or a file that
+// already holds what the log would add: replaying it again changes nothing.
+
+import { Result, Map, Vec, hashI64, i64Eq, flatten } from "core";
+import { Files, RandomFile, NotFound } from "std";
+import { SqlError } from "./error.wac";
+import { Value } from "./value.wac";
+import { Connection } from "./engine.wac";
+import { Database, openPager, adopt, newPager } from "./database.wac";
+import { Pager } from "./pager.wac";
+import { readHeader, Header } from "./reader.wac";
+import { walPages, WalPages } from "./wal.wac";
+import { Rows } from "./plan.wac";
+import { be32, put32 } from "./bytes.wac";
+import { startDatabase } from "./btree.wac";
+
+static i32 SECTOR = 512;
+
+// The open file, and the log's pages laid over it until a checkpoint takes them in. The pager's reader
+// reaches the file through this, so a rebuild can put a new file in its place.
+struct Disk {
+  RandomFile file;
+  Map<i64, u8[]> wal;
+  bool walPending;
+}
+
+export struct SqliteFile {
+  Files fs;
+  string path;
+  Connection conn;
+  Disk disk;
+  // For tests: a commit stops after writing its pages and before deleting its journal, as a crash there
+  // would, and fails.
+  bool stopBeforeCommitPoint = false;
+
+  // Opens a database file, or starts an empty one that is created at the first commit.
+  Result<SqliteFile, SqlError> open(Files fs, string path) {
+    try recoverJournal(fs, path);
+    RandomFile f = try openFile(fs, path);
+    i64 size = try fileSize(f, path);
+    Disk disk = Disk(f, Map.create(hashI64, i64Eq), false);
+    // The log, if there is one, and what it holds that the file does not.
+    WalPages? wp = null;
+    match (flatten(fs.readFile(path + "-wal").wait())) {
+      Ok(bytes): { wp = walPages(bytes); }
+      Err(e): {}
+    }
+    if (wp is not null) {
+      disk.wal = wp!.pages;
+      disk.walPending = true;
+    }
+    SqliteFile sf = SqliteFile(fs, path, Connection.over(Database.empty(), false), disk, false);
+    u8[]? first = null;
+    if (wp is not null && wp!.pages.has(1)) { first = wp!.pages.get(1); }
+    else if (size >= 100) { first = try readAt(f, 0, 100, path); }
+    if (first is null) {
+      if (size > 0) { return Result.Err(SqlError.corrupt("\{path} is shorter than a header")); }
+      // A new database: an empty one in memory, whose pages the first commit writes.
+      Database db = Database.empty();
+      sf.conn = Connection.over(db, false);
+      sf.attach(db, 0);
+      return Result.Ok(sf);
+    }
+    i64 bytes = wp is not null ? wp!.dbPages * (wp!.pageSize as i64) : size;
+    Header h = try readHeader(first!, bytes);
+    Pager pg = Pager.overFile(h.pageSize, h.pageCount, sf.reader(h.pageSize));
+    Database db = try openPager(pg, h);
+    sf.conn = Connection.over(db, false);
+    sf.attach(db, h.pageCount);
+    return Result.Ok(sf);
+  }
+
+  // The pager's way to a page: the log's copy if it has one, else the file's.
+  fn<u8[]?(i64)> reader(this, i32 ps) {
+    Disk d = this.disk;
+    string path = this.path;
+    return (i64 n) => {
+      u8[]? w = d.wal.get(n);
+      if (w is not null) {
+        u8[] c = u8[].filled(ps, 0);
+        c.copyFrom(w!, 0, 0, ps);
+        return c;
+      }
+      match (flatten(d.file.readAt((n - 1) * (ps as i64), ps).wait())) {
+        Ok(b): {
+          if (b.len() == ps) { return b; }
+          u8[] c = u8[].filled(ps, 0);
+          c.copyFrom(b, 0, 0, b.len());
+          return c;
+        }
+        Err(e): { return null; }
+      }
+    };
+  }
+
+  // Makes the database's commits write to this file. `stored` is how many pages the file holds.
+  void attach(this, Database db, i64 stored) {
+    db.main.stored = stored;
+    if (!db.main.isFile()) {
+      // A new file's database lives in memory until its first commit puts it in the file.
+      i32 ps = db.main.pageSize;
+      db.main.source = this.reader(ps);
+    }
+    SqliteFile self = this;
+    db.persist = (Database d) => self.commit(d);
+    db.refresh = () => self.reload(db);
+  }
+
+  // The database as the file now holds it, when another connection has committed to it since `db` was
+  // read: its header's change counter, which every commit advances, is no longer `db`'s. While another
+  // writer's journal is beside the file a commit is under way (or was cut short, which the next open
+  // recovers), so the file is left alone and `db` read as it was.
+  Result<Database?, SqlError> reload(this, Database db) {
+    if (this.disk.walPending) { return Result.Ok(null); }
+    i64 size = try fileSize(this.disk.file, this.path);
+    if (size < 100) { return Result.Ok(null); }
+    u8[] head = try readAt(this.disk.file, 0, 100, this.path);
+    if (be32(head, 24) == db.changeCounter) { return Result.Ok(null); }
+    match (flatten(this.fs.stat(this.path + "-journal").wait())) {
+      Ok(st): { if (st.exists) { return Result.Ok(null); } }
+      Err(e): {}
+    }
+    Header h = try readHeader(head, size);
+    Pager pg = Pager.overFile(h.pageSize, h.pageCount, this.reader(h.pageSize));
+    Database fresh = try openPager(pg, h);
+    this.conn.db = fresh;
+    this.attach(fresh, h.pageCount);
+    return Result.Ok(fresh);
+  }
+
+  // Runs one statement; a commit it makes is written to the file.
+  Result<Rows, SqlError> execute(this, string sql, Value[] params) { return this.conn.execute(sql, params); }
+
+  // Runs every statement in the text.
+  Result<Rows, SqlError> exec(this, string sql) { return this.conn.exec(sql); }
+
+  // Commits are written as they happen; nothing waits to be saved. Kept for callers of the whole-file
+  // version, which wrote here.
+  Result<void, SqlError> saveIfChanged(this) { return Result.Ok(); }
+
+  // Lets the file go. The database is not to be used after.
+  Result<void, SqlError> close(this) {
+    match (flatten(this.disk.file.close().wait())) {
+      Ok: { return Result.Ok(); }
+      Err(e): { return Result.Err(SqlError("io", "cannot close \{this.path}")); }
+    }
+  }
+
+  // ── committing ──
+
+  // Writes a commit's pages, as the top of this file describes.
+  Result<void, SqlError> commit(this, Database db) {
+    if (db.replaced) { return this.replaceWhole(db); }
+    Pager pg = db.main;
+    i64[] pages = pg.changed();
+    if (pages.len() == 0) { return Result.Ok(); }
+    try this.checkpoint(pg.pageSize);
+    i32 ps = pg.pageSize;
+    string journal = this.path + "-journal";
+    try writeJournal(this.fs, journal, pg, pg.stored);
+    // The pages, consecutive ones in one write.
+    i32 i = 0;
+    while (i < pages.len()) {
+      i32 j = i + 1;
+      while (j < pages.len() && pages[j] == pages[j - 1] + 1 && j - i < 64) { j++; }
+      u8[] run = u8[].filled((j - i) * ps, 0);
+      for (i32 k = i; k < j; k++) { run.copyFrom(pg.page(pages[k]), 0, (k - i) * ps, ps); }
+      match (flatten(this.disk.file.writeAt((pages[i] - 1) * (ps as i64), run).wait())) {
+        Ok: {}
+        Err(e): { return Result.Err(SqlError("io", "cannot write \{this.path}")); }
+      }
+      i = j;
+    }
+    try syncFile(this.disk.file, this.path);
+    if (this.stopBeforeCommitPoint) { return Result.Err(SqlError("io", "stopped before the commit point")); }
+    // Deleting the journal is the commit.
+    match (flatten(this.fs.remove(journal, false).wait())) {
+      Ok: {}
+      Err(e): { return Result.Err(SqlError("io", "cannot delete \{journal}")); }
+    }
+    return Result.Ok();
+  }
+
+  // Before the first write, the log's pages go into the file and the log goes.
+  Result<void, SqlError> checkpoint(this, i32 ps) {
+    if (!this.disk.walPending) { return Result.Ok(); }
+    i64[] ns = this.disk.wal.keys();
+    for (i64 n in ns) {
+      match (flatten(this.disk.file.writeAt((n - 1) * (ps as i64), this.disk.wal.get(n)!).wait())) {
+        Ok: {}
+        Err(e): { return Result.Err(SqlError("io", "cannot write \{this.path}")); }
+      }
+    }
+    try syncFile(this.disk.file, this.path);
+    for (string side in ["-wal", "-shm"]) {
+      match (flatten(this.fs.remove(this.path + side, false).wait())) {
+        Ok: {}
+        Err(e): {}
+      }
+    }
+    this.disk.wal = Map.create(hashI64, i64Eq);
+    this.disk.walPending = false;
+    return Result.Ok();
+  }
+
+  // A whole new image (VACUUM, auto-vacuum): written beside the file and renamed over it, then read
+  // from there like any other.
+  Result<void, SqlError> replaceWhole(this, Database db) {
+    Pager mem = db.main;
+    i32 ps = mem.pageSize;
+    u8[] image = u8[].filled((mem.count as! i32) * ps, 0);
+    for (i64 p = 1; p <= mem.count; p++) { image.copyFrom(mem.page(p), 0, ((p - 1) as! i32) * ps, ps); }
+    string tmp = this.path + "-wac-tmp";
+    match (flatten(this.fs.writeFile(tmp, image).wait())) {
+      Ok: {}
+      Err(e): { return Result.Err(SqlError("io", "cannot write \{tmp}")); }
+    }
+    match (flatten(this.fs.rename(tmp, this.path).wait())) {
+      Ok: {}
+      Err(e): { return Result.Err(SqlError("io", "cannot replace \{this.path}")); }
+    }
+    for (string side in ["-wal", "-shm"]) {
+      match (flatten(this.fs.remove(this.path + side, false).wait())) {
+        Ok: {}
+        Err(e): {}
+      }
+    }
+    flatten(this.disk.file.close().wait());
+    this.disk.file = try openFile(this.fs, this.path);
+    this.disk.wal = Map.create(hashI64, i64Eq);
+    this.disk.walPending = false;
+    Pager pg = Pager.overFile(ps, mem.count, this.reader(ps));
+    try adopt(db, pg);
+    return Result.Ok();
+  }
+}
+
+// ── the rollback journal ──────────────────────────────────────────────────
+
+static u8[] JOURNAL_MAGIC = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+// SQLite's checksum of a journal record: the nonce, plus every 200th byte from the end of the page.
+i64 pageChecksum(i64 nonce, const u8[] page) {
+  i64 sum = nonce;
+  i32 i = page.len() - 200;
+  while (i > 0) {
+    sum = (sum + (page[i] as i64)) & 0xffffffff;
+    i -= 200;
+  }
+  return sum;
+}
+
+// The journal for a commit: a header naming the file's size before it, then each page it changes that
+// the file held, as it was.
+Result<void, SqlError> writeJournal(Files fs, string journal, Pager pg, i64 stored) {
+  i64[] olds = pg.originals();
+  i32 ps = pg.pageSize;
+  i64 nonce = 0x5a17c0de;
+  u8[] out = u8[].filled(SECTOR + olds.len() * (ps + 8), 0);
+  out.copyFrom(JOURNAL_MAGIC, 0, 0, 8);
+  put32(out, 8, olds.len() as i64);
+  put32(out, 12, nonce);
+  put32(out, 16, stored);
+  put32(out, 20, SECTOR as i64);
+  put32(out, 24, ps as i64);
+  i32 at = SECTOR;
+  for (i64 n in olds) {
+    u8[] page = pg.original(n);
+    put32(out, at, n);
+    out.copyFrom(page, 0, at + 4, ps);
+    put32(out, at + 4 + ps, pageChecksum(nonce, page));
+    at += ps + 8;
+  }
+  RandomFile j = try openFile(fs, journal);
+  match (flatten(j.truncate(0).wait())) {
+    Ok: {}
+    Err(e): { return Result.Err(SqlError("io", "cannot write \{journal}")); }
+  }
+  match (flatten(j.writeAt(0, out).wait())) {
+    Ok: {}
+    Err(e): { return Result.Err(SqlError("io", "cannot write \{journal}")); }
+  }
+  try syncFile(j, journal);
+  flatten(j.close().wait());
+  return Result.Ok();
+}
+
+// A journal left by a writer that stopped before committing: its pages go back into the file, which is
+// cut to the size it had, and the journal goes. A journal whose header is not one (zeroed, or cut short)
+// holds nothing to undo.
+Result<void, SqlError> recoverJournal(Files fs, string path) {
+  string journal = path + "-journal";
+  u8[] j = u8[]();
+  match (flatten(fs.readFile(journal).wait())) {
+    Ok(b): { j = b; }
+    Err(e): { return Result.Ok(); }
+  }
+  bool hot = j.len() >= 28;
+  for (i32 i = 0; hot && i < 8; i++) { if (j[i] != JOURNAL_MAGIC[i]) { hot = false; } }
+  if (hot) {
+    i64 nRec = be32(j, 8);
+    i64 nonce = be32(j, 12);
+    i64 initial = be32(j, 16);
+    i64 sector = be32(j, 20);
+    i64 ps = be32(j, 24);
+    if (sector < 32 || sector > 65536 || ps < 512 || ps > 65536 || (ps & (ps - 1)) != 0) { hot = false; }
+    if (hot) {
+      RandomFile f = try openFile(fs, path);
+      i32 per = (ps as! i32) + 8;
+      i32 at = sector as! i32;
+      // A count of all ones means "as many as the journal holds".
+      i64 left = nRec == 0xffffffff ? ((j.len() - at) / per) as i64 : nRec;
+      while (left > 0 && at + per <= j.len()) {
+        i64 n = be32(j, at);
+        u8[] page = u8[].filled(ps as! i32, 0);
+        page.copyFrom(j, at + 4, 0, ps as! i32);
+        if (n == 0 || be32(j, at + 4 + (ps as! i32)) != pageChecksum(nonce, page)) { break; }
+        if (n <= initial) {
+          match (flatten(f.writeAt((n - 1) * ps, page).wait())) {
+            Ok: {}
+            Err(e): { return Result.Err(SqlError("io", "cannot write \{path} recovering its journal")); }
+          }
+        }
+        at += per;
+        left--;
+      }
+      match (flatten(f.truncate(initial * ps).wait())) {
+        Ok: {}
+        Err(e): { return Result.Err(SqlError("io", "cannot truncate \{path} recovering its journal")); }
+      }
+      try syncFile(f, path);
+      flatten(f.close().wait());
+    }
+  }
+  match (flatten(fs.remove(journal, false).wait())) {
+    Ok: { return Result.Ok(); }
+    Err(e): { return Result.Err(SqlError("io", "cannot delete \{journal}")); }
+  }
+}
+
+// ── the file ──────────────────────────────────────────────────────────────
+
+Result<RandomFile, SqlError> openFile(Files fs, string path) {
+  match (flatten(fs.openRandom(path, true).wait())) {
+    Ok(f): { return Result.Ok(f); }
+    Err(e): { return Result.Err(SqlError("io", "cannot open \{path}")); }
+  }
+}
+
+Result<i64, SqlError> fileSize(RandomFile f, string path) {
+  match (flatten(f.size().wait())) {
+    Ok(n): { return Result.Ok(n); }
+    Err(e): { return Result.Err(SqlError("io", "cannot read \{path}")); }
+  }
+}
+
+Result<u8[], SqlError> readAt(RandomFile f, i64 at, i32 n, string path) {
+  match (flatten(f.readAt(at, n).wait())) {
+    Ok(b): { return Result.Ok(b); }
+    Err(e): { return Result.Err(SqlError("io", "cannot read \{path}")); }
+  }
+}
+
+Result<void, SqlError> syncFile(RandomFile f, string path) {
+  match (flatten(f.sync().wait())) {
+    Ok: { return Result.Ok(); }
+    Err(e): { return Result.Err(SqlError("io", "cannot sync \{path}")); }
+  }
+}

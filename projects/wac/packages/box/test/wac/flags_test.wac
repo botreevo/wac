@@ -1,0 +1,280 @@
+// The two tables in `src/lib/flags.wac`, checked against the two things they claim to describe.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/flags_test.wac
+//
+// `refuseFlags` picks one of two sentences for a flag an applet does not implement, and the choice rests on
+// `gnuFlags`: a letter the real tool has → `sort: -k is not implemented`, which says *this* program is unfinished; a
+// letter it does not → `sort: invalid option -- 'Q'`, which says the *command* is wrong. So a letter missing from
+// `gnuFlags` blames the caller for a flag they read in a real manual — which is how `tr -C`, `rm -R` and `split -C`
+// were wrong by hand. `gnuFlags` is checked against the installed tools' own `--help`, and `implementedFlags`
+// against what the applets read (`has(a, 'X')` in their source). Neither may be a memory of what was once true.
+//
+// It was box's TypeScript `flags.test.ts`, which regex-parsed the tables out of the source. Here they are *called*:
+// a table is a function, and asking it is the one reading that cannot drift from what the program does.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { acceptedFlags, flagsChecked, gnuFlags, implementedFlags } from "../../src/lib/flags.wac";
+import { longFlags } from "../../src/lib/args.wac";
+import { appletNames } from "../../src/box.wac";
+import { ChildEnv, Exec, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+/** What `tool --help` says, both streams, or `""` when there is no such tool here. */
+string helpOf(Procs procs, string tool) {
+  Exec? r = flatten(procs.exec(tool, ["--help"], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+  if (r is null) { return ""; }
+  return string.fromBytes(r!.stdout) + string.fromBytes(r!.stderr);
+}
+
+bool isLetter(string c) { return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z"); }
+bool isSpace(string c) { return c == " " || c == "\t"; }
+
+string[] linesOf(string s) {
+  string[] out = string[]();
+  i32 n = 1;
+  for (i32 i = 0; i < s.len(); i++) { if (s.slice(i, i + 1) == "\n") { n = n + 1; } }
+  out = string[].filled(n, "");
+  i32 at = 0;
+  i32 from = 0;
+  for (i32 i = 0; i <= s.len(); i++) {
+    if (i == s.len() || s.slice(i, i + 1) == "\n") { out[at] = s.slice(from, i); at = at + 1; from = i + 1; }
+  }
+  return out;
+}
+
+/**
+ * The short options a real tool documents: a `-X` that begins a line's option list or follows a comma, and is
+ * followed by a comma, a space, `=`, `[` or the end. **Both spellings on a line**: `-r, -R, --recursive` documents two
+ * letters, and matching only the one at the start of the line loses the second.
+ */
+string gnuShort(string help) {
+  string found = "";
+  for (string line in linesOf(help)) {
+    for (i32 i = 0; i + 1 < line.len(); i++) {
+      if (line.slice(i, i + 1) != "-" || !isLetter(line.slice(i + 1, i + 2))) { continue; }
+      // What is before: only whitespace back to the line's start, or a comma and whitespace.
+      i32 j = i - 1;
+      while (j >= 0 && isSpace(line.slice(j, j + 1))) { j = j - 1; }
+      bool lead = (j < 0 && i > 0) || (j >= 0 && line.slice(j, j + 1) == ",");
+      if (!lead) { continue; }
+      string after = i + 2 < line.len() ? line.slice(i + 2, i + 3) : "";
+      if (!(after == "" || after == "," || isSpace(after) || after == "=" || after == "[")) { continue; }
+      string letter = line.slice(i + 1, i + 2);
+      if (found.indexOf(letter) < 0) { found = found + letter; }
+    }
+  }
+  return found;
+}
+
+/** A line's option column: everything before the first run of two or more spaces. */
+string column(string line) {
+  i32 i = 0;
+  while (i < line.len() && isSpace(line.slice(i, i + 1))) { i = i + 1; }
+  string body = line.slice(i, line.len());
+  for (i32 k = 0; k + 1 < body.len(); k++) {
+    if (isSpace(body.slice(k, k + 1)) && isSpace(body.slice(k + 1, k + 2))) { return body.slice(0, k); }
+  }
+  return body;
+}
+
+/** The first `--name` in `col`, or `""`. */
+string longIn(string col) {
+  i32 at = col.indexOf("--");
+  while (at >= 0) {
+    i32 e = at + 2;
+    while (e < col.len()) {
+      string c = col.slice(e, e + 1);
+      if (!((c >= "a" && c <= "z") || (c >= "0" && c <= "9") || (c == "-" && e > at + 2))) { break; }
+      e = e + 1;
+    }
+    if (e > at + 2 && col.slice(at + 2, at + 3) >= "a" && col.slice(at + 2, at + 3) <= "z") { return col.slice(at + 2, e); }
+    i32 next = col.slice(at + 2, col.len()).indexOf("--");
+    at = next < 0 ? -1 : at + 2 + next;
+  }
+  return "";
+}
+
+/**
+ * The long name a real tool documents for short letter `letter`, from **only the option column** — a description
+ * mentioning another flag is not a definition of it (`cat -b, --number-nonblank  …, overrides -n` would otherwise
+ * bind `-n` to `-b`'s name). A long form may sit alone on the next line (`strings -n` over `--bytes=`).
+ */
+string gnuLong(string help, string letter) {
+  string[] lines = linesOf(help);
+  for (i32 i = 0; i < lines.len(); i++) {
+    string l = lines[i];
+    i32 k = 0;
+    while (k < l.len() && isSpace(l.slice(k, k + 1))) { k = k + 1; }
+    if (k == 0 || k >= l.len() || l.slice(k, k + 1) != "-") { continue; }
+    string col = column(l);
+    // The short letters in the column: `-X` not preceded by a word character or dash, and not followed by one.
+    bool has = false;
+    for (i32 j = 0; j + 1 < col.len(); j++) {
+      if (col.slice(j, j + 1) != "-" || col.slice(j + 1, j + 2) != letter) { continue; }
+      string before = j > 0 ? col.slice(j - 1, j) : " ";
+      string after = j + 2 < col.len() ? col.slice(j + 2, j + 3) : " ";
+      bool wordy = isLetter(before) || before == "-" || isLetter(after) || after == "-" || (after >= "0" && after <= "9");
+      if (!wordy) { has = true; }
+    }
+    if (!has) { continue; }
+    string long = longIn(col);
+    if (long == "" && i + 1 < lines.len()) {
+      string nx = lines[i + 1];
+      i32 m = 0;
+      while (m < nx.len() && isSpace(nx.slice(m, m + 1))) { m = m + 1; }
+      if (m > 0 && m + 1 < nx.len() && nx.slice(m, m + 2) == "--") { long = longIn(column(nx)); }
+    }
+    if (long != "") { return long; }
+  }
+  return "";
+}
+
+export string test_gnuflags_is_what_the_installed_tools_document_not_what_someone_remembered(Sys sys) {
+  T t = T.create();
+  i32 checked = 0;
+  for (string name in appletNames()) {
+    string mine = gnuFlags(name);
+    if (mine == "" && !flagsChecked(name)) { continue; }
+    string documented = gnuShort(helpOf(sys.procs(), name));
+    if (documented == "") { continue; }   // not installed here; nothing to compare against
+    checked = checked + 1;
+    for (i32 i = 0; i < documented.len(); i++) {
+      string letter = documented.slice(i, i + 1);
+      t.isTrue(mine.indexOf(letter) >= 0,
+               "\{name}: -\{letter} is documented by the real tool and absent from gnuFlags — it would be called " +
+               "\"invalid option\", which blames the caller for a real flag");
+    }
+  }
+  // A machine with no coreutils would pass while comparing nothing.
+  t.isTrue(checked > 15, "only \{checked} of the tools were installed — is this the right image?");
+  return t.report();
+}
+
+/** The letters an applet's source reads: `has(a, 'X')` and `flagValue(a, 'X')` — `cut` takes both of its that way. */
+string readIn(string text) {
+  string out = "";
+  for (string pre in ["has(a, '", "flagValue(a, '"]) {
+    i32 at = text.indexOf(pre);
+    while (at >= 0) {
+      i32 c = at + pre.len();
+      if (c + 1 < text.len() && text.slice(c + 1, c + 2) == "'") {
+        string letter = text.slice(c, c + 1);
+        if (out.indexOf(letter) < 0) { out = out + letter; }
+      }
+      i32 next = text.slice(c, text.len()).indexOf(pre);
+      at = next < 0 ? -1 : c + next;
+    }
+  }
+  return out;
+}
+
+export string test_implementedflags_is_what_the_applets_read_not_what_they_were_meant_to_read(Sys sys) {
+  T t = T.create();
+  i32 seen = 0;
+  for (string name in appletNames()) {
+    if (!flagsChecked(name)) { continue; }
+    u8[]? bytes = flatten(sys.files().readFile("packages/box/src/applets/\{name}.wac").wait()).ok();
+    if (bytes is null) { continue; }   // dispatched from somewhere other than one file per applet
+    seen = seen + 1;
+    string text = string.fromBytes(bytes!);
+    string read = readIn(text);
+    // `acceptedFlags` is the deliberate exception — a letter accepted because ignoring it is what the real tool does.
+    string claimed = "";
+    string accepted = acceptedFlags(name);
+    string impl = implementedFlags(name);
+    for (i32 i = 0; i < impl.len(); i++) {
+      string l = impl.slice(i, i + 1);
+      if (accepted.indexOf(l) < 0) { claimed = claimed + l; }
+    }
+    for (i32 i = 0; i < read.len(); i++) {
+      string l = read.slice(i, i + 1);
+      t.isTrue(claimed.indexOf(l) >= 0, "\{name}: acts on -\{l} and implementedFlags does not list it, so it is refused");
+    }
+    // Not symmetric: a numeric flag arrives through `Args.num`, so `head -n` and its kind are claimed and never `has`.
+    for (i32 i = 0; i < claimed.len(); i++) {
+      string l = claimed.slice(i, i + 1);
+      t.isTrue(read.indexOf(l) >= 0 || text.indexOf("a.num") >= 0 || text.indexOf("a.hasNum") >= 0,
+               "\{name}: implementedFlags claims -\{l} and the applet never reads it");
+    }
+  }
+  t.isTrue(seen > 10, "only \{seen} applets' sources were read — the search has stopped finding them");
+  return t.report();
+}
+
+/**
+ * `longFlags` is what the installed tools document. A long option box accepts under a spelling GNU does not have is
+ * worse than one it refuses: a script written against box would not run anywhere else, and nothing would say so.
+ */
+export string test_longflags_is_what_the_installed_tools_document_not_what_someone_remembered(Sys sys) {
+  T t = T.create();
+  i32 checked = 0;
+  for (string applet in appletNames()) {
+    string letters = implementedFlags(applet);
+    if (letters == "") { continue; }
+    string help = helpOf(sys.procs(), applet);
+    if (gnuShort(help) == "") { continue; }   // no such tool here, or no help to read
+    checked = checked + 1;
+    string ours = longFlags(applet);
+    i32 from = 0;
+    for (i32 i = 0; i <= ours.len(); i++) {
+      if (i < ours.len() && ours.slice(i, i + 1) != ",") { continue; }
+      string entry = ours.slice(from, i);
+      from = i + 1;
+      i32 eq = entry.indexOf("=");
+      if (eq <= 0) { continue; }
+      string name = entry.slice(0, eq);
+      string letter = entry.slice(eq + 1, entry.len());
+      string real = gnuLong(help, letter);
+      t.isTrue(real != "", "\{applet}: --\{name} is offered for -\{letter}, which documents no long form");
+      t.isTrue(real == "" || real == name, "\{applet}: -\{letter} is --\{real} to the real tool and --\{name} here");
+      t.isTrue(letters.indexOf(letter) >= 0, "\{applet}: --\{name} maps to -\{letter}, which \{applet} does not implement");
+    }
+  }
+  // A floor on the evidence: an image with no coreutils reads no help, skips every applet and reports nothing wrong.
+  t.isTrue(checked > 12, "only \{checked} of the tools were installed — is this the right image?");
+  return t.report();
+}
+
+/** The two sentences reach a caller, through the built `box` — a handful of runs, not a per-option sweep. */
+export string test_the_two_sentences_reach_a_caller(Sys sys) {
+  T t = T.create();
+  string built = builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/box.wac", "flags-box", ["--allow-read"]);
+  // A real flag this applet does not have: ours is the incomplete side.
+  t.eqStr(firstLine(box(sys, built, ["sort", "-k2"]).err), "sort: -k is not implemented", "sort -k2");
+  t.eqI32(box(sys, built, ["sort", "-k2"]).status, 1, "sort -k2's status");
+  // An applet that implements no flags is still checked — that is what `flagsChecked` is for.
+  t.eqStr(firstLine(box(sys, built, ["nl", "-b"]).err), "nl: -b is not implemented", "nl -b");
+  // A letter nobody has: GNU's own wording, with the line that points at the right manual.
+  t.eqStr(box(sys, built, ["sort", "-Q"]).err, "sort: invalid option -- 'Q'\nTry 'sort --help' for more information.", "sort -Q");
+  // `echo` is not a getopt program: `echo -x` prints `-x`.
+  t.eqStr(box(sys, built, ["echo", "-x"]).err, "", "echo -x");
+  // A long option is one thing, not a run of short ones — read as short flags, `--key=2` refused the dash.
+  t.eqStr(box(sys, built, ["sort", "--key=2"]).err, "sort: long option not implemented: --key=2", "sort --key=2");
+  t.eqStr(box(sys, built, ["ls", "--all"]).err, "ls: long option not implemented: --all", "ls --all");
+  t.eqStr(box(sys, built, ["diff", "--unified"]).err, "diff: long option not implemented: --unified", "diff --unified");
+  t.eqStr(box(sys, built, ["echo", "--nonsense"]).err, "", "echo --nonsense");
+  // `--` still ends the options rather than being one.
+  t.eqStr(box(sys, built, ["echo", "--", "hi"]).err, "", "echo -- hi");
+  return t.report();
+}
+
+struct Said {
+  string err;
+  i32 status;
+}
+
+Said box(Sys sys, string built, string[] args) {
+  Exec? r = flatten(sys.procs().exec(built, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+  if (r is null) { return Said("<did not start>", 0 - 1); }
+  string err = string.fromBytes(r!.stderr);
+  while (err.len() > 0 && (err.slice(err.len() - 1, err.len()) == "\n" || err.slice(err.len() - 1, err.len()) == " ")) {
+    err = err.slice(0, err.len() - 1);
+  }
+  return Said(err, r!.status);
+}
+
+string firstLine(string s) {
+  i32 nl = s.indexOf("\n");
+  return nl < 0 ? s : s.slice(0, nl);
+}

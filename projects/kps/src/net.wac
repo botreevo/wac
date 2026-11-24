@@ -1,0 +1,50 @@
+// A socket's next datagram, or nothing within a few milliseconds — without leaking a reader per timeout.
+//
+// **Why not `clock().within(sock.receive(), ms)`.** On the native host a receive is a thread blocked in
+// `recv_from` on its own duplicate of the socket, and cancelling the ticket does not unblock it: the thread and its
+// descriptor stay until some later datagram arrives. A loop that waits ten milliseconds at a time with `within`
+// therefore leaves a hundred blocked readers a second — measured at 440 descriptors a second on an idle listener,
+// against a limit of 20,000 — and every one of them competes for the next packet.
+//
+// So one receive is kept outstanding across waits and only the timer is ever cancelled. A datagram is never lost
+// to a timeout either: the receive that was waiting is the one that gets it.
+
+import { Ticket, TicketBase, Result } from "core";
+import { Sys, Datagrams, Datagram, HostFault } from "std";
+
+export struct Receiver {
+  Sys sys;
+  Datagrams sock;
+  Ticket<Result<Datagram, HostFault>>? pending = null;
+
+  Receiver of(Sys sys, Datagrams sock) { return Receiver { sys: sys, sock: sock }; }
+
+  /** The next datagram, or null when none arrives within `ms` (a failed receive is also null). */
+  Ticket<Datagram?> next(this, i32 ms) { return receiveWithin(this, ms); }
+
+  /** Stop: the outstanding receive is cancelled and the socket closed, so nothing is left waiting on it. */
+  void close(this) {
+    if (this.pending is not null) {
+      this.pending!.cancel();
+      this.pending = null;
+    }
+    this.sock.close();
+  }
+}
+
+async Datagram? receiveWithin(Receiver r, i32 ms) {
+  if (r.pending is null) { r.pending = r.sock.receive(); }
+  Ticket<Result<Datagram, HostFault>> p = r.pending!;
+  if (!p.done) {
+    auto timer = r.sys.clock().sleepMillis(ms);
+    TicketBase[] racing = [p, timer];
+    await Ticket.first(racing);
+    if (!p.done) { return null; }
+    timer.cancel();
+  }
+  r.pending = null;
+  match (p.value()) {
+    Ok(d): { return d; }
+    Err(_): { return null; }
+  }
+}

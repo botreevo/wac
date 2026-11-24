@@ -1,0 +1,166 @@
+// A repository's objects, read with a cache of resolved delta bases.
+//
+// wac's `readObject` resolves a deltified object by recursing to the bottom of its chain and applying every delta
+// on the way back up, every time it is asked, and git writes chains up to fifty deep. Serving a clone reads
+// every commit and tree in the repository, and neighbouring objects share most of their chain, so the same bases
+// were inflated and rebuilt over and over: that was most of a full clone's CPU.
+//
+// This walks a chain down only as far as the first object it has already resolved, then applies the deltas
+// upward, keeping each intermediate result — which is what `git`'s delta base cache does. The cache holds
+// resolved objects by pack and offset, up to a budget of bytes; when the budget is spent the oldest half goes.
+//
+// A `Store` wraps an open `Repo` and shares its pack list, so a pack stored by a push (pushed onto `packs`) is
+// seen through both.
+
+import { Vec, Map, hashI64, i64Eq } from "core";
+import { Files, Stat } from "std";
+import { encode } from "../vendor/wac/packages/codec/src/hex.wac";
+import { Got, Pack, Raw, rawAt } from "../vendor/wac/packages/git/src/pack.wac";
+import { applyDelta } from "./delta.wac";
+import { find } from "../vendor/wac/packages/git/src/idx.wac";
+import { Repo } from "../vendor/wac/packages/git/src/repo.wac";
+import { Kind, Object, readLoose } from "../vendor/wac/packages/git/src/object.wac";
+
+struct Resolved {
+  i32 kind;
+  u8[] data;
+  /** When it was last used, by the store's clock: what decides which half goes when the budget is spent. */
+  i64 used;
+}
+
+export struct Store {
+  Repo repo;
+  Files fs;
+  string gitDir;
+  Vec<Pack> packs;
+  Map<i64, Resolved> cache;
+  i64 bytes;
+  i64 budget;
+  i64 clock;
+}
+
+export Store storeOf(Repo r) {
+  return Store(r, r.fs, r.gitDir, r.packs, Map.create(hashI64, i64Eq), 0 as i64, 96 * 1048576 as i64, 0 as i64);
+}
+
+/** Pack `k`'s entry at `off`, as one key. Offsets fit in 40 bits for any pack under a terabyte. */
+i64 keyOf(i32 k, i64 off) { return ((k as i64) << 40) | off; }
+
+string hexOf(u8[] name) { return string.fromBytes(encode(name)); }
+
+i32 kindNumber(Kind k) {
+  return match (k) {
+    Commit: 1,
+    Tree: 2,
+    Blob: 3,
+    Tag: 4
+  };
+}
+
+void remember(Store s, i64 key, i32 kind, u8[] data) {
+  // An object larger than a tenth of the budget would evict everything else for one use.
+  if ((data.len() as i64) * 10 > s.budget) { return; }
+  s.clock = s.clock + 1;
+  s.cache.set(key, Resolved(kind, data, s.clock));
+  s.bytes = s.bytes + (data.len() as i64);
+  if (s.bytes <= s.budget) { return; }
+  // Over budget: forget everything used before the median of what is held. Rare, and linear when it happens.
+  i64 cut = s.clock - ((s.cache.len() / 2) as i64);
+  i64[] keys = s.cache.keys();
+  for (i32 i = 0; i < keys.len(); i++) {
+    Resolved? r = s.cache.get(keys[i]);
+    if (r is not null && r!.used < cut) {
+      s.bytes = s.bytes - (r!.data.len() as i64);
+      s.cache.remove(keys[i]);
+    }
+  }
+}
+
+/** One step down a chain: which pack and offset the base is at, or null when it is in no pack. */
+struct At {
+  i32 pack;
+  i64 off;
+}
+
+At? locate(Store s, u8[] name) {
+  for (i32 k = 0; k < s.packs.len(); k++) {
+    Pack p = s.packs.get(k);
+    i32 i = find(p.idx, name);
+    if (i >= 0) { return At(k, p.idx.offsets[i]); }
+  }
+  return null;
+}
+
+/** The object at pack `k`, offset `off`, with its whole delta chain followed. */
+Got resolve(Store s, i32 k0, i64 off0) {
+  // Down the chain, collecting deltas, until something whole or already resolved.
+  Vec<u8[]> deltas = Vec.create();
+  Vec<i64> keys = Vec.create();
+  i32 k = k0;
+  i64 off = off0;
+  i32 kind = 0;
+  u8[] base = u8[]();
+  for (i32 depth = 0; depth < 10000; depth++) {
+    i64 key = keyOf(k, off);
+    Resolved? hit = s.cache.get(key);
+    if (hit is not null) {
+      s.clock = s.clock + 1;
+      hit!.used = s.clock;
+      kind = hit!.kind;
+      base = hit!.data;
+      break;
+    }
+    match (rawAt(s.packs.get(k), off)) {
+      Damaged(why): { return Got.Absent(why); }
+      Whole(kd, data): {
+        kind = kd;
+        base = data;
+        if (deltas.len() > 0) { remember(s, key, kd, data); }
+        break;
+      }
+      FromOffset(baseOff, delta): {
+        deltas.push(delta);
+        keys.push(key);
+        off = baseOff;
+      }
+      FromName(baseName, delta): {
+        deltas.push(delta);
+        keys.push(key);
+        At? there = locate(s, baseName);
+        if (there is null) { return Got.Absent("the base \{hexOf(baseName)} of a delta is in no pack"); }
+        k = there!.pack;
+        off = there!.off;
+      }
+    }
+    if (depth == 9999) { return Got.Absent("a delta chain does not end"); }
+  }
+  // Back up, applying each delta, keeping each result: the next object down this chain starts from it.
+  for (i32 i = deltas.len() - 1; i >= 0; i--) {
+    u8[]? made = applyDelta(base, deltas.get(i));
+    if (made is null) { return Got.Absent("a delta does not apply to its base"); }
+    base = made!;
+    if (i > 0) { remember(s, keys.get(i), kind, base); }
+  }
+  return Got.Found(kind, base);
+}
+
+/** The object called `name`: in a pack, or loose. Objects are immutable, so the order is only about speed. */
+export async Got readObject(Store s, u8[] name) {
+  At? there = locate(s, name);
+  if (there is not null) { return resolve(s, there!.pack, there!.off); }
+  string hex = hexOf(name);
+  u8[]? f = (await s.fs.readFile("\{s.gitDir}/objects/\{hex.slice(0, 2)}/\{hex.slice(2, hex.len())}")).ok();
+  if (f is null) { return Got.Absent("object \{hex} is not in this repository"); }
+  match (readLoose(f!)) {
+    Loaded(kind, data): { return Got.Found(kindNumber(kind), data); }
+    Unreadable(why): { return Got.Absent("loose object \{hex}: \{why}"); }
+  }
+}
+
+/** Whether `name` is here, without reading it: an index lookup, or a loose file's existence. */
+export async bool has(Store s, u8[] name) {
+  if (locate(s, name) is not null) { return true; }
+  string hex = hexOf(name);
+  Stat? st = (await s.fs.stat("\{s.gitDir}/objects/\{hex.slice(0, 2)}/\{hex.slice(2, hex.len())}")).ok();
+  return st is not null && st!.exists;
+}

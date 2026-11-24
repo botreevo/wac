@@ -1,0 +1,346 @@
+// One HTTP request to a URL, `http://` or `https://`, through whatever proxy the environment names, and
+// the whole response back.
+//
+// The pieces were all here already and `packages/git/src/transport.wac` had joined them once, for git's
+// two endpoints. This is the same join made general: any method, any headers, a URL rather than a host
+// and a path, plain HTTP as well as TLS, an explicit port, and `NO_PROXY`. git's transport stays as it is
+// — it says it is not a general client, and now there is one to point at.
+//
+// **`Connection: close` and the whole body in memory.** The body's end is the socket's end, and the
+// response is parsed once with `eof` set, so a connection that failed half way is a failure rather than a
+// short body. Keep-alive, redirects and chunked request bodies are absent; a response may still be
+// chunked, which `parseResponse` reads.
+//
+// **Which certificates are trusted.** `SSL_CERT_FILE` when it is set — the variable OpenSSL, curl and
+// Python read, and the one a container behind an inspecting proxy sets to a bundle holding that proxy's
+// root — and the system bundle otherwise. A store that is empty refuses every `https://` request rather
+// than skipping verification, since an empty store is a misconfiguration and not a policy.
+//
+// **The proxy.** `HTTPS_PROXY` for `https://`, `HTTP_PROXY` for `http://` (each in either case), unless
+// `NO_PROXY` names the host. Through the proxy, TLS goes in a CONNECT tunnel; plain HTTP is sent to the
+// proxy with the absolute URL as its target, which is what RFC 9112 §3.2.2 has a client do.
+
+import { Clock, Env, Files, Net, Random, Socket } from "std";
+import { Buf, Result, flatten } from "core";
+import { slice } from "../../bytes/src/slice.wac";
+import { Headers } from "../../http/src/headers.wac";
+import { HostHttp, HostResponse, hostHttpOf, hostRequestAsync } from "../../http/src/hosthttp.wac";
+import { Deadline, deadlineAfter, passed, settled, timedOut, waitForAsync } from "../../http/src/deadline.wac";
+import { ParsedResponse, parseResponse } from "../../http/src/incoming.wac";
+import { ProxyAt, Tunnel, connectThroughAsync, parseProxy, proxyFor } from "../../http/src/proxy.wac";
+import { Store, pemBundle } from "../../tls/src/roots.wac";
+import { recordsReady } from "../../tls/src/record.wac";
+import { ClientStep, clientStep, tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose,
+         tlsClientPhase, tlsClientFailure } from "../../tls/src/client.wac";
+
+/** What a fetch needs from the host. */
+export struct Caps {
+  Clock clock;
+  Random random;
+  Env env;
+  Net net;
+  Files files;
+}
+
+/** A response: the status, its header fields in the order they came, and the body. */
+export struct Fetched {
+  i32 status;
+  Headers headers;
+  u8[] body;
+}
+
+/** A URL taken apart as far as a request needs. */
+export struct Target {
+  bool tls;
+  string host;
+  i32 port;
+  /** The path and query, `/` when the URL has neither. */
+  string path;
+}
+
+/**
+ * `http://host[:port]/path?query` or the same with `https`. Null for any other scheme, a missing host,
+ * or a port out of range. A fragment is dropped, as a browser drops it, since it is never sent.
+ *
+ * An IPv6 literal is taken in brackets and the brackets are kept off the host.
+ */
+export Target? parseTarget(string url) {
+  bool tls = false;
+  string rest = "";
+  if (url.len() >= 8 && lower(url.slice(0, 8)) == "https://") { tls = true; rest = url.slice(8, url.len()); }
+  else if (url.len() >= 7 && lower(url.slice(0, 7)) == "http://") { rest = url.slice(7, url.len()); }
+  else { return null; }
+  i32 hash = rest.indexOf("#");
+  if (hash >= 0) { rest = rest.slice(0, hash); }
+  i32 end = rest.len();
+  u8[] b = rest.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '/' || b[i] == '?') { end = i; break; }
+  }
+  string authority = rest.slice(0, end);
+  string path = rest.slice(end, rest.len());
+  if (path.len() == 0 || path.slice(0, 1) == "?") { path = "/" + path; }
+  // Credentials in a URL are not sent anywhere: refused rather than silently dropped.
+  if (authority.indexOf("@") >= 0) { return null; }
+  string host = authority;
+  string portText = "";
+  if (authority.len() > 0 && authority.slice(0, 1) == "[") {
+    i32 close = authority.indexOf("]");
+    if (close < 0) { return null; }
+    host = authority.slice(1, close);
+    string after = authority.slice(close + 1, authority.len());
+    if (after.len() > 0) {
+      if (after.slice(0, 1) != ":") { return null; }
+      portText = after.slice(1, after.len());
+    }
+  } else {
+    i32 colon = authority.indexOf(":");
+    if (colon >= 0) { host = authority.slice(0, colon); portText = authority.slice(colon + 1, authority.len()); }
+  }
+  if (host.len() == 0) { return null; }
+  i32 port = tls ? 443 : 80;
+  if (portText.len() > 0) {
+    port = 0;
+    for (u8 d in portText.toBytes()) {
+      if (d < '0' || d > '9') { return null; }
+      port = port * 10 + (d - '0') as i32;
+      if (port > 65535) { return null; }
+    }
+    if (port == 0) { return null; }
+  }
+  return Target(tls, lower(host), port, path);
+}
+
+string lower(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] >= 'A' && b[i] <= 'Z') { b[i] = b[i] + 32; } }
+  return string.fromBytes(b);
+}
+
+string envVar(Env env, string name) {
+  u8[]? v = flatten(env.get(name).wait()).orElse(null);
+  return v is null ? "" : string.fromBytes(v!);
+}
+
+
+
+/** The trust store `https://` verifies against: `SSL_CERT_FILE`, or the system bundle. */
+export Store trustStore(Env env, Files files) {
+  string path = envVar(env, "SSL_CERT_FILE");
+  if (path == "") { path = "/etc/ssl/certs/ca-certificates.crt"; }
+  u8[]? bundle = flatten(files.readFile(path).wait()).ok();
+  if (bundle is null) { return Store(u8[](), i32[](), 0); }
+  return pemBundle(bundle!);
+}
+
+/** The Host field's value: the port only when it is not the scheme's own. */
+string hostField(Target t) {
+  string h = t.host.indexOf(":") >= 0 ? "[" + t.host + "]" : t.host;
+  bool usual = t.tls ? t.port == 443 : t.port == 80;
+  return usual ? h : "\{h}:\{t.port}";
+}
+
+/**
+ * `method` to `url`, with `headers` (each `Name: value`) and `body`, and the response.
+ *
+ * `Host`, `Connection: close` and, when there is a body or the method is one that carries one,
+ * `Content-Length` are written here; a caller's own `Host` or `Content-Length` would contradict them and
+ * is refused. A `User-Agent` is sent unless the caller sends one.
+ */
+export Result<Fetched, string> fetch(Caps caps, string method, string url, string[] headers, u8[] body) {
+  return settled(fetchWithinAsync(caps, method, url, headers, body, 0 - 1));
+}
+
+/**
+ * `fetch`, for an `async` caller (`issues/system/0461e`): the same request, awaited at each step, so several can be in
+ * flight — raced with `Ticket.any`, the losers cancelled — and a host that cannot wait (a page that is not
+ * cross-origin isolated) can run it. `fetch` is this, waited for.
+ */
+export async Result<Fetched, string> fetchAsync(Caps caps, string method, string url, string[] headers, u8[] body) {
+  return await fetchWithinAsync(caps, method, url, headers, body, 0 - 1);
+}
+
+/**
+ * `fetch`, given up on after `timeoutMs` — the whole request, from the connection to the last byte of the body, on
+ * sockets and through `wac.http` alike (`packages/http/src/deadline.wac`). Running out is
+ * `Err("<host>: timed out after <ms>ms")`. A negative `timeoutMs` is no deadline, which is `fetch`.
+ *
+ * Not bounded yet: the `CONNECT` to a proxy (`connectThrough`), which takes no deadline of its own — a proxy that
+ * accepts and never answers holds the caller as it did.
+ */
+export Result<Fetched, string> fetchWithin(Caps caps, string method, string url, string[] headers, u8[] body,
+                                           i32 timeoutMs) {
+  return settled(fetchWithinAsync(caps, method, url, headers, body, timeoutMs));
+}
+
+/** `fetchWithin`, awaited — `fetchAsync`'s reasons. */
+export async Result<Fetched, string> fetchWithinAsync(Caps caps, string method, string url, string[] headers, u8[] body,
+                                                     i32 timeoutMs) {
+  Deadline d = deadlineAfter(caps.clock, timeoutMs);
+  Target? parsed = parseTarget(url);
+  if (parsed is null) { return Result.Err("not an http or https URL: \{url}"); }
+  Target t = parsed!;
+
+  bool agent = false;
+  for (string h in headers) {
+    string name = lower(h.indexOf(":") < 0 ? h : h.slice(0, h.indexOf(":")));
+    if (name == "host" || name == "content-length" || name == "connection" || name == "transfer-encoding") {
+      return Result.Err("the \{name} field is the client's to write");
+    }
+    if (name == "user-agent") { agent = true; }
+    if (h.indexOf("\r") >= 0 || h.indexOf("\n") >= 0) { return Result.Err("a header field holds a line break"); }
+  }
+
+  // **The host's HTTP, where it has one** (`packages/http/src/hosthttp.wac`) — a page's `fetch`. The host does TLS,
+  // proxies and the trust store itself, so none of what follows applies, and what comes back is what it exposes.
+  HostHttp? viaHost = hostHttpOf(caps.net);
+  if (viaHost is not null) {
+    auto answered = await hostRequestAsync(viaHost!, method, url, headers, body, timeoutMs);
+    if (answered.isErr()) { return Result.Err("\{t.host}: \{answered.err()!}"); }
+    HostResponse r = answered.unwrap();
+    return Result.Ok(Fetched(r.status, r.headers, r.body));
+  }
+
+  string proxyVar = proxyFor(caps.env, t.tls, t.host);
+  ProxyAt? proxy = null;
+  if (proxyVar != "") {
+    proxy = parseProxy(proxyVar);
+    if (proxy is null) { return Result.Err("the proxy variable is not a proxy this can parse: \{proxyVar}"); }
+  }
+
+  // Plain HTTP through a proxy names the whole URL; everything else names the path.
+  string target = (!t.tls && proxy is not null) ? (t.tls ? "https://" : "http://") + hostField(t) + t.path : t.path;
+  Buf head = Buf.create();
+  head.pushStr("\{method} \{target} HTTP/1.1\r\nHost: \{hostField(t)}\r\n");
+  if (!agent) { head.pushStr("User-Agent: wac\r\n"); }
+  for (string h in headers) { head.pushStr(h + "\r\n"); }
+  if (body.len() > 0 || method == "POST" || method == "PUT" || method == "PATCH") {
+    head.pushStr("Content-Length: \{body.len()}\r\n");
+  }
+  head.pushStr("Connection: close\r\n\r\n");
+  head.pushAll(body);
+  u8[] request = head.take();
+
+  Result<u8[], string> raw = t.tls ? await overTls(caps, d, t, proxy, request) : await plain(caps, d, t, proxy, request);
+  if (raw.isErr()) { return Result.Err(raw.err()!); }
+  u8[] got = raw.unwrap();
+  if (got.len() == 0) { return Result.Err("\{t.host} closed the connection without answering"); }
+  match (parseResponse(got, method.toBytes(), true, 1 << 28)) {
+    Incomplete: { return Result.Err("the response from \{t.host} ended mid-message"); }
+    Bad(code): { return Result.Err("unparseable response from \{t.host} (\{code})"); }
+    Ok(res): { return Result.Ok(Fetched(res.status, res.headers, res.body)); }
+  }
+}
+
+/** Every byte the socket gives until it ends. */
+async Result<u8[], string> plain(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[] request) {
+  string dialHost = proxy is null ? t.host : proxy!.host;
+  i32 dialPort = proxy is null ? t.port : proxy!.port;
+  auto connected = await waitForAsync(d, caps.net.connect(dialHost, dialPort));
+  if (connected.isErr()) { return Result.Err("\{dialHost}:\{dialPort}: \{connected.err()!}"); }
+  Socket s = connected.unwrap();
+  if ((await waitForAsync(d, s.send(request))).isErr()) {
+    s.close();
+    if (passed(d)) { return Result.Err("\{dialHost}:\{dialPort}: \{timedOut(d)}"); }
+    return Result.Err("\{dialHost}:\{dialPort}: cannot send the request");
+  }
+  Buf all = Buf.create();
+  while (true) {
+    bool done = false;
+    match (await waitForAsync(d, s.recv())) {
+      Ok(r): {
+        match (r) {
+          Data(bytes): { all.pushAll(bytes); }
+          default: { done = true; }
+        }
+      }
+      // A connection that failed half way is not a short body: see the header.
+      Err(e): { s.close(); return Result.Err("\{t.host}: \{e}"); }
+    }
+    if (done) { break; }
+  }
+  s.close();
+  return Result.Ok(all.take());
+}
+
+/**
+ * The request over TLS, and the plaintext that came back. The same loop as git's transport, whose header
+ * records the three things that are easy to get wrong in it: the tunnel's leftover is fed first,
+ * `tlsClientInit` takes seconds, and phase 4 after a body is a `close_notify` rather than a failure.
+ */
+async Result<u8[], string> overTls(Caps caps, Deadline d, Target t, ProxyAt? proxy, u8[] request) {
+  Store store = trustStore(caps.env, caps.files);
+  if (store.offsets.len() == 0) { return Result.Err("no trust store, so \{t.host} cannot be verified"); }
+
+  Socket? conn = null;
+  u8[] buffered = u8[]();
+  if (proxy is null) {
+    auto direct = await waitForAsync(d, caps.net.connect(t.host, t.port));
+    if (direct.isErr()) { return Result.Err("\{t.host}:\{t.port}: \{direct.err()!}"); }
+    conn = direct.unwrap();
+  } else {
+    match (await connectThroughAsync(caps.net, proxy!.host, proxy!.port, t.host, t.port)) {
+      Ok(open): { conn = open.socket; buffered = open.leftover; }
+      Err(e): { return Result.Err(e); }
+    }
+  }
+  Socket sock = conn!;
+
+  ClientStep s = clientStep(tlsClientInit(
+    t.host.toBytes(), store.der, store.offsets,
+    (await caps.random.bytes(32)).unwrap(),
+    (await caps.random.bytes(32)).unwrap(),
+    (await caps.random.bytes(64)).unwrap(),
+    (await caps.random.bytes(32)).unwrap(),
+    (await caps.clock.nowMillis()).unwrap() / 1000));
+  if ((await waitForAsync(d, sock.send(s.toSend))).isErr()) {
+    sock.close();
+    if (passed(d)) { return Result.Err("\{t.host}: \{timedOut(d)}"); }
+    return Result.Err("\{t.host}: cannot send the client hello");
+  }
+
+  Buf got = Buf.create();
+  bool requested = false;
+  while (true) {
+    i32 phase = tlsClientPhase(s.state);
+    if (phase == 4) {
+      if (got.len > 0) { break; }
+      sock.close();
+      return Result.Err("TLS to \{t.host} failed (code \{tlsClientFailure(s.state)})");
+    }
+    if (phase == 3 && !requested) {
+      ClientStep out = clientStep(tlsClientSend(s.state, request));
+      s = ClientStep(out.state, out.toSend, u8[]());
+      if ((await waitForAsync(d, sock.send(s.toSend))).isErr()) { break; }
+      requested = true;
+    }
+    i32 ready = recordsReady(buffered);
+    if (ready > 0) {
+      ClientStep step = clientStep(tlsClientFeed(s.state, slice(buffered, 0, ready)));
+      buffered = slice(buffered, ready, buffered.len());
+      s = step;
+      if (s.toSend.len() > 0 && (await waitForAsync(d, sock.send(s.toSend))).isErr()) { break; }
+      if (s.appData.len() > 0) { got.pushAll(s.appData); }
+      continue;
+    }
+    bool closed = false;
+    match (await waitForAsync(d, sock.recv())) {
+      Ok(r): {
+        match (r) {
+          Data(bytes): {
+            u8[] joined = u8[].filled(buffered.len() + bytes.len(), 0);
+            joined.copyFrom(buffered, 0, 0, buffered.len());
+            joined.copyFrom(bytes, 0, buffered.len(), bytes.len());
+            buffered = joined;
+          }
+          default: { closed = true; }
+        }
+      }
+      Err(e): { sock.close(); return Result.Err("\{t.host}: \{e}"); }
+    }
+    if (closed) { break; }
+  }
+  clientStep(tlsClientClose(s.state));
+  sock.close();
+  return Result.Ok(got.take());
+}

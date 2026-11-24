@@ -1,0 +1,67 @@
+// A small shell: runs the SQL in a file (or standard input) against a database file, printing each
+// statement's rows. `wac run --allow-read --allow-write tools/sql.wac -- [db] [script.sql]`.
+// With no database, an in-memory one; changes to a file database are written back after each commit.
+
+import { Sys } from "std";
+import { flatten, Buf } from "core";
+import { Connection } from "../src/engine.wac";
+import { SqliteFile } from "../src/file.wac";
+import { parseOne, isBlank } from "../src/parser.wac";
+import { Value } from "../src/value.wac";
+import { sqlLiteral } from "../src/format.wac";
+
+export i32 main(Sys sys) {
+  string[] args = sys.args();
+  string? dbPath = args.len() > 0 && args[0] != "-" ? args[0] : null;
+  Connection c = Connection.memory();
+  SqliteFile? file = null;
+  if (dbPath is not null) {
+    match (SqliteFile.open(sys.files(), dbPath!)) {
+      Ok(f): { file = f; c = f.conn; }
+      Err(e): { sys.stderr().line(e.describe()).wait(); return 1; }
+    }
+  }
+  string sql = "";
+  if (args.len() > 1) {
+    sql = string.fromBytes(flatten(sys.files().readFile(args[1]).wait()).unwrap());
+  } else {
+    sql = string.fromBytes(sys.stdin().readAll().wait().unwrap().orElse(u8[]()));
+  }
+  string? rest = sql;
+  i32 status = 0;
+  while (rest is not null && !isBlank(rest!)) {
+    match (parseOne(rest!)) {
+      Ok(p): {
+        rest = p.rest;
+        match (c.run(p.stmt, Value[]())) {
+          Ok(rows): {
+            for (i32 r = 0; r < rows.rows.len(); r++) {
+              Value[] vals = rows.rows.get(r);
+              Buf line = Buf.create();
+              for (i32 k = 0; k < vals.len(); k++) {
+                if (k > 0) { line.pushStr("|"); }
+                line.pushStr(sqlLiteral(vals[k]));
+              }
+              sys.stdout().line(line.toStr()).wait();
+            }
+          }
+          Err(e): { sys.stdout().line("error: " + e.describe()).wait(); status = 1; }
+        }
+        if (file is not null) {
+          match (file!.saveIfChanged()) {
+            Ok: {}
+            Err(e): { sys.stderr().line(e.describe()).wait(); return 1; }
+          }
+        }
+      }
+      Err(e): {
+        // As SQLite's shell does, report it and go on, from the end of the line it ends on.
+        sys.stdout().line("error: " + e.describe()).wait();
+        status = 1;
+        i32 end = rest!.indexOf(";\n");
+        rest = end < 0 ? null : rest!.slice(end + 2, rest!.len());
+      }
+    }
+  }
+  return status;
+}

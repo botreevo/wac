@@ -1,0 +1,74 @@
+// One source is one module, from wherever `wac build` is run and however its entry is spelled.
+// `issues/lang/0270a`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/wac/test/wac/entrykey_test.wac
+//
+// A file's key is what a build's bytes are spelled from: the manifest's `entry`, and the name of every generic
+// instantiated over a type the project declares. It was measured from the working directory, so the same project
+// built from its root, from two levels above it and from the entry's own directory gave three modules —
+// keyed from the root, from in/proj and from the entry itself — and an absolute entry a fourth. Each build here writes
+// to `out/m` in the same place, so the manifest's `wasm` name is the same and the bytes are the whole claim.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { binaryPath, freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+
+async Exec wac(Env env, Procs procs, string dir, string[] args) {
+  return (await procs.exec(binaryPath(env), args, u8[](), ChildEnv.inherited(), Launch(dir, false, false, false, false))).unwrap();
+}
+
+string said(Exec r) { return string.fromBytes(r.stdout) + string.fromBytes(r.stderr); }
+
+/** `<dir>/in/proj`, a project whose entry uses a generic from another file over a type of its own. */
+string project(Files fs, T t, string dir) {
+  string proj = "\{dir}/in/proj";
+  t.eqStr(putFile(fs, "\{proj}/wac.json5", "{}\n"), "", "wac.json5");
+  t.eqStr(putFile(fs, "\{proj}/packages/a/box.wac",
+                  "export struct Box<T> { T item; }\nexport Box<T> boxed<T>(T item) { return Box<T>(item); }\n"), "", "box.wac");
+  t.eqStr(putFile(fs, "\{proj}/packages/a/m.wac",
+                  "import { Box, boxed } from \"./box.wac\";\nstruct Thing { i32 n; }\n" +
+                  "export i32 main() { Box<Thing> b = boxed<Thing>(Thing(7)); return b.item.n; }\n"), "", "m.wac");
+  t.eqStr(putFile(fs, "\{proj}/packages/a/bad.wac", "export i32 main() { return \"s\"; }\n"), "", "bad.wac");
+  return proj;
+}
+
+async u8[] built(Sys sys, T t, string from, string entry, string out) {
+  Exec r = await wac(sys.env(), sys.procs(), from, ["build", entry, "-o", out, "--no-cache"]);
+  t.eqI32(r.status, 0, "build \{entry} from \{from} — \{said(r)}");
+  return (await sys.files().readFile("\{out}.wasm")).orElse(u8[]());
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export async string test_a_build_is_the_same_from_any_directory_and_any_spelling(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "entrykey");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  string proj = project(sys.files(), t, dir);
+  u8[] root = await built(sys, t, proj, "packages/a/m.wac", "\{dir}/out1/m");
+  t.isTrue(root.len() > 0, "the build from the root wrote a module");
+  t.isTrue(contains(string.fromBytes(root), "\"entry\": \"packages/a/m.wac\""), "the entry, from the project's root");
+  t.isTrue(same(root, await built(sys, t, dir, "in/proj/packages/a/m.wac", "\{dir}/out2/m")), "from above the project");
+  t.isTrue(same(root, await built(sys, t, "\{proj}/packages/a", "m.wac", "\{dir}/out3/m")), "from the entry's directory");
+  t.isTrue(same(root, await built(sys, t, dir, "\{proj}/packages/a/m.wac", "\{dir}/out4/m")), "spelled absolutely");
+  return t.report();
+}
+
+/** The keys are the project's; a diagnostic is still in the terms of the directory it was run from. */
+export async string test_a_diagnostic_names_the_file_as_the_command_line_did(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "entrykey_diag");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  string proj = project(sys.files(), t, dir);
+  Exec above = await wac(sys.env(), sys.procs(), dir, ["build", "in/proj/packages/a/bad.wac", "-o", "\{dir}/bad"]);
+  t.isTrue(above.status != 0, "refused");
+  t.isTrue(contains(said(above), "--> in/proj/packages/a/bad.wac:1:28"), "from above — \{said(above)}");
+  Exec here = await wac(sys.env(), sys.procs(), "\{proj}/packages/a", ["build", "bad.wac", "-o", "\{dir}/bad"]);
+  t.isTrue(contains(said(here), "--> bad.wac:1:28"), "from its directory — \{said(here)}");
+  return t.report();
+}

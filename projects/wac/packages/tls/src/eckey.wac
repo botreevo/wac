@@ -1,0 +1,60 @@
+// A P-256 private key as SEC1's `ECPrivateKey` (RFC 5915) — `-----BEGIN EC PRIVATE KEY-----`.
+//
+//     ECPrivateKey ::= SEQUENCE {
+//       version        INTEGER { ecPrivkeyVer1(1) },
+//       privateKey     OCTET STRING,                      -- the 32-byte scalar
+//       parameters [0] ECParameters {{ NamedCurve }} OPTIONAL,
+//       publicKey  [1] BIT STRING OPTIONAL }              -- 0x04 || X || Y
+//
+// The form `openssl ec` writes and reads, which is the point: a key a program keeps on disk is one an
+// operator should be able to inspect with the tool they already have. Both optional fields are written, and
+// on reading the curve must be P-256 if named and the public key must be the scalar's if present — a file
+// whose two halves disagree is a file somebody edited, and taking either half would be a guess.
+
+import { p256PublicKey } from "../../crypto/src/p256.wac";
+import { Der, tagInteger, tagOctetString, tagSequence, tagContext, oidPrime256v1, oidEquals } from "./asn1.wac";
+import { derSequence, derIntegerSmall, derTlv, derOid, derExplicit, derBitString, derConcat } from "./derwrite.wac";
+
+/** The SEC1 DER for a 32-byte P-256 scalar, or empty if it is not one. */
+export u8[] ecPrivateKeyP256(u8[] priv) {
+  if (priv.len() != 32) { return u8[](); }
+  u8[] pub = p256PublicKey(priv);
+  if (pub.len() != 65) { return u8[](); }
+  u8[][] p = u8[][].defaulted(4);
+  p[0] = derIntegerSmall(1);
+  p[1] = derTlv(tagOctetString(), priv);
+  p[2] = derExplicit(0, derOid(oidPrime256v1()));
+  p[3] = derExplicit(1, derBitString(pub));
+  return derSequence(derConcat(p));
+}
+
+/**
+ * The 32-byte scalar inside SEC1 DER, or null.
+ *
+ * Null for anything but version 1 with a 32-byte key, a curve other than P-256 when one is named, or a public
+ * key that is not the scalar's when one is present.
+ */
+export u8[]? parseEcPrivateKeyP256(u8[] der) {
+  Der top = Der.create(der);
+  Der seq = top.element(tagSequence());
+  if (top.failed() || !top.empty()) { return null; }
+  u8[] version = seq.element(tagInteger()).rest();
+  if (seq.failed() || version.len() != 1 || version[0] != 1) { return null; }
+  u8[] priv = seq.element(tagOctetString()).rest();
+  if (seq.failed() || priv.len() != 32) { return null; }
+  u8[] pub = p256PublicKey(priv);
+  if (pub.len() != 65) { return null; }
+  if (seq.nextIs(tagContext(0))) {
+    Der params = seq.element(tagContext(0));
+    u8[] curve = params.oid();
+    if (seq.failed() || params.failed() || !oidEquals(curve, oidPrime256v1())) { return null; }
+  }
+  if (seq.nextIs(tagContext(1))) {
+    Der wrapped = seq.element(tagContext(1));
+    u8[] bits = wrapped.bitString();
+    if (seq.failed() || wrapped.failed() || bits.len() != 65) { return null; }
+    for (i32 i = 0; i < 65; i++) { if (bits[i] != pub[i]) { return null; } }
+  }
+  if (seq.failed() || !seq.empty()) { return null; }
+  return priv;
+}

@@ -1,0 +1,320 @@
+// Crashes during commits: a wacuum on a store is killed (SIGKILL, the whole process tree) at random moments while
+// it imports blocks — most often in the middle of a block's commit, which is most of the time an import takes —
+// then started again, and must come back to the same chain and state as a node that was never killed.
+//
+// A wacuum in memory first builds the chain: blocks that each write hundreds of new slots and fund a new account,
+// their payloads kept. A second wacuum, on a store, is then given those payloads as a consensus client gives them
+// (newPayload, then forkchoiceUpdated), and killed 0–300 ms into one in BLOCKS/KILLS of them (an import takes
+// ~120–250 ms here, so the kills fall before, in and after commits — the count of each is printed); each
+// restart goes on from its store and its block log, and the payloads are given again from the head it reports.
+// Every payload it accepts is checked against its header's state root, so a store left wrong by a crash shows at
+// the next block. At the end its head, and slots and balances across the whole chain, must be the first node's.
+// Every tenth block is preceded by a side chain of one or two empty blocks, which the store node is given and made
+// the head of before the next main block takes it back: reorgs, with kills in them too, and restarts that must
+// move the store back across blocks they did not run (their undo records, `src/store/undo.wac`).
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/crash.wac [BLOCKS] [KILLS] [FLUSH] [torn]
+//
+// BLOCKS defaults to 200, KILLS to 40, FLUSH (the store node's --flush-every) to 1: each block written as it
+// goes. With FLUSH above 1 the store stages blocks and writes them together, so most kills fall between flushes
+// and a restart replays the blocks since the last one from the log; how many is printed.
+//
+// A kill is not a power cut: what the process wrote, the kernel keeps. With `torn` (root, Linux, xfsprogs) each kill
+// is one: the store node's data is on ext4 on a loop device writing straight (direct I/O) to an image file, and at
+// the kill's moment that image is cloned — a reflink on the XFS it sits on, atomic against the writes — and the node
+// restarted on the clone, after ext4's own journal recovery at mount. What had reached the device is there; what
+// was in the page cache — written, not yet synced — is lost, as at a power cut on a disk that loses nothing it
+// acknowledged. (A disk losing acknowledged but unflushed writes, and any order of them, is the store's own tests'
+// model: `test/store_test.wac`, a commit cut short anywhere.)
+
+import { Sys } from "std";
+import { Vec, Ticket, strings } from "core";
+import { json.JsonValue, json.stringify } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { systemContracts } from "../../src/chain/dev.wac";
+import { Check, Proc, Rpc, Reply, shell, tempDir, removeDir, somePort, addressOf, createAddress, type2, field, quantity, trim } from "./kit.wac";
+
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+static i32 SLOTS = 150;
+
+/** A block as a consensus client hands it over: newPayloadV4's parameters, and its hash. */
+struct Given {
+  string params;
+  string hash;
+  u64 number;
+  bool side;
+  /** The block finalized with it: itself on the main chain; on a side chain, the main block it branches from. */
+  string finalized;
+}
+
+string runtime() {
+  string k = bytesToHex([((SLOTS >> 8) & 255) as! u8, (SLOTS & 255) as! u8]).slice(2, 6);
+  string k2 = bytesToHex([(((2 * SLOTS) >> 8) & 255) as! u8, ((2 * SLOTS) & 255) as! u8]).slice(2, 6);
+  return "61" + k + "5b" + "80" + "15" + "61001e" + "57" + "43" + "81" + "600035" + "01" + "43" + "61" + k2 + "02" + "01" + "55" +
+         "600190" + "03" + "600356" + "5b00";
+}
+
+u8[] hexBytes(string h) {
+  u8[] out = u8[].filled(h.len() / 2, 0);
+  u8[] d = h.toBytes();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = ((nibble(d[2 * i]) << 4) | nibble(d[2 * i + 1])) as! u8; }
+  return out;
+}
+
+i32 nibble(u8 c) { return c >= 97 ? (c as i32) - 87 : (c as i32) - 48; }
+
+i32 parse(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + ((b[i] as i32) - 48); }
+  return n;
+}
+
+string fc(string h) { return fcWith(h, h); }
+
+/** A fork choice whose safe and finalized block is `fin`: a side chain's blocks are never finalized. */
+string fcWith(string h, string fin) { return "{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{fin}\",\"finalizedBlockHash\":\"\{fin}\"}"; }
+
+async Proc start(Sys sys, string app, string dir, string data, i32 port, bool store, i32 flush, string tag) {
+  string[] argv = [app, "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--public-rpc", "--port", "\{port}",
+                   "--datadir", data, store ? "--store" : "--snapshot-every", store ? "--flush-every" : "1000000", store ? "\{flush}" : "--public-rpc"];
+  // The node's output beside the test's directory, never in its data: on the torn disk, this process holding it open
+  // kept the disk from being unmounted at a cut (power cut 4 of 40, 10 of 40, in the first full runs).
+  Proc p = await Proc.start(sys, argv, dir + "/" + data.slice(strings.lastIndexOf(data, "/") + 1, data.len()) + tag + ".log");
+  await p.says(sys, "Engine API on", 300000);
+  // Answering, and this process rather than one before it: anything the test asks next is about this one.
+  Rpc u = Rpc.at(sys, port);
+  for (i32 i = 0; i < 100 && (await u.text("eth_blockNumber", "[]")) == ""; i++) { await sys.sleepMillis(100); }
+  return p;
+}
+
+/** For `torn`: an XFS image (reflinks) holding the disk image, ext4 on it by a direct-I/O loop, mounted at dir/mnt. */
+async string mountTorn(Sys sys, string dir) {
+  return await shell(sys, "set -e; cd \{dir}; truncate -s 6G xfs.img; mkfs.xfs -q -m reflink=1 xfs.img; mkdir -p x mnt; " +
+                          "mount -o loop xfs.img x; truncate -s 3G x/disk.img; mkfs.ext4 -q -F x/disk.img; " +
+                          "mount \"$(losetup --direct-io=on -f --show x/disk.img)\" mnt && echo mounted");
+}
+
+/** The disk as it is this instant, cloned: what a power cut now would leave. */
+async void cutPower(Sys sys, string dir) { await shell(sys, "cp --reflink=always \{dir}/x/disk.img \{dir}/x/cut.img"); }
+
+/** The running disk let go and the clone put in its place, mounted — ext4 replays its journal as it would at boot. */
+async string bootFromCut(Sys sys, string dir) {
+  // The unmount tried for a while: a process just killed can hold the disk a moment longer (in the first full runs,
+  // at one cut in 20 or so, "target is busy"); who still holds it is said if it never lets go.
+  return await shell(sys, "set -e; cd \{dir}; dev=$(findmnt -no SOURCE mnt); " +
+                          "i=0; until umount mnt 2>/dev/null; do i=$((i+1)); if [ $i -ge 50 ]; then fuser -vm mnt 2>&1; exit 1; fi; sleep 0.2; done; " +
+                          "losetup -d $dev 2>&1; mv x/cut.img x/disk.img; mount \"$(losetup --direct-io=on -f --show x/disk.img)\" mnt 2>&1 && echo mounted");
+}
+
+async void unmountTorn(Sys sys, string dir) {
+  await shell(sys, "cd \{dir}; dev=$(findmnt -no SOURCE mnt); umount mnt; losetup -d $dev; dev=$(findmnt -no SOURCE x); umount x; " +
+                   "[ -n \"$dev\" ] && losetup -d $dev 2>/dev/null; rm -f xfs.img");
+}
+
+/** The process and everything under it, killed at once with no chance to finish anything. */
+async void killHard(Sys sys, string pid) {
+  // And gone, before anything starts on its port: a restart that raced it for the port would not listen.
+  await shell(sys, "k() { for c in $(pgrep -P $1); do k $c; done; kill -9 $1 2>/dev/null; }; k \{pid}; " +
+                   "while kill -0 \{pid} 2>/dev/null && ! grep -q '^State:.*Z' /proc/\{pid}/status 2>/dev/null; do sleep 0.05; done");
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  i32 blocks = args.len() > 0 ? parse(args[0]) : 200;
+  i32 kills = args.len() > 1 ? parse(args[1]) : 40;
+  i32 flush = args.len() > 2 ? parse(args[2]) : 1;
+  bool torn = args.len() > 3 && args[3] == "torn";
+  Check t = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-crash");
+  if (torn && !t.that(trim(await mountTorn(sys, dir)) == "mounted", "the store node's disk: ext4 on a direct-I/O loop, on XFS for clones")) {
+    return t.done();
+  }
+  string app = dir + "/wacuum";
+  await shell(sys, "wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o \{app} > /dev/null 2>&1");
+  u8[] key = u8[].filled(32, 0x11);
+  string me = addressOf(key);
+  await sys.writeFile(dir + "/genesis.json", ("{\"config\":{\"chainId\":1337,\"cancunTime\":0,\"pragueTime\":0},\"gasLimit\":\"0x2faf080\"," +
+    "\"baseFeePerGas\":\"0x3b9aca00\",\"timestamp\":\"0x0\",\"alloc\":{\"\{me}\":{\"balance\":\"0xd3c21bcecceda1000000\"}," + systemContracts() + "}}").toBytes());
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+
+  // The chain, built by a wacuum in memory.
+  i32 portA = await somePort(sys, 30000, 10000);
+  Proc a = await start(sys, app, dir, dir + "/a", portA, false, 1, "");
+  Rpc ua = Rpc.at(sys, portA);
+  Rpc ea = Rpc.authed(sys, portA, secret);
+  string head = field(await ua.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash");
+  u64 time = 12;
+  Vec<Given> chain = Vec.create();
+  string code = runtime();
+  string len = bytesToHex([((code.len() / 2) & 255) as! u8]).slice(2, 4);
+  u64 nonce = 0;
+  string contract = createAddress(me, 0);
+  i32 sides = 0;
+  for (i32 b = 0; b < blocks; b++) {
+    // Every tenth block, first a side chain of one or two empty blocks on the head, given to the store node and
+    // then left: the next main block takes it back across them — a reorg, which kills land in too.
+    if (b % 10 == 5) {
+      string at = head;
+      for (i32 k = 0; k < 1 + (b / 10) % 2; k++) {
+        string sattrs = "{\"timestamp\":\"\{U256.ofU64(time + 1 + (k as@ u32) as u64).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                        "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fd\",\"withdrawals\":[],\"parentBeaconBlockRoot\":\"\{ZERO}\"}";
+        string sid = field(await ea.get("engine_forkchoiceUpdatedV3", "[\{fcWith(at, head)},\{sattrs}]"), "payloadId");
+        JsonValue? sp = (await ea.call("engine_getPayloadV4", "[\"\{sid}\"]")).result();
+        if (sp is null) { break; }
+        string sparams = "[\{string.fromBytes(stringify(sp!.member("executionPayload")!))},[],\"\{ZERO}\",\{string.fromBytes(stringify(sp!.member("executionRequests")!))}]";
+        string sh = field(sp!.member("executionPayload"), "blockHash");
+        if (field(await ea.get("engine_newPayloadV4", sparams), "status") != "VALID") { break; }
+        await ea.get("engine_forkchoiceUpdatedV3", "[\{fcWith(sh, head)},null]");
+        chain.push(Given(sparams, sh, quantity(field(sp!.member("executionPayload"), "blockNumber")), true, head));
+        sides++;
+        at = sh;
+      }
+      // The first node back on its main chain.
+      await ea.get("engine_forkchoiceUpdatedV3", "[\{fc(head)},null]");
+      time += 4;
+    }
+    if (b == 0) {
+      await ua.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, "", U256.zero(), hexBytes("60" + len + "600c60003960" + len + "6000f3" + code), 200000)}\"]");
+      nonce++;
+    } else {
+      for (i32 k = 0; k < 2; k++) {
+        await ua.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, contract, U256.zero(), U256.ofU64(((k * SLOTS) as@ u32) as u64).toBytes(), 5000000)}\"]");
+        nonce++;
+      }
+      string fresh = bytesToHex(U256.ofU64(0x7000000 + ((b as@ u32) as u64)).toBytes()).slice(26, 66);
+      await ua.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, nonce, "0x" + fresh, U256.ofU64(((b as@ u32) as u64) + 1), u8[].filled(0, 0), 21000)}\"]");
+      nonce++;
+    }
+    string attrs = "{\"timestamp\":\"\{U256.ofU64(time).toHex()}\",\"prevRandao\":\"\{ZERO}\"," +
+                   "\"suggestedFeeRecipient\":\"0x00000000000000000000000000000000000000fe\",\"withdrawals\":[],\"parentBeaconBlockRoot\":\"\{ZERO}\"}";
+    time += 12;
+    string id = field(await ea.get("engine_forkchoiceUpdatedV3", "[\{fc(head)},\{attrs}]"), "payloadId");
+    JsonValue? p = (await ea.call("engine_getPayloadV4", "[\"\{id}\"]")).result();
+    if (p is null) { break; }
+    string params = "[\{string.fromBytes(stringify(p!.member("executionPayload")!))},[],\"\{ZERO}\",\{string.fromBytes(stringify(p!.member("executionRequests")!))}]";
+    string h = field(p!.member("executionPayload"), "blockHash");
+    if (field(await ea.get("engine_newPayloadV4", params), "status") != "VALID") { break; }
+    await ea.get("engine_forkchoiceUpdatedV3", "[\{fc(h)},null]");
+    chain.push(Given(params, h, quantity(field(p!.member("executionPayload"), "blockNumber")), false, h));
+    head = h;
+  }
+  t.that(chain.len() == blocks + sides, "the first node built \{blocks} blocks, and \{sides} on side chains for the reorgs");
+
+  // The same chain into a wacuum on a store, killed at random as it goes.
+  i32 portB = await somePort(sys, 40000, 20000);
+  string dataB = torn ? dir + "/mnt/b" : dir + "/b";
+  Proc b = await start(sys, app, dir, dataB, portB, true, flush, "-0");
+  // What each kill hit, for a run that comes back wrong (issues/open/0009d).
+  string events = "";
+  Rpc ub = Rpc.at(sys, portB);
+  Rpc eb = Rpc.authed(sys, portB, secret);
+  i32 killed = 0;
+  i32 restarts = 0;
+  i32 lost = 0;
+  i32 kept = 0;
+  i32 replayedMost = 0;
+  i32 replayedAll = 0;
+  i32 next = 0;
+  bool stuck = false;
+  i32 tries = 0;
+  while (next < chain.len() && !stuck) {
+    tries++;
+    if (tries > chain.len() * 4) {
+      stuck = true;
+      break;
+    }
+    Given g = chain.get(next);
+    u8[] rnd = (await sys.random().bytes(2)).ok()!;
+    bool kill = killed < kills && ((rnd[0] as i32) * blocks) < 256 * kills;
+    if (kill) {
+      // The payload sent, and the node killed a random few milliseconds into importing it.
+      Ticket<Reply> sent = eb.call("engine_newPayloadV4", g.params);
+      u8[] more = (await sys.random().bytes(2)).ok()!;
+      await sys.sleepMillis(((rnd[1] as i32) * 256 + (more[0] as i32)) % 300);
+      if (torn) { await cutPower(sys, dir); }
+      await killHard(sys, b.pid);
+      killed++;
+      string booted = torn ? trim(await bootFromCut(sys, dir)) : "mounted";
+      if (!t.that(booted == "mounted", "the disk as cut by power cut \{killed} mounts \{booted == "mounted" ? "" : booted}")) {
+        stuck = true;
+        break;
+      }
+      b = await start(sys, app, dir, dataB, portB, true, flush, "-\{restarts + 1}");
+      restarts++;
+      // Given again from where it says it is.
+      string n = await ub.text("eth_blockNumber", "[]");
+      if (n == "") {
+        t.that(false, "the node answers after kill \{killed}; it said:\n\{await b.output(sys)}");
+        stuck = true;
+        break;
+      }
+      // Where the kill fell, by what the store says it holds as it starts: the block being imported (number
+      // next + 1) committed or not. The head moves only with the next forkchoiceUpdated, which a killed import
+      // never got, so it is given again from the head either way.
+      string said = await b.output(sys);
+      i32 mark = said.indexOf("the store holds the state of block ");
+      i32 holds = -1;
+      if (mark >= 0) {
+        u8[] rest = said.slice(mark + 35, said.len()).toBytes();
+        holds = 0;
+        for (i32 e = 0; e < rest.len() && rest[e] >= 48 && rest[e] <= 57; e++) { holds = holds * 10 + ((rest[e] as i32) - 48); }
+      }
+      if (holds >= (g.number as! i32)) { kept++; } else { lost++; }
+      // The blocks the restart replayed from the log: those since the store's last write. None when the store is
+      // ahead of the head, the killed block committed and its forkchoiceUpdated never sent.
+      i32 replayed = (quantity(n) as! i32) - holds;
+      if (replayed < 0) { replayed = 0; }
+      replayedMost = replayed > replayedMost ? replayed : replayedMost;
+      replayedAll += replayed;
+      events += "kill \{killed}: \{g.side ? "side " : ""}block \{g.number} (\{next + 1} of the stream), the store holding \{holds}, the head \{quantity(n)}, \{replayed} replayed\n";
+      // Given again from just after its head, wherever that is in the stream: on a side chain, or the main one.
+      string at = field(await ub.get("eth_getBlockByNumber", "[\"latest\",false]"), "hash");
+      next = 0;
+      for (i32 i = 0; i < chain.len(); i++) {
+        if (chain.get(i).hash == at) { next = i + 1; }
+      }
+      continue;
+    }
+    string st = field(await eb.get("engine_newPayloadV4", g.params), "status");
+    if (st != "VALID") {
+      t.that(false, "\{g.side ? "side " : ""}block \{g.number} (\{next + 1} of the stream) after \{killed} kills: \{st}");
+      stuck = true;
+      break;
+    }
+    await eb.get("engine_forkchoiceUpdatedV3", "[\{fcWith(g.hash, g.finalized)},null]");
+    next++;
+  }
+  t.that(!stuck, "every block went in, \{killed} kills and restarts along the way (\{lost} with the block being imported not in the store, \{kept} with it in); flushing every \{flush}, each restart replayed up to \{replayedMost} blocks from the log, \{replayedAll} in all");
+  // Once more, cleanly, from the store alone.
+  await b.stop(sys);
+  b = await start(sys, app, dir, dataB, portB, true, flush, "-final");
+  JsonValue? hb = await ub.get("eth_getBlockByNumber", "[\"latest\",false]");
+  JsonValue? ha = await ua.get("eth_getBlockByNumber", "[\"latest\",false]");
+  t.that(field(hb, "hash") == field(ha, "hash") && field(hb, "stateRoot") == field(ha, "stateRoot"),
+         "the same head and state root as the node never killed: \{quantity(field(hb, "number"))} \{field(hb, "stateRoot")}");
+  i32 differ = 0;
+  for (i32 n = 1; n < blocks; n += 7) {
+    string slot = "[\"\{contract}\",\"\{U256.ofU64(((n as@ u32) as u64) * 2 * ((SLOTS as@ u32) as u64) + 3).toHex()}\",\"latest\"]";
+    if (await ub.text("eth_getStorageAt", slot) != await ua.text("eth_getStorageAt", slot)) { differ++; }
+    string fresh = "0x" + bytesToHex(U256.ofU64(0x7000000 + ((n as@ u32) as u64)).toBytes()).slice(26, 66);
+    string bal = "[\"\{fresh}\",\"latest\"]";
+    if (await ub.text("eth_getBalance", bal) != await ua.text("eth_getBalance", bal)) { differ++; }
+  }
+  t.that(differ == 0, "slots and balances across the chain the same: \{differ} differ");
+  // What the node said as it came back, when it came back wrong: where the store was and where the head.
+  if (differ > 0 || field(hb, "hash") != field(ha, "hash")) { sys.log("the node, restarting:\n\{await b.output(sys)}"); }
+  await b.stop(sys);
+  await a.stop(sys);
+  if (torn) { await unmountTorn(sys, dir); }
+  // A run that failed keeps everything: both nodes' data, every restart's log (b-N.log), and what each kill hit.
+  if (stuck || differ > 0 || field(hb, "hash") != field(ha, "hash")) {
+    await sys.writeFile(dir + "/events.txt", events.toBytes());
+    sys.log("  kept: \{dir} (events.txt, b-0.log … b-\{restarts}.log, b-final.log)");
+  } else {
+    await removeDir(sys, dir);
+  }
+  return t.done();
+}

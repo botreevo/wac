@@ -1,0 +1,52 @@
+// A `wait` on an `async` call that suspended does not keep the call alive.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/platform/test/wac/waitleak_test.wac
+//
+// `issues/system/0473w`, from wacuum: a call that awaits once hands its continuation to the program's schedule target
+// when it suspends, and a `wait` then steps the machine itself, past that copy. The copy does nothing when called — but
+// only `drain` ever dropped such copies, so a plain `main` driving every call with `wait` kept each one, and through it
+// the machine and everything its body held. 3000 calls of 1 MB ran the V8 host out of heap at 1.4 GB; awaited from an
+// `async main`, which drains, the same calls peaked at about 110 MB. The target clears what a `wait` ran past now
+// (`Host.enqueue` in `std/platform.wac`).
+//
+// Run as a program on the native host, because the property is the program's heap and the failure is the host's: the
+// unfixed build dies with "Fatal JavaScript out of memory" long before `done`. Measured 2026-11-13: about 2 s fixed,
+// with a flat peak from 1000 calls to 6000.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath, freshDir } from "../../../wactest/src/host.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Sys } from "std";
+import { flatten } from "core";
+
+static string PROGRAM = "import { Sys } from \"std\";\n"
+  + "async u8[] leafy(i32 i) { return u8[].filled(16, 1); }\n"
+  + "async u8[] inner(i32 i) {\n"
+  + "  u8[] big = u8[].filled(1 << 20, 1);\n"
+  + "  u8[] x = await leafy(i);\n"
+  + "  return big;\n"
+  + "}\n"
+  + "export i32 main(Sys sys) {\n"
+  + "  for (i32 i = 0; i < 3000; i++) { inner(i).wait(); }\n"
+  + "  sys.log(\"done\");\n"
+  + "  return 0;\n"
+  + "}\n";
+
+export string test_three_thousand_waited_calls_of_a_megabyte_each_do_not_accumulate(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  T t = T.create();
+  string dir = "\{flatten(env.cwd().wait()).unwrap()}/.cache/waitleak";
+  t.eqStr(freshDir(fs, dir), "", "a directory for the program");
+  string entry = "\{dir}/leak.wac";
+  t.isTrue(flatten(fs.writeFile(entry, PROGRAM.toBytes()).wait()).isOk(), "wrote \{entry}");
+  Exec? x = flatten(sys.procs().exec(binaryPath(env), ["run", entry], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+  t.isTrue(x is not null, "the binary started");
+  if (x is null) { return t.report(); }
+  string err = string.fromBytes(x!.stderr);
+  // The head only: an out-of-memory report is a page of addresses, and the sentence is at its top.
+  string shown = err.len() > 400 ? err.slice(0, 400) : err;
+  t.eqI32(x!.status, 0, "the program finished — \{shown}");
+  t.isTrue((string.fromBytes(x!.stdout) + err).indexOf("done") >= 0, "and got to the end: \{shown}");
+  fs.remove(dir, true).wait();
+  return t.report();
+}

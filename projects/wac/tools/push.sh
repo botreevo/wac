@@ -1,0 +1,749 @@
+#!/usr/bin/env bash
+# Run the suite, then push only if it passed. Merge and retry if someone got there first.
+#
+# This exists because `wac task test 2>&1 | grep ... && git push` pushes on *grep's* exit
+# code, not the test run's. It looks like it guards the push and does not. I made that
+# mistake twice in one session, and both times the tree happened to be fine — the failures
+# were my own stale compiler — which is exactly the kind of luck that teaches nothing.
+#
+# Usage: tools/push.sh
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+
+# Refuse to run with a dirty tree. The tests would pass against the working copy and the
+# push would carry the last commit, so it reports success for work that never left the
+# machine — which is worse than failing, because there is nothing to notice. I did this
+# within an hour of writing the script.
+if [ -n "$(git status --porcelain -- .)" ]; then
+  echo "== uncommitted changes: commit them first, or the push will not include them =="
+  git status --short
+  exit 1
+fi
+
+# **Keep the recent ones and drop the rest.** The log is deliberately kept after a run — the summary
+# prints `-- full output: $log --` and the slow-test lines are grepped out of it — so deleting it on
+# success would throw away the thing a reader is pointed at. What is not deliberate is keeping every
+# one ever written: 123 of them had accumulated by 2026-08-21, on a box whose `/tmp` had 20,394 entries
+# and whose disk was at 99%. Three days is longer than anyone reads back. `issues/system/0136`.
+find /tmp -maxdepth 1 -name 'push-suite-*.log' -mtime +3 -delete 2>/dev/null || true
+
+# **The checkout's binary, not whatever is on PATH.** `wac task` dispatches from `tasks.json5`, and
+# an installed `wac` would be a different build than the one this gate is testing — the seed fixpoint
+# is about *this* tree. Named once so no call site has to remember.
+WAC="./native/v8/target/release/wac"
+
+# **The gate holds the suite lock from before the pull until after the push.** It used to be held by
+# the suite alone — `tools/runTests.wac` took it and let it go four minutes later — so two agents
+# could each run a green suite and only one could land, the loser re-running everything.
+# `issues/system/0213a` measured three green suites and no push in one batch; two gates on 2026-08-27
+# each ran the whole thing twice, at a load of 6.7 on five cores.
+#
+# `$$` is recorded as the holder because this script is what stays alive; a one-shot helper's pid
+# would be dead the instant it was written. `WAC_GATE_LOCK` tells the suite below not to ask for a
+# lock its own parent is holding, and `take` checks that claim against the lock file rather than
+# believing the variable.
+#
+# **Refusing is the default and is the point.** `--queue` waits, and only for the lock; a machine
+# short of memory or an agent inside its cooldown is not a queue to join.
+gateQueue=""
+for a in "$@"; do [ "$a" = "--queue" ] && gateQueue="--queue"; done
+if ! "$WAC" run --allow-read --allow-write --allow-env --allow-run tools/runTests.wac -- lock $$ $gateQueue; then
+  exit 75
+fi
+export WAC_GATE_LOCK=$$
+# **Waiting for the lock is not this gate's work, and the budget said it was.** `$SECONDS` runs from
+# the top of the script, so `pull+seed` — set below and printed at the end — counted every minute
+# spent behind another agent's `--queue`. One run reported `pull+seed 374s`, the largest line in the
+# budget and larger than the suite, of which **360s was waiting** and 14s was the pull and the seed
+# rebuild together. A number the whole point of which is deciding what to make faster should not
+# bundle idle waiting with the only part anyone can do something about.
+tLock=$SECONDS
+# Released however this exits — a lock let go only on the happy path is a lock left behind by every
+# failure, which is the shape `release` already guards against one level down.
+trap '"$WAC" run --allow-read --allow-write --allow-env tools/runTests.wac -- unlock '"$$"' >/dev/null 2>&1' EXIT
+
+log="$(mktemp -t push-suite-XXXXXX.log)"
+
+# Space, before blaming the change. This gate has failed twice on `No space left on device` for reasons
+# outside this container: the shared overlay sits above 90% and only a few gigabytes of it are visible
+# from in here. The operator's standing answer (2026-08-05) is to clear *Deno's* cache and retry, and to
+# leave the repo's own `.cache` alone — it is small and every test repopulates it with the same bytes.
+#
+# The clearing itself lives in `tools/runTests.wac`, which the suite runs through anyway, so there is
+# one implementation of it rather than a shell copy beside the runner's own. It used to clear `gen` — 220 MB
+# — while 28 GB sat next to it in `v8_code_cache_v2`, three times, reporting success each time.
+guardDenoCache() {
+  ./native/v8/target/release/wac run --allow-read --allow-write --allow-env tools/runTests.wac -- guard
+}
+# **Before the suite rather than after it fails.** `guardDenoCache` clears when Deno's *code cache*
+# is over its own size limit, which is a different question from whether there is room to run: on
+# 2026-08-29 the code cache was well under the limit and `df` said **112 MB free, 100%**, because most
+# of this overlay belongs to the host and not to us. The suite then started, and what came back was a
+# `Deno.mkdir` failure inside `harness/buildCache.ts`, reported as a *test* failing in
+# `packages/wacc/test/wac/files_test.wac`. Nothing in that message says "disk", so the first guess is
+# whatever the change touched — which cost a real investigation before `df` was run.
+#
+# The reactive path below still exists and still matters, because the disk can fill *during* a run.
+# This only stops the case where it was already full before the run started, which is a whole suite
+# and a cooldown for a fact `df` answers instantly.
+#
+# 2 GB, because a suite's own artefacts are a few hundred megabytes and the margin is worth more than
+# the cache being kept: clearing it costs the next build some time and nothing else.
+# **The bar is 1 GB, and it was 2 GB for a day.** This disk is shared with the host and its steady
+# state is about 1.6 GB free — `issues/system/0136` printed the same `df` line in August — so a 2 GB
+# bar fired on every single gate. Measured on two consecutive runs: 1634 MB free and 1612 MB free,
+# both cleared, both leaving **1843 MB**. That is 200 MB, against the 605 MB of cache the clear lists,
+# and it is paid for with whatever the next Deno run re-transpiles.
+#
+# 1 GB because the failures this exists to prevent are recorded: 0136 has `tools/push.sh` failing
+# three times at 569 MB free. A bar at roughly twice the observed failure point is a guard; a bar
+# above the machine's resting state is a ritual that makes every gate slower and never reports
+# anything, which is also how a real disk problem would come to be ignored.
+#
+# **And this check is the optimisation, not the guarantee.** A suite that does run out of space says
+# `No space left on device`, and the arm below catches that, clears, and gives it another go — up to
+# three attempts. So the cost of setting this bar too low is one wasted suite in the rare case, and
+# the cost of setting it too high is a cache clear on every gate forever. Those are not symmetrical.
+guardDiskSpace() {
+  avail=$(df -P / 2>/dev/null | awk 'NR == 2 { print $4 }')
+  [ -z "$avail" ] && return 0
+  [ "$avail" -ge 1048576 ] && return 0
+  echo "== $((avail / 1024)) MB free before the suite, under the 1024 MB bar =="
+  freeDenoCache
+}
+
+# Says what it does and not why it was called: the caller knows whether anything is being retried.
+# It printed "the disk is full and it is not this change: clearing Deno's caches and retrying" from
+# both call sites, so the pre-flight check announced a retry of a suite that had not run yet.
+#
+# **And it lists what is about to go, rather than the three biggest things next to it.** This printed
+# `du | sort -h | tail -3`, whose top line was `npm 366M` — a directory `freeCaches` does not touch
+# and should not, since refilling it needs the network. `runTests.wac free` clears the code cache and
+# the transpile cache, which is why the number underneath said 200 MB against 605 MB listed, and the
+# report was the thing that made 200 MB look like a failure rather than the whole of what was offered.
+freeDenoCache() {
+  echo "== clearing Deno's code and transpile caches =="
+  du -sh "$HOME/.cache/deno/v8_code_cache_v2" "$HOME/.cache/deno/gen" 2>/dev/null
+  ./native/v8/target/release/wac run --allow-read --allow-write --allow-env tools/runTests.wac -- free
+  df -h / | tail -1
+}
+
+# **How many times this batch has passed the suite without landing.** `issues/system/0213a`: a full run
+# is now longer than the interval between other agents' pushes, so losing the race is the expected
+# outcome rather than bad luck — and every symptom of it is a *separate* invocation, each of which looks
+# like one unlucky run. Four green suites in a row landing nothing is invisible unless somebody is
+# reading the logs of all four, which is how it went unnoticed long enough to need measuring.
+#
+# Keyed on the **oldest unpushed commit**, because that is the one thing about a batch a merge does not
+# change: `git merge` adds commits and rewrites none, so the earliest of mine stays the same object even
+# as the batch grows around it. Per agent, since the count is about this agent's batch.
+#
+# This decides nothing about policy — 0213a's options are somebody else's call and its own note says so.
+# It makes the starvation say its own name.
+# **Computed once, before anything moves it.** The key is derived from `origin/master..HEAD`, and a
+# successful push updates the local `origin/master` ref — so recomputing it afterwards asks about an empty
+# range and answers nothing. The first version did exactly that and left the file behind on a run that
+# landed, so the next run would have opened with a stale banner about a batch that was already in.
+STARVE_FILE=""
+starveInit() {
+  local oldest who
+  oldest=$(git rev-list origin/master..HEAD 2>/dev/null | tail -1)
+  [ -z "$oldest" ] && return 0
+  who=$(printf '%s' "$PWD" | sed -n 's;.*/\(agent-[a-z0-9]*\)/.*;\1;p')
+  [ -z "$who" ] && who=unknown
+  STARVE_FILE="/tmp/wac-starve-${who}-${oldest:0:12}"
+}
+starveCount() {
+  [ -z "$STARVE_FILE" ] && { echo 0; return; }
+  cat "$STARVE_FILE" 2>/dev/null || echo 0
+}
+starveBump() {
+  [ -z "$STARVE_FILE" ] && return 0
+  echo $(($(starveCount) + 1)) > "$STARVE_FILE"
+}
+starveClear() { [ -n "$STARVE_FILE" ] && rm -f "$STARVE_FILE"; return 0; }
+
+starveInit
+
+starved=$(starveCount)
+if [ "${starved:-0}" -gt 0 ]; then
+  echo "== this batch has already passed the suite ${starved} time(s) without landing =="
+  echo "   $(git rev-list --count origin/master..HEAD 2>/dev/null) commit(s) waiting. That is"
+  echo "   issues/system/0213a — the run is longer than the gap between other agents' pushes, so"
+  echo "   losing the race is expected. The suite time spent so far is real and nobody read it."
+fi
+
+# **Merge what is already on the hub, before spending a suite on a tree that cannot land.**
+#
+# Attempt 1 pushed whatever this clone last knew and found out it was behind only by being rejected —
+# and a rejection costs a whole second suite. That is the right answer when somebody genuinely lands
+# during your run: there is nothing to do but merge and re-test. It is the wrong answer, and by far
+# the commoner one, when the clone was simply behind before the gate started. On 2026-08-28 that cost
+# 426 s to merge two commits that touch only `design/`, with no other agent running at all.
+#
+# **There used to be a pull here and its removal is why this needs saying.** The comment inside the
+# loop records it: `git -C ../wac pull`, from when the compiler was a sibling repository, left
+# pointing at *this* working tree after the repositories merged — and it treated a failed pull as a
+# note, so the gate printed `CONFLICT (content): Merge conflict in issues/system/INDEX.md`, called it
+# a note, and spent the suite on a tree with conflict markers in it.
+#
+# The lesson there is about the handling, not the position: a pull that cannot fail loudly has no
+# business before a suite. This one stops, exactly as the merge at the bottom of the loop does, and
+# for the same reason — a script that merges on your behalf must not also decide the conflict does
+# not matter.
+#
+# Before the seed check below rather than after, because a merge that brings somebody else's change
+# to `packages/wacc` ages the seed; the check that follows owns that question and now sees the merged
+# tree. `tested` is still captured *inside* the loop, so what gets pushed is still exactly what the
+# suite ran against.
+if ! git pull --no-rebase --no-edit --quiet origin master; then
+  echo "== merge needs hands before the suite: resolve, then run this again ==" >&2
+  echo "   Nothing ran. The pull above conflicts, and a suite on a tree with conflict markers in" >&2
+  echo "   it tests neither side — which this gate did for a while, and called a note." >&2
+  exit 1
+fi
+
+# **What the suite needs from the machine, asked first** (`tools/gatedeps.sh`): a missing oracle fails its
+# tests only after waiting out their timeouts, so a machine short of one package spent the whole suite to
+# say so, in forty failures that each named something else. `WAC_GATE_DEPS_ANYWAY=1` goes past it.
+if [ "${WAC_GATE_DEPS_ANYWAY:-}" != "1" ] && ! bash tools/gatedeps.sh; then
+  echo "== not running the suite: install what is listed above, or set WAC_GATE_DEPS_ANYWAY=1 ==" >&2
+  exit 1
+fi
+
+# **The git imports `wac.lock` pins, in the cache, before anything compiles a page.** `web` is
+# `projects/web` of this repository, pinned at a commit in its history, so the cache is written out of that
+# history (`projects/repo/tools/fill-cache.sh`). After the pull, because the pull is what moves the lock.
+if ! sh tools/fill-cache.sh; then
+  echo "== the locked git imports could not be fetched: nothing ran ==" >&2
+  exit 1
+fi
+
+# **Every pin into this repository is in its history** (`projects/repo/cmd/pins.wac`): a pin to a commit that
+# was rebased away, or never merged, works here and nowhere else. Milliseconds, and local git only.
+if ! "$WAC" run --allow-run --allow-read ../repo/cmd/pins.wac -- .; then
+  echo "== a pin above is not in this repository's history: nothing ran ==" >&2
+  exit 1
+fi
+
+# **The seed is checked before the first attempt, not only after a merge.**
+#
+# The retry loop already rebuilds when a *merge* ages the seed, with the argument that a script which
+# merges on your behalf should not expect you to notice that it did. The same applies one step earlier
+# and was missing: an agent's own edits age it too, and then the gate spends a whole suite discovering
+# a fact that costs 200 ms to ask. On 2026-08-24 that happened twice in one session — 495 s and 381 s —
+# both times after a **canary**, where a source file is perturbed to prove a test notices and then put
+# back. The content ends up byte-identical and the mtime does not, so there is no diff to look at and
+# nothing about the tree says the seed is behind. `issues/system/0160`.
+#
+# The same condition as the one in the loop, and for the same reason: `tools/wac/seedfresh_test.wac`
+# owns the question, so this cannot drift from the definition because it *is* the definition.
+# **And the wasmtime host, for the same reason one step earlier.** `seedfresh_test.wac` checks three
+# things and `wac task seed` rebuilds only one of them: it builds `native/v8`, so a merge touching
+# `native/src/` leaves `native/target/release/wac` behind and the suite fails on *"the wasmtime host,
+# if built, is not older than the Rust it is built from"*. The retry path below already rebuilds it
+# after a merge; attempt 1 did not, so a merge landed by an *earlier* gate cost a whole suite twice on
+# 2026-08-29 — 577s and a cooldown each time, for a `cargo build` that takes three seconds when the
+# crate is otherwise warm.
+#
+# **Always, not only when it exists.** This used to skip a checkout that had never built it, on the
+# reasoning that it had nothing to age — and then every file that drives the host skipped its half, so
+# that gate was green having asked one host fewer. A test needs the host or it does not; the gate is
+# what makes sure it is there. The first build in a cold checkout is minutes, every later one seconds.
+#
+# The seed is the v8 crate's, copied: `cargo build` embeds `native/seed/wacc.wasm` and a checkout that
+# never built this crate has none. The two are the same artefact — see the seed refresh below.
+wasmtime_host() {
+  if [ -f native/v8/seed/wacc.wasm ]; then
+    mkdir -p native/seed && cp native/v8/seed/wacc.wasm native/seed/wacc.wasm
+  fi
+  (cd native && cargo build --release >/dev/null 2>&1)
+}
+if ! wasmtime_host; then
+  echo "== the wasmtime host will not rebuild: not running the suite ==" >&2
+  echo "   Run \`cd native && cargo build --release\` by hand to see why; every two-host test would" >&2
+  echo "   otherwise compare against the older one." >&2
+  exit 1
+fi
+
+# **And the two other things the suite's tests need built, on the same rule.** A checkout that had never
+# built them failed two tests after a whole suite: `bootstrap/ts/differential.test.ts` needs the Rust
+# assembler (`bootstrap/rust`, no dependencies, seconds), and `packages/ts/test/stripDifferential.test.ts`
+# needs the TypeScript compiler from `site/node_modules`. Every long-lived checkout had both, so only a
+# fresh clone or a new worktree found out. The assembler is built every time, a no-op when it is current;
+# `npm ci` runs only when `node_modules` is missing or older than `package-lock.json`, because it reaches
+# the registry.
+if ! (cd bootstrap/rust && cargo build --release >/dev/null 2>&1); then
+  echo "== the Rust assembler will not build: not running the suite ==" >&2
+  echo "   Run \`cd bootstrap/rust && cargo build --release\` by hand to see why." >&2
+  exit 1
+fi
+if [ ! -d site/node_modules ] || [ site/package-lock.json -nt site/node_modules ]; then
+  echo "== site/node_modules is missing or older than package-lock.json — npm ci =="
+  if ! (cd site && npm ci >"$log.npm" 2>&1); then
+    echo "== npm ci failed in site/: not running the suite ==" >&2
+    tail -20 "$log.npm" | sed 's/^/   /' >&2
+    exit 1
+  fi
+fi
+
+if ! "$WAC" test --allow-read --allow-env tools/wac/seedfresh_test.wac >/dev/null 2>&1; then
+  echo "== the seed is older than the tree — rebuilding before the suite =="
+  # **Kept, not discarded.** This was `>/dev/null 2>&1` and the advice below was "run it by hand to
+  # see why", which is a round trip for output that had already been produced and thrown away. The
+  # docs and site branches further down capture theirs to a file and print the tail; this now does
+  # the same. It matters more since `issues/system/0273b`: the build refuses a compiler that is a
+  # fixed point and cannot compile a seven-line program, and the sentence explaining that is exactly
+  # what was being dropped.
+  if ! "$WAC" task seed > "$log.seed" 2>&1; then
+    echo "== the seed will not rebuild: not running the suite ==" >&2
+    tail -20 "$log.seed" | sed 's/^/   /' >&2
+    echo "   -- full output: $log.seed --" >&2
+    echo "   \`./bootstrap.sh\` is the way out if a wacc change has made wacc unable to" >&2
+    echo "   build itself." >&2
+    exit 1
+  fi
+
+  # **And the wasmtime host's copy of it, which `wac task seed` does not write.** That task is
+  # `bootstrap.sh --host v8`, so it refreshes `native/v8/seed/wacc.wasm` and leaves
+  # `native/seed/wacc.wasm` behind — and since 2026-09-01 `tools/wac/seedfresh_test.wac` checks that
+  # one too, so every change to `packages/wacc/src` reddened the docs lane until somebody ran a
+  # two-minute ladder by hand. `issues/system/0316b` is why the check is there: `cargo build` reads
+  # the seed as an *input*, so the binary looks current while carrying a compiler days old, and
+  # eleven test files then compare against it without saying so.
+  #
+  # **The two seeds are the same artefact, measured rather than assumed.** After
+  # `bootstrap.sh --host wasmtime` on 2026-09-01 the two files were byte-identical — 1,961,833 bytes,
+  # `cmp` clean — which is `design/system/0001` D9 being true: the seed is a wac program compiled to
+  # wasm and neither engine is in it. So the copy reproduces exactly what the ladder would produce,
+  # at three seconds against two minutes.
+  #
+  # If they ever diverge, that is a finding rather than a nuisance, and `./bootstrap.sh --host
+  # wasmtime` is the way back.
+  if [ -f native/v8/seed/wacc.wasm ]; then
+    mkdir -p native/seed && cp native/v8/seed/wacc.wasm native/seed/wacc.wasm
+    if ! (cd native && cargo build --release > "$log.seedwt" 2>&1); then
+      echo "== the wasmtime host will not rebuild around the new seed: not running the suite ==" >&2
+      tail -20 "$log.seedwt" | sed 's/^/   /' >&2
+      exit 1
+    fi
+  fi
+fi
+
+# **Every phase is timed, and the gate says where its minutes went.** Until 2026-08-29 only the suite
+# was, so the answer to "why is the gate slow" had one measured number and four guesses beside it —
+# and one of the guesses was in the comment below the ratchets, which said 38 seconds for something
+# that had grown to 263. `issues/system/0275b` had to be written to find that out, and the point of
+# these four variables is that the next person does not have to write it again.
+tPre=$SECONDS
+
+for attempt in 1 2 3; do
+  guardDenoCache
+  guardDiskSpace
+
+  # There used to be a `git -C ../wac pull` here. The compiler was a separate repository and this
+  # one was `wac-mono`, so `../wac` was the sibling checkout the version pin pointed at, and the
+  # pull was inside the loop on purpose: a merge on a later attempt can bring in a commit that
+  # bumps the pin, and pulling once at the top misses exactly that case.
+  #
+  # **That argument survived the repositories merging on 2026-08-09 and the path did not.** A
+  # checkout is now `…/workspaces/wac`, so `../wac` resolves to *this working tree* — the script
+  # pulled the repo it is standing in, at a point where it treats a failure as a note:
+  #
+  #     CONFLICT (content): Merge conflict in issues/system/INDEX.md
+  #     note: could not pull wac; the version check will say if it matters
+  #     == running the suite (attempt 1) ==
+  #
+  # It then spent the suite on a tree with conflict markers in it. The argument is kept by the
+  # structure rather than by a second pull: the compiler is `packages/wacc` in this repo now, so the
+  # merge at the bottom of this loop — which stops and asks for hands when it conflicts — is the
+  # one that brings a pin bump in, and it is already inside the loop.
+
+  # What the machine was doing, before and after. This container is shared with other agents,
+  # and a mutation sweep next door turns a fifty-second suite into half an hour — which looks
+  # exactly like a hang if nothing says otherwise. Twice now that has cost time to diagnose, so
+  # the numbers are printed rather than remembered.
+  # **What is being tested, so that is what gets pushed.** The dirty-tree check at the top runs
+  # once; the suite then takes three or four minutes, and an agent working through it — which is
+  # what the operator asks for rather than watching — can land a commit in that window. `git push
+  # origin master` would carry it, and the gate would report a pass for a commit the suite never
+  # saw. That is the same failure as the one the header describes, from the other side: there it
+  # pushed work that had not been tested because it was uncommitted, here because it was too new.
+  #
+  # Captured inside the loop, after any merge a previous attempt made, so a retry tests and pushes
+  # the merge it just created rather than the revision it started from.
+  tested=$(git rev-parse HEAD)
+  echo "== running the suite (attempt $attempt) =="
+  echo "   load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cores"
+  started=$SECONDS
+  # Tee'd rather than swallowed. The first version printed only "tests failed", which is the
+  # one moment the output is worth having — and when this runs unattended the terminal
+  # scrollback is not there to fall back on.
+  #
+  # This is a pipeline guarding a consequential action, which is the mistake the whole file
+  # exists to prevent. It is safe *only* because `pipefail` is set above, so the pipeline
+  # takes the exit code of `wac task test` rather than of `tee`. Remove `pipefail` and this
+  # line silently starts pushing red trees. Do not drop the `set -uo pipefail`.
+  # `timeout` is a backstop against a *hang*, not a performance gate.
+  #
+  # Deno 2.9 has no per-test timeout — none at all, and none configurable. When a test blocks
+  # forever it prints "has been running for over (4m0s)" and keeps printing it, and the run never
+  # ends. Several tests here wait on a subprocess announcing readiness with no deadline of their
+  # own (`waitForListening` in box's tests, three separate `serveOnce` helpers), and the ports come
+  # from bind-then-release, which races under `--parallel`. So an unbounded wait is reachable, and
+  # this script is the push gate: unbounded here means an agent sits for an hour with nothing to
+  # read but a warning.
+  #
+  # The value is deliberately far above any legitimate run — the suite is about fifty seconds
+  # alone, and the worst honest figure anybody has recorded on a loaded machine is half an hour.
+  # Anything past this is not slow, it is stuck. Picking a tighter bound would recreate the
+  # false-failure problem that kept issue 0031 open: a guard that fires on a busy machine gets
+  # switched off.
+  # **A retry is not a second suite in the cooldown's sense.** `tools/wac/suitegate.wac` refuses a run
+  # when the same agent ran one under twenty minutes ago, which is right for an agent reaching for
+  # `wac task test` by reflex and wrong for the loop here: attempt 1 passing and losing the push
+  # race is exactly when attempt 2 has to run, and it lands six minutes later by construction.
+  # Without this, losing a race became `tests failed after 1s (exit 3): not pushing` — measured on
+  # 2026-08-12, an hour after that gate landed.
+  #
+  # `WAC_SUITE_RETRY`, not `WAC_SUITE_ANYWAY`: the second goes past the *lock* as well, and the lock
+  # is the part that stops two suites overlapping, which is what the OOM kills came from. A retry
+  # waits its turn like anything else.
+  # **The kernel's kill counter, before and after.** A suite that is killed for memory leaves a log
+  # with no summary line in it — thousands of passing tests and then nothing — which reads exactly
+  # like a hang and is not one. That happened on 2026-08-12 with `tools/suiteGate.ts` in place and
+  # all four of its refusals passed, and the only way anyone knew was reading
+  # `/sys/fs/cgroup/memory.events` by hand afterwards. issues/system 0142.
+  # **Which counter, and why the obvious one can be structurally zero.** `memory.events` counts only
+  # kills the *cgroup's own limit* caused. This container runs at the cgroup root with `memory.max`
+  # unlimited, so that counter cannot move: a kill under host pressure is the global OOM killer's and
+  # never appears there. It read 0 through a run that had plainly died, which is the instrument
+  # `issues/system/0142` was closed on reporting nothing.
+  #
+  # `/proc/vmstat` sees those kills and is **host-wide**, so it also counts other containers'. A
+  # delta is therefore evidence rather than proof it was us — which is why the message below says
+  # where the number came from instead of asserting whose kill it was.
+  oomSource=cgroup
+  [ "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" = "max" ] && oomSource=vmstat
+  oomCount() {
+    if [ "$oomSource" = vmstat ]; then
+      awk '/^oom_kill /{print $2}' /proc/vmstat 2>/dev/null || echo 0
+    else
+      awk '/^oom_kill /{print $2}' /sys/fs/cgroup/memory.events 2>/dev/null || echo 0
+    fi
+  }
+  oomBefore=$(oomCount)
+  if [ "$attempt" -gt 1 ]; then
+    WAC_SUITE_RETRY=1 timeout --kill-after=30s 45m "$WAC" task test 2>&1 | tee "$log"
+  else
+    timeout --kill-after=30s 45m "$WAC" task test 2>&1 | tee "$log"
+  fi
+  status=${PIPESTATUS[0]}
+  oomAfter=$(oomCount)
+  # Set here rather than in the success path below, because the failure branches need it too: how
+  # long a run lasted is what separates `timeout` firing at 45 minutes from somebody else's SIGKILL
+  # nine minutes in, and reading a stale value from the previous attempt would answer the wrong one.
+  elapsed=$((SECONDS - started))
+  if [ "$status" -ne 0 ]; then
+    echo
+    # Elapsed on every branch, because "how long did it take" is the first thing anyone asks and
+    # the answer distinguishes the two failure modes that look alike.
+    # **3 is a refusal, not a failure**, and it is the one exit code whose reason is already on the
+    # screen: `tools/wac/suitegate.wac` prints "not running the suite: <why>" and exits 75 without starting
+    # anything. Falling through to the branches below reported it as "the run itself died … usually a
+    # worker killed for memory; check /proc/loadavg", which sends the reader to the machine when the
+    # answer is two lines above — and the suite log is empty because no suite ran, so the "nothing
+    # matched FAILED" test fires and confirms the wrong story.
+    #
+    # **One retry, and then stop**, which sorts the four refusals without reading the message. The
+    # cooldown is the one worth retrying and the only one attempt 2 can clear, because `WAC_SUITE_RETRY`
+    # above skips exactly that and nothing else. So: refused on attempt 1, go round once; refused again,
+    # it is the lock, the memory floor or the load ceiling, none of which clears in the second this
+    # takes, and spending the third attempt on it only buries the reason further up the log.
+    #
+    # Deciding by construction rather than by grepping the text, because the refusal is written to the
+    # terminal and does not reach `$log` — which is also why the branch below cannot be reused: it
+    # reads an empty log and concludes the run died.
+    # **The refusal has its own exit code, and it did not always.** The gate exits 75
+    # (`EX_TEMPFAIL`) when it will not start a suite. It used to exit 3 — which is also `wac test`'s
+    # code for a failing test and what `tools/runTests.wac` passes through — so a genuine red suite
+    # arrived in this branch, had its log deleted below, and was announced as "nothing ran, and the
+    # reason is printed above" while the reason was a `FAIL` line in the log that had just been removed.
+    #
+    # The first repair guessed from whether `$log` was empty. That is wrong too: the refusal reaches the
+    # log through `tee`, so a refusal leaves a short log rather than none, and the next gate run
+    # announced a cooldown refusal as a failing suite. Two wrong readings of the same overloaded code
+    # are what bought the code of its own.
+    if [ "$status" -eq 75 ]; then
+      rm -f "$log" "$log".*   # and its siblings: .docs, .site, .seed
+      if [ "$attempt" -eq 1 ]; then
+        echo "== the suite gate refused; going round once with WAC_SUITE_RETRY=1 =="
+        echo "   That skips the twenty-minute cooldown and nothing else. If the refusal was the lock,"
+        echo "   the memory floor or the load ceiling, the next attempt refuses too and this stops."
+        continue
+      fi
+      echo "== the suite gate refused; nothing ran, and the reason is printed above =="
+      echo "   Not a test failure and not a kill: no suite started, so the log is empty."
+      echo "   Wait for the other run to finish rather than retrying — see tools/wac/suitegate.wac for"
+      echo "   the overrides and what each one skips."
+      exit 3
+    fi
+    # **124 and 137 are not the same answer, and treating them alike printed a false one.** 124 is
+    # `timeout` firing: the run reached 45 minutes and was cut, which is issue 0036's hang. 137 is
+    # SIGKILL. `timeout` only sends that 30 seconds *after* the 45 minutes, so a 137 that arrives in
+    # ten is somebody else's kill — the kernel's, for memory, which is issues/system 0142. On
+    # 2026-08-12 this branch reported "the suite did not finish in 45m" for a run that had been going
+    # nine minutes and whose oom_kill counter had just moved from 21 to 22. Every word of that was
+    # wrong, and the counter it needed was already being read a few lines below, in the branch this
+    # one skips past.
+    killed=$((oomAfter - oomBefore))
+    if [ "$status" -eq 137 ] && [ "$elapsed" -lt 2700 ]; then
+      echo "== the suite was killed after ${elapsed}s: not pushing =="
+      if [ "$killed" -gt 0 ]; then
+        echo "   The kernel killed $killed process(es) for memory during this run — this is that kill."
+        echo "   Not a hang and not a failing test: the log simply stops. issues/system 0142."
+        echo "   Re-run when the machine is quiet; nothing below is evidence about the change."
+      else
+        echo "   SIGKILL, and the kernel's oom_kill counter did not move, so it was not memory."
+        echo "   Something outside this script stopped it. issues/system 0142 collects these."
+      fi
+    elif [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+      echo "== the suite did not finish in 45m: not pushing =="
+      echo "   This is a hang, not slowness — see issue 0036. Deno never kills a blocked test, so"
+      echo "   the run would have continued indefinitely. Still running when it was cut:"
+      grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -10
+      [ "$killed" -gt 0 ] && echo "   (the kernel also killed $killed process(es) for memory in this window)"
+    else
+      # A failure that is really the shared disk: clear Deno's cache once and give the suite another go,
+      # rather than reporting a change as broken when nothing about it was.
+      if grep -q "No space left on device" "$log" && [ "$attempt" -lt 3 ]; then
+        echo "== the disk filled during the suite and it is not this change: retrying =="
+        freeDenoCache
+        continue
+      fi
+
+      echo "== tests failed after $((SECONDS - started))s (exit $status): not pushing =="
+      # Said before the failures, because it changes what they mean: with the counter moved, a log
+      # that stops mid-pass is a kill and the tests in it are not evidence about the change.
+      if [ "$oomAfter" -gt "$oomBefore" ]; then
+        echo "== the oom_kill counter ($oomSource) moved by $((oomAfter - oomBefore)) during this run =="
+        echo "   A log that ends without a summary is that kill, not a failing test and not a hang."
+        if [ "$oomSource" = vmstat ]; then
+          echo "   That counter is host-wide, because this cgroup has no memory limit for a kill to"
+          echo "   be attributed to. So it is evidence and not proof: another container's kill looks"
+          echo "   the same from here. A log that *does* end with a summary was not this."
+        fi
+        echo "   Re-run when the machine is quiet; see issues/system 0142 before believing anything below."
+      fi
+      # **What a failure looks like has to include the `wac test` lane's words.** `FAILED` and
+      # `error:` are Deno's, and this pattern was written when Deno ran everything. `wac test` says
+      # `FAIL`, and its per-directory summary says `1 with failures` and `3 that did not run` — none
+      # of which match. So a run with real failing tests printed *nothing matched FAILED or error:,
+      # so no test reported anything — the run itself died … usually a worker killed for memory*, and
+      # the reader went to look at `free -m`. That happened three times in one morning before anybody
+      # read the log by hand; the tell was that two runs produced an identical count of summaries,
+      # which is not what a memory kill looks like.
+      #
+      # `cannot emit` and `did not build` are here for a failure with no failing test at all: a
+      # directory whose files collide on a name builds one at a time instead, every test passes, and
+      # the suite still exits non-zero. Without them the summary is empty and truthful and useless.
+      #
+      # **A passing run must match none of these, and on 2026-08-29 it matched nine.** Eight were the
+      # wasmtime-host skips — *"skipped — cargo did not build `native`"* — and one was a green status
+      # line that happened to quote the marker `// error:`. So every red gate opened with nine lines
+      # of noise above the failure, in the one piece of output everybody reads when something is
+      # wrong. The filter is not the thing to loosen: `did not build` is here for a real failure with
+      # no failing test in it. The *messages* gave way — the skips say "cargo has not built" and the
+      # status line describes its marker instead of quoting it.
+      #
+      # Worth re-running after any change here: `grep -E "$fails"` over a **green** suite log should
+      # print nothing at all.
+      fails='FAILED|^FAIL |error:|wacc: cannot emit|did not build|with failures|did not run'
+      echo "-- failures --"
+      if ! grep -qE "$fails" "$log"; then
+        # **A failure with no failures in it means the run died rather than reported.** This happened on
+        # 2026-08-05: the suite type-checked all 140 files, printed its last `Check` line, and exited
+        # non-zero in nine seconds with no diagnostic — fifteen minutes after a host reboot, with other
+        # agents rebuilding caches. The likeliest cause is a `--parallel` worker killed for memory, which
+        # issue 0075 has already seen reported as though the test were wrong. The exit code above is what
+        # tells them apart, and it was not printed at the time, so the only diagnosis available was a
+        # guess. Somebody made a confident one and it was wrong.
+        echo "   Nothing in the log looked like a failure, so no test reported anything — the run"
+        echo "   itself died. Exit $status. 1 with no output is usually a worker killed for memory;"
+        echo "   check /proc/loadavg and free -m, and try again on a quieter machine before believing"
+        echo "   the change is at fault."
+      fi
+      grep -E "$fails" "$log" | head -20
+      # Any test that outstayed Deno's warning threshold is worth naming even on a plain failure:
+      # it is the likeliest cause of a slow run somebody is about to blame on their own change.
+      slow=$(grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -5)
+      [ -n "$slow" ] && { echo "-- tests that ran unusually long --"; echo "$slow"; }
+    fi
+    echo "-- full output: $log --"
+    exit 1
+  fi
+
+  echo "== suite passed in ${elapsed}s (load now $(cut -d' ' -f1-3 /proc/loadavg)) =="
+  # **The threshold has to move when the suite does, and it has moved twice.** It said "several times
+  # the usual ~50s" above 180s until 2026-08-18, when the wac lane became the largest and every green
+  # run tripped it — a warning that cannot warn. It was re-measured then at 208s (78s Deno, 29s alone,
+  # 100s `wac test`) and set to 330s.
+  #
+  # **Measured again 2026-08-26, on a quiet box the operator had just freed, and it had gone stale the
+  # same way:** two green runs at 498s and 418s, tripping 330 by 90-170s with nothing wrong. The split
+  # is what moved — `issues/system/0161` keeps migrating tests into the lane that costs more per test:
+  #
+  #     2026-08-18    Deno  78s    `wac test` 100s    alone 29s    total 208s
+  #     2026-08-26    Deno  45-70s `wac test` 372-427s             total 418-498s
+  #
+  # The wac lane quadrupled in eight days while the Deno lane shrank. 600s is where a run is out of the
+  # ordinary now; `where the time went` prints the split, and `packages/crypto/test/wac` alone is 318s
+  # of the 1213s of work, so that is the first place to look when this does fire.
+  if [ "$elapsed" -gt 600 ]; then
+    echo "   that is well above the ~420s this suite costs when nothing is wrong. Usually the machine"
+    echo "   was busy — three agents share five cores — but check for a hung test too (issue 0036);"
+    echo "   the load above tells you which, and the \`where the time went\` block says which lane."
+    slow=$(grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -5)
+    [ -n "$slow" ] && { echo "-- tests that ran unusually long --"; echo "$slow"; }
+  fi
+
+  # **The suite and nothing after it, since 2026-10-27.** This gate also ran the doc checks
+  # (`wac task docs`), the site's Deno test with `npx tsc -b`, and the coverage ratchets
+  # (`wac task coverage:all`). The operator cut all three: the gate had grown to about forty minutes, and
+  # three agents wait on it. Each is still a task, to run when a change is in its territory:
+  #
+  #     wac task docs              tools/ guards — links, issue counts, task names
+  #     wac task coverage:all      the per-package coverage floors
+  #     cd site && npx tsc -b      the site's type-check
+  #
+  # `issues/system/0275b` has the numbers that drove the cut.
+
+  # **The budget, printed on the run that produced it.** Every number here used to be reconstructed
+  # afterwards from separate measurements, which is how the ratchets spent a fortnight described as
+  # 38 seconds. `pull+seed` covers everything from the lock to the first attempt, so on a retry it is
+  # the original figure rather than this attempt's; the suite row is this attempt's own.
+  #
+  # **`lock wait` is time this gate did not spend**, and it is printed so that the lines below it can
+  # be read as work. It measures how many other agents were ahead of you, so it is the one row no
+  # change to the suite can move.
+  echo "== where this gate's time went =="
+  printf '   %-11s %4ss\n' \
+    'lock wait' "$tLock" \
+    'pull+seed' "$((tPre - tLock))" \
+    'suite'     "$elapsed" \
+    'total'     "$SECONDS"
+
+  # `$tested:master`, not `HEAD:master`: pushing the revision the suite ran against. If HEAD has
+  # moved since, those commits stay local and go out with the next gate, which is the answer that
+  # keeps "the gate tested what it pushed" true rather than nearly true.
+  if git push --quiet origin "$tested:master" 2>/dev/null; then
+    if [ "$tested" != "$(git rev-parse HEAD)" ]; then
+      echo "== pushed $(git rev-parse --short "$tested") — HEAD moved during the suite, so"
+      echo "   $(git rev-list --count "$tested"..HEAD) later commit(s) wait for the next run =="
+    else
+      echo "== pushed =="
+    fi
+    rm -f "$log" "$log".*   # and its siblings: .docs, .site, .seed
+    starveClear
+    exit 0
+  fi
+
+  # The suite passed and the push did not land: that is one starved pass, counted before the merge
+  # changes what the batch is.
+  starveBump
+  echo "== push rejected, merging and retrying =="
+  before=$(git rev-parse HEAD)
+  if ! git pull --no-rebase --no-edit --quiet origin master; then
+    echo "== merge needs hands: resolve, then run this again =="
+    exit 1
+  fi
+  # **A merge that brought only documentation is pushed without another suite.** Against the tree the suite
+  # just passed, `tools/docsOnly.wac` asks whether anything changed that a test could execute — a `.md` with
+  # an executed ```wac fence, or any other file, is a no. When it answers yes, the code under test is the
+  # tree that passed, byte for byte, so a second suite would test the same thing again — and lose the race
+  # again, since a docs-only push takes no lock and needs seconds. That rerun is most of what
+  # `issues/system/0213a` and `0154` measured. A push lost even then merges once more and asks again; the
+  # first answer of no goes round the loop and runs the suite, as before.
+  # **A merge that brought only other projects' work is pushed without another suite, the same way.** This
+  # repository holds several projects, each reaching the others only through pins to commits already in its
+  # history, so a commit that changes nothing under projects/wac cannot change what this suite tested — and
+  # without this, every push by any other project would send this gate round its twenty minutes again.
+  for otherRound in 1 2 3 4 5; do
+    git diff --quiet "$tested" HEAD -- . || break
+    echo "== what landed is outside projects/wac, so the tested code is unchanged: pushing the merge =="
+    if git push --quiet origin HEAD:master 2>/dev/null; then
+      echo "== pushed $(git rev-parse --short HEAD), the merge of $(git rev-parse --short "$tested") with other projects' work =="
+      rm -f "$log" "$log".*
+      starveClear
+      exit 0
+    fi
+    echo "== rejected again ($otherRound): merging what landed =="
+    if ! git pull --no-rebase --no-edit --quiet origin master; then
+      echo "== merge needs hands: resolve, then run this again =="
+      exit 1
+    fi
+  done
+  for docsRound in 1 2 3 4 5; do
+    said=$("$WAC" run --allow-read --allow-run tools/docsOnly.wac -- "$tested" HEAD 2>&1); docsOnly=$?
+    printf '%s\n' "$said" | sed 's/^/   /'
+    [ "$docsOnly" -eq 0 ] || break
+    echo "== what landed is documentation only, so the tested code is unchanged: pushing the merge =="
+    if git push --quiet origin HEAD:master 2>/dev/null; then
+      echo "== pushed $(git rev-parse --short HEAD), the merge of $(git rev-parse --short "$tested") with documentation =="
+      rm -f "$log" "$log".*
+      starveClear
+      exit 0
+    fi
+    echo "== rejected again ($docsRound): merging what landed =="
+    if ! git pull --no-rebase --no-edit --quiet origin master; then
+      echo "== merge needs hands: resolve, then run this again =="
+      exit 1
+    fi
+  done
+  # **Reseed when the merge aged the seed, and ask the test that owns that question.**
+  #
+  # `native/v8/seed/wacc.wasm` and `native/v8/target/release/wac` are gitignored and one per agent, so
+  # a merge that brings somebody else's change to anything they are built from ages them — and the next
+  # attempt runs the suite against a compiler older than the tree. That is `issues/system/0160`, and it
+  # costs a full suite run each time.
+  #
+  # Here rather than in the caller's hands because the gate is what did the pulling. CLAUDE.md tells an
+  # agent to reseed after a merge; a script that merges on your behalf should not also expect you to
+  # notice that it did.
+  #
+  # **This used to test `git diff … -- packages/wacc/src` and `-- native`, and that was too narrow.**
+  # The seed is built from the whole import closure of `packages/wac/src/wac.wac`, which reaches
+  # `packages/bytes`, `packages/platform`, `packages/fs` and more — so a merge touching
+  # packages/bytes/src/buf.wac (now `core/buf.wac`) aged the seed, this condition said no, and the retry failed on
+  # `seedfresh` after 364 seconds. Naming the directories means keeping a copy of that closure here and
+  # being wrong the first time somebody adds an import.
+  #
+  # `tools/wac/seedfresh_test.wac` already owns the question — it compares both artefacts against everything
+  # they are built from — and answering it costs about 200ms. So the condition is that test, and it
+  # cannot drift from the definition because it *is* the definition.
+  if ! "$WAC" test --allow-read --allow-env tools/wac/seedfresh_test.wac >/dev/null 2>&1; then
+    echo "   the merge aged the seed or a host — rebuilding"
+    if ! "$WAC" task seed > "$log.seed" 2>&1; then
+      echo "== the seed would not rebuild after the merge: not retrying =="
+      tail -20 "$log.seed" | sed 's/^/   /'
+      echo "   -- full output: $log.seed --"
+      exit 1
+    fi
+    # **And the wasmtime host, which `wac task seed` does not build.** It builds `native/v8` only, so
+    # a merge touching `native/src/` left `native/target/release/wac` behind — and the retry then
+    # failed with `Cli.execWith is not implemented in the native runtime yet`, from a host that
+    # predated the merge that added it. `issues/system/0208` is that it has no owner; this is the gate
+    # not needing one, and it builds it whether or not it existed — see `wasmtime_host` above.
+    if ! wasmtime_host; then
+      echo "== the wasmtime host would not rebuild after the merge: not retrying ==" >&2
+      echo "   Run \`cd native && cargo build --release\` by hand; every two-host test would be" >&2
+      echo "   comparing against the older one." >&2
+      exit 1
+    fi
+  fi
+done
+
+echo "== still being beaten to the push after three tries; try again in a moment =="
+echo "   this batch has now passed the suite $(starveCount) time(s) without landing — issues/system/0213a"
+exit 1

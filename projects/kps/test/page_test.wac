@@ -1,0 +1,75 @@
+// The dialer a page runs, judged against both listeners: `cmd/dialpage.wac` built as a page with `--grant webrtc`
+// and run in Chromium by `interop/js/page-dial.mjs`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-net test/page_test.wac
+//
+// The page dials the reference listener (`@kpstreams/server`) and wac-kps's own echo server and runs the same
+// scenarios against each: an echo to EOF, 3 MiB past the 1 MiB stream window both ways, concurrent streams, 120 in a
+// row past the stream limit, datagrams and an oversized one refused, and a reset carried with its code. Against the
+// reference listener a failure is the page's; against both, the page and the listener are held to the same results.
+
+import { Check } from "./check.wac";
+import { splitLines } from "./oracle.wac";
+import { flatten } from "core";
+import { ChildEnv, Exec, Launch, Procs, Sys } from "std";
+
+Exec sh(Procs procs, string script) {
+  return flatten(procs.exec("/bin/sh", ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+/** Start a server with `cmd`, which prints `kps <address>`; answer the address, or "" if none appeared. */
+string started(Procs procs, string cmd, string log) {
+  sh(procs, "(\{cmd} > \{log} 2>&1 &)");
+  for (i32 i = 0; i < 100; i++) {
+    Exec e = sh(procs, "grep -o 'kps [^ ]*' \{log} | head -1 | cut -d' ' -f2; sleep 0.1");
+    string a = string.fromBytes(e.stdout);
+    while (a.len() > 0 && a.slice(a.len() - 1, a.len()) == "\n") { a = a.slice(0, a.len() - 1); }
+    if (a.len() > 0) { return a; }
+  }
+  return "";
+}
+
+/** Run the page against `addr`, fold each line into `c` prefixed with `who`, and answer how many passed. */
+i32 dialled(Check c, Procs procs, string who, string addr) {
+  Exec e = sh(procs, "cd interop/js && timeout 240 node page-dial.mjs ../../.tmp/pagetest/page '\{addr}' 2>&1");
+  string out = string.fromBytes(e.stdout);
+  i32 passes = 0;
+  bool done = false;
+  for (string line in splitLines(out)) {
+    if (line.indexOf("PASS ") == 0) { passes++; }
+    if (line.indexOf("FAIL ") == 0) { c.fail("\{who}: \{line.slice(5, line.len())}"); }
+    if (line.indexOf("DONE ") == 0) { done = true; }
+  }
+  c.ok(done, "\{who}: the page finished: \{out}");
+  return passes;
+}
+
+export string test_a_page_dials_the_reference_listener_and_the_wac_one_alike(Sys sys) {
+  Check c = Check.create();
+  Procs procs = sys.procs();
+  sh(procs, "mkdir -p .tmp/pagetest/page && rm -f .tmp/pagetest/*.log");
+
+  // The page builder is `webbuild`: `projects/web/tools/build.wac` at the locked commit, from wac's package cache.
+  Exec built = sh(procs,
+    "commit=$(tr '\\n' ' ' < wac.lock | sed -n 's/.*\"webbuild\" *: *{[^}]*\"commit\" *: *\"\\([0-9a-f]\\{40\\}\\)\".*/\\1/p'); " +
+    "build=\"${WAC_HOME:-$HOME/.wac}/cache/git/https%3A%2F%2Fgithub.com%2Fvoltrevo%2Fwac.git/$commit/projects/web/tools/build.wac\"; " +
+    "wac run --allow-read --allow-write --allow-run \"$build\" cmd/dialpage.wac .tmp/pagetest/page --grant webrtc 2>&1");
+  c.eqI32(built.status, 0, "the page builds: \{string.fromBytes(built.stdout)}");
+  if (built.status != 0) { return c.report(); }
+
+  string jsAddr = started(procs, "timeout 300 node interop/js/js-echo-server.mjs .tmp/pagetest 41996", ".tmp/pagetest/js.log");
+  c.ok(jsAddr.len() > 0, "the reference listener started");
+  i32 jsPasses = jsAddr.len() > 0 ? dialled(c, procs, "@kpstreams/server", jsAddr) : 0;
+  sh(procs, "pkill -f 'js-echo-server.mjs .tmp/pagetest' || true");
+
+  Exec echo = sh(procs, "wac build cmd/echo.wac -o .tmp/pagetest/echo --allow-net --allow-read --allow-write --quiet 2>&1");
+  c.eqI32(echo.status, 0, "the echo server builds: \{string.fromBytes(echo.stdout)}");
+  string wacAddr = started(procs, "timeout 300 wac .tmp/pagetest/echo.wasm .tmp/pagetest/id 0 127.0.0.1", ".tmp/pagetest/wac.log");
+  c.ok(wacAddr.len() > 0, "the wac listener started");
+  i32 wacPasses = wacAddr.len() > 0 ? dialled(c, procs, "wac-kps", wacAddr) : 0;
+  sh(procs, "pkill -f 'pagetest/echo.wasm' || true");
+
+  c.eqI32(jsPasses, 8, "the page passes every scenario against the reference listener");
+  c.eqI32(wacPasses, jsPasses, "and as many against the wac listener");
+  return c.report();
+}

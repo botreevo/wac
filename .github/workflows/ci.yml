@@ -1,0 +1,101 @@
+name: CI
+
+# Every push and pull request: the pin check, and each project the change touches — that project's own
+# tools/ci.sh, with the wac it pins. A change to one project runs that project and nothing else, which is
+# the point of keeping them separate (CLAUDE.md).
+
+# **ubuntu-24.04, not -latest**: wac's suite judges wacland's tools against the host's own GNU tools and bash, as
+# the gate machine (24.04) has them, and -latest moved to 26.04 in November 2026, whose newer coreutils and bash
+# word their errors differently. Move this when the gate machine moves.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:   # run by hand: every project
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      projects: ${{ steps.which.outputs.projects }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: which
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then base="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then base=""
+          else base="${{ github.event.before }}"; fi
+          all=$(ls projects | while read -r p; do [ -f "projects/$p/tools/ci.sh" ] && echo "$p"; done)
+          # By hand, a new branch, a force push, or a change to CI itself: every project.
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null || git diff --name-only "$base" HEAD | grep -q '^\.github/'; then
+            touched="$all"
+          else
+            touched=$(git diff --name-only "$base" HEAD | awk -F/ '$1 == "projects" { print $2 }' | sort -u)
+          fi
+          list=$(for p in $touched; do echo "$all" | grep -qx "$p" && echo "$p"; done || true)
+          echo "projects=$(printf '%s\n' $list | jq -R . | jq -cs 'map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+          echo "projects: $(echo $list)"
+
+  pins:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: ./.github/actions/wac
+      - run: wac run --allow-run --allow-read projects/repo/cmd/pins.wac
+
+  project:
+    needs: changes
+    if: needs.changes.outputs.projects != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.changes.outputs.projects) }}
+    runs-on: ubuntu-24.04
+    name: ${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+      # The wac this project pins: its lock's `wac` entry, git's WAC_COMMIT, or else this checkout's projects/wac.
+      - id: pin
+        run: |
+          p=projects/${{ matrix.project }}
+          c=""
+          if [ -f "$p/wac.lock" ]; then
+            c=$(tr '\n' ' ' < "$p/wac.lock" | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
+          fi
+          [ -z "$c" ] && [ -f "$p/WAC_COMMIT" ] && c=$(tr -d ' \n' < "$p/WAC_COMMIT")
+          echo "commit=$c" >> "$GITHUB_OUTPUT"
+          echo "wac: ${c:-the projects/wac of this checkout}"
+      - uses: ./.github/actions/wac
+        with:
+          commit: ${{ steps.pin.outputs.commit }}
+      - name: Fill the package cache
+        run: |
+          [ -f projects/${{ matrix.project }}/wac.lock ] || exit 0
+          sh projects/repo/tools/fill-cache.sh projects/${{ matrix.project }}/wac.lock
+      - name: tools/ci.sh
+        run: |
+          set -o pipefail
+          if ! sh projects/${{ matrix.project }}/tools/ci.sh 2>&1 | tee "$RUNNER_TEMP/ci.log"; then
+            echo "::error title=${{ matrix.project }} failed::$(grep -E 'FAIL|error|rror:' "$RUNNER_TEMP/ci.log" | tail -n 20 | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi

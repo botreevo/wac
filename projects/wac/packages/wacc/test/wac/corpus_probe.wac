@@ -1,0 +1,249 @@
+// The differential corpus every rung is compared over.
+//
+// This is packages/wacc/test/corpus.ts (deleted 2026-11-11) with no JavaScript in it. Twelve of this package's
+// TypeScript tests — two thousand lines of them — begin by loading the same list of `.wac` files, so
+// it is written once here for the same reason it was written once there.
+//
+// Note what it does *not* do: it does not compile or type-check anything. A corpus entry only has to
+// be lexable and parseable, so a file that is valid syntax and invalid semantics is still a useful
+// case — arguably the more useful kind, since it puts the parser somewhere the working code never
+// goes.
+//
+// ## The two things that make it correct
+//
+//   - **the floor.** A cwd that is not the repository root turns the whole walk into an empty list,
+//     and an empty list makes every differential standing on it pass. Ten is well under the real
+//     count and well over what a broken walk returns.
+//   - **`spec/tour.wac` is required, not optional.** It is the single most valuable entry by a
+//     distance — written to exercise every feature in the language, which no working package does.
+//     It used to be allowed to go missing, and a checkout without it lost the richest file in the
+//     corpus while still printing "compared 50 files" as though nothing had happened. A skip is
+//     fine; a silent skip reads as coverage that was never there.
+//
+// **Sorted by bytes**, through `packages/fs`'s `sortNames`, where the TypeScript used
+// `localeCompare`. The order only has to be the same twice — a failure list that reads differently
+// between two runs makes a diff meaningless — and byte order is what every tool this is compared
+// against does with `LC_ALL=C`.
+
+import { Files } from "std";
+import { importSpecs } from "../../src/files.wac";
+import { Res, resolveFrom } from "../../src/path.wac";
+import { Located, Manifest, packageEntry, readManifest } from "../../../wacpkg/src/manifest.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
+import { endsWith } from "../../../wactest/src/strings.wac";
+import { sortNames } from "../../../fs/src/trees.wac";
+import { flatten } from "core";
+import { closureOf } from "./source_probe.wac";
+
+/** As many `.wac` files as the repository is ever expected to hold. */
+static i32 CAP = 4096;
+
+/** The corpus, or why there isn't one. */
+export struct Corpus {
+  bool ok;
+  /** Why not, when `ok` is false. Empty otherwise. */
+  string error;
+  /** Parallel with `sources`, as every `api.wac` entry point wants them. */
+  string[] paths;
+  string[] sources;
+}
+
+Corpus refused(string why) {
+  return Corpus(false, why, string[].filled(0, ""), string[].filled(0, ""));
+}
+
+/**
+ * Every `.wac` file under `dir`, recursively, appended to `found` from `n` — the new count, or -2 if
+ * the cap was reached.
+ *
+ * **It used to be three fixed directories one level deep** — `src`, `test/wac`, `bench` — which
+ * covered 741 of the 943 `.wac` files under `packages/` and, worse, left 64 *import edges* pointing
+ * at files the corpus does not supply: `packages/box/src/applets/*` under a nested directory,
+ * `packages/bignum/test/probe.wac` beside `test/wac` rather than in it. Those imports contributed no
+ * declarations, every name from them was unknown, and unknown is silent — so rung 3 was checking
+ * files half-blind and saying they were clean.
+ *
+ * Found by `issues/lang/0157`: once the checker refuses an import naming a file nobody supplied, the
+ * gap reports itself. That is the general shape — an extractor bounds the invariant it feeds, and the
+ * bound is invisible from inside.
+ */
+i32 walk(Files fs, string dir, string[] found, i32 n) {
+  string[]? listing = flatten(fs.readDir(dir).wait()).ok();
+  // An absent directory is the normal case here — most packages have no `bench/`.
+  if (listing is null) { return n; }
+  string[] names = listing!;
+  sortNames(names);
+  for (i32 i = 0; i < names.len(); i++) {
+    if (n < 0) { return n; }
+    string full = dir + "/" + names[i];
+    if (endsWith(names[i], ".wac")) {
+      if (n >= CAP) { return -2; }
+      found[n] = full;
+      n = n + 1;
+      continue;
+    }
+    // No extension is the only cheap signal for a directory here, and a `.` in the last segment is
+    // the only cheap signal against: `readDir` on a plain file answers null, which `walk` treats as
+    // an absent directory, so a misjudgement costs a wasted call rather than a wrong corpus.
+    if (names[i].indexOf(".") < 0) { n = walk(fs, full, found, n); }
+  }
+  return n;
+}
+
+/**
+ * Every `.wac` path in `packages/`, plus `spec/tour.wac`, sorted.
+ *
+ * Paths first and contents afterwards, so the sort is over one array rather than two kept in step —
+ * a pair sort written by hand is where this would go wrong silently, by pairing a path with another
+ * file's source.
+ */
+string[] paths(Files fs, i32[] countOut) {
+  string[] found = string[].filled(CAP, "");
+  i32 n = 0;
+
+  string[]? top = flatten(fs.readDir("packages").wait()).ok();
+  if (top is null) { countOut[0] = -1; return found; }
+  string[] packages = top!;
+  sortNames(packages);
+
+  for (i32 p = 0; p < packages.len(); p++) {
+    n = walk(fs, "packages/" + packages[p], found, n);
+    if (n < 0) { countOut[0] = -2; return found; }
+  }
+  // **`tools/` too, because `packages/` imports it.** Nine import edges from `packages/box`,
+  // `packages/sh` and others name `tools/wac/covledger.wac` and `tools/wac/shfuzz.wac`, and a corpus
+  // that walks only `packages/` supplies neither — so those files were checked without them and
+  // reported clean. `issues/lang/0157`.
+  n = walk(fs, "tools", found, n);
+  if (n < 0) { countOut[0] = -2; return found; }
+  countOut[0] = n;
+  return found;
+}
+
+/**
+ * Load the corpus, sanity-check it, and say what it holds.
+ *
+ * `caller` appears in a failure because the same broken walk from two test files otherwise looks
+ * like one flaky test.
+ */
+export Corpus loadCorpus(Files fs, string caller) {
+  i32[] countOut = i32[].filled(1, 0);
+  string[] all = paths(fs, countOut);
+  i32 n = countOut[0];
+  if (n == -1) { return refused(caller + ": cannot read `packages/` — these run from the repo root"); }
+  if (n == -2) { return refused(caller + ": more than " + itoa(CAP) + " files; the cap is too low"); }
+
+  string[] found = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { found[i] = all[i]; }
+  sortNames(found);
+
+  // `spec/tour.wac` last, as the TypeScript appends it after sorting.
+  string[] wanted = string[].filled(n + 1, "");
+  for (i32 i = 0; i < n; i++) { wanted[i] = found[i]; }
+  wanted[n] = "spec/tour.wac";
+
+  string[] sources = string[].filled(wanted.len(), "");
+  for (i32 i = 0; i < wanted.len(); i++) {
+    auto rRead = flatten(fs.readFile(wanted[i]).wait());
+    u8[]? r = rRead.ok();
+    if ((r is null)) { return refused(caller + ": cannot read " + wanted[i] + " — " + "\{rRead.isErr() ? "\{rRead.err()!}" : ""}"); }
+    sources[i] = string.fromBytes(r!);
+  }
+
+  if (wanted.len() < 10) {
+    return refused(caller + ": corpus is only " + itoa(wanted.len()) +
+                   " files — the walk is probably wrong. These run from the repo root; check the cwd.");
+  }
+  return Corpus(true, "", wanted, sources);
+}
+
+/**
+ * `entry` and what it imports, out of `c` — what a build would hand the compiler for it — or a refusal naming
+ * `entry` when the corpus does not hold it.
+ *
+ * **For a test that asks the compiler about one program.** The `api.wac` `*Files` entry points parse every
+ * file they are given, so handing them the whole corpus costs seconds per call however small the program:
+ * `describewac_test.wac` was 77s that way and `checked_test.wac` 49s in one test, and both were asking about
+ * a handful of files. Narrowed, the answer is the one a build gets.
+ *
+ * **Short is the failure to guard against**, as `closureOf` says: a closure missing a file makes the
+ * compiler answer "an import of a file that was not supplied", and a test comparing two such answers passes.
+ * A caller should check that the program it narrowed to is not blocked.
+ */
+export Corpus closureCorpus(Corpus c, string entry) {
+  i32 at = -1;
+  string[] keys = string[].filled(c.paths.len(), "");
+  for (i32 i = 0; i < c.paths.len(); i++) {
+    keys[i] = "/" + c.paths[i];
+    if (c.paths[i] == entry) { at = i; }
+  }
+  if (at < 0) { return refused(entry + " is not in the corpus"); }
+  i32[] near = closureOf(keys, c.sources, at);
+  string[] ps = string[].filled(near.len(), "");
+  string[] ss = string[].filled(near.len(), "");
+  for (i32 i = 0; i < near.len(); i++) { ps[i] = c.paths[near[i]]; ss[i] = c.sources[near[i]]; }
+  return Corpus(true, "", ps, ss);
+}
+
+/** The corpus entries under `packages/wacc/src/`, which is what the bootstrap rung is about. */
+export string[] waccSources(Corpus c) {
+  i32 n = 0;
+  for (i32 i = 0; i < c.paths.len(); i++) {
+    if (c.paths[i].len() > 18 && c.paths[i].slice(0, 18) == "packages/wacc/src/") { n = n + 1; }
+  }
+  string[] out = string[].filled(n, "");
+  i32 at = 0;
+  for (i32 i = 0; i < c.paths.len(); i++) {
+    if (c.paths[i].len() > 18 && c.paths[i].slice(0, 18) == "packages/wacc/src/") {
+      out[at] = c.paths[i];
+      at = at + 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * Each specifier that names a **nested project's directory**, mapped to the module its manifest
+ * `exports` — what `wac` does for such an import (spec ch02 `§wac-import-nested-project-sd4s5n8`).
+ * Without it a file importing `"../../web"` was reported for an import of *no file at that path*,
+ * which is this harness not resolving what the command does, not a fault in the file.
+ *
+ * Keys may be `/`-prefixed, as rung 3's are, or relative, as `loadCorpus`'s are; the mapped module is
+ * keyed the same way. Here rather than in rung 3 since rung 4 needs it too: without it every page
+ * example — they all import `"../../web"` — emitted with its imports half-resolved and was counted
+ * partial.
+ */
+export Res nestedProjects(Files fs, string[] keys, string[] sources) {
+  string[] from = string[]();
+  string[] spec = string[]();
+  string[] to = string[]();
+  for (i32 i = 0; i < keys.len(); i++) {
+    string[] specs = importSpecs(sources[i].toBytes());
+    for (i32 k = 0; k < specs.len(); k++) {
+      string sp = specs[k];
+      if (sp.len() == 0 || sp.slice(0, 1) != "." || (sp.len() > 4 && sp.slice(sp.len() - 4, sp.len()) == ".wac")) {
+        continue;
+      }
+      string dir = resolveFrom(keys[i], sp);
+      bool rooted = dir.len() > 0 && dir.slice(0, 1) == "/";
+      string disk = rooted ? dir.slice(1, dir.len()) : dir;
+      u8[]? m = flatten(fs.readFile(disk + "/wac.json5").wait()).ok();
+      if ((m is null)) { continue; }
+      Manifest mf = readManifest(m!);
+      if (!mf.ok || mf.exports == "") { continue; }
+      Located entry = packageEntry(disk, mf.exports);
+      if (!entry.ok) { continue; }
+      from = grown(from, keys[i]);
+      spec = grown(spec, sp);
+      to = grown(to, (rooted ? "/" : "") + entry.path);
+    }
+  }
+  return Res(string[](), from, spec, to, "");
+}
+
+string[] grown(string[] xs, string x) {
+  string[] out = string[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+

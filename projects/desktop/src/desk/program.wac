@@ -1,0 +1,272 @@
+// A program from the disk: its module started as a process of its own, with windows when it asks for them.
+//
+// **The desktop is the program's host** (the handover's design point 1). The module is started with
+// `spawnProviding` and two capabilities: `wac.page` and `wac.desktop` (`services.wac`). Its files are the disk as its
+// `Grants` let it see it (`grants.wac`): its own folder, `.apps/<name>`, which is where it starts, and whatever the
+// person hands it — a file picked for it, or one dropped on its window.
+//
+// **A program starts with no window** (design point 2). Its share of `wac.page`'s numbers is `MAX_WINDOWS` slices of
+// `PAGE_WINDOW`, one per window: a page's program opens the first by opening its page — its first request in slice 0
+// opens the window — and any program opens more with `wac.desktop`'s `DESKTOP_WINDOW` (`Desktop.openWindow`).
+// Each window's slice is answered by a `PageServer` drawing into that window's body, so what a program draws in one
+// window cannot reach another. A request for a window that has not drawn yet waits until it has.
+//
+// **Its windows are its**: closing the last one stops it, and when it ends they close. A program that never opened
+// one — a command-line program — says what it wrote in the desktop's note when it is done.
+
+import { Answer, Authority, Child, FAULT_UNSUPPORTED, Launch, Provider } from "std";
+import { Ticket, Vec } from "core";
+import { Element, Node, PAGE_CAPABILITY, PAGE_VERSION, PAGE_WINDOW, Page, PageServer, Ref, Ui, html.div, when } from "web";
+import { Grants, grantedFiles } from "./grants.wac";
+import { desktopProvider } from "./services.wac";
+import { recall } from "./remember.wac";
+import { askedFull } from "./full.wac";
+import { loudnessOf } from "./prefs.wac";
+import { Got, leafOf } from "./vfs.wac";
+import { CLOSED_WINDOW, Desk, Hand, MAX_WINDOWS, NO_WINDOW, Pending, Running, Start, Win, close, dropHand, find, openWindowFor,
+         runningOf } from "./wm.wac";
+
+/** The folder a program keeps what it keeps in: `.apps/` and its file's name, without `.wasm`. */
+export string appFolder(string path) {
+  string leaf = leafOf(path);
+  string name = leaf.len() > 5 && leaf.slice(leaf.len() - 5, leaf.len()) == ".wasm" ? leaf.slice(0, leaf.len() - 5) : leaf;
+  return ".apps/" + name;
+}
+
+Ticket<Answer> refused(string why) {
+  Ticket<Answer> t;
+  t.resolve(Answer(FAULT_UNSUPPORTED(), why, u8[](), 0 as i64, 0 as i64, 0));
+  return t;
+}
+
+/** `wac.page`, for program `r`: each window's slice answered by that window's server, once it has drawn. */
+Provider pageProvider(Desk d, Running r, fn<void()> bumpDesk) {
+  return Provider(PAGE_CAPABILITY(), PAGE_VERSION(), PAGE_WINDOW * MAX_WINDOWS,
+                  (i32 k, i64 a, i64 b, string text, u8[] bytes) => pageRequest(d, r, bumpDesk, k, a, b, text, bytes));
+}
+
+Ticket<Answer> pageRequest(Desk d, Running r, fn<void()> bumpDesk, i32 k, i64 a, i64 b, string text, u8[] bytes) {
+  i32 slice = k / PAGE_WINDOW;
+  if (slice < 0 || slice >= MAX_WINDOWS) { return refused("no window \{slice}"); }
+  PageServer? s = r.servers.get(slice);
+  if (s is not null) { return s!.answer(k % PAGE_WINDOW, a, b, text, bytes); }
+  i32 win = r.wins.get(slice);
+  if (win == CLOSED_WINDOW) { return refused("window \{slice} was closed"); }
+  if (win == NO_WINDOW) {
+    // The first window is the page a program opens; any other it asks for with `DESKTOP_WINDOW` first.
+    if (slice != 0) { return refused("window \{slice} was not opened"); }
+    openWindowFor(d, r, 0, r.title);
+    bumpDesk();
+  }
+  Ticket<Answer> t;
+  r.waiting.push(Pending(slice, k % PAGE_WINDOW, a, b, text, bytes, t));
+  return t;
+}
+
+/**
+ * Start the program `s` names, with no window until it asks for one; it ends when it does, or its last window shuts.
+ * It holds its own folder, what it was allowed before, and what `s` hands it for this run.
+ */
+export async void launch(Desk d, Page page, Start s, fn<void()> bumpDesk) {
+  string path = s.path;
+  Got<u8[]> read = await d.fs.read(path);
+  if (!read.ok) {
+    d.error = "could not read " + path + ": " + read.error;
+    bumpDesk();
+    return;
+  }
+  string home = appFolder(path);
+  await d.fs.fs.mkdir(home, true);
+  Grants g = Grants.create();
+  g.grant(home, true);
+  await recall(d, path, g);
+  for (i32 i = 0; i < s.given.paths.len(); i++) { g.grant(s.given.paths.get(i), s.given.writable.get(i)); }
+  Vec<i32> wins = Vec.create();
+  Vec<PageServer?> servers = Vec.create();
+  for (i32 i = 0; i < MAX_WINDOWS; i++) {
+    wins.push(NO_WINDOW);
+    servers.push(null);
+  }
+  Running r = Running(d.nextRun, path, leafOf(path), g, s, null, wins, servers, Vec.create(), false, false);
+  d.nextRun++;
+  d.running.push(r);
+  auto started = await page.sys.procs().spawnProviding(read.value, s.args, Authority(grantedFiles(d.fs.fs, g, home, () => { soon(page, d, bumpDesk); }), null, null, null),
+                                                       [pageProvider(d, r, bumpDesk), desktopProvider(d, r, bumpDesk)],
+                                                       Launch("/" + home, false, false, false, false));
+  if (started.isErr()) {
+    ended(d, r);
+    d.error = "could not start " + path + ": \{started.err()!}";
+    bumpDesk();
+    return;
+  }
+  Child child = started.ok()!;
+  r.child = child;
+  // A window the program opened before its spawn was answered: its server learns the child now (`drawn`).
+  for (i32 i = 0; i < MAX_WINDOWS; i++) {
+    PageServer? open = r.servers.get(i);
+    if (open is not null) { open!.forChild(child.handle); }
+  }
+  if (r.done) {
+    child.stop();
+    return;
+  }
+  string out = string.fromBytes((await child.output().readAll()).orElse(u8[]()));
+  string errs = string.fromBytes((await child.errors().readAll()).orElse(u8[]()));
+  i32 code = (await child.exit()).orElse(0 - 1);
+  if (r.done) { return; }
+  ended(d, r);
+  // A program with nothing to show says what it wrote; one with windows says only that it failed.
+  string said = trimmed(out + errs);
+  if (!r.shown) {
+    d.note = leafOf(path) + (code == 0 ? "" : " exited with \{code}") + (said == "" ? " finished" : ": " + firstLine(said));
+  } else if (code != 0) {
+    d.error = r.title + " exited with \{code}" + (trimmed(errs) == "" ? "" : ": " + firstLine(trimmed(errs)));
+  }
+  bumpDesk();
+}
+
+/**
+ * A program changed the disk: every window showing it looks again — a moment later, once, however many changes a
+ * command made in the meantime.
+ */
+void soon(Page page, Desk d, fn<void()> bumpDesk) {
+  if (d.lookSoon) { return; }
+  d.lookSoon = true;
+  lookAgain(page, d, bumpDesk);
+}
+
+async void lookAgain(Page page, Desk d, fn<void()> bumpDesk) {
+  await page.sleep(150);
+  d.lookSoon = false;
+  d.fsRev++;
+  bumpDesk();
+}
+
+/** `s` without the spaces and line ends around it. */
+string trimmed(string s) {
+  u8[] b = s.toBytes();
+  i32 from = 0;
+  i32 to = b.len();
+  while (from < to && (b[from] == ' ' || b[from] == '\n' || b[from] == '\r' || b[from] == '\t')) { from++; }
+  while (to > from && (b[to - 1] == ' ' || b[to - 1] == '\n' || b[to - 1] == '\r' || b[to - 1] == '\t')) { to--; }
+  return s.slice(from, to);
+}
+
+string firstLine(string s) {
+  i32 nl = s.indexOf("\n");
+  string line = nl < 0 ? s : s.slice(0, nl);
+  return line.len() > 160 ? line.slice(0, 160) + "…" : line;
+}
+
+/** Program `r` is over: its windows close, and it is no longer running. */
+void ended(Desk d, Running r) {
+  r.done = true;
+  for (i32 i = 0; i < MAX_WINDOWS; i++) {
+    i32 win = r.wins.get(i);
+    if (win >= 0) {
+      r.wins.set(i, CLOSED_WINDOW);
+      if (find(d, win) is not null) { close(d, win); }
+    }
+  }
+  for (i32 i = 0; i < d.running.len(); i++) {
+    if (d.running.get(i) is r) {
+      d.running.remove(i);
+      return;
+    }
+  }
+}
+
+/**
+ * Window `slice` of program `r` has drawn into `body`: its server, and everything that waited for it.
+ *
+ * **The program's page is a shadow root of the window's body** (`Element.shadow`): its stylesheets apply inside its
+ * window and nowhere else, and the desktop's — or another program's — do not reach in. Without it, any program's
+ * `<style>` could restyle the desktop, the consent dialog included, and two programs' rules for one class name
+ * fought. The body contains its layout and paint too (`style.wac`), so even `position: fixed` stays in the window.
+ */
+void drawn(Desk d, Running r, Win w, i32 slice, Page page, Element body, fn<void()> bumpDesk) {
+  PageServer server = PageServer.into(page, body.shadow(), (string t) => {
+    w.title = t;
+    if (slice == 0 || r.title == "") { r.title = t; }
+    bumpDesk();
+  }, (string line) => { page.log(w.title + ": " + line); });
+  r.servers.set(slice, server);
+  // As loud as Settings says, from its first sound (`settings.wac`).
+  server.louder(loudnessOf(d.prefs), 0);
+  // **A canvas the program asks for as its own is drawn in the program's worker** (`PageServer.forChild`): its pixels
+  // go straight from the program to the screen, not through this desktop's worker a frame behind — which held Pip
+  // under sixty frames a second on a phone. A window opened before the spawn was answered learns it in `launch`.
+  if (r.child is not null) { server.forChild(r.child!.handle); }
+  // Full screen, asked for: the desktop's to give, and to take back (`full.wac`).
+  i32 winId = w.id;
+  server.whenFullScreen((Element asked, bool on) => { if (askedFull(d, winId, on, page.now())) { bumpDesk(); } });
+  if (r.start.takesFiles) { d.hands.push(Hand(w.id, (bool ok, string name, u8[] bytes) => { server.hand(ok, name, bytes); })); }
+  Vec<Pending> later = Vec.create();
+  Vec<Pending> now = r.waiting;
+  r.waiting = later;
+  for (i32 i = 0; i < now.len(); i++) {
+    Pending p = now.get(i);
+    if (p.slice != slice) {
+      later.push(p);
+      continue;
+    }
+    Ticket<Answer> answered = server.answer(p.k, p.a, p.b, p.text, p.bytes);
+    Ticket<Answer> waiting = p.answer;
+    when(answered, () => { waiting.resolve(answered.value()); });
+  }
+}
+
+/** Window `slice` of program `r` closed: its slice answers no more, and the program stops if that was its last. */
+void shut(Desk d, Running r, Win w, i32 slice) {
+  dropHand(d, w.id);
+  // Its page hears it is closed (web's `Page.closed`): a program with other windows goes on without this one.
+  PageServer? server = r.servers.get(slice);
+  if (server is not null) { server!.close(); }
+  r.servers.set(slice, null);
+  if (r.wins.get(slice) == w.id) { r.wins.set(slice, CLOSED_WINDOW); }
+  if (r.done) { return; }
+  for (i32 i = 0; i < MAX_WINDOWS; i++) { if (r.wins.get(i) >= 0) { return; } }
+  r.done = true;
+  if (r.child is not null) { r.child!.stop(); }
+  for (i32 i = 0; i < d.running.len(); i++) {
+    if (d.running.get(i) is r) {
+      d.running.remove(i);
+      return;
+    }
+  }
+}
+
+/** Which program and which of its windows `w` is, from its `arg`: `<program>/<slot>`. */
+i32 partOf(string arg, i32 which) {
+  i32 cut = arg.indexOf("/");
+  if (cut < 0) { return 0 - 1; }
+  string part = which == 0 ? arg.slice(0, cut) : arg.slice(cut + 1, arg.len());
+  i32 n = 0;
+  for (i32 i = 0; i < part.len(); i++) {
+    u8 c = part.toBytes()[i];
+    if (c < '0' || c > '9') { return 0 - 1; }
+    n = n * 10 + (c as i32 - 48);
+  }
+  return n;
+}
+
+/** One window of a running program: its body is the program's, drawn through the window's server. */
+export Node ProgramApp(Ui ui, Desk d, Win w, Page page, fn<void()> bumpDesk, i32 fsRev, i32 rev) {
+  Ref body = ui.ref();
+  i32 id = partOf(w.arg, 0);
+  i32 slice = partOf(w.arg, 1);
+  Running? r = runningOf(d, id);
+  // Drawn once, when the window first draws, and shut when it closes: the effect's cleanup is the window going.
+  ui.effect("", () => {
+    Running? now = runningOf(d, id);
+    Element? e = body.element();
+    if (now is not null && e is not null && slice >= 0 && slice < MAX_WINDOWS) { drawn(d, now!, w, slice, page, e!, bumpDesk); }
+    return () => { if (now is not null) { shut(d, now!, w, slice); } };
+  });
+  // **The body is drawn once and never again with children of its own**: what is in it is the program's, made
+  // through the server's handles, and this view must not render over it.
+  return <div class="program">
+    <div class="program-body" ref={body}></div>
+    {r is null ? <div class="program-status">This program is no longer running.</div> : Node.Text("")}
+  </div>;
+}

@@ -1,0 +1,461 @@
+// The kernels as WGSL: one compute shader per kernel, operation and element types, each the GPU's reading of a
+// definition in `backend.wac`.
+//
+// **Every shader takes its sizes from a uniform, never from its text**, so there is one program per kind of work
+// rather than one per shape, and a model compiles its shaders once in its first step. The uniform is 64 `i32`s read as
+// sixteen `vec4`s — uniform arrays are laid out sixteen bytes to an element — and `P(i)` reads the `i`th. A uniform,
+// not a storage buffer, because WGSL only lets a loop with a barrier in it run a number of times the whole workgroup
+// agrees on, and a value from a uniform is one it can prove that of.
+//
+// **Every buffer is read through a function, `L_<name>(i)`, that answers an `f32`**, whatever the buffer holds. An
+// `F16` buffer is halves packed two to a `u32` and unpacked with `unpack2x16float` — core WGSL, so this needs no
+// `shader-f16` and runs on every adapter, SwiftShader included. The arithmetic is always `f32`.
+//
+// **An elementwise shader is a function `value(i)`** — element `i` of the output — and a `main` around it that
+// writes the output in its type: one invocation an element for `F32`, one a pair for `F16`, since two invocations
+// cannot each write half of one `u32`. Invocations run 64 to a workgroup in a grid up to 65535 workgroups wide
+// (`GpuBackend.spread`), and one past the end returns at once. The reductions and the matrix product write `F32`
+// always; the backend casts their result when it should be a half.
+
+import { Binary, DType, Reduce, Unary, sameDType } from "../backend.wac";
+import { Shaders } from "./shaders.wac";
+
+/** How many `i32` parameters a shader can be handed. */
+export static i32 PARAMS = 64;
+
+/** `template` with every `key` in it replaced by `value`. */
+string substitute(string template, string key, string value) {
+  string out = "";
+  string rest = template;
+  i32 at = rest.indexOf(key);
+  while (at >= 0) {
+    out += rest.slice(0, at) + value;
+    rest = rest.slice(at + key.len(), rest.len());
+    at = rest.indexOf(key);
+  }
+  return out + rest;
+}
+
+bool half(DType t) { return sameDType(t, DType.F16); }
+
+/** A short spelling of the types a program was made for, for its name in the cache: `f16,f32>f16`. */
+export string typesKey(DType[] ins, DType out) {
+  string s = "";
+  for (i32 i = 0; i < ins.len(); i++) {
+    if (i > 0) { s += ","; }
+    s += half(ins[i]) ? "f16" : "f32";
+  }
+  return s + ">" + (half(out) ? "f16" : "f32");
+}
+
+string header() {
+  return """
+      @group(0) @binding(0) var<uniform> p: array<vec4<i32>, 16>;
+      fn P(i: i32) -> i32 { return p[i / 4][i % 4]; }
+      fn F(i: i32) -> f32 { return bitcast<f32>(P(i)); }
+      // Through a `var`, because WGSL refuses an infinity or a NaN in a constant expression.
+      fn infinity() -> f32 { var bits = 0x7f800000u; return bitcast<f32>(bits); }
+      fn nan() -> f32 { var bits = 0x7fc00000u; return bitcast<f32>(bits); }
+
+      """;
+}
+
+/** The input buffers, bound from 1 in order, each with its `L_<name>`. */
+string inputs(string[] names, DType[] types) {
+  string s = "";
+  for (i32 k = 0; k < names.len(); k++) {
+    string n = names[k];
+    if (half(types[k])) {
+      s += "@group(0) @binding(\{k + 1}) var<storage, read> \{n}: array<u32>;\n"
+         + "fn L_\{n}(i: i32) -> f32 { return unpack2x16float(\{n}[i / 2])[i % 2]; }\n";
+    } else {
+      s += "@group(0) @binding(\{k + 1}) var<storage, read> \{n}: array<f32>;\n"
+         + "fn L_\{n}(i: i32) -> f32 { return \{n}[i]; }\n";
+    }
+  }
+  return s;
+}
+
+/** The output buffer `ys`, bound after the inputs, as `F32` — the reductions' and the matrix product's. */
+string f32Output(i32 binding) { return "@group(0) @binding(\{binding}) var<storage, read_write> ys: array<f32>;\n"; }
+
+/**
+ * An elementwise shader: `body` is the body of `fn value(i: i32) -> f32`, reading the inputs through their `L_`
+ * functions; `extra` is anything it calls. `P(0)` is the number of elements.
+ */
+string elementwise(string[] names, DType[] types, DType out, string extra, string body) {
+  i32 o = names.len() + 1;
+  string common = header() + extra + inputs(names, types) + "\nfn value(i: i32) -> f32 {\n" + body + "\n}\n";
+  if (half(out)) {
+    return common + "@group(0) @binding(\{o}) var<storage, read_write> ys: array<u32>;\n" + """
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+          let t = i32(gid.x + gid.y * nwg.x * 64u);
+          let i = t * 2;
+          let n = P(0);
+          if (i >= n) { return; }
+          var second = 0.0;
+          if (i + 1 < n) { second = value(i + 1); }
+          ys[t] = pack2x16float(vec2<f32>(value(i), second));
+        }
+        """;
+  }
+  return common + "@group(0) @binding(\{o}) var<storage, read_write> ys: array<f32>;\n" + """
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+        let i = i32(gid.x + gid.y * nwg.x * 64u);
+        if (i >= P(0)) { return; }
+        ys[i] = value(i);
+      }
+      """;
+}
+
+export string unaryExpr(Unary op) {
+  match (op) {
+    Neg: { return "-v"; }
+    Abs: { return "abs(v)"; }
+    Exp: { return "exp(v)"; }
+    // Near 0, `exp(v) - 1` and `log(1 + v)` lose the digits the functions exist to keep; a few terms of the series
+    // keep them.
+    Expm1: { return "select(exp(v) - 1.0, v * (1.0 + v * (0.5 + v * (0.16666667 + v * 0.041666668))), abs(v) < 0.01)"; }
+    Log: { return "log(v)"; }
+    Log1p: { return "select(log(1.0 + v), v * (1.0 - v * (0.5 - v * (0.33333334 - v * 0.25))), abs(v) < 0.01)"; }
+    Sqrt: { return "sqrt(v)"; }
+    Rsqrt: { return "inverseSqrt(v)"; }
+    Square: { return "v * v"; }
+    Reciprocal: { return "1.0 / v"; }
+    Sin: { return "sin(v)"; }
+    Cos: { return "cos(v)"; }
+    // Some drivers compute tanh from exponentials that overflow beyond about 44; it is 1 to f32 long before 15.
+    Tanh: { return "tanh(clamp(v, -15.0, 15.0))"; }
+    Sigmoid: { return "1.0 / (1.0 + exp(-v))"; }
+    Relu: { return "max(v, 0.0)"; }
+    Softplus: { return "max(v, 0.0) + log(1.0 + exp(-abs(v)))"; }
+    Sign: { return "sign(v)"; }
+    Floor: { return "floor(v)"; }
+    Ceil: { return "ceil(v)"; }
+    // WGSL's round, like wasm's nearest, takes a tie to the even neighbour.
+    Round: { return "round(v)"; }
+    Step: { return "select(0.0, 1.0, v > 0.0)"; }
+  }
+}
+
+export string unaryShader(Unary op, DType t) {
+  return elementwise(["xs"], [t], t, "", "  let v = L_xs(i);\n  return " + unaryExpr(op) + ";");
+}
+
+export string castShader(DType from, DType to) { return elementwise(["xs"], [from], to, "", "  return L_xs(i);"); }
+
+export string fillShader(DType t) { return elementwise(string[](), DType[](), t, "", "  return F(1);"); }
+
+export string binaryExpr(Binary op) {
+  match (op) {
+    Add: { return "a + b"; }
+    Sub: { return "a - b"; }
+    Mul: { return "a * b"; }
+    Div: { return "a / b"; }
+    Pow: { return "powf(a, b)"; }
+    Maximum: { return "select(max(a, b), a + b, a != a || b != b)"; }
+    Minimum: { return "select(min(a, b), a + b, a != a || b != b)"; }
+    Equal: { return "select(0.0, 1.0, a == b)"; }
+    NotEqual: { return "select(0.0, 1.0, a != b)"; }
+    Less: { return "select(0.0, 1.0, a < b)"; }
+    LessEqual: { return "select(0.0, 1.0, a <= b)"; }
+    Greater: { return "select(0.0, 1.0, a > b)"; }
+    GreaterEqual: { return "select(0.0, 1.0, a >= b)"; }
+  }
+}
+
+/**
+ * WGSL's `pow` is undefined below zero, where TensorFlow's answers whenever the exponent is whole: `(-2)³` is -8. So the
+ * magnitude is raised and the sign put back, and a fractional power of a negative is NaN, as it is on the CPU.
+ */
+string powDefinition() {
+  return """
+      fn powf(a: f32, b: f32) -> f32 {
+        if (b == 0.0) { return 1.0; }
+        if (a == 0.0) { return select(0.0, infinity(), b < 0.0); }
+        let r = pow(abs(a), b);
+        if (a > 0.0) { return r; }
+        if (fract(b) != 0.0) { return nan(); }
+        return select(r, -r, fract(b * 0.5) != 0.0);
+      }
+
+      """;
+}
+
+/** The offsets an output index reads, for `n` operands whose strides follow the shape in the parameters. */
+string stridedLoop(i32 operands) {
+  string decl = "";
+  string step = "";
+  for (i32 k = 0; k < operands; k++) {
+    decl += "  var o\{k} = 0;\n";
+    step += "    o\{k} += c * P(2 + rank * \{k + 1} + d);\n";
+  }
+  return "  let rank = P(1);\n" + decl
+       + "  var rem = i;\n"
+       + "  for (var d = rank - 1; d >= 0; d--) {\n"
+       + "    let s = P(2 + d);\n"
+       + "    let c = rem % s;\n"
+       + "    rem = rem / s;\n"
+       + step
+       + "  }\n";
+}
+
+export string binaryShader(Binary op, DType t) {
+  return elementwise(["xa", "xb"], [t, t], t, powDefinition(),
+                     stridedLoop(2) + "  let a = L_xa(o0);\n  let b = L_xb(o1);\n  return " + binaryExpr(op) + ";");
+}
+
+export string selectShader(DType cond, DType t) {
+  return elementwise(["xc", "xa", "xb"], [cond, t, t], t, "",
+                     stridedLoop(3) + "  if (L_xc(o0) != 0.0) { return L_xa(o1); }\n  return L_xb(o2);");
+}
+
+export string gatherShader(DType t) {
+  // [n, rank, out…, strides…] with the offset after them, at 2 + 2·rank.
+  return elementwise(["xs"], [t], t, "", stridedLoop(1) + "  return L_xs(o0 + P(2 + rank * 2));");
+}
+
+export string padShader(DType t) {
+  // [n, rank, out…, in…, begin…] with the fill value's bits after them.
+  return elementwise(["xs"], [t], t, "", """
+        let rank = P(1);
+        var rem = i;
+        var src = 0;
+        var mul = 1;
+        var inside = true;
+        for (var d = rank - 1; d >= 0; d--) {
+          let c = rem % P(2 + d);
+          rem = rem / P(2 + d);
+          let at = c - P(2 + rank * 2 + d);
+          let size = P(2 + rank + d);
+          if (at < 0 || at >= size) { inside = false; }
+          src += at * mul;
+          mul *= size;
+        }
+        if (inside) { return L_xs(src); }
+        return F(2 + rank * 3);
+      """);
+}
+
+/** A convolution's geometry in the parameters, from 1: n, h, w, c, kh, kw, sh, sw, dh, dw, top, left, oh, ow. */
+string convNames() {
+  return """
+        let N = P(1); let H = P(2); let W = P(3); let C = P(4);
+        let KH = P(5); let KW = P(6); let SH = P(7); let SW = P(8); let DH = P(9); let DW = P(10);
+        let PT = P(11); let PL = P(12); let OH = P(13); let OW = P(14);
+        let COLS = KH * KW * C;
+      """;
+}
+
+export string im2colShader(DType t) {
+  return elementwise(["xs"], [t], t, "", convNames() + """
+        let col = i % COLS;
+        let row = i / COLS;
+        let ch = col % C;
+        let kx = (col / C) % KW;
+        let ky = col / (C * KW);
+        let ox = row % OW;
+        let oy = (row / OW) % OH;
+        let b = row / (OW * OH);
+        let iy = oy * SH + ky * DH - PT;
+        let ix = ox * SW + kx * DW - PL;
+        if (iy >= 0 && iy < H && ix >= 0 && ix < W) { return L_xs(((b * H + iy) * W + ix) * C + ch); }
+        return F(15);
+      """);
+}
+
+/** Each input element sums the window elements that read it — gathered, so no two invocations write one place. */
+export string col2imShader(DType t) {
+  return elementwise(["xs"], [t], t, "", convNames() + """
+        let ch = i % C;
+        let ix = (i / C) % W;
+        let iy = (i / (C * W)) % H;
+        let b = i / (C * W * H);
+        var sum = 0.0;
+        for (var ky = 0; ky < KH; ky++) {
+          let ty = iy + PT - ky * DH;
+          if (ty < 0 || ty % SH != 0 || ty / SH >= OH) { continue; }
+          for (var kx = 0; kx < KW; kx++) {
+            let tx = ix + PL - kx * DW;
+            if (tx < 0 || tx % SW != 0 || tx / SW >= OW) { continue; }
+            sum += L_xs(((b * OH + ty / SH) * OW + tx / SW) * COLS + (ky * KW + kx) * C + ch);
+          }
+        }
+        return sum;
+      """);
+}
+
+export string takeShader(DType t, DType index) {
+  // [n·width, width, rows]
+  return elementwise(["table", "idx"], [t, index], t, "", """
+        let width = P(1);
+        let r = i32(L_idx(i / width));
+        if (r >= 0 && r < P(2)) { return L_table(r * width + i % width); }
+        return 0.0;
+      """);
+}
+
+/** Each table element sums the values whose index names its row — gathered, since WGSL has no float atomics. */
+export string scatterAddShader(DType t, DType index) {
+  // [rows·width, width, n]
+  return elementwise(["vals", "idx"], [t, index], t, "", """
+        let width = P(1);
+        let r = i / width;
+        let c = i % width;
+        var sum = 0.0;
+        for (var k = 0; k < P(2); k++) {
+          if (i32(L_idx(k)) == r) { sum += L_vals(k * width + c); }
+        }
+        return sum;
+      """);
+}
+
+string reduceIdentity(Reduce op) {
+  match (op) {
+    Sum: { return "0.0"; }
+    Prod: { return "1.0"; }
+    Max: { return "-infinity()"; }
+    Min: { return "infinity()"; }
+  }
+}
+
+string reduceCombine(Reduce op) {
+  match (op) {
+    Sum: { return "a + b"; }
+    Prod: { return "a * b"; }
+    Max: { return "max(a, b)"; }
+    Min: { return "min(a, b)"; }
+  }
+}
+
+/**
+ * One workgroup a row: 64 invocations stride along it, then halve their 64 partial results to one in shared memory.
+ * [outer, inner]. Writes `F32`.
+ */
+export string reduceShader(Reduce op, DType t) {
+  return substitute(substitute(header() + inputs(["xs"], [t]) + f32Output(2) + """
+      var<workgroup> part: array<f32, 64>;
+
+      fn combine(a: f32, b: f32) -> f32 { return @COMBINE@; }
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+        let row = i32(wid.x + wid.y * nwg.x);
+        let inner = P(1);
+        let valid = row < P(0);
+        var acc = @IDENTITY@;
+        if (valid) {
+          for (var j = i32(lid); j < inner; j += 64) { acc = combine(acc, L_xs(row * inner + j)); }
+        }
+        part[lid] = acc;
+        workgroupBarrier();
+        for (var s = 32u; s > 0u; s = s / 2u) {
+          if (lid < s) { part[lid] = combine(part[lid], part[lid + s]); }
+          workgroupBarrier();
+        }
+        if (lid == 0u && valid) { ys[row] = part[0]; }
+      }
+      """, "@COMBINE@", reduceCombine(op)), "@IDENTITY@", reduceIdentity(op));
+}
+
+/** `reduceShader`'s shape, carrying each candidate's index; the earlier index wins a tie, as on the CPU. */
+export string argReduceShader(bool max, DType t) {
+  return substitute(header() + inputs(["xs"], [t]) + f32Output(2) + """
+      var<workgroup> pv: array<f32, 64>;
+      var<workgroup> pi: array<i32, 64>;
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+        let row = i32(wid.x + wid.y * nwg.x);
+        let inner = P(1);
+        let valid = row < P(0);
+        var bv = 0.0;
+        var bi = 2147483647;
+        if (valid) {
+          for (var j = i32(lid); j < inner; j += 64) {
+            let v = L_xs(row * inner + j);
+            if (bi == 2147483647 || v @BETTER@ bv) { bv = v; bi = j; }
+          }
+        }
+        pv[lid] = bv;
+        pi[lid] = bi;
+        workgroupBarrier();
+        for (var s = 32u; s > 0u; s = s / 2u) {
+          if (lid < s) {
+            let ov = pv[lid + s];
+            let oi = pi[lid + s];
+            if (oi != 2147483647 && (pi[lid] == 2147483647 || ov @BETTER@ pv[lid] || (ov == pv[lid] && oi < pi[lid]))) {
+              pv[lid] = ov;
+              pi[lid] = oi;
+            }
+          }
+          workgroupBarrier();
+        }
+        if (lid == 0u && valid) { ys[row] = f32(pi[0]); }
+      }
+      """, "@BETTER@", max ? ">" : "<");
+}
+
+/**
+ * Sixteen by sixteen tiles: each workgroup computes one tile of the output, staging a tile of each operand in shared
+ * memory per step along `k`, so each number is read from the buffer once per tile rather than once per product.
+ * [batch, m, k, n, ta, tb, aStride, bStride]; the grid is (n / 16, m / 16, batch). Writes `F32`, accumulated in `f32`.
+ */
+export string matmulShader(DType t) {
+  return header() + inputs(["xa", "xb"], [t, t]) + f32Output(3) + """
+      var<workgroup> ta: array<array<f32, 16>, 16>;
+      var<workgroup> tb: array<array<f32, 16>, 16>;
+
+      @compute @workgroup_size(16, 16)
+      fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+        let M = P(1); let K = P(2); let N = P(3);
+        let transA = P(4) != 0; let transB = P(5) != 0;
+        let q = i32(wid.z);
+        let ab = q * P(6);
+        let bb = q * P(7);
+        let ly = i32(lid.y); let lx = i32(lid.x);
+        let row = i32(wid.y) * 16 + ly;
+        let col = i32(wid.x) * 16 + lx;
+        var sum = 0.0;
+        let tiles = (K + 15) / 16;
+        for (var t = 0; t < tiles; t++) {
+          let ac = t * 16 + lx;
+          var av = 0.0;
+          if (row < M && ac < K) { av = select(L_xa(ab + row * K + ac), L_xa(ab + ac * M + row), transA); }
+          ta[ly][lx] = av;
+          let br = t * 16 + ly;
+          var bv = 0.0;
+          if (br < K && col < N) { bv = select(L_xb(bb + br * N + col), L_xb(bb + col * K + br), transB); }
+          tb[ly][lx] = bv;
+          workgroupBarrier();
+          for (var s = 0; s < 16; s++) { sum += ta[ly][s] * tb[s][lx]; }
+          workgroupBarrier();
+        }
+        if (row < M && col < N) { ys[q * M * N + row * N + col] = sum; }
+      }
+      """;
+}
+
+/** The kernels above, as the `Shaders` the WebGPU backend runs. */
+export struct Wgsl : Shaders {
+  override string fill(this, DType t) { return fillShader(t); }
+  override string cast(this, DType from, DType to) { return castShader(from, to); }
+  override string unary(this, Unary op, DType t) { return unaryShader(op, t); }
+  override string binary(this, Binary op, DType t) { return binaryShader(op, t); }
+  override string select(this, DType cond, DType t) { return selectShader(cond, t); }
+  override string reduce(this, Reduce op, DType t) { return reduceShader(op, t); }
+  override string argReduce(this, bool max, DType t) { return argReduceShader(max, t); }
+  override string matmul(this, DType t) { return matmulShader(t); }
+  override string gather(this, DType t) { return gatherShader(t); }
+  override string pad(this, DType t) { return padShader(t); }
+  override string im2col(this, DType t) { return im2colShader(t); }
+  override string col2im(this, DType t) { return col2imShader(t); }
+  override string take(this, DType t, DType index) { return takeShader(t, index); }
+  override string scatterAdd(this, DType t, DType index) { return scatterAddShader(t, index); }
+}

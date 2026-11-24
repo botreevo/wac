@@ -1,0 +1,71 @@
+// Assertions for tensors, and the gradient check every backward rule is held to.
+
+import { Device, Gradients, Tensor } from "../src/tensor.wac";
+import { sameShape, shapeText } from "../src/shape.wac";
+
+export struct Check {
+  string failures;
+
+  Check create() { return Check(""); }
+
+  void fail(this, string what) { this.failures += what + "; "; }
+
+  void ok(this, bool cond, string what) { if (!cond) { this.fail(what); } }
+
+  void near(this, f64 got, f64 want, f64 tol, string what) {
+    // Equal first: two infinities are equal, and their difference is NaN.
+    if (got == want) { return; }
+    f64 d = got - want;
+    if (d < 0.0) { d = 0.0 - d; }
+    f64 scale = want < 0.0 ? 0.0 - want : want;
+    if (scale < 1.0) { scale = 1.0; }
+    if (!(d <= tol * scale)) { this.fail("\{what}: got \{got}, want \{want}"); }
+  }
+
+  /** `t` has shape `shape` and holds `want`, each within `tol`. */
+  void values(this, Tensor t, i32[] shape, f32[] want, f64 tol, string what) {
+    if (!sameShape(t.shape, shape)) {
+      this.fail("\{what}: shape \{shapeText(t.shape)}, want \{shapeText(shape)}");
+      return;
+    }
+    f32[] got = t.valuesNow();
+    if (got.len() != want.len()) { this.fail("\{what}: \{got.len()} values, want \{want.len()}"); return; }
+    for (i32 i = 0; i < got.len(); i++) { this.near(got[i] as f64, want[i] as f64, tol, "\{what}[\{i}]"); }
+  }
+
+  /**
+   * `f`'s gradient with respect to each of `inputs`, as `gradients` computes it, agrees with central differences —
+   * every element nudged both ways by `eps`. Computed on `f32`, so the tolerance is loose; a wrong rule is wrong by far
+   * more than rounding.
+   */
+  void gradient(this, Device d, fn<Tensor(Tensor[])> f, Tensor[] inputs, string what) {
+    Gradients g = d.gradients(() => f(inputs), inputs);
+    f64 eps = 0.01;
+    for (i32 k = 0; k < inputs.len(); k++) {
+      f32[] base = inputs[k].valuesNow();
+      f32[] analytic = g.grads[k].valuesNow();
+      if (!sameShape(g.grads[k].shape, inputs[k].shape)) {
+        this.fail("\{what}: gradient \{k} has shape \{shapeText(g.grads[k].shape)}, input \{shapeText(inputs[k].shape)}");
+        continue;
+      }
+      for (i32 i = 0; i < base.len(); i++) {
+        f64 plus = this.nudged(d, f, inputs, k, base, i, eps);
+        f64 minus = this.nudged(d, f, inputs, k, base, i, 0.0 - eps);
+        f64 numeric = (plus - minus) / (2.0 * eps);
+        this.near(analytic[i] as f64, numeric, 0.03, "\{what}: d/dx\{k}[\{i}]");
+      }
+    }
+  }
+
+  f64 nudged(this, Device d, fn<Tensor(Tensor[])> f, Tensor[] inputs, i32 k, f32[] base, i32 i, f64 by) {
+    f32[] v = f32[].filled(base.len(), 0.0);
+    v.copyFrom(base, 0, 0, base.len());
+    v[i] = ((v[i] as f64) + by) as~ f32;
+    Tensor[] moved = Tensor[].filled(inputs.len(), inputs[0]);
+    for (i32 j = 0; j < inputs.len(); j++) { moved[j] = j == k ? d.tensor(v, inputs[k].shape) : inputs[j]; }
+    // In f64, from the f32 the function answers: the difference of two nearly equal f32s is where the error is.
+    return f(moved).sum([], false).item() as f64;
+  }
+
+  string report(this) { return this.failures; }
+}

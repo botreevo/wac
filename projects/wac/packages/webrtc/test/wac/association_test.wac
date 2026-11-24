@@ -1,0 +1,226 @@
+// The association engine, two of them back to back, with the path between them in the test's hands.
+//
+//     wac test packages/webrtc/test/wac/association_test.wac
+//
+// What two conforming ends must do for each other: the handshake from either side and from both at once, many
+// streams ordered and unordered, messages split and reassembled, loss recovered on a reliable stream and
+// abandoned on an unreliable one with a FORWARD-TSN, and a stream reset each way. usrsctp judges the same engine
+// over DTLS in `association_live_test.wac`; this file is the rules, with the path in reach.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Association, SctpEvent, MAX_CHUNK_DATA } from "../../src/association.wac";
+import { chunkForwardTsn, chunkKindAt, chunkCount } from "../../src/sctp.wac";
+import { Vec } from "core";
+
+/** The path: everything each side sent, delivered in order unless `drop` says otherwise. */
+struct Path {
+  Association a;
+  Association b;
+  /** Every message each side received, as "stream:text". */
+  Vec<string> atA;
+  Vec<string> atB;
+  Vec<string> eventsA;
+  Vec<string> eventsB;
+  /** Packets from a dropped before b sees them, counted from 1; empty drops nothing. */
+  i32[] dropAtoB;
+  i32 sentAtoB;
+  /** Whether any packet a sent carried a FORWARD-TSN. */
+  bool sawForwardTsn;
+}
+
+Path path(bool aInitiates, bool bInitiates) {
+  Association a = Association.create(aInitiates, 0x11112222, 1000, 1048576);
+  Association b = Association.create(bInitiates, 0x33334444, -50, 1048576);   // a TSN about to wrap
+  return Path(a, b, Vec<string>.create(), Vec<string>.create(), Vec<string>.create(), Vec<string>.create(),
+              i32[](), 0, false);
+}
+
+void record(Association x, Vec<string> msgs, Vec<string> evs) {
+  SctpEvent[] es = x.events();
+  for (i32 i = 0; i < es.len(); i++) {
+    match (es[i]) {
+      Up: { evs.push("up"); }
+      Message(s, ppid, d): { msgs.push("\{s}:" + string.fromBytes(d)); }
+      Reset(s): { evs.push("reset \{s}"); }
+      ResetDone(s): { evs.push("resetdone \{s}"); }
+      Down(aborted): { evs.push(aborted ? "aborted" : "down"); }
+    }
+  }
+}
+
+/** Exchange until neither side has anything to send. `now` advances a millisecond per round. */
+i64 run(Path p, i64 now) {
+  i64 t = now;
+  for (i32 round = 0; round < 400; round++) {
+    u8[][] fromA = p.a.take();
+    u8[][] fromB = p.b.take();
+    if (fromA.len() == 0 && fromB.len() == 0) { break; }
+    for (i32 i = 0; i < fromA.len(); i++) {
+      p.sentAtoB++;
+      for (i32 k = 0; k < chunkCount(fromA[i]); k++) {
+        if (chunkKindAt(fromA[i], k) == chunkForwardTsn()) { p.sawForwardTsn = true; }
+      }
+      bool dropped = false;
+      for (i32 d = 0; d < p.dropAtoB.len(); d++) { if (p.dropAtoB[d] == p.sentAtoB) { dropped = true; } }
+      if (!dropped) { p.b.receive(fromA[i], t); }
+    }
+    for (i32 i = 0; i < fromB.len(); i++) { p.a.receive(fromB[i], t); }
+    record(p.a, p.atA, p.eventsA);
+    record(p.b, p.atB, p.eventsB);
+    t = t + (1 as i64);
+  }
+  record(p.a, p.atA, p.eventsA);
+  record(p.b, p.atB, p.eventsB);
+  return t;
+}
+
+string joined(Vec<string> v) {
+  string s = "";
+  for (i32 i = 0; i < v.len(); i++) { s += (i == 0 ? "" : ",") + v.get(i); }
+  return s;
+}
+
+/**
+ * The handshake from the initiator, and from both ends at once — the WebRTC case, where each side's SCTP connects
+ * as its DTLS comes up.
+ *
+ * Would catch: an INIT-ACK not carrying our own tag on a collision (each side then drops the other's packets as
+ * having the wrong verification tag), a COOKIE-ECHO refused outside CLOSED, and `Up` reported twice or not at all.
+ */
+export string test_the_handshake_from_one_end_and_from_both() {
+  T t = T.create();
+  Path p = path(true, false);
+  p.a.start(0 as i64);
+  run(p, 0 as i64);
+  t.eqStr(joined(p.eventsA), "up", "the initiator is up");
+  t.eqStr(joined(p.eventsB), "up", "and so is the answerer");
+
+  Path q = path(true, true);
+  q.a.start(0 as i64);
+  q.b.start(0 as i64);
+  run(q, 0 as i64);
+  t.isTrue(q.a.established() && q.b.established(), "both initiating at once still comes up");
+  t.eqStr(joined(q.eventsA), "up", "once at a");
+  t.eqStr(joined(q.eventsB), "up", "once at b");
+  q.a.send(3, 53, "x".toBytes(), false, -1, 10 as i64);
+  run(q, 10 as i64);
+  t.eqStr(joined(q.atB), "3:x", "and data crosses it");
+  return t.report();
+}
+
+/**
+ * Many streams, each in order; a message larger than a chunk split and rejoined; unordered messages delivered as
+ * they complete; and the TSN wrapping through zero on the way.
+ *
+ * Would catch: streams sharing one sequence counter, a message rejoined out of order or with a fragment missing,
+ * and a TSN comparison that breaks where the counter wraps (b starts at -50).
+ */
+export string test_streams_ordered_unordered_and_split_messages() {
+  T t = T.create();
+  Path p = path(true, false);
+  p.a.start(0 as i64);
+  i64 now = run(p, 0 as i64);
+  string big = "";
+  for (i32 i = 0; i < MAX_CHUNK_DATA * 3 + 7; i++) { big += "\{i % 10}"; }
+  for (i32 i = 0; i < 40; i++) { p.b.send(i % 5, 53, "m\{i}".toBytes(), false, -1, now); }
+  p.b.send(9, 53, big.toBytes(), false, -1, now);
+  p.b.send(7, 53, "u".toBytes(), true, -1, now);
+  now = run(p, now);
+  t.eqI32(p.atA.len(), 42, "every message arrives");
+  for (i32 s = 0; s < 5; s++) {
+    string order = "";
+    for (i32 i = 0; i < p.atA.len(); i++) {
+      string m = p.atA.get(i);
+      if (m.slice(0, 2) == "\{s}:") { order += m.slice(2, m.len()) + " "; }
+    }
+    string want = "";
+    for (i32 i = s; i < 40; i += 5) { want += "m\{i} "; }
+    t.eqStr(order, want, "stream \{s} in order");
+  }
+  bool bigOk = false;
+  for (i32 i = 0; i < p.atA.len(); i++) { if (p.atA.get(i) == "9:" + big) { bigOk = true; } }
+  t.isTrue(bigOk, "the message of four chunks arrives whole");
+  return t.report();
+}
+
+/**
+ * A lost packet on a reliable stream is retransmitted and the order still holds; on an unreliable one
+ * (`maxRetransmits: 0`) it is abandoned, a FORWARD-TSN goes out, and the receiver's cumulative point moves on.
+ *
+ * Would catch: no retransmission on timeout, an unreliable chunk resent, no FORWARD-TSN (the receiver's cumulative
+ * point stays below the hole for ever, and so do its SACKs), and a receiver that ignores the FORWARD-TSN.
+ */
+export string test_loss_is_retransmitted_or_abandoned_by_the_streams_reliability() {
+  T t = T.create();
+  Path p = path(true, false);
+  p.a.start(0 as i64);
+  i64 now = run(p, 0 as i64);
+  p.dropAtoB = [p.sentAtoB + 1];
+  p.a.send(2, 53, "first".toBytes(), false, -1, now);
+  p.a.send(2, 53, "second".toBytes(), false, -1, now);
+  now = run(p, now);
+  now = now + (1500 as i64);
+  p.a.tick(now);
+  now = run(p, now);
+  t.eqStr(joined(p.atB), "2:first,2:second", "the lost message is resent, and order holds");
+
+  p.dropAtoB = [p.sentAtoB + 1];
+  p.a.send(1, 53, "lost".toBytes(), true, 0, now);
+  p.a.send(1, 53, "kept".toBytes(), true, 0, now);
+  now = run(p, now);
+  i32 cumBefore = p.b.cumTsn;
+  for (i32 i = 0; i < 4; i++) {
+    now = now + (3000 as i64);
+    p.a.tick(now);
+    now = run(p, now);
+  }
+  t.isTrue(joined(p.atB).indexOf("1:kept") >= 0, "the unreliable message after the hole arrives");
+  t.isTrue(joined(p.atB).indexOf("1:lost") < 0, "the lost one is never resent");
+  t.isTrue(p.sawForwardTsn, "a FORWARD-TSN went out");
+  t.eqI32(p.b.cumTsn, p.a.nextTsn - 1, "and the receiver's cumulative point covers everything a sent");
+  t.isTrue(cumBefore != p.b.cumTsn, "having moved past the hole");
+  return t.report();
+}
+
+/**
+ * A stream reset each way: the receiver performs it only after every TSN the request covers, and reports it; the
+ * requester hears it performed; the stream's numbering starts again at zero.
+ *
+ * Would catch: a reset performed before the data it covers (that data is then numbered as a new message), a
+ * request never answered, and the sequence number not restarting — the next message on the stream would then
+ * wait for ever for an earlier one.
+ */
+export string test_a_stream_reset_each_way() {
+  T t = T.create();
+  Path p = path(true, false);
+  p.a.start(0 as i64);
+  i64 now = run(p, 0 as i64);
+  p.a.send(4, 53, "one".toBytes(), false, -1, now);
+  p.a.send(4, 53, "two".toBytes(), false, -1, now);
+  p.a.resetStream(4, now);
+  now = run(p, now);
+  t.eqStr(joined(p.atB), "4:one,4:two", "the data before the reset arrives");
+  t.eqStr(joined(p.eventsB), "up,reset 4", "b performs the reset");
+  t.eqStr(joined(p.eventsA), "up,resetdone 4", "a hears it performed");
+  p.b.resetStream(4, now);
+  now = run(p, now);
+  t.eqStr(joined(p.eventsA), "up,resetdone 4,reset 4", "b's reset back reaches a");
+  p.a.send(4, 53, "again".toBytes(), false, -1, now);
+  now = run(p, now);
+  t.eqStr(joined(p.atB), "4:one,4:two,4:again", "a message after the reset is sequence 0 and is delivered");
+  return t.report();
+}
+
+/** An ABORT ends both ends; nothing more is sent. */
+export string test_an_abort_ends_the_association() {
+  T t = T.create();
+  Path p = path(true, false);
+  p.a.start(0 as i64);
+  i64 now = run(p, 0 as i64);
+  p.a.abort();
+  run(p, now);
+  t.eqStr(joined(p.eventsA), "up,aborted", "the end that aborted is down");
+  t.eqStr(joined(p.eventsB), "up,aborted", "and so is its peer");
+  t.isFalse(p.a.send(1, 53, "x".toBytes(), false, -1, now), "and nothing can be sent");
+  return t.report();
+}

@@ -1,0 +1,210 @@
+// git's smart-HTTP transport: one request to a git server, over our own TLS, through whatever proxy is set.
+//
+// `design/system/0005` step 6. The pieces are all elsewhere and this is what joins them:
+//
+//     packages/http/src/proxy.wac      CONNECT, because this container has no direct egress
+//     packages/tls/src/roots.wac       the system's PEM bundle as a trust store
+//     packages/tls/src/client.wac      the handshake and the records
+//     packages/http/src/incoming.wac   the response
+//
+// **Not a general https client, and named so it cannot be mistaken for one.** It does what git's two
+// endpoints need — a GET of `info/refs` and a POST of `git-upload-pack` — with `Connection: close` and the
+// whole body in memory. Keep-alive, redirects, chunked requests and authentication are all absent, and a
+// caller wanting them wants something else. It lives here rather than in `packages/http` because that
+// package does not depend on `packages/tls` and should not start to for two endpoints.
+//
+// ## The three things that are easy to get wrong here
+//
+// **The tunnel's leftover is fed first.** A proxy may put the end of its `200` and the first bytes of the
+// tunnel in one packet, and `recv` hands over what arrived. So the TLS buffer starts as `Tunnel.leftover`
+// rather than empty. It is almost always empty, because in TLS the client speaks first — which is exactly
+// why it would go unnoticed.
+//
+// **`tlsClientInit` wants seconds.** `box`'s `gets` records what happens otherwise: the millisecond clock
+// puts "now" around the year 57000, every certificate has expired, and it arrives as `bad_certificate`
+// looking like a chain problem.
+//
+// **Phase 4 after a body is a `close_notify`, not a failure.** A server asked for `Connection: close` ends
+// that way, so what decides is whether the body arrived. `gets` reported "handshake failed" on every
+// successful fetch before that was understood.
+
+import { Clock, Env, Files, Net, Random, Socket } from "std";
+import { slice } from "../../bytes/src/slice.wac";
+import { Store, pemBundle } from "../../tls/src/roots.wac";
+import { recordsReady } from "../../tls/src/record.wac";
+import { ClientStep, clientStep, tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose,
+         tlsClientPhase, tlsClientFailure } from "../../tls/src/client.wac";
+import { Incoming, ParsedResponse, parseResponse } from "../../http/src/incoming.wac";
+import { ProxyAt, Tunnel, connectThrough, parseProxy, proxyFor } from "../../http/src/proxy.wac";
+import { flatten } from "core";
+
+/** Where the system keeps its trust store. */
+export string bundlePath() { return "/etc/ssl/certs/ca-certificates.crt"; }
+
+/** `https://host/path` split into its two halves. `ok` false means it was not that. */
+export struct Remote {
+  bool ok;
+  string host;
+  /** The path, with its leading slash, and no trailing one. */
+  string path;
+}
+
+/**
+ * Split an https URL.
+ *
+ * Only `https`: a plain-HTTP remote would work and is not what this is for, and `git://` is a different
+ * protocol rather than a different scheme on this one.
+ */
+export Remote parseRemote(string url) {
+  string rest = url;
+  i32 scheme = rest.indexOf("://");
+  if (scheme < 0) { return Remote(false, "", ""); }
+  if (rest.slice(0, scheme) != "https") { return Remote(false, "", ""); }
+  rest = rest.slice(scheme + 3, rest.len());
+  i32 slash = rest.indexOf("/");
+  if (slash < 0) { return Remote(false, "", ""); }
+  string host = rest.slice(0, slash);
+  string path = rest.slice(slash, rest.len());
+  if (host.len() == 0) { return Remote(false, "", ""); }
+  return Remote(true, host, path);
+}
+
+/** The system's trust store, or an empty one with `refused` telling the caller why not. */
+export Store systemStore(Files fs) {
+  u8[]? bundle = flatten(fs.readFile(bundlePath()).wait()).ok();
+  if ((bundle is null)) { return Store(u8[](), i32[](), 0); }
+  return pemBundle(bundle!);
+}
+
+/** What one request produced. */
+export struct Answer {
+  bool ok;
+  /** The HTTP status, when `ok`. */
+  i32 status;
+  /** The response body, when `ok`. */
+  u8[] body;
+  string error;
+}
+
+/**
+ * One request to `host`, and the whole response.
+ *
+ * `body` empty means a GET; anything else is a POST with `contentType`. That is the whole of the method
+ * selection, because git's two endpoints are exactly one of each and a third would want naming.
+ */
+export Answer request(Clock clock, Random rnd, Env env, Net net, const Store store, string host, string target, u8[] body, string contentType) {
+  if (store.offsets.len() == 0) {
+    return Answer(false, 0, u8[](), "no trust store, so nothing can be verified");
+  }
+
+  Socket? conn = null;
+  u8[] buffered = u8[]();
+  // `HTTPS_PROXY` for an `https` remote, which is every remote this serves, and `NO_PROXY` honoured: this read
+  // `HTTP_PROXY` alone, so where only `HTTPS_PROXY` was set it connected directly and an authenticating proxy's
+  // server answered 401 (`issues/system/0451e`).
+  string proxyVar = proxyFor(env, true, host);
+  if (proxyVar == "") {
+    auto direct = flatten(net.connect(host, 443).wait());
+    if (direct.isErr()) { return Answer(false, 0, u8[](), "\{host}: \{direct.err()!}"); }
+    conn = direct.unwrap();
+  } else {
+    ProxyAt? at = parseProxy(proxyVar);
+    if (at is null) {
+      return Answer(false, 0, u8[](), "HTTPS_PROXY is not a proxy this can parse: \{proxyVar}");
+    }
+    Tunnel t = match (connectThrough(net, at!.host, at!.port, host, 443)) {
+      Ok(open): open,
+      Err(e): return Answer(false, 0, u8[](), e),
+    };
+    conn = t.socket;
+    buffered = t.leftover;   // **First, before any recv.** See the header.
+  }
+  Socket sock = conn!;
+
+  ClientStep s = clientStep(tlsClientInit(
+    host.toBytes(), store.der, store.offsets,
+    flatten(rnd.bytes(32).wait()).unwrap(),
+    flatten(rnd.bytes(32).wait()).unwrap(),
+    flatten(rnd.bytes(64).wait()).unwrap(),
+    flatten(rnd.bytes(32).wait()).unwrap(),
+    flatten(clock.nowMillis().wait()).unwrap() / 1000));
+  if (flatten(sock.send(s.toSend).wait()).isErr()) {
+    sock.close();
+    return Answer(false, 0, u8[](), "cannot send the client hello");
+  }
+
+  u8[] got = u8[]();
+  bool requested = false;
+  while (true) {
+    i32 phase = tlsClientPhase(s.state);
+    if (phase == 4) {
+      if (got.len() > 0) { break; }
+      sock.close();
+      return Answer(false, 0, u8[](), "TLS to \{host} failed (code "
+        + "\{tlsClientFailure(s.state)})");
+    }
+    if (phase == 3 && !requested) {
+      string head = (body.len() == 0 ? "GET " : "POST ") + target + " HTTP/1.1\r\n"
+        + "Host: " + host + "\r\n"
+        + "User-Agent: git/wac\r\n"
+        + "Accept: */*\r\n";
+      if (body.len() > 0) {
+        head = head + "Content-Type: \{contentType}\r\n"
+             + "Content-Length: \{body.len()}\r\n";
+      }
+      head = head + "Connection: close\r\n\r\n";
+      u8[] whole = u8[].filled(head.toBytes().len() + body.len(), 0);
+      u8[] headBytes = head.toBytes();
+      whole.copyFrom(headBytes, 0, 0, headBytes.len());
+      whole.copyFrom(body, 0, headBytes.len(), body.len());
+      ClientStep out = clientStep(tlsClientSend(s.state, whole));
+      s = ClientStep(out.state, out.toSend, u8[]());
+      if (flatten(sock.send(s.toSend).wait()).isErr()) { break; }
+      requested = true;
+    }
+
+    // Asked before reading rather than after: the leftover may already hold whole records, and a `recv`
+    // first would block on a peer that has said everything it is going to.
+    i32 ready = recordsReady(buffered);
+    if (ready > 0) {
+      ClientStep step = clientStep(tlsClientFeed(s.state, slice(buffered, 0, ready)));
+      buffered = slice(buffered, ready, buffered.len());
+      s = step;
+      if (s.toSend.len() > 0 && flatten(sock.send(s.toSend).wait()).isErr()) { break; }
+      if (s.appData.len() > 0) { got = concat(got, s.appData); }
+      continue;
+    }
+
+    bool closed = false;
+    match (flatten(sock.recv().wait())) {
+      Ok(r): {
+        match (r) {
+          Data(bytes): { buffered = concat(buffered, bytes); }
+          default: { closed = true; }
+        }
+      }
+      Err(e): {
+        sock.close();
+        return Answer(false, 0, u8[](), "\{host}: \{e}");
+      }
+    }
+    if (closed) { break; }
+  }
+
+  clientStep(tlsClientClose(s.state));
+  sock.close();
+  if (got.len() == 0) { return Answer(false, 0, u8[](), "\{host} said nothing"); }
+
+  match (parseResponse(got, (body.len() == 0 ? "GET" : "POST").toBytes(), true, 1 << 26)) {
+    Incomplete: { return Answer(false, 0, u8[](), "the response ended mid-message"); }
+    Bad(code): { return Answer(false, 0, u8[](), "unparseable response (\{code})"); }
+    Ok(res): { return Answer(true, res.status, res.body, ""); }
+  }
+}
+
+u8[] concat(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}

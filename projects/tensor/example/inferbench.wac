@@ -1,0 +1,57 @@
+// Inference speed on WebGPU, as a page: the digit model a single image at a time — each one a round trip to the GPU
+// and back — and in batches, and the tiny GPT a forward pass at a time. The numbers go in the title, which
+// `tools/gpucheck.js` prints. Served beside `mnist.weights`.
+
+import { Page, Site } from "web";
+import { Result } from "core";
+import { Device, Tensor } from "../src/tensor.wac";
+import { gpuDevice } from "../src/gpu/backend.wac";
+import { Layer, Sequential } from "../src/nn.wac";
+import { loadWeights } from "../src/checkpoint.wac";
+import { digitModel } from "./mnist/mnist.wac";
+import { Gpt, GptConfig } from "./gpt/model.wac";
+
+async f64 msPer(Page page, Device d, i32 reps, fn<Tensor()> f) {
+  Tensor warm = d.tidy(f);
+  await warm.values();
+  warm.dispose();
+  f64 t0 = page.now();
+  for (i32 i = 0; i < reps; i++) {
+    Tensor r = d.tidy(f);
+    await r.values();
+    r.dispose();
+  }
+  return (page.now() - t0) / (reps as f64);
+}
+
+f64 round2(f64 v) { return (v * 100.0).round() / 100.0; }
+
+export async i32 main(Page page) {
+  page.title("running");
+  Result<Device, string> gpu = await gpuDevice(page.sys.host, (string s) => { page.log(s); });
+  if (gpu.isErr()) {
+    page.title("NO GPU: " + gpu.err()!);
+    return 1;
+  }
+  Device d = gpu.ok()!;
+  Result<Site, string> site = await Site.of(page.sys);
+  Sequential m = digitModel(d);
+  if (site.isErr() || loadWeights(m.params(), (await site.ok()!.get("mnist.weights")).orElse(u8[]())).isErr()) {
+    page.title("FAIL no weights");
+    return 1;
+  }
+  string out = "PASS";
+  i32[] batches = [1, 64, 500];
+  for (i32 b in batches) {
+    Tensor x = d.uniform([b, 28, 28, 1], 0.0, 1.0);
+    f64 ms = await msPer(page, d, b == 1 ? 20 : 5, () => m.apply(x, false).softmax(-1));
+    out += " | digits batch \{b}: \{round2(ms)} ms, \{round2(ms / (b as f64))} ms/image";
+    page.log(out);
+  }
+  Gpt g = Gpt.create(d, GptConfig(27, 16, 64, 4, 2, 0.0));
+  Tensor idx = d.fill([1, 16], 3.0);
+  f64 gm = await msPer(page, d, 10, () => g.apply(idx, false));
+  out += " | gpt forward of 16: \{round2(gm)} ms";
+  page.title(out);
+  return 0;
+}

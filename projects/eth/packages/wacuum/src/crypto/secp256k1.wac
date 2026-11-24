@@ -1,0 +1,186 @@
+// secp256k1's double multiplication a·G + b·Q — what every signature recovery comes down to — by the GLV
+// endomorphism and width-5 NAF.
+//
+// The curve has an endomorphism φ(x, y) = (β·x, y) that is multiplication by λ, β and λ being cube roots of
+// one mod p and mod n. A 256-bit scalar k splits into two of about 128 bits, k = k1 + k2·λ (mod n), so
+// k·P = k1·P + k2·φ(P): four half-length multiplications sharing 129 doublings, where Shamir's trick over the
+// whole scalars needs 256. Each half is written in width-5 NAF — digits odd and below 16 in size, at least
+// four zeros between any two — so about one bit in six costs an addition, of a multiple from a table of
+// eight. Together that is half the field multiplications of `Curve.mul2`.
+//
+// The constants are libsecp256k1's, and were checked when this was written: β³ = 1 mod p, λ³ = 1 mod n,
+// λ·G = (β·Gx, Gy), and (a1, b1), (a2, b2) a reduced basis of the lattice {(x, y) : x + y·λ = 0 mod n}.
+// Nothing here is constant-time: it recovers public keys and verifies, and handles no secret.
+
+import { U256, wordsOf } from "../u256.wac";
+import { mulFull } from "../limbs.wac";
+import { Field } from "./field.wac";
+import { Curve, Jac, wnaf } from "./curve.wac";
+
+// Constants as their words, parsed once by the compiler (see U256.ofWords).
+static u64[] SECP_P = wordsOf(U256.fromHex("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f")!);
+static u64[] SECP_N = wordsOf(U256.fromHex("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")!);
+static u64[] BETA = wordsOf(U256.fromHex("0x7ae96a2b657c07106e64479eac3434e99cf0497512f58995c1396c28719501ee")!);
+static u64[] LAMBDA = wordsOf(U256.fromHex("0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72")!);
+static u64[] MINUS_B1 = wordsOf(U256.fromHex("0xe4437ed6010e88286f547fa90abfe4c3")!);
+static u64[] B2 = wordsOf(U256.fromHex("0x3086d221a7d46bcde86c90e49284eb15")!);
+static u64[] G1 = wordsOf(U256.fromHex("0x3086d221a7d46bcde86c90e49284eb153daa8a1471e8ca7fe893209a45dbb031")!);
+static u64[] G2 = wordsOf(U256.fromHex("0xe4437ed6010e88286f547fa90abfe4c4221208ac9df506c61571b4ae8ac47f71")!);
+static u64[] GX = wordsOf(U256.fromHex("0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")!);
+static u64[] GY = wordsOf(U256.fromHex("0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")!);
+
+export U256 secpP() { return U256.ofWords(SECP_P); }
+export U256 secpN() { return U256.ofWords(SECP_N); }
+
+// The constants, as functions: wac's statics are fixed at compile time and const throughout, and U256's
+// methods take a plain receiver.
+U256 beta() { return U256.ofWords(BETA); }
+U256 lambda() { return U256.ofWords(LAMBDA); }
+/** −b1 and b2 of the lattice basis (b1 is negative; a1 = b2). */
+U256 minusB1() { return U256.ofWords(MINUS_B1); }
+U256 b2() { return U256.ofWords(B2); }
+/** round(2^384·b2 / n) and round(2^384·(−b1) / n): c = round(k·b / n) is then (k·g) >> 384, rounded. */
+U256 g1() { return U256.ofWords(G1); }
+U256 g2() { return U256.ofWords(G2); }
+
+/**
+ * G's odd multiples, G to 15·G, and the same of φ(G), as [x, y, z] limbs for each of the sixteen points: the
+ * same for every multiplication, so worked out by the compiler and copied, which saves each recovery the
+ * twenty microseconds of working them out.
+ */
+static u64[][] G_TABLES = gTables();
+
+u64[][] gTables() {
+  Secp s = Secp.bare();
+  Jac[] odd = s.c.oddMultiples(s.generator());
+  Jac[] phi = s.phiOf(odd);
+  u64[][] out = u64[][].filled(48, s.betaM);
+  for (i32 i = 0; i < 8; i++) {
+    out[3 * i] = odd[i].x;
+    out[3 * i + 1] = odd[i].y;
+    out[3 * i + 2] = odd[i].z;
+    out[24 + 3 * i] = phi[i].x;
+    out[24 + 3 * i + 1] = phi[i].y;
+    out[24 + 3 * i + 2] = phi[i].z;
+  }
+  return out;
+}
+
+u64[] copyOf(const u64[] a) {
+  u64[] out = u64[].filled(a.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  return out;
+}
+
+/** The curve and what every multiplication on it shares: β in the field's form, and `G_TABLES`. */
+export struct Secp {
+  Curve c;
+  U256 n;
+  u64[] betaM;
+  Jac[] gOdd;
+  Jac[] gOddPhi;
+
+  Secp create() {
+    Secp s = Secp.bare();
+    Jac[] odd = Jac[].filled(8, s.c.infinity());
+    Jac[] phi = Jac[].filled(8, s.c.infinity());
+    for (i32 i = 0; i < 8; i++) {
+      odd[i] = Jac(copyOf(G_TABLES[3 * i]), copyOf(G_TABLES[3 * i + 1]), copyOf(G_TABLES[3 * i + 2]));
+      phi[i] = Jac(copyOf(G_TABLES[24 + 3 * i]), copyOf(G_TABLES[24 + 3 * i + 1]), copyOf(G_TABLES[24 + 3 * i + 2]));
+    }
+    s.gOdd = odd;
+    s.gOddPhi = phi;
+    return s;
+  }
+
+  /** The curve and β, without the tables. */
+  Secp bare() {
+    Curve c = Curve.create(Field.create(secpP()), U256.ofU64(7));
+    return Secp(c, secpN(), c.f.fromU256(beta()), Jac[].filled(0, c.infinity()), Jac[].filled(0, c.infinity()));
+  }
+
+  Jac generator(this) {
+    return this.c.fromAffine(U256.ofWords(GX),
+                             U256.ofWords(GY));
+  }
+
+
+  /** φ of each: (β·X, Y, Z), since x = X/Z² scales with X. */
+  Jac[] phiOf(this, Jac[] t) {
+    Jac[] out = Jac[].filled(t.len(), t[0]);
+    for (i32 i = 0; i < t.len(); i++) { out[i] = Jac(this.c.f.mul(this.betaM, t[i].x), t[i].y, t[i].z); }
+    return out;
+  }
+
+  /** a·G + b·Q, both scalars below n. */
+  Jac mulG2(this, U256 a, Jac q, U256 b) {
+    Curve c = this.c;
+    Split sa = split(a);
+    Split sb = split(b);
+    Jac[] qOdd = this.c.oddMultiples(q);
+    Part[] parts = [Part(wnaf(sa.k1), this.gOdd, sa.neg1), Part(wnaf(sa.k2), this.gOddPhi, sa.neg2),
+                    Part(wnaf(sb.k1), qOdd, sb.neg1), Part(wnaf(sb.k2), this.phiOf(qOdd), sb.neg2)];
+    i32 len = 0;
+    for (i32 j = 0; j < 4; j++) {
+      if (parts[j].digits.len() > len) { len = parts[j].digits.len(); }
+    }
+    // The accumulator is changed in place: a run of doublings and additions that allocates nothing.
+    Jac r = c.freshInfinity();
+    for (i32 i = len - 1; i >= 0; i--) {
+      c.doubleTo(r);
+      for (i32 j = 0; j < 4; j++) {
+        Part part = parts[j];
+        if (i >= part.digits.len()) { continue; }
+        i32 d = part.digits[i];
+        if (d == 0) { continue; }
+        c.addTo(r, part.table[(d < 0 ? -d : d) >> 1], (d < 0) != part.neg);
+      }
+    }
+    return r;
+  }
+}
+
+/** A scalar's two halves, each with its sign: k = ±k1 ± k2·λ (mod n). */
+export struct Split {
+  U256 k1;
+  bool neg1;
+  U256 k2;
+  bool neg2;
+}
+
+/** Split k (below n) into halves of about 128 bits: k2 = c1·(−b1) − c2·b2 and k1 = k − k2·λ, mod n. */
+export Split split(U256 k) {
+  U256 n = secpN();
+  U256 c1 = roundedHigh(k, g1());
+  U256 c2 = roundedHigh(k, g2());
+  U256 k2 = c1.mulmod(minusB1(), n).addmod(n.sub(c2.mulmod(b2(), n)), n);
+  U256 k1 = k.addmod(n.sub(k2.mulmod(lambda(), n)), n);
+  // Each is small either as it is or as its negation; the negation is kept with a sign.
+  U256 half = n.shr(1);
+  bool neg1 = k1.gt(half);
+  bool neg2 = k2.gt(half);
+  return Split(neg1 ? n.sub(k1) : k1, neg1, neg2 ? n.sub(k2) : k2, neg2);
+}
+
+/** (a·b + 2^383) >> 384: the high part of a 512-bit product, rounded. */
+U256 roundedHigh(U256 a, U256 b) {
+  u64[] p = mulFull(limbs(a), limbs(b));
+  U256 high = U256(p[12] | (p[13] << 32), p[14] | (p[15] << 32), 0, 0);
+  return (p[11] >> 31) == 1 ? high.add(U256.one()) : high;
+}
+
+u64[] limbs(U256 x) {
+  u64[] l = u64[].filled(8, 0);
+  for (i32 i = 0; i < 4; i++) {
+    l[2 * i] = x.word(i) & 0xFFFFFFFF;
+    l[2 * i + 1] = x.word(i) >> 32;
+  }
+  return l;
+}
+
+/** One scalar half's part in the joint loop: its digits, its table, and whether its sign is flipped. */
+struct Part {
+  i32[] digits;
+  Jac[] table;
+  bool neg;
+}

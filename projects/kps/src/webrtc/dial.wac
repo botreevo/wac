@@ -1,0 +1,107 @@
+// Dialling a KPS listener over WebRTC with wac's own stack — SPEC §5.2's client, without a browser.
+//
+// **The same dial as the reference client's, done below the SDP.** A browser has to be handed descriptions; this
+// has no browser, so what those descriptions would say is set directly: a random ufrag, the password both ends
+// derive from the certhash used as both ends' password, the listener's certificate pinned to the certhash, this end
+// the DTLS client and the ICE controlling agent. One socket, one candidate pair — the listener's address and
+// whatever address the socket has — nominated by the first check.
+//
+// Underneath, `webrtc.Session` runs the checks, the DTLS client handshake (`webrtc.ClientPeer`) and the SCTP
+// association, which this end starts. On top, the engine every WebRTC end here shares (`conn.wac`), joined to the
+// session by `NativePeer` exactly as the listener's peers are.
+
+import { Result } from "core";
+import { Sys, Datagrams, Datagram } from "std";
+import { webrtc.Session, webrtc.Association, webrtc.ClientPeer, webrtc.Consent } from "wac";
+import { Address, parseAddress, decodeCerthash, sdpFingerprint } from "../address.wac";
+import { Code, Reason } from "../errors.wac";
+import { Connection, Endpoint } from "../api.wac";
+import { Identity, makeIdentity } from "../identity.wac";
+import { NativePeer } from "./native.wac";
+import { Limits } from "./flow.wac";
+import { icePassword, ufragFrom } from "./ice.wac";
+import { ipBytes } from "../listener.wac";
+import { Receiver } from "../net.wac";
+
+/**
+ * Dial `address`. `Ok` once the HELLOs have crossed; `Err` if the address is not one, no socket can be had, the
+ * listener's certificate is not the one the certhash names, or `timeoutMs` passes first.
+ */
+export async Result<Connection, Reason> dial(Sys sys, string address, Limits limits, i64 timeoutMs) {
+  Address? a = parseAddress(address).ok();
+  if (a is null) { return Result.Err(Reason.saying(Code.InternalError, "not a KPS address: \{address}")); }
+  u8[]? digest = decodeCerthash(a!.certhash);
+  if (digest is null) { return Result.Err(Reason.saying(Code.InternalError, "not a sha-256 certhash: \{a!.certhash}")); }
+  u8[] r = u8[]();
+  match (await sys.random().bytes(244)) {
+    Ok(b): { r = b; }
+    Err(e): { return Result.Err(Reason.saying(Code.InternalError, "no randomness: \{e}")); }
+  }
+  i64 now = (await sys.clock().nowMillis()).ok() ?? 0 as i64;
+  // A certificate of our own, made for this dial: DTLS needs one from each end, and nobody pins ours.
+  Identity? me = makeIdentity(part(r, 0, 32), part(r, 32, 16), part(r, 48, 32), now / (1000 as i64));
+  if (me is null) { return Result.Err(Reason.saying(Code.InternalError, "could not make a certificate for the dial")); }
+  Datagrams? sock = null;
+  match (await sys.net().bindDatagram(a!.ip.indexOf(":") >= 0 ? "::" : "0.0.0.0", 0)) {
+    Ok(s): { sock = s; }
+    Err(e): { return Result.Err(Reason.saying(Code.NetworkError, "no socket: \{e}")); }
+  }
+
+  string ufrag = ufragFrom(part(r, 80, 8));
+  string pwd = icePassword(digest!, ufrag);
+  ClientPeer dtls = ClientPeer.of(me!.cert, me!.key, part(r, 88, 32), part(r, 120, 32), part(r, 152, 32));
+  Association assoc = Association.create(true, bigI32(r, 184) | 1, bigI32(r, 188), 1048576);
+  Session session = Session.of(dtls, assoc, Consent.of(5000 as i64, 30000 as i64, now), ufrag, pwd, ufrag, pwd,
+                               sdpFingerprint(digest!));
+  session.dtlsClient = true;
+  NativePeer p = NativePeer.make(session, limits, Endpoint(a!.ip, a!.port), now);
+  p.conn!.helloDeadline = now + timeoutMs;
+  p.emit(session.connect(part(r, 192, 20), now));
+  drive(sys, sock!, p, a!);
+  Result<bool, Reason> up = await p.conn!.established();
+  if (up.isErr()) { return Result.Err(up.err()!); }
+  return Result.Ok(p.conn!);
+}
+
+/**
+ * The socket's loop: a datagram from the listener or a quarter-tick of silence, then whatever the clock says, until
+ * the connection is over and everything it had to say has gone. Datagrams from anywhere else are not the listener's.
+ */
+async void drive(Sys sys, Datagrams sock, NativePeer p, Address a) {
+  u8[] theirIp = ipBytes(a.ip);
+  Receiver rx = Receiver.of(sys, sock);
+  await flush(sock, p, a);
+  while (!(p.conn!.ended is not null && p.outbox.len() == 0)) {
+    Datagram? got = await rx.next(25);
+    i64 now = (await sys.clock().nowMillis()).ok() ?? 0 as i64;
+    if (got is not null) {
+      Datagram d = got!;
+      if (d.error.len() == 0 && d.port == a.port && sameHost(d.peer, a.ip)) { p.receive(d.bytes, theirIp, d.port, now); }
+    }
+    p.tick(now);
+    await flush(sock, p, a);
+    if (p.down && p.outbox.len() == 0) { break; }
+  }
+  rx.close();
+}
+
+async void flush(Datagrams sock, NativePeer p, Address a) {
+  u8[][] out = p.take();
+  for (i32 i = 0; i < out.len(); i++) { await sock.sendTo(a.ip, a.port, out[i]); }
+}
+
+/** Whether a datagram's source is the listener: the same address, allowing for IPv4 reported as IPv4-mapped IPv6. */
+bool sameHost(string from, string ip) {
+  if (from == ip) { return true; }
+  return from == "::ffff:" + ip;
+}
+
+u8[] part(u8[] b, i32 from, i32 n) {
+  u8[] out = u8[].filled(n, 0);
+  out.copyFrom(b, from, 0, n);
+  return out;
+}
+
+i32 bigI32(u8[] b, i32 at) {
+  return (b[at] as i32 << 24) | (b[at + 1] as i32 << 16) | (b[at + 2] as i32 << 8) | b[at + 3] as i32;
+}

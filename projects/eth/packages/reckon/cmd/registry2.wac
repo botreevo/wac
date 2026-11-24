@@ -1,0 +1,139 @@
+// registry2 — the registry v2 (contracts/Registry.sol) read by proof, for tools/registry2.sh. A prototype's harness:
+// the policy is one fixed shape, so that admission can be driven from a shell against a real chain.
+//
+//     registry2 endorse FILE --key K --out F       an endorsement of FILE's raw CID, signed; prints the CID and the
+//                                                  statement's id
+//     registry2 admit FILE --statement F… --endorser ADDR --list ADDR  CHAIN
+//                                                  admit FILE's CID as `app` under "endorsed by ADDR, not on ADDR's
+//                                                  rejection list", with the Chain proved from the registry; exit 0
+//                                                  admitted, 1 refused, 3 the chain could not be read
+//     registry2 resolve NAME@ADDR [--now SECONDS]  CHAIN
+//                                                  what the name means now, and anything pending
+//     registry2 slot revoked|rejected ADDR CID     a slot, for checking against eth_getStorageAt
+//     registry2 slot name ADDR NAME
+//     registry2 cid FILE                           FILE's raw CID
+//     registry2 rejection-id CID REASON            the id of the Rejection statement (claims.wac's statementId)
+//
+// CHAIN is --rpc HOST:PORT --registry ADDR --code-hash HASH [--anchor BLOCKHASH].
+
+import { Sys } from "std";
+import { Result } from "core";
+import { codec.hexEncode } from "wac";
+import { ipfs.Cid, ipfs.RAW, ipfs.parseCid, ipfs.Store, ipfs.Resolver } from "@/lib.wac";
+import { Statement, statementId, signStatement, signedBlock } from "../src/claims.wac";
+import { Index } from "../src/graph.wac";
+import { Policy, Named, RoleRules, Rule, Chain, Decision, Conformance, admit } from "../src/admit.wac";
+import { Endpoint, endpointOf, Asks, Proved, Resolved, asksFor, chainFor, resolveName, revokedSlot, rejectionSlot, nameSlot } from "../src/registry2.wac";
+import { unhex } from "../src/hex.wac";
+
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+string flag(string[] a, string name) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return "";
+}
+
+string[] flags(string[] a, string name) {
+  string[] out = string[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != name) { continue; }
+    string[] next = string[].defaulted(out.len() + 1);
+    for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+    next[out.len()] = a[i + 1];
+    out = next;
+  }
+  return out;
+}
+
+Result<u8[], string> addr(string s) {
+  u8[]? b = unhex(s);
+  if (b is null || b!.len() != 20) { return Result.Err("\{s} is not an address"); }
+  return Result.Ok(b!);
+}
+
+Result<Endpoint, string> endpoint(string[] a) {
+  return endpointOf(flag(a, "--rpc"), flag(a, "--registry"), flag(a, "--code-hash"), flag(a, "--anchor"));
+}
+
+/** Without trailing whitespace: a key file written by an editor ends in a newline. */
+string strip(string s) {
+  i32 n = s.len();
+  while (n > 0 && (s.toBytes()[n - 1] == 10 || s.toBytes()[n - 1] == 13 || s.toBytes()[n - 1] == 32)) { n--; }
+  return s.slice(0, n);
+}
+
+async Result<Cid, string> rawCid(Sys sys, string path) {
+  u8[] b = try await sys.readFile(path);
+  return Result.Ok(Cid.of(RAW(), b));
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 2) { sys.warn("usage: registry2 endorse|admit|resolve|slot|cid … (see the header of cmd/registry2.wac)"); return 2; }
+  match (await dispatch(sys, a)) {
+    Ok(code): { return code; }
+    Err(e): { sys.warn("registry2: \{e}"); return 3; }
+  }
+}
+
+async Result<i32, string> dispatch(Sys sys, string[] a) {
+  if (a[0] == "rejection-id" && a.len() >= 3) {
+    Cid c = try parseCid(a[1]);
+    sys.log(statementId(Statement.Rejection(c, a[2])).text());
+    return Result.Ok(0);
+  }
+  if (a[0] == "cid") { Cid c = try await rawCid(sys, a[1]); sys.log(c.text()); return Result.Ok(0); }
+  if (a[0] == "endorse") {
+    Cid c = try await rawCid(sys, a[1]);
+    u8[] key = try await sys.readFile(flag(a, "--key"));
+    u8[]? priv = unhex(strip(string.fromBytes(key)));
+    if (priv is null || priv!.len() != 32) { return Result.Err("--key: a file holding 32 bytes of hex"); }
+    Statement s = Statement.Endorsement(c, "registry2 e2e");
+    await sys.writeFile(flag(a, "--out"), signedBlock(signStatement(s, priv!)));
+    sys.log("\{c.text()} \{statementId(s).text()}");
+    return Result.Ok(0);
+  }
+  if (a[0] == "admit") {
+    Cid c = try await rawCid(sys, a[1]);
+    Index ix = Index.create();
+    for (string f in flags(a, "--statement")) {
+      u8[] b = try await sys.readFile(f);
+      Cid _ = try ix.addBlock(b);
+    }
+    u8[] endorser = try addr(flag(a, "--endorser"));
+    u8[] list = try addr(flag(a, "--list"));
+    Policy p = Policy([Named("endorser", endorser)], Cid[](), string[](), string[](), [list],
+                      [RoleRules("app", [Rule.Endorsed(["endorser"], 1)])], Conformance[]());
+    Resolver r = Resolver(Store.dir(sys.files(), flag(a, "--store") == "" ? ".objects" : flag(a, "--store")), Store[]());
+    Endpoint ep = try endpoint(a);
+    Asks asks = asksFor(p, ix, r, c);
+    Proved pr = try chainFor(sys.net(), ep, asks);
+    sys.log("chain: block \{pr.at.number} 0x\{hex(pr.at.blockHash).slice(0, 16)}…, \{pr.at.slots.len()} slot(s) proved"
+            + (pr.at.anchored ? "" : " (header on the node's word: no anchor)")
+            + "; \{pr.chain.revokedId.len()} revocation(s), \{pr.chain.rejected.len()} rejection(s) set");
+    Decision d = admit(p, ix, r, pr.chain, c, "app");
+    for (string line in d.why) { sys.log(line); }
+    return Result.Ok(d.ok ? 0 : 1);
+  }
+  if (a[0] == "resolve") {
+    i32 at = a[1].indexOf("@");
+    if (at < 0) { return Result.Err("resolve NAME@ADDRESS"); }
+    u8[] pub = try addr(a[1].slice(at + 1, a[1].len()));
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / (1000 as i64);
+    if (flag(a, "--now") != "") { now = 0 as i64; string s = flag(a, "--now"); for (i32 i = 0; i < s.len(); i++) { now = now * (10 as i64) + ((s.toBytes()[i] as i64) - (48 as i64)); } }
+    Endpoint ep = try endpoint(a);
+    Resolved res = try resolveName(sys.net(), ep, pub, a[1].slice(0, at), now);
+    sys.log("\{res.name.cid!.text()} delay \{res.name.delay}s (block \{res.at.number}, time \{res.at.timestamp}, now \{now})");
+    if (res.name.pending is not null) { sys.log("pending \{res.name.pending!.text()} from \{res.name.effectiveAt} (in \{res.name.effectiveAt - now}s)"); }
+    if (res.name.pendingDelay >= (0 as i64)) { sys.log("pending delay \{res.name.pendingDelay}s from \{res.name.delayAt}"); }
+    return Result.Ok(0);
+  }
+  if (a[0] == "slot" && a.len() >= 4) {
+    u8[] who = try addr(a[2]);
+    if (a[1] == "name") { sys.log("0x" + hex(nameSlot(who, a[3]))); return Result.Ok(0); }
+    Cid c = try parseCid(a[3]);
+    sys.log("0x" + hex(a[1] == "revoked" ? revokedSlot(who, c) : rejectionSlot(who, c)));
+    return Result.Ok(0);
+  }
+  return Result.Err("unknown command \{a[0]}");
+}

@@ -1,0 +1,258 @@
+// Running a program: which grants it gets, and what happens to its streams.
+//
+// **`wac prog.wasm` and the running half of `wac run`**, taken out of the *compiler's* example along
+// with the test runner — `issues/system/0257c`. A compiler does not start programs. The operator's
+// rule is that a host may implement *running a module*, because that is the engine doing engine work,
+// and everything else goes through the wac program; this is the wac program's side of that line.
+//
+// The two rules about grants that are easy to get backwards, and are why this is one module:
+//
+//   * **`wac run --allow-read prog.wac` grants the build**, and a flag *after* the entry is an
+//     argument to the program. `grantsBefore` and `grantAfterEntry` are that split.
+//   * **`wac prog.wasm` grants what the module's own manifest declares**, which is not `spawn`'s rule
+//     — there the parent decides. `declaredGrants` reads them out of the module rather than asking
+//     for everything and letting a host narrow it, which is the difference between a capability hole
+//     and a program that runs with what it asked for.
+
+import { Authority, Child, Env, Exec, Files, Launch, Net, Output, Procs, Unsupported } from "std";
+import { reason } from "../../fs/src/words.wac";
+import { askedOfBits, within } from "./grants.wac";
+import { Read, flatten } from "core";
+import { JsonObject, JsonValue } from "../../json/src/value.wac";
+import { parse } from "../../json/src/json.wac";
+import { manifestIn } from "../../wacc/src/manifest.wac";
+
+/**
+ * A child's status as a shell reports it: its exit code; 1 for a trap, a program that ran and failed — which every host
+ * reports alike now (`Child.ended()`, spec ch44); and -1, 126 to the caller, when it did not run to an end.
+ */
+async i32 statusOf(Child kid) {
+  match (await kid.ended()) {
+    Ok(e): {
+      match (e) {
+        Exited(code): { return code; }
+        Trapped(kind, said): { return 1; }
+        HostLimit(why): { return 0 - 1; }
+      }
+    }
+    Err(e): { return 0 - 1; }
+  }
+}
+
+
+/**
+ * Everything after the entry, verbatim, as the argument vector the program receives.
+ *
+ * **Flags before the entry are this command's; everything after it is the program's.** That is the
+ * split `issues/system/0177` settled and the reason this cannot go through `positionals`, which drops
+ * anything starting with `-`: `wac run prog.wac --verbose` has to hand `--verbose` over rather than
+ * swallow it as a grant this command does not know.
+ *
+ * The entry's own path is not passed on — argument 0 is the first argument to the *program*, as
+ * `docs/your-own-project.md` puts it, because a wac program reads its name from nowhere.
+ *
+ * A leading `--` is dropped, which is what makes a program able to receive the string `--allow-read`.
+ */
+export string[] programArgs(string[] argv, i32 argc, string entry) {
+  i32 at = -1;
+  for (i32 i = 1; i < argc && at < 0; i++) {
+    if (argv[i] == entry) { at = i; }
+  }
+  if (at < 0) { return string[](); }
+  i32 from = at + 1;
+  if (from < argc && argv[from] == "--") { from = from + 1; }
+  i32 n = argc - from;
+  if (n < 0) { n = 0; }
+  string[] out = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { out[i] = argv[from + i]; }
+  return out;
+}
+
+/**
+ * A grant written *after* the entry, which is a program argument and almost never meant as one.
+ *
+ * `wac run p.wac --allow-read` built an artefact with no grants and passed the flag as `argv[0]`, so
+ * the program ran without the capability it asked for and its next sentence was about the bogus
+ * argument — `issues/system/0177`. Refused by name instead. The scan stops at `--`, because past that
+ * a program may legitimately want the string.
+ */
+export string grantAfterEntry(string[] argv, i32 argc, string entry) {
+  i32 at = -1;
+  for (i32 i = 1; i < argc && at < 0; i++) {
+    if (argv[i] == entry) { at = i; }
+  }
+  if (at < 0) { return ""; }
+  for (i32 i = at + 1; i < argc; i++) {
+    string a = argv[i];
+    if (a == "--") { return ""; }
+    if (a == "--allow-read" || a == "--allow-write" || a == "--allow-net" || a == "--allow-env"
+        || a == "--allow-run") {
+      return a;
+    }
+  }
+  return "";
+}
+
+/**
+ * A grant this command asks for, from the arguments *before* the entry only.
+ *
+ * `grantsIn` scans the whole line, which is right for `build` — where everything on it is the
+ * command's — and wrong here: `wac run p.wac --allow-net` would build a networked program out of the
+ * program's own argument. Refused above rather than honoured, and this is the half that makes the
+ * refusal meaningful by not reading past the entry either.
+ */
+export i32 grantsBefore(string[] argv, i32 argc, string entry) {
+  i32 bits = 0;
+  for (i32 i = 1; i < argc; i++) {
+    string a = argv[i];
+    if (a == entry) { return bits; }
+    if (a == "--allow-read") { bits = bits | 1; }
+    if (a == "--allow-write") { bits = bits | 2; }
+    if (a == "--allow-net") { bits = bits | 4; }
+    if (a == "--allow-env") { bits = bits | 8; }
+    if (a == "--allow-run") { bits = bits | 16; }
+  }
+  return bits;
+}
+
+/**
+ * The grants a built module's own manifest declares, as the bitmask `spawn` takes.
+ *
+ * **`wac prog.wasm` runs a program with what it declared**, which is a different rule from `spawn`'s
+ * "what the parent hands you" — and reading it here is how the two can be the same. `platform.wac`
+ * puts the reason plainly: whoever packages the thing chooses what it may do, and the person running
+ * it cannot quietly widen that. Passing every grant instead and letting the host intersect would give
+ * a module more than it asked for whenever the *command* had been built with more, which is the one
+ * outcome that would be a hole rather than a difference.
+ *
+ * `-1` when the module carries no manifest, which the caller reports rather than treating as "none":
+ * a file that is not a wac program and a program that wants nothing are different answers.
+ *
+ * `packages/json` is already in this program's graph through `wacpkg`, so this costs a call.
+ */
+export i32 declaredGrants(u8[] wasm) {
+  string text = manifestIn(wasm);
+  if (text == "") { return -1; }
+  JsonValue? doc = parse(text.toBytes()).ok();
+  if (doc is null) { return -1; }
+  JsonObject root = JsonObject.create();
+  match (doc!) {
+    Object(o): { root = o; }
+    default: { return -1; }
+  }
+  JsonValue? g = root.getStr("grants");
+  if (g is null) { return 0; }
+  JsonObject table = JsonObject.create();
+  match (g!) {
+    Object(o): { table = o; }
+    default: { return 0; }
+  }
+  return (declared(table, "read") ? 1 : 0) | (declared(table, "write") ? 2 : 0)
+       | (declared(table, "net") ? 4 : 0) | (declared(table, "env") ? 8 : 0)
+       | (declared(table, "run") ? 16 : 0);
+}
+
+/** One grant in a manifest's `grants` table. Absent and false are the same answer. */
+bool declared(JsonObject table, string name) {
+  JsonValue? v = table.getStr(name);
+  if (v is null) { return false; }
+  match (v!) {
+    Bool(b): { return b; }
+    default: { return false; }
+  }
+}
+
+/**
+ * `wac <prog.wasm> [args…]` — run a built module, with the grants its own manifest declares.
+ *
+ * The whole argument vector after the module is the program's, verbatim: no flags of ours can appear
+ * there, because there is nothing here to configure. The native binary passes `args.skip(2)` and this
+ * is the same list.
+ *
+ * The two failure sentences are the native binary's, word for word, because
+ * `commandparity_test.wac` compares them. The third one it has — a manifest that is present and not
+ * JSON — carries `serde`'s own text there and cannot be reproduced from here, so that case is out of
+ * the differential rather than approximated. See `declaredGrants` for why the grants come from the
+ * module rather than from this command.
+ */
+export async i32 runModule(string[] argv, Output err, Files fs, Net net, Env env, Procs procs, i32 argc, string path) {
+  u8[] wasm;
+  match (await fs.readFile(path)) {
+    Ok(bytes): { wasm = bytes; }
+    Err(e): {
+      // **The fault's words, not the host's sentence**: one phrase every host uses for what happened,
+      // rather than three spellings of it. See `reason`.
+      err.line("wac: cannot read " + path + " — " + reason(e));
+      return 1;
+    }
+  }
+  string[] args = string[].filled(argc - 1 < 0 ? 0 : argc - 1, "");
+  for (i32 i = 1; i < argc; i++) { args[i - 1] = argv[i]; }
+  return await runBytes(err, fs, net, env, procs, wasm, args, path);
+}
+
+/**
+ * A module already in hand, run with what its own manifest declares.
+ *
+ * Split from `runModule` for `wac app-run`, whose module is not a whole file: it is the tail of an
+ * executable, after a shell preamble. Everything from the manifest down is identical, and the one
+ * thing the two do not share is how they got the bytes — so that is what stayed behind.
+ *
+ * `shown` is the path to name in a message. It is the file the *caller* pointed at, which for an
+ * app is the executable rather than anything a compiler wrote, and a sentence naming a module the
+ * caller has never seen is a sentence about the wrong thing.
+ */
+export async i32 runBytes(Output err, Files fs, Net net, Env env, Procs procs, u8[] wasm, string[] args, string shown) {
+  i32 grants = declaredGrants(wasm);
+  if (grants < 0) {
+    // **Name the command, not the API behind it.** This said *"build it with
+    // packages/platform/native.ts"*, which `docs/your-own-project.md` describes as the lower-level
+    // compiler API and tells a reader not to reach for — so the one message a person meets after
+    // `wac compile` sent them away from the command and at the thing the guide says is not it.
+    // GitHub wac#28.
+    //
+    // `compile` is what produces a module with no manifest, so the sentence says which command to
+    // use *instead* rather than only which one to use: without that, "build it with `wac build`" is
+    // advice about a file whose provenance the reader has to work out for themselves.
+    err.line("wac: \{shown} carries no wac.manifest section, so it is a raw module rather "
+              + "than a program — `wac compile` writes one of these, and `wac build <entry.wac> "
+              + "-o <stem>` writes one that can run");
+    return 1;
+  }
+  return await spawnWith(err, Authority(fs, net, env, procs), grants, wasm, args, shown);
+}
+
+/**
+ * `wasm` run as a child holding what `grants` asks for out of `all`, with this program's streams, and its
+ * status once it ends.
+ *
+ * **Inherited both ways, so there is nothing between the program and the terminal.** This relayed
+ * the child's two streams until 2026-08-29, and a parent reading two queues cannot know which was
+ * written first: `echo one; nope; echo two` put the complaint after both lines, 11 runs in 20.
+ * `issues/system/0282c`.
+ * 
+ * The `relay` that did it is **gone** rather than kept for a caller that might want it — there is
+ * none, and `packages/sh/src/exec.wac` has its own loop for the parents that do read their
+ * children. What replaced it is the kernel: a launcher hands over its streams and waits for a
+ * status.
+ */
+export async i32 spawnWith(Output err, Authority all, i32 grants, u8[] wasm, string[] args, string shown) {
+  match (await all.procs!.spawn(wasm, args, within(all, askedOfBits(grants)), Launch("", true, true, false, false))) {
+    Ok(kid): { return await statusOf(kid); }
+    Err(e): {
+      if (e is Unsupported) { err.line("wac: this host cannot run a module — it has no form of `spawn`"); }
+      else { err.line("wac: cannot run \{shown} — \{e}"); }
+      return 1;
+    }
+  }
+}
+
+/**
+ * Where the generated aggregate goes: `.cache/`, one level down, which is what `aggregateSource`'s
+ * single `../` assumes.
+ *
+ * **Named for the moment it was made**, because two runs in one directory must not write the same
+ * path — the native command uses its process id for the same reason and this host offers no such
+ * thing to a wac program. The name ends `_test.wac` so that a walk which happens across `.cache`
+ * would find something that *is* a test file rather than a fragment.
+ */

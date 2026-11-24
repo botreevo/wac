@@ -1,0 +1,187 @@
+// `init`: what the system says to start, started and reaped — design/0001 step 7's other half.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/init_test.wac
+//
+// Step 7 is "something owns the image, starts the daemons, and reaps". `sshd -i image` is the first half; this is the
+// second, and what makes it step 7 rather than a launcher is that **the services are data in the image**: `cat
+// /etc/init`, edit it, and the next boot is different. Every case runs through the built `imaged`, because the file
+// the services come from is in the same image the session writes to.
+//
+// Asserted: services start, their output arrives, each status is reported, the worst becomes `init`'s own, an absent
+// file starts nothing without failing, comments and blank lines are skipped. Not asserted, because it is not
+// implemented and says so: restart policy, dependency order, health, readiness, and stopping a service — `init.wac`'s
+// header names all five. It was box's TypeScript `init.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { freshDir, scratch } from "../../../wactest/src/host.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { ChildEnv, Exec, Launch, Sys, TimedOut } from "std";
+import { Vec, flatten } from "core";
+
+struct Said {
+  string out;
+  string err;
+  i32 status;
+}
+
+/** The built `imaged`, and the directory its images live in. */
+struct Rig {
+  string imaged;
+  string dir;
+}
+
+Rig rig(Sys sys, string name) {
+  string dir = scratch(sys.env(), "box-init-\{name}");
+  freshDir(sys.files(), dir);
+  return Rig(builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/imaged.wac", "init-imaged",
+                      ["--allow-read", "--allow-write"]), dir);
+}
+
+/** A session over `image` running `script`, bounded: a run that never returns is the failure, said as one. */
+async Said session(Sys sys, Rig r, string image, string script) {
+  auto got = await sys.clock().within(sys.procs().exec(r.imaged, [image, "-c", script], u8[](), ChildEnv.inherited(),
+                                                       Launch(r.dir, false, false, false, false)), 60000);
+  if (got.isErr()) { return Said("", got.err()! is TimedOut ? "the session did not finish in 60s" : "\{got.err()!}", 0 - 1); }
+  Exec x = got.unwrap();
+  return Said(string.fromBytes(x.stdout), string.fromBytes(x.stderr), x.status);
+}
+
+/**
+ * An image with `/etc/init` in it, written by one session so the next can boot it. The lines go in with **real
+ * newlines** inside the single-quoted argument: `printf '%s'` interprets escapes only in its format, so `\n` in the
+ * argument would make one service of two.
+ */
+async string withServices(Sys sys, T t, Rig r, string name, string[] lines) {
+  string image = "\{r.dir}/\{name}.wacimg";
+  string body = "";
+  for (string l in lines) { body = body + l + "\n"; }
+  Said wrote = await session(sys, r, image, "mkdir /etc; printf '%s' '\{body}' > /etc/init; cat /etc/init | wc -l");
+  t.eqI32(wrote.status, 0, "writing \{name}: \{wrote.err}");
+  return image;
+}
+
+string[] lineList(string s) {
+  Vec<string> out = Vec.create();
+  string cur = "";
+  for (i32 i = 0; i < s.len(); i++) {
+    string c = s.slice(i, i + 1);
+    if (c == "\n") { if (cur != "") { out.push(cur); } cur = ""; } else { cur = cur + c; }
+  }
+  if (cur != "") { out.push(cur); }
+  return out.toArray();
+}
+
+string joined(string[] xs) {
+  string out = "";
+  for (string x in xs) { out = out + x + "|"; }
+  return out;
+}
+
+export async string test_the_services_are_data_in_the_image_and_init_starts_and_reaps_them(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "basic");
+  string image = await withServices(sys, t, r, "basic", ["echo hello from a service", "seq 1 3"]);
+  Said boot = await session(sys, r, image, "init");
+  t.eqI32(boot.status, 0, boot.err);
+  // Both start before either is waited for; then each service's own output, then its status; then the system's
+  // ending — without which a boot that finished reads exactly like one killed part-way through.
+  t.eqStr(joined(lineList(boot.out)),
+          "init: started echo|init: started seq|hello from a service|init: echo exited 0|1|2|3|init: seq exited 0|" +
+          "init: all services have stopped|", "the boot's log");
+  return t.report();
+}
+
+export async string test_what_a_service_wrote_is_in_the_image_the_system_left_behind(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "durable");
+  string image = await withServices(sys, t, r, "durable", ["touch /marker", "echo done"]);
+  Said boot = await session(sys, r, image, "init");
+  t.eqI32(boot.status, 0, boot.err);
+  t.isTrue(contains(boot.out, "init: all services have stopped"), boot.out);
+  Said next = await session(sys, r, image, "ls /");
+  t.isTrue(contains(next.out, "marker"), "the marker did not survive: \{next.out}");
+  return t.report();
+}
+
+export async string test_a_service_that_fails_is_reported_and_becomes_inits_own_status(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "failing");
+  string image = await withServices(sys, t, r, "failing", ["echo first", "false", "echo after"]);
+  Said boot = await session(sys, r, image, "init; echo status=$?");
+  t.isTrue(contains(boot.out, "init: false exited 1"), boot.out);
+  t.isTrue(contains(boot.out, "after"), "a later service did not run");
+  t.isTrue(contains(boot.out, "status=1"), boot.out);
+  return t.report();
+}
+
+export async string test_comments_and_blank_lines_are_skipped_and_an_absent_file_starts_nothing(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "comments");
+  string image = await withServices(sys, t, r, "comments", ["# a comment", "", "echo only-me   # trailing"]);
+  Said boot = await session(sys, r, image, "init");
+  t.eqStr(joined(lineList(boot.out)), "init: started echo|only-me|init: echo exited 0|init: all services have stopped|",
+          "the boot's log");
+  // No `/etc/init` at all: nothing to start, said out loud, and not a failure.
+  Said none = await session(sys, r, "\{r.dir}/empty.wacimg", "init; echo status=$?");
+  t.isTrue(contains(none.out, "status=0"), "\{none.out} / \{none.err}");
+  t.isTrue(contains(none.err, "nothing to start"), none.err);
+  return t.report();
+}
+
+/**
+ * The claim `spawnSelf` is for: `init` hands each service `GRANT_NONE`, so a service cannot read the host even though
+ * `imaged` itself can — it must, to open the image. A service that could would mean `init` was calling, not spawning.
+ */
+export async string test_a_service_is_a_child_with_its_own_grants_not_a_call_inside_init(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "grants");
+  string image = await withServices(sys, t, r, "grants", ["cat /etc/init"]);
+  Said boot = await session(sys, r, image, "init");
+  t.isTrue(contains(boot.out, "init: cat exited"), boot.out);
+  string host = await withServices(sys, t, r, "hostread", ["get /etc/hostname"]);
+  Said tried = await session(sys, r, host, "init");
+  string mine = flatten(sys.files().readFile("/etc/hostname").wait()).isOk()
+    ? string.fromBytes(flatten(sys.files().readFile("/etc/hostname").wait()).unwrap()) : "";
+  while (mine.len() > 0 && (mine.slice(mine.len() - 1, mine.len()) == "\n")) { mine = mine.slice(0, mine.len() - 1); }
+  if (mine.len() > 0) { t.isFalse(contains(tried.out, mine), "a service read the host's hostname: \{tried.out}"); }
+  return t.report();
+}
+
+/**
+ * A service can see the system it was started by: it asks `init` over the channel wac-mono 0116 built, and `init` —
+ * itself a spawned applet whose filesystem is the session's — passes the question to whoever holds the image.
+ */
+export async string test_a_service_can_see_the_system_it_was_started_by(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "reading");
+  string image = "\{r.dir}/reading.wacimg";
+  Said wrote = await session(sys, r, image, "mkdir /etc; echo hello from the image > /etc/motd; " +
+                                            "printf '%s' 'cat /etc/motd\nwc -l /etc/motd\n' > /etc/init");
+  t.eqI32(wrote.status, 0, "writing the image: \{wrote.err}");
+  Said boot = await session(sys, r, image, "init");
+  t.eqI32(boot.status, 0, boot.out + boot.err);
+  t.eqStr(joined(lineList(boot.out)),
+          "init: started cat|init: started wc|hello from the image|init: cat exited 0|1 /etc/motd|init: wc exited 0|" +
+          "init: all services have stopped|", "the boot's log");
+  return t.report();
+}
+
+/** A service that fails says why — `init` used to read each service's output and never its error stream. */
+export async string test_a_service_that_fails_says_why(Sys sys) {
+  T t = T.create();
+  Rig r = rig(sys, "complaining");
+  string image = "\{r.dir}/complaining.wacimg";
+  Said wrote = await session(sys, r, image, "mkdir /etc; printf '%s' 'cat /etc/nosuch\n' > /etc/init");
+  t.eqI32(wrote.status, 0, "writing the image: \{wrote.err}");
+  Said boot = await session(sys, r, image, "init");
+  t.eqI32(boot.status, 1, boot.out + boot.err);
+  t.isTrue(contains(boot.err, "cat: /etc/nosuch: No such file or directory"), "the service's complaint went nowhere: \{boot.err}");
+  string[] said = lineList(boot.out);
+  t.isTrue(said.len() >= 2, boot.out);
+  if (said.len() >= 2) {
+    t.eqStr(said[said.len() - 2], "init: cat exited 1", boot.out);
+    t.eqStr(said[said.len() - 1], "init: all services have stopped", boot.out);
+  }
+  return t.report();
+}

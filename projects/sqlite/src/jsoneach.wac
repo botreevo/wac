@@ -1,0 +1,204 @@
+// json_each and json_tree: the table-valued functions that list a JSON value's members.
+//
+// Their `id` column is where each element sits in the value's JSONB form, SQLite's binary JSON, which
+// SQLite builds from the text to walk it. Every JSONB element is a header and a payload: numbers and
+// strings keep their text as written, so a payload's size follows from the text, and the header is
+// the smallest that holds that size. An array's or object's payload is its elements, an object's
+// alternating label and value. That is enough to know every element's offset without building the
+// blob, which is all `id` needs.
+
+import { Vec, Result } from "core";
+import { Value } from "./value.wac";
+import { SqlError } from "./error.wac";
+import { formatReal } from "./format.wac";
+import { Json, Step, parseJson, parsePath, jsonText, jsonType, sqlOf, unescape, fromJsonb } from "./json.wac";
+
+export static string[] JSON_EACH_COLS = ["key", "value", "type", "atom", "id", "parent", "fullkey", "path", "json", "root"];
+
+i32 headerSize(i64 payload) {
+  if (payload <= 11) { return 1; }
+  if (payload <= 0xff) { return 2; }
+  if (payload <= 0xffff) { return 3; }
+  return 5;
+}
+
+i64 payloadSize(const Json j) {
+  match (j) {
+    JNum(raw): { return raw.toBytes().len() as i64; }
+    JStr(raw): { return raw.toBytes().len() as i64; }
+    JArr(items): {
+      i64 n = 0;
+      for (i32 i = 0; i < items.len(); i++) { n += elementSize(items.get(i)); }
+      return n;
+    }
+    JObj(keys, vals): {
+      i64 n = 0;
+      for (i32 i = 0; i < keys.len(); i++) { n += labelSize(keys.get(i)) + elementSize(vals.get(i)); }
+      return n;
+    }
+    default: { return 0; }
+  }
+}
+
+i64 elementSize(const Json j) {
+  i64 p = payloadSize(j);
+  return headerSize(p) as i64 + p;
+}
+
+i64 labelSize(string raw) {
+  i64 p = raw.toBytes().len() as i64;
+  return headerSize(p) as i64 + p;
+}
+
+// The path step to an object member: `.name` when the name is a plain identifier, quoted otherwise.
+string memberStep(string raw) {
+  u8[] b = raw.toBytes();
+  bool quote = b.len() == 0 || !isAlpha(b[0]);
+  for (i32 i = 0; i < b.len() && !quote; i++) { if (!isAlpha(b[i]) && !(b[i] >= '0' && b[i] <= '9')) { quote = true; } }
+  return quote ? ".\"" + raw + "\"" : "." + raw;
+}
+
+bool isAlpha(u8 c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+// Where a path's last step begins, so the path of what holds the element it names is what precedes.
+i32 lastStepStart(string path) {
+  u8[] b = path.toBytes();
+  i32 last = b.len();
+  bool inQuote = false;
+  for (i32 i = 1; i < b.len(); i++) {
+    if (b[i] == '"') { inQuote = !inQuote; }
+    else if (!inQuote && (b[i] == '.' || b[i] == '[')) { last = i; }
+  }
+  return last;
+}
+
+struct Walk {
+  Vec<Value[]> rows;
+  Value json;
+  Value root;
+}
+
+void emit(Walk w, Value key, const Json j, i64 id, Value parent, string fullkey, string path) {
+  bool container = match (j) { JArr: true, JObj: true, default: false };
+  Value v = sqlOf(j);
+  w.rows.push([key, v, Value.Text(jsonType(j)), container ? Value.Null : v, Value.Int(id), parent,
+               Value.Text(fullkey), Value.Text(path), w.json, w.root]);
+}
+
+// The members of the container at `at` (its header's offset), each as a row, and with `deep` their
+// members after each, depth first.
+void members(Walk w, const Json j, i64 at, i64 rowId, bool deep, string fullkey) {
+  i64 pos = at + headerSize(payloadSize(j)) as i64;
+  match (j) {
+    JArr(items): {
+      for (i32 i = 0; i < items.len(); i++) {
+        Json it = items.get(i);
+        string fk = fullkey + "[\{i}]";
+        emit(w, Value.Int(i as i64), it, pos, deep ? Value.Int(rowId) : Value.Null, fk, fullkey);
+        if (deep) { members(w, it, pos, pos, true, fk); }
+        pos += elementSize(it);
+      }
+    }
+    JObj(keys, vals): {
+      for (i32 i = 0; i < keys.len(); i++) {
+        Json it = vals.get(i);
+        string fk = fullkey + memberStep(keys.get(i));
+        // A member's id is its label's offset; the value follows the label.
+        emit(w, Value.Text(unescape(keys.get(i))), it, pos, deep ? Value.Int(rowId) : Value.Null, fk, fullkey);
+        i64 valueAt = pos + labelSize(keys.get(i));
+        if (deep) { members(w, it, valueAt, pos, true, fk); }
+        pos = valueAt + elementSize(it);
+      }
+    }
+    default: {}
+  }
+}
+
+// The rows json_each (tree false) or json_tree (true) answers for a value and an optional path, with
+// every column of JSON_EACH_COLS.
+export Result<Vec<Value[]>, SqlError> jsonEachRows(bool tree, Value input, Value? pathArg) {
+  Walk w = Walk(Vec.create(), input, Value.Text("$"));
+  string text = "";
+  match (input) {
+    Null: { return Result.Ok(w.rows); }
+    Text(s): { text = s; }
+    Int(i): { text = "\{i}"; }
+    Real(r): { text = formatReal(r); }
+    Blob(b): {
+      // JSONB: read as the JSON it encodes.
+      Json? decoded = fromJsonb(b);
+      if (decoded is null) { return Result.Err(SqlError("error", "malformed JSON")); }
+      text = jsonText(decoded!);
+      w.json = Value.Text(text);
+    }
+  }
+  string path = "$";
+  if (pathArg is not null) {
+    match (pathArg!) {
+      Null: { return Result.Ok(w.rows); }
+      Text(s): { path = s; }
+      default: { return Result.Err(SqlError("error", "bad JSON path")); }
+    }
+    w.root = pathArg!;
+  }
+  Json? parsed = parseJson(text);
+  if (parsed is null) { return Result.Err(SqlError("error", "malformed JSON")); }
+  Step[]? steps = parsePath(path);
+  if (steps is null) { return Result.Err(SqlError("error", "bad JSON path: '\{path}'")); }
+  // Follow the path, keeping the offset of each element and, for a member, of its label.
+  Json cur = parsed!;
+  i64 at = 0;
+  i64 id = 0;
+  Value key = Value.Null;
+  for (i32 k = 0; k < steps!.len(); k++) {
+    const Step s = steps![k];
+    i64 pos = at + headerSize(payloadSize(cur)) as i64;
+    bool found = false;
+    Json next = cur;
+    match (cur) {
+      JObj(keys, vals): {
+        if (s.key is null) { return Result.Ok(w.rows); }
+        for (i32 i = 0; i < keys.len() && !found; i++) {
+          if (keys.get(i) == s.key! || unescape(keys.get(i)) == s.key!) {
+            id = pos;
+            at = pos + labelSize(keys.get(i));
+            key = Value.Text(unescape(keys.get(i)));
+            next = vals.get(i);
+            found = true;
+          } else {
+            pos += labelSize(keys.get(i)) + elementSize(vals.get(i));
+          }
+        }
+      }
+      JArr(items): {
+        if (s.key is not null) { return Result.Ok(w.rows); }
+        i32 target = s.fromEnd ? items.len() - s.index : s.index;
+        if (target < 0 || target >= items.len()) { return Result.Ok(w.rows); }
+        for (i32 i = 0; i < target; i++) { pos += elementSize(items.get(i)); }
+        id = pos;
+        at = pos;
+        key = Value.Int(target as i64);
+        next = items.get(target);
+        found = true;
+      }
+      default: {}
+    }
+    if (!found) { return Result.Ok(w.rows); }
+    cur = next;
+  }
+  string parentPath = steps!.len() == 0 ? "$" : path.slice(0, lastStepStart(path));
+  if (tree) {
+    // The element itself, then everything under it.
+    emit(w, key, cur, id, Value.Null, path, parentPath);
+    members(w, cur, at, id, true, path);
+    return Result.Ok(w.rows);
+  }
+  bool container = match (cur) { JArr: true, JObj: true, default: false };
+  if (container) {
+    members(w, cur, at, id, false, path);
+  } else {
+    // A lone value is its own single row, keyless, with the path to it as both of its paths.
+    emit(w, Value.Null, cur, id, Value.Null, path, path);
+  }
+  return Result.Ok(w.rows);
+}

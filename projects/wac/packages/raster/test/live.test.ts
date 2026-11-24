@@ -1,0 +1,206 @@
+// test-lane: browser — drives Chromium through Playwright, which needs -A
+// The raster desktop on a real canvas, with the pixels read back.
+//
+// Everything else in this package is checked without a screen: a surface read back as numbers, a hit
+// answered as an index, a grid asked what is in a cell. All of that can be **self-consistently
+// wrong** — about where the origin is, which way `y` runs, whether a rectangle's `w` is a size or a
+// right edge — because both sides of every one of those assertions is my own code.
+//
+// A canvas is not my code. So this loads `example/rasterdesk.wac` in chromium, reads
+// `getImageData` back out, and checks that what the model put at (x, y) is what the page has at
+// (x, y). It is the first thing in this package that could catch a coordinate convention being
+// wrong everywhere at once.
+//
+// **Skipped loudly** when there is no browser, in the same words `browser_live.test.ts` uses — a
+// skip that reads like a pass is how a differential comes to compare nothing.
+
+import { buildPage, waitInPage, canvasesOnThePage } from "../../../harness/buildPage.ts";
+import { findChromium, launchOptions } from "../../../harness/chromium.ts";
+
+/** Local, because this repo has no third-party dependencies. */
+function assertEquals<T>(got: T, want: T, msg?: string): void {
+  const a = JSON.stringify(got), b = JSON.stringify(want);
+  if (a !== b) {
+    throw new Error(
+      `assertEquals failed${msg === undefined ? "" : ` — ${msg}`}\n  got:  ${a}\n  want: ${b}`,
+    );
+  }
+}
+
+/**
+ * Why this cannot run, or the empty string.
+ *
+ * **The permission is checked first, and that is not optional.** `wac task test` grants read, write,
+ * run, net and env — *not* `--allow-sys`, which `playwright-core` needs at **import** time to work
+ * out where Chrome keeps its profile. Asking for a browser without asking for that permission gives
+ * a test that passes under `deno test -A` and fails inside the suite with `NotCapable: Requires sys
+ * access to "homedir"` from somewhere in an npm bundle, naming neither this file nor the reason.
+ *
+ * That is exactly what this file did on its first suite run. The answer is the one
+ * `packages/platform/test/browser_live.test.ts` already worked out: ask, and let the answer decide.
+ * The shared suite should not be the thing that needs a browser.
+ */
+// Found by `harness/chromium.ts`, which launches it by executable (`issues/system/0452e`).
+const CHROMIUM = findChromium();
+const cannotBecause = CHROMIUM.cannot;
+if (cannotBecause !== "") {
+  console.warn(
+    `SKIPPING the raster live test: ${cannotBecause}.\n` +
+      `  The rest of packages/raster is checked without a browser; this is the one that reads a ` +
+      `real canvas back.`,
+  );
+}
+
+/** Serve a directory. A page built by `web` needs no special headers. */
+function serve(dir: string): { port: number; stop: () => Promise<void> } {
+  const server = Deno.serve({ port: 0, onListen: () => {} }, async (req) => {
+    const name = new URL(req.url).pathname.replace(/^\//, "") || "index.html";
+    try {
+      return new Response(await Deno.readFile(`${dir}/${name}`), {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+        },
+      });
+    } catch {
+      return new Response("no", { status: 404 });
+    }
+  });
+  return { port: (server.addr as Deno.NetAddr).port, stop: () => server.shutdown() };
+}
+
+Deno.test({
+  name: "the raster desktop reaches a real canvas, at the coordinates the model used",
+  ignore: cannotBecause !== "",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  fn: async () => {
+    const { chromium } = await import("npm:playwright@1");
+    const dir = await Deno.makeTempDir({ prefix: "wac-rasterdesk-" });
+    let browser;
+    let http: { port: number; stop(): Promise<void> } | undefined;
+    try {
+      await buildPage("packages/raster/example/rasterdesk.wac", dir);
+      const port = (http = serve(dir)).port;
+      // --no-proxy-server: this container sets HTTP_PROXY, and Chromium would send 127.0.0.1
+      // through Squid, which cannot reach it.
+      browser = await chromium.launch(launchOptions(CHROMIUM));
+      const page = await browser.newPage();
+      await canvasesOnThePage(page);
+      const failures: string[] = [];
+      page.on("pageerror", (e: Error) => failures.push(String(e)));
+      await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
+
+      // Wait for the canvas to have been sized by `pixels`
+      // rather than for a fixed time — the same lesson as the TLS fixture earlier today.
+      // **Page code as strings, not closures**, as `browser_live.test.ts` does: `document` is not
+      // in Deno's type environment, and a closure would have to be type-checked against types the
+      // page has and this process does not.
+      await waitInPage(page, 
+        "(() => { const c = document.getElementById('screen');" +
+          " return c !== null && c.width === 320 && c.height === 200; })()",
+        undefined,
+        { timeout: 30_000 },
+      ).catch(async (e: Error) => {
+        // What the page actually says, because "timed out" names nothing.
+        const body = await page.evaluate("document.body.innerText") as string;
+        throw new Error(`${e.message}
+the page says: ${JSON.stringify(body.slice(0, 400))}
+errors: ${failures.join(" | ")}`);
+      });
+      assertEquals(failures, [], "the page reported an error");
+
+      /** One pixel out of the canvas, as `0xRRGGBBAA`. */
+      const at = async (x: number, y: number): Promise<number> =>
+        await page.evaluate(
+          `(() => { const d = document.getElementById('screen').getContext('2d')` +
+            `.getImageData(${x}, ${y}, 1, 1).data;` +
+            ` return ((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]) >>> 0; })()`,
+        ) as number;
+
+      // **`pixels` sized the canvas**, which is the whole reason it and `pixelsIn` are two
+      // calls: the markup has a `<canvas>` with no dimensions.
+      const size = await page.evaluate(
+        "(() => { const c = document.getElementById('screen'); return [c.width, c.height]; })()",
+      ) as number[];
+      assertEquals(size, [320, 200], "the canvas was not sized by pixels");
+
+      // The desktop behind everything, at a corner no window covers.
+      assertEquals(await at(2, 2), 0x101416FF, "the desktop colour is not at the origin");
+
+      // **The window frames, where the model put them.** `one` is opened at (20, 20) and `two` at
+      // (120, 70), each 12 cells wide — 96 pixels — so their top-left corners are frame-coloured.
+      // If `y` ran the other way, or the surface's rows were transposed, this is where it shows.
+      assertEquals(await at(20, 20), 0x46D9C0FF, "the first window's corner is missing");
+      assertEquals(await at(120, 70), 0x46D9C0FF, "the second window's corner is missing");
+
+      // Inside the first window's title bar, which is `barHeight()` tall from its top edge.
+      assertEquals(await at(60, 22), 0x2A3438FF, "the first window's title bar is not where it should be");
+
+      // **And the partial blit.** A 16x16 magenta square at (200, 24), put there by `pixelsIn`
+      // and by nothing else — so its corners say whether that capability's origin agrees with the
+      // model's. Both edges, because a square one pixel off still has a middle.
+      assertEquals(await at(200, 24), 0xFF00FFFF, "the patch's top-left is not at (200, 24)");
+      assertEquals(await at(215, 39), 0xFF00FFFF, "the patch's bottom-right is not at (215, 39)");
+      assertEquals(await at(199, 24), 0x101416FF, "the patch started one pixel early");
+      assertEquals(await at(216, 39), 0x101416FF, "the patch ran one pixel long");
+
+      // The partial blit must not have resized or cleared the canvas, which is what `pixels`
+      // does and what would throw away everything outside the rectangle.
+      assertEquals(await at(20, 20), 0x46D9C0FF, "the partial blit cleared the canvas");
+
+      // ── The event path, which is the half no headless test can reach ────────────────────────
+      //
+      // `desk.wac`'s own tests press and drag with synthetic numbers. What they cannot check is that
+      // a *browser's* pointer coordinates mean the same thing the model's do — they arrive relative
+      // to the element the listener is on, which is the canvas, which is what a `Surface` is indexed
+      // by. That claim is only testable here.
+      //
+      // **The target must be empty first, or the check proves nothing.** My first version dragged to
+      // (120, 120) and waited for the frame colour there — and window "two" is opened at (120, 70)
+      // and is 96 by 84, so its *left edge* already sits on that pixel. The assertion would have
+      // passed with no drag at all. So the destination is asserted clear before the drag, which is
+      // the canary that makes the after-state mean something.
+      //
+      // Window "one" is at (20, 20), 96 by 84 — x 20..115, y 20..103. (60, 110) is below it and left
+      // of "two", so it is desktop. Grab the title bar at (60, 24) and move +40, +90: the corner
+      // goes from (20, 20) to (60, 110).
+      assertEquals(await at(60, 110), 0x101416FF, "the drag's destination was not empty to begin with");
+
+      const box = await page.evaluate(
+        "(() => { const r = document.getElementById('screen').getBoundingClientRect();" +
+          " return [r.left, r.top]; })()",
+      ) as number[];
+      const pt = (x: number, y: number) => ({ x: box[0] + x, y: box[1] + y });
+
+      await page.mouse.move(pt(60, 24).x, pt(60, 24).y);
+      await page.mouse.down();
+      await page.mouse.move(pt(100, 114).x, pt(100, 114).y);
+      await page.mouse.up();
+
+      // Wait for the pixel rather than for a duration: the program redraws when it gets the event,
+      // and how long that takes is the machine's business.
+      await waitInPage(page, 
+        "(() => { const d = document.getElementById('screen').getContext('2d')" +
+          ".getImageData(60, 110, 1, 1).data;" +
+          " return (((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]) >>> 0) === 0x46D9C0FF; })()",
+        undefined,
+        { timeout: 15_000 },
+      ).catch(async (e: Error) => {
+        throw new Error(
+          `${e.message}\nthe window did not arrive at (60, 110): that pixel is ` +
+            `0x${(await at(60, 110)).toString(16)}, and (20, 20) is ` +
+            `0x${(await at(20, 20)).toString(16)}`,
+        );
+      });
+
+      // And it is no longer where it started — a drag that drew the window in both places would
+      // pass the check above and still be wrong.
+      assertEquals(await at(20, 20), 0x101416FF, "the window was drawn at its old position too");
+      assertEquals(failures, [], "the page reported an error during the drag");
+    } finally {
+      await browser?.close();
+      await http?.stop();
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

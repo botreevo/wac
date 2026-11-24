@@ -1,0 +1,102 @@
+// dag-pb: the protobuf node UnixFS files and directories are made of, written the one canonical way the
+// profile allows (links first, then data — IPIP-0550) and read strictly: fields in that order, each at most once,
+// no unknown fields.
+//
+//     PBNode { repeated PBLink Links = 2; optional bytes Data = 1; }
+//     PBLink { optional bytes Hash = 1; optional string Name = 2; optional uint64 Tsize = 3; }
+
+import { Result } from "core";
+import { Out, In } from "./bytes.wac";
+import { Cid, cidFromBytes } from "./cid.wac";
+
+export struct Link {
+  Cid cid;
+  string name;
+  /** The total size of the blocks under this link, the profile requires it to be accurate. */
+  i64 tsize = 0 as i64;
+}
+
+export struct PbNode {
+  Link[] links;
+  u8[] data;
+  bool hasData = false;
+}
+
+export u8[] encodePb(PbNode n) {
+  Out o = Out.create();
+  for (i32 i = 0; i < n.links.len(); i++) {
+    Out l = Out.create();
+    u8[] h = n.links[i].cid.bytes();
+    l.byte(0x0a); l.varint(h.len() as i64); l.all(h);
+    u8[] name = n.links[i].name.toBytes();
+    l.byte(0x12); l.varint(name.len() as i64); l.all(name);
+    l.byte(0x18); l.varint(n.links[i].tsize);
+    u8[] lb = l.bytes();
+    o.byte(0x12); o.varint(lb.len() as i64); o.all(lb);
+  }
+  if (n.hasData) { o.byte(0x0a); o.varint(n.data.len() as i64); o.all(n.data); }
+  return o.bytes();
+}
+
+export Result<PbNode, string> decodePb(u8[] b) {
+  In r = In.of(b);
+  Link[] links = Link[]();
+  u8[] data = u8[]();
+  bool hasData = false;
+  while (!r.done()) {
+    i64 tag = r.varint();
+    if (tag == (0x12 as i64)) {
+      if (hasData) { return Result.Err("dag-pb: a link after the data (only links-first is canonical)"); }
+      i64 len = r.varint();
+      u8[] lb = r.take(len as! i32);
+      if (r.bad != "") { return Result.Err("dag-pb: \{r.bad}"); }
+      Link l = try decodeLink(lb);
+      links = pushLink(links, l);
+    } else if (tag == (0x0a as i64)) {
+      if (hasData) { return Result.Err("dag-pb: data twice"); }
+      i64 len = r.varint();
+      data = r.take(len as! i32);
+      hasData = true;
+    } else {
+      return Result.Err("dag-pb: unexpected field tag \{tag}");
+    }
+    if (r.bad != "") { return Result.Err("dag-pb: \{r.bad}"); }
+  }
+  return Result.Ok(PbNode(links, data, hasData));
+}
+
+Result<Link, string> decodeLink(u8[] b) {
+  In r = In.of(b);
+  Cid? cid = null;
+  string name = "";
+  i64 tsize = 0 as i64;
+  i32 last = 0;
+  while (!r.done()) {
+    i64 tag = r.varint();
+    i32 field = (tag >>> (3 as i64)) as! i32;
+    if (field <= last) { return Result.Err("dag-pb link: fields out of order or repeated"); }
+    last = field;
+    if (tag == (0x0a as i64)) {
+      i64 len = r.varint();
+      u8[] h = r.take(len as! i32);
+      if (r.bad != "") { return Result.Err(r.bad); }
+      cid = try cidFromBytes(h);
+    } else if (tag == (0x12 as i64)) {
+      i64 len = r.varint();
+      name = string.fromBytes(r.take(len as! i32));
+    } else if (tag == (0x18 as i64)) {
+      tsize = r.varint();
+    } else {
+      return Result.Err("dag-pb link: unexpected field tag \{tag}");
+    }
+    if (r.bad != "") { return Result.Err("dag-pb link: \{r.bad}"); }
+  }
+  if (cid is null) { return Result.Err("dag-pb link without a hash"); }
+  return Result.Ok(Link(cid!, name, tsize));
+}
+
+export Link[] pushLink(Link[] xs, Link x) {
+  Link[] out = Link[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}

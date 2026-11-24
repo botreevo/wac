@@ -1,0 +1,92 @@
+// Train the tiny GPT on a text, on the CPU, and write some of what it learned.
+//
+//     wac run --allow-read example/gpt/train.wac names.txt [steps] [width] [layers]
+//
+// `names.txt` is one name a line (Karpathy's makemore list is the one this was tuned on): the model learns what names
+// look like and invents new ones. Nine tenths of the text is trained on and the last tenth only measured, so the
+// validation loss says whether it is learning names or memorising these ones. For reference, a model that guessed
+// every byte equally likely scores ln(27) ≈ 3.30 on that list, and one that knew only which letter tends to follow
+// which about 2.45.
+
+import { Sys } from "std";
+import { Device, Tensor } from "../../src/tensor.wac";
+import { Adam } from "../../src/optim.wac";
+import { Gpt, GptConfig, Vocab, batchOf, sample, shuffledLines } from "./model.wac";
+
+i32 argOr(string[] args, i32 k, i32 fallback) {
+  if (args.len() <= k) { return fallback; }
+  i32 v = 0;
+  for (i32 i = 0; i < args[k].len(); i++) { v = v * 10 + ((args[k].toBytes()[i] as i32) - 48); }
+  return v;
+}
+
+f32[] part(f32[] all, i32 from, i32 to) {
+  f32[] out = f32[].filled(to - from, 0.0);
+  out.copyFrom(all, from, 0, to - from);
+  return out;
+}
+
+/** The mean loss over `batches` random batches, not training. */
+f32 estimate(Device d, Gpt m, f32[] data, i32 batches, i32 batch) {
+  f64 total = 0.0;
+  for (i32 i = 0; i < batches; i++) {
+    Tensor l = d.tidy(() => {
+      Tensor[] xy = batchOf(d, data, batch, m.config.context);
+      return m.loss(xy[0], xy[1], false);
+    });
+    total += l.item() as f64;
+    l.dispose();
+  }
+  return (total / (batches as f64)) as~ f32;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 1) {
+    sys.log("usage: train.wac <corpus.txt> [steps] [width] [layers]");
+    return 2;
+  }
+  u8[] text = (await sys.readFile(args[0])).orElse(u8[]());
+  if (text.len() == 0) {
+    sys.log("cannot read \{args[0]}");
+    return 1;
+  }
+  i32 steps = argOr(args, 1, 2000);
+  Device d = Device.cpu();
+  d.seed(1337 as i64);
+  // One entry a line — names — is shuffled first; running text is not, its order being the thing to learn.
+  if (args[0].indexOf("names") >= 0) { text = shuffledLines(text, d); }
+  Vocab vocab = Vocab.of(text);
+  f32[] data = vocab.encode(text);
+  i32 split = data.len() * 9 / 10;
+  f32[] train = part(data, 0, split);
+  f32[] valid = part(data, split, data.len());
+
+  GptConfig c = GptConfig(vocab.size(), 16, argOr(args, 2, 64), 4, argOr(args, 3, 2), 0.0);
+  Gpt model = Gpt.create(d, c);
+  Adam opt = Adam.create(0.003);
+  sys.log("\{text.len()} bytes, \{vocab.size()} distinct; a model of \{model.size()} numbers, context \{c.context}, width \{c.width}, \{c.layers} layers of \{c.heads} heads");
+
+  i64 started = await sys.monotonicNanos();
+  for (i32 step = 0; step <= steps; step++) {
+    if (step % 250 == 0) {
+      f32 tl = estimate(d, model, train, 8, 32);
+      f32 vl = estimate(d, model, valid, 8, 32);
+      f64 secs = ((await sys.monotonicNanos()) - started) as~ f64 / 1000000000.0;
+      sys.log("step \{step}: train \{tl}, validation \{vl}  (\{secs} s)");
+    }
+    if (step == steps) { break; }
+    // The rate falls by ten over the run, which is most of what separates a good run from an unsettled one.
+    opt.rate = 0.003 * (1.0 - 0.9 * (step as f64) / (steps as f64));
+    opt.minimize(() => {
+      Tensor[] xy = batchOf(d, train, 32, c.context);
+      return model.loss(xy[0], xy[1], true);
+    }, model.params()).dispose();
+  }
+
+  sys.log("\nwhat it writes, starting from a new line:");
+  u8[] newline = [10];
+  u8[] written = await sample(model, vocab, d, newline, 200, 1.0);
+  sys.log(string.fromBytes(written));
+  return 0;
+}

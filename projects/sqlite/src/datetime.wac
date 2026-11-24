@@ -1,0 +1,633 @@
+// date(), time(), datetime(), julianday(), unixepoch(), strftime() and timediff(): a port of SQLite's
+// src/date.c (public domain), so the same input gives the same answer. Times are UTC; `localtime` and
+// `utc` change nothing, since a wac program has no time zone database.
+
+import { Buf } from "core";
+import { Value } from "./value.wac";
+import { textOf, toReal, wholeNumber, isNull } from "./ops.wac";
+import { lower } from "./lexer.wac";
+import { sqlPrintf } from "./printf.wac";
+
+struct DateTime {
+  i64 iJD = 0;        // julian day number times 86400000
+  i32 Y = 0;
+  i32 M = 0;
+  i32 D = 0;
+  i32 h = 0;
+  i32 m = 0;
+  i32 tz = 0;         // minutes
+  f64 s = 0.0;
+  bool validJD = false;
+  bool validYMD = false;
+  bool validHMS = false;
+  i32 nFloor = 0;
+  bool rawS = false;
+  bool isError = false;
+  bool useSubsec = false;
+}
+
+bool digit(u8 c) { return c >= '0' && c <= '9'; }
+
+bool space(u8 c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 12 || c == 11; }
+
+// getDigits for one field: n digits at `at`, within [min, max], then `next` (0: anything).
+i32 field(const u8[] z, i32 at, i32 n, i32 min, i32 max, u8 next) {
+  if (at + n > z.len()) { return -1; }
+  i32 v = 0;
+  for (i32 i = 0; i < n; i++) {
+    if (!digit(z[at + i])) { return -1; }
+    v = v * 10 + (z[at + i] - '0') as i32;
+  }
+  if (v < min || v > max) { return -1; }
+  if (next != 0 && (at + n >= z.len() || z[at + n] != next)) { return -1; }
+  return v;
+}
+
+// Answers the index after the time zone, or -1 when what follows is not one.
+bool parseTimezone(const u8[] z, i32 at0, DateTime p) {
+  i32 at = at0;
+  while (at < z.len() && space(z[at])) { at++; }
+  p.tz = 0;
+  if (at >= z.len()) { return false; }
+  u8 c = z[at];
+  i32 sgn = 0;
+  if (c == '-') { sgn = -1; }
+  else if (c == '+') { sgn = 1; }
+  else if (c == 'Z' || c == 'z') {
+    at++;
+    while (at < z.len() && space(z[at])) { at++; }
+    return at < z.len();
+  } else {
+    return true;
+  }
+  at++;
+  i32 hr = field(z, at, 2, 0, 14, ':');
+  i32 mn = hr < 0 ? -1 : field(z, at + 3, 2, 0, 59, 0);
+  if (hr < 0 || mn < 0) { return true; }
+  at += 5;
+  p.tz = sgn * (mn + hr * 60);
+  while (at < z.len() && space(z[at])) { at++; }
+  return at < z.len();
+}
+
+// True on failure, as SQLite's.
+bool parseHhMmSs(const u8[] z, i32 at0, DateTime p) {
+  i32 at = at0;
+  i32 h = field(z, at, 2, 0, 24, ':');
+  i32 m = h < 0 ? -1 : field(z, at + 3, 2, 0, 59, 0);
+  if (h < 0 || m < 0) { return true; }
+  at += 5;
+  i32 s = 0;
+  f64 ms = 0.0;
+  if (at < z.len() && z[at] == ':') {
+    at++;
+    s = field(z, at, 2, 0, 59, 0);
+    if (s < 0) { return true; }
+    at += 2;
+    if (at + 1 < z.len() && z[at] == '.' && digit(z[at + 1])) {
+      f64 scale = 1.0;
+      at++;
+      while (at < z.len() && digit(z[at])) {
+        ms = ms * 10.0 + ((z[at] - '0') as f64);
+        scale = scale * 10.0;
+        at++;
+      }
+      ms = ms / scale;
+      if (ms > 0.999) { ms = 0.999; }
+    }
+  }
+  p.validJD = false;
+  p.rawS = false;
+  p.validHMS = true;
+  p.h = h;
+  p.m = m;
+  p.s = (s as f64) + ms;
+  return parseTimezone(z, at, p);
+}
+
+void datetimeError(DateTime p) {
+  p.iJD = 0; p.Y = 0; p.M = 0; p.D = 0; p.h = 0; p.m = 0; p.tz = 0; p.s = 0.0;
+  p.validJD = false; p.validYMD = false; p.validHMS = false; p.nFloor = 0; p.rawS = false; p.useSubsec = false;
+  p.isError = true;
+}
+
+void computeJD(DateTime p) {
+  if (p.validJD) { return; }
+  i32 Y = 2000;
+  i32 M = 1;
+  i32 D = 1;
+  if (p.validYMD) { Y = p.Y; M = p.M; D = p.D; }
+  if (Y < -4713 || Y > 9999 || p.rawS) { datetimeError(p); return; }
+  if (M <= 2) { Y--; M += 12; }
+  i32 A = (Y + 4800) / 100;
+  i32 B = 38 - A + (A / 4);
+  i32 X1 = 36525 * (Y + 4716) / 100;
+  i32 X2 = 306001 * (M + 1) / 10000;
+  p.iJD = (((X1 + X2 + D + B) as f64 - 1524.5) * 86400000.0) as~ i64;
+  p.validJD = true;
+  if (p.validHMS) {
+    p.iJD += (p.h as i64) * 3600000 + (p.m as i64) * 60000 + ((p.s * 1000.0 + 0.5).trunc() as~ i64);
+    if (p.tz != 0) {
+      p.iJD -= (p.tz as i64) * 60000;
+      p.validYMD = false;
+      p.validHMS = false;
+      p.tz = 0;
+    }
+  }
+}
+
+void computeFloor(DateTime p) {
+  if (p.D <= 28) { p.nFloor = 0; }
+  else if ((((1 as i32) << p.M) & 0x15aa) != 0) { p.nFloor = 0; }
+  else if (p.M != 2) { p.nFloor = p.D == 31 ? 1 : 0; }
+  else if (p.Y % 4 != 0 || (p.Y % 100 == 0 && p.Y % 400 != 0)) { p.nFloor = p.D - 28; }
+  else { p.nFloor = p.D - 29; }
+}
+
+bool parseYyyyMmDd(const u8[] z, DateTime p) {
+  i32 at = 0;
+  bool neg = false;
+  if (z.len() > 0 && z[0] == '-') { at = 1; neg = true; }
+  i32 Y = field(z, at, 4, 0, 9999, '-');
+  i32 M = Y < 0 ? -1 : field(z, at + 5, 2, 1, 12, '-');
+  i32 D = M < 0 ? -1 : field(z, at + 8, 2, 1, 31, 0);
+  if (Y < 0 || M < 0 || D < 0) { return true; }
+  at += 10;
+  while (at < z.len() && (space(z[at]) || z[at] == 'T')) { at++; }
+  if (at < z.len() && !parseHhMmSs(z, at, p)) {
+  } else if (at >= z.len()) {
+    p.validHMS = false;
+  } else {
+    return true;
+  }
+  p.validJD = false;
+  p.validYMD = true;
+  p.Y = neg ? -Y : Y;
+  p.M = M;
+  p.D = D;
+  computeFloor(p);
+  if (p.tz != 0) { computeJD(p); }
+  return false;
+}
+
+void setRawDateNumber(DateTime p, f64 r) {
+  p.s = r;
+  p.rawS = true;
+  if (r >= 0.0 && r < 5373484.5) {
+    p.iJD = (r * 86400000.0 + 0.5).trunc() as~ i64;
+    p.validJD = true;
+  }
+}
+
+void setNow(DateTime p, i64 nowMillis) {
+  p.iJD = nowMillis + 210866760000000;
+  p.validJD = true;
+  p.validYMD = false;
+  p.validHMS = false;
+  p.tz = 0;
+}
+
+bool parseDateOrTime(string text, DateTime p, i64 now) {
+  u8[] z = text.toBytes();
+  if (!parseYyyyMmDd(z, p)) { return false; }
+  if (!parseHhMmSs(z, 0, p)) { return false; }
+  string l = lower(text);
+  if (l == "now") { setNow(p, now); return false; }
+  Value? n = wholeNumber(text);
+  if (n is not null) { setRawDateNumber(p, toReal(n!)); return false; }
+  if (l == "subsec" || l == "subsecond") { p.useSubsec = true; setNow(p, now); return false; }
+  return true;
+}
+
+bool validJulianDay(i64 iJD) { return iJD >= 0 && iJD <= 464269060799999; }
+
+void computeYMD(DateTime p) {
+  if (p.validYMD) { return; }
+  if (!p.validJD) { p.Y = 2000; p.M = 1; p.D = 1; }
+  else if (!validJulianDay(p.iJD)) { datetimeError(p); return; }
+  else {
+    i32 Z = ((p.iJD + 43200000) / 86400000) as! i32;
+    i32 alpha = (((Z as f64) + 32044.75) / 36524.25).trunc() as~ i32 - 52;
+    i32 A = Z + 1 + alpha - ((alpha + 100) / 4) + 25;
+    i32 B = A + 1524;
+    i32 C = (((B as f64) - 122.1) / 365.25).trunc() as~ i32;
+    i32 D = (36525 * (C & 32767)) / 100;
+    i32 E = (((B - D) as f64) / 30.6001).trunc() as~ i32;
+    i32 X1 = (30.6001 * (E as f64)).trunc() as~ i32;
+    p.D = B - D - X1;
+    p.M = E < 14 ? E - 1 : E - 13;
+    p.Y = p.M > 2 ? C - 4716 : C - 4715;
+  }
+  p.validYMD = true;
+}
+
+void computeHMS(DateTime p) {
+  if (p.validHMS) { return; }
+  computeJD(p);
+  i32 dayMs = ((p.iJD + 43200000) % 86400000) as! i32;
+  p.s = ((dayMs % 60000) as f64) / 1000.0;
+  i32 dayMin = dayMs / 60000;
+  p.m = dayMin % 60;
+  p.h = dayMin / 60;
+  p.rawS = false;
+  p.validHMS = true;
+}
+
+void computeYMDHMS(DateTime p) { computeYMD(p); computeHMS(p); }
+
+void clearYMDHMSTZ(DateTime p) { p.validYMD = false; p.validHMS = false; p.tz = 0; }
+
+void autoAdjust(DateTime p) {
+  if (!p.rawS || p.validJD) { p.rawS = false; }
+  else if (p.s >= -210866760000.0 && p.s <= 253402300799.0) {
+    f64 r = p.s * 1000.0 + 210866760000000.0;
+    clearYMDHMSTZ(p);
+    p.iJD = (r + 0.5).trunc() as~ i64;
+    p.validJD = true;
+    p.rawS = false;
+  }
+}
+
+static string[] XFORM_NAME = ["second", "minute", "hour", "day", "month", "year"];
+static f64[] XFORM_LIMIT = [4.6427e+14, 7.7379e+12, 1.2897e+11, 5373485.0, 176546.0, 14713.0];
+static f64[] XFORM_SECS = [1.0, 60.0, 3600.0, 86400.0, 2592000.0, 31536000.0];
+
+DateTime copyOf(const DateTime p) {
+  return DateTime(p.iJD, p.Y, p.M, p.D, p.h, p.m, p.tz, p.s, p.validJD, p.validYMD, p.validHMS, p.nFloor, p.rawS,
+                  p.isError, p.useSubsec);
+}
+
+i32 slen(const u8[] z) { return z.len(); }
+
+// True on failure, as SQLite's parseModifier.
+bool parseModifier(string mod, DateTime p, i32 idx) {
+  string z = lower(mod);
+  u8[] b = mod.toBytes();
+  if (b.len() == 0) { return true; }
+  u8 c0 = b[0];
+  if (z == "auto") {
+    if (idx > 1) { return true; }
+    autoAdjust(p);
+    return false;
+  }
+  if (z == "ceiling") { computeJD(p); clearYMDHMSTZ(p); p.nFloor = 0; return false; }
+  if (z == "floor") { computeJD(p); p.iJD -= (p.nFloor as i64) * 86400000; clearYMDHMSTZ(p); return false; }
+  if (z == "julianday") {
+    if (idx > 1) { return true; }
+    if (p.validJD && p.rawS) { p.rawS = false; return false; }
+    return true;
+  }
+  if (z == "localtime" || z == "utc") { return false; }
+  if (z == "unixepoch") {
+    if (!p.rawS || idx > 1) { return true; }
+    f64 r = p.s * 1000.0 + 210866760000000.0;
+    if (r >= 0.0 && r < 464269060800000.0) {
+      clearYMDHMSTZ(p);
+      p.iJD = (r + 0.5).trunc() as~ i64;
+      p.validJD = true;
+      p.rawS = false;
+      return false;
+    }
+    return true;
+  }
+  if (z.len() > 8 && z.slice(0, 8) == "weekday ") {
+    Value? nv = wholeNumber(z.slice(8, z.len()));
+    if (nv is null) { return true; }
+    f64 r = toReal(nv!);
+    if (r < 0.0 || r >= 7.0 || r.trunc() != r) { return true; }
+    i64 n = r as~ i64;
+    computeYMDHMS(p);
+    p.tz = 0;
+    p.validJD = false;
+    computeJD(p);
+    i64 Z = ((p.iJD + 129600000) / 86400000) % 7;
+    if (Z > n) { Z -= 7; }
+    p.iJD += (n - Z) * 86400000;
+    clearYMDHMSTZ(p);
+    return false;
+  }
+  if (z == "subsec" || z == "subsecond") { p.useSubsec = true; return false; }
+  if (z.len() > 9 && z.slice(0, 9) == "start of ") {
+    if (!p.validJD && !p.validYMD && !p.validHMS) { return true; }
+    string what = z.slice(9, z.len());
+    computeYMD(p);
+    p.validHMS = true;
+    p.h = 0;
+    p.m = 0;
+    p.s = 0.0;
+    p.rawS = false;
+    p.tz = 0;
+    p.validJD = false;
+    if (what == "month") { p.D = 1; return false; }
+    if (what == "year") { p.M = 1; p.D = 1; return false; }
+    if (what == "day") { return false; }
+    return true;
+  }
+  if (!(c0 == '+' || c0 == '-' || digit(c0))) { return true; }
+  // A number, then a unit; or ±YYYY-MM-DD[ HH:MM[:SS]]; or ±HH:MM[:SS].
+  i32 n = 1;
+  while (n < b.len()) {
+    if (b[n] == ':' || space(b[n])) { break; }
+    if (b[n] == '-') {
+      if (n == 5 && field(b, 1, 4, 0, 9999, 0) >= 0) { break; }
+      if (n == 6 && field(b, 1, 5, 0, 14712, 0) >= 0) { break; }
+    }
+    n++;
+  }
+  Value? rv = wholeNumber(mod.slice(0, n));
+  if (rv is null) { return true; }
+  f64 r = toReal(rv!);
+  i32 tAt = 0;
+  bool haveTime = false;
+  if (n < b.len() && b[n] == '-') {
+    if (c0 != '+' && c0 != '-') { return true; }
+    i32 base = n == 5 ? 1 : 2;
+    i32 Y = n == 5 ? field(b, 1, 4, 0, 9999, '-') : field(b, 1, 5, 0, 14712, '-');
+    i32 Mo = Y < 0 ? -1 : field(b, base + 4 + (n == 5 ? 0 : 0), 2, 0, 11, '-');
+    // The field offsets follow the year's width.
+    i32 yw = n == 5 ? 4 : 5;
+    Mo = Y < 0 ? -1 : field(b, 1 + yw + 1, 2, 0, 11, '-');
+    i32 Dd = Mo < 0 ? -1 : field(b, 1 + yw + 4, 2, 0, 30, 0);
+    if (Y < 0 || Mo < 0 || Dd < 0) { return true; }
+    computeYMDHMS(p);
+    p.validJD = false;
+    i32 D = Dd;
+    if (c0 == '-') { p.Y -= Y; p.M -= Mo; D = -D; } else { p.Y += Y; p.M += Mo; }
+    i32 x = p.M > 0 ? (p.M - 1) / 12 : (p.M - 12) / 12;
+    p.Y += x;
+    p.M -= x * 12;
+    computeFloor(p);
+    computeJD(p);
+    p.validHMS = false;
+    p.validYMD = false;
+    p.iJD += (D as i64) * 86400000;
+    i32 endDate = 1 + yw + 6;
+    if (endDate >= b.len()) { return false; }
+    if (space(b[endDate]) && field(b, endDate + 1, 2, 0, 24, ':') >= 0 && field(b, endDate + 4, 2, 0, 59, 0) >= 0) {
+      tAt = endDate + 1;
+      haveTime = true;
+    } else {
+      return true;
+    }
+  } else if (n < b.len() && b[n] == ':') {
+    tAt = digit(b[0]) ? 0 : 1;
+    haveTime = true;
+  }
+  if (haveTime) {
+    DateTime tx = DateTime { };
+    if (parseHhMmSs(b, tAt, tx)) { return true; }
+    computeJD(tx);
+    tx.iJD -= 43200000;
+    i64 day = tx.iJD / 86400000;
+    tx.iJD -= day * 86400000;
+    if (c0 == '-') { tx.iJD = 0 - tx.iJD; }
+    computeJD(p);
+    clearYMDHMSTZ(p);
+    p.iJD += tx.iJD;
+    return false;
+  }
+  // "+NNN days" and the like.
+  i32 at = n;
+  while (at < b.len() && space(b[at])) { at++; }
+  string unit = z.slice(at, z.len());
+  if (unit.len() < 3 || unit.len() > 10) { return true; }
+  if (unit.slice(unit.len() - 1, unit.len()) == "s") { unit = unit.slice(0, unit.len() - 1); }
+  computeJD(p);
+  f64 rounder = r < 0.0 ? -0.5 : 0.5;
+  p.nFloor = 0;
+  for (i32 i = 0; i < XFORM_NAME.len(); i++) {
+    if (XFORM_NAME[i] != unit || !(r > -XFORM_LIMIT[i] && r < XFORM_LIMIT[i])) { continue; }
+    if (i == 4) {
+      computeYMDHMS(p);
+      p.M += r.trunc() as~ i32;
+      i32 x = p.M > 0 ? (p.M - 1) / 12 : (p.M - 12) / 12;
+      p.Y += x;
+      p.M -= x * 12;
+      computeFloor(p);
+      p.validJD = false;
+      r = r - r.trunc();
+    } else if (i == 5) {
+      computeYMDHMS(p);
+      p.Y += r.trunc() as~ i32;
+      computeFloor(p);
+      p.validJD = false;
+      r = r - r.trunc();
+    }
+    computeJD(p);
+    p.iJD += (r * 1000.0 * XFORM_SECS[i] + rounder).trunc() as~ i64;
+    clearYMDHMSTZ(p);
+    return false;
+  }
+  clearYMDHMSTZ(p);
+  return true;
+}
+
+// The date the arguments describe, or null.
+DateTime? isDate(const Value[] args, i32 from, i64 now) {
+  DateTime p = DateTime { };
+  if (args.len() - from == 0) { setNow(p, now); return p; }
+  match (args[from]) {
+    Int: { setRawDateNumber(p, toReal(args[from])); }
+    Real: { setRawDateNumber(p, toReal(args[from])); }
+    Null: { return null; }
+    default: { if (parseDateOrTime(textOf(args[from]), p, now)) { return null; } }
+  }
+  for (i32 i = from + 1; i < args.len(); i++) {
+    if (isNull(args[i])) { return null; }
+    if (parseModifier(textOf(args[i]), p, i - from)) { return null; }
+  }
+  computeJD(p);
+  if (p.isError || !validJulianDay(p.iJD)) { return null; }
+  if (args.len() - from == 1 && p.validYMD && p.D > 28) { p.validYMD = false; }
+  return p;
+}
+
+// As C's %0Nd: the width counts a minus sign, so -1 in two places is "-1".
+string pad(i64 v, i32 width) {
+  bool neg = v < 0;
+  string s = "\{neg ? 0 - v : v}";
+  while (s.len() + (neg ? 1 : 0) < width) { s = "0" + s; }
+  return neg ? "-" + s : s;
+}
+
+string spacePad(i64 v, i32 width) {
+  string s = "\{v}";
+  while (s.len() < width) { s = " " + s; }
+  return s;
+}
+
+string ymd(DateTime x) {
+  i32 Y = x.Y < 0 ? -x.Y : x.Y;
+  return (x.Y < 0 ? "-" : "") + pad(Y as i64, 4) + "-" + pad(x.M as i64, 2) + "-" + pad(x.D as i64, 2);
+}
+
+string hms(DateTime x) {
+  string out = pad(x.h as i64, 2) + ":" + pad(x.m as i64, 2) + ":";
+  if (x.useSubsec) {
+    i32 s = (1000.0 * x.s + 0.5).trunc() as~ i32;
+    return out + pad((s / 1000) as i64, 2) + "." + pad((s % 1000) as i64, 3);
+  }
+  return out + pad((x.s.trunc() as~ i32) as i64, 2);
+}
+
+i32 daysAfterJan01(DateTime x) {
+  DateTime j = copyOf(x);
+  j.validJD = false;
+  j.M = 1;
+  j.D = 1;
+  computeJD(j);
+  return ((x.iJD - j.iJD + 43200000) / 86400000) as! i32;
+}
+
+i32 daysAfterMonday(DateTime x) { return (((x.iJD + 43200000) / 86400000) % 7) as! i32; }
+
+i32 daysAfterSunday(DateTime x) { return (((x.iJD + 129600000) / 86400000) % 7) as! i32; }
+
+// A real with three decimals and the given width, zero-padded ("%06.3f", "%.3f").
+string fixed3(f64 v, i32 width) {
+  i64 ms = (v * 1000.0 + (v < 0.0 ? -0.5 : 0.5)).trunc() as~ i64;
+  bool neg = ms < 0;
+  if (neg) { ms = 0 - ms; }
+  string s = "\{ms / 1000}." + pad(ms % 1000, 3);
+  while (s.len() + (neg ? 1 : 0) < width) { s = "0" + s; }
+  return neg ? "-" + s : s;
+}
+
+export Value dateFunction(string name, const Value[] args, i64 now) {
+  if (name == "strftime") {
+    if (args.len() == 0 || isNull(args[0])) { return Value.Null; }
+    DateTime? px = isDate(args, 1, now);
+    if (px is null) { return Value.Null; }
+    DateTime x = px!;
+    computeJD(x);
+    computeYMDHMS(x);
+    u8[] f = textOf(args[0]).toBytes();
+    Buf out = Buf.create();
+    i32 i = 0;
+    while (i < f.len()) {
+      if (f[i] != '%') { out.push(f[i]); i++; continue; }
+      i++;
+      if (i >= f.len()) { return Value.Null; }
+      u8 c = f[i];
+      i++;
+      if (c == 'd') { out.pushStr(pad(x.D as i64, 2)); }
+      else if (c == 'e') { out.pushStr(spacePad(x.D as i64, 2)); }
+      else if (c == 'f') { out.pushStr(fixed3(x.s > 59.999 ? 59.999 : x.s, 6)); }
+      else if (c == 'F') { out.pushStr(pad(x.Y as i64, 4) + "-" + pad(x.M as i64, 2) + "-" + pad(x.D as i64, 2)); }
+      else if (c == 'G' || c == 'g') {
+        DateTime y = copyOf(x);
+        y.iJD += ((3 - daysAfterMonday(x)) as i64) * 86400000;
+        y.validYMD = false;
+        computeYMD(y);
+        out.pushStr(c == 'g' ? pad((y.Y % 100) as i64, 2) : pad(y.Y as i64, 4));
+      }
+      else if (c == 'H') { out.pushStr(pad(x.h as i64, 2)); }
+      else if (c == 'k') { out.pushStr(spacePad(x.h as i64, 2)); }
+      else if (c == 'I' || c == 'l') {
+        i32 h = x.h;
+        if (h > 12) { h -= 12; }
+        if (h == 0) { h = 12; }
+        out.pushStr(c == 'I' ? pad(h as i64, 2) : spacePad(h as i64, 2));
+      }
+      else if (c == 'j') { out.pushStr(pad((daysAfterJan01(x) + 1) as i64, 3)); }
+      else if (c == 'J') { out.pushStr(g16((x.iJD as~ f64) / 86400000.0)); }
+      else if (c == 'm') { out.pushStr(pad(x.M as i64, 2)); }
+      else if (c == 'M') { out.pushStr(pad(x.m as i64, 2)); }
+      else if (c == 'p') { out.pushStr(x.h >= 12 ? "PM" : "AM"); }
+      else if (c == 'P') { out.pushStr(x.h >= 12 ? "pm" : "am"); }
+      else if (c == 'R') { out.pushStr(pad(x.h as i64, 2) + ":" + pad(x.m as i64, 2)); }
+      else if (c == 's') {
+        if (x.useSubsec) { out.pushStr(fixed3(((x.iJD - 210866760000000) as~ f64) / 1000.0, 0)); }
+        else { out.pushStr("\{x.iJD / 1000 - 210866760000}"); }
+      }
+      else if (c == 'S') { out.pushStr(pad((x.s.trunc() as~ i32) as i64, 2)); }
+      else if (c == 'T') { out.pushStr(pad(x.h as i64, 2) + ":" + pad(x.m as i64, 2) + ":" + pad((x.s.trunc() as~ i32) as i64, 2)); }
+      else if (c == 'u' || c == 'w') {
+        i32 d = daysAfterSunday(x);
+        if (d == 0 && c == 'u') { d = 7; }
+        out.pushStr("\{d}");
+      }
+      else if (c == 'U') { out.pushStr(pad(((daysAfterJan01(x) - daysAfterSunday(x) + 7) / 7) as i64, 2)); }
+      else if (c == 'V') {
+        DateTime y = copyOf(x);
+        y.iJD += ((3 - daysAfterMonday(x)) as i64) * 86400000;
+        y.validYMD = false;
+        computeYMD(y);
+        out.pushStr(pad((daysAfterJan01(y) / 7 + 1) as i64, 2));
+      }
+      else if (c == 'W') { out.pushStr(pad(((daysAfterJan01(x) - daysAfterMonday(x) + 7) / 7) as i64, 2)); }
+      else if (c == 'Y') { out.pushStr(pad(x.Y as i64, 4)); }
+      else if (c == '%') { out.pushStr("%"); }
+      else { return Value.Null; }
+    }
+    return Value.Text(out.toStr());
+  }
+  if (name == "timediff") {
+    if (args.len() != 2) { return Value.Null; }
+    DateTime? a = isDate([args[0]], 0, now);
+    DateTime? b = isDate([args[1]], 0, now);
+    if (a is null || b is null) { return Value.Null; }
+    DateTime d1 = a!;
+    DateTime d2 = b!;
+    computeYMDHMS(d1);
+    computeYMDHMS(d2);
+    string sign = "+";
+    i32 Y = 0;
+    i32 M = 0;
+    if (d1.iJD >= d2.iJD) {
+      Y = d1.Y - d2.Y;
+      if (Y != 0) { d2.Y = d1.Y; d2.validJD = false; computeJD(d2); }
+      M = d1.M - d2.M;
+      if (M < 0) { Y--; M += 12; }
+      if (M != 0) { d2.M = d1.M; d2.validJD = false; computeJD(d2); }
+      while (d1.iJD < d2.iJD) {
+        M--;
+        if (M < 0) { M = 11; Y--; }
+        d2.M--;
+        if (d2.M < 1) { d2.M = 12; d2.Y--; }
+        d2.validJD = false;
+        computeJD(d2);
+      }
+      d1.iJD -= d2.iJD;
+      d1.iJD += 148699540800000;
+    } else {
+      sign = "-";
+      Y = d2.Y - d1.Y;
+      if (Y != 0) { d2.Y = d1.Y; d2.validJD = false; computeJD(d2); }
+      M = d2.M - d1.M;
+      if (M < 0) { Y--; M += 12; }
+      if (M != 0) { d2.M = d1.M; d2.validJD = false; computeJD(d2); }
+      while (d1.iJD > d2.iJD) {
+        M--;
+        if (M < 0) { M = 11; Y--; }
+        d2.M++;
+        if (d2.M > 12) { d2.M = 1; d2.Y++; }
+        d2.validJD = false;
+        computeJD(d2);
+      }
+      d1.iJD = d2.iJD - d1.iJD;
+      d1.iJD += 148699540800000;
+    }
+    clearYMDHMSTZ(d1);
+    computeYMDHMS(d1);
+    return Value.Text(sign + pad(Y as i64, 4) + "-" + pad(M as i64, 2) + "-" + pad((d1.D - 1) as i64, 2) + " " +
+                      pad(d1.h as i64, 2) + ":" + pad(d1.m as i64, 2) + ":" + fixed3(d1.s, 6));
+  }
+  DateTime? px = isDate(args, 0, now);
+  if (px is null) { return Value.Null; }
+  DateTime x = px!;
+  if (name == "julianday") { computeJD(x); return Value.Real((x.iJD as~ f64) / 86400000.0); }
+  if (name == "unixepoch") {
+    computeJD(x);
+    if (x.useSubsec) { return Value.Real(((x.iJD - 210866760000000) as~ f64) / 1000.0); }
+    return Value.Int(x.iJD / 1000 - 210866760000);
+  }
+  if (name == "date") { computeYMD(x); return Value.Text(ymd(x)); }
+  if (name == "time") { computeHMS(x); return Value.Text(hms(x)); }
+  computeYMDHMS(x);
+  return Value.Text(ymd(x) + " " + hms(x));
+}
+
+// "%.16g", for %J.
+// SQLite's %J: the Julian day as printf's %.16g writes it.
+string g16(f64 v) { return sqlPrintf("%.16g", [Value.Real(v)], 0); }

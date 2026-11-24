@@ -1,0 +1,75 @@
+// One deadline for a whole request — connect, send, every read — so a server that never answers costs the caller what
+// they said they would spend and no more. `client.wac`'s `requestWithin` and `packages/fetch`'s `fetchWithin` take
+// one; `wac.http` carries it to the host, whose `fetch` aborts at it.
+//
+// **Per request, not per wait.** A read timeout of N lets a server that trickles a byte every N−1 seconds hold a
+// caller for ever; a deadline is when the caller stops waiting, whatever the server does. Each wait is bounded by
+// what is *left* (`left`), through `Clock.within`, which cancels the wait it abandons.
+import { Clock } from "std";
+import { Result, Ticket, flatten } from "core";
+
+/** When a request gives up: `at` on the clock's `nowMillis`, and the budget it was given; `ms` negative is none. */
+export struct Deadline {
+  Clock clock;
+  i64 at;
+  i32 ms;
+}
+
+/** A deadline `ms` from now on `clock`; a negative `ms` sets none. */
+export Deadline deadlineAfter(Clock clock, i32 ms) {
+  if (ms < 0) { return Deadline(clock, 0 - 1 as i64, ms); }
+  i64 now = flatten(clock.nowMillis().wait()).orElse(0 as i64);
+  return Deadline(clock, now + ms as i64, ms);
+}
+
+/** Milliseconds left, at least 0; -1 when there is no deadline, which `Clock.within` reads as no bound. */
+export i32 left(Deadline d) {
+  if (d.ms < 0) { return 0 - 1; }
+  i64 now = flatten(d.clock.nowMillis().wait()).orElse(d.at);
+  i64 rest = d.at - now;
+  return rest <= 0 as i64 ? 0 : rest as~ i32;
+}
+
+/** Whether the deadline has come. */
+export bool passed(Deadline d) { return d.ms >= 0 && left(d) == 0; }
+
+/** The words a request that ran out says, after its host: `timed out after 5000ms`. */
+export string timedOut(Deadline d) { return "timed out after \{d.ms}ms"; }
+
+/**
+ * `t`'s answer, waited for no longer than `d` allows — or, with no deadline, for as long as it takes. A failure is
+ * its text, and running out is `timedOut(d)` whatever the wait abandoned was.
+ */
+export Result<A, string> waitFor<A, E>(Deadline? d, Ticket<Result<A, E>> t) {
+  return settled(waitForAsync<A, E>(d, t));
+}
+
+/**
+ * `waitFor` for an `async` caller: the same answer, awaited rather than waited for, so a host that cannot wait — a
+ * page that is not cross-origin isolated (`packages/platform/host/asynchost.ts`) — can run it, and a caller can hold
+ * several at once and race them (`Ticket.any`). `issues/system/0461e`.
+ */
+export async Result<A, string> waitForAsync<A, E>(Deadline? d, Ticket<Result<A, E>> t) {
+  if (d is null || d!.ms < 0) {
+    auto r = await t;
+    if (r.isErr()) { return Result.Err("\{r.err()!}"); }
+    return Result.Ok(r.unwrap());
+  }
+  Deadline dl = d!;
+  auto bounded = await dl.clock.within<A, E>(t, left(dl));
+  if (bounded.isErr()) {
+    if (passed(dl)) { return Result.Err(timedOut(dl)); }
+    return Result.Err("\{bounded.err()!}");
+  }
+  return Result.Ok(bounded.unwrap());
+}
+
+/**
+ * An `async` request's answer, waited for: what each blocking form here is, so the request has one implementation. A
+ * wait the host could not finish is the request's failure, in its words.
+ */
+export Result<A, string> settled<A>(Ticket<Result<A, string>> t) {
+  auto r = t.wait();
+  if (r.isErr()) { return Result.Err("\{r.err()!}"); }
+  return r.unwrap();
+}

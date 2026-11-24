@@ -1,0 +1,72 @@
+// A sealed shell with the applets, as a built program with **no capabilities at all**.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/sealed_test.wac
+//
+// wac-mono 0109: an applet used to read the *host* through a `Cli` while the shell held its filesystem as a value, so
+// one session had two filesystems. Applets take an `Fs` now, and `sealedapplets_test.wac` runs a hundred of them in
+// process. What needs a process is the claim about the *build*: there is no read grant to reach the host with, so a
+// run that printed the real `/etc/passwd` could not have got there by accident. It was box's TypeScript
+// `sealed.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp, builtProgram } from "../../../wactest/src/built.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { Authority, ChildEnv, Exec, Launch, Sys } from "std";
+import { flatten } from "core";
+import { Ran, openInput } from "./openinput.wac";
+
+static string SEALED = "packages/box/src/bin/sealedsh.wac";
+
+export async string test_a_program_built_with_no_grants_cannot_reach_the_host(Sys sys) {
+  T t = T.create();
+  string built = builtApp(sys.env(), sys.files(), sys.procs(), SEALED, "sealed-sealedsh", string[]());
+  // `PATH` because a built app finds `wac` on it; nothing else of this process's environment.
+  u8[]? path = flatten(sys.env().get("PATH").wait()).orElse(null);
+  ChildEnv e = ChildEnv.empty().set("LC_ALL", "C").set("PATH", path is null ? "/usr/bin:/bin" : string.fromBytes(path!));
+  // **The host is not there.** Not refused by a permission — absent, because the only filesystem it has is its own.
+  Exec host = (await sys.procs().exec(built, ["-c", "cat /etc/passwd; echo rc=$?"], u8[](), e, Launch.plain())).unwrap();
+  t.eqStr(string.fromBytes(host.stdout), "rc=1\n", string.fromBytes(host.stderr));
+  t.isTrue(contains(string.fromBytes(host.stderr), "No such file or directory"), string.fromBytes(host.stderr));
+  // The canary: a program that answered "absent" to everything would satisfy that on its own. The world it does have
+  // is its own — what the shell wrote is what an applet reads, and `ls` sees the mounts.
+  Exec listed = (await sys.procs().exec(built, ["-c", "echo hi > /f; cat /f; ls /"], u8[](), e, Launch.plain())).unwrap();
+  t.eqStr(string.fromBytes(listed.stdout), "hi\nbin\ndev\nf\nproc\ntmp\n", string.fromBytes(listed.stderr));
+  return t.report();
+}
+
+/**
+ * The same hang as `stdinopen_test.wac`, on the route a shell takes when it *cannot* spawn — wac-mono 0110's other
+ * half. With no capabilities every applet runs in process through `pushChild`, which took the child's input as a
+ * value, so the shell read its own input to the end before starting an applet that might never read a byte: `seq 1 3`
+ * hung. Its input is held open here and never written.
+ */
+export async string test_an_applet_runs_when_the_shell_cannot_spawn_and_its_own_input_stays_open(Sys sys) {
+  T t = T.create();
+  string path = builtProgram(sys.env(), sys.files(), sys.procs(), SEALED, "sealed-sealedsh-module", string[]());
+  u8[] wasm = flatten(sys.files().readFile(path).wait()).orElse(u8[]());
+  string[] scripts = [
+    // A lone applet that reads nothing: the case that hung.
+    "seq 1 3",
+    // A pipeline, on the sequential route rather than the spawning one.
+    "seq 1 3 | cat",
+    // `split` writes several files, by redirecting its output — which a memory image must collect and write itself.
+    "seq 1 10 > n; split -l 4 n part; ls; cat partac",
+    // A relative operand after `cd`: the filesystem has to be told where the shell is standing.
+    "mkdir d; cd d; echo hi > f; cat f; ls; cd ..; cat d/f",
+    // One that writes and reads a file, so the filesystem is in the loop as well.
+    "printf 'b\\na\\n' > f; sort f",
+  ];
+  string[] wants = ["1\n2\n3\n", "1\n2\n3\n", "bin\ndev\nn\npartaa\npartab\npartac\nproc\ntmp\n9\n10\n", "hi\nf\nhi\n",
+                    "a\nb\n"];
+  for (i32 i = 0; i < scripts.len(); i++) {
+    Ran got = await openInput(sys, wasm, ["-c", scripts[i]], Authority.none(), 20000);
+    t.isFalse(got.hung, "\{scripts[i]} did not finish");
+    t.eqI32(got.status, 0, "\{scripts[i]}: its status");
+    t.eqStr(got.out, wants[i], scripts[i]);
+  }
+  // `find .` is the same question with the one name that is not a name: `.` means nothing without a working directory.
+  Ran dot = await openInput(sys, wasm, ["-c", "echo x > f; find ."], Authority.none(), 20000);
+  t.isFalse(dot.hung, "find . finished");
+  t.isTrue(contains(dot.out, "./f"), "find . lists ./f: \{dot.out}");
+  return t.report();
+}

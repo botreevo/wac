@@ -1,0 +1,116 @@
+// `wac run` leaves the directory it was run from as it found it — and runs from one it cannot write.
+//
+// `run` compiles in a child and hands the module back through a file (`runApart` in `src/wac.wac`). The first version
+// put that file under `.cache/` in the working directory, so a run from a read-only directory failed with "cannot
+// write .cache/wac-run-….wasm" where it had always worked, and every other directory a program was run from kept a
+// `.cache/` it had not had. The next put it under `$WAC_HOME/cache/run/` first, and a home that went away under a run
+// failed it (`issues/system/0467d`). It goes in the temp directory now, then the home, and the working directory last.
+//
+// Both halves are asked of the real binary from a directory of the test's own, with the program elsewhere: the
+// working directory is the thing under test, so nothing about it may be the repository's.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath, freshDir } from "../../../wactest/src/host.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+static string PROGRAM = "import { Sys } from \"std\";\n"
+  + "export async i32 main(Sys sys) {\n"
+  + "  u8[] all = (await sys.stdin().readAll()).orElse(u8[]());\n"
+  + "  await sys.stdout().line(\"read \\{all.len()}\");\n"
+  + "  return 7;\n"
+  + "}\n";
+
+string root(Env env) { return flatten(env.cwd().wait()).unwrap(); }
+
+/** The program, written outside the directories it is run from. */
+string program(T t, Env env, Files fs) {
+  string dir = "\{root(env)}/.cache/runcwd-program";
+  string fresh = freshDir(fs, dir);
+  t.eqStr(fresh, "", "a directory for the program");
+  string path = "\{dir}/echoin.wac";
+  t.isTrue(flatten(fs.writeFile(path, PROGRAM.toBytes()).wait()).isOk(), "wrote \{path}");
+  return path;
+}
+
+/** `wac run <entry>` from `cwd`, with three bytes on its input. */
+Exec runFrom(Env env, Procs procs, string cwd, string entry) { return runWith(env, procs, cwd, entry, ChildEnv.inherited()); }
+
+Exec runWith(Env env, Procs procs, string cwd, string entry, ChildEnv childEnv) {
+  Exec? x = flatten(procs.exec(binaryPath(env), ["run", entry], "abc".toBytes(), childEnv,
+                               Launch(cwd, false, false, false, false)).wait()).ok();
+  return x is null ? Exec(0 - 1, u8[](), "the binary did not start".toBytes(), "did not start") : x!;
+}
+
+string[] entries(Files fs, string dir) { return flatten(fs.readDir(dir).wait()).orElse(string[]()); }
+
+string listed(string[] names) {
+  string out = "";
+  for (string n in names) { out = out + (out == "" ? "" : " ") + n; }
+  return out;
+}
+
+export string test_a_run_from_an_empty_directory_leaves_it_empty(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  T t = T.create();
+  string entry = program(t, env, fs);
+  string dir = "\{root(env)}/.cache/runcwd-empty";
+  t.eqStr(freshDir(fs, dir), "", "an empty directory to run from");
+  Exec r = runFrom(env, sys.procs(), dir, entry);
+  t.eqI32(r.status, 7, "the program's own status — \{string.fromBytes(r.stderr)}");
+  t.eqStr(string.fromBytes(r.stdout), "read 3\n", "and its input reached it, not the compile");
+  t.eqStr(listed(entries(fs, dir)), "", "what the run left in the directory it was run from");
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+export string test_a_run_from_a_read_only_directory_runs(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string entry = program(t, env, fs);
+  string dir = "\{root(env)}/.cache/runcwd-readonly";
+  t.eqStr(freshDir(fs, dir), "", "a directory to run from");
+  procs.exec("chmod", ["555", dir], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  // Root writes anywhere, and then this would prove nothing: say so — a skip, not a pass (spec ch47).
+  bool readOnly = flatten(fs.writeFile("\{dir}/probe", u8[]()).wait()).isErr();
+  if (!readOnly) {
+    fs.remove("\{dir}/probe", false).wait();
+    procs.exec("chmod", ["755", dir], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+    t.skip("\{dir} is still writable after chmod 555 (running as root?), so there is no read-only directory to run from");
+    return t.report();
+  }
+  Exec r = runFrom(env, procs, dir, entry);
+  t.eqI32(r.status, 7, "the program's own status — \{string.fromBytes(r.stderr)}");
+  t.eqStr(string.fromBytes(r.stdout), "read 3\n", "and its input reached it");
+  t.eqStr(listed(entries(fs, dir)), "", "what the run left in the directory it was run from");
+  procs.exec("chmod", ["755", dir], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+export string test_a_home_that_cannot_be_made_does_not_send_the_module_into_the_working_directory(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string entry = program(t, env, fs);
+  // A `WAC_HOME` that cannot exist — under a directory nothing may write — stands for one that was removed while the
+  // run was in flight, which is what `packages/platform/test/packages.test.ts` did to its neighbours (0467d). The run
+  // is not the home's to fail, and the working directory is not where its hand-over goes instead.
+  string locked = "\{root(env)}/.cache/runcwd-lockedhome";
+  t.eqStr(freshDir(fs, locked), "", "a directory to hold the home");
+  procs.exec("chmod", ["555", locked], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  string dir = "\{root(env)}/.cache/runcwd-nohome";
+  t.eqStr(freshDir(fs, dir), "", "an empty directory to run from");
+  Exec r = runWith(env, procs, dir, entry, ChildEnv.inherited().set("WAC_HOME", "\{locked}/home"));
+  t.eqI32(r.status, 7, "the program's own status — \{string.fromBytes(r.stderr)}");
+  t.eqStr(string.fromBytes(r.stdout), "read 3\n", "and its input reached it");
+  t.eqStr(listed(entries(fs, dir)), "", "what the run left in the directory it was run from");
+  procs.exec("chmod", ["755", locked], u8[](), ChildEnv.inherited(), Launch.plain()).wait();
+  fs.remove(locked, true).wait();
+  fs.remove(dir, true).wait();
+  return t.report();
+}

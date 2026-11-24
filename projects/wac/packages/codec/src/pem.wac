@@ -1,0 +1,76 @@
+// PEM — RFC 7468's textual encoding: a label, base64 in lines of 64, and the label again.
+//
+//     -----BEGIN CERTIFICATE-----
+//     MIIBdzCCAR2gAwIBAgIQ…
+//     -----END CERTIFICATE-----
+//
+// What a person can open in an editor, paste into a terminal, and hand to `openssl`. Writing is strict — RFC
+// 7468 §2's lines of exactly 64, a final newline — and reading takes what §3 calls the lax form: whitespace
+// anywhere in the body, any text between blocks. A block whose END label differs from its BEGIN, or whose body
+// is not base64, is not a block; reading carries on after it rather than taking a neighbour's body.
+
+import { Buf, Vec } from "core";
+import { encode, decode, ALPHABET_STANDARD } from "./base64.wac";
+
+/** One block: what its BEGIN line called it, and the bytes its body decodes to. */
+export struct PemBlock {
+  string label;
+  u8[] der;
+}
+
+/** `der` as one PEM block labelled `label`, ending in a newline. */
+export u8[] pemEncode(string label, const u8[] der) {
+  u8[] body = encode(der, ALPHABET_STANDARD(), true);
+  Buf out = Buf.create();
+  out.pushStr("-----BEGIN \{label}-----\n");
+  for (i32 at = 0; at < body.len(); at += 64) {
+    i32 n = body.len() - at < 64 ? body.len() - at : 64;
+    out.pushBytes(body, at, n);
+    out.push('\n');
+  }
+  out.pushStr("-----END \{label}-----\n");
+  return out.take();
+}
+
+/** Every well-formed block in `text`, in order. */
+export PemBlock[] pemBlocks(u8[] text) {
+  Vec<PemBlock> found;
+  string s = string.fromBytes(text);
+  i32 at = 0;
+  while (true) {
+    i32 rel = s.slice(at, s.len()).indexOf("-----BEGIN ");
+    if (rel < 0) { break; }
+    i32 open = at + rel;
+    i32 labelFrom = open + 11;
+    i32 labelEnd = s.slice(labelFrom, s.len()).indexOf("-----");
+    if (labelEnd < 0) { break; }
+    string label = s.slice(labelFrom, labelFrom + labelEnd);
+    i32 bodyFrom = labelFrom + labelEnd + 5;
+    // The END line must name the same label — the RFC requires it, and accepting a mismatch would let one
+    // block's body be read under another's label.
+    string end = "-----END \{label}-----";
+    i32 endRel = s.slice(bodyFrom, s.len()).indexOf(end);
+    if (label.indexOf("\n") >= 0 || endRel < 0) {
+      at = labelFrom;
+      continue;
+    }
+    u8[] raw = s.slice(bodyFrom, bodyFrom + endRel).toBytes();
+    Buf digits = Buf.create();
+    for (i32 i = 0; i < raw.len(); i++) {
+      i32 c = raw[i] as i32;
+      if (c != 10 && c != 13 && c != 32 && c != 9) { digits.push(raw[i]); }
+    }
+    u8[]? der = decode(digits.take());
+    if (der is not null) { found.push(PemBlock(label, der!)); }
+    at = bodyFrom + endRel + end.len();
+  }
+  return found.toArray();
+}
+
+/** The first block labelled `label`, or null. */
+export u8[]? pemFind(u8[] text, string label) {
+  for (PemBlock b in pemBlocks(text)) {
+    if (b.label == label) { return b.der; }
+  }
+  return null;
+}

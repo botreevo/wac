@@ -1,0 +1,214 @@
+// The desktop's disk: std's `Files`, which every program it starts sees through its grants.
+//
+// **One filesystem, two backings.** A page served over http gets the browser's Origin Private File System
+// as `page.sys.files()` — what is written survives a reload. A page opened from a `file://` URL is refused
+// that storage (Chromium answers a SecurityError), so the same desktop runs on a `MemoryStore` instead,
+// and says so. Either way it is one `Files`, with the site mounted at `/site` when there is one: Files writes
+// a file and a terminal's `ls` sees it, because they are asking the same filesystem rather than two that agree.
+//
+// The apps see it through `Vfs`, which takes paths relative to the root — "" is the root,
+// "Desktop/notes.md" a file — and answers with the host's own sentence on failure.
+
+import { Result, Ticket, Vec, flatten } from "core";
+import { Files, MemoryStore, Sys } from "std";
+import { Page } from "web";
+
+export struct Info {
+  bool isDir;
+  i64 size;
+  /** Milliseconds since the epoch; 0 when unknown. */
+  i64 modified;
+}
+
+/** A result that is either a value or why there is none. */
+export struct Got<T> {
+  bool ok;
+  T value;
+  string error;
+}
+
+export struct Vfs {
+  /** Whether what is written here outlives the tab. */
+  bool persistent;
+  /** The filesystem underneath, which each program is handed through its grants. */
+  Files fs;
+  fn<Ticket<Got<u8[]>>(string)> read;
+  fn<Ticket<Got<bool>>(string, u8[])> write;
+  fn<Ticket<Got<Info>>(string)> stat;
+  /** The names in a folder, unsorted. */
+  fn<Ticket<Got<string[]>>(string)> list;
+  /** Make a folder and every folder above it. */
+  fn<Ticket<Got<bool>>(string)> mkdir;
+  /** Remove a file, or a folder and everything in it. */
+  fn<Ticket<Got<bool>>(string)> remove;
+  fn<Ticket<Got<bool>>(string, string)> rename;
+}
+
+/** The folder part of a path: "a/b" for "a/b/c", "" for "c". */
+export string parentOf(string path) {
+  u8[] b = path.toBytes();
+  for (i32 i = b.len() - 1; i >= 0; i--) { if (b[i] == '/') { return path.slice(0, i); } }
+  return "";
+}
+
+/** The last part of a path. */
+export string leafOf(string path) {
+  u8[] b = path.toBytes();
+  for (i32 i = b.len() - 1; i >= 0; i--) { if (b[i] == '/') { return path.slice(i + 1, path.len()); } }
+  return path;
+}
+
+/** `name` inside `dir`. */
+export string join(string dir, string name) { return dir == "" ? name : dir + "/" + name; }
+
+// ── over wac's filesystem ──────────────────────────────────────────────────
+
+/** `p`, relative to the root, as `Files` wants it: absolute. */
+string abs(string p) { return "/" + p; }
+
+async Got<u8[]> fsRead(Files fs, string p) {
+  match (await fs.readFile(abs(p))) {
+    Ok(b): { return Got(true, b, ""); }
+    Err(e): { return Got(false, u8[](), "\{e}"); }
+  }
+}
+
+/** Write a file, making the folders above it first: the browser's storage will not write into nothing. */
+async Got<bool> fsWrite(Files fs, string p, u8[] b) {
+  string dir = parentOf(p);
+  if (dir != "") {
+    Got<bool> made = await fsChange(fs.mkdir(abs(dir), true));
+    if (!made.ok) { return made; }
+  }
+  return await fsChange(fs.writeFile(abs(p), b));
+}
+
+async Got<Info> fsStat(Files fs, string p) {
+  match (await fs.stat(abs(p))) {
+    Ok(s): {
+      if (!s.exists) { return Got(false, Info(false, 0, 0), "\{p}: no such file or folder"); }
+      return Got(true, Info(s.isDir, s.size, s.modifiedMillis), "");
+    }
+    Err(e): { return Got(false, Info(false, 0, 0), "\{e}"); }
+  }
+}
+
+async Got<string[]> fsList(Files fs, string p) {
+  match (await fs.readDir(abs(p))) {
+    Ok(names): { return Got(true, names, ""); }
+    Err(e): { return Got(false, string[](), "\{e}"); }
+  }
+}
+
+/** Any change's answer — a `Result<void, F>` for whichever fault `F` that change can have — as a `Got`. */
+async Got<bool> fsChange<F>(Ticket<Result<void, F>> pending) {
+  match (await pending) {
+    Ok(v): { return Got(true, true, ""); }
+    Err(e): { return Got(false, false, "\{e}"); }
+  }
+}
+
+/** The apps' view of `fs`. */
+export Vfs vfsOf(Files fs, bool persistent) {
+  return Vfs(
+    persistent,
+    fs,
+    (string p) => fsRead(fs, p),
+    (string p, u8[] b) => fsWrite(fs, p, b),
+    (string p) => fsStat(fs, p),
+    (string p) => fsList(fs, p),
+    (string p) => fsChange(fs.mkdir(abs(p), true)),
+    (string p) => fsChange(fs.remove(abs(p), true)),
+    (string a, string b) => fsChange(fs.rename(abs(a), abs(b))),
+  );
+}
+
+/** The time now: a clock is answered as it is asked, so waiting on it never blocks the page. */
+export i64 nowMillis(Page page) { return flatten(page.sys.clock().nowMillis().wait()).orElse(0 as i64); }
+
+/** Whether the browser's storage answers at all: a `file://` page is refused it outright. */
+export async bool usable(Files host) {
+  match (await host.mkdir("Desktop", true)) {
+    Ok(v): { return true; }
+    Err(e): { return false; }
+  }
+}
+
+/** The desktop's filesystem: on the browser's storage when it will have us, in memory when it will not. */
+export Files filesystem(Sys sys, bool persistent) {
+  return persistent ? sys.files() : MemoryStore.create(sys.clock()).asUser("root");
+}
+
+// ── whole-folder operations ────────────────────────────────────────────────
+
+/** Copy every file below `from` to the same place below `to`. Folders are made as they are needed. */
+export async Got<bool> copyTree(Vfs fs, string from, string to) {
+  Got<Info> s = await fs.stat(from);
+  if (!s.ok) { return Got(false, false, s.error); }
+  if (!s.value.isDir) {
+    Got<u8[]> b = await fs.read(from);
+    if (!b.ok) { return Got(false, false, b.error); }
+    return await fs.write(to, b.value);
+  }
+  Got<bool> made = await fs.mkdir(to);
+  if (!made.ok) { return made; }
+  Got<string[]> names = await fs.list(from);
+  if (!names.ok) { return Got(false, false, names.error); }
+  for (i32 i = 0; i < names.value.len(); i++) {
+    Got<bool> r = await copyTree(fs, join(from, names.value[i]), join(to, names.value[i]));
+    if (!r.ok) { return r; }
+  }
+  return Got(true, true, "");
+}
+
+/** A name in `dir` that is not taken: `name`, or `name 2`, `name 3`, … before its extension. */
+export async string freeName(Vfs fs, string dir, string name) {
+  Got<string[]> names = await fs.list(dir);
+  if (!names.ok) { return name; }
+  if (!has(names.value, name)) { return name; }
+  i32 dot = -1;
+  u8[] b = name.toBytes();
+  for (i32 i = b.len() - 1; i > 0; i--) { if (b[i] == '.') { dot = i; break; } }
+  string stem = dot > 0 ? name.slice(0, dot) : name;
+  string ext = dot > 0 ? name.slice(dot, name.len()) : "";
+  for (i32 n = 2; n < 1000; n++) {
+    string candidate = "\{stem} \{n}\{ext}";
+    if (!has(names.value, candidate)) { return candidate; }
+  }
+  return name;
+}
+
+bool has(string[] xs, string x) {
+  for (i32 i = 0; i < xs.len(); i++) { if (xs[i] == x) { return true; } }
+  return false;
+}
+
+/** Whether `path` is `dir` or somewhere inside it. */
+export bool within(string path, string dir) {
+  return path == dir || dir == "" || (path.len() > dir.len() && path.slice(0, dir.len() + 1) == dir + "/");
+}
+
+/**
+ * Move `from` into the folder `dir`, under a name not taken there; answers the name it got. A rename where
+ * the storage does one, and a copy and a delete where it will not.
+ */
+export async Got<string> moveInto(Vfs fs, string from, string dir) {
+  if (dir != "") { await fs.mkdir(dir); }
+  string name = await freeName(fs, dir, leafOf(from));
+  string to = join(dir, name);
+  Got<bool> r = await fs.rename(from, to);
+  if (r.ok) { return Got(true, name, ""); }
+  Got<bool> c = await copyTree(fs, from, to);
+  if (!c.ok) { await fs.remove(to); return Got(false, "", c.error); }
+  Got<bool> gone = await fs.remove(from);
+  if (!gone.ok) { return Got(false, name, gone.error); }
+  return Got(true, name, "");
+}
+
+/** Copy `from` into the folder `dir`, under a name not taken there; answers the name it got. */
+export async Got<string> copyInto(Vfs fs, string from, string dir) {
+  if (dir != "") { await fs.mkdir(dir); }
+  string name = await freeName(fs, dir, leafOf(from));
+  Got<bool> c = await copyTree(fs, from, join(dir, name));
+  return Got(c.ok, name, c.error);
+}

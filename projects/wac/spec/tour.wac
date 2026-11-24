@@ -1,0 +1,1228 @@
+// =============================================================================
+// tour.wac — the whole language in one file.
+//
+// wac is a C-family surface syntax for WebAssembly GC. Every feature maps to
+// obvious wasm instructions; there is no runtime, no linear memory, no hidden
+// allocation. Structs and arrays are GC heap references. The compiler is
+// written in wac (packages/wacc: lex -> parse -> check -> emit -> .wasm binary).
+//
+// This file is the fast path to knowing wac. It compiles, and `selfTest()` at
+// the bottom returns true — so what you read here is what the compiler does.
+// The full definition is spec/ — chapters whose examples are programs with
+// their outcomes written above them; this is the map, not the territory.
+//
+// How to read it:
+//   - Declarations are the reference. Comments carry only what code can't show:
+//     the rule, and the thing that surprises you.
+//   - `// ERROR:` marks code that does NOT compile. It is commented out. Those
+//     lines are as important as the working ones — most of wac's design is in
+//     what it refuses.
+//   - `// -> v` is the value an expression or call produces.
+//
+// Three rules explain most of the language:
+//   1. No implicit conversions. Ever. Except subtype -> parent and T -> T?.
+//   2. If an operation can trap, its spelling contains `!`.
+//   3. `const` is part of the type: deep, and it travels with the reference.
+//
+// wac is unstable by choice. Section 24 lists what it does not have, and that
+// list gets shorter — generics, enums and `match` were all on it once. Trust
+// this file over your memory, and the compiler over this file.
+// =============================================================================
+
+// ── 1. FUNCTIONS ────────────────────────────────────────────────────────────
+
+// Return type first, C-style. Parameter types explicit. No overloading.
+i32 helper(i32 x) { return x * 2; }        // file-private
+export i32 double(i32 x) { return helper(x); }
+
+// `export` = visible to other wac files via `import`. Only the *entry* file's
+// exports become wasm exports; an imported file's exports stay internal.
+export void nothing() { return; }          // `return;` is a legal early exit
+
+// Recursion and mutual recursion need no forward declaration (two-pass).
+export i32 factorial(i32 n) {
+  if (n <= 1) { return 1; }
+  return n * factorial(n - 1);
+}
+i32 isEven(i32 n) { if (n == 0) { return 1; } return isOdd(n - 1); }
+i32 isOdd(i32 n)  { if (n == 0) { return 0; } return isEven(n - 1); }
+
+// Every path in a non-void function must return. The checker is a real reachability
+// analysis, not a syntactic guess — see the infinite-loop case in section 7.
+// ERROR: i32 bad(bool b) { if (b) { return 1; } }   // not all paths return
+
+// Trailing commas are allowed in every comma list — params, args, array
+// literals, named-field inits, import lists. Keeps multi-line diffs clean.
+i32 area(
+  i32 w,
+  i32 h,
+) { return w * h; }
+export i32 trailingComma() { return area(3, 4,); }   // -> 12
+
+// ── 2. PRIMITIVE TYPES AND LITERALS ─────────────────────────────────────────
+
+// i32 i64 u32 u64 f32 f64 bool string  — locals, params, fields, returns
+// u8 i8 u16 i16                        — the same, stored narrow in arrays (section 9)
+// anyref i31ref                        — abstract refs (section 14)
+//
+// Integer arithmetic wraps. Float arithmetic is IEEE 754.
+export i32 wrap() { return 2147483647 + 1; }   // -> -2147483648
+
+// Literal typing splits on notation, because the two notations mean different
+// things. A DECIMAL literal is a magnitude: it takes the narrowest type that
+// holds it. A HEX literal is a bit pattern: its width comes from the digit
+// count (<=8 digits i32, 9..16 i64) and is read as two's complement at that
+// width. So a mask is written as the mask, not as its signed decimal twin.
+export i32 dec()     { return 42; }             // i32
+export i64 decBig()  { return 1000000000000; }  // i64 — too big for i32
+export i32 poly()    { return 0xEDB88320; }     // -> -306674912  (8 digits, i32)
+export i64 padded()  { return 0x0EDB88320; }    // -> 3988292384  (9 digits, i64)
+export i32 grouped() { return 0xEDB8_8320; }    // `_` is a separator, ignored...
+export i32 million() { return 1_000_000; }      // ...and cannot change the width
+
+// A literal first takes whatever integer type is EXPECTED of it, as long as the
+// value has a reading there. Without this every constant in unsigned code would
+// need a cast.
+export u32 twiceU(u32 x) { return x * 2; }      // the 2 is a u32, so this wraps
+export i64 fiveWide()    { return 5; }          // and the 5 is an i64
+export u64 uMax()        { return 18446744073709551615; }   // only a u64 holds it
+
+// Adoption reinterprets the value as written; it never converts. A literal that
+// does not fit is an error, and a VARIABLE never coerces.
+// ERROR: u32 a = -1;                // -1 has no u32 reading
+// ERROR: i32 b = 5000000000;        // does not fit i32
+// ERROR: u32 c(i32 x) { return x; } // variables never coerce, only literals
+
+// Negation folds into the rule, so a signed minimum is spellable in decimal
+// even though its magnitude is one past the positive range.
+export i32 mostNegative() { return -2147483648; }
+
+// bool is a distinct type. `true` is 1 and `false` is 0, but bool is NOT i32.
+// Conditions must be bool; comparisons and `&& || !` produce bool.
+export i32 strictBool(i32 x) {
+  if (x != 0) { return 1; }   // ERROR would be: if (x) { ... }
+  return 0;
+}
+
+// ── 3. VARIABLES AND const ──────────────────────────────────────────────────
+
+// A `const` at the top level is a named compile-time value. It has no storage —
+// the initialiser is substituted at each use — so there is nothing to
+// initialise and no ordering between declarations.
+static i32 BLOCK = 64;
+static i32 TWO_BLOCKS = BLOCK * 2;      // constants may build on constants
+export static u32 CRC_POLY = 0xEDB88320;   // and may be imported
+export i32 useConst(i32 x) { return (x & BLOCK) + TWO_BLOCKS; }
+// The initialiser must be a compile-time expression: literals, operators over
+// them, casts, other constants. Nothing evaluated at run time, which is what
+// makes substitution honest.
+// ERROR: i32 f() { return 1; }  const i32 A = f();   // a call
+// ERROR: const i32 B = B + 1;                        // defined from itself
+// ERROR: const P C = P(1);                           // structs are not values yet
+
+// A constant ARRAY is one shared table, built once when the module is
+// instantiated rather than rebuilt at every use — which is the whole reason to
+// want them. Writing through one is an error, since there is only the one.
+static i32[] TABLE = [10, 20, 30];
+export i32 fromTable(i32 i) { return TABLE[i]; }
+// ERROR: TABLE[0] = 9;              // one object, shared by every use
+// ERROR: const i32[] S = i32[].filled(8, 0);  // no elements written down to evaluate
+
+export i32 variables() {
+  i32 x = 5;                 // mutable
+  const i32 y = 10;          // immutable
+  i32 z;                     // declared now; every path assigns it before a read
+  if (x > 0) { z = 1; } else { z = 0; }
+  // ERROR: y = 11;          // y is const
+  auto w = y;                // `auto` infers from the initialiser: i32
+  // ERROR: auto n = 7;      // ...and a bare literal gives it nothing to infer
+  // ERROR: var v = 5;       // there is no `var`
+  x += w * z;
+  return x;                  // -> 15
+}
+
+// For references, `const` means DEEP immutability: no write through that
+// reference at any depth, and the constness follows the reference around.
+// See section 11 for how that interacts with methods.
+export f64 constRef() {
+  const Point p = Point(1.0, 2.0);
+  // ERROR: p.x = 3.0;       // deep const: no writes through p
+  return p.x + p.y;          // reads are fine   -> 3.0
+}
+
+// ── 4. OPERATORS ────────────────────────────────────────────────────────────
+
+// Arithmetic + - * / %      matching numeric types only; not on bool
+// Comparison == != < <= > >= matching types, -> bool; primitives + string only,
+//                            never on struct/array refs (use `is`)
+// Logical  && || !          bool only, short-circuiting
+// Bitwise  & | ^ ~          i32 or i64, matching
+// Shift    << >> >>>        integers; also i64 << i32. On a SIGNED type `>>`
+//                            sign-extends and `>>>` zero-fills; on an unsigned
+//                            type `>>` is already logical. There is no `<<<`.
+//
+// Signed and unsigned differ only where the sign bit changes the answer:
+// `/ % < <= > >=` and `>>`. Add, sub, mul, the bitwise ops, `<<`, `==` and
+// `!=` are bit-identical, so they emit the same instruction for both.
+// Unary `-` is NOT defined on unsigned — write `0 - x` for wrapping negation.
+// ERROR: u32 f(u32 x) { return x >>> 1; }   // redundant: `>>` is already
+//                                           // logical on an unsigned type
+//
+// Precedence, tightest first:
+//   unary - ! ~  |  as as! as~ as@  |  * / %  |  + -  |  << >> >>>
+//   |  < <= > >=  |  == !=  |  &  |  ^  |  |  |  &&  |  ||  |  is  |  ?:
+// Note `is` binds looser than `&&`/`||`, and casts bind tighter than `*`.
+
+export i32 mixTypes(i32 a, f64 b) {
+  // ERROR: return a + b;    // i32 + f64 — no implicit promotion, ever
+  return a + (b as~ i32);
+}
+
+// `%` is a remainder, not a modulo: the sign follows the LEFT operand, matching
+// C's fmod and JS's `%`. Float `%` is the one arithmetic operator that isn't a
+// single wasm instruction (wasm has no f64.rem) so it calls a builtin — and it
+// is exact. Writing `a - trunc(a/b)*b` yourself would NOT match, because the
+// quotient rounds before trunc sees it.
+export f64 rem(f64 a, f64 b) { return a % b; }
+// rem(7.0, 2.0) -> 1.0    rem(-7.0, 2.0) -> -1.0    rem(7.0, -2.0) -> 1.0
+// rem(1.0, 0.1) -> 0.09999999999999995     (not -2.2e-16)
+
+export i32 shifts(i32 x) {
+  i32 arith = x >> 1;        // shifts(-16): -8
+  i32 logic = x >>> 1;       // shifts(-16): 2147483640
+  return arith + logic;
+}
+
+// Compound assignment: += -= *= /= %= <<= >>= >>>= &= |= ^=
+// Statement only, never an expression. Works on locals, fields, elements.
+// `++`/`--` ARE expressions, prefix and postfix, on i32/i64 lvalues. As in C,
+// postfix yields the old value and prefix the new one.
+export i32 incr() {
+  i32 x = 5;
+  i32 old = x++;             // old = 5, x = 6
+  i32 nu  = ++x;             // x = 7, nu = 7
+  return old * 100 + nu * 10 + x;   // -> 577
+}
+
+// ── 5. CASTS — four numeric modes, plus reference casts ─────────────────────
+
+// The whole system in one line: if it can trap, there's a `!`.
+//
+//   as    lossless — always exact; compile error if it could lose information
+//   as!   checked  — exact, or trap
+//   as~   nearest  — best approximation; rounds and clamps, never traps
+//   as@   raw      — reinterpret the bits; never traps. Only between
+//                    integers, where keeping bits differs from rounding.
+//
+// Using the wrong one is a compile error, including using a stronger cast than
+// you need. This is the point: the spelling at the call site tells the reader
+// what can go wrong, so `as` in a diff is provably safe.
+//
+//   as:   i32->i64 (sign-extend)  i32->f64  f32->f64  bool->i32
+//   as!:  every other numeric pair. Narrowing checks range and fractional part;
+//         widening into a float checks that the value round-trips. NaN never
+//         traps regardless of payload.
+//   as~:  every other numeric pair. Round-to-nearest (half to even), saturate
+//         on overflow, plus i32->bool (0 is false, nonzero true).
+//   as@:  integer narrowing (keep the low bits) and same-width signedness
+//         changes. Never from a float: `x.trunc() as~ i32` drops the fraction.
+
+export i64 widen(i32 x)     { return x as i64; }     // lossless
+export i32 checked(i64 x)   { return x as! i32; }    // traps outside i32 range
+export i32 nearest(f64 x)   { return x as~ i32; }    // 3.7 -> 4, 2.5 -> 2, 1e300 -> i32 max
+export i32 raw(i64 x)       { return x as@ i32; }    // keeps the low 32 bits
+export i32 toward0(f64 x)   { return x.trunc() as~ i32; } // 3.7 -> 3, NaN -> 0
+export bool truthy(i32 x)   { return x as~ bool; }   // 0 -> false, else true
+
+// ERROR: i64 a = x as~ i64;   // i32->i64 is lossless — must use `as`
+// ERROR: f32 b = y as@ f32;   // f64->f32 has no raw form distinct from as~
+
+// SIGNED <-> UNSIGNED is the same four modes over the same bits. wasm has no
+// signed types — an i32 is 32 bits and signedness lives in the instruction —
+// so u32/i32 and u64/i64 share a representation and differ only in which
+// opcode gets emitted. A same-width change therefore moves nothing:
+export u32 bits(i32 x)  { return x as@ u32; }   // -1 -> 4294967295, zero cost
+export u32 chkU(i32 x)  { return x as! u32; }   // traps if x is negative
+export u32 clampU(i32 x) { return x as~ u32; }  // negatives clamp to 0
+// Widening out of u32 is exact, so it is plain `as`:
+//   u32 -> u64, u32 -> i64 (zero-extend), u32 -> f64, bool -> u32
+// ERROR: i32 y = u as i32;   // not lossless either way — use as!/as~/as@
+// ERROR: u64 z = i as@ u64;  // sign- vs zero-extend are different answers,
+//                            // so there is no single "raw" one; go via i64
+
+// REFERENCE casts reuse the same operators, and the compiler picks the meaning
+// from the operand type:
+//   `as`  upcast to a parent struct — free, no runtime check
+//   `as!` downcast — ref.cast, traps on the wrong type
+//   `!`   unwrap T? -> T — ref.as_non_null, traps on null
+// ERROR: Circle c = someShape as Circle;   // a downcast may fail — use as!
+
+// ── 6. STRINGS ──────────────────────────────────────────────────────────────
+
+// `string` is built in, immutable, UTF-8, backed by a packed i8[]. Immutability
+// makes aliasing indistinguishable from copying. String ops are emitted as
+// internal wasm functions and dead-code-eliminated when unused.
+export i32 strBasics() {
+  string s = "hello";
+  string emoji = "hello 😀";
+  return s.len() + emoji.len();     // 5 + 10 — len() is BYTES, not characters
+}
+// Escapes: \n \t \r \\ \" \0 — each one byte — and \u{H...H}, one to six hex
+// digits naming a code point, which encodes as UTF-8 and so may be up to four.
+// Its bounds are `string.fromCodepoint`'s: at most 10FFFF, and not a surrogate.
+export i32 strEscapes() {
+  return "\u{41}".len() + "\u{1F600}".len();   // -> 5 — one byte and four
+}
+// A literal may NOT hold an invisible character raw: a control, a format
+// character, private use, or a line/paragraph separator. Write it as \u{...}.
+// U+200C and U+200D are the exception, being the two that change how a VISIBLE
+// character looks rather than where it sits — emoji sequences need them.
+// The bidirectional overrides are why this is a safety rule and not only a
+// tidiness one: one of those reorders what a reviewer sees without changing
+// what the compiler reads.
+// ERROR: string bad = "a\u{202E}b" written with the character itself, not the escape
+
+// BLOCK strings hold newlines: `\u{22}\u{22}\u{22}`, a newline, the content, the
+// closing mark. The margin is the least indentation of the CONTENT lines and
+// comes off each. The closing mark decides one thing — whether the value ends
+// in a newline — and its own indentation is not part of the margin, which is
+// deliberately unlike Java, where moving the delimiter reindents the value.
+export i32 strBlock() {
+  string usage = """
+      usage: wac build <entry.wac>
+      """;
+  return usage.len();               // -> 29 — the margin is gone, the newline stays
+}
+
+// INTERPOLATION is exactly sugar for `+`: `"a\{e}b"` is the same program as
+// `("a" + e + "b")`, parentheses and all, so `.len()` on it measures the whole
+// thing rather than the last piece. There is no formatting language — whatever
+// `+` takes on the right of a string is what may go in the braces, including
+// another literal that interpolates in turn. The braces are matched, so an
+// expression may contain its own.
+export i32 strInterp() {
+  string who = "wac";
+  return "hi \{who}!".len();       // -> 7 — the same as ("hi " + who + "!").len()
+}
+// A literal backslash before a brace is still `\\{`: an escaped backslash and
+// then an ordinary brace, which is what it always meant.
+
+export string strOps() {
+  string s = "hello";
+  s += " world";                    // strings are immutable: `+=` rebinds s,
+                                    // exactly as `s = s + " world"` would
+  return s.slice(6, 11);            // -> "world"  — byte offsets, [start, end)
+}
+// `+=` is the only compound operator defined on strings; `-=`, `*=`, `|=` and
+// the rest are rejected, since the underlying operator is numeric.
+export i32 strFind() { return "hello world".indexOf("world"); }   // -> 6, or -1
+
+// Indexing decodes the UTF-8 codepoint starting at byte i and returns it as a
+// one-character STRING (there is no char type). Mid-sequence gives "". Out of
+// range traps.
+export string strIndex() { return "a😀b"[1]; }        // -> "😀"
+export i32 strMid()      { return "a😀b"[2].len(); }  // -> 0, index is mid-emoji
+
+// == != compare by content; < <= > >= compare lexicographically by byte.
+// This is the one reference type where == is allowed.
+export bool strEq() { return "hel" + "lo" == "hello"; }   // -> true
+// ERROR: string s = "n=" + 5;    // no implicit conversion, not even to string
+// ERROR: s[0] = "H";             // immutable
+
+// ── 7. CONTROL FLOW ─────────────────────────────────────────────────────────
+
+// Braces are always required. Conditions are always bool.
+export i32 branch(i32 n) {
+  if (n < 0)      { return -n; }
+  else if (n == 0) { return 0; }
+  else             { return n; }
+}
+
+export i32 loops(i32 n) {
+  i32 total = 0;
+  while (n > 0) { total += n; n--; }
+  for (i32 i = 0; i < 3; i++) { total += i; }        // init decl, cond, update
+  do { total++; } while (false);                      // body runs at least once
+  return total;
+}
+
+export i32 breakContinue(i32[] arr) {
+  i32 total = 0;
+  for (i32 i = 0; i < arr.len(); i++) {
+    if (arr[i] < 0) { continue; }                     // skip
+    if (arr[i] == 99) { break; }                      // stop
+    total += arr[i];
+  }
+  return total;
+}
+// ERROR: `break;` or `continue;` outside a loop.
+
+// A loop whose condition is literally `true`, or a `for` with no condition, is
+// recognised as infinite. If no `break` can escape it, control never reaches
+// past it, so a non-void function needs no trailing return.
+export i32 infinite(i32 step, i32 floor) {
+  i32 n = 0;
+  while (true) {
+    n += step;
+    if (n > floor) { return n; }
+  }
+}                              // no return needed here
+export i32 forever(i32 target) {
+  for (i32 i = 0; ; i++) { if (i == target) { return i; } }
+}
+// Only a break that escapes *that* loop counts: a break inside a nested loop or
+// a switch binds to the inner construct and leaves the outer loop infinite.
+// ERROR: a `while (true)` containing a reachable `break` DOES need a return
+//        after it — the loop can now finish.
+
+// switch has NO fallthrough — each case is its own block. Scrutinee and case
+// values must be a 32-bit integer — i32 or u32, since br_table dispatches on
+// 32 bits and signedness plays no part in an equality match.
+export i32 classify(i32 day) {
+  switch (day) {
+    case 0: { return 0; }
+    case 6: { return 0; }
+    default: { return 1; }
+  }
+}
+
+// Ternary: both branches must agree on type, and a bare literal branch adopts
+// the other's type, so `u32 x = c ? 1 : 2` works. For reference branches the result
+// type is their closest common ancestor (walk both parent chains, take the
+// nearest shared struct). No common ancestor is a compile error.
+export i32 ternary(i32 a, i32 b) { return a > b ? a : b; }
+
+// `trap;` halts immediately — wasm's `unreachable`.
+export i32 mustBePositive(i32 n) {
+  if (n <= 0) { trap; }
+  return n;
+}
+
+// ── 8. ARRAYS ───────────────────────────────────────────────────────────────
+
+// WasmGC arrays: heap, GC'd, bounds-checked, fixed length at creation. Length
+// is NOT part of the type — i32[] of length 3 and of length 5 are the same type.
+export i32 arrays() {
+  i32[] a = i32[].filled(5, 0);          // array.new_default — length 5, all zeros
+  i32[] b = [1, 2, 3];    // array.new_fixed — length 3
+  i32[] c = i32[].filled(b.len(), 0);    // length can be any runtime i32 expression
+  a[0] = 10;                   // array.set
+  return a[0] + b[2] + a.len() + c.len();   // array.get / array.len   -> 21
+}
+// Out-of-bounds traps, enforced by the runtime.
+
+// Arrays are references — assignment aliases, it does not copy.
+export i32 arrayAlias() {
+  i32[] a = [1, 2, 3];
+  i32[] b = a;
+  b[0] = 99;
+  return a[0];                 // -> 99
+}
+
+// `T[].defaulted(N)` requires that T has a default value (see section 10).
+export i32 arrayOfRefs() {
+  Point?[] maybe = Point?[].defaulted(10);     // nullable elements default to null
+  Point[]  pts   = Point[].defaulted(10);      // each element is a distinct Point()
+  i32[][]  grid  = i32[][].defaulted(3);       // array of array REFS, not a matrix:
+  grid[0] = [1, 2, 3] as i32[];          // each row may have a different length
+  grid[1] = [4, 5, 6, 7] as i32[];
+  return (maybe[0] is null ? 1 : 0) + (pts[0].x == 0.0 ? 1 : 0) + grid[1][3];
+}                                                                // -> 9
+
+// PACKED types — i8 u8 i16 u16 — are integers like any other: a local, a
+// parameter, a field, a return and an array element may be one. An array of
+// them stores 1 or 2 bytes per element. Arithmetic wraps at the type's own
+// width, and nothing converts implicitly: widen with `as`, narrow with a cast
+// that says what to do with what does not fit.
+export i32 packed() {
+  u8[] bytes = u8[].filled(4, 0);
+  bytes[0] = 0xFF;             // a hex literal names bits: 255
+  bytes[1] = 300 as@ u8;       // `as@` keeps the low bits: 44 (plain 300 is refused)
+  u8[] hello = [104, 101, 108, 108, 111];   // literals take the element type
+  u16[] shorts = u16[].filled(2, 0);
+  shorts[0] = 1000;
+  bytes[2] |= 0x0F;            // compound ops compute at u8
+  bytes[3]++;
+  u8 top = 255;
+  top++;                       // wraps to 0
+  return (bytes[0] as i32) + (bytes[1] as i32) + (hello[0] as i32) + (shorts[0] as i32) +
+         (bytes[2] as i32) + (bytes[3] as i32) + (top as i32);
+}
+export i32 packedSigned() {
+  i8[] b = i8[].filled(1, 0);
+  b[0] = 0xFF;                 // the same byte as above...
+  return b[0] as i32;                 // ...reads back -1 here.  Use u8[] for bytes.
+}
+// ERROR: u8 x = 300;                  // out of range for u8
+// ERROR: i32 f(u8 v) { return v; }    // no implicit widening: `return v as i32;`
+// ERROR: u8[] bad = [1.5];            // a float is not a u8
+// ERROR: bytes[0] == 'é';             // a byte is NOT a codepoint: 'é' is 233,
+//                                     // but "é" is the two bytes 195 169, so
+//                                     // this could never be true. Numbers
+//                                     // truncate; codepoints are refused.
+
+// ── 9. STRUCTS ──────────────────────────────────────────────────────────────
+
+// WasmGC struct types: heap-allocated, GC'd. Fields mutable by default.
+export struct Point {
+  f64 x = 0.0;
+  f64 y = 0.0;
+
+  // No `this` parameter => STATIC method. Called as Point.create(...).
+  Point create(f64 x, f64 y) { return Point(x, y); }
+
+  // `const this` => read-only receiver. `this` => may write non-const fields.
+  f64 distanceSq(const this, Point other) {
+    f64 dx = this.x - other.x;
+    f64 dy = this.y - other.y;
+    return dx * dx + dy * dy;
+  }
+  void moveBy(this, f64 dx, f64 dy) { this.x += dx; this.y += dy; }
+}
+// Methods compile to plain functions with the receiver as an implicit first
+// parameter: `p.moveBy(1,2)` becomes `Point$moveBy(p, 1, 2)`.
+
+struct IdPoint {
+  const i32 id;                // immutable after construction
+  i32 x;
+}
+const struct Config {          // `const struct` — every field immutable
+  i32 width;
+  i32 height;
+}
+
+// Two construction forms. Parentheses supply every field in order; braces name
+// fields in any order and may leave out the ones that have a default.
+export i32 construction() {
+  Point p = Point(3.0, 4.0);              // positional, declaration order
+  Point q = Point { y: 4.0, x: 3.0 };     // named, any order
+  Point r = Point { };                    // every field its default: x and y are 0.0
+  return (p.x == q.x ? 1 : 0) + (r.x == 0.0 ? 1 : 0);   // -> 2
+}
+// ERROR: Point(3.0);   // parentheses supply every field; defaults never fill in
+
+// Field access is struct.get / struct.set. Assignment ALIASES — a struct
+// variable holds a reference, so this returns 99, not 1.
+export i32 structAlias() {
+  Point a = Point(1.0, 2.0);
+  Point b = a;
+  b.x = 99.0;
+  return a.x as~ i32;
+}
+
+// Inside a method you must write `this.` — bare field and method names are not
+// resolved against the struct.
+// ERROR: i32 getX(const this) { return x; }   // 'x' is not defined
+
+// == is not defined on struct references. Compare fields, or use `is` (below).
+// ERROR: bool same = pointA == pointB;
+
+// ── 10. DEFAULT VALUES ──────────────────────────────────────────────────────
+
+// A default is an absence: a value that means "nothing yet". `T { }`,
+// `T[].defaulted(N)` and a local read before it is assigned need T to have one.
+//   nullable T? -> null       array T[] -> empty       string -> ""
+//   a number and bool -> NONE: zero is a number somebody might have meant
+//   a field with an initialiser (`f64 x = 0.0;`) -> that value, built per construction
+//   non-null struct T -> T { } if every field has a default (recursive)
+struct Line { Point start; Point end; }      // Line { } nests default Points
+struct Bag  { i32[] items; }                 // Bag { }.items.len() is 0
+
+// A non-null recursive field has no default — constructing it would not
+// terminate. Make it nullable instead. This is why linked structures in wac use
+// `T?` for their links.
+// ERROR: struct Bad { i32 v; Bad next; }
+struct Node { i32 val = 0; Node? next; }         // fine: next defaults to null
+
+export i32 defaults() {
+  Line l = Line { };
+  Bag  b = Bag { };
+  return (l.start.x == 0.0 ? 1 : 0) + b.items.len() + Node { }.val;   // -> 1
+}
+
+// ── 11. SUBTYPING, OVERRIDE, AND DEEP const ─────────────────────────────────
+
+// `: Parent` maps to WasmGC's `sub`. A subtype APPENDS fields; it cannot remove
+// or retype parent ones. Positional construction takes parent fields first.
+export struct Shape {
+  f64 x;
+  f64 y;
+  // `virtual` grants a subtype the override, and a call dispatches on the runtime type.
+  virtual string name(const this) { return "shape"; }
+  f64 getX(const this) { return this.x; }
+}
+export struct Rect : Shape {
+  f64 w;
+  f64 h;
+  // A parent's `virtual` method is replaced with `override`; using `override` with nothing
+  // to override is an error, and a parent's method that is not virtual cannot be redeclared.
+  override string name(const this) { return "rect"; }
+  f64 area(const this) { return this.w * this.h; }
+}
+export struct Circle : Shape {
+  f64 radius;
+  override string name(const this) { return "circle"; }
+  f64 area(const this) { return 3.14159265358979 * this.radius * this.radius; }
+}
+
+export f64 subtyping() {
+  Rect r = Rect(1.0, 2.0, 10.0, 20.0);   // Shape's x,y first, then w,h
+  Shape s = r;                            // subtype widens to parent implicitly
+  return s.getX() + r.area();             // parent methods work on subtypes
+}
+
+// A `virtual` method dispatches on the RUNTIME type: assigning a Circle to a Shape
+// variable and calling name() gives "circle". A method that is not virtual runs the
+// static type's body — and a subtype may not redeclare it, so nothing can disagree.
+export string virtualDispatch() {
+  Circle c = Circle(0.0, 0.0, 5.0);
+  Shape s = c;
+  return s.name();                        // -> "circle"
+}
+export string dynamicDispatch(Shape s) {
+  // `virtual` already dispatches on the runtime type, so no test is needed for `name()`. A test
+  // only answers — `is` binds nothing — and `matches` is what names the narrower value.
+  if (Circle c matches s) { return c.name(); }
+  return s.name();
+}
+
+// Static methods are NOT inherited — a subtype must declare its own.
+// ERROR: Rect r = Rect.create(...);   // if only Shape declared `create`
+
+// `is` has exactly three meanings, chosen by what follows it:
+//   x is Type   runtime type test    ref.test
+//   x is null   null test            ref.is_null
+//   x is y      reference identity   ref.eq
+export bool identity() {
+  Point a = Point(1.0, 2.0);
+  Point b = a;
+  Point c = Point(1.0, 2.0);       // same values, different object
+  // The parens are REQUIRED: `is` binds looser than `&&`, so `a is b && a is
+  // not c` would parse as `a is (b && a) is not c` and fail to compile.
+  return (a is b) && (a is not c);   // -> true
+}
+
+// DEEP const. A const reference forbids writes at every depth, and the
+// constness travels with the reference however it was obtained — through a
+// field, through a method's return value, or by copying it into a fresh local.
+struct Inner { i32 v; void mutate(this) { this.v = 1; } }
+struct Outer {
+  Inner inner;
+  Inner getInner(const this) { return this.inner; }
+  void tryIt(const this) {
+    // ERROR: this.inner.mutate();      // non-const method through const this
+    // ERROR: this.getInner().mutate(); // laundering through a call doesn't help
+    // ERROR: Inner i = this.inner; i.mutate();   // nor through a new binding
+    i32 read = this.inner.v;            // reading is always fine
+  }
+}
+// No plain binding can hold a const reference: `Node? cur = head` from a
+// `const Node head` is refused, since a plain local could write. A cursor over a
+// const list puts its NAME outside the const with parentheses — `(const Node)?
+// cur` rebinds freely, and everything it holds stays const. `const Node? cur`
+// would be const all the way down and could not step.
+export i32 constWalk(const Node head) {
+  i32 total = 0;
+  (const Node)? cur = head;
+  while (cur is not null) {
+    total += cur!.val;
+    // ERROR: cur!.val = 0;            // still const: nothing written through it
+    cur = cur!.next;                   // but the name moves
+  }
+  return total;
+}
+
+// ── 12. GENERICS ────────────────────────────────────────────────────────────
+
+// A type parameter is a name the compiler substitutes. `Cell<i32>` and
+// `Cell<string>` are two separate types with two separate copies of the code —
+// monomorphised, so there is no boxing, no dispatch and no shared representation.
+struct Cell<T> {
+  T value;
+
+  T get(const this) { return this.value; }
+  void set(this, T v) { this.value = v; }
+}
+
+// More than one parameter, in declaration order.
+struct Pair<A, B> {
+  A first;
+  B second;
+}
+
+export i32 cells() {
+  Cell<i32> n = Cell<i32>(0);           // i32 has no default, so the value is given
+  n.set(7);
+  Cell<string> s = Cell<string> { };     // string does: ""
+  s.set("wac");
+  Pair<i32, string> p = Pair<i32, string> { first: 0 };
+  p.first = 3;
+  p.second = "abc";
+  return n.get() + s.get().len() + p.first + p.second.len();   // -> 16
+}
+
+// There are NO CONSTRAINTS. A type parameter stands for any type, and a method
+// body that would not compile for some `T` is an error at the instantiation that
+// reaches it, not at the declaration. The declaration is not checked on its own.
+
+// Functions are generic too, and their TYPE ARGUMENTS ARE INFERRED — never
+// written. The argument types decide, and there is no spelling that overrides
+// them.
+T pick<T>(T a, T b, bool takeFirst) { return takeFirst ? a : b; }
+
+export i32 inference() {
+  return pick(3, 9, true) + pick(1, 2, false);     // -> 5
+}
+// ERROR: pick<i32>(3, 9, true)   // no such syntax: angle brackets are type
+//                                // syntax only, never call syntax
+
+// Angle brackets appear in TYPE POSITION only. `Cell<i32>` names a type;
+// `a < b` is a comparison, and the parser never has to guess between them.
+
+// Two instantiations are the same type when their arguments are the same types,
+// whatever the spelling that produced them, and across files. Identity is by
+// type, not by name.
+
+// ── 13. ENUMS AND match ─────────────────────────────────────────────────────
+
+// An enum is a fixed set of variants, each optionally carrying named payload
+// fields. It compiles to the struct hierarchy you would otherwise write by hand:
+// a base struct, a subtype per variant, and a tag the compiler maintains.
+enum Step {
+  Stop,
+  Go(i32 n),
+  Turn(f64 degrees),
+}
+
+// A payload-less variant is a VALUE, not a call: `Step.Stop`, never `Step.Stop()`.
+// Construction is qualified by the enum, like a static method.
+
+// As a STATEMENT, arms are `Pattern:` followed by statements — the same
+// shape as `switch`, same implicit break, no fallthrough. Bindings are
+// positional, take their types from the declaration, and are scoped to the arm.
+export i32 advance(Step s) {
+  match (s) {
+    Stop: { return 0; }
+    Go(n): { return n; }
+    Turn(d): { return d as~ i32; }
+  }
+}
+
+// As an EXPRESSION, arms are separated by commas and each is a value.
+// Omit the parentheses to ignore every payload; name a binding `_` to ignore one.
+export string describe(Step s) {
+  return match (s) {
+    Stop: "stop",
+    Go(_): "go",
+    Turn: "turn"
+  };
+}
+// ERROR: match (s) { Stop: 0, Go(n): n }
+//        // match does not cover 'Turn' — exhaustiveness is checked. A `default:`
+//        // arm would cover it, and every variant added later too, which is the
+//        // reason to leave it out when the cases are few
+
+// Each variant is also a TYPE, and a subtype of the enum — which is what lets an
+// arm or a `matches` bind it, and why a variant name is a file-scope name like a struct's.
+// Two enums in one file therefore cannot share a variant name.
+
+// Enums take type parameters, which is what `Result<T, E>` is.
+// A generic enum may carry methods, and `match` inside one sees `this`.
+enum Maybe<T> {
+  Just(T v),
+  Absent
+
+  T orElse(const this, T fallback) {
+    return match (this) { Just(v): v, Absent: fallback };
+  }
+}
+
+export i32 maybes() {
+  Maybe<i32> a = Maybe.Just(4);       // type arguments come from the expected
+  Maybe<i32> b = Maybe.Absent;        // type; there is no `Maybe<i32>.Just(4)`
+  return a.orElse(0) + b.orElse(100);  // -> 104
+}
+// A generic enum's variants have NO BARE NAME — `Maybe<i32>` and `Maybe<f64>`
+// would both claim `Just` and neither has a better claim. So `Just j = a;` and
+// `a is Just` are errors, while `match` is unaffected: an arm resolves its
+// variant through the subject's enum rather than through the file's scope.
+
+// A UNION holds a value of any one of its member types, with no constructor: a
+// member value IS a union value. `match` takes it apart by type, and inside
+// each arm the subject has that arm's type. `if (string t matches c) { … }`
+// tests and binds one member.
+union<i32, string, bool> cellAt(i32 k) {
+  if (k == 0) { return 7; }
+  if (k == 1) { return "seven"; }
+  return true;
+}
+export i32 unions() {
+  i32 total = 0;
+  for (i32 k = 0; k < 3; k++) {
+    union<i32, string, bool> c = cellAt(k);
+    total += match (c) {
+      i32:    c,                      // c is an i32 here
+      string: c.len(),                // ...and a string here
+      bool:   c ? 1 : 0,
+    };
+  }
+  return total;                       // -> 7 + 5 + 1 = 13
+}
+
+// An enum HAS NO DEFAULT VALUE — there is no default variant — so `Step[].defaulted(2)`
+// and a struct holding a bare `Step` cannot be default-constructed. Write the
+// array as a literal, or make the field nullable.
+
+// ── 14. NULLABILITY, anyref, i31ref ─────────────────────────────────────────
+
+// References are NON-NULL by default. `T?` is the nullable form. `T` widens to
+// `T?` implicitly; the reverse needs an explicit unwrap.
+export i32 nullability() {
+  Point p = Point(1.0, 2.0);
+  Point? q = null;             // `null` has no type of its own — inferred from context
+  q = p;                       // ok: T -> T?
+  // ERROR: p = q;             // q might be null
+  // ERROR: Point r = null;    // non-null
+  // ERROR: i32 n = null;      // primitives are never nullable
+  return q! .x as~ i32;        // `!` = ref.as_non_null, traps if null
+}
+
+// Test with `is null` / `is not null`. Narrowing is not automatic: even inside
+// an `is not null` guard you still write the `!`. It is a trap you can see.
+export i32 walk(Node? head) {
+  i32 total = 0;
+  Node? cur = head;
+  while (cur is not null) {
+    total += cur!.val;
+    cur = cur!.next;
+  }
+  return total;
+}
+
+// Unwrap also works in an lvalue chain.
+export i32 unwrapLvalue() {
+  Node a = Node(10, null);
+  Node? p = Node(20, null);
+  p!.next = a;
+  return p!.next!.val;         // -> 10
+}
+
+// anyref is the top reference type. i31ref is a 31-bit integer packed INTO a
+// reference — no heap allocation — which is how you put unboxed integers and
+// heap objects in the same container.
+export i32 anyrefs() {
+  i31ref small = 42 as! i31ref;      // ref.i31; checked, since i32 may not fit
+  i32 n = small as i32;              // i31.get_s; lossless, 31 bits fit i32
+  anyref[] items = anyref[].defaulted(3);
+  items[0] = 7 as! i31ref;           // no allocation
+  items[1] = Point(1.0, 2.0);        // heap allocated
+  i32 total = n;
+  if (items[0] is i31ref) { total += items[0] as! i31ref as i32; }
+  return total;                      // -> 49
+}
+
+// ── 15. FUNCTION REFERENCES ─────────────────────────────────────────────────
+
+// `fn<Ret(Params)>` — return type first, mirroring declarations. Maps to wasm's
+// typed function refs: `ref.func` to obtain, `call_ref` to invoke.
+// A bare name is the whole of the syntax — there is no `&f`.
+//
+// A lambda is a function value written in place, and it captures the locals it
+// names by reference — see `lambdas()` below.
+i32 square(i32 x) { return x * x; }
+i32 negate(i32 x) { return -x; }
+bool ascending(i32 a, i32 b) { return a < b; }
+bool descending(i32 a, i32 b) { return a > b; }
+
+export i32 funcrefs() {
+  fn<i32(i32)> f = square;           // reference a function by bare name
+  fn<bool(i32, i32)> cmp = descending;
+  return f(5) + (cmp(3, 5) ? 0 : 1); // -> 26
+}
+
+// As parameters, as return values, as struct fields, as array elements.
+i32 apply(fn<i32(i32)> f, i32 x) { return f(x); }
+fn<bool(i32, i32)> comparator(bool reverse) {
+  if (reverse) { return descending; }
+  return ascending;
+}
+struct Handler { fn<i32(i32)> cb; }
+
+export i32 funcrefUses() {
+  fn<i32(i32)>[] fs = [double, square, negate];
+  i32 total = 0;
+  for (i32 i = 0; i < fs.len(); i++) { total += fs[i](5); }   // 10 + 25 - 5
+  Handler h = Handler(square);
+  fn<i32(i32)>? maybe = null;                                  // nullable form
+  if (maybe is not null) { total += maybe!(1); }
+  return total + apply(double, 5) + h.cb(2) + (comparator(true)(3, 5) ? 0 : 1);
+}
+
+// Method references. `Counter.inc` is the underlying function with the receiver
+// as an explicit first parameter, and a static is just its own signature — both
+// are ordinary `fn<...>` values, as the two lines below show.
+//
+// A BOUND reference — `c.inc`, the method with that receiver already in it — is
+// an `fn<void()>`. It captures the receiver and nothing else.
+// See spec/2-types/20-functions-and-funcrefs.md.
+struct Counter {
+  i32 count;
+  Counter create(i32 initial) { return Counter(initial); }
+  void inc(this) { this.count++; }
+}
+export i32 methodRefs() {
+  fn<void(Counter)> bump = Counter.inc;      // `this` becomes a parameter
+  fn<Counter(i32)> make = Counter.create;    // static: just its own signature
+  Counter c = make(0);
+  bump(c);
+  bump(c);
+  (Counter.inc)(c);                          // inline form, same as c.inc()
+  fn<void()> again = c.inc;                  // bound to c
+  again();
+  return c.count;                            // -> 4
+}
+
+export i32 lambdas() {
+  i32 step = 3;
+  fn<i32(i32)> add = (i32 a) => a + step;    // captures `step`...
+  step = 10;                                 // ...by reference, so this is seen
+  return add(1);                             // -> 11
+}
+
+// ── 16. IMPORTS AND NAMING  (syntax only — needs more than one file) ────────
+
+//   import { distance, Point } from "./geometry.wac";
+//   import { Point as Point3d } from "./spatial.wac";     // rename with `as`
+//
+// - Only `export`ed functions and structs can be imported. Importing a struct
+//   brings its constructors, fields and methods with it.
+// - Paths are relative (`./`, `../`). Circular imports are fine: wac files hold
+//   only declarations, so there is no initialisation order to get wrong.
+// - Two specifiers name modules the compiler ships rather than files on disk:
+//
+//       import { Read } from "core";              // no capability needed
+//       import { Cli, Core } from "std";   // the capability world
+//
+//   Quoted like everything else. Nothing on disk answers for either name: `core`
+//   and `std` are reserved, so your own `core/` or `std/` directory cannot shadow
+//   them. `core` is the library every program has and holds no capability — the
+//   containers, `Result`, tickets, and the `math` and `strings` namespaces
+//   (section 17); `std` is the world a program is handed: files, network,
+//   processes, clocks (chapter 44).
+// - Names are mangled internally to `<filestem>$<name>` — `geometry$Point`,
+//   `geometry$Point$distanceSq`. Two files may each declare `Point` or `max`;
+//   they stay distinct types with distinct layouts.
+// - Only the ENTRY file's exports become wasm exports. Two imported files can
+//   both export `compute` without colliding in the wasm export section.
+// - NO implicit re-export. If b.wac imports `foo` from a.wac, another file
+//   cannot import `foo` from b.wac — go to the file that declares it.
+// - An alias is a new NAME, not a new TYPE. `import { Box as B }` gives a name
+//   for the same struct, so `fn<i32(B)> f = B.get;` matches lib's `Box.get`.
+//
+// Naming rules, in and out of imports:
+// - Any collision at the same scope is an error: two functions, two structs, a
+//   function and a struct, two fields, two methods, a field and a method, an
+//   import and a local, two imports. Rename the import to resolve it.
+// - There is no overloading anywhere.
+// - Block-scope SHADOWING is allowed, including a for-loop variable shadowing
+//   an outer one. The inner binding is a separate variable.
+export i32 shadowing() {
+  i32 x = 1;
+  { i32 x = 2; x = 3; }        // a distinct inner x
+  for (i32 i = 0; i < 3; i++) { }
+  return x;                    // -> 1
+}
+// Convention: PascalCase structs, camelCase functions, methods and variables.
+
+// ── 17. CORE — the library every program has ────────────────────────────────
+
+// `import { … } from "core"` costs nothing but what you use: a build reads only
+// what the program reaches. Namespaces are modules — `math.log`, `strings.split`.
+import { Vec, Map, Result, Ticket, hashString, stringEq, math, strings } from "core";
+
+// Vec<T>: a growable array. `sort` is stable, ordered by a comparison function.
+export i32 vecs() {
+  Vec<i32> v = Vec<i32>.create();
+  v.push(3); v.push(1); v.push(2);
+  v.sort((i32 a, i32 b) => a - b);
+  return v.get(0) * 100 + v.get(1) * 10 + v.get(2);   // -> 123
+}
+
+// Map<K, V>: a hash map, handed its hash and equality — there are no traits.
+export i32 maps() {
+  Map<string, i32> m = Map<string, i32>.create(hashString, stringEq);
+  m.set("a", 1);
+  m.set("b", 2);
+  return m.getOr("b", 0) + m.getOr("z", 40);          // -> 42
+}
+
+// Result<T, E>: a failure is a value. `try e` answers e's value, or returns
+// its error from the enclosing function — the one control-flow shortcut.
+struct Empty { }
+Result<i32, Empty> lengthOf(string s) {
+  if (s == "") { return Result.Err(Empty()); }
+  return Result.Ok(s.len());
+}
+Result<i32, Empty> addLengths(string a, string b) {
+  i32 x = try lengthOf(a);
+  i32 y = try lengthOf(b);                  // not reached when lengthOf(a) failed
+  return Result.Ok(x + y);
+}
+export i32 results() {
+  return addLengths("abc", "d").orElse(-1) * 10 + (addLengths("", "d").isErr() ? 1 : 0);   // -> 41
+}
+
+// Text beyond `len`, `slice` and `indexOf` is in `strings` — byte offsets,
+// like everything on a string — and mathematics beyond the five float
+// instructions (`sqrt`, `abs`, `min`, `max`, `copySign`) is in `math`.
+export string texts() { return strings.join(strings.split(strings.trim("  a,b,c "), ","), "+"); }   // -> "a+b+c"
+export bool maths() {
+  return math.log(1.0) == 0.0 && math.pow(2.0, 10.0) == 1024.0 && 2.25.sqrt() == 1.5;
+}
+
+// ── 18. ASYNC — tickets and await ────────────────────────────────────────────
+
+// A Ticket<T> is a T that may not have arrived. `async T f()` hands its caller
+// a Ticket<T>; `await` inside it waits for one. There are no threads: a
+// suspended function is a state machine the compiler builds (chapter 35).
+Ticket<i32> settled(i32 v) {
+  Ticket<i32> t;
+  t.resolve(v);                             // a ticket made directly is settled by hand
+  return t;
+}
+async i32 addLater(i32 a, i32 b) {
+  i32 x = await settled(a);
+  i32 y = await settled(b);
+  return x + y;
+}
+// `wait()` drives a ticket from outside async code; it answers a Result,
+// because a ticket nothing will settle is an error rather than a hang.
+export i32 asyncs() { return addLater(20, 22).wait()!; }        // -> 42
+
+// An `async` lambda goes wherever a `fn<Ticket<R>(…)>` is wanted — a field,
+// an argument, a return — and answers R from its body.
+struct Opener { fn<Ticket<i32>(i32)> open; }
+export i32 asyncSlots() {
+  Opener o = Opener(async (i32 n) => { i32 v = await settled(n); return v * 2; });
+  return o.open(21).wait()!;                                     // -> 42
+}
+
+// ── 19. TUPLES — several values without declaring a struct ──────────────────
+
+// `(T, U)` is a type, `(a, b)` a value of it, `.0` and `.1` its members. Two
+// tuples of the same member types are the same type — structural, where a
+// struct is nominal — and a function returning one is how wac returns several.
+(i32, i32) divmod(i32 n, i32 d) { return (n / d, n % d); }
+export i32 tuples() {
+  (i32, string) pair = (7, "seven");
+  (i32 q, i32 r) = divmod(17, 5);           // taken apart where declared: q = 3, r = 2
+  auto (a, b) = divmod(9, 4);               // `auto` binds each member's own type
+  return pair.0 + q * 10 + r + a + b + pair.1.len();   // 7 + 30 + 2 + 2 + 1 + 5 -> 47
+}
+// A tuple has no identity: `==` compares members, and it is never null.
+
+// ── 20. SYMBOLS AND OPERATORS ───────────────────────────────────────────────
+
+// `symbol s;` declares a name no other declaration shares — not even another
+// `symbol s` in another file. A struct may have a field or method named by one,
+// written `[s]` and reached as `x.[s]`, so two libraries can both add a member
+// to your type without colliding. Symbols are nominal: an import alias is the
+// same symbol under another name.
+symbol label;
+struct Tagged {
+  i32 v;
+  string [label](const this) { return "tagged"; }
+}
+
+// Operators on structs are methods named by `core`'s `operators` symbols, and
+// interpolation converts through `toString`. There is no other overloading.
+import { operators, toString } from "core";
+struct Vec2 {
+  i32 x;
+  i32 y;
+  Vec2 [operators.add](const this, const Vec2 rhs) { return Vec2(this.x + rhs.x, this.y + rhs.y); }
+  bool [operators.equal](const this, const Vec2 rhs) { return this.x == rhs.x && this.y == rhs.y; }
+  string [toString](const this) { return "(\{this.x}, \{this.y})"; }
+}
+export string symbols() {
+  Vec2 sum = Vec2(1, 2) + Vec2(3, 4);       // a.[operators.add](b)
+  bool same = sum == Vec2(4, 6);            // == on a struct only where it says what equal means
+  return "\{Tagged(1).[label]()} \{sum} \{same}";   // -> "tagged (4, 6) true"
+}
+
+// ── 21. MARKUP ──────────────────────────────────────────────────────────────
+
+// Markup is an expression that lowers to calls, and the language names no tree
+// type. `<box>…</box>` calls the function `box` in scope with its children;
+// text, a quoted tag `<"b">` and a fragment `<>…</>` are built by the child
+// type's `markup` methods. HTML is a library (`web`), not the language.
+import { markup } from "core";
+enum Tree {
+  Leaf(string text),
+  Branch(string tag, Tree[] kids),
+
+  Tree [markup.text](string text) { return Tree.Leaf(text); }
+  Tree [markup.element](string tag, string[] names, string[] values, Tree[] kids) { return Tree.Branch(tag, kids); }
+  Tree [markup.fragment](Tree[] kids) { return Tree.Branch("", kids); }
+
+  i32 leaves(const this) {
+    match (this) {
+      Leaf(t): { return 1; }
+      Branch(tag, kids): {
+        i32 n = 0;
+        for (i32 i = 0; i < kids.len(); i++) { n = n + kids[i].leaves(); }
+        return n;
+      }
+    }
+  }
+}
+Tree box(Tree[] kids) { return Tree.Branch("box", kids); }
+export i32 markups() {
+  i32 n = 42;
+  return (<box>hello{n}<"b">bold</"b"><>a{"b"}</></box>).leaves();   // -> 5
+}
+
+// ── 22. STATIC CODE — computed at compile time ──────────────────────────────
+
+// A `static` is computed by the compiler, running ordinary wac (chapter 28).
+// `typeref(T)` is a type as a value, `type(…)` a type computed from one, and
+// `static_if` keeps one branch per instantiation — the other is not compiled
+// there, though it is still checked.
+static i32 SQUARES = sumOfSquares(10);      // the call runs while compiling
+i32 sumOfSquares(i32 n) {
+  i32 t = 0;
+  for (i32 i = 1; i <= n; i++) { t += i * i; }
+  return t;
+}
+i32 widthOf<T>() {
+  static_if (typeref(T) == typeref(i64)) { return 64; } else { return 32; }
+}
+// `typeof(e)` is the static type of `e`; `e` is checked and never run.
+export i32 statics() {
+  typeof(SQUARES) n = 1;                    // an i32
+  return SQUARES + widthOf<i64>() + widthOf<i32>() + n;   // 385 + 64 + 32 + 1 -> 482
+}
+
+// ── 23. GENERATORS ──────────────────────────────────────────────────────────
+
+// `gen<Y> R f(…)` yields Ys and returns an R. Calling it runs nothing; each step
+// runs it to its next `yield`. `for (x in g)` steps one to the end.
+gen<i32> void evensBelow(i32 n) {
+  for (i32 i = 0; i < n; i += 2) { yield i; }
+}
+export i32 generators() {
+  i32 total = 0;
+  for (i32 v in evensBelow(10)) { total += v; }   // 0 + 2 + 4 + 6 + 8
+  return total;                                   // -> 20
+}
+
+// ── 24. WHAT WAC DOES NOT HAVE ──────────────────────────────────────────────
+
+// Read this before you write wac you'd expect to work. None of these exist:
+//
+//   interfaces / traits     subtyping is single-parent struct extension only
+//   linear memory           no pointers, no mem[addr], no data segments
+//   mutable globals         a module-level value is `static`: computed at compile
+//                           time, and const (spec chapter 27)
+//   host function imports   nothing is imported from JS; a capability is a value
+//                           the program is handed (chapter 07)
+//   exceptions              a failure is a value — `Result<T, E>` (chapter 26)
+//   char type               a character literal is a `u8`; string indexing
+//                           yields a one-character string
+//   threads, varargs, default arguments, named arguments at call sites
+//
+// The list used to be longer. Closures (section 15), tuples and so several
+// returns (section 19), unions (section 13), type declarations (chapter 30),
+// virtual dispatch (section 11), operator methods (`[operators.add]`, section
+// 20) and `async` (section 18) were all on it.
+//
+// `switch` takes integers only — not strings, not enums. Use `match` for an
+// enum, and an if-chain for a string.
+//
+// Consequences worth internalising:
+//   - No mutable globals means every piece of state is a parameter, a local, or a field
+//     reachable from one. A lambda captures locals, which does not add a
+//     fourth place for state to live: it shares one of the three.
+//   - `void` functions taking a struct or array mutate through the reference —
+//     that is the idiomatic way to return "several" things.
+//   - No host imports means a module that takes no `fn<...>` parameter has an
+//     empty wasm import section and cannot call out at all. That is the whole
+//     sandbox: there is no ambient authority to opt out of.
+//
+// **This language is unstable on purpose.** It gains features when something
+// written in it needs them, and the list above shrinks — generics, enums and
+// `match` were all on it. If a section of this file disagrees with the
+// compiler, the compiler is right and this file is a bug: fix it here rather
+// than working around it.
+
+// ── 25. SELF TEST — `selfTest()` returns true iff every claim above holds. ──
+
+export bool selfTest() {
+  return double(21) == 42
+      && factorial(10) == 3628800
+      && isEven(42) == 1 && isOdd(42) == 0
+      && trailingComma() == 12
+      && wrap() == 0x80000000 && mostNegative() == -2147483648
+      && twiceU(2147483648) == 0 && fiveWide() == 5
+      && uMax() == 18446744073709551615
+      && dec() == 42 && decBig() == 1000000000000
+      && poly() == -306674912 && padded() == 3988292384
+      && (decBig() as@ i32) == -727379968   // as@ keeps the low 32 bits
+      && grouped() == poly() && million() == 1000000
+      && strictBool(3) == 1 && strictBool(0) == 0
+      && variables() == 15 && constRef() == 3.0
+      && constWalk(Node(1, Node(2, Node(3, null)))) == 6
+      && useConst(255) == 192 && CRC_POLY == 0xEDB88320
+      && fromTable(1) == 20
+      && mixTypes(1, 2.7) == 4
+      && rem(-7.0, 2.0) == -1.0 && rem(7.0, -2.0) == 1.0
+      && shifts(-16) == 2147483632
+      && incr() == 577
+      && widen(42) == 42 as i64 && checked(42 as i64) == 42
+      && nearest(3.7) == 4 && nearest(2.5) == 2
+      && toward0(3.7) == 3 && toward0(0.0 / 0.0) == 0
+      && truthy(42) && !truthy(0)
+      && strBasics() == 15
+      && strEscapes() == 5 && strBlock() == 29 && strInterp() == 7
+      && strOps() == "world" && strFind() == 6
+      && strIndex() == "😀" && strMid() == 0
+      && strEq()
+      && branch(-5) == 5 && branch(0) == 0 && branch(5) == 5
+      && loops(3) == 10
+      && breakContinue([1, -1, 2, 99, 50] as i32[]) == 3
+      && infinite(4, 10) == 12 && forever(7) == 7
+      && classify(0) == 0 && classify(3) == 1
+      && ternary(3, 7) == 7
+      && mustBePositive(5) == 5
+      && arrays() == 21 && arrayAlias() == 99 && arrayOfRefs() == 9
+      && packed() == 255 + 44 + 104 + 1000 + 15 + 1
+      && packedSigned() == -1
+      && construction() == 2 && structAlias() == 99
+      && defaults() == 1
+      && subtyping() == 201.0
+      && virtualDispatch() == "circle"
+      && dynamicDispatch(Circle(0.0, 0.0, 5.0)) == "circle"
+      && dynamicDispatch(Shape(0.0, 0.0)) == "shape"
+      && identity()
+      && bits(-1) == 4294967295 && chkU(5) == 5 && clampU(-5) == 0
+      && nullability() == 1
+      && walk(Node(1, Node(2, Node(3, null)))) == 6
+      && walk(null) == 0
+      && unwrapLvalue() == 10
+      && anyrefs() == 49
+      && funcrefs() == 26
+      && funcrefUses() == 30 + 10 + 4 + 1
+      && methodRefs() == 4 && lambdas() == 11
+      && shadowing() == 1
+      && cells() == 16 && inference() == 5
+      && advance(Step.Go(6)) == 6 && advance(Step.Stop) == 0
+      && advance(Step.Turn(90.0)) == 90
+      && describe(Step.Turn(1.0)) == "turn" && describe(Step.Go(2)) == "go"
+      && maybes() == 104
+      && unions() == 13
+      && vecs() == 123 && maps() == 42 && results() == 41
+      && texts() == "a+b+c" && maths()
+      && asyncs() == 42 && asyncSlots() == 42
+      && tuples() == 47 && symbols() == "tagged (4, 6) true"
+      && markups() == 5 && statics() == 482 && generators() == 20;
+}

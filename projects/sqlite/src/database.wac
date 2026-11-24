@@ -1,0 +1,928 @@
+// A database: its schema, held parsed, and its tables and indexes, which are b-trees on its pager.
+//
+// **The file's pages are the database.** Opening reads sqlite_schema and nothing else; a table's rows are
+// read from its b-tree as statements ask for them, and changed there. A commit writes sqlite_schema again
+// when the schema changed, and the header, onto page 1 (flush), and the pager writes the changed pages.
+//
+// **Two things are held in memory instead.** A temporary table, which the file never holds, and a
+// WITHOUT ROWID table: the engine works with rowids, so such a table is kept as a rowid table of its
+// own on a second pager (`aux`), numbered as read, with its indexes the same way; when it has changed,
+// a commit writes its b-tree in the file (keyed by its primary key, as SQLite keeps it) and its indexes'
+// again from that.
+//
+// **Some commits write a whole new image** (rebuild): VACUUM, and every commit of an auto-vacuum
+// database, whose pointer map this does not keep up page by page.
+
+import { Result, Vec, Map, hashString, stringEq } from "core";
+import { SqlError } from "./error.wac";
+import { Value, collationId, compareValues, compareColl, COLL_BINARY } from "./value.wac";
+import { encodeRecord, decodeRecord, encodeRecordIn, decodeRecordIn, toUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
+import { put16, put32, be16, be32 } from "./bytes.wac";
+import { MAGIC, signed32, readHeader, Header } from "./reader.wac";
+import { Pager } from "./pager.wac";
+import { Cursor, KeyCmp, startDatabase, createTree, clearTree, dropTree, tableInsert, indexInsert } from "./btree.wac";
+import { Pages, buildTable, buildIndex, fillPtrmap } from "./writer.wac";
+import { parseOne, callsWhere, nondeterministic } from "./parser.wac";
+import { Expr, Stmt, CreateTable, CreateIndex, ColumnDef, TableConstraint, ForeignKeyDef, JOIN_FIRST } from "./ast.wac";
+import { lower, upper } from "./lexer.wac";
+import { Exec, Scope, Ctx, bindExpr, eval, fillGenerated } from "./query.wac";
+import { Node, BoundSource } from "./plan.wac";
+import { FnEnv } from "./functions.wac";
+import { truth } from "./ops.wac";
+import { Column, Row, Index, Table, RowCursor, View, Trigger, SchemaEntry, ForeignKey, affinityOf, AFF_REAL, constValue } from "./schema.wac";
+
+// What version of SQLite the file claims was the last to write it. Readers only print it.
+static i64 SQLITE_VERSION_NUMBER = 3045000;
+
+export struct Database {
+  Vec<SchemaEntry> order;
+  Map<string, Table> tables;      // keyed by lower-case name
+  Map<string, Index> indexes;
+  Map<string, View> views;
+  Map<string, Trigger> triggers;
+  i32 pageSize;
+  i64 changeCounter;
+  i64 schemaCookie;
+  i64 userVersion;
+  i64 applicationId;
+  bool wal = false;               // in WAL mode, which the file header records and SQLite keeps
+  i32 autoVacuum = 0;             // PRAGMA auto_vacuum: 0 none, 1 full, 2 incremental
+  i32 pendingAutoVacuum = -1;     // a change to or from none, which waits for VACUUM, or -1
+  i32 encoding = 1;               // text in the file: 1 UTF-8, 2 UTF-16le, 3 UTF-16be
+  // indexesOf's answers, valid while `order` is the same list at the same length: every schema change
+  // either appends to it or replaces it.
+  Vec<SchemaEntry>? cacheOrder;
+  i32 cacheLen = 0;
+  Map<string, Index[]> ixCache;
+  // The objects CREATE TEMP made, by lower-case name: they live in memory only, and the file never holds
+  // them (nor the indexes and triggers of a temporary table).
+  Map<string, bool> temps;
+  // The database's pages, and the pages of what is held in memory instead (see the top of this file).
+  Pager main;
+  Pager aux;
+  bool rebuild = false;          // VACUUM asked for a fresh image at the next commit
+  bool replaced = false;         // ... and this commit made one: the file is to be written whole
+  bool creatingTemp = false;     // CREATE TEMP is making the table being made
+  // How a commit's pages reach the file; null for a database in memory only. It is called once the
+  // pages are final, before the pager lets go of their old contents.
+  fn<Result<void, SqlError>(Database)>? persist = null;
+  // Asked before each statement outside a transaction: the database as the file now holds it, when
+  // another connection (another process) has committed since this one last looked; null when not.
+  fn<Result<Database?, SqlError>()>? refresh = null;
+
+  Database empty() {
+    return Database { order: Vec.create(), tables: Map.create(hashString, stringEq), indexes: Map.create(hashString, stringEq),
+                      views: Map.create(hashString, stringEq), triggers: Map.create(hashString, stringEq), pageSize: 4096, changeCounter: 0, schemaCookie: 0, userVersion: 0, applicationId: 0,
+                      ixCache: Map.create(hashString, stringEq), temps: Map.create(hashString, stringEq),
+                      main: newPager(4096), aux: newPager(4096) };
+  }
+
+  // Whether nothing has been put in the database yet, so its page size may still change.
+  bool blank(this) { return this.order.len() == 0 && this.main.count <= 1; }
+
+  // Gives a table being made its b-tree: in the file, or in memory for a temporary table and for a
+  // WITHOUT ROWID table's rows (which also get their b-tree in the file).
+  void attachTable(this, Table t) {
+    bool temp = this.creatingTemp;
+    // PRAGMA page_size takes effect while the database has nothing in it, as in SQLite.
+    if (!temp && this.blank() && this.main.pageSize != this.pageSize) {
+      Pager np = newPager(this.pageSize);
+      for (i32 i = 0; i < this.main.sps.len(); i++) { np.savepoint(); }
+      this.main = np;
+    }
+    this.prepare(t);
+    t.pg = temp || t.withoutRowid ? this.aux : this.main;
+    t.root = createTree(t.pg!, true);
+    if (t.withoutRowid && !temp) { t.fileRoot = createTree(this.main, false); }
+  }
+
+  // What reading a table's rows needs: its encoding, and how to compute its VIRTUAL columns.
+  void prepare(this, Table t) {
+    t.enc = this.encoding;
+    if (t.hasVirtual()) {
+      Database self = this;
+      t.gen = (Row r) => {
+        match (fillGenerated(t, r, self)) {
+          Ok: {}
+          Err(e): {}
+        }
+      };
+    }
+  }
+
+  // Gives an index being made its b-tree, beside its table's.
+  void attachIndex(this, Index ix, Table t) {
+    ix.enc = this.encoding;
+    ix.pg = t.pg;
+    ix.root = createTree(ix.pg!, false);
+    if (t.withoutRowid && t.fileRoot != 0 && lower(ix.name) != lower(t.pkIndex)) {
+      ix.fileRoot = createTree(this.main, false);
+      t.shadowDirty = true;
+    }
+  }
+
+  // Gives back the pages of a table or index that is going.
+  void detachTable(this, Table t) {
+    if (t.pg is not null) { dropTree(t.pg!, t.root); }
+    if (t.fileRoot != 0) { dropTree(this.main, t.fileRoot); }
+  }
+
+  void detachIndex(this, Index ix) {
+    if (ix.pg is not null) { dropTree(ix.pg!, ix.root); }
+    if (ix.fileRoot != 0) { dropTree(this.main, ix.fileRoot); }
+  }
+
+  // The page sqlite_schema names for a table or index: where the file holds it.
+  i64 rootOf(this, const SchemaEntry e) {
+    if (e.kind == "table") {
+      Table t = this.table(e.name)!;
+      return t.withoutRowid ? t.fileRoot : t.root;
+    }
+    if (e.kind == "index") {
+      Index ix = this.index(e.name)!;
+      Table? t = this.table(ix.table);
+      return t is not null && t!.withoutRowid ? ix.fileRoot : ix.root;
+    }
+    return 0;
+  }
+
+  // What went wrong reading the pages, if anything did; cleared as it is taken.
+  string? takeFault(this) {
+    string? f = this.main.fault ?? this.aux.fault;
+    this.main.fault = null;
+    this.aux.fault = null;
+    return f;
+  }
+
+  Table? table(this, string name) { return this.tables.get(lower(name)); }
+
+  Index? index(this, string name) { return this.indexes.get(lower(name)); }
+
+  View? view(this, string name) { return this.views.get(lower(name)); }
+
+  Trigger? trigger(this, string name) { return this.triggers.get(lower(name)); }
+
+  // The triggers on a table or view for one timing and event, newest first: the order SQLite fires them.
+  Trigger[] triggersOn(this, string table, string timing, string event) {
+    Vec<Trigger> out;
+    string t = lower(table);
+    for (i32 i = this.order.len() - 1; i >= 0; i--) {
+      SchemaEntry e = this.order.get(i);
+      if (e.kind != "trigger" || lower(e.table) != t) { continue; }
+      Trigger tr = this.triggers.get(lower(e.name))!;
+      if (tr.def.timing == timing && tr.def.event == event) { out.push(tr); }
+    }
+    return out.toArray();
+  }
+
+  // The indexes on a table, in schema order — the order SQLite checks uniqueness in.
+  bool isTemp(this, const SchemaEntry e) {
+    return this.temps.has(lower(e.name)) || (e.kind != "table" && e.kind != "view" && this.temps.has(lower(e.table)));
+  }
+
+  Index[] indexesOf(this, string table) {
+    if (this.cacheOrder is null || this.cacheOrder! is not this.order || this.cacheLen != this.order.len()) {
+      this.ixCache.clear();
+      this.cacheOrder = this.order;
+      this.cacheLen = this.order.len();
+    }
+    Index[]? hit = this.ixCache.get(table);
+    if (hit is not null) { return hit!; }
+    Index[] found = this.findIndexes(table);
+    this.ixCache.set(table, found);
+    return found;
+  }
+
+  Index[] findIndexes(this, string table) {
+    Vec<Index> out;
+    string t = lower(table);
+    for (i32 i = 0; i < this.order.len(); i++) {
+      SchemaEntry e = this.order.get(i);
+      if (e.kind == "index" && lower(e.table) == t) { out.push(this.indexes.get(lower(e.name))!); }
+    }
+    return out.toArray();
+  }
+}
+
+SqlError err0(string m) { return SqlError("error", m); }
+
+bool isIntegerType(string t) { return upper(t) == "INTEGER"; }
+
+// The table a CREATE TABLE describes, and the indexes its constraints imply, in the order SQLite numbers
+// them: column constraints as the columns come, then table constraints.
+export Result<Table, SqlError> tableFrom(const CreateTable c, Vec<Index> autos) {
+  Vec<Column> cols;
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    const ColumnDef d = c.cols[i];
+    i32 coll = 0;
+    if (d.collate is not null) {
+      coll = collationId(d.collate!);
+      if (coll < 0) { return Result.Err(err0("no such collation sequence: \{d.collate!}")); }
+    }
+    Column col = Column(d.name, d.typeName, affinityOf(d.typeName), d.notNull, d.dflt, coll, d.generated, d.stored, "", d.notNullConflict);
+    if (c.strict) {
+      string ty = upper(d.typeName);
+      if (ty == "INT") { ty = "INTEGER"; }
+      if (ty == "") { return Result.Err(SqlError.schema("missing datatype for \{c.name}.\{d.name}")); }
+      if (ty != "INTEGER" && ty != "REAL" && ty != "TEXT" && ty != "BLOB" && ty != "ANY") {
+        return Result.Err(SqlError.schema("unknown datatype for \{c.name}.\{d.name}: \"\{d.typeName}\""));
+      }
+      col.strictType = ty;
+      // ANY keeps values exactly as given.
+      if (ty == "ANY") { col.affinity = 0; }
+    }
+    if (d.generated is not null && (d.primaryKey || d.dflt is not null)) {
+      return Result.Err(SqlError.schema("generated columns cannot be part of the PRIMARY KEY or have a default"));
+    }
+    cols.push(col);
+  }
+  Table t = Table { name: c.name, sql: c.sql, cols: cols.toArray(), rows: Vec.create(), strict: c.strict, checks: Expr[](), fks: ForeignKey[](), pk: i32[]() };
+  t.withoutRowid = c.withoutRowid;
+  i32 pkCount = 0;
+  for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].primaryKey) { pkCount++; } }
+  for (i32 i = 0; i < c.constraints.len(); i++) {
+    if (c.constraints[i].kind.indexOf("PRIMARY KEY") == 0) { pkCount++; }
+  }
+  if (pkCount > 1) { return Result.Err(SqlError.schema("table \"\{c.name}\" has more than one primary key")); }
+  i32 n = 0;
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    const ColumnDef d = c.cols[i];
+    if (d.primaryKey) {
+      if (c.withoutRowid && d.autoincrement) {
+        return Result.Err(SqlError.schema("AUTOINCREMENT not allowed on WITHOUT ROWID tables"));
+      }
+      if (c.withoutRowid) {
+        n++;
+        Index pk = autoIndex(t, n, [i]);
+        pk.desc[0] = d.pkDesc;
+        pk.onConflict = d.pkConflict;
+        t.pkIndex = pk.name;
+        autos.push(pk);
+      } else if (isIntegerType(d.typeName) && !d.pkDesc) {
+        t.rowidAlias = i;
+        t.autoincrement = d.autoincrement;
+        t.rowidConflict = d.pkConflict;
+      } else {
+        if (d.autoincrement) { return Result.Err(SqlError.schema("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")); }
+        n++;
+        Index pk = autoIndex(t, n, [i]);
+        pk.onConflict = d.pkConflict;
+        autos.push(pk);
+      }
+    }
+    if (d.unique) {
+      n++;
+      Index u = autoIndex(t, n, [i]);
+      u.onConflict = d.uniqueConflict;
+      autos.push(u);
+    }
+  }
+  for (i32 i = 0; i < c.constraints.len(); i++) {
+    // Only keys make indexes; CHECK and FOREIGN KEY constraints are handled below.
+    if (c.constraints[i].kind != "UNIQUE" && c.constraints[i].kind.indexOf("PRIMARY KEY") != 0) { continue; }
+    const string[] names = c.constraints[i].cols;
+    // A column named twice counts once.
+    Vec<i32> posV;
+    Vec<bool> descV;
+    for (i32 k = 0; k < names.len(); k++) {
+      i32 at = t.colIndex(names[k]);
+      if (at < 0) { return Result.Err(SqlError.schema("no such column: \{names[k]}")); }
+      bool seen = false;
+      for (i32 m = 0; m < posV.len(); m++) { if (posV.get(m) == at) { seen = true; } }
+      if (seen) { continue; }
+      posV.push(at);
+      descV.push(k < c.constraints[i].desc.len() && c.constraints[i].desc[k]);
+    }
+    i32[] pos = posV.toArray();
+    bool pk = c.constraints[i].kind.indexOf("PRIMARY KEY") == 0;
+    for (i32 k = 0; pk && k < pos.len(); k++) {
+      if (t.cols[pos[k]].gen is not null) {
+        return Result.Err(SqlError.schema("generated columns cannot be part of the PRIMARY KEY"));
+      }
+    }
+    if (pk && c.withoutRowid) {
+      if (c.constraints[i].kind == "PRIMARY KEY AUTOINCREMENT") {
+        return Result.Err(SqlError.schema("AUTOINCREMENT not allowed on WITHOUT ROWID tables"));
+      }
+      n++;
+      Index ix = autoIndex(t, n, pos);
+      ix.desc = descV.toArray();
+      ix.onConflict = c.constraints[i].onConflict;
+      t.pkIndex = ix.name;
+      autos.push(ix);
+      continue;
+    }
+    if (pk && pos.len() == 1 && isIntegerType(t.cols[pos[0]].typeName)) {
+      t.rowidAlias = pos[0];
+      t.autoincrement = c.constraints[i].kind == "PRIMARY KEY AUTOINCREMENT";
+      t.rowidConflict = c.constraints[i].onConflict;
+      continue;
+    }
+    n++;
+    Index ix = autoIndex(t, n, pos);
+    ix.onConflict = c.constraints[i].onConflict;
+    autos.push(ix);
+  }
+  // CHECK constraints, from the columns then the table, and foreign keys likewise.
+  Vec<Expr> checks;
+  Vec<ForeignKey> fks;
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    const ColumnDef d = c.cols[i];
+    for (i32 k = 0; k < d.checks.len(); k++) { checks.push(d.checks[k] as Expr); }
+    if (d.fk is not null) { fks.push(fkFrom([i], d.fk!)); }
+    if (d.primaryKey) { t.pk = [i]; }
+  }
+  for (i32 i = 0; i < c.constraints.len(); i++) {
+    const TableConstraint tc = c.constraints[i];
+    if (tc.check is not null) { checks.push(tc.check! as Expr); }
+    if (tc.kind.indexOf("PRIMARY KEY") == 0 || tc.kind == "FOREIGN KEY") {
+      i32[] pos = i32[].filled(tc.cols.len(), 0);
+      for (i32 k = 0; k < tc.cols.len(); k++) {
+        pos[k] = t.colIndex(tc.cols[k]);
+        if (pos[k] < 0) { return Result.Err(SqlError.schema("unknown column \"\{tc.cols[k]}\" in foreign key definition")); }
+      }
+      if (tc.kind == "FOREIGN KEY") { fks.push(fkFrom(pos, tc.fk!)); } else { t.pk = pos; }
+    }
+  }
+  t.checks = checks.toArray();
+  t.fks = fks.toArray();
+  if (c.withoutRowid) {
+    if (t.pkIndex == "") { return Result.Err(SqlError.schema("PRIMARY KEY missing on table \{c.name}")); }
+    // Its key is the index's columns, a column named twice counted once, and none of them may be NULL.
+    for (i32 i = 0; i < autos.len(); i++) { if (autos.get(i).name == t.pkIndex) { t.pk = autos.get(i).cols; } }
+    for (i32 col in t.pk) { t.cols[col].notNull = true; }
+  }
+  // A primary key's column is NOT NULL in effect only for the rowid alias; elsewhere SQLite allows
+  // NULL there, for compatibility, and so does this.
+  return Result.Ok(t);
+}
+
+// A constraint's index compares each column by the column's own collation.
+ForeignKey fkFrom(i32[] cols, const ForeignKeyDef d) {
+  return ForeignKey(cols, d.parent, d.parentCols as string[], d.onDelete, d.onUpdate, d.deferred);
+}
+
+Index autoIndex(Table t, i32 n, i32[] cols) {
+  i32[] colls = i32[].filled(cols.len(), 0);
+  for (i32 i = 0; i < cols.len(); i++) { colls[i] = t.cols[cols[i]].coll; }
+  return Index { name: "sqlite_autoindex_\{t.name}_\{n}", table: t.name, sql: null, cols: cols, desc: bool[].filled(cols.len(), false),
+                 colls: colls, unique: true, pred: null, keyFn: null };
+}
+
+export Result<Index, SqlError> indexFrom(CreateIndex c, Table t) {
+  i32[] pos = i32[].filled(c.cols.len(), 0);
+  bool[] desc = bool[].filled(c.cols.len(), false);
+  i32[] colls = i32[].filled(c.cols.len(), 0);
+  for (i32 i = 0; i < c.cols.len(); i++) {
+    if (c.cols[i].expr is not null) {
+      if (callsWhere(c.cols[i].expr!, nondeterministic)) {
+        return Result.Err(err0("non-deterministic functions prohibited in index expressions"));
+      }
+      pos[i] = 0;
+      if (c.cols[i].collate is not null) { colls[i] = collationId(c.cols[i].collate!); }
+      desc[i] = c.cols[i].desc;
+      continue;
+    }
+    pos[i] = t.colIndex(c.cols[i].name);
+    if (pos[i] < 0) { return Result.Err(SqlError.schema("no such column: \{c.cols[i].name}")); }
+    desc[i] = c.cols[i].desc;
+    colls[i] = t.cols[pos[i]].coll;
+    if (c.cols[i].collate is not null) {
+      colls[i] = collationId(c.cols[i].collate!);
+      if (colls[i] < 0) { return Result.Err(err0("no such collation sequence: \{c.cols[i].collate!}")); }
+    }
+  }
+  Index ix = Index { name: c.name, table: t.name, sql: c.sql, cols: pos, desc: desc, colls: colls, unique: c.unique, pred: null, keyFn: null };
+  // A partial index's WHERE and an expression index's terms are evaluated against each row.
+  Scope sc = Scope([BoundSource(lower(t.name), t, JOIN_FIRST, null, false, string[](), null)], null, null, false);
+  Exec x = Exec { db: Database.empty(), params: Value[](), env: FnEnv { nowMillis: 0, changes: 0, totalChanges: 0,
+                  lastInsertRowid: 0, randomBytes: u8[].filled(8, 0), randomAt: 0 }, ctes: Vec.create() };
+  if (c.where is not null) {
+    if (callsWhere(c.where!, nondeterministic)) {
+      return Result.Err(err0("non-deterministic functions prohibited in partial index WHERE clauses"));
+    }
+    Node w = try bindExpr(c.where!, sc, x);
+    ix.pred = (Row r) => truth(eval(w, Ctx([r as Row?], null, null, null, null), x).orElse(Value.Null)) == 1;
+  }
+  bool anyExpr = false;
+  for (i32 i = 0; i < c.cols.len(); i++) { if (c.cols[i].expr is not null) { anyExpr = true; } }
+  if (anyExpr) {
+    Node[] terms = Node[].filled(c.cols.len(), Node.NLit(Value.Null));
+    for (i32 i = 0; i < c.cols.len(); i++) {
+      if (c.cols[i].expr is not null) { terms[i] = try bindExpr(c.cols[i].expr!, sc, x); }
+      else { terms[i] = Node.NCol(0, 0, pos[i], t.cols[pos[i]].affinity, t.cols[pos[i]].coll); }
+    }
+    ix.keyFn = (Row r) => {
+      Value[] k = Value[].filled(terms.len(), Value.Null);
+      Ctx cx = Ctx([r as Row?], null, null, null, null);
+      for (i32 i = 0; i < terms.len(); i++) { k[i] = eval(terms[i], cx, x).orElse(Value.Null); }
+      return k;
+    };
+  }
+  return Result.Ok(ix);
+}
+
+// A memory pager holding an empty database: page 1, with sqlite_schema's empty root under the header.
+export Pager newPager(i32 pageSize) {
+  Pager pg = Pager.memory(pageSize);
+  startDatabase(pg);
+  return pg;
+}
+
+// Fills an index with an entry for each of its table's rows.
+export void rebuildIndex(Index ix, Table t) {
+  RowCursor c = t.cursor();
+  bool ok = c.first();
+  while (ok) {
+    ix.add(c.row());
+    ok = c.next();
+  }
+}
+
+// ── opening ──────────────────────────────────────────────────────────────
+
+// A database over an image held whole in memory.
+export Result<Database, SqlError> openBytes(u8[] data) {
+  Header h = try readHeader(data, data.len() as i64);
+  return openPager(Pager.fromBytes(h.pageSize, data, h.pageCount), h);
+}
+
+// A database over a pager whose page 1 holds a valid header `h`: sqlite_schema is read, and every
+// table and index attached to its root. Only a WITHOUT ROWID table's rows are read now (see the top).
+export Result<Database, SqlError> openPager(Pager pg, Header h) {
+  Database db = Database.empty();
+  db.main = pg;
+  db.aux = newPager(h.pageSize);
+  db.pageSize = h.pageSize;
+  db.changeCounter = h.changeCounter;
+  db.schemaCookie = h.schemaCookie;
+  db.userVersion = h.userVersion;
+  db.applicationId = h.applicationId;
+  db.wal = h.wal;
+  db.autoVacuum = h.autoVacuum;
+  db.encoding = h.encoding;
+  if (h.reserved != 0) { return Result.Err(SqlError.unsupported("reserved bytes per page")); }
+  Vec<Value[]> schema;
+  Vec<i64> schemaIds;
+  Cursor sc = Cursor.over(pg, 1, true);
+  bool more = sc.first();
+  while (more) {
+    Value[]? v = decodeRecordIn(sc.payload, h.encoding);
+    if (v is null || v!.len() < 5) { return Result.Err(SqlError.corrupt("malformed schema entry")); }
+    schema.push(v!);
+    schemaIds.push(sc.rowid);
+    more = sc.next();
+  }
+  if (pg.fault is not null) { return Result.Err(SqlError.corrupt(pg.fault!)); }
+  // Tables first, so an index can find its table whatever order the entries come in.
+  Vec<Index> autos;
+  for (i32 i = 0; i < schema.len(); i++) {
+    Value[] v = schema.get(i);
+    string? kind = textAt(v, 0);
+    string? name = textAt(v, 1);
+    string? sql = textAt(v, 4);
+    if (kind is null || name is null) { return Result.Err(SqlError.corrupt("malformed schema entry")); }
+    if (kind! != "table") { continue; }
+    if (sql is null) { return Result.Err(SqlError.corrupt("table \{name!} has no sql")); }
+    Stmt st = (try parseOne(sql!)).stmt;
+    match (st) {
+      CreateTableStmt(c): {
+        Table t = try tableFrom(c, autos);
+        i64 root = rootIn(v);
+        if (root < 1 || root > pg.count) { return Result.Err(SqlError.corrupt("table \{name!} has root page \{root}")); }
+        db.prepare(t);
+        if (t.withoutRowid) {
+          t.pg = db.aux;
+          t.root = createTree(db.aux, true);
+          t.fileRoot = root;
+        } else {
+          t.pg = pg;
+          t.root = root;
+        }
+        db.tables.set(lower(t.name), t);
+      }
+      default: { return Result.Err(SqlError.corrupt("schema entry for \{name!} is not CREATE TABLE")); }
+    }
+  }
+  for (i32 i = 0; i < autos.len(); i++) { db.indexes.set(lower(autos.get(i).name), autos.get(i)); }
+  for (i32 i = 0; i < schema.len(); i++) {
+    Value[] v = schema.get(i);
+    string kind = textAt(v, 0)!;
+    string name = textAt(v, 1)!;
+    string? tbl = textAt(v, 2);
+    string? sql = textAt(v, 4);
+    if (kind == "index") {
+      if (sql is not null) {
+        match ((try parseOne(sql!)).stmt) {
+          CreateIndexStmt(c): {
+            Table? t = db.table(c.table);
+            if (t is null) { return Result.Err(SqlError.corrupt("index \{name} is on a missing table")); }
+            db.indexes.set(lower(name), try indexFrom(c, t!));
+          }
+          default: { return Result.Err(SqlError.corrupt("schema entry for \{name} is not CREATE INDEX")); }
+        }
+      } else if (db.index(name) is null) {
+        return Result.Err(SqlError.corrupt("\{name} matches no constraint of its table"));
+      }
+    } else if (kind == "trigger") {
+      if (sql is null) { return Result.Err(SqlError.corrupt("trigger \{name} has no sql")); }
+      match ((try parseOne(sql!)).stmt) {
+        CreateTriggerStmt(t): { db.triggers.set(lower(name), Trigger(t)); }
+        default: { return Result.Err(SqlError.corrupt("schema entry for \{name} is not CREATE TRIGGER")); }
+      }
+    } else if (kind == "view") {
+      if (sql is null) { return Result.Err(SqlError.corrupt("view \{name} has no sql")); }
+      match ((try parseOne(sql!)).stmt) {
+        CreateViewStmt(vn, ine, cols, sel, text): { db.views.set(lower(name), View(name, sql!, cols, sel)); }
+        default: { return Result.Err(SqlError.corrupt("schema entry for \{name} is not CREATE VIEW")); }
+      }
+    } else if (kind != "table") {
+      return Result.Err(SqlError.unsupported("schema entries of type \{kind}"));
+    }
+    db.order.push(SchemaEntry(kind, name, tbl ?? name));
+    // A WITHOUT ROWID table's key index is the table itself in the file, with no entry of its own; it
+    // is listed here, after its table, as the engine lists it on CREATE TABLE.
+    if (kind == "table") {
+      Table t = db.table(name)!;
+      if (t.withoutRowid) { db.order.push(SchemaEntry("index", t.pkIndex, t.name)); }
+    }
+  }
+  // An automatic index the schema does not list would be a table this did not understand.
+  for (i32 i = 0; i < autos.len(); i++) {
+    bool listed = false;
+    for (i32 k = 0; k < db.order.len(); k++) { if (db.order.get(k).name == autos.get(i).name) { listed = true; } }
+    Table owner = db.table(autos.get(i).table)!;
+    if (owner.withoutRowid && owner.pkIndex == autos.get(i).name) { listed = true; }
+    if (!listed) { return Result.Err(SqlError.corrupt("\{autos.get(i).name} is missing from the schema")); }
+  }
+  // Each index to its root; a WITHOUT ROWID table's indexes are made in memory from its rows.
+  for (i32 i = 0; i < schema.len(); i++) {
+    Value[] v = schema.get(i);
+    if (textAt(v, 0)! != "index") { continue; }
+    Index ix = db.index(textAt(v, 1)!)!;
+    Table t = db.table(ix.table)!;
+    i64 root = rootIn(v);
+    if (root < 1 || root > pg.count) { return Result.Err(SqlError.corrupt("index \{ix.name} has root page \{root}")); }
+    ix.enc = db.encoding;
+    if (t.withoutRowid) {
+      ix.fileRoot = root;
+    } else {
+      ix.pg = pg;
+      ix.root = root;
+    }
+  }
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (e.kind != "table") { continue; }
+    Table t = db.table(e.name)!;
+    if (t.withoutRowid) { try loadShadow(db, t); }
+  }
+  if (pg.fault is not null) { return Result.Err(SqlError.corrupt(pg.fault!)); }
+  return Result.Ok(db);
+}
+
+i64 rootIn(const Value[] v) { return match (v[3]) { Int(r): r, default: 0 as i64 }; }
+
+// A WITHOUT ROWID table's rows, read from its b-tree in the file into memory and numbered in key order,
+// with its indexes made from them.
+Result<void, SqlError> loadShadow(Database db, Table t) {
+  bool virt = t.hasVirtual();
+  Cursor c = Cursor.over(db.main, t.fileRoot, false);
+  bool more = c.first();
+  i64 n = 0;
+  while (more) {
+    n++;
+    Value[]? v = decodeRecordIn(c.payload, db.encoding);
+    if (v is null) { return Result.Err(SqlError.corrupt("malformed record in \{t.name}")); }
+    Row r = t.fromRecord(n, v!, virt);
+    if (virt && t.gen is not null) { t.gen!(r); }
+    t.put(r);
+    more = c.next();
+  }
+  Index[] ixs = db.indexesOf(t.name);
+  for (i32 i = 0; i < ixs.len(); i++) {
+    Index ix = ixs[i];
+    ix.enc = db.encoding;
+    ix.pg = db.aux;
+    ix.root = createTree(db.aux, false);
+    rebuildIndex(ix, t);
+  }
+  t.shadowDirty = false;
+  return Result.Ok();
+}
+
+string? textAt(const Value[] v, i32 i) {
+  if (i >= v.len()) { return null; }
+  match (v[i]) { Text(s): { return s; } default: { return null; } }
+}
+
+// ── committing ───────────────────────────────────────────────────────────
+
+// Writes onto the pages what a commit must, besides the rows already there: each WITHOUT ROWID table
+// that changed, sqlite_schema when the schema did, and the header.
+export void flush(Database db, bool schemaChanged) {
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (e.kind != "table" || db.isTemp(e)) { continue; }
+    Table t = db.table(e.name)!;
+    if (t.withoutRowid && t.shadowDirty) { writeShadow(db, t); }
+  }
+  if (schemaChanged) { writeSchema(db); }
+  u8[] h = db.main.write(1);
+  writeHeader(h, db, db.main.pageSize, db.main.count, 0);
+}
+
+// sqlite_schema's rows, made again from the schema.
+void writeSchema(Database db) {
+  clearTree(db.main, 1);
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (isKeyIndex(db, e) || db.isTemp(e)) { continue; }
+    tableInsert(db.main, 1, (i + 1) as i64, schemaRecord(db, e, db.rootOf(e)));
+  }
+}
+
+u8[] schemaRecord(Database db, const SchemaEntry e, i64 root) {
+  Value sql = Value.Null;
+  string tbl = e.table;
+  string name = e.name;
+  if (e.kind == "table") { Table t = db.table(e.name)!; sql = Value.Text(t.sql); name = t.name; tbl = t.name; }
+  else if (e.kind == "index") {
+    Index ix = db.index(e.name)!;
+    if (ix.sql is not null) { sql = Value.Text(ix.sql!); }
+    name = ix.name;
+    tbl = ix.table;
+  } else if (e.kind == "view") { View v = db.view(e.name)!; sql = Value.Text(v.sql); name = v.name; tbl = v.name; }
+  else { Trigger tr = db.trigger(e.name)!; sql = Value.Text(tr.def.sql); name = tr.def.name; tbl = tr.def.table; }
+  return encodeRecordIn([Value.Text(e.kind), Value.Text(name), Value.Text(tbl), Value.Int(root), sql], db.encoding);
+}
+
+// A WITHOUT ROWID table's b-trees in the file, written again from what memory holds.
+void writeShadow(Database db, Table t) {
+  Index pk = db.index(t.pkIndex)!;
+  clearTree(db.main, t.fileRoot);
+  fillTree(db.main, t.fileRoot, shadowRecords(db, t), orderOf(db, pk.desc, pk.colls));
+  Index[] ixs = db.indexesOf(t.name);
+  for (i32 i = 0; i < ixs.len(); i++) {
+    Index ix = ixs[i];
+    if (ix.fileRoot == 0) { continue; }
+    clearTree(db.main, ix.fileRoot);
+    Keyed k = keyedRecords(db, ix, t, pk);
+    fillTree(db.main, ix.fileRoot, k.recs, k.order);
+  }
+  t.shadowDirty = false;
+}
+
+// An index-shaped comparison of records in the file: column by column, in these directions and
+// collations, in the database's encoding.
+Index orderOf(Database db, bool[] desc, i32[] colls) {
+  Index o = Index { name: "", table: "", sql: null, cols: i32[](), desc: desc, colls: colls, unique: false, pred: null, keyFn: null };
+  o.pg = db.main;
+  o.enc = db.encoding;
+  return o;
+}
+
+void fillTree(Pager pg, i64 root, u8[][] recs, Index order) {
+  for (i32 i = 0; i < recs.len(); i++) { indexInsert(pg, root, recs[i], order.cmpTo(order.keyOf(recs[i]))); }
+}
+
+// A WITHOUT ROWID table's records as the file holds them, in its key's order.
+u8[][] shadowRecords(Database db, Table t) {
+  Index pk = db.index(t.pkIndex)!;
+  Vec<u8[]> out;
+  Cursor c = pk.cursor();
+  bool more = c.first();
+  while (more) {
+    Value[] key = pk.keyOf(c.payload);
+    match (key[key.len() - 1]) {
+      Int(id): {
+        Row? r = t.get(id);
+        if (r is not null) { out.push(t.record(r!)); }
+      }
+      default: {}
+    }
+    more = c.next();
+  }
+  return out.toArray();
+}
+
+struct Keyed {
+  u8[][] recs;
+  Index order;
+}
+
+// The records of an index on a WITHOUT ROWID table, as the file holds them: each entry's values, then
+// the table's key columns the index does not already hold (in the key's collations and directions) in
+// place of the rowid, and sorted that way.
+Keyed keyedRecords(Database db, Index ix, Table t, Index pk) {
+  Vec<i32> extra;
+  Vec<bool> extraDesc;
+  for (i32 j = 0; j < pk.cols.len(); j++) {
+    bool held = false;
+    if (ix.keyFn is null) { for (i32 d in ix.cols) { if (d == pk.cols[j]) { held = true; } } }
+    if (!held) { extra.push(pk.cols[j]); extraDesc.push(pk.desc[j]); }
+  }
+  i32 n = ix.cols.len();
+  bool[] desc = bool[].filled(n + extra.len(), false);
+  i32[] colls = i32[].filled(n + extra.len(), 0);
+  desc.copyFrom(ix.desc, 0, 0, n);
+  colls.copyFrom(ix.colls, 0, 0, n);
+  for (i32 k = 0; k < extra.len(); k++) {
+    colls[n + k] = t.cols[extra.get(k)].coll;
+    desc[n + k] = extraDesc.get(k);
+  }
+  Index order = orderOf(db, desc, colls);
+  Vec<Value[]> keys;
+  Cursor c = ix.cursor();
+  bool more = c.first();
+  while (more) {
+    Value[] key = ix.keyOf(c.payload);
+    Value[] fk = Value[].filled(n + extra.len(), Value.Null);
+    fk.copyFrom(key, 0, 0, n);
+    match (key[n]) {
+      Int(id): {
+        Row? r = t.get(id);
+        if (r is not null) { for (i32 k = 0; k < extra.len(); k++) { fk[n + k] = r!.vals[extra.get(k)]; } }
+      }
+      default: {}
+    }
+    keys.push(fk);
+    more = c.next();
+  }
+  Value[][] arr = keys.toArray();
+  sortKeys(arr, (Value[] a, Value[] b) => order.compare(a, b));
+  u8[][] out = u8[][].defaulted(arr.len());
+  for (i32 i = 0; i < arr.len(); i++) { out[i] = encodeRecordIn(arr[i], db.encoding); }
+  return Keyed(out, order);
+}
+
+// A merge sort, stable, of index keys.
+void sortKeys(Value[][] a, fn<i32(Value[], Value[])> cmp) {
+  if (a.len() < 2) { return; }
+  Value[][] tmp = Value[][].defaulted(a.len());
+  i32 width = 1;
+  Value[][] src = a;
+  Value[][] dst = tmp;
+  while (width < a.len()) {
+    for (i32 lo = 0; lo < a.len(); lo += 2 * width) {
+      i32 mid = lo + width < a.len() ? lo + width : a.len();
+      i32 hi = lo + 2 * width < a.len() ? lo + 2 * width : a.len();
+      i32 i = lo;
+      i32 j = mid;
+      i32 k = lo;
+      while (i < mid && j < hi) {
+        if (cmp(src[j], src[i]) < 0) { dst[k] = src[j]; j++; } else { dst[k] = src[i]; i++; }
+        k++;
+      }
+      while (i < mid) { dst[k] = src[i]; i++; k++; }
+      while (j < hi) { dst[k] = src[j]; j++; k++; }
+    }
+    Value[][] sw = src;
+    src = dst;
+    dst = sw;
+    width *= 2;
+  }
+  if (src is not a) { a.copyFrom(src, 0, 0, a.len()); }
+}
+
+// Whether a schema entry is a WITHOUT ROWID table's key index, which the file holds as the table itself
+// and does not list.
+export bool isKeyIndex(Database db, const SchemaEntry e) {
+  if (e.kind != "index") { return false; }
+  Table? t = db.table(e.table);
+  return t is not null && t!.withoutRowid && lower(t!.pkIndex) == lower(e.name);
+}
+
+// ── images ───────────────────────────────────────────────────────────────
+
+// The database's pages as one image: what `Connection.image` answers for a memory database.
+export u8[] toBytes(Database db) {
+  i32 ps = db.main.pageSize;
+  u8[] out = u8[].filled((db.main.count as! i32) * ps, 0);
+  for (i64 p = 1; p <= db.main.count; p++) { out.copyFrom(db.main.page(p), 0, ((p - 1) as! i32) * ps, ps); }
+  return out;
+}
+
+// A fresh image of the whole database, as VACUUM makes: every b-tree built again bottom-up, packed, with
+// no freelist, in the page size and auto-vacuum mode the database is to have.
+export u8[] buildImage(Database db) {
+  Pages ps = Pages(db.pageSize, Vec.create(), db.autoVacuum != 0);
+  ps.reserve();
+  // Roots are reserved up front so the schema can name them; contents follow in schema order.
+  i64[] roots = i64[].filled(db.order.len(), 0);
+  for (i32 i = 0; i < db.order.len(); i++) {
+    string k = db.order.get(i).kind;
+    if ((k == "table" || k == "index") && !isKeyIndex(db, db.order.get(i)) && !db.isTemp(db.order.get(i))) { roots[i] = ps.reserve(); }
+  }
+  Vec<i64> schemaIds;
+  Vec<u8[]> schemaRecs;
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (isKeyIndex(db, e) || db.isTemp(e)) { continue; }
+    if (e.kind == "table") {
+      Table t = db.table(e.name)!;
+      if (t.withoutRowid) {
+        buildIndex(ps, roots[i], shadowRecords(db, t));
+      } else {
+        Vec<i64> ids;
+        Vec<u8[]> recs;
+        Cursor c = Cursor.over(t.pg!, t.root, true);
+        bool more = c.first();
+        while (more) { ids.push(c.rowid); recs.push(c.payload); more = c.next(); }
+        buildTable(ps, roots[i], ids.toArray(), recs.toArray());
+      }
+    } else if (e.kind == "index") {
+      Index ix = db.index(e.name)!;
+      Table owner = db.table(ix.table)!;
+      if (owner.withoutRowid) {
+        buildIndex(ps, roots[i], keyedRecords(db, ix, owner, db.index(owner.pkIndex)!).recs);
+      } else {
+        Vec<u8[]> recs;
+        Cursor c = Cursor.over(ix.pg!, ix.root, false);
+        bool more = c.first();
+        while (more) { recs.push(c.payload); more = c.next(); }
+        buildIndex(ps, roots[i], recs.toArray());
+      }
+    }
+    schemaRecs.push(schemaRecord(db, e, roots[i]));
+    schemaIds.push((i + 1) as i64);
+  }
+  buildTable(ps, 1, schemaIds.toArray(), schemaRecs.toArray());
+  // Auto-vacuum: every root was reserved before any other page, so they are the first pages after the
+  // header's, and the largest of them is what the header records.
+  i64 largestRoot = 0;
+  if (db.autoVacuum != 0) {
+    largestRoot = 1;
+    Vec<i64> all;
+    all.push(1);
+    for (i64 r in roots) {
+      if (r > 0) { all.push(r); }
+      if (r > largestRoot) { largestRoot = r; }
+    }
+    fillPtrmap(ps, all.toArray());
+  }
+  i32 n = ps.pages.len();
+  u8[] out = u8[].filled(n * db.pageSize, 0);
+  for (i32 i = 0; i < n; i++) { out.copyFrom(ps.pages.get(i), 0, i * db.pageSize, db.pageSize); }
+  writeHeader(out, db, db.pageSize, n as i64, largestRoot);
+  return out;
+}
+
+// Points the database's tables and indexes at a new image's b-trees, found by name in its schema.
+export Result<void, SqlError> adopt(Database db, Pager pg) {
+  Map<string, i64> roots = Map.create(hashString, stringEq);
+  Cursor sc = Cursor.over(pg, 1, true);
+  bool more = sc.first();
+  while (more) {
+    Value[]? v = decodeRecordIn(sc.payload, db.encoding);
+    if (v is not null && v!.len() >= 5) {
+      string? name = textAt(v!, 1);
+      if (name is not null) { roots.set(lower(name!), rootIn(v!)); }
+    }
+    more = sc.next();
+  }
+  if (pg.fault is not null) { return Result.Err(SqlError.corrupt(pg.fault!)); }
+  db.main = pg;
+  db.pageSize = pg.pageSize;
+  for (i32 i = 0; i < db.order.len(); i++) {
+    SchemaEntry e = db.order.get(i);
+    if (isKeyIndex(db, e) || db.isTemp(e)) { continue; }
+    i64? r = roots.get(lower(e.name));
+    if (r is null) { continue; }
+    if (e.kind == "table") {
+      Table t = db.table(e.name)!;
+      if (t.withoutRowid) { t.fileRoot = r!; } else { t.pg = pg; t.root = r!; t.forgetAll(); }
+    } else if (e.kind == "index") {
+      Index ix = db.index(e.name)!;
+      Table owner = db.table(ix.table)!;
+      if (owner.withoutRowid) { ix.fileRoot = r!; } else { ix.pg = pg; ix.root = r!; }
+    }
+  }
+  return Result.Ok();
+}
+
+// The 100-byte file header, written over the start of page 1. The freelist's two fields are the
+// pager's, and stay as they are.
+void writeHeader(u8[] b, const Database db, i32 pageSize, i64 pages, i64 largestRoot) {
+  u8[] m = MAGIC.toBytes();
+  b.copyFrom(m, 0, 0, 16);
+  put16(b, 16, pageSize == 65536 ? 1 : pageSize);
+  b[18] = db.wal ? 2 : 1;
+  b[19] = db.wal ? 2 : 1;
+  b[20] = 0;
+  b[21] = 64;
+  b[22] = 32;
+  b[23] = 32;
+  put32(b, 24, db.changeCounter);
+  put32(b, 28, pages);
+  put32(b, 40, db.schemaCookie);
+  put32(b, 44, 4);
+  put32(b, 48, 0);
+  put32(b, 52, largestRoot);
+  put32(b, 56, db.encoding as i64);
+  put32(b, 60, db.userVersion);
+  put32(b, 64, db.autoVacuum == 2 ? 1 : 0);
+  put32(b, 68, db.applicationId);
+  put32(b, 92, db.changeCounter);
+  put32(b, 96, SQLITE_VERSION_NUMBER);
+}

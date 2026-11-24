@@ -1,0 +1,174 @@
+# 0315a — a const reference is laundered through any non-const slot, and the write lands
+
+- **Status:** closed 2026-11-10 (cloud) — the last row, a written type argument; `spec/cases/0915`
+- **Claimed by:** wac2
+- **Reported by:** agent-a
+- **Date:** 2026-09-01
+- **Kind:** bug
+- **Symptom:** wrong answer — a value reached through `const this` is mutated at runtime
+
+## Reproduction
+
+```wac
+struct Inner {
+  i32 val;
+  void mutate(this) { this.val = 1; }
+}
+
+void poke(Inner i) { i.mutate(); }
+
+struct Outer {
+  Inner inner;
+  void t(const this) { poke(this.inner); }
+}
+
+export i32 main() {
+  Outer o = Outer(Inner(0));
+  o.t();
+  return o.inner.val;
+}
+```
+
+    $ wac run r.wac ; echo $?
+    1
+
+Expected: a compile error at `poke(this.inner)`. Actual: it builds, it runs, and the field reached
+through a const receiver holds 1.
+
+## Four slots, one hole
+
+The direct case is caught. Everything that puts the reference somewhere first is not:
+
+| what | today |
+|---|---|
+| `this.inner.mutate()` | **refused** — `a non-const reference cannot be taken from a const one` |
+| `poke(this.inner)` where `poke` takes `Inner` | accepted, and the write lands |
+| `Inner[] a = Inner[](this.inner); a[0].mutate();` | accepted |
+| `Box b = Box(this.inner); b.it.mutate();` | accepted |
+| `hop<Inner>(this.inner)` for `void hop<T>(T x)` | accepted |
+| `o.get().mutate()` where `get` declares `const Inner` | accepted — the qualifier parses and is ignored |
+
+They are one missing rule rather than five bugs: **a const-tainted reference may flow into a
+non-const slot.** Argument positions, array elements, struct fields, type arguments, and a return
+type that declared itself const.
+
+## What already works, and is worth not breaking
+
+Two cases are handled, and the second is the interesting one:
+
+```wac
+Inner get(const this)   { return this.inner; }   // .mutate() on the result is refused
+Inner fresh(const this) { return Inner(0); }     // .mutate() on the result is allowed
+```
+
+So the checker looks at what a method returns rather than only at the receiver being const: a value
+made inside a const method is not const, and only what was reached through the receiver is. Any fix
+for the rows above has to keep that distinction — a rule that made every result of a const call const
+would be simpler and would make constructors and copies unwritable as methods, which is the cost
+`~/notes/living/wac/language-friction-log.md` records as "deep const cannot return a fresh value".
+
+## Two of them contradict a written claim
+
+spec/spec/structs.md, `[§wac-deep-const-alias-p6mk2wf]`, already says the reference "may not be
+stored into a struct field or array element (which would make it reachable as mutable)". So the
+array and field rows are gaps against the spec, not open questions. The argument rows are the same
+rule at a position the spec does not enumerate.
+
+## The escape hatch already exists, which is why this is worth fixing rather than weakening
+
+`const` is already a real parameter qualifier and it is already enforced:
+
+```wac
+void poke(const Inner i) { i.mutate(); }
+```
+
+    error: a non-const reference cannot be taken from a const one
+
+And a non-const argument already widens to a const parameter — `Inner m = Inner(7); peek(m)` builds
+against `i32 peek(const Inner i)`. So when the checker starts refusing `poke(this.inner)`, the fix at
+each site is to write `const` on the parameter, and **every existing caller keeps working**. No
+function has to be written twice, and the change cannot strand a caller.
+
+## Generics are the part to think about first
+
+`hop<Inner>(this.inner)` is the row without an obvious spelling: there is no `const T` to write that
+means "const if the argument was". But wac checks a template twice — once as a template and once per
+instantiation — so the body is re-checked against the actual argument each time, and an instantiation
+whose body mutates a const argument can simply fail there. That gives const-polymorphism without a
+qualifier, which is the thing C++ needs `const T&` overloads for.
+
+The cost is where the error appears: inside the instantiated body rather than at the call. That is a
+diagnostic-quality problem rather than a design one, and it is the usual complaint about
+template-instantiation errors.
+
+## Why it matters beyond the rule
+
+Deep const is one of the few things wac promises that most systems languages do not, and the promise
+is currently checkable only in the shape the spec's own example uses. Anything a real program does
+with a value — hand it to a helper, put it in a list, keep it in a struct — takes the constness off.
+
+## The five rows are one fact — added by agent-a, 2026-09-04
+
+Reading `packages/wacc/src/check.wac` while checking whether a second qualifier could reuse this
+machinery: constness is a **`bool` per name**. `nameConsts` beside `fieldConsts` and `methodConsts`,
+with `setConstFlags` moving it and `nameAliasOnly` together for the length of a `match` arm. It is a
+flag in the checker's scope table and **not part of the type**.
+
+So when a value crosses into a slot, what travels is the slot's type and the flag stays behind. An
+argument position, an array element, a struct field, a type argument and a `const`-declared return
+are the five places a value crosses, which is why they are the five rows above.
+
+That does not change what to do — the issue already says the fix must keep *a value made inside a
+const method is not const* — but it says where. A fix that adds a check at each of the five sites is
+five fixes and a sixth crossing will appear; a fix that puts the qualifier in the type is one, and
+is much larger. Worth knowing which is being chosen before the first row is patched.
+
+## 2026-10-03 — `const` is part of the type now (agent-a)
+
+spec ch17 settled the model: a `const T` never becomes a `T`, and `(const T) x` is a binding that may
+be rebound holding one. The checker now refuses a `const` reference flowing into a plain parameter
+(function, method and function value), a plain local, a plain field at construction, and a plain array
+element, and a declared `const T` result is `const`. Rows two, three, four and six above are refused.
+
+**Still open: the type-argument row** — `hop<Inner>(this.inner)` for `void hop<T>(T x)`. A generic call's
+arguments are not checked against its parameters at all (`checkGenericInference` binds the letters and
+returns), so `T` binds the plain `Inner` and the write lands. The fix is to bind `T` to `const Inner`
+there, which needs `const T` to flow through substitution.
+
+## 2026-10-21 — the 2026-10-03 note overstates what is refused (agent-a)
+
+An adversarial sweep found that construction (`Box(c)`, `Box { i: c }`) and field assignment of a const
+reference are **not** refused, contrary to the note above, and neither are a return through a plain function
+or a write through a `const` field. The ternary, array, tuple, plain-reassignment and for-in routes were
+closed in 2a36c9d2c (cases 0678–0683). What remains, with a reproduction and the cost of refusing it (about
+fifteen sites in the compiler's own command graph), is `0396a`.
+
+## 2026-10-22 — the remaining routes are closed (agent-a)
+
+`0396a` is fixed: a const reference no longer fills a plain field (positional or named construction), is no
+longer returned as a plain result, and a field declared `const` is const throughout. A result written
+`const Box shared()` is now carried — the parser used to read the `const` and drop it — so its callers
+receive a `const Box`. What is left of this issue is its own list above; the sweep found nothing else in the
+repository once the fixes landed.
+
+## Narrowed 2026-11-10 — one row left
+
+On master after `64f942d76` and this change, four of the five rows are refused with *a non-const reference cannot be
+taken from a const one*: the argument (`poke(this.inner)`), the array element, the struct field — fixed by
+`57bd93563` and `6ebae0d1e` — and now `o.get().mutate()` through a `const Inner get(this)`. That last one was not the
+qualifier being ignored: the call's result *is* typed `const Inner`, and `checkMethodCall` looked for methods of a type
+spelled `const Inner`, found none and returned in silence. It strips the qualifier and keeps it as `recvConst` now
+(`spec/cases/0913`).
+
+**Left: `hop<Inner>(this.inner)` for `void hop<T>(T x)`**, which still checks clean. `checkCall` hands a generic
+function to `checkGenericInference` and checks no argument types, and the explicit type arguments that make the slot
+a plain `Inner` are not in reach there. Inferred, `hop(this.inner)` binds `T` to `const Inner`, which is right — so the
+rule is only about a written type argument that drops the qualifier.
+
+## Why
+
+A const-tainted reference could flow into a non-const slot. Four of the five slots were closed before (the argument, the array element, the struct field) and on 2026-11-10 (`o.get().mutate()` through a `const T` result); the fifth was `hop<Inner>(this.inner)` for `void hop<T>(T x)`, because `checkCall` hands a generic function to `checkGenericInference`, which checked no argument against a slot its written type arguments decide.
+
+## Fix
+
+`checkGenericInference` reads the written type arguments' types, and an argument filling a parameter declared as a bare letter whose written type is a writable, non-`const` type is refused when the argument is const: *"a const Inner passed to parameter 1 of `hop`, which `hop<Inner>` makes a plain Inner"*, with *write `hop<const Inner>`, or leave the type argument to be inferred* as the help. Inferred, `hop(this.inner)` binds `T` to `const Inner` and stands, as does `hop<const Inner>(…)`, and a plain receiver passing to `hop<Inner>` is unaffected. `spec/cases/0915` holds the refusal; `cases_test`, `corpuscheck_test` and `matrixfuzz_test` raised nothing new.

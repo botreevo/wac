@@ -1,0 +1,64 @@
+// Data channels of every kind, against aiortc playing the browser — `test/channels_oracle.py`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-net packages/webrtc/test/wac/channels_test.wac
+//
+// `example/answer.wac` is built and handed to the oracle, which offers, starts it with the offer on its input, and
+// asks: a negotiated reliable channel and a negotiated unordered one with no retransmissions (KPS's two), three
+// DCEP channels, a 50 KB message, and a channel closed by stream reset while the others carry on. aiortc's SCTP
+// never saw this code, and it refuses the unreliable channel outright unless our INIT says we speak FORWARD-TSN —
+// so a green run is the association's extensions working as well as its basics.
+//
+// Chromium asks the same of the session in `browser.test.ts`; aiortc is here because it runs from a wac test, and
+// because it is strict where libwebrtc is lenient: it would not finish DTLS without an SRTP profile in our
+// ServerHello, which Chromium never asked for.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { absentOracle } from "../../../wactest/src/oracle.wac";
+import { freshDir } from "../../../wactest/src/host.wac";
+import { wacBinary } from "../../../wactest/src/built.wac";
+import { Held } from "../../../wactest/src/daemon.wac";
+import { flatten } from "core";
+import { ChildEnv, Exec, Launch, Sys } from "std";
+
+static string SOURCE = "packages/webrtc/example/answer.wac";
+static string ORACLE = "packages/webrtc/test/channels_oracle.py";
+
+export string test_aiortc_opens_every_kind_of_channel_against_the_example(Sys sys) {
+  T t = T.create();
+  string dir = "\{flatten(sys.env().cwd().wait()).unwrap()}/.cache/channels";
+  string whyDir = freshDir(sys.files(), dir);
+  t.isTrue(whyDir == "", whyDir);
+  string stem = "\{dir}/answer";
+  auto built = flatten(sys.procs().exec(wacBinary(sys.env()), ["build", SOURCE, "-o", stem, "--allow-net", "--quiet"],
+                                        u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? b = built.ok();
+  t.isTrue(b is not null && b!.status == 0, "the example builds: \{b is null ? "" : string.fromBytes(b!.stderr)}");
+  if (b is null || b!.status != 0) { return t.report(); }
+
+  Held held = Held.take(sys.net());
+  t.isTrue(held.port > 0, "a port to run it on");
+  if (held.port < 0) { return t.report(); }
+  i32 port = held.port;
+  held.release();
+
+  auto ran = flatten(sys.procs().exec("python3", [ORACLE, "127.0.0.1", "\{port}", wacBinary(sys.env()), "\{stem}.wasm"],
+                                      u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = ran.ok();
+  // aiortc is the oracle; not installed is a skip, saying so (spec ch47 `§wac-test-skip-k4r8w2m`).
+  if (absentOracle(t, "aiortc against the example", "python3", r)) { return t.report(); }
+  if (r is null) { return t.report(); }
+  string out = string.fromBytes(r!.stdout);
+  t.isTrue(out.indexOf("DONE ") >= 0, "the oracle finished: \{out} \{string.fromBytes(r!.stderr)}");
+  i32 at = 0;
+  i32 passes = 0;
+  while (true) {
+    i32 nl = out.slice(at, out.len()).indexOf("\n");
+    if (nl < 0) { break; }
+    string line = out.slice(at, at + nl);
+    at = at + nl + 1;
+    if (line.indexOf("FAIL ") == 0) { t.fail(line.slice(5, line.len())); }
+    if (line.indexOf("PASS ") == 0) { passes++; }
+  }
+  t.isTrue(passes >= 10, "aiortc asked at least ten things and they passed: \{passes}");
+  return t.report();
+}

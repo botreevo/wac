@@ -1,0 +1,696 @@
+// `core` and `std`, from one source tree into the compiler that embeds them — `design/lang/0009`
+// D3 step 2.
+//
+//     wac task gen:core           # write the embedding
+//     wac task gen:core --check   # fail if it is out of step
+//
+// ## Why a generator rather than a shared file
+//
+// **The compiler cannot read `core` at runtime.** wacc's copy lives inside a wasm module, and a
+// module has no filesystem. So it keeps a literal, and de-duplicating means generating that literal
+// from the tree rather than teaching the compiler to open a file.
+//
+// **`core` and `std` are each reached by their name alone** — spec ch02, `§wac-no-subpath-wqatc72`.
+// `core`'s name reaches its entry, `core/core.wac`, which re-exports from the rest of its files; each of
+// those is carried as a module of its own (`carriedTree`). `std` is `std/platform.wac`.
+//
+// There were two outputs until 2026-08-28: this also wrote the TypeScript reference's copy of the
+// same declarations, and generating both from one tree was how they were kept from drifting. There
+// is one compiler now, so there is one copy and nothing to drift from — but the *lists* below are
+// still what `coreSource`, `coreExports` and the banner are generated from, which is what stops
+// them answering for different sets.
+//
+// **In wac since 2026-08-30**, from tools/genCore.ts. Deno is a bootstrap host and a test oracle;
+// it was on the build path here, which is the one place it should not be — a generated file whose
+// generator needs a second runtime is a file a fresh checkout cannot regenerate.
+
+import { Sys, Files, Output } from "std";
+import { joined, splitKeepingEmpty, trimmed } from "../../packages/wactest/src/strings.wac";
+import { itoa } from "../../packages/fmt/src/itoa.wac";
+import { flatten } from "core";
+import { enumVariantsOfText, variadicCalleesIn } from "../../packages/wacc/src/scans.wac";
+
+/** `core`'s entry: the module `import { … } from "core"` reaches, which says which of the files' names are core's. */
+string coreEntry() { return "core/core.wac"; }
+
+/**
+ * **Every other file of `core`, each a module of its own** — carried by the compiler beside the entry.
+ *
+ * Each is a file as any project writes one: its imports are kept, its names are its own, and it is reached
+ * the way any module is, through the entry's `export { … } from` and `export * as`. The compiler carries each
+ * under a key no file path can spell, `" core/vec.wac"`, and reads it from there as it reads any file.
+ *
+ * Until 2026-11-02 the files were concatenated into one module with their imports blanked, which the
+ * compiler read without lowering: so `core` could not say `export * as`, its namespaces were dotted names
+ * written out by hand, and its files' own scopes were a fiction the concatenation did not keep.
+ */
+string[] carriedTree() {
+  return [
+    "core/read.wac", "core/result.wac", "core/hash.wac",
+    "core/map.wac", "core/vec.wac", "core/buf.wac", "core/text.wac", "core/operators.wac",
+    "core/ticket.wac", "core/number.wac", "core/hypothetical.wac", "core/math.wac", "core/markup.wac", "core/strings.wac"
+  ];
+}
+
+/** The key the compiler carries a file of `carriedTree` under: its path, behind a space no file path has. */
+string carriedKey(string path) { return " " + path; }
+
+/**
+ * `std` — the capability half of the built-ins, `design/lang/0009` D4.
+ *
+ * **One file, and D4 is what says so**: `std` is "`Core`, `Cli`, filesystem, network, processes,
+ * environment, terminal, clocks, randomness, page", which is `platform.wac` and names nothing else.
+ * `frame.wac` and `stream.wac` sit next to it in `packages/platform` and are *not* in it — they are
+ * library code written over the capabilities rather than capabilities, and they stay a package.
+ *
+ * That distinction is also the one the mechanism can enforce. **A built-in cannot import a
+ * package**, because the compiler carries its text and there is no `../../bytes/src/buf.wac` inside
+ * a wasm module. `platform.wac` imports `"core"` and nothing else, so it embeds exactly.
+ */
+string stdPath() { return "std/platform.wac"; }
+
+/** The one file this writes. */
+string waccOut() { return "packages/wacc/src/coretext.wac"; }
+
+/**
+ * Every input read once, in the order the generated file names them: `core`'s files, then `std`.
+ *
+ * One read rather than one per use, because `coreSource`, `coreExports` and the banner all want the
+ * same bytes and a file that changed between two of those reads would produce an embedding that never
+ * existed on disk.
+ */
+struct Tree {
+  string[] paths;
+  string[] texts;
+  string why;
+  /** `carriedTree`'s files, read with the rest. */
+  string[] carriedPaths;
+  string[] carriedTexts;
+
+  bool ok(const this) { return this.why == ""; }
+
+  /** `core`'s entry, as written. */
+  string coreText(const this) { return this.texts[0]; }
+
+  /** Every `export * as X from "./f.wac"` in the entry, as `X|<key>` — see `starsOf`. */
+  string[] stars(const this) { return starsOf(this.texts[0]); }
+
+  string stdText(const this) { return this.texts[this.paths.len() - 1]; }
+
+  /** Every carried file's text, one after another — for the tables that are about `core` as a whole. */
+  string carriedAll(const this) {
+    string out = "";
+    for (i32 i = 0; i < this.carriedTexts.len(); i++) { out = out + "\n" + this.carriedTexts[i]; }
+    return out;
+  }
+}
+
+bool startsWith(string s, string prefix) {
+  return s.len() >= prefix.len() && s.slice(0, prefix.len()) == prefix;
+}
+
+/**
+ * The names `core` exports, from its text: every top-level `export` declaration's name.
+ *
+ * Read from the declarations rather than listed, because a list is a second statement of what the files
+ * already say. A top-level declaration starts in column 0, and its name is the word before the first
+ * `(`, `{`, `=`, `;` or `:` once a generic parameter list there is stepped over — `export struct Vec<T> {`,
+ * `export Option<B> mapOption<A, B>(`, `export static i32 N = 1;`, `export struct Ticket<T> : TicketBase {`.
+ */
+string[] exportsOf(string text) {
+  string[] ls = splitKeepingEmpty(text);
+  string[] found = string[].filled(ls.len(), "");
+  i32 n = 0;
+  for (i32 i = 0; i < ls.len(); i++) {
+    if (!startsWith(ls[i], "export ")) { continue; }
+    u8[] b = ls[i].toBytes();
+    i32 end = 7;
+    i32 depth = 0;
+    while (end < b.len()) {
+      i32 c = b[end] as i32;
+      if (c == 60) { depth = depth + 1; }
+      if (c == 62) { depth = depth - 1; }
+      if (depth == 0 && (c == 40 || c == 123 || c == 61 || c == 59 || c == 58)) { break; }
+      end = end + 1;
+    }
+    while (end > 7 && b[end - 1] == 32) { end = end - 1; }
+    if (end > 7 && b[end - 1] == 62) {
+      // `mapOption<A, B>` — step back over the parameter list to the name.
+      i32 d = 0;
+      while (end > 7) {
+        end = end - 1;
+        if (b[end] == 62) { d = d + 1; }
+        if (b[end] == 60) { d = d - 1; }
+        if (d == 0) { break; }
+      }
+      while (end > 7 && b[end - 1] == 32) { end = end - 1; }
+    }
+    i32 start = end;
+    while (start > 7 && b[start - 1] != 32 && b[start - 1] != 62) { start = start - 1; }
+    if (start < end) {
+      string name = ls[i].slice(start, end);
+      // A verbatim name, `@"operators.add"`, exports its text (spec ch01).
+      if (name.len() > 3 && name.slice(0, 2) == "@\"") { name = name.slice(2, name.len() - 1); }
+      found[n] = name;
+      n = n + 1;
+    }
+  }
+  string[] out = string[].filled(n, "");
+  out.copyFrom(found, 0, 0, n);
+  return out;
+}
+
+/**
+ * The names `core`'s entry exports through its lists, `export { a, b as c } from "./f.wac";` — each item's
+ * name after `as`, or else its own, a verbatim name as its text (spec ch01). A list may run over lines.
+ */
+string[] entryListNames(string text) {
+  string[] found = string[].filled(text.len() / 4 + 1, "");
+  i32 n = 0;
+  i32 at = text.indexOf("export {");
+  while (at >= 0) {
+    string rest = text.slice(at + 8, text.len());
+    i32 close = rest.indexOf("}");
+    if (close < 0) { break; }
+    string[] items = splitOn(rest.slice(0, close), ",");
+    for (i32 i = 0; i < items.len(); i++) {
+      string item = trimmed(items[i]);
+      i32 rename = item.indexOf(" as ");
+      if (rename >= 0) { item = trimmed(item.slice(rename + 4, item.len())); }
+      if (item.len() > 3 && item.slice(0, 2) == "@\"") { item = item.slice(2, item.len() - 1); }
+      if (item != "") { found[n] = item; n = n + 1; }
+    }
+    i32 next = rest.slice(close, rest.len()).indexOf("export {");
+    at = next < 0 ? 0 - 1 : at + 8 + close + next;
+  }
+  string[] out = string[].filled(n, "");
+  out.copyFrom(found, 0, 0, n);
+  return out;
+}
+
+/** `s` cut at every `sep`. */
+string[] splitOn(string s, string sep) {
+  string[] parts = string[].filled(s.len() + 1, "");
+  i32 n = 0;
+  i32 from = 0;
+  i32 at = s.indexOf(sep);
+  while (at >= 0) {
+    parts[n] = s.slice(from, from + at);
+    n = n + 1;
+    from = from + at + sep.len();
+    at = s.slice(from, s.len()).indexOf(sep);
+  }
+  parts[n] = s.slice(from, s.len());
+  string[] out = string[].filled(n + 1, "");
+  out.copyFrom(parts, 0, 0, n + 1);
+  return out;
+}
+
+/**
+ * The names declared at the top of a file — its own, exported or not: what the emitter will name
+ * unqualified for a carried file, so two of `core`'s files must not share one (`duplicateNames`).
+ */
+string[] topLevelNamesOf(string text) {
+  string[] ls = splitKeepingEmpty(text);
+  string[] found = string[].filled(ls.len(), "");
+  i32 n = 0;
+  for (i32 i = 0; i < ls.len(); i++) {
+    string l = ls[i];
+    if (l.len() == 0 || l.slice(0, 1) == " " || l.slice(0, 1) == "/" || l.slice(0, 1) == "*"
+        || l.slice(0, 1) == "}" || l.slice(0, 1) == ")" || startsWith(l, "import ")
+        || startsWith(l, "export {") || startsWith(l, "export *")) { continue; }
+    string decl = startsWith(l, "export ") ? l : "export " + l;
+    string[] one = exportsOf(decl);
+    if (one.len() == 1) { found[n] = one[0]; n = n + 1; }
+  }
+  string[] out = string[].filled(n, "");
+  out.copyFrom(found, 0, 0, n);
+  return out;
+}
+
+/** "" when no two of `core`'s carried files declare one top-level name; otherwise the first such, said. */
+string duplicateNames(string[] paths, string[] texts) {
+  for (i32 a = 0; a < paths.len(); a++) {
+    string[] mine = topLevelNamesOf(texts[a]);
+    for (i32 b = a + 1; b < paths.len(); b++) {
+      string[] theirs = topLevelNamesOf(texts[b]);
+      for (i32 i = 0; i < mine.len(); i++) {
+        for (i32 j = 0; j < theirs.len(); j++) {
+          if (mine[i] == theirs[j]) {
+            return paths[a] + " and " + paths[b] + " both declare `" + mine[i] + "`, and a carried file's names are "
+                 + "emitted as they are written — rename one";
+          }
+        }
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * `core`'s namespace re-exports, `export * as X from "./f.wac";` one to a line, as `X|<key of core/f.wac>`.
+ */
+string[] starsOf(string text) {
+  string[] ls = splitKeepingEmpty(text);
+  string[] found = string[].filled(ls.len(), "");
+  i32 n = 0;
+  for (i32 i = 0; i < ls.len(); i++) {
+    string l = ls[i];
+    if (!startsWith(l, "export * as ")) { continue; }
+    i32 from = l.indexOf(" from \"./");
+    if (from < 0) { continue; }
+    string name = l.slice(12, from);
+    string rest = l.slice(from + 9, l.len());
+    i32 close = rest.indexOf("\"");
+    if (close < 0) { continue; }
+    found[n] = name + "|" + carriedKey("core/" + rest.slice(0, close));
+    n = n + 1;
+  }
+  string[] out = string[].filled(n, "");
+  out.copyFrom(found, 0, 0, n);
+  return out;
+}
+
+/**
+ * Every symbol `core`'s files declare, under the name a program reaches it by: `toString` as it is, and one
+ * a namespace module declares behind its namespace — `operators.wac`'s `add` is `operators.add`.
+ */
+string[] qualifiedSymbols(Tree tree, string[] stars) {
+  string[] found = string[].filled(512, "");
+  i32 n = 0;
+  for (i32 i = 0; i < tree.carriedPaths.len(); i++) {
+    string key = carriedKey(tree.carriedPaths[i]);
+    string prefix = "";
+    for (i32 k = 0; k < stars.len(); k++) {
+      i32 bar = stars[k].indexOf("|");
+      if (stars[k].slice(bar + 1, stars[k].len()) == key) { prefix = stars[k].slice(0, bar) + "."; }
+    }
+    string[] own = symbolsOf(tree.carriedTexts[i]);
+    for (i32 j = 0; j < own.len() && n < found.len(); j++) {
+      found[n] = prefix + own[j];
+      n = n + 1;
+    }
+  }
+  string[] out = string[].filled(n, "");
+  out.copyFrom(found, 0, 0, n);
+  return out;
+}
+
+/** The names `export symbol …;` declares, in order — a verbatim name as its text (spec ch01). */
+string[] symbolsOf(string text) {
+  string[] ls = splitKeepingEmpty(text);
+  string[] found = string[].filled(ls.len(), "");
+  i32 n = 0;
+  for (i32 i = 0; i < ls.len(); i++) {
+    string l = ls[i];
+    if (l.len() < 15 || l.slice(0, 14) != "export symbol ") { continue; }
+    i32 end = l.indexOf(";");
+    if (end < 0) { continue; }
+    string name = l.slice(14, end);
+    if (name.len() > 3 && name.slice(0, 2) == "@\"") { name = name.slice(2, name.len() - 1); }
+    found[n] = name;
+    n = n + 1;
+  }
+  string[] out = string[].filled(n, "");
+  out.copyFrom(found, 0, 0, n);
+  return out;
+}
+
+/**
+ * Read every input, collapsing each file's trailing newlines to exactly one.
+ *
+ * Collapsing rather than trimming: a file with no trailing newline keeps none, so the embedding of
+ * a file is the file, and only the ragged blank lines a text editor leaves are normalised away.
+ */
+Tree readTree(Files fs) {
+  string[] paths = string[].filled(2, "");
+  paths[0] = coreEntry();
+  paths[1] = stdPath();
+
+  string[] texts = string[].filled(paths.len(), "");
+  string[] why = string[].filled(1, "");
+  for (i32 i = 0; i < paths.len(); i++) { texts[i] = readNormalised(fs, paths[i], why); }
+  string[] carried = carriedTree();
+  string[] carriedTexts = string[].filled(carried.len(), "");
+  for (i32 i = 0; i < carried.len(); i++) { carriedTexts[i] = readNormalised(fs, carried[i], why); }
+  return Tree(paths, texts, why[0], carried, carriedTexts);
+}
+
+/** A file with its trailing newlines collapsed to one; `why[0]` says so when it cannot be read. */
+string readNormalised(Files fs, string path, string[] why) {
+  u8[]? f = flatten(fs.readFile(path).wait()).ok();
+  if ((f is null)) {
+    if (why[0] == "") { why[0] = "cannot read " + path; }
+    return "";
+  }
+  string t = string.fromBytes(f!);
+  i32 e = t.len();
+  while (e > 0 && t.slice(e - 1, e) == "\n") { e = e - 1; }
+  return e < t.len() ? t.slice(0, e) + "\n" : t;
+}
+
+/** A path or specifier as a wac string literal. */
+string quoted(string s) {
+  string out = "\"";
+  u8[] b = s.toBytes();
+  i32 from = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 c = b[i] as i32;
+    if (c != 92 && c != 34) { continue; }
+    out = out + s.slice(from, i) + (c == 92 ? "\\\\" : "\\\"");
+    from = i + 1;
+  }
+  return out + s.slice(from, s.len()) + "\"";
+}
+
+/**
+ * One source line as a wac string literal ending in `\n`.
+ *
+ * Scanning the bytes and slicing only at the ones that need escaping, rather than a byte at a time:
+ * `\` and `"` are ASCII and UTF-8 is self-synchronising, so every cut this makes is on a codepoint
+ * boundary however much of `core` is not ASCII.
+ */
+string quotedLine(string l) {
+  string out = "\"";
+  u8[] b = l.toBytes();
+  i32 from = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 c = b[i] as i32;
+    if (c != 92 && c != 34) { continue; }
+    out = out + l.slice(from, i) + (c == 92 ? "\\\\" : "\\\"");
+    from = i + 1;
+  }
+  return out + l.slice(from, l.len()) + "\\n\"";
+}
+
+/**
+ * The text as wac statements: one quoted line per source line, in an array, joined by a loop.
+ *
+ * A line each rather than one long literal, because that is what makes a diff of the generated file
+ * readable — a one-line change to `core` should be a one-line change there.
+ */
+string asWac(string text) {
+  string[] lines = splitKeepingEmpty(text);
+  i32 n = lines.len();
+  if (n > 0 && lines[n - 1] == "") { n = n - 1; }
+  if (n == 0) { return "  return \"\";"; }
+
+  // **An array and a loop, because no expression may grow with the text.** This was one `+` chain
+  // until `issues/lang/0165a`: `std/platform.wac` as a single chain was an expression ~1,939
+  // operands deep, and every recursive walk over it — parse, check, emit — recursed once per
+  // operand, until one import edge tipped it into `Maximum call stack size exceeded`.
+  //
+  // The fix then was chunks of 64, `s = s + …;` statements — which holds for the compiler and not
+  // for the optimiser. binaryen's local sinking folds each `s = s + …` into the next one, rebuilding
+  // the chain whole, and its binary writer recurses once per level: `--optimize` of anything that
+  // embeds wacc died in `emitBinary` with the same RangeError, the deploy's `wacc.html` first. An
+  // array literal is one flat list of operands and a loop cannot be folded into an expression, so the
+  // depth no longer depends on how long `core` is, for any consumer.
+  string out = "  string[] lines = [\n";
+  for (i32 i = 0; i < n; i++) {
+    out = out + "    " + quotedLine(lines[i]) + (i + 1 < n ? ",\n" : "\n");
+  }
+  // `as string[]` because wac-L5 builds this file too, and it reads an array literal only with
+  // its type written after it.
+  //
+  // **Into one buffer, not `s = s + lines[i]`.** That copies everything so far once per line — about
+  // 350 MB to build `std` — and wacc asks for these texts several times per build, so it was most of
+  // the time of compiling anything (`issues/lang/0398b`). Measuring first and copying each line once
+  // is linear in the text.
+  out = out + "  ] as string[];\n";
+  out = out + "  i32 total = 0;\n";
+  out = out + "  for (i32 i = 0; i < lines.len(); i++) { total = total + lines[i].toBytes().len(); }\n";
+  out = out + "  u8[] all = u8[].filled(total, 0);\n";
+  out = out + "  i32 at = 0;\n";
+  out = out + "  for (i32 i = 0; i < lines.len(); i++) {\n";
+  out = out + "    u8[] b = lines[i].toBytes();\n";
+  out = out + "    all.copyFrom(b, 0, at, b.len());\n";
+  out = out + "    at = at + b.len();\n";
+  out = out + "  }\n";
+  return out + "  return string.fromBytes(all);";
+}
+
+/** `"a", "b"` — the body of a `[…]` literal. */
+string quotedList(string[] paths) {
+  string[] out = string[].filled(paths.len(), "");
+  for (i32 i = 0; i < paths.len(); i++) { out[i] = quoted(paths[i]); }
+  return joined(out, ", ");
+}
+
+string blk(string[] ls) { return joined(ls, "\n"); }
+
+/** `s` as one string literal, its line breaks written `\n` — a table, without a `+` per row. */
+string oneLiteral(string s) {
+  string q = quoted(s);
+  u8[] b = q.toBytes();
+  i32 breaks = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == 10) { breaks++; } }
+  u8[] out = u8[].filled(b.len() + breaks, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == 10) { out[at] = 92; out[at + 1] = 110; at = at + 2; continue; }
+    out[at] = b[i];
+    at = at + 1;
+  }
+  return string.fromBytes(out);
+}
+
+/**
+ * `Name|count|d0;d1;…` for each `struct` or `enum` header in `text` with a default type argument — the
+ * same table `lowerTypeDefaults` reads off a program's own files. A header is one line in core and std.
+ */
+string[] typeDefaultsTable(string text) {
+  string[] ls = splitKeepingEmpty(text);
+  string[] out = string[].filled(ls.len(), "");
+  i32 n = 0;
+  for (i32 i = 0; i < ls.len(); i++) {
+    string l = ls[i];
+    i32 k = l.indexOf("enum ");
+    i32 kw = 5;
+    if (k < 0) { k = l.indexOf("struct "); kw = 7; }
+    string lead = k > 0 ? trimmed(l.slice(0, k)) : "";
+    if (k < 0 || (lead != "" && lead != "export" && lead != "export const")) { continue; }
+    string rest = l.slice(k + kw, l.len());
+    i32 lt = rest.indexOf("<");
+    i32 gt = rest.indexOf(">");
+    if (lt < 0 || gt < lt || rest.slice(lt, gt).indexOf("=") < 0) { continue; }
+    string name = trimmed(rest.slice(0, lt));
+    string[] params = splitOnComma(rest.slice(lt + 1, gt));
+    string defaults = "";
+    for (i32 p = 0; p < params.len(); p++) {
+      i32 eq = params[p].indexOf("=");
+      defaults = defaults + (p > 0 ? ";" : "") + (eq < 0 ? "" : trimmed(params[p].slice(eq + 1, params[p].len())));
+    }
+    out[n] = name + "|" + itoa(params.len()) + "|" + defaults;
+    n++;
+  }
+  string[] exact = string[].filled(n, "");
+  exact.copyFrom(out, 0, 0, n);
+  return exact;
+}
+
+string[] splitOnComma(string s) {
+  i32 n = 1;
+  for (i32 i = 0; i < s.len(); i++) { if (s.slice(i, i + 1) == ",") { n++; } }
+  string[] out = string[].filled(n, "");
+  i32 k = 0;
+  i32 from = 0;
+  for (i32 i = 0; i < s.len(); i++) {
+    if (s.slice(i, i + 1) == ",") { out[k] = s.slice(from, i); k++; from = i + 1; }
+  }
+  out[k] = s.slice(from, s.len());
+  return out;
+}
+
+/** A function body answering `callee<i>()` for the `i`th of `keys`, and `none` for any other key. */
+string carriedDispatch(string[] keys, string callee, string none) {
+  string out = "";
+  for (i32 i = 0; i < keys.len(); i++) {
+    out = out + "  if (key == " + quoted(keys[i]) + ") { return " + callee + itoa(i) + "(); }\n";
+  }
+  return out + "  return " + none + ";";
+}
+
+/** `carriedExports`' body: each carried file's export list, by key. */
+string carriedExportsBody(string[] keys, string[] texts) {
+  string out = "";
+  for (i32 i = 0; i < keys.len(); i++) {
+    out = out + "  if (key == " + quoted(keys[i]) + ") { return [" + quotedList(exportsOf(texts[i])) + "] as string[]; }\n";
+  }
+  return out + "  return string[]();";
+}
+
+/** One function per carried file, holding its text — the same shape `coreSource` has, for the same reason. */
+string carriedTextFunctions(string[] texts) {
+  string out = "";
+  for (i32 i = 0; i < texts.len(); i++) {
+    out = out + "string carriedText" + itoa(i) + "() {\n" + asWac(texts[i]) + "\n}\n\n";
+  }
+  return out;
+}
+
+/** The table as a wac expression: each line quoted and ended with a newline. */
+string typeDefaultsWac(string[] rows) {
+  if (rows.len() == 0) { return "\"\""; }
+  string out = "";
+  for (i32 i = 0; i < rows.len(); i++) { out = out + (i == 0 ? "" : " + ") + quoted(rows[i]) + " + \"\\n\""; }
+  return out;
+}
+
+/** The whole of `packages/wacc/src/coretext.wac`. */
+string waccFile(Tree tree) {
+  // **Every input, not only the root.** The banner once named two of `core`'s files and omitted the rest
+  // and `std/platform.wac`, so somebody editing one of those had nothing telling them a generated file
+  // had gone stale.
+  string core = tree.coreText();
+  string[] stars = tree.stars();
+  string[] starNames = string[].filled(stars.len(), "");
+  for (i32 i = 0; i < stars.len(); i++) { starNames[i] = stars[i].slice(0, stars[i].indexOf("|")); }
+  string[] listed = entryListNames(core);
+  string[] exported = string[].filled(listed.len() + stars.len(), "");
+  exported.copyFrom(listed, 0, 0, listed.len());
+  exported.copyFrom(starNames, 0, listed.len(), stars.len());
+  string carriedAll = tree.carriedAll();
+  string[] keys = string[].filled(tree.carriedPaths.len(), "");
+  for (i32 i = 0; i < keys.len(); i++) { keys[i] = carriedKey(tree.carriedPaths[i]); }
+  string[] inputs = string[].filled(tree.paths.len() + keys.len(), "");
+  inputs.copyFrom(tree.paths, 0, 0, tree.paths.len());
+  inputs.copyFrom(tree.carriedPaths, 0, tree.paths.len(), keys.len());
+  return blk([
+    "// Generated by `wac task gen:core` from " + joined(inputs, ", ") + ". Do not edit.",
+    "//",
+    "// wacc's embedding of `core` and `std`. `core/README.md` says why anything is in there; this file is",
+    "// only the text, kept apart from `emit.wac` so that a generator owns a whole file rather than splicing",
+    "// into one that is also in the seed.",
+    "",
+    "/** `core`'s entry, the module `import { … } from \"core\"` reaches: re-exports of its carried files. */",
+    "export string coreSource() {",
+    asWac(core),
+    "}",
+    "",
+    "/** `std`, the module `import { … } from \"std\"` reaches. */",
+    "export string stdSource() {",
+    asWac(tree.stdText()),
+    "}",
+    "",
+    "/**",
+    " * Every name `core` exports, read from its entry — so a check with no files in hand can still",
+    " * say *no such export* about a name `core` does not have.",
+    " */",
+    "export string[] coreExports() {",
+    "  return [" + quotedList(exported) + "] as string[];",
+    "}",
+    "",
+    "/**",
+    " * `core`'s namespaces that are modules of their own, as `name|<key>`: `export * as math from",
+    " * \"./math.wac\"` is `math` and the key the compiler carries `core/math.wac` under.",
+    " */",
+    "export string[] coreStars() {",
+    "  return [" + quotedList(stars) + "] as string[];",
+    "}",
+    "",
+    "/** The keys of `core`'s carried modules, in the order `carriedText` and `carriedExports` take them. */",
+    "export string[] carriedKeys() {",
+    "  return [" + quotedList(keys) + "] as string[];",
+    "}",
+    "",
+    "/** A carried module's text, or `\"\"` for a key that names none. */",
+    "export string carriedText(string key) {",
+    carriedDispatch(keys, "carriedText", "\"\""),
+    "}",
+    "",
+    "/** The names a carried module exports, read from its declarations as `coreExports` reads `core`'s. */",
+    "export string[] carriedExports(string key) {",
+    carriedExportsBody(keys, tree.carriedTexts),
+    "}",
+    "",
+    carriedTextFunctions(tree.carriedTexts),
+    "/** Whether a key is in `core`'s carried tree — a path behind the space no file path starts with. */",
+    "export bool isCarriedKey(string spec) { return spec.len() > 6 && spec.slice(0, 6) == \" core/\"; }",
+    "",
+    "/**",
+    " * The exports of `core` that are symbols — `toString`, `markup.text` — so a check of one file can",
+    " * know a member named `[markup.text]` is named by one, with no files in hand to read it from.",
+    " */",
+    "export string[] coreSymbols() {",
+    "  return [" + quotedList(qualifiedSymbols(tree, stars)) + "] as string[];",
+    "}",
+    "",
+    "/**",
+    " * The default type arguments `core` and `std` declare, as `Name|count|d0;d1;…` lines — read here, once,",
+    " * so `lowerTypeDefaults` need not lex the whole of both on every compile (spec ch19).",
+    " */",
+    "export string builtinTypeDefaults() {",
+    "  return " + typeDefaultsWac(typeDefaultsTable(carriedAll + "\n" + tree.stdText())) + ";",
+    "}",
+    "",
+    "/**",
+    " * The enums `core` and then `std` declare, as `Name|V1|V2|` lines — `enumVariantsIn` from `scans.wac`,",
+    " * run here once, so `lowerUnqualifiedVariants` need not parse both on every compile.",
+    " */",
+    "export string builtinEnumVariants() {",
+    "  return " + oneLiteral(enumVariantsOfText(carriedAll) + enumVariantsOfText(tree.stdText())) + ";",
+    "}",
+    "",
+    "/** The names of `core`'s variadic functions and methods, as `|a|b|` — `variadicCalleesIn` from `scans.wac`. */",
+    "export string builtinVariadicCallees() {",
+    "  return " + oneLiteral(variadicCalleesIn(carriedAll)) + ";",
+    "}",
+    "",
+    "/**",
+    " * Does this specifier name a module inside the compiler rather than a file on disk? The two names, and",
+    " * the keys of `core`'s carried modules, which only the compiler writes: a path below either name is",
+    " * refused, since a package is named whole (`§wac-no-subpath-wqatc72`).",
+    " */",
+    "export bool isBuiltinSpec(string spec) { return spec == \"core\" || spec == \"std\" || isCarriedKey(spec); }",
+    ""
+  ]);
+}
+
+export i32 main(Sys sys) {
+  string[] argv = sys.args();
+  Output err = sys.stderr();
+  Output out = sys.stdout();
+  Files fs = sys.files();
+  bool check = false;
+  i32 argc = argv.len();
+  for (i32 i = 0; i < argc; i++) {
+    if (argv[i] == "--check") { check = true; }
+  }
+
+  Tree tree = readTree(fs);
+  if (!tree.ok()) {
+    err.line("gen:core: " + tree.why);
+    return 1;
+  }
+  string dup = duplicateNames(tree.carriedPaths, tree.carriedTexts);
+  if (dup != "") {
+    err.line("gen:core: " + dup);
+    return 1;
+  }
+  string want = waccFile(tree);
+
+  u8[]? now = flatten(fs.readFile(waccOut()).wait()).ok();
+  if ((now is not null) && string.fromBytes(now!) == want) {
+    out.line(check ? "core/: the embedding is in step" : "core/: the embedding is unchanged");
+    return 0;
+  }
+
+  if (check) {
+    string what = (now is not null) ? waccOut() + " is out of step with core/"
+                         : waccOut() + " is missing";
+    err.line("1 generated file(s) do not match `core/`:\n  " + what + "\n\n"
+              + "Run `wac task gen:core`. Editing the embedding by hand is what this replaces — it "
+              + "is generated from the list of files in the generator, and that list is also what "
+              + "`coreSource`, `stdSource` and `coreExports` answer for.");
+    return 1;
+  }
+
+  // The byte count, which is what `.len()` answers. The TypeScript this replaces printed
+  // `text.length` and called it bytes; that is UTF-16 code units, and `core` is not all ASCII, so
+  // the number it printed was short by one per non-BMP-free line.
+  fs.writeFile(waccOut(), want.toBytes()).wait();
+  out.line("wrote " + waccOut() + " (" + itoa(want.len()) + " bytes)");
+  out.line("core/: the embedding written");
+  return 0;
+}

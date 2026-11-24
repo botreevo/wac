@@ -1,0 +1,67 @@
+// Running a whole shell script **in this process**, and reading what it wrote.
+//
+// box's tests build a 900 KB bundle and spawn it to ask one question: 71 builds and about a hundred
+// spawns for 130 assertions, at 5.4 s a compile and 132 ms a spawn. Nearly all of those questions are
+// about box's own code, and box's own code is right here — `Shell` with `sh.external = boxRun` is what
+// `example/boxsh.wac` wires up, and a `Frame` is what captures a child's output without a process.
+//
+// This file is the keystone for moving them: if a script runs here and its bytes come back, the rest is
+// rewriting assertions rather than inventing machinery. `routes_test.wac` already asserts that the
+// in-process route and the spawned one are the same program, which is what makes the move safe.
+
+import { Sys } from "std";
+import { flatten } from "core";
+import { Kept } from "../../../platform/src/stream.wac";
+import { bytesInput } from "../../../fs/src/trees.wac";
+import { ProcTable } from "../../../fs/src/proc.wac";
+import { Shell } from "../../../sh/src/exec.wac";
+import { shellMain } from "../../../sh/src/entry.wac";
+import { wireBox } from "../../src/shrun.wac";
+import { T } from "../../../wactest/src/assert.wac";
+
+/** What a script wrote, and the status it left. */
+struct Ran {
+  string out;
+  string err;
+  i32 status;
+}
+
+/**
+ * Run one script through a shell that has box's applets, inside this process.
+ *
+ * The frame is the child's world: its `argv` is what `shellMain` reads its `-c` from, and its `out` and
+ * `err` are where every write lands instead of the host's streams.
+ */
+async Ran runScript(Sys sys, string script) {
+  Kept out = Kept.create();
+  Kept err = Kept.create();
+  Shell sh = Shell.of(bytesInput(u8[]()), out.out, err.out, sys.clock(), sys.env(), sys.net(), sys.procs(),
+                      sys.files(), ProcTable.create(), flatten(sys.env().cwd().wait()).orElse("/"), true);
+  wireBox(sh, sys.random());
+  i32 status = await shellMain(["sh", "-c", script], sh, 1);
+  return Ran(string.fromBytes(out.bytes()), string.fromBytes(err.bytes()), status);
+}
+
+export async string test_a_script_runs_in_this_process_and_its_bytes_come_back(Sys sys) {
+  T t = T.create();
+  Ran r = await runScript(sys, "echo hi");
+  t.eqStr(r.out, "hi\n", "a plain echo");
+  t.eqI32(r.status, 0, "and it succeeded: \{r.err}");
+  return t.report();
+}
+
+export async string test_a_pipeline_through_boxs_applets_runs_here_too(Sys sys) {
+  T t = T.create();
+  // `seq`, `grep` and `wc` are box applets, reached through `sh.external` rather than by spawning —
+  // the same three the website's transcript uses, and the reason `boxRun` exists.
+  Ran r = await runScript(sys, "seq 1 20 | grep 7 | wc -l");
+  t.eqStr(r.out, "2\n", "the pipeline's answer");
+  return t.report();
+}
+
+export async string test_a_failing_command_leaves_its_status(Sys sys) {
+  T t = T.create();
+  Ran r = await runScript(sys, "false");
+  t.eqI32(r.status, 1, "a false exits 1");
+  return t.report();
+}

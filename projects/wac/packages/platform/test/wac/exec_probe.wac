@@ -1,0 +1,62 @@
+// What `Procs.exec`'s environment and inheritance do, from inside a program, as a transcript.
+//
+// Two callers, for two reasons that need the same program. `exec_test.wac` runs it because the
+// *inherited* case cannot be checked by the program that asks for it — a child writes to this
+// program's stdout, and a program cannot read its own, so the claim needs three levels and the test
+// is the one that reads the outcome. `runtimes_test.wac` runs it because a capability implemented
+// once per host is a capability implemented four times, and two of those are only ever reached from
+// a program built for them.
+//
+// **The verdicts go to stderr and the inherited bytes to stdout**, which is what makes the two
+// streams comparable between hosts. An inherited child writes to the real descriptor whenever it
+// gets there and this program's own writes are buffered by whatever is underneath; on one stream
+// their order is a race, and on two there is nothing to race.
+//
+// Each line is a verdict rather than a measurement, for the same reason: the *number* of inherited
+// variables differs between a program launched by `deno` and one launched by `node`, and neither
+// number is the claim. "Did the name we passed arrive" is.
+
+import { Exec, Sys, ChildEnv, Launch, Output, Procs } from "std";
+import { flatten } from "core";
+
+string yn(bool b) { return b ? "yes" : "no"; }
+
+export i32 main(Sys sys) {
+  Output err = sys.stderr();
+  Procs procs = sys.procs();
+  // Inherited: the line below arrives on *this* program's stdout, and the answer carries none of it.
+  Exec a = flatten(procs.exec("/bin/echo", ["from the grandchild"], u8[](), ChildEnv(false, string[]()), Launch("", false, true, false, false)).wait()).unwrap();
+  err.write(("inherit: ran=\{yn(a.ran())} status=\{a.status}" +
+                " buffered=\{a.stdout.len()}/\{a.stderr.len()}\n").toBytes());
+
+  // Handed a name, and the environment it would have had anyway is still there.
+  Exec b = flatten(procs.exec("/usr/bin/printenv", string[](), u8[](), ChildEnv(false, ["WAC_EXEC_PROBE=handed over"]), Launch("", false, false, false, false)).wait()).unwrap();
+  string had = string.fromBytes(b.stdout);
+  err.write(("env: ran=" + yn(b.ran()) +
+                " handed=" + yn(had.indexOf("WAC_EXEC_PROBE=handed over") >= 0) +
+                " kept-others=" + yn(had.indexOf("PATH=") >= 0) + "\n").toBytes());
+
+  // Cleared: exactly what was passed, which is `issues/system/0198`'s end state.
+  Exec c = flatten(procs.exec("/usr/bin/printenv", string[](), u8[](), ChildEnv(true, ["WAC_EXEC_PROBE=only this"]), Launch("", false, false, false, false)).wait()).unwrap();
+  err.write(("cleared: ran=" + yn(c.ran()) + " only-what-was-passed=" +
+                yn(string.fromBytes(c.stdout) == "WAC_EXEC_PROBE=only this\n") + "\n").toBytes());
+
+  // **A child that died by signal, which every host answers `-1` for and none of them was checked on.**
+  // A signalled process has no exit code at all, so each of the four writes `code ?? -1` — or
+  // `unwrap_or(-1)` — with the same comment beside it and nothing comparing the four. That is a
+  // convention held in four places by agreement rather than by a test, which is what this line makes
+  // into one. `-1` is safe as a sentinel because a POSIX status is eight bits: no child that *exited*
+  // can produce it, and `exit 255` below is the neighbour that proves the range is not being clipped.
+  //
+  // `ran=yes` is the other half of the claim and the easier one to get wrong: the program started, so
+  // this is not `error`'s business — a signal is how it *ended*. `issues/system/0184` wants exactly
+  // this distinction one level up, for a wasm trap.
+  Exec d = flatten(procs.exec("/bin/sh", ["-c", "kill -9 $$"], u8[](), ChildEnv(false, string[]()), Launch("", false, true, false, false)).wait()).unwrap();
+  err.write(("signalled: ran=\{yn(d.ran())} status=\{d.status}" +
+                " signalled=\{yn(d.signalled())}\n").toBytes());
+
+  Exec e = flatten(procs.exec("/bin/sh", ["-c", "exit 255"], u8[](), ChildEnv(false, string[]()), Launch("", false, true, false, false)).wait()).unwrap();
+  err.write(("exited: ran=\{yn(e.ran())} status=\{e.status}" +
+                " signalled=\{yn(e.signalled())}\n").toBytes());
+  return 0;
+}

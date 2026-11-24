@@ -1,0 +1,62 @@
+// Where `wac update` fetches a pinned url from — git's `url.<base>.insteadOf`, as `tools/use-mirror.sh` sets it.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Mirror, mirrorOf, fetchUrlOf, noMirror, readMirror } from "../../src/mirror.wac";
+import { Sys, Env, MemoryStore } from "std";
+import { parseConfig } from "../../../git/src/config.wac";
+
+/** The rules in a git config file's text. */
+Mirror rulesIn(string text) { return mirrorOf(parseConfig(text.toBytes())); }
+
+export string test_the_setting_use_mirror_writes_sends_github_to_the_mirror() {
+  T t = T.create();
+  Mirror m = rulesIn("[url \"https://git.voltrevo.com/\"]\n\tinsteadOf = https://github.com/voltrevo/\n");
+  t.eqStr(fetchUrlOf(m, "https://github.com/voltrevo/wac-web.git"), "https://git.voltrevo.com/wac-web.git",
+          "a pinned GitHub url is fetched from the mirror");
+  t.eqStr(fetchUrlOf(m, "https://github.com/someone-else/x.git"), "https://github.com/someone-else/x.git",
+          "a url the prefix does not start is left as pinned");
+  t.eqStr(fetchUrlOf(noMirror(), "https://github.com/voltrevo/wac.git"), "https://github.com/voltrevo/wac.git",
+          "no rules, no change");
+  return t.report();
+}
+
+export string test_the_longest_matching_prefix_wins_whatever_the_order() {
+  T t = T.create();
+  string text = "[url \"https://a.example/\"]\n\tinsteadOf = https://github.com/\n"
+              + "[url \"https://b.example/vv/\"]\n\tinsteadOf = https://github.com/voltrevo/\n";
+  Mirror m = rulesIn(text);
+  t.eqStr(fetchUrlOf(m, "https://github.com/voltrevo/wac.git"), "https://b.example/vv/wac.git",
+          "the longer prefix is applied, as git applies it");
+  t.eqStr(fetchUrlOf(m, "https://github.com/other/x.git"), "https://a.example/other/x.git",
+          "and the shorter one where only it matches");
+  return t.report();
+}
+
+export string test_a_base_keeps_its_case_and_other_settings_are_not_rules() {
+  T t = T.create();
+  Mirror m = rulesIn("[user]\n\tname = Ada\n[url \"https://Mirror.Example/Git/\"]\n\tInsteadOf = https://github.com/\n"
+                     + "[url \"https://x.example/\"]\n\tpushInsteadOf = https://github.com/\n");
+  t.eqI32(m.bases.len(), 1, "one insteadOf; user.name and pushInsteadOf are not fetch rules");
+  t.eqStr(fetchUrlOf(m, "https://github.com/v/w.git"), "https://Mirror.Example/Git/v/w.git",
+          "the key is matched case-insensitively and the base kept as written");
+  return t.report();
+}
+
+/** An environment of exactly these pairs, with no `HOME`: no config file is read, only what the pairs say. */
+u8[]? pairs(string name) {
+  if (name == "GIT_CONFIG_COUNT") { return "2".toBytes(); }
+  if (name == "GIT_CONFIG_KEY_0") { return "safe.directory".toBytes(); }
+  if (name == "GIT_CONFIG_VALUE_0") { return "/repo".toBytes(); }
+  if (name == "GIT_CONFIG_KEY_1") { return "URL.https://Mirror.Example/.InsteadOf".toBytes(); }
+  if (name == "GIT_CONFIG_VALUE_1") { return "https://github.com/".toBytes(); }
+  return null;
+}
+
+export string test_the_environments_config_pairs_are_rules_too(Sys sys) {
+  T t = T.create();
+  Mirror m = readMirror(Env.of(pairs), MemoryStore.create(sys.clock()).asUser("root"));
+  t.eqI32(m.bases.len(), 1, "the insteadOf pair is a rule and safe.directory is not");
+  t.eqStr(fetchUrlOf(m, "https://github.com/voltrevo/wac.git"), "https://Mirror.Example/voltrevo/wac.git",
+          "its section and key lowered as git does, and its subsection kept as written");
+  return t.report();
+}

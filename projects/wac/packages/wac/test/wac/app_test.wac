@@ -1,0 +1,449 @@
+// `wac app` — a program that runs by being run, and calls out to the `wac` on the machine.
+//
+// `[§wac-cli-app-4mt8qzv]` `[§wac-cli-app-grants-8xr2knw]` `[§wac-cli-app-skew-3vq9mkt]`
+//
+// The artefact is a shell preamble with a wasm module glued to the end: `./thing` execs
+// `wac app-run "$0"`, which finds the module inside the file it was pointed at. So it is one file,
+// it is executable, it survives an `scp`, and it is a few hundred KB rather than the 67 MB a
+// self-sufficient executable cost — because the engine is not in it.
+//
+// **The interesting assertion is the third one.** Two builds of the same program, one granted and
+// one not, have *byte-identical preambles*: the capability is inside the module, past the `\0asm`,
+// where a text editor cannot reach it. If that ever stops being true then the shell lines at the top
+// of every distributed program become the place its permissions live, which is the one place they
+// must not be.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryDir, binaryPath, freshDir, scratch } from "../../../wactest/src/host.wac";
+import { contains, trimmed } from "../../../wactest/src/strings.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Output, Procs, Sys } from "std";
+import { flatten } from "core";
+
+/**
+ * A shell, because `Cli.exec` passes no environment and no working directory.
+ *
+ * Both are needed here: the point of the artefact is that it finds `wac` on PATH, so the test has to
+ * be able to say what PATH is — including saying it is one without `wac` in it.
+ */
+Exec sh(Procs procs, string script) {
+  return flatten(procs.exec("/bin/sh", ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+/** `wac app <entry> [grant] -o <dest>`, run against the binary this test is running under. */
+Exec build(Env env, Procs procs, string entry, string grant, string dest) {
+  string[] argv = grant == "" ? ["app", entry, "-o", dest]
+                              : ["app", entry, grant, "-o", dest];
+  return flatten(procs.exec(binaryPath(env), argv, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+/** A program that imports only `Sys`, so the build is a compile of two lines. */
+bool writeEntry(Output out, Files fs, T t, string path) {
+  auto wrote = flatten(fs.writeFile(path,
+    ("import { Sys } from \"std\";\n" +
+     "export i32 main(Sys sys) { sys.stdout().line(\"an app ran\"); return 0; }\n").toBytes()).wait());
+  t.isTrue(wrote.isOk(), "could not write the entry — \{wrote.isErr() ? "\{wrote.err()!}" : ""}");
+  return wrote.isOk();
+}
+
+export string test_wac_app_builds_something_that_runs_itself(Sys sys) {
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratch(env, "app-runs");
+  string whyDir = freshDir(fs, dir);
+  t.isTrue(whyDir == "", whyDir);
+  if (!writeEntry(out, fs, t, "\{dir}/hello.wac")) { return t.report(); }
+
+  Exec made = build(env, procs, "\{dir}/hello.wac", "", "\{dir}/thing");
+  t.isTrue(made.ran(), "wac app did not run — \{made.error}");
+  t.eqI32(made.status, 0, "wac app failed: \{string.fromBytes(made.stderr)}");
+  if (made.status != 0) { return t.report(); }
+
+  // Run it the way somebody who was handed the file would: by name, with `wac` on PATH and nothing
+  // else about the environment arranged.
+  Exec ran = sh(procs, "PATH='\{binaryDir(env)}':/usr/bin:/bin '\{dir}/thing'");
+  t.isTrue(ran.ran(), "the shell did not run — \{ran.error}");
+  t.eqI32(ran.status, 0, "./thing failed: \{string.fromBytes(ran.stderr)}");
+  t.eqStr(trimmed(string.fromBytes(ran.stdout)), "an app ran",
+          "stdout: \{string.fromBytes(ran.stdout)}\{string.fromBytes(ran.stderr)}");
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+export string test_an_app_without_wac_on_the_path_says_so(Sys sys) {
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratch(env, "app-nopath");
+  string whyDir = freshDir(fs, dir);
+  t.isTrue(whyDir == "", whyDir);
+  if (!writeEntry(out, fs, t, "\{dir}/hello.wac")) { return t.report(); }
+  Exec made = build(env, procs, "\{dir}/hello.wac", "", "\{dir}/thing");
+  t.eqI32(made.status, 0, "wac app failed: \{string.fromBytes(made.stderr)}");
+  if (made.status != 0) { return t.report(); }
+
+  // **The failure a stranger meets first.** Without the check in the preamble this is `wac: not
+  // found` from their shell, which names our command and explains nothing; the whole reason the
+  // artefact is small is that it depends on something, so it has to say what.
+  Exec bare = sh(procs, "PATH=/usr/bin:/bin '\{dir}/thing'");
+  t.isTrue(bare.ran(), "the shell did not run — \{bare.error}");
+  t.eqI32(bare.status, 127, "an app with no `wac` should exit 127: " +
+          string.fromBytes(bare.stderr) + string.fromBytes(bare.stdout));
+  t.isTrue(contains(string.fromBytes(bare.stderr), "needs the wac command on PATH"),
+           "it should say what is missing: \{string.fromBytes(bare.stderr)}");
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+export string test_the_grants_are_in_the_module_and_not_the_preamble(Sys sys) {
+  string[] argv = sys.args();
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratch(env, "app-grants");
+  string whyDir = freshDir(fs, dir);
+  t.isTrue(whyDir == "", whyDir);
+
+  // A program that reads, so that the grant is the difference between working and refused.
+  auto wrote = flatten(fs.writeFile("\{dir}/read.wac",
+    ("import { Sys } from \"std\";\n" +
+     "export async i32 main(Sys sys) {\n" +
+     "  auto r = await sys.files().readFile(sys.args()[0]);\n" +
+     "  sys.stdout().line(r.isOk() ? \"read ok\" : \"refused: \" + (r.isErr() ? \"\\{r.err()!}\" : \"\"));\n" +
+     "  return r.isOk() ? 0 : 1;\n" +
+     "}\n").toBytes()).wait());
+  t.isTrue(wrote.isOk(), "could not write the entry — \{wrote.isErr() ? "\{wrote.err()!}" : ""}");
+  if (wrote.isErr()) { return t.report(); }
+  fs.writeFile("\{dir}/data.txt", "hello\n".toBytes()).wait();
+
+  Exec sealed = build(env, procs, "\{dir}/read.wac", "", "\{dir}/sealed");
+  Exec granted = build(env, procs, "\{dir}/read.wac", "--allow-read", "\{dir}/granted");
+  t.eqI32(sealed.status, 0, "sealed build: \{string.fromBytes(sealed.stderr)}");
+  t.eqI32(granted.status, 0, "granted build: \{string.fromBytes(granted.stderr)}");
+  if (sealed.status != 0 || granted.status != 0) { return t.report(); }
+
+  // **Byte-identical preambles.** Everything before the module's `\0asm` is the same in both, so
+  // nothing a person can edit in a text editor decides what the program may do.
+  u8[]? a = flatten(fs.readFile("\{dir}/sealed").wait()).ok();
+  u8[]? b = flatten(fs.readFile("\{dir}/granted").wait()).ok();
+  t.isTrue((a is not null) && (b is not null), "could not read the two artefacts back");
+  if ((a is null) || (b is null)) { return t.report(); }
+  i32 cut = magicAt(a!);
+  t.isTrue(cut > 0, "the sealed artefact has no wasm module in it");
+  t.eqI32(magicAt(b!), cut, "the two preambles are different lengths");
+  if (cut <= 0 || magicAt(b!) != cut) { return t.report(); }
+  bool same = true;
+  for (i32 i = 0; i < cut; i++) {
+    if (a![i] != b![i]) { same = false; }
+  }
+  t.isTrue(same, "the preambles differ, so something outside the module decides the grants");
+
+  // And the grant is real on both sides: refused without, allowed with.
+  string path = binaryDir(env);
+  Exec no = sh(procs, "PATH='\{path}':/usr/bin:/bin '\{dir}/sealed' '\{dir}/data.txt'");
+  t.isTrue(contains(string.fromBytes(no.stdout), "refused"),
+           "the sealed app should be refused: \{string.fromBytes(no.stdout)}" +
+           string.fromBytes(no.stderr));
+  Exec yes = sh(procs, "PATH='\{path}':/usr/bin:/bin '\{dir}/granted' '\{dir}/data.txt'");
+  t.eqStr(trimmed(string.fromBytes(yes.stdout)), "read ok",
+          "the granted app should read: \{string.fromBytes(yes.stdout)}" +
+          string.fromBytes(yes.stderr));
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+/** Where the wasm module starts: the first `\0asm`, which shell text cannot contain. */
+i32 magicAt(u8[] b) {
+  for (i32 i = 0; i + 3 < b.len(); i++) {
+    if (b[i] == 0 && b[i + 1] == 'a' && b[i + 2] == 's' && b[i + 3] == 'm') { return i; }
+  }
+  return -1;
+}
+
+/**
+ * A version this run is not, on a file that names one, is refused.
+ *
+ * **Both sides are supplied by the test, since 2026-08-26, and that is the point rather than a
+ * workaround.** No host publishes `WAC_VERSION` any more — `native/v8` did, from cargo's default
+ * `0.1.0`, and stopped, because a version nobody had decided was leaking into an artefact format and
+ * making one host's output differ from the other two's in the only line they were allowed to share.
+ * The operator's ruling is to not define one for now.
+ *
+ * So the rule under test is dormant in ordinary use and is not gone: **only two versions that both
+ * exist can differ.** With nothing published, nothing is refused — which is what
+ * `test_an_app_stamped_with_no_version_still_runs` holds. This one supplies a version to both sides
+ * through the environment, which is the seam the hosts use, and checks the refusal still works the day
+ * somebody defines one. Written this way rather than deleted because the deferral is "for now": a
+ * check that is unreachable *and* untested rots, and this one costs a variable on a shell line.
+ */
+export string test_an_app_built_by_another_version_is_refused(Sys sys) {
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratch(env, "app-skew");
+  string whyDir = freshDir(fs, dir);
+  t.isTrue(whyDir == "", whyDir);
+  if (!writeEntry(out, fs, t, "\{dir}/hello.wac")) { return t.report(); }
+  Exec made = build(env, procs, "\{dir}/hello.wac", "", "\{dir}/thing");
+  t.eqI32(made.status, 0, "wac app failed: \{string.fromBytes(made.stderr)}");
+  if (made.status != 0) { return t.report(); }
+
+  // Rewrite the version line in place — the same edit an older build would have written — keeping
+  // every byte after it, so the module is untouched and the version is the only difference.
+  auto gotRead = flatten(fs.readFile("\{dir}/thing").wait());
+  u8[]? got = gotRead.ok();
+  t.isTrue((got is not null), "could not read the artefact back — \{gotRead.isErr() ? "\{gotRead.err()!}" : ""}");
+  if ((got is null)) { return t.report(); }
+  i32 cut = magicAt(got!);
+  string head = "";
+  for (i32 i = 0; i < cut; i++) { head = head + string.fromCodepoint(got![i] as i32); }
+  i32 mark = indexOf(head, "# wac-app ");
+  t.isTrue(mark >= 0, "the artefact carries no version line");
+  if (mark < 0) { return t.report(); }
+  i32 eol = mark;
+  while (eol < head.len() && head.slice(eol, eol + 1) != "\n") { eol = eol + 1; }
+  string edited = "\{head.slice(0, mark)}# wac-app 0.0.0-not-this-one\{head.slice(eol, head.len())}";
+  u8[] out2 = u8[].filled(edited.len() + (got!.len() - cut), 0);
+  u8[] eb = edited.toBytes();
+  for (i32 i = 0; i < eb.len(); i++) { out2[i] = eb[i]; }
+  for (i32 i = 0; i < got!.len() - cut; i++) { out2[eb.len() + i] = got![cut + i]; }
+  auto put = flatten(fs.writeFile("\{dir}/old", out2).wait());
+  t.isTrue(put.isOk(), "could not write the edited artefact — \{put.isErr() ? "\{put.err()!}" : ""}");
+  fs.setExecutable("\{dir}/old", true).wait();
+
+  // `WAC_VERSION` on the shell line is what a host would have set. The binary passes an exported one
+  // through untouched — it never had a reason to overwrite the caller's, and now it has none of its
+  // own to prefer.
+  Exec ran = sh(procs, "WAC_VERSION=9.9.9-this-run PATH='\{binaryDir(env)}"
+                     + "':/usr/bin:/bin '\{dir}/old'");
+  t.isTrue(ran.ran(), "the shell did not run — \{ran.error}");
+  t.eqI32(ran.status, 1, "a version mismatch should be refused: " +
+          string.fromBytes(ran.stdout) + string.fromBytes(ran.stderr));
+  t.isTrue(contains(string.fromBytes(ran.stderr), "0.0.0-not-this-one"),
+           "the refusal should name the version that built it: \{string.fromBytes(ran.stderr)}");
+  t.isTrue(contains(string.fromBytes(ran.stderr), "9.9.9-this-run"),
+           "the refusal should name the version running it: \{string.fromBytes(ran.stderr)}");
+
+  // **And the same file is not refused when this run names no version**, which is the half that
+  // stopped being hypothetical: it is every invocation on every host today. Same artefact, same
+  // command, `WAC_VERSION` simply absent.
+  Exec quiet = sh(procs, "PATH='\{binaryDir(env)}':/usr/bin:/bin '\{dir}/old'");
+  t.isTrue(quiet.ran(), "the shell did not run — \{quiet.error}");
+  t.eqI32(quiet.status, 0, "a run that names no version cannot refuse for one: " +
+          string.fromBytes(quiet.stdout) + string.fromBytes(quiet.stderr));
+  t.eqStr(trimmed(string.fromBytes(quiet.stdout)), "an app ran",
+          "stdout: \{string.fromBytes(quiet.stdout)}\{string.fromBytes(quiet.stderr)}");
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * An artefact whose version line is *blank* runs, rather than being called unmarked.
+ *
+ * **This is what every host but `native/v8` writes today.** The stamp comes from `WAC_VERSION`, which
+ * `native/v8/src/main.rs` sets and no other host does, so `wac app` on a Deno- or Node-hosted `wac`
+ * produced `# wac-app ` with nothing after it — and `app-run` answered *has a module in it but no
+ * `# wac-app ` line — not built by `wac app`* about a file it had just built. Unrunnable by every
+ * host, including the one that made it. Reported 2026-08-26 against a hosted build outside the
+ * repository; `issues/system/0230a` carries the stamp half, which is a separate decision.
+ *
+ * `builtBy` answering `""` was the whole of it: one answer for *no marker line* and for *a marker
+ * line naming no version*, read by the caller as the first. So the assertion is that a blank stamp
+ * reaches the program — the version check below it already tolerates the blank in the other
+ * direction and could never be reached.
+ *
+ * Written by editing rather than by building on another host, for the same reason the case above
+ * edits: this suite has one `wac` and the artefact's bytes are what the claim is about. The edit is
+ * the exact string the silent hosts emit.
+ */
+export string test_an_app_stamped_with_no_version_still_runs(Sys sys) {
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratch(env, "app-blank");
+  string whyDir = freshDir(fs, dir);
+  t.isTrue(whyDir == "", whyDir);
+  if (!writeEntry(out, fs, t, "\{dir}/hello.wac")) { return t.report(); }
+  Exec made = build(env, procs, "\{dir}/hello.wac", "", "\{dir}/thing");
+  t.eqI32(made.status, 0, "wac app failed: \{string.fromBytes(made.stderr)}");
+  if (made.status != 0) { return t.report(); }
+
+  auto gotRead = flatten(fs.readFile("\{dir}/thing").wait());
+  u8[]? got = gotRead.ok();
+  t.isTrue((got is not null), "could not read the artefact back — \{gotRead.isErr() ? "\{gotRead.err()!}" : ""}");
+  if ((got is null)) { return t.report(); }
+  i32 cut = magicAt(got!);
+  string head = "";
+  for (i32 i = 0; i < cut; i++) { head = head + string.fromCodepoint(got![i] as i32); }
+  i32 mark = indexOf(head, "# wac-app ");
+  t.isTrue(mark >= 0, "the artefact carries no version line");
+  if (mark < 0) { return t.report(); }
+  i32 eol = mark;
+  while (eol < head.len() && head.slice(eol, eol + 1) != "\n") { eol = eol + 1; }
+  // The trailing space is kept and nothing follows it — `APP_MARK` exactly, which is the line
+  // `preamble("")` writes.
+  string edited = "\{head.slice(0, mark)}# wac-app \{head.slice(eol, head.len())}";
+  u8[] out3 = u8[].filled(edited.len() + (got!.len() - cut), 0);
+  u8[] eb = edited.toBytes();
+  for (i32 i = 0; i < eb.len(); i++) { out3[i] = eb[i]; }
+  for (i32 i = 0; i < got!.len() - cut; i++) { out3[eb.len() + i] = got![cut + i]; }
+  auto put = flatten(fs.writeFile("\{dir}/blank", out3).wait());
+  t.isTrue(put.isOk(), "could not write the edited artefact — \{put.isErr() ? "\{put.err()!}" : ""}");
+  fs.setExecutable("\{dir}/blank", true).wait();
+
+  Exec ran = sh(procs, "PATH='\{binaryDir(env)}':/usr/bin:/bin '\{dir}/blank'");
+  t.isTrue(ran.ran(), "the shell did not run — \{ran.error}");
+  t.eqI32(ran.status, 0, "a blank stamp should not be refused: " +
+          string.fromBytes(ran.stdout) + string.fromBytes(ran.stderr));
+  // **The program ran, not merely that nothing was refused.** A status of 0 with no output would
+  // also satisfy the line above, and that is the shape a wrong fix takes.
+  t.eqStr(trimmed(string.fromBytes(ran.stdout)), "an app ran",
+          "stdout: \{string.fromBytes(ran.stdout)}\{string.fromBytes(ran.stderr)}");
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+/** First index of `want` in `s`, or -1. */
+i32 indexOf(string s, string want) {
+  if (want.len() == 0 || want.len() > s.len()) { return -1; }
+  for (i32 i = 0; i + want.len() <= s.len(); i++) {
+    if (s.slice(i, i + want.len()) == want) { return i; }
+  }
+  return -1;
+}
+
+/**
+ * A flag whose second half lives in another command is refused, not half-honoured.
+ *
+ * `--coverage` reached the *shared* compile — which is above the per-command dispatch — so the module
+ * came out instrumented, and then this arm wrote only the executable. The `.cov` table naming the
+ * counters is `wac build`'s, and `covdump` will not read an app anyway because of the two shell lines
+ * on the front. So the entire effect of the flag was the instrumentation it silently paid for.
+ *
+ * **The assertion is on the message, not on the status**, because `2` is also what an unknown flag
+ * and a missing `-o` return: a test that only checked the code would pass on a build that had merely
+ * become unable to parse its own command line. `issues/system/0274c`.
+ */
+export string test_app_refuses_a_flag_it_cannot_finish(Sys sys) {
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratch(env, "app-buildonly");
+  string whyDir = freshDir(fs, dir);
+  t.isTrue(whyDir == "", whyDir);
+  if (!writeEntry(out, fs, t, "\{dir}/hello.wac")) { return t.report(); }
+
+  // The three that reach the shared compile and change what it emits. `--js` is refused too, but by
+  // the generic message: it is `bindgen`'s flag, so pointing at `wac build` would be a wrong hint.
+  string[] flags = ["--coverage", "--trace", "--trace-slots"];
+  for (i32 i = 0; i < flags.len(); i++) {
+    auto madeRan = flatten(procs.exec(binaryPath(env), ["app", "\{dir}/hello.wac", flags[i], "-o", "\{dir}/thing"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+    Exec? made = madeRan.ok();
+    t.isTrue((made is not null), "wac app did not run — \{madeRan.isErr() ? "\{madeRan.err()!}" : ""}");
+    t.eqI32(made!.status, 2, "\{flags[i]} was accepted: \{string.fromBytes(made!.stderr)}");
+    string said = string.fromBytes(made!.stderr);
+    t.isTrue(contains(said, flags[i]), "\{flags[i]} is not named in the refusal: \{said}");
+    // It must point at the command that *can* finish the job, or the reader is told no and not where
+    // to go — which for `--coverage` is the difference between a dead end and a working build.
+    t.isTrue(contains(said, "wac build"), "the refusal does not name `wac build`: \{said}");
+    // And nothing may be left behind: a refused build that wrote the executable anyway would be the
+    // same silent half-job in a new place.
+    u8[]? f = flatten(fs.readFile("\{dir}/thing").wait()).ok();
+    t.isTrue((f is null), "\{flags[i]} wrote an executable despite refusing");
+  }
+
+  // A flag belonging to a *third* command gets the ordinary refusal, naming what `app` does take.
+  auto jsRan = flatten(procs.exec(binaryPath(env), ["app", "\{dir}/hello.wac", "--js", "-o", "\{dir}/thing"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? js = jsRan.ok();
+  t.eqI32(js!.status, 2, "--js was accepted: \{string.fromBytes(js!.stderr)}");
+  t.isTrue(contains(string.fromBytes(js!.stderr), "--allow-read"),
+           "the refusal does not say what `app` takes: \{string.fromBytes(js!.stderr)}");
+
+  // The canary: the same build without the flag succeeds, so the refusals above are about the
+  // flag rather than about the entry, the directory or the binary.
+  Exec fine = build(env, procs, "\{dir}/hello.wac", "", "\{dir}/thing");
+  t.eqI32(fine.status, 0, "the same build without a flag failed: \{string.fromBytes(fine.stderr)}");
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+/**
+ * A reader that stops ends the program, rather than leaving it writing into a closed pipe.
+ *
+ * **The mechanism changed under this test on 2026-08-29, and the case is the same.** It was written
+ * for `relay`, which read the child's two streams and wrote them on: `write` returns false when the
+ * far end has gone, that being the whole of what a broken pipe means, and discarding the answer meant
+ * `./thing | head -2` relayed for ever — `head` exits, the relay keeps draining, and the child,
+ * writing into a queue that always accepts, never finds out. `issues/system/0278c`.
+ *
+ * There is no relay now. A launcher hands the child its own streams (`INHERIT_OUT`,
+ * `issues/system/0282c`), so the child writes the real pipe and the operating system tells it the
+ * reader has gone — the same fact by a shorter route, and one nothing can forget to pass on. Kept
+ * because the *claim* is about the artefact and not about how it was implemented: a reader that
+ * stops must end the program.
+ *
+ * **Through `/bin/sh`, because the pipe has to be the operating system's.** The shell's own
+ * pipelines are a different mechanism with its own stopping rule (`issues/system/0275c` was that
+ * one), and a case written with them would pass while this stayed broken — which is exactly what
+ * happened: every other route stopped correctly, so it read as a shell bug for a while.
+ *
+ * The program is `yes`-shaped rather than bounded on purpose. A producer that ends on its own cannot
+ * tell "the reader was noticed" from "the writer finished", and a bounded one passed throughout.
+ */
+export string test_a_closed_reader_stops_the_program(Sys sys) {
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratch(env, "app-brokenpipe");
+  string whyDir = freshDir(fs, dir);
+  t.isTrue(whyDir == "", whyDir);
+
+  auto wrote = flatten(fs.writeFile("\{dir}/forever.wac",
+    ("import { Sys, Output } from \"std\";\n" +
+     "import { flatten } from \"core\";\n" +
+     "export i32 main(Sys sys) {\n  Output out = sys.stdout();\n" +
+     // Unbounded, and the loop is the assertion: on a host that reports the closed reader this
+     // returns, and on one that does not it never leaves the `while`.
+     "  while (true) { if (flatten(out.write(\"y\\n\".toBytes()).wait()).isErr()) { return 0; } }\n" +
+     "  return 0;\n" +
+     "}\n").toBytes()).wait());
+  t.isTrue(wrote.isOk(), "could not write the program — \{wrote.isErr() ? "\{wrote.err()!}" : ""}");
+  if (wrote.isErr()) { return t.report(); }
+
+  Exec made = build(env, procs, "\{dir}/forever.wac", "", "\{dir}/forever");
+  t.eqI32(made.status, 0, "wac app failed: \{string.fromBytes(made.stderr)}");
+  if (made.status != 0) { return t.report(); }
+
+  // `timeout` is the detector rather than a safety margin: the failure is *not returning*, so a case
+  // without one hangs the suite instead of failing it. Ten seconds against a case that answers in
+  // well under one.
+  Exec ran = sh(procs, "PATH='\{binaryDir(env)}':/usr/bin:/bin "
+                   + "timeout 10 sh -c '\"\{dir}/forever\" | head -2'");
+  t.isTrue(ran.ran(), "the shell did not run — \{ran.error}");
+  t.isTrue(ran.status != 124, "the program never stopped writing into a closed pipe");
+  t.eqStr(trimmed(string.fromBytes(ran.stdout)), "y\ny",
+          "head took two lines: \{string.fromBytes(ran.stdout)}\{string.fromBytes(ran.stderr)}");
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}

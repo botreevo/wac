@@ -1,0 +1,163 @@
+// Full screen: a program's window filling the screen, given by the desktop and left by the desktop's way out.
+//
+// **A program only asks** (web's `Element.fullScreen`, which a window's `PageServer` hands here): the desktop decides,
+// and the desktop draws the way out — a handle at the top of the screen, outside the window's body, which no program
+// can cover, since what it draws stays inside its body (`contain: paint`), nor hear a tap on, since the handle is not
+// its element. Back, on a phone, is the desktop's too: a window's page has no location of its own.
+//
+// **Given only just after the person touched that window**: a tap or a key in it within `FRESH_TAP`, and after full
+// screen last ended — so a program cannot take the screen on its own, nor take it straight back when the person has
+// left it. The browser's own full screen, which hides its bars, is asked for at the same moment, and the browser has
+// the same rule: it allows it only just after a tap or a key.
+//
+// **The desktop as a whole can fill the screen too** — Settings' Full screen now, or, chosen there, at the first tap or
+// key each time it opens (`Prefs.screen`). That is the person's own choice, made by a tap on the desktop itself, and
+// left the same ways: Escape, or a phone's Back. A window's full screen inside it ends back on the desktop, still full.
+
+import { PageServer } from "web";
+import { Desk, MAX_WINDOWS, Win, find, frontOf } from "./wm.wac";
+
+/** How long after a tap or key in a window its program may still be given full screen, in milliseconds. */
+export static f64 FRESH_TAP = 4000.0;
+
+/** A tap or a key in window `id`: what lets its program have full screen, for a moment. */
+export void touched(Desk d, i32 id, f64 now) {
+  d.full.tappedWin = id;
+  d.full.tappedAt = now;
+}
+
+/** The server drawing window `id`, if a program draws it. */
+PageServer? serverOf(Desk d, i32 id) {
+  for (i32 i = 0; i < d.running.len(); i++) {
+    for (i32 slice = 0; slice < MAX_WINDOWS; slice++) {
+      if (d.running.get(i).wins.get(slice) == id) { return d.running.get(i).servers.get(slice); }
+    }
+  }
+  return null;
+}
+
+/**
+ * Window `id`'s program asks for full screen, or to leave it: given if the person touched that window a moment ago and
+ * since full screen last ended, and said either way, so the program knows. Whether anything changed.
+ */
+export bool askedFull(Desk d, i32 id, bool on, f64 now) {
+  if (!on) {
+    if (d.full.win != id) { return false; }
+    leaveFull(d, now);
+    return true;
+  }
+  // Full already, and told so when it began: asked again, nothing to say.
+  if (d.full.win == id) { return false; }
+  PageServer? server = serverOf(d, id);
+  Win? w = find(d, id);
+  // The person's last tap or key in the window — on its frame, or heard by the program itself, which its server knows
+  // before the program does, so a request it makes at once cannot arrive before the tap that let it.
+  f64 heard = server is null ? 0.0 - 1.0 : server!.heardAt;
+  bool framed = d.full.tappedWin == id && now - d.full.tappedAt <= FRESH_TAP && d.full.tappedAt > d.full.leftAt;
+  bool fresh = framed || (heard >= 0.0 && now - heard <= FRESH_TAP && heard > d.full.leftAt);
+  if (w is null || !fresh) { return false; }
+  if (d.full.win >= 0) { leaveFull(d, now); }
+  d.full.win = id;
+  d.full.since = now;
+  d.full.bar = false;
+  w!.min = false;
+  d.focused = id;
+  d.topZ++;
+  w!.z = d.topZ;
+  d.launcher = false;
+  d.recents = false;
+  showScreen(d);
+  if (server is not null) { server!.fullScreened(true); }
+  return true;
+}
+
+/**
+ * The browser's full screen asked for, or left, as the desktop now wants it: while the desktop as a whole fills the
+ * screen, or a window does — and only when that changes, so a window's ending inside the whole desktop's is no change.
+ */
+void showScreen(Desk d) {
+  bool want = d.full.whole || d.full.win >= 0;
+  fn<void(bool)>? screen = d.full.screen;
+  if (want == d.full.shown || screen is null) { return; }
+  d.full.shown = want;
+  if (want) { d.full.asking = true; }
+  screen!(want);
+}
+
+/** The desktop as a whole fills the screen, or no longer does — chosen in Settings, by a tap. */
+export void wholeScreen(Desk d, bool on, f64 now) {
+  d.full.whole = on;
+  if (!on && d.full.win >= 0) { leaveFull(d, now); }
+  showScreen(d);
+  settingsAgain(d);
+}
+
+/**
+ * **A tap or key anywhere on the desktop, the first since it opened**: with Settings' "every time" chosen, the moment the
+ * browser lets the desktop fill the screen. Once only, so a person who left it is not put back. Whether it began.
+ */
+export bool firstTouch(Desk d, f64 now) {
+  if (d.full.autoTried || d.prefs.screen != "auto") { return false; }
+  d.full.autoTried = true;
+  if (d.full.whole) { return false; }
+  wholeScreen(d, true, now);
+  return true;
+}
+
+/** Settings shows whether the desktop fills the screen: its windows drawn again when that changes (`Win.rev`). */
+void settingsAgain(Desk d) {
+  for (i32 i = 0; i < d.wins.len(); i++) {
+    Win w = d.wins.get(i);
+    if (w.app == "settings") { w.rev = w.rev + 1; }
+  }
+}
+
+/** Full screen left — by the person, or because its window is no longer in front — and its program told. */
+export void leaveFull(Desk d, f64 now) {
+  i32 id = d.full.win;
+  if (id < 0) { return; }
+  d.full.win = 0 - 1;
+  d.full.leftAt = now;
+  d.full.bar = false;
+  showScreen(d);
+  PageServer? server = serverOf(d, id);
+  if (server is not null) { server!.fullScreened(false); }
+}
+
+/**
+ * **Full screen lasts only while its window is in front**: closed, put away, or another brought forward — Back or Home
+ * on a phone, say — and it ends. Whether it did.
+ */
+export bool keptFull(Desk d, f64 now) {
+  if (d.full.win < 0) { return false; }
+  Win? w = find(d, d.full.win);
+  if (w is not null && !w!.min && frontOf(d) == d.full.win) { return false; }
+  leaveFull(d, now);
+  return true;
+}
+
+/**
+ * **The browser says whether the desktop's page fills the screen** — once it has done what was asked, or because the
+ * person left it with Escape or Back. Left, so is the window's full screen; begun after the desktop had left it again,
+ * it is left too. An earlier full screen's end, said after a new one was asked for, is out of date and changes nothing.
+ * Whether anything changed.
+ */
+export bool browserSaid(Desk d, bool full, f64 now) {
+  if (full) {
+    d.full.asking = false;
+    if (!d.full.whole && d.full.win < 0) {
+      // Begun after the desktop no longer wanted it: left again at once.
+      d.full.shown = true;
+      showScreen(d);
+    }
+    return false;
+  }
+  if (d.full.asking) { return false; }
+  d.full.shown = false;
+  if (!d.full.whole && d.full.win < 0) { return false; }
+  // The person left it — Escape, Back: the whole desktop's, and a window's with it.
+  d.full.whole = false;
+  if (d.full.win >= 0) { leaveFull(d, now); }
+  settingsAgain(d);
+  return true;
+}

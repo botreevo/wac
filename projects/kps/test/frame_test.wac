@@ -1,0 +1,83 @@
+// The frame and control codecs, against the bytes SPEC §6.2 and §8 fix — and the cases Go's reference
+// (`libs/go/framing_test.go`) holds its own codec to, ported one for one.
+//
+//     wac test test/frame_test.wac
+
+import { Check, hex, unhex } from "./check.wac";
+import { Frame, Control, parseFrame, parseControl, encodeData, encodeFin, encodeCode, encodeMaxStreamData,
+         encodeConnClose, encodeHello, encodeMaxData, encodeMaxStreams, FRAME_RESET, FRAME_STOP_SENDING,
+         MAX_FRAME, MAX_OFFSET, WIRE_VERSION } from "../src/webrtc/frame.wac";
+import { Code } from "../src/errors.wac";
+
+string frame(const u8[] m) {
+  return match (parseFrame(m)) {
+    Data(p): "data \{hex(p)}",
+    Fin: "fin",
+    ResetFrame(c): "reset \{c}",
+    StopSending(c): "stop \{c}",
+    MaxStreamData(v): "msd \{v}",
+    Violation(why): "violation",
+  };
+}
+
+string control(const u8[] m) {
+  return match (parseControl(m)) {
+    Close(c): "close \{c}",
+    Hello(v, a, b, c): "hello \{v} \{a} \{b} \{c}",
+    MaxData(v): "maxdata \{v}",
+    MaxStreams(v): "maxstreams \{v}",
+    Bad(why): "bad",
+  };
+}
+
+/** The encodings, byte for byte: type first, integers big-endian. */
+export string test_frames_encode_to_the_bytes_the_spec_fixes() {
+  Check c = Check.create();
+  c.eqStr(hex(encodeData("hi".toBytes(), 0, 2)), "006869", "DATA is 0x00 then the bytes");
+  c.eqStr(hex(encodeFin()), "01", "FIN is one byte");
+  c.eqStr(hex(encodeCode(FRAME_RESET, Code.Reset.wire())), "0200000003", "RESET(reset=3), big-endian");
+  c.eqStr(hex(encodeCode(FRAME_STOP_SENDING, Code.Cancelled.wire())), "0300000001", "STOP_SENDING(cancelled=1)");
+  c.eqStr(hex(encodeMaxStreamData(258 as i64)), "040000000000000102", "MAX_STREAM_DATA is a u64");
+  c.eqStr(hex(encodeHello(WIRE_VERSION, 1048576 as i64, 8388608 as i64, 100 as i64)),
+          "0101" + "0000000000100000" + "0000000000800000" + "0000000000000064", "HELLO is 26 exact bytes");
+  c.eqStr(hex(encodeConnClose(Code.ProtocolError.wire())), "0000000006", "CONNECTION_CLOSE(protocol-error=6)");
+  c.eqStr(hex(encodeMaxData(42 as i64)), "02000000000000002a", "MAX_DATA");
+  c.eqStr(hex(encodeMaxStreams(7 as i64)), "030000000000000007", "MAX_STREAMS");
+  return c.report();
+}
+
+/**
+ * Parsing is strict: every wire-rule violation is a violation, never something weaker. Go's table first, then
+ * the cases it does not have — an oversized frame, and credit one past MAX_OFFSET.
+ */
+export string test_frame_parsing_refuses_what_wire_version_1_does_not_allow() {
+  Check c = Check.create();
+  c.eqStr(frame(encodeCode(FRAME_RESET, Code.InternalError.wire())), "reset 11", "RESET round-trips its code");
+  c.eqStr(frame(encodeMaxStreamData(MAX_OFFSET)), "msd \{MAX_OFFSET}", "MAX_STREAM_DATA at MAX_OFFSET is fine");
+  c.eqStr(frame(unhex("01")), "fin", "FIN");
+  string[] bad = ["", "00", "0101", "020000", "030000000000", "04010203", "0501",
+                  "044000000000000000"];      // MAX_OFFSET + 1
+  string[] names = ["empty message", "empty DATA", "FIN with payload", "short RESET", "long STOP_SENDING",
+                    "short MAX_STREAM_DATA", "unknown type", "credit above MAX_OFFSET"];
+  for (i32 i = 0; i < bad.len(); i++) { c.eqStr(frame(unhex(bad[i])), "violation", names[i]); }
+  u8[] big = u8[].filled(MAX_FRAME + 1, 0);
+  c.eqStr(frame(big), "violation", "a frame of 16385 bytes");
+  u8[] ok = u8[].filled(MAX_FRAME, 9);
+  ok[0] = 0;
+  c.ok(frame(ok).indexOf("data ") == 0, "a DATA frame of exactly 16384 bytes is fine");
+  return c.report();
+}
+
+export string test_control_parsing_is_exact_too() {
+  Check c = Check.create();
+  c.eqStr(control(encodeHello(WIRE_VERSION, 1 as i64, 2 as i64, 3 as i64)), "hello 1 1 2 3", "HELLO round-trips");
+  c.eqStr(control(encodeHello(9, 1 as i64, 2 as i64, 3 as i64)), "hello 9 1 2 3",
+          "an unknown version still parses — refusing it is the connection's business, with `unsupported`");
+  c.eqStr(control(encodeConnClose(Code.Reset.wire())), "close 3", "CONNECTION_CLOSE round-trips");
+  c.eqStr(control(encodeMaxData(42 as i64)), "maxdata 42", "MAX_DATA round-trips");
+  c.eqStr(control(encodeMaxStreams(MAX_OFFSET)), "maxstreams \{MAX_OFFSET}", "MAX_STREAMS at the ceiling");
+  string[] bad = ["", "00000000", "010100", "0700", "000000000000", "024000000000000000",
+                  "01" + "01" + "4000000000000000" + "0000000000000000" + "0000000000000000"];
+  for (i32 i = 0; i < bad.len(); i++) { c.eqStr(control(unhex(bad[i])), "bad", "control \"\{bad[i]}\" is refused"); }
+  return c.report();
+}

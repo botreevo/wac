@@ -1,0 +1,99 @@
+// A data directory's chain log, record by record, beside what its store holds: for working out why a node does not
+// come back. Each block record as its number, hash and parent; each fork choice as its head and finalized block;
+// then the block the store's last commit names, and the blocks it keeps undo records for.
+//
+//     wac run --allow-read tools/chainlog.wac -- GENESIS DATADIR [FROM_BYTE]
+
+import { Sys } from "std";
+import { Vec } from "core";
+import { json.parse } from "wac";
+import { rlp.decode, rlp.itemsOf, rlp.bytesOf, rlp.isList } from "@/lib.wac";
+import { U256 } from "../src/u256.wac";
+import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
+import { blockTimestamp, decodeBlock, BlockDecode } from "../src/chain/block.wac";
+import { Store, Change } from "../src/store/tree.wac";
+import { fileDisk } from "../src/store/file.wac";
+import { undoFrom } from "../src/store/undo.wac";
+
+/** The length of the RLP item at `at`, header and all; -1 if cut short. */
+i32 itemLength(u8[] b, i32 at) {
+  if (at >= b.len()) { return -1; }
+  i32 p = b[at] as i32;
+  i32 n = 0;
+  if (p < 0x80) { n = 1; }
+  else if (p < 0xb8) { n = 1 + p - 0x80; }
+  else if (p < 0xc0) {
+    i32 l = p - 0xb7;
+    i32 len = 0;
+    for (i32 i = 0; i < l; i++) { len = (len << 8) | (b[at + 1 + i] as i32); }
+    n = 1 + l + len;
+  } else if (p < 0xf8) { n = 1 + p - 0xc0; }
+  else {
+    i32 l = p - 0xf7;
+    i32 len = 0;
+    for (i32 i = 0; i < l; i++) { len = (len << 8) | (b[at + 1 + i] as i32); }
+    n = 1 + l + len;
+  }
+  return at + n <= b.len() ? n : -1;
+}
+
+string short(U256 h) { return h.toHex().slice(0, 12); }
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 2) {
+    sys.warn("usage: chainlog.wac GENESIS DATADIR [FROM_BYTE]");
+    return 2;
+  }
+  string[] why = [""];
+  Genesis gen = genesisFrom(parse((await sys.readFile(a[0])).ok()!).ok()!, why)!;
+  i32 from = 0;
+  if (a.len() > 2) {
+    u8[] d = a[2].toBytes();
+    for (i32 i = 0; i < d.len(); i++) { from = from * 10 + ((d[i] - 48) as i32); }
+  }
+  u8[] log = (await sys.readFile(a[1] + "/chain.log")).ok()!;
+  i32 at = 0;
+  while (at < log.len()) {
+    i32 n = itemLength(log, at);
+    if (n < 0) {
+      sys.log("\{at}: cut short");
+      break;
+    }
+    u8[] rec = u8[].filled(n, 0);
+    rec.copyFrom(log, at, 0, n);
+    auto d = decode(rec);
+    if (at >= from && d.ok && isList(d.item)) {
+      auto f = itemsOf(d.item);
+      u8[] kind = bytesOf(f[0]);
+      if (kind.len() == 1 && kind[0] == 1) {
+        u8[] raw = bytesOf(f[1]);
+        BlockDecode bd = decodeBlock(gen.config.specAt(blockTimestamp(raw)), raw);
+        if (bd.block is null) { sys.log("\{at}: block that does not decode"); }
+        else {
+          auto h = bd.block!.header;
+          sys.log("\{at}: block \{h.number.toDecimal()} \{short(h.hash)} on \{short(h.parentHash)}");
+        }
+      } else if (kind.len() == 1 && kind[0] == 2) {
+        sys.log("\{at}: choice head \{short(U256.fromBytes(bytesOf(f[1]), 0, 32))} finalized \{short(U256.fromBytes(bytesOf(f[3]), 0, 32))}");
+      } else {
+        sys.log("\{at}: record of kind \{kind.len() == 1 ? kind[0] as i32 : -1}");
+      }
+    }
+    at += n;
+  }
+  Store store = (await Store.open((await fileDisk(sys, a[1] + "/state.db")).unwrap())).unwrap();
+  u8[] user = store.committed().user;
+  if (user.len() >= 40) { sys.log("the store holds block \{U256.fromBytes(user, 32, 8).toDecimal()} \{short(U256.fromBytes(user, 0, 32))}"); }
+  Vec<Change> undo = await store.range(undoFrom(0), undoFrom(0xffffffffffff), 0x7fffffff);
+  string kept = "";
+  for (i32 i = 0; i < undo.len(); i++) {
+    u8[] k = undo.get(i).key;
+    if (k[k.len() - 1] != 0 || k[k.len() - 2] != 0) { continue; }
+    u64 num = 0;
+    for (i32 b = 1; b < 9; b++) { num = (num << 8) | (k[b] as u64); }
+    kept = kept + " \{num}:\{short(U256.fromBytes(k, 9, 32))}";
+  }
+  sys.log("undo records:\{kept}");
+  return 0;
+}

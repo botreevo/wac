@@ -1,0 +1,183 @@
+// The faucet: a transfer from the account the genesis funded, at most once per cooldown for each client
+// address and for each recipient.
+//
+// Both limits are kept in memory, so a restart forgets them. For a devnet whose ether is worth nothing that
+// is the right trade: a restart is rare, and nothing has to be written for every drip.
+
+import { Map, Vec, hashString, stringEq } from "core";
+import { json.JsonValue, json.JsonArray } from "wac";
+import { U256, Engine, Answer, bytesToHex } from "@/packages/wacuum/src/lib.wac";
+import { signedTransfer, checksummed } from "./chain.wac";
+import { lower } from "./http.wac";
+
+export struct Faucet {
+  u8[] key;
+  U256 address;
+  u64 chainId;
+  /** What one drip sends, in wei. */
+  U256 amount;
+  i64 cooldownMillis;
+  /** When each client address, and each recipient, last had a drip. */
+  Map<string, i64> byClient;
+  Map<string, i64> byRecipient;
+  i32 drips;
+
+  Faucet create(u8[] key, U256 address, u64 chainId, U256 amount, i64 cooldownMillis) {
+    return Faucet(key, address, chainId, amount, cooldownMillis, Map.create(hashString, stringEq),
+                  Map.create(hashString, stringEq), 0);
+  }
+}
+
+/** What a drip came to: the transaction's hash, or why there was none. */
+export struct Drip {
+  string txHash;
+  string refused;
+  /** When the refusal was the cooldown: how long until the next drip, in seconds. */
+  i64 waitSeconds;
+}
+
+/**
+ * Send `faucet.amount` to `to`, for the client at `client`, at `nowMillis`. The transaction goes into the
+ * engine's mempool and is in the next block.
+ */
+export Drip drip(Faucet faucet, Engine e, string client, U256 to, i64 nowMillis) {
+  string recipient = bytesToHex(to.toBytes());
+  string visitor = visitorOf(client);
+  i64 wait = remaining(faucet.byClient, visitor, faucet.cooldownMillis, nowMillis);
+  i64 waitTo = remaining(faucet.byRecipient, recipient, faucet.cooldownMillis, nowMillis);
+  if (waitTo > wait) { wait = waitTo; }
+  if (wait > 0) {
+    return Drip("", "The faucet sends to each address, and to each visitor, once every \{hours(faucet.cooldownMillis)}.", (wait + 999) / 1000);
+  }
+  if (to.eq(faucet.address)) { return Drip("", "That is the faucet's own address.", 0); }
+
+  // The next nonce counts what is already waiting in the mempool, so drips in one block do not collide; the
+  // fee cap is twice the next base fee, which covers any rise a devnet's blocks can make before this is in.
+  string from = checksummed(faucet.address);
+  Answer n = e.call("eth_getTransactionCount", params2(from, "pending"));
+  Answer fee = e.call("eth_gasPrice", JsonValue.Array(JsonArray.create()));
+  if (n.result is null || fee.result is null) { return Drip("", "The node could not say what the faucet's next transaction is.", 0); }
+  u64 nonce = U256.fromHex(n.result!.text()!)!.low();
+  U256 tip = U256.ofU64(1000000000);
+  U256 maxFee = U256.fromHex(fee.result!.text()!)!.mul(U256.ofU64(2)).add(tip);
+  u8[] raw = signedTransfer(faucet.key, faucet.chainId, nonce, tip, maxFee, to, faucet.amount);
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Str(bytesToHex(raw).toBytes()));
+  Answer sent = e.call("eth_sendRawTransaction", JsonValue.Array(ps));
+  if (sent.result is null) { return Drip("", "The node refused the faucet's transaction: \{sent.message}", 0); }
+  faucet.byClient.set(visitor, nowMillis);
+  faucet.byRecipient.set(recipient, nowMillis);
+  faucet.drips++;
+  return Drip(sent.result!.text()!, "", 0);
+}
+
+/**
+ * Who a client address is, for the faucet's limit. An IPv4 address is one visitor. An IPv6 address is not:
+ * a network is handed a /64 at the least, and any host on it can take as many addresses in it as it likes, so
+ * a visitor is the /64 — `2001:db8:0:1::/64`. An IPv4 address written as IPv6 (`::ffff:192.0.2.1`, as a
+ * dual-stack socket reports it) is the IPv4 address. Anything that does not parse is taken as it is written.
+ */
+export string visitorOf(string client) {
+  string a = lower(client);
+  if (a.indexOf("[") == 0 && a.indexOf("]") > 0) { a = a.slice(1, a.indexOf("]")); }
+  if (a.indexOf("%") >= 0) { a = a.slice(0, a.indexOf("%")); }
+  if (a.indexOf(":") < 0) { return a; }
+  if (a.indexOf("::ffff:") == 0 && a.indexOf(".") > 0) { return a.slice(7, a.len()); }
+  i32[]? groups = ipv6Groups(a);
+  if (groups is null) { return a; }
+  string hex = "0123456789abcdef";
+  string out = "";
+  for (i32 i = 0; i < 4; i++) {
+    i32 g = groups![i];
+    string digits = "";
+    if (g == 0) { digits = "0"; }
+    while (g > 0) {
+      digits = hex.slice(g % 16, g % 16 + 1) + digits;
+      g = g / 16;
+    }
+    out += digits + ":";
+  }
+  return out + ":/64";
+}
+
+/** The eight 16-bit groups of an IPv6 address in text, `::` filled in; null if it is not one. */
+i32[]? ipv6Groups(string a) {
+  i32 gap = a.indexOf("::");
+  string left = gap < 0 ? a : a.slice(0, gap);
+  string right = gap < 0 ? "" : a.slice(gap + 2, a.len());
+  if (right.indexOf("::") >= 0) { return null; }
+  Vec<i32> l = Vec.create();
+  Vec<i32> r = Vec.create();
+  if (!groupsOf(left, l) || !groupsOf(right, r)) { return null; }
+  i32 missing = 8 - l.len() - r.len();
+  if ((gap < 0 && missing != 0) || (gap >= 0 && missing < 1)) { return null; }
+  i32[] out = i32[].filled(8, 0);
+  for (i32 i = 0; i < l.len(); i++) { out[i] = l.get(i); }
+  for (i32 i = 0; i < r.len(); i++) { out[8 - r.len() + i] = r.get(i); }
+  return out;
+}
+
+/**
+ * The groups of one side of `::` into `out`. A dotted quad at the end is the last 32 bits, written as IPv4
+ * (`64:ff9b::192.0.2.1`) — two groups.
+ */
+bool groupsOf(string side, Vec<i32> out) {
+  if (side == "") { return true; }
+  string rest = side + ":";
+  while (rest.len() > 0) {
+    i32 colon = rest.indexOf(":");
+    string g = rest.slice(0, colon);
+    rest = rest.slice(colon + 1, rest.len());
+    if (g.indexOf(".") >= 0 && rest == "") {
+      i32[] q = [0, 0, 0, 0];
+      string parts = g + ".";
+      for (i32 i = 0; i < 4; i++) {
+        i32 dot = parts.indexOf(".");
+        if (dot <= 0 || dot > 3) { return false; }
+        i32 n = 0;
+        for (u8 c in parts.slice(0, dot).toBytes()) {
+          if (c < '0' || c > '9') { return false; }
+          n = n * 10 + ((c - '0') as i32);
+        }
+        if (n > 255) { return false; }
+        q[i] = n;
+        parts = parts.slice(dot + 1, parts.len());
+      }
+      if (parts != "") { return false; }
+      out.push(q[0] * 256 + q[1]);
+      out.push(q[2] * 256 + q[3]);
+      continue;
+    }
+    if (g.len() == 0 || g.len() > 4) { return false; }
+    i32 v = 0;
+    for (u8 c in g.toBytes()) {
+      i32 d = c >= '0' && c <= '9' ? (c - '0') as i32 : c >= 'a' && c <= 'f' ? (c - 'a') as i32 + 10 : -1;
+      if (d < 0) { return false; }
+      v = v * 16 + d;
+    }
+    out.push(v);
+  }
+  return out.len() <= 8;
+}
+
+/** How many milliseconds `key` must still wait, or 0. */
+i64 remaining(Map<string, i64> last, string key, i64 cooldown, i64 now) {
+  i64? at = last.get(key);
+  if (at is null || now - at! >= cooldown) { return 0; }
+  return cooldown - (now - at!);
+}
+
+/** A duration as people say it: "24 hours", "1 hour", "30 minutes". */
+export string hours(i64 millis) {
+  i64 minutes = millis / 60000;
+  if (minutes % 60 != 0 || minutes == 0) { return minutes == 1 ? "minute" : "\{minutes} minutes"; }
+  i64 h = minutes / 60;
+  return h == 1 ? "hour" : "\{h} hours";
+}
+
+JsonValue params2(string a, string b) {
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Str(a.toBytes()));
+  ps.push(JsonValue.Str(b.toBytes()));
+  return JsonValue.Array(ps);
+}

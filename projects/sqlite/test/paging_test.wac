@@ -1,0 +1,117 @@
+// A database file read and written a page at a time: the page cache stays its size however large the
+// file, a commit interrupted before its journal is deleted is undone on the next open, and a database
+// with a write-ahead log is written after its log is taken in.
+
+import { Vec, flatten } from "core";
+import { Sys } from "std";
+import { Check } from "./check.wac";
+import { SqliteFile } from "../src/file.wac";
+import { Value } from "../src/value.wac";
+import { Rows } from "../src/plan.wac";
+
+i64 one(SqliteFile f, string sql) {
+  Rows r = f.conn.execute(sql, Value[]()).unwrap();
+  return match (r.rows.get(0)[0]) { Int(n): n, default: -1 as i64 };
+}
+
+bool exists(Sys sys, string path) {
+  match (flatten(sys.files().stat(path).wait())) {
+    Ok(st): { return st.exists; }
+    Err(e): { return false; }
+  }
+}
+
+SqliteFile fresh(Sys sys, string path) {
+  sys.files().mkdir("dist", true).wait();
+  for (string side in ["", "-journal", "-wal", "-shm"]) { sys.files().remove(path + side, false).wait(); }
+  return SqliteFile.open(sys.files(), path).unwrap();
+}
+
+export string test_a_large_file_is_read_through_a_small_cache(Sys sys) {
+  Check t = Check.create();
+  string path = "dist/paging_big.db";
+  SqliteFile f = fresh(sys, path);
+  t.ok(f.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v BLOB); CREATE INDEX t_k ON t (k);").isOk(), "create");
+  t.ok(f.exec("BEGIN").isOk(), "begin");
+  for (i32 i = 0; i < 4000; i++) {
+    f.conn.execute("INSERT INTO t (k, v) VALUES (?, zeroblob(500))", [Value.Text("key\{(i * 7919) % 4000}")]).unwrap();
+  }
+  t.ok(f.exec("COMMIT").isOk(), "commit");
+  // Open it again with room for 20 pages: every query reads what it needs and lets the rest go.
+  SqliteFile g = SqliteFile.open(sys.files(), path).unwrap();
+  g.conn.db.main.limit = 20;
+  t.eqI64(one(g, "SELECT count(*) FROM t"), 4000, "count");
+  t.eqI64(one(g, "SELECT sum(length(v)) FROM t"), 2000000, "every row's blob");
+  i64 want = 0;
+  for (i32 i = 0; i < 4000; i++) { if ((i * 7919) % 4000 == 1234) { want = (i + 1) as i64; } }
+  t.eqI64(one(g, "SELECT id FROM t WHERE k = 'key1234'"), want, "a lookup by index");
+  t.ok(g.conn.db.main.cache.len() <= 60, "cache holds \{g.conn.db.main.cache.len()} pages of \{g.conn.db.main.count}");
+  t.ok(g.exec("UPDATE t SET v = zeroblob(10) WHERE id % 3 = 0; DELETE FROM t WHERE id % 5 = 0;").isOk(), "change through the small cache");
+  SqliteFile h = SqliteFile.open(sys.files(), path).unwrap();
+  t.eqI64(one(h, "SELECT count(*) FROM t"), 3200, "rows after the delete");
+  t.eqI64(one(h, "SELECT count(*) FROM t WHERE length(v) = 10"), 1067, "rows after the update");
+  t.eqI64(one(h, "SELECT count(*) FROM t INDEXED BY t_k WHERE k > ''"), 3200, "the index agrees");
+  return t.report();
+}
+
+export string test_a_commit_stopped_before_its_journal_goes_is_undone(Sys sys) {
+  Check t = Check.create();
+  string path = "dist/paging_crash.db";
+  SqliteFile f = fresh(sys, path);
+  t.ok(f.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT); INSERT INTO t (s) VALUES ('kept');").isOk(), "setup");
+  f.stopBeforeCommitPoint = true;
+  t.ok(f.exec("INSERT INTO t (s) VALUES ('lost'); ").isErr(), "the interrupted commit fails");
+  t.ok(exists(sys, path + "-journal"), "the journal is left behind");
+  SqliteFile g = SqliteFile.open(sys.files(), path).unwrap();
+  t.eqI64(one(g, "SELECT count(*) FROM t"), 1, "only the committed row");
+  t.ok(!exists(sys, path + "-journal"), "the journal is gone");
+  t.ok(g.exec("INSERT INTO t (s) VALUES ('after')").isOk(), "writable after recovery");
+  t.eqI64(one(SqliteFile.open(sys.files(), path).unwrap(), "SELECT count(*) FROM t"), 2, "and kept");
+  // A journal left this way is one SQLite plays back too (tools/journal_check.py checks it with SQLite).
+  string path2 = "dist/paging_crash_sqlite.db";
+  SqliteFile k = fresh(sys, path2);
+  t.ok(k.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT); INSERT INTO t (s) VALUES ('kept');").isOk(), "setup 2");
+  k.stopBeforeCommitPoint = true;
+  t.ok(k.exec("UPDATE t SET s = 'lost'; INSERT INTO t (s) VALUES ('lost');").isErr(), "interrupted 2");
+  return t.report();
+}
+
+export string test_a_database_with_a_log_is_written_after_its_log_is_taken_in(Sys sys) {
+  Check t = Check.create();
+  string path = "dist/paging_wal.db";
+  for (string side in ["", "-journal", "-wal", "-shm"]) { sys.files().remove(path + side, false).wait(); }
+  sys.files().writeFile(path, flatten(sys.files().readFile("test/data/wal.db").wait()).unwrap()).wait();
+  sys.files().writeFile(path + "-wal", flatten(sys.files().readFile("test/data/wal.db-wal").wait()).unwrap()).wait();
+  SqliteFile f = SqliteFile.open(sys.files(), path).unwrap();
+  i64 before = one(f, "SELECT count(*) FROM later");
+  t.ok(f.exec("INSERT INTO later DEFAULT VALUES").isOk(), "a write");
+  t.ok(!exists(sys, path + "-wal"), "the log was taken in");
+  SqliteFile g = SqliteFile.open(sys.files(), path).unwrap();
+  t.eqI64(one(g, "SELECT count(*) FROM later"), before + 1, "the log's rows and the new one");
+  return t.report();
+}
+
+export string test_a_commit_by_another_connection_is_seen_by_the_next_statement(Sys sys) {
+  Check t = Check.create();
+  string path = "dist/paging_two.db";
+  SqliteFile a = fresh(sys, path);
+  t.ok(a.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t (v) VALUES ('one');").isOk(), "create");
+  // Two connections to one file, as a server and an admin tool beside it are.
+  SqliteFile b = SqliteFile.open(sys.files(), path).unwrap();
+  t.eqI64(one(b, "SELECT count(*) FROM t"), 1, "b reads a's row");
+  t.ok(a.exec("INSERT INTO t (v) VALUES ('two')").isOk(), "a inserts");
+  t.eqI64(one(b, "SELECT count(*) FROM t"), 2, "b sees a's later commit");
+  t.ok(b.exec("UPDATE t SET v = 'TWO' WHERE id = 2").isOk(), "b writes on top of it");
+  t.eqI64(one(a, "SELECT count(*) FROM t WHERE v = 'TWO'"), 1, "a sees b's commit");
+  // A schema change too: the reloaded connection knows the new table.
+  t.ok(b.exec("CREATE TABLE u (x); INSERT INTO u VALUES (5);").isOk(), "b makes a table");
+  t.eqI64(one(a, "SELECT x FROM u"), 5, "a reads b's new table");
+  // Inside a transaction the view holds still, as a read lock would keep it.
+  t.ok(a.exec("BEGIN").isOk(), "a begins");
+  t.eqI64(one(a, "SELECT count(*) FROM t"), 2, "a's view at the start");
+  t.ok(b.exec("INSERT INTO t (v) VALUES ('three')").isOk(), "b commits meanwhile");
+  t.eqI64(one(a, "SELECT count(*) FROM t"), 2, "a's view is unchanged in its transaction");
+  t.ok(a.exec("COMMIT").isOk(), "a commits nothing");
+  t.eqI64(one(a, "SELECT count(*) FROM t"), 3, "and sees b's after it");
+  return t.report();
+}

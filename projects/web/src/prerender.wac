@@ -1,0 +1,169 @@
+// A page's first frame, drawn ahead of time: what `tools/build.wac` puts in `index.html` for a page that exports its
+// frames (`Frame`), so the reader sees the page while its module is still on the way, and what the browser's host then
+// adopts rather than draws again.
+//
+// **The first frame is the program's first batch** (`PAGE_BATCH`): what `main` drew before its first turn ended —
+// `moduleFor`'s `run` renders straight after calling the program, before any answer from the host has arrived. So it
+// depends on nothing but the program, its clock and its randomness, and a build and a browser draw the same one. A
+// program that draws something else in the browser loses nothing but time: the host rebuilds what does not match.
+//
+// **Every element carries its handle**, `data-wac-h="17"`, and every text node is preceded by a comment naming
+// its, `<!--wac:18-->`, since the browser's parser joins neighbouring text into one node and an empty one is no node
+// at all. That is how the host finds, for each handle the program makes, the node already there
+// (`documentSide` in `tools/build.wac`). Both marks are gone once the first batch has been applied.
+//
+// What cannot be written as markup is left out, or written without its mark and drawn when the module runs: a shadow root and what is in it, and
+// a canvas's pixels.
+
+import { Buf } from "core";
+import { Sys } from "std";
+import { Frame, Page, Size, sizeOf } from "./page.wac";
+import { TestDoc, TestNode } from "./testdoc.wac";
+import { isVoidElement, writeCss, writeEscaped } from "./html.wac";
+
+/** A page drawn into records, for its first frame to be read back as markup. */
+export struct Prerender {
+  TestDoc doc;
+  /** The page to hand the program: `program(prerender.page)`, as `moduleFor`'s `run` hands it the real one. */
+  Page page;
+  /** The document as the first batch left it, once one has landed. */
+  string? markup;
+
+  Prerender create() { return Prerender.at(0, 0); }
+
+  /** A page whose window is `width` by `height`, as a `Frame` says — what `page.size()` answers the program. */
+  Prerender at(i32 width, i32 height) { return Prerender.on("/", width, height); }
+
+  /** The page at `path` on its site (`page.path()`), in a window `width` by `height` — a `Frame.on`. */
+  Prerender on(string path, i32 width, i32 height) {
+    TestDoc doc = TestDoc.batched();
+    doc.size = Size(width, height);
+    doc.path = path;
+    Prerender r = Prerender(doc, doc.page(), null);
+    doc.onBatch = () => { if (r.markup is null) { r.markup = markupOf(r.doc); } };
+    return r;
+  }
+
+  /**
+   * The first frame, as markup: the program's first turn ended as a browser's host ends it — the views rendered and
+   * the changes sent — and the document as that batch left it. Empty when the program drew nothing.
+   */
+  string first(this) {
+    this.page.turn();
+    return this.markup ?? markupOf(this.doc);
+  }
+}
+
+/**
+ * **Whether a page's module was run to draw its frames** — with no page, by the build (`drawPageFrames` in
+ * `tools/build.wac`): `--frames`, or `--frame <k>`.
+ */
+export bool drawing(string[] args) {
+  return (args.len() == 1 && args[0] == "--frames") || (args.len() == 2 && args[0] == "--frame");
+}
+
+/**
+ * **The page's first frames, drawn for the build**: `--frames` writes how many there are and then each one's path, a
+ * line each; `--frame <k>` writes the `k`th — its media query, the page's title and its description, a line each, then
+ * the markup its first batch left (`Prerender.first`), the program handed the page at that frame's path in a window that
+ * frame's size. Then the program is ended, whatever it is still waiting for: that is the browser's to finish, and a
+ * program that returns with work waiting has failed.
+ */
+export i32 drawFrames(Sys sys, fn<void(Page)> program, Frame[] frames) {
+  string[] args = sys.args();
+  if (args[0] == "--frames") {
+    string listed = "\{frames.len()}\n";
+    for (Frame f in frames) { listed = listed + oneLine(f.path) + "\n"; }
+    sys.stdout().write(listed.toBytes()).wait();
+    sys.exit(0);
+  }
+  // `sizeOf` reads a number before an `x`, and anything else as 0 by 0: the frame's number, as `<k>x1`.
+  Size read = sizeOf(args[1] + "x1");
+  i32 k = read.height == 1 ? read.width : 0 - 1;
+  if (k < 0 || k >= frames.len()) {
+    sys.stderr().line("no frame \{args[1]}: there are \{frames.len()}");
+    return 2;
+  }
+  Frame f = frames[k];
+  Prerender r = Prerender.on(f.path, f.width, f.height);
+  program(r.page);
+  string markup = r.first();
+  sys.stdout().write((oneLine(f.media) + "\n" + oneLine(r.doc.title) + "\n" + oneLine(r.doc.description) + "\n" + markup).toBytes()).wait();
+  sys.exit(0);
+}
+
+/** `s` on one line: a line break in it is a space, so it cannot be taken for the next of `drawFrames`'s lines. */
+string oneLine(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '\n' || b[i] == '\r') { b[i] = ' '; } }
+  return string.fromBytes(b);
+}
+
+/** What is under the document's root, as markup carrying the handles. */
+export string markupOf(TestDoc doc) {
+  Buf out = Buf.create();
+  TestNode root = doc.at(0);
+  for (i32 i = 0; i < root.kids.len(); i++) { writeRecord(out, doc, root.kids.get(i), ""); }
+  return string.fromBytes(out.take());
+}
+
+/** Node `id` as markup, inside an element whose tag is `inside`. */
+void writeRecord(Buf out, TestDoc doc, i32 id, string inside) {
+  TestNode n = doc.at(id);
+  if (n.tag == "") {
+    // **Text in a stylesheet or a textarea has no mark**: in there a comment is text, not a node. The host makes that
+    // text again, and drops the old.
+    if (inside != "style" && inside != "textarea") { out.pushStr("<!--wac:\{id}-->"); }
+    writeText(out, n.text, inside == "style");
+    return;
+  }
+  // A shadow root is a page of its own inside its host, made when the module runs.
+  if (n.tag == "#shadow") { return; }
+  out.pushStr("<");
+  out.pushStr(n.tag);
+  out.pushStr(" data-wac-h=\"\{id}\"");
+  string value = "";
+  bool hasValue = false;
+  for (i32 i = 0; i < n.names.len(); i++) {
+    string name = n.names.get(i);
+    string v = n.values.get(i);
+    // **A property is not an attribute**, but the three a program sets have one that starts the element off the same:
+    // an input's `value`, and `checked` and `selected` when they are true. A textarea's value is its content.
+    if (name.len() > 0 && name.slice(0, 1) == ".") {
+      if (name == ".value") {
+        value = v;
+        hasValue = true;
+        if (n.tag != "input") { continue; }
+        name = "value";
+      } else if ((name == ".checked" || name == ".selected") && v == "true") {
+        out.pushStr(" " + name.slice(1, name.len()));
+        continue;
+      } else {
+        continue;
+      }
+    }
+    out.pushStr(" ");
+    out.pushStr(name);
+    out.pushStr("=\"");
+    writeEscaped(out, v, true);
+    out.pushStr("\"");
+  }
+  out.pushStr(">");
+  if (isVoidElement(n.tag)) { return; }
+  // A textarea with a value shows that rather than its content.
+  if (n.tag == "textarea" && hasValue) {
+    writeEscaped(out, value, false);
+    out.pushStr("</textarea>");
+    return;
+  }
+  // `text` on an element: its content replaced with text, which the host makes no handle for.
+  if (n.tag != "canvas") { writeText(out, n.text, n.tag == "style"); }
+  for (i32 i = 0; i < n.kids.len(); i++) { writeRecord(out, doc, n.kids.get(i), n.tag); }
+  out.pushStr("</");
+  out.pushStr(n.tag);
+  out.pushStr(">");
+}
+
+void writeText(Buf out, string text, bool css) {
+  if (css) { writeCss(out, text); } else { writeEscaped(out, text, false); }
+}

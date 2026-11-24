@@ -1,0 +1,251 @@
+// The suite queue runs its longest chunk first, and this is what says so.
+//
+// **Why it is worth a test.** The queue's wall time is its floor plus whatever the tail wastes, and
+// the tail is decided by one insertion sort in `chunksOf`. That sort used *file count* as a proxy for
+// cost, which was good enough while `packages/crypto`'s chunk was 195s and nothing could hide behind
+// it. `issues/system/0274b` took crypto to 25s and the proxy stopped being good enough in the same
+// commit — the suite's own footer, before and after:
+//
+//     before   1283s of work, floor 357s, wall 452s    ->   95s of loss
+//     after    1045s of work, floor 299s, wall 450s    ->  151s of loss
+//
+// 238s came out of the work and 2s came off the wall, so all of it went into idle workers. The fix is
+// to order by the previous run's measurements, kept in `.cache/suite-times`; this checks the ordering
+// actually reads them, because a file that is written and never read looks exactly the same from
+// outside as one that works.
+//
+// **The keys come from the runner rather than from here.** An earlier draft named
+// `packages/wacc/test/wac#6` directly and would have gone quietly vacuous the day wacc's file count
+// changed the number of parts — the key would name nothing, both chunks would be unknown, and the
+// assertion would pass for the wrong reason. So this asks `--dry` what the chunks are, then makes the
+// *second* of a pair expensive and the first cheap, and requires them to swap.
+//
+// **`WAC_SUITE_TIMES` is why the runner has that variable.** `tools/` runs inside the suite, so a
+// test writing the real path would be a second writer on the file the run around it is about to
+// write.
+
+import { Exec, execReason, ChildEnv, Env, Files, Procs, Sys, Launch } from "std";
+import { T } from "../../packages/wactest/src/assert.wac";
+import { binaryPath, freshDir } from "../../packages/wactest/src/host.wac";
+import { contains, splitLines, startsWith, trimmed } from "../../packages/wactest/src/strings.wac";
+import { itoa, atoi } from "../../packages/fmt/src/itoa.wac";
+import { mergedTimes } from "./suitehouse.wac";
+import { flatten } from "core";
+
+/** One `--dry` chunk line, reduced to the key `chunksOf` would have given it. */
+struct Parsed {
+  bool ok;
+  string key;
+  string label;
+}
+
+/**
+ * `   chunk 3 (12): packages/wacc/test/wac — 12 of its files (4 of 7)` → `packages/wacc/test/wac#3`.
+ *
+ * A whole-directory chunk has no `(k of n)` and its key is the directory, which this reports too —
+ * the caller wants a *split* one and checks.
+ */
+Parsed parseChunk(string line) {
+  string t = trimmed(line);
+  if (!startsWith(t, "chunk ")) { return Parsed(false, "", ""); }
+  i32 colon = t.indexOf(": ");
+  if (colon < 0) { return Parsed(false, "", ""); }
+  string label = t.slice(colon + 2, t.len());
+  i32 dash = label.indexOf(" — ");
+  string dir = dash < 0 ? label : label.slice(0, dash);
+  // The part number is the last `(` on the line, and only a split chunk has one.
+  i32 open = 0 - 1;
+  for (i32 i = 0; i < label.len(); i++) {
+    if (label.slice(i, i + 1) == "(") { open = i; }
+  }
+  if (open < 0 || dash < 0) { return Parsed(true, dir, label); }
+  string rest = label.slice(open + 1, label.len());
+  i32 of = rest.indexOf(" of ");
+  if (of <= 0) { return Parsed(true, dir, label); }
+  i32 k = atoi(rest.slice(0, of)) - 1;
+  return Parsed(true, dir + "#" + itoa(k), label);
+}
+
+/** `wac task test -- --dry`, with the times file pointed wherever the caller wants. */
+string dryRun(T t, Env env, Procs procs, string times) {
+  Exec r = flatten(procs.exec(binaryPath(env), ["task", "test", "--", "--dry"], u8[](), ChildEnv(false, ["WAC_SUITE_TIMES=" + times]), Launch("", false, false, false, false)).wait()).unwrap();
+  t.isTrue(r.ran() && r.status == 0, "the dry run — " + execReason(r));
+  if (!r.ran() || r.status != 0) { return ""; }
+  return string.fromBytes(r.stdout) + string.fromBytes(r.stderr);
+}
+
+/** Where `key` appears in the chunk order, or -1. */
+i32 positionOf(string[] lines, string key) {
+  i32 at = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    Parsed p = parseChunk(lines[i]);
+    if (!p.ok) { continue; }
+    if (p.key == key) { return at; }
+    at = at + 1;
+  }
+  return 0 - 1;
+}
+
+export string test_a_chunk_recorded_as_slow_is_dispatched_before_one_recorded_as_fast(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = flatten(env.cwd().wait()).unwrap() + "/.cache/suiteorder-probe";
+  string why = freshDir(fs, dir);
+  t.isTrue(why == "", why);
+  string times = dir + "/times";
+
+  // A file that does not exist is the fresh-checkout case, and the order it gives is the one the
+  // proxy always gave. It is also where the pair to swap comes from.
+  string[] first = splitLines(dryRun(t, env, procs, times));
+  string a = "";
+  string b = "";
+  for (i32 i = 0; i < first.len(); i++) {
+    Parsed p = parseChunk(first[i]);
+    if (!p.ok || !contains(p.key, "#")) { continue; }
+    if (a == "") { a = p.key; continue; }
+    if (b == "") { b = p.key; }
+  }
+  t.isTrue(a != "" && b != "", "the dry run named two split chunks — got '" + a + "' and '" + b + "'");
+  if (a == "" || b == "") { fs.remove(dir, true).wait(); return t.report(); }
+  t.isTrue(positionOf(first, a) < positionOf(first, b),
+           "with no file, " + a + " should still come before " + b);
+
+  // Now say the second one is the expensive one. Nothing else is recorded, so every other chunk is
+  // unknown and sorts above both — what is being checked is this pair's order relative to each other.
+  auto wrote = flatten(fs.writeFile(times, (a + "\t1000\n" + b + "\t900000\n").toBytes()).wait());
+  t.isTrue(wrote.isOk(), "writing the times file — " + "\{wrote.isErr() ? "\{wrote.err()!}" : ""}");
+
+  string[] second = splitLines(dryRun(t, env, procs, times));
+  i32 pa = positionOf(second, a);
+  i32 pb = positionOf(second, b);
+  t.isTrue(pa >= 0 && pb >= 0, "both chunks are still in the order: " + itoa(pa) + " and " + itoa(pb));
+  t.isTrue(pb < pa,
+           "900,000ms should be dispatched before 1,000ms — " + b + " is at " + itoa(pb) +
+           " and " + a + " at " + itoa(pa));
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+/** `--dry` narrowed to one directory, answering its output and its exit status. */
+struct Dry { bool ok; i32 status; string out; }
+
+Dry dryRunOn(Env env, Procs procs, string times, string target) {
+  Exec r = flatten(procs.exec(binaryPath(env), ["task", "test", "--", "--dry", target], u8[](), ChildEnv(false, ["WAC_SUITE_TIMES=" + times]), Launch("", false, false, false, false)).wait()).unwrap();
+  if (!r.ran()) { return Dry(false, 0 - 1, r.error); }
+  return Dry(true, r.status, string.fromBytes(r.stdout) + string.fromBytes(r.stderr));
+}
+
+/** The `N test files` the discovery line reports, or -1. */
+i32 filesReported(string out) {
+  string[] lines = splitLines(out);
+  for (i32 i = 0; i < lines.len(); i++) {
+    i32 at = lines[i].indexOf(" test files");
+    if (at < 0) { continue; }
+    i32 from = at;
+    while (from > 0) {
+      string c = lines[i].slice(from - 1, from);
+      if (c < "0" || c > "9") { break; }
+      from = from - 1;
+    }
+    return atoi(lines[i].slice(from, at));
+  }
+  return 0 - 1;
+}
+
+/**
+ * **A run narrowed to one big directory has to survive its own chunking.**
+ *
+ * `chunksOf` allocated `Chunk[dirs.len() * 4]`, and four was not a bound — it was the number
+ * `packages/wacc` happened to produce on the day the line was written, when the comment on
+ * `chunkSize` still said "12 is where packages/wacc's 40 files become four chunks". At 84 files it
+ * is seven, and `wac task test packages/wacc` died with *array element access out of bounds* and no
+ * further explanation.
+ *
+ * **It could only fail for a narrow target, which is why nobody hit it.** The array is sized from
+ * `dirs.len()`, so the whole-repository run gets 40 x 4 = 160 slots for 59 chunks and the overflow
+ * has nowhere to happen. Ask for one directory and the slack is gone: one directory, four slots,
+ * seven chunks. Every developer command that names a package took that path.
+ *
+ * The check that keeps this honest is the second assertion. A directory small enough to fit in four
+ * chunks would pass this test while testing nothing, so the case asserts it is still big enough to
+ * have overflowed — more than `chunkSize()` x 4 files. If wacc's tests are ever split up, that
+ * assertion fails and says to point this somewhere still large rather than leaving it vacuous.
+ */
+export string test_a_dry_run_of_one_large_directory_does_not_overflow_its_chunks(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = flatten(env.cwd().wait()).unwrap() + "/.cache/suiteorder-narrow";
+  t.isTrue(freshDir(fs, dir) == "", "the fixture directory could not be made");
+
+  Dry d = dryRunOn(env, procs, dir + "/times", "packages/wacc/test/wac");
+  t.isTrue(d.ok, "the dry run did not start — " + d.out);
+  t.eqI32(d.status, 0, "`--dry packages/wacc/test/wac` failed, and a trap here is the chunk array "
+      + "being sized from a guess rather than from the work: " + d.out);
+
+  i32 files = filesReported(d.out);
+  t.isTrue(files > 48, "that directory now has " + itoa(files) + " test files, which fits in four "
+      + "chunks of " + itoa(12) + " — so this case no longer reaches the bound it is about, and "
+      + "wants pointing at whichever directory is now the largest");
+
+  fs.remove(dir, true).wait();
+  return t.report();
+}
+
+
+/**
+ * **A narrowed run keeps the measurements it did not take.**
+ *
+ * `writeTimes` built its output from the chunks *this* run measured and wrote that over the file. A
+ * full suite measures every chunk, so the gate never noticed; `wac task test packages/fmt` measures
+ * one, and left `.cache/suite-times` holding a single line. Observed, not theorised: the file went
+ * from 59 chunks to 1.
+ *
+ * What that costs is the ordering this file is about. Every other chunk becomes unmeasured, the queue
+ * falls back to the file-count proxy, and the next full run pays for it until it rebuilds the file —
+ * `issues/system/0274b` put the difference between those two orderings at about 150s of idle
+ * workers. A developer running the tests for one package silently slowed the next push, and nothing
+ * said so, because the file is written and merely shorter.
+ *
+ * A measurement is a fact about a chunk rather than about the run that took it, so the file is merged:
+ * this run's keys replace their old lines and every other line stays.
+ *
+ * **Tested as a function rather than by running a narrowed suite**, which is not a thing a test may
+ * do — `wac task test <package>` takes the gate lock and starts the twenty-minute cooldown, so a test
+ * that called it would refuse on a machine that had just pushed and would sabotage the gate on one
+ * that was about to. That is why the merge is in `suitehouse.wac`.
+ */
+export string test_merging_the_times_file_keeps_what_this_run_did_not_measure() {
+  T t = T.create();
+  string was = "packages/a/test/wac\t100\npackages/b/test/wac#0\t200\npackages/b/test/wac#1\t300\n";
+
+  // A run that measured one of them: its line is replaced, the other two survive.
+  string got = mergedTimes(was, ["packages/b/test/wac#0\t999"]);
+  t.isTrue(contains(got, "packages/a/test/wac\t100"), "an untouched key was dropped: " + got);
+  t.isTrue(contains(got, "packages/b/test/wac#1\t300"), "an untouched key was dropped: " + got);
+  t.isTrue(contains(got, "packages/b/test/wac#0\t999"), "the new measurement is missing: " + got);
+  t.isTrue(!contains(got, "packages/b/test/wac#0\t200"),
+      "the old measurement for a key this run measured is still there, so the file grows a second "
+      + "line for one chunk and `recordedMs` answers with whichever it meets first: " + got);
+
+  // **A prefix is not a key.** `packages/b/test/wac` and `packages/b/test/wac#0` share their start,
+  // and a merge that matched on prefixes would drop the first when the second was measured.
+  t.isTrue(contains(mergedTimes(was, ["packages/b/test/wac#0\t1"]), "packages/a/test/wac"),
+      "matching on prefixes rather than on the whole key");
+  string one = mergedTimes("packages/b/test/wac\t100\n", ["packages/b/test/wac#0\t1"]);
+  t.isTrue(contains(one, "packages/b/test/wac\t100"),
+      "`packages/b/test/wac` was dropped when `packages/b/test/wac#0` was measured — a directory that "
+      + "grows past one chunk would lose its own record: " + one);
+
+  // A first run has nothing to merge with, and a run that measured nothing does not reach here.
+  t.isTrue(contains(mergedTimes("", ["k\t1"]), "k\t1"), "an empty file lost the new line");
+
+  // A line without a tab is not a record; keeping it would make the file unparseable to itself.
+  t.isTrue(!contains(mergedTimes("junk\n", ["k\t1"]), "junk"),
+      "a line with no tab survived the merge");
+  return t.report();
+}

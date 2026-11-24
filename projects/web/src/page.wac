@@ -1,0 +1,677 @@
+// A web page, as a wac program sees it: `export async i32 main(Page page)`.
+//
+// **What a page shows is elements the program holds** (`design/system/0012`). `page.root()` is the
+// handle to everything the program draws (`element.wac`), and `page.mount(draw)` puts a view over it —
+// components that are functions of `Ui`, rendering only what changed (`view.wac`). What belongs to the
+// page rather than to an element is here: its title, the clock, timers and frames, files the user hands
+// over, a download, sound, and `page.sys`, what the build granted.
+//
+// **The program is an `async` function, and nothing blocks.** It waits for what happens later — a timer,
+// a frame, a file, an element's value, an event on an element it listens to — with `await`; each `await`
+// hands control back, and the host calls back in when something arrives. Nothing is shared, so a built
+// page needs nothing from the server that serves it.
+//
+// **A page is the `wac.page` capability** (`line.wac`): every change is a request to the program's host, and
+// everything that comes back — an event, a frame, a file, a value, a new location — is the answer to one.
+// Whoever answers them draws: a standalone page's host into the document, a desktop into a window, a test
+// into records. `Page.open(sys)` finds the capability on the program's own host, so the same program runs
+// under any of them, and one with no page to draw into is told so rather than started.
+//
+// **Where it runs is the host's choice, not the program's.** A standalone page's program runs in a worker
+// by default, so a program that computes for a long time costs its own responsiveness and not the tab's; on
+// the page's own thread with `--in-page`. Nothing here can tell.
+//
+// **A page's program is a module like any other** (`tools/build.wac`'s `moduleFor`): a `main(Sys sys)` that opens
+// the page, runs the program's `main(Page page)`, and renders each time a view has something to render
+// (`changed`, then `turn`). Its host runs it on as answers arrive, as it runs every program, and the render waits
+// behind what the program was doing, so it comes once a handler is done rather than in the middle of one.
+//
+// **A test runs it on by hand** (`TestDoc`): with this page as the schedule target (spec ch35), each machine that
+// suspends hands its continuation to `take`, which attaches it to the ticket it waits on; an answer settles the
+// ticket and runs the program on, there and then, and `drain` and `turn` finish the turn.
+
+import { Continuation, Queue, Result, Ticket, TicketBase, Vec } from "core";
+import { Answer, FAULT_NONE, OP_CAPABILITY, OP_MONOTONIC_NANOS, OP_SLEEP_MILLIS, Sys, ask } from "std";
+import { Node, htmlOf } from "./html.wac";
+import { Element, Elements } from "./element.wac";
+import { PAGE_CAPABILITY, PageLine, when } from "./line.wac";
+import { Ui, View } from "./view.wac";
+
+// The tree, its tags, the handles and the view are this package's too, so a page imports everything from
+// `"web"` (`design/system/0012`).
+export { Attr, Head, Node, On, documentOf, htmlOf, isVoidElement } from "./html.wac";
+export * as html from "./tags.wac";
+export { Element, ElementEvent, Listen } from "./element.wac";
+// `wac.page` itself, for whoever answers it — a desktop drawing a program into a window, or a test.
+export { PAGE_BATCH, PAGE_CAPABILITY, PAGE_ONE_AT_A_TIME, PAGE_VERSION, Change, batchOf, PAGE_MAKE, PAGE_MAKE_TEXT, PAGE_TEXT, PAGE_ATTR, PAGE_PROP, PAGE_MOVE, PAGE_REMOVE, PAGE_LISTEN, PAGE_FOCUS, PAGE_VALUE, PAGE_PIXELS, PAGE_PIXELS_IN,
+         PAGE_SCROLL, PAGE_SELECT, PAGE_TYPE_TEXT, PAGE_TITLE, PAGE_LOG, PAGE_DOWNLOAD, PAGE_EVENT, PAGE_FILE, PAGE_FRAME, PAGE_LOCATION, PAGE_SOUND, PAGE_PLAY, PAGE_STOP, PAGE_GAIN, PAGE_GO, PAGE_SURFACE, PAGE_FULLSCREEN, PAGE_ZONE, PAGE_VISIBLE, PAGE_BACK, PAGE_ZONE_NAME, PAGE_STORED, PAGE_STORE, PAGE_PATH, PAGE_NAVIGATE, PAGE_LINKS, PAGE_DESCRIBE, HOST_SURFACE_NEW, HOST_SURFACE_DRAW, HOST_SURFACE_DRAW_IN, PAGE_COUNT, PAGE_WINDOW, Happened, PageLine, eventAnswer, happenedOf, highOf, lowOf, pair, putF64, getF64, quad, quadAt, when } from "./line.wac";
+export { Mounted, Ref, State, Ui, View } from "./view.wac";
+export { TestDoc, TestNode, TestSocket } from "./testdoc.wac";
+export { Prerender, drawFrames, drawing, markupOf } from "./prerender.wac";
+// `wac.page` answered into an element this program holds — a desktop drawing a program into a window.
+export { PageServer } from "./serve.wac";
+// `wac.desktop`, for a program a desktop started: `Desktop.of(sys)`.
+export { DESKTOP_CAPABILITY, DESKTOP_COPY, DESKTOP_COUNT, DESKTOP_NOTE, DESKTOP_OPEN, DESKTOP_PASTE, DESKTOP_PICK,
+         DESKTOP_VERSION, DESKTOP_WINDOW, DESKTOP_ASK, DESKTOP_NEW, Desktop } from "./desktop.wac";
+// `wac.site`: the site a page was served from, read a file at a time, or mounted read-only as files.
+export { SITE_CAPABILITY, SITE_COUNT, SITE_GET, SITE_VERSION, Site, siteFiles } from "./site.wac";
+// `wac.origin`: the server the page was served from — requests of any method, and WebSockets.
+export { ORIGIN_CAPABILITY, ORIGIN_VERSION, ORIGIN_COUNT, ORIGIN_FETCH, ORIGIN_OPEN, ORIGIN_SEND, ORIGIN_NEXT, ORIGIN_CLOSE,
+         MESSAGE_TEXT, MESSAGE_BINARY, MESSAGE_CLOSED, Message, Origin, OriginSocket, Reply, RequestParts, requestBytes,
+         requestParts } from "./origin.wac";
+
+
+/** `ElementEvent.mods`: which modifier keys were held. */
+export static i32 MOD_SHIFT = 1;
+export static i32 MOD_CTRL = 2;
+export static i32 MOD_ALT = 4;
+export static i32 MOD_META = 8;
+
+/** A file the user handed over — chosen with an `<input type="file">`, or dropped on the page. */
+export struct Picked {
+  bool ok;
+  /**
+   * Its name — or, for a file inside a folder the user handed over, its path from that folder down:
+   * `photos/2024/a.jpg`. A folder dropped on the page, or chosen with `<input type="file"
+   * webkitdirectory>`, arrives as one `Picked` per file in it; the folder itself never arrives.
+   */
+  string name;
+  u8[] bytes;
+  /** Why it could not be read, when `ok` is false. */
+  string error;
+}
+
+/** A size in CSS pixels: a window's, or a frame's. */
+export struct Size {
+  i32 width;
+  i32 height;
+}
+
+/**
+ * **A first frame to draw at build time** (`src/prerender.wac`): the page as a reader whose window is `width` by
+ * `height` CSS pixels first sees it, shown to every reader whose window matches `media` — a CSS media query, `""` for
+ * any. A page that exports `Frame[] prerendered()` from its entry file is built with those frames in its HTML, and the
+ * first whose query matches is the one a reader sees before the module has arrived, and the one the program adopts.
+ */
+export struct Frame {
+  /** The page's path on its site (`Page.path`): `/` for the page at the root, `/docs/spec/` for one at a route. */
+  string path;
+  i32 width;
+  i32 height;
+  string media;
+
+  /** The page at the site's root, in a window this size. */
+  Frame at(i32 width, i32 height, string media) { return Frame("/", width, height, media); }
+
+  /**
+   * **The page at `path`**, in a window this size: the build writes it as `<path>/index.html`, a page of its own — what a
+   * link to it loads, and what a search engine reads — all of a site's pages running the one module.
+   */
+  Frame on(string path, i32 width, i32 height, string media) { return Frame(path, width, height, media); }
+}
+
+/** A page: what the program is handed. */
+export struct Page {
+  /** Where the page's requests go: the program's host, and the capability's numbers on it. */
+  PageLine line;
+  /** Where the program's suspended machines wait, and how they are run on. */
+  Runner runner;
+  /** Every handle the program holds, the root among them. */
+  Elements es;
+  /** The views mounted, rendered at the end of every call into the program. */
+  Vec<View> views;
+  /**
+   * **What the host granted** (`design/system/0012`): the files, clock, randomness and output a page's
+   * program has — the `Sys` its module was started with, as a command-line program's is. A standalone page's
+   * host grants what the build said (`--grant read,write`) and refuses the rest, naming the flag. Its host is
+   * the one the page's requests go to.
+   */
+  Sys sys;
+  /**
+   * **A development build's check** (`--dev`): after every turn each view renders everything again and
+   * logs each place the page does not show what its components render (`View.check`).
+   */
+  bool checking;
+  /**
+   * **Where the reader is**: the document's location hash, without its `#` — `"/spec/strings"` for
+   * `…#/spec/strings`. Asked for when the page opens, and again after each change (`follow`); a link
+   * written `href="#/spec"` changes it, and so do the browser's back and forward.
+   */
+  string at;
+  /** Who hears each change of `at`, by slot; a stopped watcher's slot is null. */
+  Vec<fn<void(string)>?> watchers;
+  /** Whether a view has had something to render since `changed` last answered, and who waits to hear it. */
+  bool woken;
+  Ticket<void>? waking;
+  /** The last number given a sound or a voice: each is the page's own, numbered as handles are. */
+  i32 played;
+  /**
+   * **Whether the page is seen**, as the host last said (`PAGE_VISIBLE`): `"1"`, `"0"`, or `""` until it has said —
+   * which reads as seen, since a page that is being drawn usually is. Asked for again after each answer, as `at` is.
+   */
+  string seen;
+  /** Who hears each change of `seen`, by slot, as `watchers` hear the location. */
+  Vec<fn<void(bool)>?> seers;
+  /** The window's size when the page opened, as the host said in answer to finding the page; 0 by 0 if it did not. */
+  Size opened;
+  /** **Where the reader is on the site** (`PAGE_PATH`): `/` until the host says, which it does before the first turn. */
+  string route;
+  /** Who hears each change of `route`, by slot, as `watchers` hear the location. */
+  Vec<fn<void(string)>?> routers;
+
+  /**
+   * **The page the program's host provides**, found by name: `Err` says why there is none — a program run
+   * from a command line has no page, and is told so rather than handed one that draws nowhere.
+   */
+  async Result<Page, string> open(Sys sys) {
+    // `capability` asked by hand, which is what it does, for the answer's `flags`: how the host wants the changes.
+    Answer found = await ask(sys.host, OP_CAPABILITY(), 0 as i64, 0 as i64, PAGE_CAPABILITY(), "^1".toBytes());
+    if (found.fault != FAULT_NONE()) { return Result.Err(found.text); }
+    Page page = Page.over(PageLine.of(sys.host, found.n as~ i32, found.flags), sys);
+    page.opened = sizeOf(string.fromBytes(found.bytes));
+    return Result.Ok(page);
+  }
+
+  /**
+   * **Settled when the page is closed** — a window of a desktop's, closed by the person or the desktop — and never
+   * for a standalone page. A program with several windows forgets this one then; one with only this has ended.
+   */
+  Ticket<bool> closed(this) { return this.es.ended; }
+
+  /** A page over `line`, whose host is `sys`'s, following the document's events and location from here on. */
+  Page over(PageLine line, Sys sys) {
+    Vec<View> views = Vec.create();
+    Vec<fn<void(string)>?> watchers = Vec.create();
+    Vec<fn<void(bool)>?> seers = Vec.create();
+    Page p = Page(line, Runner.create(), Elements.create(line), views, sys, false, "", watchers, false, null, 0, "", seers, Size(0, 0),
+                  "", Vec.create());
+    // A change held is a turn to end, whether or not a view has anything to render: a handler that only changed an
+    // element of its own still has that change to send.
+    line.onHeld = () => { p.wake(); };
+    p.follow();
+    p.followPath();
+    p.watch();
+    return p;
+  }
+
+  /**
+   * **The path, asked for again each time it is answered** — `follow`'s twin for `PAGE_PATH`. A host that does not
+   * serve it faults it, and the page stays at `/`.
+   */
+  void followPath(this) {
+    Page page = this;
+    Ticket<Answer> t = this.line.path(this.route);
+    when(t, () => {
+      if (t.value().fault != FAULT_NONE()) { if (page.route == "") { page.route = "/"; } return; }
+      page.route = t.value().text;
+      for (i32 i = 0; i < page.routers.len(); i++) {
+        fn<void(string)>? w = page.routers.get(i);
+        if (w is not null) { w!(page.route); }
+      }
+      page.followPath();
+    });
+  }
+
+  /** **Whether the page is seen, asked for again each time it is answered** — `follow`'s twin for `PAGE_VISIBLE`. */
+  void watch(this) {
+    Page page = this;
+    Ticket<Answer> t = this.line.visible(this.seen);
+    when(t, () => {
+      // A host that does not serve the request faults it; asking again would only fault again.
+      if (t.value().fault != FAULT_NONE()) { return; }
+      page.seen = t.value().text;
+      for (i32 i = 0; i < page.seers.len(); i++) {
+        fn<void(bool)>? w = page.seers.get(i);
+        if (w is not null) { w!(page.seen != "0"); }
+      }
+      page.watch();
+    });
+  }
+
+  /** **The location, asked for again each time it is answered**: the host answers once it is not `at`. */
+  void follow(this) {
+    Page page = this;
+    Ticket<Answer> t = this.line.location(this.at);
+    when(t, () => {
+      string hash = t.value().text;
+      page.at = hash.len() > 0 && hash[0] == "#" ? hash.slice(1, hash.len()) : hash;
+      for (i32 i = 0; i < page.watchers.len(); i++) {
+        fn<void(string)>? w = page.watchers.get(i);
+        if (w is not null) { w!(page.at); }
+      }
+      page.follow();
+    });
+  }
+
+  /**
+   * The page's root element: the authority over everything the program shows. Children made through it
+   * come back as handles, and holding one is the right to change that element and hear its events.
+   */
+  Element root(this) { return this.es.root(); }
+
+  /**
+   * Render `draw` into the root and keep it rendered: a component of no attributes, whose state and whose
+   * children's state the view watches (`view.wac`). The view owns the root's children from here on.
+   */
+  View mount(this, fn<Node(Ui)> draw) { return this.mountIn(this.root(), draw); }
+
+  /** The same, into one element the program holds — a widget's own corner of the page. */
+  View mountIn(this, Element host, fn<Node(Ui)> draw) {
+    Page page = this;
+    View v = View.create(host, (i32 ms, fn<void()> f) => { when(page.sleep(ms), f); });
+    v.onDirty = () => { page.wake(); };
+    this.views.push(v);
+    v.mount(draw);
+    return v;
+  }
+
+  /**
+   * **Settles once a view has something to render** — at once, if one has since this last answered. What runs a
+   * page as a module awaits it and calls `turn`: the wait is queued behind whatever the program was doing, so the
+   * render comes once the program has run on, not in the middle of a handler.
+   */
+  Ticket<void> changed(this) {
+    Ticket<void> t;
+    if (this.woken) {
+      this.woken = false;
+      t.settleWith(() => { });
+      return t;
+    }
+    this.waking = t;
+    return t;
+  }
+
+  void wake(this) {
+    Ticket<void>? w = this.waking;
+    if (w is null) {
+      this.woken = true;
+      return;
+    }
+    this.waking = null;
+    w!.settleWith(() => { });
+  }
+
+  /**
+   * **Render each time a view has something to render, for as long as the page lives** — what runs a page's program
+   * as a module does (`tools/build.wac`'s `moduleFor`), and `Desktop.openWindow` for each window it opens.
+   */
+  async void keepRendering(this) {
+    this.turn();
+    while (true) {
+      await this.changed();
+      this.turn();
+    }
+  }
+
+  /** The end of a call into the program: every view renders what changed, and the changes go to the host. */
+  void turn(this) {
+    for (i32 i = 0; i < this.views.len(); i++) { this.views.get(i).turn(); }
+    if (this.checking) {
+      for (i32 i = 0; i < this.views.len(); i++) {
+        string[] said = this.views.get(i).check();
+        for (i32 j = 0; j < said.len(); j++) { this.line.log("view check: " + said[j]); }
+      }
+    }
+    this.line.flush();
+  }
+
+  /**
+   * **The window's size when the page opened**, in CSS pixels — known before the program's first turn, so a page can
+   * draw the layout that fits from its first frame (`Frame`), where a size heard from `element.on("resize", …)` comes
+   * a turn later. 0 by 0 from a host that did not say. It is not changed after: what changes is heard as a resize.
+   */
+  Size size(this) { return this.opened; }
+
+  /** The location hash, without its `#`: empty when there is none. */
+  string location(this) { return this.at; }
+
+  /**
+   * Call `f` with each new location from here on; answers what stops it. A component follows the
+   * location with a state and an effect whose cleanup is that answer:
+   * `ui.effect("", () => page.onLocation((string where) => { at.set(where); }))`.
+   */
+  fn<void()> onLocation(this, fn<void(string)> f) {
+    i32 slot = this.watchers.len();
+    this.watchers.push(f);
+    Vec<fn<void(string)>?> ws = this.watchers;
+    return () => { ws.set(slot, null); };
+  }
+
+  /**
+   * **Whether the reader can see the page**: false while its tab is in the background, the screen is off or the page is
+   * being left. A clock the person is being timed by stops then, and anything unsaved is saved — the page may never
+   * be seen again.
+   */
+  bool visible(this) { return this.seen != "0"; }
+
+  /**
+   * Call `f` with each change of `visible()` from here on; answers what stops it — `onLocation`'s twin, followed from
+   * an effect the same way.
+   */
+  fn<void()> onVisible(this, fn<void(bool)> f) {
+    i32 slot = this.seers.len();
+    this.seers.push(f);
+    Vec<fn<void(bool)>?> ws = this.seers;
+    return () => { ws.set(slot, null); };
+  }
+
+  /**
+   * **How many minutes the reader's local time is ahead of UTC** at `ms`, milliseconds since the epoch — what a page
+   * needs to say what day it is where the reader is, which the clock alone cannot. The host answers at once; 0 from
+   * one that cannot, which is UTC.
+   */
+  i32 zoneAt(this, i64 ms) {
+    Ticket<Answer> t = this.line.zone(ms);
+    return t.settled() && t.value().fault == FAULT_NONE() ? t.value().n as~ i32 : 0;
+  }
+
+  void title(this, string t) { this.line.title(t); }
+
+  /**
+   * **The location becomes `where`** — with `push`, a new place in the browser's history, which Back leaves for the
+   * one before; without, in place of this one. Heard as any new location is (`onLocation`). A page in a window of a
+   * desktop has no location of its own: its server refuses it.
+   */
+  void go(this, string where, bool push) { this.line.go(where, push); }
+
+  /**
+   * **Where the reader is on the page's site**: `/` at its root, `/docs/spec/` at that route — from the site's root,
+   * whatever folder it is served from. Known before the program's first turn, so the page draws what is at that path
+   * from its first frame (`Frame.on`). A page in a window of a desktop is at `/`.
+   */
+  string path(this) { return this.route == "" ? "/" : this.route; }
+
+  /**
+   * **The page goes to `path` on its site** without loading again — with `push`, a new place in the browser's history,
+   * which Back leaves; without, in place of this one — and `onPath` hears it.
+   */
+  void navigate(this, string path, bool push) {
+    // `path()` says it at once; who listens hears it from the host, which answers the path asked for (`followPath`), so
+    // each change is heard once whoever made it.
+    this.route = path;
+    this.line.navigate(path, push);
+  }
+
+  /** Call `f` with each new path — a link followed (`routeLinks`), `navigate`, Back and Forward; answers what stops it. */
+  fn<void()> onPath(this, fn<void(string)> f) {
+    i32 slot = this.routers.len();
+    this.routers.push(f);
+    Vec<fn<void(string)>?> rs = this.routers;
+    return () => { rs.set(slot, null); };
+  }
+
+  /**
+   * **Links to this site's pages are followed here** from now on: a click on one goes there without loading the page
+   * again, and `onPath` hears the path. Every page of the site is also a page of its own (`Frame.on`), so the same link
+   * works before the program runs, from a search engine and in a new tab. Write links with `hrefTo`.
+   */
+  void routeLinks(this) { this.line.links(true); }
+
+  /** What the page is, in a sentence: its description, which a search engine shows, and which a first frame carries. */
+  void describe(this, string text) { this.line.describe(text); }
+
+  /** The browser's Back (`PAGE_BACK`): the history left as it was, and the place before this one heard as any new location. */
+  void back(this) { this.line.back(); }
+
+  /** The reader's time zone by name — `Europe/Paris` — or `UTC` from a host that cannot say (`PAGE_ZONE_NAME`). */
+  string zoneName(this) {
+    Ticket<Answer> t = this.line.zoneName();
+    return t.settled() && t.value().fault == FAULT_NONE() && t.value().text != "" ? t.value().text : "UTC";
+  }
+
+  /** What the page stored under `key` (`PAGE_STORED`), or null when nothing is: the browser's store for the page's origin. */
+  async string? stored(this, string key) {
+    Answer a = await this.line.stored(key);
+    if (a.fault != FAULT_NONE() || a.flags == 1) { return null; }
+    return a.text;
+  }
+
+  /** `value` stored under `key` (`PAGE_STORE`), for this page and any later one on its origin to read. */
+  void store(this, string key, string value) { this.line.store(key, value); }
+
+  /** Whatever is stored under `key`, removed. */
+  void unstore(this, string key) { this.line.unstore(key); }
+  void log(this, string line) { this.line.log(line); }
+
+  /**
+   * Milliseconds, from a clock that only goes forward — the host's own, which answers at once; 0 from a host
+   * that cannot.
+   */
+  f64 now(this) {
+    Ticket<Answer> t = ask(this.line.host, OP_MONOTONIC_NANOS(), 0 as i64, 0 as i64, "", u8[]());
+    return t.settled() && t.value().fault == 0 ? (t.value().n as~ f64) / 1000000.0 : 0.0;
+  }
+
+  /** Offer `bytes` to the user as a file called `name`. */
+  void download(this, string name, u8[] bytes) { this.line.download(name, bytes); }
+
+  /**
+   * **A sound the page can play**: `samples` from -1 to 1, one channel, `rate` of them a second — made by the program,
+   * which is how a game has the sounds it has. Sent to the host once, here, and played from there as often as the
+   * program likes (`Sound.play`), so playing one costs a few bytes, whatever its length.
+   *
+   * **A browser plays nothing until the audio is resumed**, and only lets it be resumed from something the person has
+   * just done — a click, a tap, a key. Nothing resumes it on its own: the program calls `resumeAudio` from that
+   * handler. A sound played while the audio is held waits, and plays when it resumes only if it was asked for just
+   * before; a loop plays whenever it runs.
+   */
+  Sound sound(this, f64[] samples, i32 rate) {
+    u8[] b = u8[].filled(samples.len() * 2, 0 as u8);
+    for (i32 i = 0; i < samples.len(); i++) {
+      f64 x = samples[i];
+      if (x > 1.0) { x = 1.0; }
+      if (x < 0.0 - 1.0) { x = 0.0 - 1.0; }
+      i32 v = (x * 32767.0) as~ i32;
+      b[i * 2] = (v & 255) as@ u8;
+      b[i * 2 + 1] = ((v >> 8) & 255) as@ u8;
+    }
+    this.played++;
+    this.line.sound(this.played, rate, b);
+    return Sound(this, this.played, (samples.len() as f64) / (rate as f64));
+  }
+
+  /**
+   * **The page's audio, as the browser holds it**: `"suspended"`, `"running"`, `"interrupted"` (Safari, while another
+   * app has the speaker) or `"closed"` — the browser's own `AudioContext.state`. Asking makes the audio if the page has
+   * none yet, which is suspended until resumed.
+   */
+  Ticket<string> audioState(this) {
+    Ticket<string> t;
+    Ticket<Answer> a = this.line.audio(false);
+    when(a, () => { t.resolve(a.value().text); });
+    return t;
+  }
+
+  /**
+   * **Resume the page's audio** — the browser's `AudioContext.resume()`, and what makes sound possible at all. A
+   * browser allows it only from something the person has just done, so call it from that handler (a click, a tap, a
+   * key); and again when the page is seen after being hidden (`visible`), since a browser suspends audio in a hidden
+   * tab or a call and does not resume it itself. Answers the state once the browser has settled it, or the browser's
+   * reason when it refused — then the next gesture can ask again.
+   */
+  Ticket<Result<string, string>> resumeAudio(this) {
+    Ticket<Result<string, string>> t;
+    Ticket<Answer> a = this.line.audio(true);
+    when(a, () => {
+      Answer x = a.value();
+      t.resolve(x.flags == 0 ? Result.Ok(x.text) : Result.Err(string.fromBytes(x.bytes)));
+    });
+    return t;
+  }
+
+  /** The next file the user hands over, waited for. The host keeps one handed over before anything asked. */
+  Ticket<Picked> nextFile(this) {
+    Ticket<Picked> t;
+    Ticket<Answer> a = this.line.file();
+    when(a, () => {
+      Answer x = a.value();
+      bool ok = x.flags == 0;
+      t.resolve(Picked(ok, x.text, ok ? x.bytes : u8[](), ok ? "" : string.fromBytes(x.bytes)));
+    });
+    return t;
+  }
+
+  /** A ticket that settles after `ms` milliseconds, answering `now()` when it did. */
+  Ticket<f64> sleep(this, i32 ms) {
+    return this.nowWhen(ask(this.line.host, OP_SLEEP_MILLIS(), ms as i64, 0 as i64, "", u8[]()));
+  }
+
+  /** A ticket that settles before the browser next paints, answering `now()` — one per frame drawn. */
+  Ticket<f64> nextFrame(this) { return this.nowWhen(this.line.frame()); }
+
+  Ticket<f64> nowWhen(this, Ticket<Answer> a) {
+    Page page = this;
+    Ticket<f64> t;
+    when(a, () => { t.resolve(page.now()); });
+    return t;
+  }
+
+  /**
+   * Settles once the browser has painted what the page shows now, answering `now()`. Before long work,
+   * so a "reading…" note is on screen while it runs: on the page's own thread (`--in-page`) nothing is
+   * painted while the program computes, and a frame callback runs *before* the paint it belongs to, so
+   * the wait is a frame and then a timer. In a worker the page paints regardless, and this is a frame.
+   */
+  async f64 painted(this) {
+    await this.nextFrame();
+    return await this.sleep(0);
+  }
+
+  /** Where a suspended machine's continuation goes — see `Runner.take`. */
+  void take(this, Continuation k) { this.runner.take(k); }
+
+  /** Run what is ready, until nothing is. */
+  void drain(this) { this.runner.drain(); }
+}
+
+/** A sound sent to the host (`Page.sound`), to play. */
+export struct Sound {
+  Page page;
+  i32 id;
+  /** How long it lasts, played once. */
+  f64 seconds;
+
+  /** Play it once, at `volume` — 1 as it was made, 0 silent — over whatever else is playing. */
+  Voice play(this, f64 volume) { return this.start(volume, false); }
+
+  /** Play it over and over, until the voice is stopped: music, or a sound that lasts as long as something does. */
+  Voice loop(this, f64 volume) { return this.start(volume, true); }
+
+  Voice start(this, f64 volume, bool loop) {
+    Page p = this.page;
+    p.played++;
+    f64 v = volume < 0.0 ? 0.0 : volume;
+    p.line.play(p.played, this.id, (v * 1000.0) as~ i32, loop);
+    return Voice(p, p.played);
+  }
+
+  /**
+   * **Played at a moment**: `at` milliseconds by the page's clock (`Page.now`), `offset` seconds into the sound.
+   * Several started for the same moment play together, to the sample — the layers of a song, each its own voice,
+   * turned up and down as the program likes (`Voice.fade`) without ever drifting apart.
+   */
+  Voice playAt(this, f64 volume, bool loop, f64 at, f64 offset) {
+    Page p = this.page;
+    p.played++;
+    f64 v = volume < 0.0 ? 0.0 : volume;
+    p.line.playAt(p.played, this.id, (v * 1000.0) as~ i32, loop, at, offset);
+    return Voice(p, p.played);
+  }
+}
+
+/** A sound playing (`Sound.play`, `Sound.loop`). */
+export struct Voice {
+  Page page;
+  i32 id;
+
+  /** Stop it, if it is still playing. */
+  void stop(this) { this.page.line.stop(this.id); }
+
+  /** Its volume to `volume`, smoothly over `ms` milliseconds. */
+  void fade(this, f64 volume, i32 ms) {
+    f64 v = volume < 0.0 ? 0.0 : volume;
+    this.page.line.gain(this.id, (v * 1000.0) as~ i32, ms < 0 ? 0 : ms);
+  }
+}
+
+/**
+ * How a program that never blocks is run on: the schedule target its machines hand their
+ * continuations to, and the queue of the ones with nothing to wait for. A page has one, and so does a
+ * copy of it started by `spawnSelf`, which has no page.
+ */
+export struct Runner {
+  /** Continuations with nothing to wait on — a bare `await;` — run before control goes back. */
+  Queue<Continuation> ready;
+
+  Runner create() {
+    Queue<Continuation> ready;
+    return Runner(ready);
+  }
+
+  /**
+   * Where a suspended machine's continuation goes. A continuation waiting on a ticket runs when that
+   * ticket settles; one waiting on nothing runs before control goes back to the browser.
+   */
+  void take(this, Continuation k) {
+    TicketBase? on = k.t;
+    if (on is null || on!.settled()) {
+      this.ready.push(k);
+      return;
+    }
+    on!.whenSettled(k.call);
+  }
+
+  /** Run what is ready, until nothing is. */
+  void drain(this) {
+    while (Continuation k matches this.ready.pop()) { k.call(); }
+  }
+}
+
+/** `"390x844"` as a size; 0 by 0 for anything else, which is how a host that did not say reads. */
+export Size sizeOf(string s) {
+  i32 x = s.indexOf("x");
+  if (x <= 0) { return Size(0, 0); }
+  i32 w = digitsOf(s.slice(0, x));
+  i32 h = digitsOf(s.slice(x + 1, s.len()));
+  return w < 0 || h < 0 ? Size(0, 0) : Size(w, h);
+}
+
+/** A run of decimal digits as a number, or -1 if it is anything else. */
+i32 digitsOf(string s) {
+  if (s.len() == 0 || s.len() > 6) { return 0 - 1; }
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  for (u8 c in b) {
+    if (c < '0' || c > '9') { return 0 - 1; }
+    n = n * 10 + ((c - '0') as i32);
+  }
+  return n;
+}
+
+/**
+ * **A link from the page at `from` to the one at `to`**, both paths on the site (`Page.path`), relative — so it works
+ * however deep the site is served, before the program runs as after: from `/docs/a/`, `/docs/b/` is `../b/`.
+ */
+export string hrefTo(string from, string to) {
+  string[] f = segmentsOf(from);
+  string[] t = segmentsOf(to);
+  i32 same = 0;
+  while (same < f.len() && same < t.len() && f[same] == t[same]) { same++; }
+  string out = "";
+  for (i32 i = same; i < f.len(); i++) { out = out + "../"; }
+  for (i32 i = same; i < t.len(); i++) { out = out + t[i] + "/"; }
+  return out == "" ? "./" : out;
+}
+
+/** A path's folders: `/docs/spec/` is `docs`, `spec`. */
+string[] segmentsOf(string path) {
+  Vec<string> out = Vec.create();
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 cut = rest.indexOf("/");
+    string part = cut < 0 ? rest : rest.slice(0, cut);
+    if (part != "") { out.push(part); }
+    rest = cut < 0 ? "" : rest.slice(cut + 1, rest.len());
+  }
+  return out.toArray();
+}

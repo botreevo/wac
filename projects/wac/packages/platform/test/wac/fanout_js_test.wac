@@ -1,0 +1,149 @@
+// A server on the JavaScript host goes on with hundreds of connections idle — `issues/system/0373d`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env --allow-net packages/platform/test/wac/fanout_js_test.wac
+//
+// The reproduction from the issue: a server that answers each connection once it has seen a request's blank line, and
+// a timer beside it. Before the fix, each idle connection's pending `recv` held one of the bridge's 128 slots, and at
+// about 130 the whole program stopped — accepts, timers, logging — and stayed stopped after every connection closed.
+// `fanout.test.ts` holds the bridge to that directly; this is the program a stranger with a few hundred connections
+// could stop. It was `fanout_js.test.ts`, which ran the server through `harness/appRun.ts` from TypeScript; the server
+// is built for the Deno host here and started as a process, and the connections are this test's own.
+//
+// **Four hundred, not thousands**: each costs a descriptor on both ends, and the suite runs under a soft limit of 1024.
+// Three rings' worth is the difference between a ceiling and none.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtByDeno } from "../../../wactest/src/built.wac";
+import { Daemon, Held, start, stop, waitForLogWithin, logOf } from "../../../wactest/src/daemon.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { Socket, Sys } from "std";
+import { Vec, flatten } from "core";
+
+static string PROGRAM =
+  "import { Sys, Socket } from \"std\";\n" +
+  "\n" +
+  "i32 number(string s) {\n" +
+  "  i32 n = 0;\n" +
+  "  u8[] b = s.toBytes();\n" +
+  "  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + (b[i] as i32 - 48); }\n" +
+  "  return n;\n" +
+  "}\n" +
+  "\n" +
+  "export async i32 main(Sys sys) {\n" +
+  "  string[] args = sys.args();\n" +
+  "  serve(sys, number(args[0]));\n" +
+  "  tick(sys, number(args[1]));\n" +
+  "  await sys.drain();\n" +
+  "  return 0;\n" +
+  "}\n" +
+  "\n" +
+  "/** The timer, which has to keep running however many connections are waiting. */\n" +
+  "async void tick(Sys sys, i32 ticks) {\n" +
+  "  i32 n = 0;\n" +
+  "  while (true) {\n" +
+  "    await sys.sleepMillis(200);\n" +
+  "    n++;\n" +
+  "    if (n == ticks) {\n" +
+  "      sys.log(\"ticks \\{n}\");\n" +
+  "      sys.exit(0);\n" +
+  "    }\n" +
+  "  }\n" +
+  "}\n" +
+  "\n" +
+  "async void serve(Sys sys, i32 port) {\n" +
+  "  match (await sys.net().listen(\"127.0.0.1\", port)) {\n" +
+  "    Err(e): { sys.warn(\"listen: \\{e}\"); }\n" +
+  "    Ok(l): {\n" +
+  "      sys.log(\"listening\");\n" +
+  "      while (true) {\n" +
+  "        match (await l.accept()) {\n" +
+  "          Err(e): { sys.warn(\"accept: \\{e}\"); }\n" +
+  "          Ok(sock): { one(sys, sock); }\n" +
+  "        }\n" +
+  "      }\n" +
+  "    }\n" +
+  "  }\n" +
+  "}\n" +
+  "\n" +
+  "/** Wait for the request's blank line, then answer. */\n" +
+  "async void one(Sys sys, Socket sock) {\n" +
+  "  string got = \"\";\n" +
+  "  while (got.indexOf(\"\\r\\n\\r\\n\") < 0) {\n" +
+  "    match (await sock.recv()) {\n" +
+  "      Err(e): { sock.close(); return; }\n" +
+  "      Ok(r): {\n" +
+  "        match (r) {\n" +
+  "          End: { sock.close(); return; }\n" +
+  "          Data(b): { got += string.fromBytes(b); }\n" +
+  "          Failed(why): { sock.close(); return; }\n" +
+  "        }\n" +
+  "      }\n" +
+  "    }\n" +
+  "  }\n" +
+  "  await sock.send(\"HTTP/1.1 200 OK\\r\\nContent-Length: 3\\r\\nConnection: close\\r\\n\\r\\nok\\n\".toBytes());\n" +
+  "  sock.close();\n" +
+  "}\n";
+
+static i32 IDLE = 400;
+/** Ticks of 200 ms before the server exits on its own: long enough for everything below. */
+static i32 TICKS = 40;
+
+/** A whole request on a connection of its own, and `ok` for the answer's body — or why there was none. */
+string ask(Sys sys, i32 port) {
+  auto c = flatten(sys.net().connect("127.0.0.1", port).wait());
+  if (c.isErr()) { return "no connection"; }
+  Socket s = c.unwrap();
+  flatten(s.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n".toBytes()).wait());
+  string said = "";
+  bool reading = true;
+  while (reading) {
+    auto r = flatten(s.recv().wait());
+    if (r.isErr()) { reading = false; continue; }
+    match (r.unwrap()) {
+      Data(b): { said = said + string.fromBytes(b); }
+      End: { reading = false; }
+      Failed(why): { reading = false; }
+    }
+  }
+  s.close();
+  return said.len() >= 3 && said.slice(said.len() - 3, said.len()) == "ok\n" ? "ok" : "no answer (got " + said + ")";
+}
+
+export string test_a_server_answers_with_400_connections_idle_and_recovers_when_they_close(Sys sys) {
+  T t = T.create();
+  string dir = flatten(sys.env().cwd().wait()).unwrap() + "/.cache/fanout";
+  sys.files().mkdir(dir, true).wait();
+  string entry = ".cache/fanout/server.wac";
+  sys.files().writeFile(entry, PROGRAM.toBytes()).wait();
+  string built = builtByDeno(sys.env(), sys.files(), sys.procs(), entry, "fanout-js-deno",
+                             ["--allow-read", "--allow-write", "--allow-net", "--allow-run", "--allow-env"], "deno", false);
+  if (built == "") { t.fail("the server was not built"); return t.report(); }
+  Held h = Held.take(sys.net());
+  i32 port = h.port;
+  h.release();
+  Daemon d = start(sys.procs(), "deno run -A " + built + " \{port} \{TICKS}", dir + "/server.log");
+  bool up = waitForLogWithin(sys.clock(), sys.files(), d, "listening", 30000);
+  t.isTrue(up, "the server listened: " + logOf(sys.files(), d));
+  if (!up) { stop(sys.procs(), d); return t.report(); }
+  // A request line and nothing after it, on each: every one is a `recv` the program waits on.
+  Vec<Socket> idle = Vec.create();
+  for (i32 i = 0; i < IDLE; i++) {
+    auto c = flatten(sys.net().connect("127.0.0.1", port).wait());
+    if (c.isErr()) { t.fail("connection \{i} was refused"); break; }
+    Socket s = c.unwrap();
+    flatten(s.send("GET / HTTP/1.1\r\n".toBytes()).wait());
+    idle.push(s);
+  }
+  // With all of them waiting, a whole request is still answered; with all of them closed, again.
+  string during = ask(sys, port);
+  for (i32 i = 0; i < idle.len(); i++) { idle.get(i).close(); }
+  string after = ask(sys, port);
+  bool ticked = waitForLogWithin(sys.clock(), sys.files(), d, "ticks \{TICKS}", 30000);
+  string log = logOf(sys.files(), d);
+  stop(sys.procs(), d);
+  t.eqStr(during, "ok", "with \{IDLE} idle connections: " + log);
+  t.eqStr(after, "ok", "after they closed: " + log);
+  // And the timer ran to the end while all of that happened, which it did not when the program stopped.
+  t.isTrue(ticked, "the timer reached \{TICKS}: " + log);
+  return t.report();
+}

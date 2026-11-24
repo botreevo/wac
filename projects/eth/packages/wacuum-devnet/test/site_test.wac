@@ -1,0 +1,190 @@
+// The site in process: requests through `route`, against a real engine, with no socket in between.
+
+import { U256, Engine, hexToBytes } from "@/packages/wacuum/src/lib.wac";
+import { ChainSpec, addressOf, checksummed, genesisJson, ether } from "../src/chain.wac";
+import { Disk, engineFor } from "../src/node.wac";
+import { Faucet } from "../src/faucet.wac";
+import { Index, catchUp, touching, byHash } from "../src/index.wac";
+import { Site } from "../src/explorer.wac";
+import { Served, Images, route } from "../src/server.wac";
+import { Request, Response, parseHead, headersEnd, formValue, clientAddress, responseBytes } from "../src/http.wac";
+import { scaled, grouped, ago, short } from "../src/format.wac";
+import { Check } from "./check.wac";
+
+static string KEY = "0x4242424242424242424242424242424242424242424242424242424242424242";
+
+Served served() {
+  u8[] key = hexToBytes(KEY)!;
+  U256 faucet = addressOf(key);
+  // Two contracts for the gas cap's tests: one that answers the gas it has left (GAS, MSTORE, RETURN 32 bytes),
+  // and one that loops until its gas runs out.
+  string plain = genesisJson(ChainSpec(4242, checksummed(faucet), "0xd3c21bcecceda1000000"));
+  i32 at = plain.indexOf("\"alloc\": {") + 10;
+  string genesis = plain.slice(0, at) + "\"" + GAS_LEFT + "\": {\"code\": \"0x5a60005260206000f3\"}, \"" + FOREVER +
+                   "\": {\"code\": \"0x5b600056\"}, " + plain.slice(at, plain.len());
+  Engine e = engineFor(genesis.toBytes()).engine!;
+  Site site = Site("test devnet", "https://devnet.invalid", 4242, checksummed(faucet), "5 ETH", "hour", 2);
+  return Served(site, e, Index.create(), Faucet.create(key, faucet, 4242, ether().mul(U256.ofU64(5)), 3600000 as i64),
+                genesis, Images.decode(), 1000000 as i64, Disk(null, "", 0));
+}
+
+Request request(string text) {
+  u8[] b = text.toBytes();
+  i32 end = headersEnd(b, b.len());
+  Request r = parseHead(b, end)!;
+  u8[] body = u8[].filled(b.len() - end, 0);
+  for (i32 i = 0; i < body.len(); i++) { body[i] = b[end + i]; }
+  r.body = body;
+  return r;
+}
+
+Request get(string path) { return request("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n"); }
+
+Request post(string path, string body) {
+  return request("POST " + path + " HTTP/1.1\r\nHost: x\r\nContent-Length: \{body.len()}\r\n\r\n" + body);
+}
+
+string text(Response r) { return string.fromBytes(r.body); }
+
+export string test_requests_parse() {
+  Check t = Check.create();
+  Request r = request("POST /faucet?x=1 HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 6.6.6.6, 10.1.2.3\r\nContent-Length: 9\r\n\r\naddress=1");
+  t.eqStr(r.method, "POST", "the method");
+  t.eqStr(r.path, "/faucet", "the path, without the query");
+  t.eqStr(r.query, "x=1", "the query");
+  t.ok(r.contentLength == 9, "the length");
+  t.eqStr(clientAddress(r, "127.0.0.1", true), "10.1.2.3", "behind the proxy, the address it added: the last");
+  t.eqStr(clientAddress(r, "8.8.8.8", false), "8.8.8.8", "not behind it, the connection's own");
+  t.eqStr(formValue("a=1&address=0xAb%43+d&z", "address"), "0xAbC d", "a form value, decoded");
+  t.eqStr(formValue("a=1", "address"), "", "and an absent one");
+  return t.report();
+}
+
+export string test_numbers_read_as_people_write_them() {
+  Check t = Check.create();
+  t.eqStr(scaled(ether().mul(U256.ofU64(1234)), 18, 6), "1,234", "whole ether, grouped");
+  t.eqStr(scaled(U256.ofU64(1500000000000000000), 18, 6), "1.5", "a fraction, without trailing zeros");
+  t.eqStr(scaled(U256.ofU64(28000000000000), 18, 6), "0.000028", "a fee");
+  t.eqStr(scaled(U256.ofU64(5), 18, 6), "< 0.000001", "dust says so");
+  t.eqStr(scaled(U256.zero(), 18, 6), "0", "nothing");
+  t.eqStr(grouped("1000000"), "1,000,000", "thousands");
+  t.eqStr(ago(100, 165), "1 min ago", "an age");
+  t.eqStr(short("0x2282c9ce552886563f8942932e9e8b086d754cbc028a5b4bd580a659dc61e7a1"), "0x2282c9…61e7a1", "a hash cut short");
+  return t.report();
+}
+
+export string test_the_pages_draw() {
+  Check t = Check.create();
+  Served s = served();
+  Response home = route(s, get("/"), "1.1.1.1", 0 as i64);
+  t.ok(home.status == 200, "the home page");
+  t.ok(text(home).indexOf("<td><span>test devnet</span></td>") > 0, "names the network, for a wallet");
+  t.ok(text(home).indexOf("https://devnet.invalid/rpc") > 0, "and gives the RPC URL");
+  t.ok(route(s, get("/block/0"), "1.1.1.1", 0 as i64).status == 200, "the genesis block");
+  t.ok(route(s, get("/block/7"), "1.1.1.1", 0 as i64).status == 404, "a block not made yet is not found");
+  t.ok(route(s, get("/nowhere"), "1.1.1.1", 0 as i64).status == 404, "nor is a page that is not there");
+  t.ok(route(s, get("/address/0x12"), "1.1.1.1", 0 as i64).status == 404, "nor an address that is not one");
+  Response g = route(s, get("/genesis.json"), "1.1.1.1", 0 as i64);
+  t.ok(text(g).indexOf("\"chainId\": 4242") > 0, "the genesis is served");
+  Response s1 = route(s, get("/search?q=0"), "1.1.1.1", 0 as i64);
+  t.ok(s1.status == 303 && s1.headers[0] == "Location: /block/0", "a number searches for a block");
+  Response s2 = route(s, get("/search?q=1%0d%0aSet-Cookie:%20x=1"), "1.1.1.1", 0 as i64);
+  t.ok(s2.status == 404, "a query with a line break in it is nothing, not a redirect");
+  string written = string.fromBytes(responseBytes(s2));
+  t.ok(written.slice(0, written.indexOf("\r\n\r\n")).indexOf("Set-Cookie") < 0, "and no header comes of it");
+  Response s3 = route(s, get("/search?q=0x19E7E376E7C213B7E7E7E46CC70A5DD086DAFF2A"), "1.1.1.1", 0 as i64);
+  t.eqStr(s3.headers[0], "Location: /address/0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a", "an address, in any case");
+  Response bad = Response(200, "text/plain", ["X: a\r\nSet-Cookie: y=1"], u8[]());
+  t.ok(string.fromBytes(responseBytes(bad)).indexOf("Set-Cookie") < 0, "a header with a line break is never written");
+  return t.report();
+}
+
+export string test_rpc_answers_with_cors() {
+  Check t = Check.create();
+  Served s = served();
+  Response r = route(s, post("/rpc", "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"eth_chainId\",\"params\":[]}"), "1.1.1.1", 0 as i64);
+  t.eqStr(text(r), "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":\"0x1092\"}", "the chain id");
+  t.eqStr(r.headers[0], "Access-Control-Allow-Origin: *", "any origin may ask");
+  Response e = route(s, post("/rpc", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"engine_forkchoiceUpdatedV3\",\"params\":[]}"), "1.1.1.1", 0 as i64);
+  t.ok(text(e).indexOf("needs a token") > 0, "but not steer the chain");
+  t.ok(route(s, request("OPTIONS /rpc HTTP/1.1\r\n\r\n"), "1.1.1.1", 0 as i64).status == 204, "a preflight is answered");
+  return t.report();
+}
+
+export string test_a_drip_through_the_form_shows_on_the_address_page() {
+  Check t = Check.create();
+  Served s = served();
+  string to = "0x00000000000000000000000000000000000dead1";
+  Response r = route(s, post("/faucet", "address=" + to), "1.1.1.1", 0 as i64);
+  t.ok(r.status == 200 && text(r).indexOf("On its way") > 0, "the drip is sent: " + text(r));
+  Response again = route(s, post("/faucet", "address=0x00000000000000000000000000000000000dead2"), "1.1.1.1", 1000 as i64);
+  t.ok(again.status == 429, "the same visitor again is told to wait");
+  t.ok(route(s, post("/faucet", "address=nope"), "1.1.1.2", 0 as i64).status == 400, "a bad address is refused");
+  t.eqStr(s.engine.produce(U256.ofU64(10), U256.zero()), "", "a block is made");
+  catchUp(s.index, s.engine);
+  t.ok(touching(s.index, to).len() == 1, "the index has the drip");
+  string page = text(route(s, get("/address/" + to), "1.1.1.1", 0 as i64));
+  t.ok(page.indexOf("5 ETH") > 0, "the address page shows the balance: " + page);
+  t.ok(page.indexOf("/tx/0x") > 0, "and the transaction");
+  string tx = page.slice(page.indexOf("/tx/0x") + 4, page.indexOf("/tx/0x") + 70);
+  string txPage = text(route(s, get("/tx/" + tx), "1.1.1.1", 0 as i64));
+  t.ok(txPage.indexOf("Succeeded") > 0, "and the transaction succeeded");
+  return t.report();
+}
+
+export string test_blocks_beyond_the_history_are_said_to_be_so_and_forgotten() {
+  Check t = Check.create();
+  Served s = served();
+  s.engine.history = 5;
+  string to = "0x00000000000000000000000000000000000dead1";
+  t.ok(route(s, post("/faucet", "address=" + to), "1.1.1.1", 0 as i64).status == 200, "a drip");
+  for (u64 i = 1; i <= 1010; i++) { s.engine.produce(U256.ofU64(i), U256.zero()); }
+  catchUp(s.index, s.engine);
+  t.ok(s.engine.keptFrom > 1000, "the engine kept only the last few: from \{s.engine.keptFrom}");
+  string old = text(route(s, get("/block/1"), "1.1.1.1", 0 as i64));
+  t.ok(old.indexOf("older than the 5 blocks this node keeps") > 0, "an old block says why it is not there");
+  t.ok(route(s, get("/block/1009"), "1.1.1.1", 0 as i64).status == 200, "a recent one is there");
+  t.ok(touching(s.index, to).len() == 0, "and the index forgot the drip, which was in block 1");
+  return t.report();
+}
+
+/** Where the test genesis puts its contract that answers the gas it has left, and the one that never stops. */
+static string GAS_LEFT = "0x00000000000000000000000000000000000a5a5a";
+static string FOREVER = "0x00000000000000000000000000000000000f0f0f";
+
+/** The gas an `eth_call` of `GAS_LEFT` reports, from the JSON-RPC answer to `body`. */
+U256 gasLeft(Served s, string call) {
+  string body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[" + call + ",\"latest\"]}";
+  string answer = text(route(s, post("/rpc", body), "1.1.1.1", 0 as i64));
+  i32 at = answer.indexOf("\"result\":\"");
+  if (at < 0) { return U256.max(); }
+  string rest = answer.slice(at + 10, answer.len());
+  string hex = rest.slice(0, rest.indexOf("\""));
+  return U256.fromHex(hex) ?? U256.max();
+}
+
+export string test_a_call_runs_with_no_more_than_the_cap() {
+  Check t = Check.create();
+  Served s = served();    // a cap of 1,000,000
+  U256 cap = U256.ofU64(1000000);
+  t.ok(gasLeft(s, "{\"to\":\"" + GAS_LEFT + "\",\"gas\":\"0x2aea540\"}").le(cap), "asking for a block's gas gets the cap");
+  t.ok(gasLeft(s, "{\"to\":\"" + GAS_LEFT + "\"}").le(cap), "asking for none gets the cap");
+  U256 small = gasLeft(s, "{\"to\":\"" + GAS_LEFT + "\",\"gas\":\"0x10000\"}");
+  t.ok(small.le(U256.ofU64(65536)) && small.gt(U256.ofU64(60000)), "asking for less gets that: \{small.toDecimal()}");
+  string batch = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}," +
+                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_call\",\"params\":[{\"to\":\"" + GAS_LEFT + "\",\"gas\":\"0x2aea540\"},\"latest\"]}]";
+  string answer = text(route(s, post("/rpc", batch), "1.1.1.1", 0 as i64));
+  t.ok(answer.indexOf("\"id\":1,\"result\":\"0x1092\"") > 0 && answer.indexOf("\"id\":2,\"result\":\"0x") > 0, "a batch is answered whole: " + answer);
+  return t.report();
+}
+
+export string test_an_estimate_beyond_the_cap_is_refused_before_it_is_searched() {
+  Check t = Check.create();
+  Served s = served();
+  string body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"eth_estimateGas\",\"params\":[{\"to\":\"" + FOREVER + "\"}]}";
+  string answer = text(route(s, post("/rpc", body), "1.1.1.1", 0 as i64));
+  t.ok(answer.indexOf("\"id\":7") > 0 && answer.indexOf("limit of 1000000 gas") > 0, "a call that never ends is refused: " + answer);
+  string fine = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"eth_estimateGas\",\"params\":[{\"to\":\"0x00000000000000000000000000000000000dead1\",\"value\":\"0x0\"}]}";
+  t.ok(text(route(s, post("/rpc", fine), "1.1.1.1", 0 as i64)).indexOf("\"result\":\"0x5208\"") > 0, "a plain transfer is estimated at 21,000");
+  return t.report();
+}

@@ -1,0 +1,254 @@
+// Input generators for differential fuzzing.
+//
+// Random bytes alone are a weak corpus: they are incompressible, so they only ever exercise the
+// literal path and never produce a match, a length symbol or a distance symbol. Each generator below
+// targets a different part of the format, and the shapes that historically break DEFLATE
+// implementations — long runs (overlapping copies), matches at exactly the window edge, alphabets
+// that skew the Huffman tree — get their own.
+//
+// Everything is driven by an explicit seed, so a failing case is reproducible from its index alone.
+//
+// It was packages/gzip/test/fuzz/corpus.ts, deleted 2026-11-11 once its last reader had gone: gzip's `cov.ts` built
+// the same corpus to drive coverage until `packages/gzip/test/cov_exercise.wac` built it from here
+// (`issues/system/0222`), and tools/coverage.ts went with the move off Deno. So this is the only copy of the
+// generators now. The port was faithful line by line, including the draw order, which is what makes "case 137" mean
+// the input it meant before.
+//
+// Not a test file and not discovered as one: `wac test` walks `*_test.wac`. `issues/system/0161`.
+
+/**
+ * Deterministic LCG. Not good randomness; good reproducibility.
+ *
+ * A struct rather than a closure, because the generators below all draw from one sequence and the
+ * corpus is only reproducible if they keep drawing from the same one. `rng.next` is a bound
+ * reference where the host-side version returned a closure.
+ */
+export struct Rng {
+  i32 s;
+
+  i32 next(this) {
+    this.s = (this.s * 1103515245 + 12345) & 0x7FFFFFFF;
+    return this.s >> 8;
+  }
+
+  /** A draw in `[0, n)`. `n` is never zero at any call site; a zero would be a bug in the caller. */
+  i32 upto(this, i32 n) { return this.next() % n; }
+}
+
+export Rng makeRng(i32 seed) { return Rng(seed == 0 ? 1 : seed); }
+
+string[] words() {
+  return [
+                  "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "deflate",
+                  "huffman", "compression", "window", "literal", "distance", "length", "symbol",
+                  "block", "stream", "byte", "bit", "code", "tree", "table", "match"
+  ];
+}
+
+/** One case: what generated it and the bytes. */
+export struct Case {
+  string name;
+  u8[] data;
+}
+
+export static i32 GEN_INCOMPRESSIBLE = 0;
+export static i32 GEN_RUNS = 1;
+export static i32 GEN_TEXT = 2;
+export static i32 GEN_SPARSE = 3;
+export static i32 GEN_PERIODIC = 4;
+export static i32 GEN_WINDOW_EDGE = 5;
+export static i32 GEN_SMALL_ALPHABET = 6;
+export static i32 GEN_SKEWED = 7;
+export static i32 GEN_MIXED = 8;
+
+export string[] generatorNames() {
+  return [
+                  "incompressible", "runs", "text", "sparse", "periodic", "windowEdge",
+                  "smallAlphabet", "skewed", "mixed"
+  ];
+}
+
+/**
+ * Generate `size` bytes with generator `which`.
+ *
+ * A switch rather than nine funcrefs, because `mixed` calls back into the others and a table of
+ * references that includes itself is a knot with nothing to gain.
+ */
+export u8[] generate(i32 which, Rng rng, i32 size) {
+  if (which == GEN_INCOMPRESSIBLE) { return incompressible(rng, size); }
+  if (which == GEN_RUNS) { return runs(rng, size); }
+  if (which == GEN_TEXT) { return text(rng, size); }
+  if (which == GEN_SPARSE) { return sparse(rng, size); }
+  if (which == GEN_PERIODIC) { return periodic(rng, size); }
+  if (which == GEN_WINDOW_EDGE) { return windowEdge(rng, size); }
+  if (which == GEN_SMALL_ALPHABET) { return smallAlphabet(rng, size); }
+  if (which == GEN_SKEWED) { return skewed(rng, size); }
+  return mixed(rng, size);
+}
+
+/** Uniform random bytes: all literals, no matches, worst case for ratio. */
+u8[] incompressible(Rng rng, i32 size) {
+  u8[] out = u8[].filled(size, 0);
+  for (i32 i = 0; i < size; i++) { out[i] = (rng.next() & 0xFF) as@ u8; }
+  return out;
+}
+
+/** Runs of a repeated byte: overlapping copies at distance 1. */
+u8[] runs(Rng rng, i32 size) {
+  u8[] out = u8[].filled(size, 0);
+  i32 i = 0;
+  while (i < size) {
+    i32 len = 1 + rng.upto(300);
+    i32 b = rng.next() & 0xFF;
+    for (i32 k = 0; k < len && i < size; k++) { out[i] = b as@ u8; i = i + 1; }
+  }
+  return out;
+}
+
+/** Word-ish text: skewed byte frequencies plus frequent short matches. */
+u8[] text(Rng rng, i32 size) {
+  string[] vocab = words();
+  string joined = "";
+  i32 n = 0;
+  while (n < size) {
+    string w = vocab[rng.upto(vocab.len())];
+    joined = joined == "" ? w : "\{joined} \{w}";
+    n = n + w.len() + 1;
+  }
+  u8[] all = joined.toBytes();
+  i32 take = all.len() < size ? all.len() : size;
+  u8[] out = u8[].filled(take, 0);
+  for (i32 i = 0; i < take; i++) { out[i] = all[i]; }
+  return out;
+}
+
+/** Mostly zeros with occasional noise: very long zero runs in the code lengths. */
+u8[] sparse(Rng rng, i32 size) {
+  u8[] out = u8[].filled(size, 0);
+  i32 hits = 1 + rng.upto(20);
+  for (i32 k = 0; k < hits; k++) {
+    i32 at = rng.upto(size < 1 ? 1 : size);
+    i32 b = rng.next() & 0xFF;
+    if (at < size) { out[at] = b as@ u8; }
+  }
+  return out;
+}
+
+/** A repeating period, so matches land at one predictable distance. */
+u8[] periodic(Rng rng, i32 size) {
+  i32 period = 1 + rng.upto(300);
+  u8[] unit = u8[].filled(period, 0);
+  for (i32 i = 0; i < period; i++) { unit[i] = (rng.next() & 0xFF) as@ u8; }
+  u8[] out = u8[].filled(size, 0);
+  for (i32 i = 0; i < size; i++) { out[i] = unit[i % period]; }
+  return out;
+}
+
+/**
+ * A distinctive block repeated at a distance near the 32 KiB window edge — where a distance is either
+ * just encodable or just past the limit.
+ */
+u8[] windowEdge(Rng rng, i32 size) {
+  i32 n = size > 40000 ? size : 40000;
+  u8[] out = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { out[i] = (0x80 | (rng.next() & 0x3F)) as@ u8; }
+  u8[] pat = u8[].filled(64, 0);
+  for (i32 i = 0; i < pat.len(); i++) { pat[i] = (rng.next() & 0xFF) as@ u8; }
+  i32[] gaps = [32700, 32760, 32768, 32770, 32800];
+  i32 gap = gaps[rng.upto(gaps.len())];
+  for (i32 i = 0; i < pat.len(); i++) { out[i] = pat[i]; }
+  if (gap + pat.len() < n) {
+    for (i32 i = 0; i < pat.len(); i++) { out[gap + i] = pat[i]; }
+  }
+  return out;
+}
+
+/** Few distinct byte values: a small, heavily skewed alphabet. */
+u8[] smallAlphabet(Rng rng, i32 size) {
+  i32 k = 1 + rng.upto(5);
+  u8[] alphabet = u8[].filled(k, 0);
+  for (i32 i = 0; i < k; i++) { alphabet[i] = (rng.next() & 0xFF) as@ u8; }
+  u8[] out = u8[].filled(size, 0);
+  for (i32 i = 0; i < size; i++) { out[i] = alphabet[rng.upto(k)]; }
+  return out;
+}
+
+/**
+ * Exponentially skewed frequencies, which drive natural Huffman code lengths past the 15-bit limit
+ * and exercise the rebuild.
+ */
+u8[] skewed(Rng rng, i32 size) {
+  u8[] out = u8[].filled(size, 0);
+  for (i32 i = 0; i < size; i++) {
+    // Most draws land on a few symbols; the tail is very rare.
+    i32 v = 0;
+    i32 r = rng.upto(1024);
+    while (r > 1 && v < 40) { r = r >> 1; v = v + 1; }
+    out[i] = ((v * 6 + 3) & 0xFF) as@ u8;
+  }
+  return out;
+}
+
+/** Concatenation of other shapes, so statistics shift within one stream. */
+u8[] mixed(Rng rng, i32 size) {
+  i32[] gens = [
+                     GEN_INCOMPRESSIBLE, GEN_RUNS, GEN_TEXT, GEN_SPARSE, GEN_PERIODIC,
+                     GEN_SMALL_ALPHABET
+  ];
+  u8[][] chunks = u8[][].filled(256, u8[]());
+  i32 count = 0;
+  i32 n = 0;
+  while (n < size && count < chunks.len()) {
+    i32 room = size - n + 1;
+    i32 cap = room < 4000 ? room : 4000;
+    u8[] chunk = generate(gens[rng.upto(gens.len())], rng, 1 + rng.upto(cap < 1 ? 1 : cap));
+    chunks[count] = chunk;
+    count = count + 1;
+    n = n + chunk.len();
+  }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < count; i++) {
+    u8[] c = chunks[i];
+    for (i32 k = 0; k < c.len(); k++) { out[at + k] = c[k]; }
+    at = at + c.len();
+  }
+  return out;
+}
+
+/** The awkward sizes, which the corpus always covers before it draws any at random. */
+i32[] edgeSizes() { return [0, 1, 2, 3, 4, 5, 257, 258, 259, 65534, 65535, 65536] as i32[]; }
+
+/**
+ * Build the corpus.
+ *
+ * Sizes deliberately cluster around the awkward values — 0, 1, 2, 3 (the minimum match), 258 (the
+ * maximum), and the 65535 stored-block boundary — rather than being uniformly random.
+ */
+export Case[] buildCorpus(i32 count, i32 seed) {
+  Rng rng = makeRng(seed);
+  string[] names = generatorNames();
+  i32[] sizes = edgeSizes();
+  i32 edges = names.len() * sizes.len();
+  i32 total = count > edges ? count : edges;
+  Case[] out = Case[].filled(total, Case("", u8[]()));
+  i32 n = 0;
+
+  // Always include the degenerate sizes first, across every generator.
+  for (i32 g = 0; g < names.len(); g++) {
+    for (i32 s = 0; s < sizes.len(); s++) {
+      out[n] = Case("\{names[g]}/\{sizes[s]}", generate(g, rng, sizes[s]));
+      n = n + 1;
+    }
+  }
+
+  // Then fill the rest with random shapes and sizes.
+  while (n < total) {
+    i32 g = rng.upto(names.len());
+    i32 size = rng.upto(40000);
+    out[n] = Case("\{names[g]}/\{size}", generate(g, rng, size));
+    n = n + 1;
+  }
+  return out;
+}
+

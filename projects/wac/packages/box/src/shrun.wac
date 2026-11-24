@@ -1,0 +1,154 @@
+// `box`'s applets, as the shell's external commands.
+//
+//   import { wireBox } from "../src/shrun.wac";
+//   Shell sh = Shell.create(sys);
+//   wireBox(sh, sys.random());
+//
+// Two lines, and `sort`, `grep`, `sha256sum`, `gzip`, `cut`, `shuf` and fifty more become
+// commands you can type. `packages/sh` had its own `cat`, `wc`, `head`, `tail`, `rev`, `sort`,
+// `uniq`, `grep`, `tr`, `seq`, `nl` and `printf` — twelve programs that existed only because the
+// real ones could not be called, and its own comments said so. They are the fallback now.
+//
+// ## Why the wiring points this way
+//
+// `box` depends on `sh` and not the other way round, so `sh` cannot import this table; it takes a
+// funcref instead and whoever has both packages hands one to the other. That also keeps `sh`
+// testable alone: with nothing wired in, the hook falls through and the shell behaves exactly as
+// it did.
+//
+// ## Why an applet needs no changes
+//
+// An applet reads the `Input` and writes the `Output`s it is handed, and here those are built from
+// closures over buffers this function holds — the bytes we supply in, and what it writes kept. The
+// applet is not compiled differently, does not know, and cannot tell.
+//
+// The one thing that is *not* faithful is isolation. This is the same wasm instance with the same
+// authority: an applet run here can open any file the shell could. A real boundary is `spawn`,
+// which `sh` tries first — see `trySpawn` — and which a browser cannot do yet.
+
+import { Clock, Env, Files, Input, Net, Output, OutputClosed, OutputFault, Procs, Random, Sys } from "std";
+import { Buf, Result, Vec, flatten } from "core";
+import { Args, parseList } from "./lib/args.wac";
+import { UNKNOWN, appletNames, dispatch } from "./box.wac";
+import { Ran } from "../../sh/src/refusal.wac";
+import { Shell } from "../../sh/src/exec.wac";
+import { bytesInput, systemFiles } from "../../fs/src/trees.wac";
+import { ProcTable } from "../../fs/src/proc.wac";
+
+/** How much of an in-process applet's output the shell will hold: the 8 MiB a spawned child's queue is capped at. */
+static i32 HELD = 8 * 1024 * 1024;
+
+/**
+ * Make `box`'s applets `sh`'s external commands, run in process over `sh`'s own world — its files, clock,
+ * environment, network and programs — with `rnd` for the ones that need randomness.
+ */
+export void wireBox(Shell sh, Random rnd) {
+  sh.external = (Files fs, string cwd, Vec<string> argv, u8[] stdin, bool inheritIn) =>
+    boxRun(sh, rnd, fs, cwd, argv, stdin, inheritIn);
+  sh.externalNames = boxNames;
+}
+
+/**
+ * A shell on a system over `root`: `/dev`, `/proc` and `/bin` mounted on it, `cmdline` entered as the first
+ * process, and the applets wired in and spawnable — what `sealedsh`, `imaged` and a terminal page run. It
+ * starts at `/` and borrows nothing of the machine's environment.
+ */
+export Shell systemShell(Sys sys, Files root, Vec<string> cmdline) {
+  ProcTable table = ProcTable.create();
+  table.current = table.start(0, cmdline, flatten(sys.clock().nowMillis().wait()).orElse(0 as i64));
+  Shell sh = Shell.onFs(sys, systemFiles(root, sys.random(), table, boxNames()), table);
+  wireBox(sh, sys.random());
+  // Spawned rather than called, which is what makes an applet a real program here: the child is served
+  // this session's files, so it sees the session rather than the machine (wac-mono 0116).
+  sh.externalSpawnable = true;
+  return sh;
+}
+
+/**
+ * Run `argv` as a `box` applet, with `stdin` as its input and `cwd` as where it stands.
+ *
+ * `Ran.missing()` for a name that is not an applet, because that is what makes the shell say
+ * `command not found` and report 127 rather than printing `box`'s usage at somebody who typed a
+ * typo. The `UNKNOWN` sentinel exists for exactly this: an applet that ran and failed returns 1,
+ * and one that does not exist has to be a different answer.
+ */
+export async Ran boxRun(Shell sh, Random rnd, Files fs, string cwd, Vec<string> argv, u8[] stdin, bool inheritIn) {
+  if (argv.len() == 0) { return Ran.missing(); }
+  string[] args = argv.toArray();
+  string name = args[0];
+  Args a = parseList(args, 1, name);
+
+  Buf said = Buf.create();
+  Buf complained = Buf.create();
+  bool[] over = bool[].filled(1, false);
+  // **Written as it goes when nothing stands between the command and the shell's own streams** — a server
+  // says it is listening while it listens, not when it stops (`issues/system/0362a`). Held otherwise, since a
+  // pipe, a redirection or a capture places the bytes after the command ends.
+  bool through = sh.writesThrough;
+  Output out = through ? sh.stdout : Output((u8[] b) => held(said, over, b), stillOpen);
+  Output err = through ? sh.stderr : Output((u8[] b) => held(complained, over, b), stillOpen);
+  Input in = inheritIn ? sh.stdin : bytesInput(stdin);
+  i32 code = await dispatch(args, in, err, out, sh.clock, rnd, sh.env, fs.relativeTo(cwd), sh.net, sh.procs,
+                            () => sh.takeInterrupt(), a, name);
+
+  if (code == UNKNOWN) { return Ran.missing(); }
+  if (over[0]) {
+    return Ran.refused(
+      ("\{name}: output exceeded what this shell can hold for a command it runs in process; " +
+       "run it as a spawned program, where the output streams\n").toBytes(),
+      1,
+    );
+  }
+  return Ran(said.take(), complained.take(), code, true, false);
+}
+
+/** `b` kept in `into`, or refused as a closed output once the two streams together pass `HELD`. */
+async Result<void, OutputFault> held(Buf into, bool[] over, u8[] b) {
+  if (over[0] || into.len + b.len() > HELD) {
+    over[0] = true;
+    return Result.Err(OutputClosed("the shell holds no more of this command's output"));
+  }
+  into.pushAll(b);
+  return Result.Ok();
+}
+
+async Result<void, OutputFault> stillOpen() { return Result.Ok(); }
+
+/**
+ * Run one applet as *this program's* `main` would, writing to the real streams.
+ *
+ * The other half of `Shell.externalSpawnable`. When the shell runs an applet as a child — a worker of
+ * its own, through `spawnSelf` — the child starts at `main` with the applet's name as its first
+ * argument, and `main` has to know what to do with that. `box.wac`'s already does; a program that
+ * *embeds* the shell needs this to do the same thing. Its files are `sys.files()`: its parent's if
+ * something spawned it and serves them, the host's otherwise (wac-mono 0116).
+ *
+ * Answers `UNKNOWN` for a name that is not an applet, so a caller can be a shell instead — checked before
+ * anything else, so this binary started as a shell asks its parent nothing.
+ */
+export async i32 boxApplet(Sys sys) {
+  string[] argv = sys.args();
+  if (argv.len() < 1 || !isApplet(argv[0])) { return UNKNOWN; }
+  return await dispatch(argv, sys.stdin(), sys.stderr(), sys.stdout(), sys.clock(), sys.random(), sys.env(),
+                        sys.files(), sys.net(), sys.procs(), sys.interrupted, parseList(argv, 1, argv[0]), argv[0]);
+}
+
+/**
+ * Whether `dispatch` has a program of this name.
+ *
+ * Asked from the one list `appletNames` is, so this cannot drift from what `dispatch` will actually
+ * run — a second list of names would be the thing that decides whether a filesystem gets built.
+ */
+bool isApplet(string name) {
+  string[] names = appletNames();
+  for (i32 i = 0; i < names.len(); i++) { if (names[i] == name) { return true; } }
+  return false;
+}
+
+/**
+ * Every name `boxRun` answers to, for `Shell.externalNames`.
+ *
+ * The same list `box`'s own usage prints, so the shell's `help` and `box` with no arguments cannot
+ * disagree about what exists.
+ */
+export string[] boxNames() { return appletNames(); }

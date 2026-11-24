@@ -1,0 +1,3454 @@
+//! `wac`, hosted by wasmtime: the one host with no JavaScript in it.
+//!
+//! **The binary was `wacland` until 2026-08-28.** Wacland is the system — userland written in wac,
+//! `wac sh` and the platform under it — and naming one host after it said the system was this
+//! engine. It is `wac`, the same command as `native/v8`, carrying the same seed module.
+//!
+//! design/0001 step 2a, wac-mono 0087. The peer of `packages/platform/host/{deno,node,browser}.ts`, in
+//! the role Deno plays but Wasm-native. It is the only host that tests the portability claim at all —
+//! the other three are JavaScript and share the transport, the worker model and the event loop.
+//!
+//! ## What it turned out to be
+//!
+//! Much less than the JavaScript host, and the reason is worth stating because it was not obvious
+//! before the ABI was read: **a compiled wac program has no imports of its own.** It asks for
+//! `wac.cb0`…`wac.cbN` — one dispatcher per funcref *signature* — and everything else the host does is
+//! calling exports. There is no bundle to make, no generated glue, and nothing to keep in step except
+//! the manifest.
+//!
+//! The `SharedArrayBuffer`, the `Atomics.wait`, the ring of slots and the responder have no counterpart
+//! here, exactly as 0087 predicted: they exist to park a *worker* while an asynchronous host runs, and
+//! native code blocks the calling thread. See `tickets.rs`, which is what replaced them.
+//!
+//! ## What is here, and what is not
+//!
+//! Here: loading, dispatch, marshalling, the capability structs built from the manifest's field order,
+//! the ticket table, and the capabilities that need no operating system beyond a clock and a thread —
+//! `argCount`, `arg`, `write`, `writeErr`, `nowMillis`, `monotonicNanos`, `sleepMillis`, `randomBytes`,
+//! `exitCode` and `waitAny`.
+//!
+//! Not here, and it says so rather than answering plausibly: **the filesystem, the network and
+//! `spawn`**. Every one of those is a registered, callable funcref whose arm refuses by name. A
+//! runtime that answered an empty file or a closed socket would make every program that used it wrong
+//! in a way nothing could see, which is design/0001 D6.
+
+mod manifest;
+mod streams;
+mod tickets;
+
+use manifest::{Manifest, SUPPORTED_VERSION};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use streams::{Exit, Stream};
+use tickets::{Outcome, Tickets};
+use wasmtime::{
+    Caller, Config, Engine, Extern, ExternType, Instance, Linker, Module, Store, UpdateDeadline, Val,
+};
+
+/// What shape a ticket's outcome has, so it can be flattened into the one answer every request gets —
+/// design/system/0013 step 6. The same `Outcome::Bytes` is a `Read` from `recv` and plain bytes from `arg`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Kind {
+    I32,
+    I64,
+    Bytes,
+    Str,
+    BytesOpt,
+    Bool,
+    Exec,
+    Change,
+    FileResult,
+    Stat,
+    Names,
+    Socket,
+    Datagram,
+    Child,
+    Read,
+}
+
+/// What a registered funcref does when the guest calls it: one of the four calls `__wacHost` is handed.
+///
+/// Everything a program asks of this host is a numbered `request` — design/system/0013 step 6 — so the
+/// capabilities are arms of `serve` rather than functions the module holds.
+#[derive(Clone, Debug, PartialEq)]
+enum Cap {
+    Request,
+    WaitAny,
+    Exit,
+    /// `interrupted` — nothing here owns a keyboard, so it is always "no". See below.
+    Interrupted,
+}
+
+/// The three queues and the status of one spawned child, as the *parent* holds them.
+///
+/// Clonable because a child is named by two handles — its output and its error stream — and every
+/// field is an `Arc`, so the clone is the same child rather than a copy of one.
+#[derive(Clone)]
+struct ChildProc {
+    /// What the parent sends becomes the child's standard input.
+    stdin: Arc<Stream>,
+    stdout: Arc<Stream>,
+    stderr: Arc<Stream>,
+    /// The child's filesystem **requests**, which its parent reads — see `Child.fsHandle` in
+    /// platform.wac, and wac-mono 0116 for what a child could not see without it.
+    fsreq: Arc<Stream>,
+    /// The parent's **answers**, which the child reads. The other direction of the same channel.
+    fsrep: Arc<Stream>,
+    exit: Arc<Exit>,
+    /// Set by `closeSocket`, read by the child's own epoch callback: **stop wherever you are**.
+    ///
+    /// Ending the queues is not enough and issue 0123 is why. A child that writes finds out on its
+    /// next write; a child that only computes never asks, and `closeSocket` promised termination —
+    /// which is what it does on the JavaScript hosts, where a worker is terminated outright. The
+    /// engine ticks an epoch, every guest loop back-edge checks it, and the callback below turns
+    /// this flag into a trap. That is what termination is for wasm.
+    stop: Arc<AtomicBool>,
+}
+
+/// A socket, as this runtime holds it.
+///
+/// `Arc<TcpStream>` rather than a mutex: `&TcpStream` implements both `Read` and `Write`, so a
+/// `recv` parked on one thread and a `send` on another are the kernel's problem rather than this
+/// runtime's — which is what `example/writeread.wac` exists to ask about.
+#[derive(Clone)]
+enum Sock {
+    Listening(Arc<std::net::TcpListener>),
+    Open(Arc<std::net::TcpStream>),
+    /// A bound UDP socket. Neither of the above: nothing connects to it and nothing is accepted
+    /// from it, and every datagram carries its own peer. `Arc` for the same reason the others have
+    /// one — `&UdpSocket` both sends and receives, so two threads need no lock between them.
+    Datagram(Arc<std::net::UdpSocket>),
+}
+
+/// What a handle names.
+///
+/// A child has two — one for each of its output streams — because a program has two streams and
+/// merging them is a bug `platform.wac` names by example.
+#[derive(Clone)]
+enum Handle {
+    /// The child's ordinary handle: `send` feeds it, `recv` reads its standard output.
+    Main(ChildProc),
+    /// The `errHandle`: `recv` reads its error stream, and nothing is sent to it.
+    Err(ChildProc),
+    /// The `fsHandle`: `recv` reads what the child is asking of the filesystem, and `send` answers
+    /// it. The one handle a parent both reads and writes for a reason other than standard input.
+    Fs(ChildProc),
+    /// A socket. `send` writes it, `recv` reads it, `accept` takes from a listening one.
+    Net(Sock),
+    /// **A file opened as a stream** — `Cli.openFile`. `recv` reads it and `send` writes it, as a socket's;
+    /// `closeFile` ends it. `Arc` because `&File` reads and writes, so a reader thread needs no lock.
+    File(Arc<std::fs::File>),
+}
+
+/// Everything a handle can name, shared with the threads that make them.
+///
+/// **Behind an `Arc<Mutex<…>>` because `accept` and `connect` finish on a thread**, and a socket they
+/// produced has to be namable by a handle the guest is given. Nothing else about a `Store` crosses a
+/// thread — a `Val` is not `Send` — and this is the one table that must.
+///
+/// A closed slot becomes `None` and is **never reused**: a handle held past a close names nothing
+/// rather than naming somebody else's connection, which `deno.ts` says of its own table in the same
+/// words and for the same reason.
+struct Handles {
+    slots: Vec<Option<Handle>>,
+}
+
+/// Standard input's handle, and a child's end of its filesystem channel — `STDIN` and `PARENT_FS`
+/// in platform.wac, and `FIRST_FREE_HANDLE` in `host/children.ts`.
+const STDIN_HANDLE: i32 = 0;
+const PARENT_FS_HANDLE: i32 = 1;
+const FIRST_FREE_HANDLE: usize = 2;
+
+impl Default for Handles {
+    /// **The reserved handles are slots nothing can be allocated into.**
+    ///
+    /// They used to be neither reserved nor allocated here: the table started empty, so the first
+    /// child a native program spawned was handle 0 — the number that means standard input on every
+    /// other host. Nothing had noticed because `Cap::Recv` consults the table before it considers
+    /// standard input, so a program that spawned before it read got its child and one that read
+    /// first got nothing; both are wrong and neither says so. Reserving is what makes
+    /// `recv(STDIN_HANDLE)` and `recv(PARENT_FS_HANDLE)` mean the same thing here as in the
+    /// JavaScript hosts, where the counter has always started past them.
+    fn default() -> Self {
+        Handles { slots: vec![None; FIRST_FREE_HANDLE] }
+    }
+}
+
+impl Handles {
+    fn push(&mut self, what: Handle) -> i32 {
+        self.slots.push(Some(what));
+        (self.slots.len() - 1) as i32
+    }
+
+    fn get(&self, h: i32) -> Option<&Handle> {
+        if h < 0 {
+            return None;
+        }
+        self.slots.get(h as usize)?.as_ref()
+    }
+
+    fn close(&mut self, h: i32) {
+        if h >= 0 {
+            if let Some(slot) = self.slots.get_mut(h as usize) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// The streams a program has when it *is* a child, rather than the process's own.
+struct AsChild {
+    stdin: Arc<Stream>,
+    stdout: Arc<Stream>,
+    stderr: Arc<Stream>,
+    /// This program's filesystem **requests**, which its parent reads. `send(PARENT_FS, …)`.
+    fsreq: Arc<Stream>,
+    /// Its parent's **answers**, which this program reads. `recv(PARENT_FS)`.
+    fsrep: Arc<Stream>,
+    /// Whether this child writes the *process's* own streams rather than the queues above.
+    ///
+    /// `platform.wac`'s `INHERIT_OUT`. Two queues record nothing about which stream was written
+    /// first, so a parent relaying them puts a diagnostic after the output it belonged between;
+    /// writing the real descriptors keeps the order the child wrote in. `issues/system/0282c`.
+    inherit_out: bool,
+    /// Whether this child was told to read the *process's* input rather than what its parent sends.
+    ///
+    /// **Without this the queue below shadowed the real thing.** A child spawned with `inheritInput`
+    /// gets its `stdin` queue `finish`ed at once — nothing will arrive on it and a reader must not
+    /// wait — and `readChunk` then read that finished queue, saw empty, and answered *end of input*
+    /// before it could reach the process's own stdin. So every filter run by a shell that spawns —
+    /// `cat`, `wc`, `head`, `sort`, `grep` — produced nothing under this runtime while working
+    /// everywhere else, and the comment beside the `finish` said the opposite was happening.
+    inherits: bool,
+}
+
+/// Read for a ticket and answer it, taking nothing if the ticket has been abandoned.
+///
+/// Two guards, and both are needed. `read_unless` declines to take the bytes at all when nobody is
+/// waiting, which is what closes the window another reader could see as an ended stream. The
+/// `unread` after `complete` is the backstop for the narrower race where the caller gives up
+/// *between* the two. `issues/system/0307b`.
+fn deliver(
+    stream: &streams::Stream,
+    table: &Tickets,
+    id: i32,
+    reading: &std::sync::Mutex<HashMap<i32, i32>>,
+) {
+    let Some(bytes) = stream.read_unless(|| !table.is_live(id)) else {
+        reading.lock().unwrap().remove(&id);
+        return;
+    };
+    match table.complete(id, Outcome::Bytes(bytes)) {
+        // Nobody was waiting, and `unread_bytes` has already put them back — so there is nothing for
+        // a later `drop` to hand over and the note can go.
+        unclaimed @ Some(_) => {
+            unread_bytes(stream, unclaimed);
+            reading.lock().unwrap().remove(&id);
+        }
+        // **Filed under a live ticket, so the note stays.** This is exactly the state `drop` has to
+        // clean up after: the answer is sitting in `done` and the caller may still give up on it.
+        // Forgetting the handle here is what made the first version of this fix do nothing at all —
+        // `drop` found the answer and had nowhere to put it. `issues/system/0308b`.
+        None => {}
+    }
+}
+
+/// Put stream bytes nobody claimed back into the stream they came from.
+///
+/// Preferred to the handle-keyed map below wherever there *is* a queue, because another reader may
+/// already be parked on it — a bounded read that timed out and was retried is exactly that — and it
+/// would never look in a side table. `issues/system/0307b`.
+fn unread_bytes(stream: &streams::Stream, unclaimed: Option<Outcome>) {
+    if let Some(Outcome::Bytes(bytes)) = unclaimed {
+        stream.unread(bytes);
+    }
+}
+
+/// Put back what a reader took for a ticket nobody claimed, for the next `recv` on that handle.
+///
+/// Only bytes, and only a non-empty run of them. An error describes a call that no longer exists,
+/// and an empty read is the stream ending — neither is a thing the next reader is missing.
+fn park_unclaimed(back: &std::sync::Mutex<HashMap<i32, Vec<u8>>>, handle: i32, unclaimed: Option<Outcome>) {
+    if let Some(Outcome::Bytes(bytes)) = unclaimed {
+        if !bytes.is_empty() {
+            back.lock().unwrap().entry(handle).or_default().extend(bytes);
+        }
+    }
+}
+
+struct Host {
+    /// `caps[signature][slot]`, matching the module's per-signature funcref tables.
+    caps: Vec<Vec<Cap>>,
+    /// argv as bytes, since a program's arguments are bytes (wac-mono 0065).
+    args: Vec<Vec<u8>>,
+    tickets: Arc<Tickets>,
+    /// What the manifest says this program may reach. A capability outside them is not silently
+    /// weaker: it answers what "you may not" *means* for that capability, which differs by capability.
+    grants: manifest::Grants,
+    /// What `__wacHost` answered: the value every answer is delivered to, through `__wacAnswered`.
+    wac_host: Option<Val>,
+    /// Each request in flight, by the program's id: the ticket doing the work, and the shape it answers.
+    inflight: HashMap<i32, (i32, Kind)>,
+    /// Standard output and standard error, once `closeOutput` has ended them: a write after it is refused.
+    out_closed: [bool; 2],
+    /// Children this program spawned, and the handles that name their streams.
+    handles: Arc<std::sync::Mutex<Handles>>,
+    /// Which handle a read ticket is reading, so a *dropped* one knows where to put its answer.
+    ///
+    /// A ticket id does not say what it was reading, and `drop` is given nothing else — so an answer
+    /// that arrived before the caller gave up had nowhere to go and was binned. The v8 host has kept
+    /// this map for `receiveFrom` since `issues/system/0207`; this is the same thing for reads.
+    /// `issues/system/0308b`.
+    reading: Arc<std::sync::Mutex<HashMap<i32, i32>>>,
+    /// The spawn tickets not yet collected, and whether each child was started detached: a dropped one stops its
+    /// child unless it was (spec ch44 `§wac-std-child-drop-n2r5vxe`).
+    spawned: HashMap<i32, bool>,
+    /// A connection a *dropped* accept had already taken, waiting for the next accept on that
+    /// listener.
+    ///
+    /// **The two orderings need different remedies, which is why both exist.** A thread that finds
+    /// its ticket gone hands the connection to a *live* ticket, because the retry is already blocked
+    /// inside `accept()` and cannot be given anything left lying about. A `drop` that finds the
+    /// answer in hand has the opposite problem: the retry has not been issued yet, so there is no
+    /// live ticket to hand to and the connection has to wait here for one. Parking alone measured
+    /// 0 of 8 on the first ordering; handing on alone measured 0 of 6 on the second.
+    /// `issues/system/0310b`.
+    parked_accepts: Arc<std::sync::Mutex<HashMap<i32, std::collections::VecDeque<Outcome>>>>,
+    /// Live `accept` tickets per listener, oldest first.
+    ///
+    /// A connection cannot be handed to a thread already blocked in `listener.accept()` — it is
+    /// waiting in the kernel for a *different* one — so leaving the socket somewhere for it to find
+    /// does nothing, which was measured. What works is giving it to a ticket that is still live:
+    /// the answer goes to whoever is waiting, whichever thread happened to take the connection.
+    /// `issues/system/0310b`.
+    accepting: Arc<std::sync::Mutex<HashMap<i32, std::collections::VecDeque<i32>>>>,
+    /// Bytes a reader took for a ticket nobody claimed, waiting for the next `recv` on that handle.
+    ///
+    /// `Stream::read` blocks and then *drains*, and a socket read takes bytes off the socket. So a
+    /// reader whose caller gave up still removes them, and until `issues/system/0307b` it then
+    /// dropped them: the next `recv` began after a hole and nothing said so. This is where they
+    /// wait instead — the same idea as the v8 host's parked datagrams, one resource wider.
+    pushback: Arc<std::sync::Mutex<HashMap<i32, Vec<u8>>>>,
+    /// Where this program's relative paths resolve from, when its parent said. Empty means the
+    /// process's own directory.
+    ///
+    /// **Not a `Frame`**, which is what the first version used and which was wrong in a way that took
+    /// a while to see: a frame also *captures output*, so a child given a directory had everything it
+    /// printed collected into a buffer nobody would ever pop. It ran, exited 0, and said nothing.
+    cwd: Vec<u8>,
+    /// Set when this program is itself a spawned child: its output goes to its parent's queues and
+    /// its input comes from one, rather than from the process's own streams.
+    as_child: Option<AsChild>,
+    /// Everything a child thread needs to make another instance of this same module.
+    world: Option<Arc<World>>,
+    /// Monotonic zero, so `monotonicNanos` measures from this program's start rather than the epoch.
+    started: std::time::Instant,
+    /// The status `exitWith` asked for, set before it unwinds the program to `main`'s call.
+    exit_request: Option<i32>,
+}
+
+impl Host {
+    fn new(signatures: usize, args: Vec<Vec<u8>>, grants: manifest::Grants) -> Self {
+        Host {
+            caps: vec![Vec::new(); signatures],
+            args,
+            tickets: Arc::new(Tickets::default()),
+            grants,
+            wac_host: None,
+            inflight: HashMap::new(),
+            out_closed: [false, false],
+            handles: Arc::new(std::sync::Mutex::new(Handles::default())),
+            reading: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            spawned: HashMap::new(),
+            parked_accepts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            accepting: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pushback: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            as_child: None,
+            cwd: Vec::new(),
+            world: None,
+            started: std::time::Instant::now(),
+            exit_request: None,
+        }
+    }
+
+    /// Register `cap` under signature `sig` and answer its slot, reusing one it already has.
+    ///
+    /// **The same capability through the same signature is the same function**, so a module loaded
+    /// twice into one store, or a signature shared by two of the four calls, never burns a second slot
+    /// of a table whose size was fixed at compile time. `issues/lang/0109` is the day it did.
+    fn register(&mut self, sig: usize, cap: Cap, limit: u32) -> Result<u32, String> {
+        if let Some(i) = self.caps[sig].iter().position(|c| same_cap(c, &cap)) {
+            return Ok(i as u32);
+        }
+        let slot = self.caps[sig].len();
+        if slot as u32 >= limit {
+            return Err(format!("at most {limit} distinct functions of signature {sig} can be passed"));
+        }
+        self.caps[sig].push(cap);
+        Ok(slot as u32)
+    }
+}
+
+// ── Marshalling ───────────────────────────────────────────────────────────────
+//
+// Every value crosses at offset 0 of `$bind$mem`, a staging buffer grown by `$bind$mem_ensure`. That
+// is the whole layout contract: four helpers for strings, four more for arrays, and no knowledge here
+// of how a wac value is actually laid out.
+
+fn export_func(caller: &mut Caller<'_, Host>, name: &str) -> Result<wasmtime::Func, wasmtime::Error> {
+    match caller.get_export(name) {
+        Some(Extern::Func(f)) => Ok(f),
+        _ => Err(wasmtime::Error::msg(format!("the module has no {name}"))),
+    }
+}
+
+/// Call an export whose arity is read from its own type rather than assumed.
+///
+/// The first version of this passed a fixed results buffer and failed on `$bind$str_to_mem`, which the
+/// JavaScript bindgen calls for its side effect and which does in fact return a value. Asking the
+/// function how many results it has is both shorter and the only version that cannot be wrong.
+fn call_dyn(
+    caller: &mut Caller<'_, Host>,
+    f: &wasmtime::Func,
+    args: &[Val],
+) -> Result<Vec<Val>, wasmtime::Error> {
+    let n = f.ty(&mut *caller).results().len();
+    let mut results = vec![Val::I32(0); n];
+    f.call(&mut *caller, args, &mut results)?;
+    Ok(results)
+}
+
+fn staging(caller: &mut Caller<'_, Host>) -> Result<wasmtime::Memory, wasmtime::Error> {
+    match caller.get_export("$bind$mem") {
+        Some(Extern::Memory(m)) => Ok(m),
+        _ => Err(wasmtime::Error::msg("the module has no $bind$mem")),
+    }
+}
+
+/// Copy `bytes` into the staging buffer, growing it first.
+fn to_staging(caller: &mut Caller<'_, Host>, bytes: &[u8]) -> Result<(), wasmtime::Error> {
+    let ensure = export_func(caller, "$bind$mem_ensure")?;
+    let have = call_dyn(caller, &ensure, &[Val::I32(bytes.len() as i32)])?;
+    if let Some(Val::I32(n)) = have.first() {
+        if (*n as usize) < bytes.len() {
+            return Err(wasmtime::Error::msg(format!(
+                "could not grow the transfer buffer to {} bytes",
+                bytes.len()
+            )));
+        }
+    }
+    let mem = staging(caller)?;
+    mem.write(&mut *caller, 0, bytes)?;
+    Ok(())
+}
+
+/// Read a reference the module can copy into the staging buffer: a string, a `u8[]` or an `i32[]`.
+fn from_staging(
+    caller: &mut Caller<'_, Host>,
+    value: &Val,
+    len_export: &str,
+    to_mem_export: &str,
+    width: usize,
+) -> Result<Vec<u8>, wasmtime::Error> {
+    let len_fn = export_func(caller, len_export)?;
+    let to_mem = export_func(caller, to_mem_export)?;
+    let out = call_dyn(caller, &len_fn, std::slice::from_ref(value))?;
+    let n = match out.first() {
+        Some(Val::I32(n)) => (*n as usize) * width,
+        _ => return Err(wasmtime::Error::msg(format!("{len_export} did not answer an i32"))),
+    };
+    let ensure = export_func(caller, "$bind$mem_ensure")?;
+    call_dyn(caller, &ensure, &[Val::I32(n as i32)])?;
+    call_dyn(caller, &to_mem, std::slice::from_ref(value))?;
+    let mem = staging(caller)?;
+    let mut bytes = vec![0u8; n];
+    mem.read(&mut *caller, 0, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// The message a `trap "…"` left behind, read straight off the array.
+///
+/// Everything else on this boundary runs inside a host call and has a `Caller`; this runs *after* `main`
+/// has trapped, where there is only the store and the instance. It reads the `i8[]` element by element
+/// through wasmtime's GC API rather than through `$bind$str_to_mem`, because that helper is emitted only
+/// when a string actually crosses to the host — a program whose `main` takes no capabilities and only
+/// traps exports `$trap$message` and `$bind$str_len` and not that one, which is exactly the program this
+/// is for.
+///
+/// `None` for anything absent or unreadable: an engine trap sets no message, and a module built before
+/// this feature exports no `$trap$message` at all.
+fn trap_message(store: &mut Store<Host>, instance: &Instance) -> Option<String> {
+    let msg_fn = instance.get_func(&mut *store, "$trap$message")?;
+    let mut got = [Val::I32(0)];
+    msg_fn.call(&mut *store, &[], &mut got).ok()?;
+    let anyref = match &got[0] {
+        Val::AnyRef(Some(r)) => *r,
+        _ => return None,
+    };
+    let arr = anyref.as_array(&*store).ok()??;
+    let n = arr.len(&*store).ok()?;
+    let mut bytes = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        match arr.get(&mut *store, i).ok()? {
+            // `i8[]` reads as a signed byte, which is what a wac `string` is made of.
+            Val::I32(b) => bytes.push(b as u8),
+            _ => return None,
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn read_string(caller: &mut Caller<'_, Host>, s: &Val) -> Result<Vec<u8>, wasmtime::Error> {
+    from_staging(caller, s, "$bind$str_len", "$bind$str_to_mem", 1)
+}
+
+fn read_u8_array(caller: &mut Caller<'_, Host>, a: &Val) -> Result<Vec<u8>, wasmtime::Error> {
+    from_staging(caller, a, "$bind$arr_u8_len", "$bind$arr_u8_to_mem", 1)
+}
+
+/// An `i32[]` as numbers. The staging buffer is bytes, and wasm is little-endian everywhere.
+fn read_i32_array(caller: &mut Caller<'_, Host>, a: &Val) -> Result<Vec<i32>, wasmtime::Error> {
+    let bytes = from_staging(caller, a, "$bind$arr_i32_len", "$bind$arr_i32_to_mem", 4)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+fn make_string(caller: &mut Caller<'_, Host>, bytes: &[u8]) -> Result<Val, wasmtime::Error> {
+    to_staging(caller, bytes)?;
+    let from_mem = export_func(caller, "$bind$str_from_mem")?;
+    let out = call_dyn(caller, &from_mem, &[Val::I32(bytes.len() as i32)])?;
+    out.into_iter().next().ok_or_else(|| wasmtime::Error::msg("$bind$str_from_mem answered nothing"))
+}
+
+fn make_u8_array(caller: &mut Caller<'_, Host>, bytes: &[u8]) -> Result<Val, wasmtime::Error> {
+    to_staging(caller, bytes)?;
+    let from_mem = export_func(caller, "$bind$arr_u8_from_mem")?;
+    let out = call_dyn(caller, &from_mem, &[Val::I32(bytes.len() as i32)])?;
+    out.into_iter().next().ok_or_else(|| wasmtime::Error::msg("$bind$arr_u8_from_mem answered nothing"))
+}
+
+// ── Running ───────────────────────────────────────────────────────────────────
+
+/// The compiler built into this binary, when one was.
+///
+/// `None` unless `seed/wacc.wasm` was present at build time — see `build.rs`. With one, this binary
+/// is a `wac` command; without, it is the runtime it has always been, and says so rather than
+/// pretending.
+///
+/// **One file, not two, since 2026-08-28.** This took a `seed/wacc.json` beside the module, because
+/// this host was written when a program was a pair — and `native/v8/build.rs` had already said so in
+/// a comment nobody acted on. The `.json` stopped being written when a module started carrying its
+/// manifest in a `wac.manifest` section, so the pair could never be complete, so `wac_seed` was
+/// never set, so this binary could never be built as a `wac` command at all. The seed on disk went
+/// stale for a fortnight and nothing noticed, because nothing read it.
+#[cfg(wac_seed)]
+const SEED: Option<&[u8]> = Some(include_bytes!(env!("WAC_SEED_WASM")));
+#[cfg(not(wac_seed))]
+const SEED: Option<&[u8]> = None;
+
+/// The `wac.manifest` section of `wasm`, parsed and version-checked. `what` names it in an error.
+fn manifest_of(wasm: &[u8], what: &str) -> Result<Arc<Manifest>, wasmtime::Error> {
+    let Some(text) = wacmanifest::manifest_in(wasm) else {
+        return Err(wasmtime::Error::msg(format!(
+            "{what}: no `wac.manifest` section — built by something that does not write one?"
+        )));
+    };
+    let m: Arc<Manifest> = serde_json::from_str::<Manifest>(&text).map(Arc::new)
+        .map_err(|e| wasmtime::Error::msg(format!("{what}: {e}")))?;
+    if m.version != SUPPORTED_VERSION {
+        return Err(wasmtime::Error::msg(format!(
+            "{what}: manifest version {} — this runtime speaks {}",
+            m.version, SUPPORTED_VERSION
+        )));
+    }
+    Ok(m)
+}
+
+/// Run the built-in compiler with these arguments.
+///
+/// The manifest comes out of the module's own section, by the same route a module named on the
+/// command line takes — so the payload this binary carries is the identical artefact, and there is
+/// no second form of it that could drift.
+fn run_seed(args: &[String]) -> Result<i32, wasmtime::Error> {
+    let wasm = SEED.expect("a seed");
+    let mut m = manifest_of(wasm, "the built-in compiler")?;
+    // **The seed holds everything and the program narrows it**, which is `issues/system/0257c`'s
+    // ruling — a host may implement *running a module* and must not implement the *command
+    // surface*. `--allow-run` is read by the wac-side command, not here; what this hands over is the
+    // ceiling, and `load_module` intersects it with whatever the program then asks for.
+    //
+    // **Without this the seed got only what its own manifest declared**, so `run` was never granted
+    // and `Cli.exec` was refused for every program on this host while working on the other — the
+    // same four-line program answering `EXEC ok` under v8 and `Not granted to this application`
+    // here. `issues/system/0313b`. The v8 host has had this block since `0264c`; this one did not,
+    // which is the drift two parallel `run_seed`s invite.
+    //
+    // `manifest_of` answers an `Arc` and this one is a line old, so it is still the only reference
+    // and `get_mut` succeeds. Written to fail loudly rather than silently keep the old ceiling if
+    // that ever stops being true.
+    let raised = Arc::get_mut(&mut m).ok_or_else(|| {
+        wasmtime::Error::msg("the seed's manifest was shared before its grants were set")
+    })?;
+    raised.grants = manifest::Grants { read: true, write: true, env: true, net: true, run: true, sealed: raised.grants.sealed };
+    let program_args: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
+    run(m, wasm, program_args)
+}
+
+fn main() -> Result<(), wasmtime::Error> {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() < 2 {
+        if SEED.is_some() {
+            std::process::exit(run_seed(&[])? );
+        }
+        eprintln!("usage: wac <program.wasm> [args...]");
+        eprintln!("  a module carrying its own manifest — `wac build <entry.wac> -o <stem>`");
+        std::process::exit(2);
+    }
+    // **A program, or arguments for the built-in compiler.** Deciding by what the first argument
+    // *is* rather than by a flag: `wac compile x.wac` and `wac prog.wasm` are both what someone
+    // would type, and a program is always a readable `.wasm`.
+    //
+    // It took a `.json` beside the module until 2026-08-20, which was history rather than a reason —
+    // this host predates the self-describing section and nobody came back to it. One artefact means
+    // the manifest cannot be separated from the module it describes.
+    if !(argv[1].ends_with(".wasm") && Path::new(&argv[1]).exists()) {
+        if SEED.is_some() {
+            std::process::exit(run_seed(&argv[1..])?);
+        }
+        eprintln!("{}: not a module, and this build has no compiler in it", argv[1]);
+        eprintln!("  build with seed/wacc.wasm present — `./bootstrap.sh --host wasmtime`");
+        std::process::exit(2);
+    }
+    let wasm = std::fs::read(&argv[1])
+        .map_err(|e| wasmtime::Error::msg(format!("{}: {e}", argv[1])))?;
+    let m = manifest_of(&wasm, &argv[1])?;
+    let program_args: Vec<Vec<u8>> = argv[2..].iter().map(|a| a.as_bytes().to_vec()).collect();
+
+    let code = run(m, &wasm, program_args)?;
+    std::process::exit(code);
+}
+
+/// Everything a second instance of this same program needs.
+///
+/// Held behind an `Arc` because a spawned child builds its own `Store` **on its own thread**, and the
+/// engine, the module and the manifest are the only things that cross. Nothing from the parent's store
+/// does: a `Val` is not `Send` and must not be, which is the language enforcing what `spawn` is for.
+struct World {
+    engine: Engine,
+    module: Module,
+    manifest: Arc<Manifest>,
+    /// The module's bytes, for `trap_kind` to read the instruction a trap stopped at.
+    wasm: Arc<[u8]>,
+}
+
+/// How often the engine's epoch advances, and so the coarsest a stop can be.
+///
+/// 5 ms is under the round trip of any capability call — every opcode parks the worker — so a stop
+/// is indistinguishable from immediate to anything that could observe it, and the thread wakes 200
+/// times a second whether or not anything is running. It is one thread for the whole process.
+///
+/// **What it costs, measured rather than asserted.** Enabling `epoch_interruption` puts a check on
+/// every loop back-edge and function entry in the compiled code, and that is the price, not this
+/// thread: `seq 1 200000 | wc -l` through the shell runs about 10% slower with it than without —
+/// two binaries alternated run by run, because measuring them one after the other on a shared
+/// machine says whatever the load was doing at the time (the first attempt read 34%, which was
+/// another agent's suite). Slowing the tick to 100 ms does not buy any of it back, which is what
+/// says the cost is the check rather than the ticking.
+///
+/// That is the price of `closeSocket` meaning what platform.wac says it means. The alternative was
+/// a guarantee that was false for any child that did not write.
+const EPOCH_TICK: Duration = Duration::from_millis(5);
+
+/// Advance the engine's epoch for as long as the process lives.
+///
+/// Detached deliberately: there is nothing to join, and a process exiting with this thread asleep is
+/// the ordinary case. `increment_epoch` is the only thing that makes a deadline arrive, so a run
+/// without this would set deadlines nothing ever reaches — which is worse than not enabling
+/// interruption at all, because the code would read as if it worked.
+fn tick_epochs(engine: &Engine) {
+    let engine = engine.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(EPOCH_TICK);
+        engine.increment_epoch();
+    });
+}
+
+/// Let this store run until `stop` says otherwise, checking once per epoch.
+///
+/// `None` is the process's own store, which nothing stops: it still needs a deadline, because a
+/// store under epoch interruption traps at once without one.
+fn run_until_stopped(store: &mut Store<Host>, stop: Option<Arc<AtomicBool>>) {
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(move |_| match &stop {
+        Some(flag) if flag.load(Ordering::Relaxed) => Err(wasmtime::Error::msg(STOPPED)),
+        _ => Ok(UpdateDeadline::Continue(1)),
+    });
+}
+
+/// What a child's trap says when it was stopped rather than broken. Matched, not shown to anyone.
+const STOPPED: &str = "wac: stopped by its parent";
+
+/// The module, compiled once and kept.
+///
+/// **`Module::from_file` compiles with cranelift every run**, and that is most of what this runtime
+/// costs before it does anything: measured at roughly 3 ms per KB of wasm, so `wacsh` — 582 KB —
+/// took **1.7 seconds to answer `true`**, against 116 ms for the same program on the Deno host and
+/// 0.7 ms for bash. A 94 KB example took 213 ms, which is the same rate; the cost tracks the module
+/// and not the work.
+///
+/// That is a correctness problem and not only a slow one. `native_shell` and `native_hostfs` run
+/// twenty-odd scripts through this binary, each paying the compile again, and they bound each script
+/// with `timeout` — so on a machine at three times its core count the compile alone approaches the
+/// bound and the test reports the two hosts disagreeing (issue 0128). Raising the bound hides it;
+/// not compiling twenty times removes it.
+///
+/// So the compiled artifact is cached. `deserialize_file` is `unsafe` because it trusts the artifact
+/// to have been produced by this exact engine: the guard is that the file is written by this program,
+/// keyed by the wasm's own bytes and this wasmtime's version, and any mismatch recompiles rather
+/// than being repaired.
+///
+/// Written to a temporary name and renamed, because two of these run at once in the test suite and a
+/// half-written artifact that another process reads is the one failure worse than recompiling.
+///
+/// ## One shared directory, not beside the module
+///
+/// It used to live beside the `.wasm` — "which is where the tests already put one build and run it
+/// many times". True *within* a run and false across them: the tests build into a fresh temporary
+/// directory every time, so the artifact was written where nothing would ever look for it again, and
+/// the first run of each module paid the compile on every suite run. Measured 2026-08-19, `wacsh`
+/// built into a new temp directory twice: **2591ms then 22ms, 2816ms then 19ms.** Five test files
+/// build a native app, several build more than one.
+///
+/// The key is the wasm's own bytes and this wasmtime's version, so the location is free: an artifact
+/// that matches is correct wherever it sits. One shared directory means a program built into a
+/// hundred temporary directories compiles once — and the agents sharing this machine share it too,
+/// which is a hit rather than a race, since the same key means the same bytes and the write is a
+/// rename.
+///
+/// Bounded, because nothing else will do it: 4.8 MB apiece and one per distinct program. `sweep`
+/// keeps the newest `KEEP` and removes the rest, oldest first, after each write.
+fn compiled(engine: &Engine, wasm: &[u8]) -> Result<Module, wasmtime::Error> {
+    let key = cache_key(wasm);
+    let dir = std::env::temp_dir().join("wac-cwasm");
+    let _ = std::fs::create_dir_all(&dir);
+    let cached = dir.join(format!("{key:016x}.cwasm"));
+    if cached.exists() {
+        // SAFETY: written below by this program, from this engine, and named after the hash of the
+        // wasm it was compiled from — a different module or a different wasmtime gets a different
+        // name and misses rather than loading something it should not.
+        if let Ok(m) = unsafe { Module::deserialize_file(engine, &cached) } {
+            return Ok(m);
+        }
+        // A stale or truncated artifact is not an error worth reporting: compiling is always correct.
+        let _ = std::fs::remove_file(&cached);
+    }
+    let module = Module::new(engine, wasm)?;
+    if let Ok(bytes) = module.serialize() {
+        let tmp = cached.with_extension(format!("cwasm.{}", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &cached).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        sweep(&dir);
+    }
+    Ok(module)
+}
+
+/// How many compiled artifacts the shared directory keeps. Roughly 4.8 MB each.
+const KEEP: usize = 40;
+
+/// Keep the newest `KEEP` artifacts and remove the rest.
+///
+/// By modification time, which a hit does not touch — so this is "least recently *written*" rather
+/// than least recently used, and an artifact in daily use can be swept if forty newer ones arrive
+/// first. The cost of being wrong is one recompile, so the simpler rule is the right one; the cost
+/// of not sweeping at all is a temporary directory that grows without limit, which this repository
+/// has paid before (`issues/system/0068`, 23 GB of a cache nobody was watching).
+fn sweep(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut found: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "cwasm"))
+        .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, e.path())))
+        .collect();
+    if found.len() <= KEEP {
+        return;
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in found.into_iter().skip(KEEP) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The wasmtime this binary was built against, so an upgrade cannot reuse an artifact from the old one.
+const WASMTIME_BUILD: &str = env!("WASMTIME_BUILD");
+
+/// A name for a compiled artifact: the wasm's bytes and the wasmtime that would load it.
+///
+/// FNV-1a rather than anything cryptographic — this decides whether to *reuse a cache entry we
+/// wrote*, not whether to trust a stranger's file, and a collision costs a recompile because
+/// `deserialize_file` checks its own header and is allowed to fail.
+fn cache_key(wasm: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in wasm.iter().chain(env!("CARGO_PKG_VERSION").as_bytes()).chain(WASMTIME_BUILD.as_bytes()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn run(m: Arc<Manifest>, wasm: &[u8], args: Vec<Vec<u8>>) -> Result<i32, wasmtime::Error> {
+    let mut config = Config::new();
+    // The ABI is made of references — a wac string, a struct and a funcref all cross as one — so the
+    // proposals that carry them are not optional here.
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    // **The collector, chosen rather than defaulted.** wasmtime's default is deferred reference
+    // counting, which pays on every store of a reference into the heap — and a wac program stores
+    // references constantly, because a string, a struct and an array all are one. Measured on a
+    // microbenchmark of escaping allocations: 4.13s under DRC, 0.33s copying, 0.17s with collection
+    // switched off entirely; and on wacc compiling itself, 10.7s against 2.4s. See issues/system/0138.
+    config.collector(match std::env::var("WACLAND_GC").as_deref() {
+        Ok("null") => wasmtime::Collector::Null,
+        Ok("drc") => wasmtime::Collector::DeferredReferenceCounting,
+        _ => wasmtime::Collector::Copying,
+    });
+    // **What makes a child stoppable.** Compiled code checks a counter at every loop back-edge and
+    // function entry; when it is past the store's deadline the store's callback decides. Without
+    // this the only way out of a guest loop is for the guest to return, and `closeSocket` could not
+    // keep the promise it makes in platform.wac (issue 0123).
+    config.epoch_interruption(true);
+    let engine = Engine::new(&config)?;
+    tick_epochs(&engine);
+    let module = compiled(&engine, wasm)?;
+    let world = Arc::new(World { engine: engine.clone(), module: module.clone(), manifest: m.clone(), wasm: Arc::from(wasm) });
+    let mut host = Host::new(m.callbacks.len(), args, m.grants.clone());
+    host.world = Some(world);
+    let mut store = Store::new(&engine, host);
+    run_until_stopped(&mut store, None);
+
+    let linker = wire(&engine, &module, &m)?;
+
+    match enter(&mut store, &module, &linker, &m) {
+        // The same sentence a child gets (`out_of_gc_heap`), and the status a host limit reports: -1, as 255.
+        Err(e) if is_out_of_gc_heap(&e) => {
+            eprintln!("wac: {} {}", m.entry, OUT_OF_GC_HEAP);
+            Ok(255)
+        }
+        other => other,
+    }
+}
+
+/// **A full GC heap is a host limit, not a bug in the program** — `issues/system/0472w`, the wasmtime half. This host's
+/// GC heap is a reservation addressed with 32-bit references, 4 GiB at most, and the copying collector keeps two halves
+/// of it, so about 2 GiB can be live: a 3000 MB program ended as a trap with a wasm backtrace. It is said, and names the
+/// host that can go further.
+const OUT_OF_GC_HEAP: &str = "ran out of memory: its GC heap is full — this host's holds about 2 GiB live (4 GiB \
+                              reserved); the native V8 host (`wac` by default) takes `wac --max-heap <size>` or \
+                              WAC_MAX_HEAP, up to the machine's memory";
+
+fn is_out_of_gc_heap(e: &wasmtime::Error) -> bool {
+    format!("{}", e.root_cause()).contains("GC heap out of memory")
+}
+
+/// A wac `string` a loaded module returned, read through its own `$bind$str_*` helpers.
+///
+/// **`from_staging`'s twin, on a `Store` rather than a `Caller`.** Everything else on this boundary
+/// runs inside a host call and has a `Caller`; a loaded module's export is called from *outside* one,
+/// where there is only the store and the instance — the same position `trap_message` is in.
+fn read_string_in(store: &mut Store<Host>, instance: &Instance, v: &Val) -> String {
+    let get = |st: &mut Store<Host>, name: &str| instance.get_func(&mut *st, name);
+    let Some(len_fn) = get(store, "$bind$str_len") else { return String::new() };
+    let Some(to_mem) = get(store, "$bind$str_to_mem") else { return String::new() };
+    let Some(ensure) = get(store, "$bind$mem_ensure") else { return String::new() };
+    let mut out = [Val::I32(0)];
+    if len_fn.call(&mut *store, std::slice::from_ref(v), &mut out).is_err() {
+        return String::new();
+    }
+    let n = match out[0] {
+        Val::I32(n) if n >= 0 => n as usize,
+        _ => return String::new(),
+    };
+    let mut ignored = vec![Val::I32(0); ensure.ty(&mut *store).results().len()];
+    if ensure.call(&mut *store, &[Val::I32(n as i32)], &mut ignored).is_err() {
+        return String::new();
+    }
+    let mut ignored = vec![Val::I32(0); to_mem.ty(&mut *store).results().len()];
+    if to_mem.call(&mut *store, std::slice::from_ref(v), &mut ignored).is_err() {
+        return String::new();
+    }
+    let Some(Extern::Memory(mem)) = instance.get_export(&mut *store, "$bind$mem") else {
+        return String::new();
+    };
+    let mut bytes = vec![0u8; n];
+    if mem.read(&mut *store, 0, &mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// A module `Cli.load` instantiated, and what is needed to call into it — `issues/system/0240c`.
+///
+/// **Its own `Store`, because a host call arrives holding the caller's.** wasmtime will not let a
+/// store be re-entered, and a second module is a second store either way — so the loaded module gets
+/// one, and its `Host` *shares the caller's* `tickets`, `handles` and `grants` by `Arc`. That sharing
+/// is what makes a loaded module's `readFile` behave exactly as its loader's, and is why `Cli.load`
+/// takes no grant argument: there is nowhere for a narrowing to live.
+struct HeldModule {
+    store: Store<Host>,
+    instance: Instance,
+    manifest: Arc<Manifest>,
+}
+
+thread_local! {
+    /// **Thread-local, like the V8 host's, and for the same reason**: this runtime is one program per
+    /// thread — a spawned child gets a thread of its own — so a table here is a table per program.
+    /// It cannot live in `Host` because a `Store<Host>` inside a `Host` is the store owning itself.
+    static LOADED: std::cell::RefCell<HashMap<i32, HeldModule>> =
+        std::cell::RefCell::new(HashMap::new());
+    static NEXT_LOADED: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+/// Instantiate `wasm` in a store of its own, sharing this caller's world.
+fn load_module(caller: &mut Caller<'_, Host>, wasm: &[u8], asked: i32) -> Result<i32, String> {
+    let world = world_from(&caller.engine().clone(), wasm)?;
+    let m = world.manifest.clone();
+    // **A ceiling of the caller's own, intersected here rather than trusted** — the same rule
+    // `spawn_instance` keeps, and for the same reason: asking for more than this program holds is not
+    // an error, and the module simply finds the capability denied. `issues/system/0242c` is the day
+    // `load` had no `asked` at all, so a loaded module got the loader's whole world and a test wrote a
+    // file the run had never granted.
+    let mine = &caller.data().grants;
+    let grants = manifest::Grants {
+        read: mine.read && (asked & GRANT_READ) != 0,
+        write: mine.write && (asked & GRANT_WRITE) != 0,
+        env: mine.env && (asked & GRANT_ENV) != 0,
+        net: mine.net && (asked & GRANT_NET) != 0,
+        // **Inheritable now**, and by the same intersection as the four above: `GRANT_RUN` exists and
+        // this stage is the one the old note asked for. `issues/system/0264c`.
+        run: mine.run && (asked & GRANT_RUN) != 0,
+        // A module a sealed program loads is sealed too, or loading one would be the way back to a clock.
+        sealed: mine.sealed || (asked & GRANT_SEALED) != 0,
+    };
+    // The rest of the caller's authority is shared by reference — see `HeldModule`.
+    let mut host = Host::new(m.callbacks.len(), caller.data().args.clone(), grants);
+    host.tickets = caller.data().tickets.clone();
+    host.handles = caller.data().handles.clone();
+    host.cwd = caller.data().cwd.clone();
+    host.world = Some(world.clone());
+    let mut store = Store::new(&world.engine, host);
+    run_until_stopped(&mut store, None);
+    let linker = wire(&world.engine, &world.module, &m).map_err(|e| format!("{e}"))?;
+    let instance = prepare(&mut store, &world.module, &linker, &m).map_err(|e| format!("{e}"))?;
+    let handle = NEXT_LOADED.with(|n| {
+        let h = n.get();
+        n.set(h + 1);
+        h
+    });
+    LOADED.with(|t| {
+        t.borrow_mut().insert(handle, HeldModule { store, instance, manifest: m })
+    });
+    Ok(handle)
+}
+
+/// Call `name` on a loaded module: `(status, text, value)`, as `CallResult` carries them.
+///
+/// **A trap is a value.** `func.call` answers `Err` for one, and `test_traps_*` passes by trapping —
+/// 389 of this repository's 2553 test exports do. `$trap$message` carries what a `trap "…"` said, the
+/// same way `enter` reads it for a program.
+fn call_loaded(handle: i32, name: &str, arg: i32) -> (i32, String, i32) {
+    LOADED.with(|t| {
+        let mut table = t.borrow_mut();
+        let Some(lm) = table.get_mut(&handle) else {
+            return (2, format!("no module on handle {handle}"), 0);
+        };
+        let Some(sig) = lm.manifest.exports.iter().find(|e| e.name == name).cloned() else {
+            return (2, format!("no export named {name}"), 0);
+        };
+        let takes_int = sig.params.len() == 1 && sig.params[0] == "i32";
+        // A test that takes the host is handed the one `__wacHost` answered when the module was loaded.
+        let takes_host = sig.params.len() == 1 && lm.manifest.host_type() == Some(sig.params[0].as_str());
+        if !sig.params.is_empty() && !takes_int && !takes_host {
+            return (3, format!("cannot call {name}({})", sig.params.join(", ")), 0);
+        }
+        let host = lm.store.data().wac_host.clone();
+        if takes_host && host.is_none() {
+            return (3, format!("this module exports no __wacHost for {name}"), 0);
+        }
+        if !sig.ret.is_empty() && sig.ret != "void" && sig.ret != "i32" && sig.ret != "string" {
+            return (3, format!("{name} answers {}", sig.ret), 0);
+        }
+        let Some(f) = lm.instance.get_func(&mut lm.store, name) else {
+            return (2, format!("no export named {name}"), 0);
+        };
+        let mut args: Vec<Val> = Vec::new();
+        if takes_int {
+            args.push(Val::I32(arg));
+        }
+        if takes_host {
+            args.extend(host);
+        }
+        let wants = if sig.ret.is_empty() || sig.ret == "void" { 0 } else { 1 };
+        let mut out = vec![Val::I32(0); wants];
+        if f.call(&mut lm.store, &args, &mut out).is_err() {
+            // **The program's own sentence, and nothing when it had none.** `trap "why"` leaves it in
+            // a global and that text is identical on every host. This used to fall back to the
+            // engine's words, normalised to V8's spelling so the four hosts would agree — a value
+            // invented here to match one invented there, identical for every trap wac emits, saying
+            // nothing `status == 1` had not. `status` is the answer to "did it trap"; this field is
+            // the answer to "did it say why", and for an engine trap the answer is no.
+            return (1, trap_message(&mut lm.store, &lm.instance).unwrap_or_default(), 0);
+        }
+        if sig.ret == "string" {
+            let text = out
+                .first()
+                .map(|v| read_string_in(&mut lm.store, &lm.instance, v))
+                .unwrap_or_default();
+            return (0, text, 0);
+        }
+        if sig.ret == "i32" {
+            return (0, String::new(), match out.first() {
+                Some(Val::I32(n)) => *n,
+                _ => 0,
+            });
+        }
+        (0, String::new(), 0)
+    })
+}
+
+/// Instantiate, and hand the module this host's four calls through its `__wacHost`.
+///
+/// **Split out of `enter` so that `Cli.load` can reuse it** — `issues/system/0240c`. A loaded module
+/// needs everything here and none of what follows it: `enter` goes on to call `main`, and a loaded
+/// module is called export by export instead.
+///
+/// A module with no `__wacHost` takes nothing from a host — a `main` with no parameters, a test file of
+/// pure functions — and that is not an error. The value `__wacHost` answers is kept in the store, so
+/// every answer can be delivered to it and every caller handed it.
+fn prepare(
+    store: &mut Store<Host>,
+    module: &Module,
+    linker: &Linker<Host>,
+    m: &Manifest,
+) -> Result<Instance, wasmtime::Error> {
+    let instance = linker.instantiate(&mut *store, module)?;
+    let Some(entry) = m.exports.iter().find(|e| e.name == "__wacHost") else { return Ok(instance) };
+    if entry.params.len() != 4 {
+        return Err(wasmtime::Error::msg(format!(
+            "{}: __wacHost takes ({}), and this host hands it four calls",
+            m.entry,
+            entry.params.join(", ")
+        )));
+    }
+    let mut calls = Vec::with_capacity(4);
+    for (ty, cap) in entry.params.iter().zip([Cap::Request, Cap::WaitAny, Cap::Exit, Cap::Interrupted]) {
+        calls.push(funcref_for(&mut *store, &instance, m, ty, cap)?);
+    }
+    let make = instance
+        .get_func(&mut *store, "__wacHost")
+        .ok_or_else(|| wasmtime::Error::msg(format!("{}: no exported __wacHost", m.entry)))?;
+    let mut made = [Val::I32(0)];
+    make.call(&mut *store, &calls, &mut made)?;
+    store.data_mut().wac_host = Some(made[0].clone());
+    Ok(instance)
+}
+
+/// Instantiate and run `main`, answering its status.
+fn enter(
+    store: &mut Store<Host>,
+    module: &Module,
+    linker: &Linker<Host>,
+    m: &Manifest,
+) -> Result<i32, wasmtime::Error> {
+    let instance = prepare(store, module, linker, m)?;
+    let main = instance
+        .get_func(&mut *store, "main")
+        .ok_or_else(|| wasmtime::Error::msg(format!("{}: no exported `main`", m.entry)))?;
+    // **Sized from `main`'s own signature**: `main()` is handed nothing and `main(Host)` the value
+    // `__wacHost` answered. Read from the instantiated function rather than from the manifest, which is
+    // the copy that could disagree.
+    let mut args: Vec<Val> = Vec::new();
+    if main.ty(&mut *store).params().len() == 1 {
+        let host = store.data().wac_host.clone().ok_or_else(|| {
+            wasmtime::Error::msg(format!("{}: main takes the host, and there is no __wacHost", m.entry))
+        })?;
+        args.push(host);
+    }
+    let results = main.ty(&mut *store).results().len();
+    let mut out = vec![Val::I32(0); results];
+    // **What the program said, if it said anything.** A `trap "…"` puts its message in a global before
+    // trapping — after one there is no code left to run — and `$trap$message` hands it back once the trap
+    // has unwound. Empty for an engine trap, which writes nothing. `issues/lang/0147`.
+    if let Err(e) = main.call(&mut *store, &args, &mut out) {
+        if let Some(code) = store.data_mut().exit_request.take() {
+            return Ok(code);
+        }
+        let said = trap_message(&mut *store, &instance).unwrap_or_default();
+        if said.is_empty() {
+            return Err(e);
+        }
+        return Err(wasmtime::Error::msg(format!("{} trapped: {said}", m.entry)));
+    }
+    // A `void main` that returned is a success: there is no status to read, and inventing one from an
+    // empty slot is how a program with nothing to say gets a verdict it never gave.
+    let status = match out.first() {
+        Some(Val::I32(n)) => *n,
+        _ => 0,
+    };
+    // **Work scheduled and never run is an error** (spec ch07 `§wac-exit-work-left-pu5wju6`): `main` returning says
+    // the program is done, and a continuation still waiting says it was not. The program's `__wacOutstanding` is
+    // asked, as the v8 host asks it; a module that took the host and cannot be asked is refused rather than let off.
+    if let Some(host) = args.first().cloned() {
+        let ask = instance.get_func(&mut *store, "__wacOutstanding").ok_or_else(|| {
+            wasmtime::Error::msg(format!("{}: exports no `__wacOutstanding`, so its unfinished work cannot be asked about", m.entry))
+        })?;
+        let mut left = [Val::I32(0)];
+        ask.call(&mut *store, &[host], &mut left)?;
+        if let Val::I32(n) = left[0] {
+            if n > 0 {
+                eprintln!("wac: {} finished with {n} continuation(s) still waiting — call `sys.drain()` to run them", m.entry);
+                return Ok(1);
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// Every dispatcher import the module asks for, wired to `dispatch`.
+///
+/// One per funcref *signature*, with the signature taken from the module rather than rebuilt from the
+/// manifest: the module is the thing that has to be satisfied, and a type assembled from the manifest
+/// would be a second opinion about it.
+fn wire(engine: &Engine, module: &Module, m: &Manifest) -> Result<Linker<Host>, wasmtime::Error> {
+    let mut linker = Linker::new(engine);
+    for imp in module.imports() {
+        if imp.module() != "wac" {
+            return Err(wasmtime::Error::msg(format!(
+                "{}: imports {}::{}, and this runtime supplies only `wac`",
+                m.entry,
+                imp.module(),
+                imp.name()
+            )));
+        }
+        let ExternType::Func(ty) = imp.ty() else {
+            return Err(wasmtime::Error::msg(format!("wac::{} is not a function", imp.name())));
+        };
+        let sig = m
+            .callbacks
+            .iter()
+            .position(|c| c.field == imp.name())
+            .ok_or_else(|| wasmtime::Error::msg(format!("wac::{} is in no manifest", imp.name())))?;
+        linker.func_new("wac", imp.name(), ty, move |mut caller, params, results| {
+            dispatch(&mut caller, sig, params, results)
+        })?;
+    }
+    Ok(linker)
+}
+
+/// Run a spawned child to completion on this thread, and answer its status.
+///
+/// **The confinement is the runtime's here, not only the language's.** `children.ts` is careful to say
+/// that in the JavaScript hosts "the isolation is the language's, not the runtime's": a Deno worker
+/// inherits the process's permissions, so a wac child is confined only because wac has no ambient
+/// anything. Here the child gets a `Host` built with the grants its parent chose and a fresh `Store`,
+/// and there is no route from one store to another — a `Val` is not `Send`, which is the type system
+/// saying the same thing. wac-mono 0015.
+fn run_child(
+    world: Arc<World>,
+    argv: Vec<Vec<u8>>,
+    grants: manifest::Grants,
+    cwd: Vec<u8>,
+    streams: AsChild,
+    stop: Arc<AtomicBool>,
+) -> (i32, i32, i32, Vec<u8>) {
+    let m = world.manifest.clone();
+    let mut host = Host::new(m.callbacks.len(), argv, grants);
+    host.world = Some(world.clone());
+    let stdout = streams.stdout.clone();
+    let stderr = streams.stderr.clone();
+    let fsreq = streams.fsreq.clone();
+    let inherit_out = streams.inherit_out;
+    host.as_child = Some(streams);
+    // A child's relative paths resolve from where its parent said — the thing `spawn` got wrong in the
+    // JavaScript hosts, where a spawned program inherited the *host's* directory instead of the shell's.
+    host.cwd = cwd;
+    let mut store = Store::new(&world.engine, host);
+    run_until_stopped(&mut store, Some(stop.clone()));
+    let (code, how, kind, said) = match wire(&world.engine, &world.module, &m)
+        .and_then(|linker| enter(&mut store, &world.module, &linker, &m))
+    {
+        Ok(code) => (code, 0, code, Vec::new()),
+        // **A child its parent stopped is not a child that failed.** The trap is one this runtime
+        // asked for, so it says nothing on the error stream and answers -1 — which is what a
+        // terminated worker answers on the JavaScript hosts, and what `packages/sh` reads as "this
+        // one has no status of its own to report".
+        Err(_) if stop.load(Ordering::Relaxed) => (-1, 2, 0, b"stopped by its parent".to_vec()),
+        // A full GC heap ends as `HostLimit`, in the words `OUT_OF_GC_HEAP` gives it.
+        Err(e) if is_out_of_gc_heap(&e) => {
+            let text = OUT_OF_GC_HEAP;
+            let line = format!("wac: {} {text}\n", m.entry);
+            if inherit_out {
+                eprint!("{line}");
+            } else {
+                let _ = stderr.write(line.as_bytes());
+            }
+            (1, 2, 0, text.as_bytes().to_vec())
+        }
+        Err(e) => {
+            // **Said as the other hosts say it** — `wac: prog trapped: why` — with the engine's own reason
+            // (`wasm trap: call stack exhausted`) rather than a page of backtrace, and the program's message
+            // when it gave one, which `enter` has already put in that form.
+            let shown = format!("{e}");
+            let line = if shown.contains(" trapped: ") {
+                format!("wac: {shown}\n")
+            } else {
+                format!("wac: {} trapped: {}\n", m.entry, e.root_cause())
+            };
+            // **Where the child writes**: the process's own error stream when it inherited it — `wac run`
+            // hands a program the terminal — and its queue otherwise, for a parent that reads it. This
+            // wrote the queue always, and an inheriting child's queue has no reader, so every trap under
+            // `wac run` on this host was silent: an exit status and not a word (wac-sqlite).
+            if inherit_out {
+                eprint!("{line}");
+            } else {
+                let _ = stderr.write(line.as_bytes());
+            }
+            // **How, as a value** (`Child.ended()`): a `trap "…"` is the one `enter` worded with the program's own message;
+            // anything else is the engine's, and wasmtime names which.
+            let (kind, said) = if let Some(at) = shown.find(" trapped: ") {
+                (0, shown[at + " trapped: ".len()..].to_string())
+            } else {
+                (trap_kind(&e, &world.wasm), format!("{}", e.root_cause()))
+            };
+            (1, 1, kind, said.into_bytes())
+        }
+    };
+    stdout.finish();
+    stderr.finish();
+    // And it will ask nothing more. A parent parked in `recv(fsHandle)` is waiting for a request
+    // from a program that has exited; without this it waits for ever, which is the shape a shell
+    // serving its children would meet on every command that ends.
+    fsreq.finish();
+    (code, how, kind, said)
+}
+
+/// std's `TrapKind`, in order, for an engine trap: `Explicit` is 0 and is `enter`'s to say; `Other` is 10.
+fn trap_kind(e: &wasmtime::Error, wasm: &[u8]) -> i32 {
+    use wasmtime::Trap;
+    match e.downcast_ref::<Trap>() {
+        // **An out-of-range truncation is a bad conversion, as V8 says it.** wasmtime names both
+        // `INT_MIN / -1` and `i32.trunc_f64_s(1e20)` `IntegerOverflow`, and keeps
+        // `BadConversionToInteger` for NaN; V8 calls the second "float unrepresentable in integer
+        // range". §wac-std-child-ended-q2v8mtf says one kind on every host, so the instruction the
+        // trap stopped at decides: a `trunc` (0xA8–0xAB, 0xAE–0xB1) is `BadConversion`.
+        Some(Trap::IntegerOverflow) if trapped_at_trunc(e, wasm) => 6,
+        Some(Trap::UnreachableCodeReached) => 1,
+        Some(Trap::MemoryOutOfBounds) | Some(Trap::HeapMisaligned) | Some(Trap::ArrayOutOfBounds) => 2,
+        Some(Trap::TableOutOfBounds) => 3,
+        Some(Trap::IntegerDivisionByZero) => 4,
+        Some(Trap::IntegerOverflow) => 5,
+        Some(Trap::BadConversionToInteger) => 6,
+        Some(Trap::IndirectCallToNull) | Some(Trap::NullReference) => 7,
+        Some(Trap::BadSignature) | Some(Trap::CastFailure) => 8,
+        Some(Trap::StackOverflow) => 9,
+        _ => 10,
+    }
+}
+
+/// Whether the innermost wasm frame of `e` stopped at a trapping float-to-int `trunc`.
+fn trapped_at_trunc(e: &wasmtime::Error, wasm: &[u8]) -> bool {
+    let Some(trace) = e.downcast_ref::<wasmtime::WasmBacktrace>() else { return false };
+    let Some(at) = trace.frames().first().and_then(|f| f.module_offset()) else { return false };
+    matches!(wasm.get(at), Some(0xA8..=0xAB) | Some(0xAE..=0xB1))
+}
+
+/// Whether two capabilities are the same behaviour, and so may share a slot.
+fn same_cap(a: &Cap, b: &Cap) -> bool {
+    a == b
+}
+
+/// Register `cap` under the signature spelled `ty` and answer the funcref to pass into wasm.
+fn funcref_for(
+    store: &mut Store<Host>,
+    instance: &wasmtime::Instance,
+    m: &Manifest,
+    ty: &str,
+    cap: Cap,
+) -> Result<Val, wasmtime::Error> {
+    let sig = m
+        .callback_index(ty)
+        .ok_or_else(|| wasmtime::Error::msg(format!("no callback signature for {ty}")))?;
+    let limit = m.callbacks[sig].slots;
+    let slot = store.data_mut().register(sig, cap, limit).map_err(wasmtime::Error::msg)?;
+    let helper = instance
+        .get_func(&mut *store, &m.callbacks[sig].helper)
+        .ok_or_else(|| wasmtime::Error::msg(format!("no {}", m.callbacks[sig].helper)))?;
+    let mut fr = [Val::I32(0)];
+    helper.call(&mut *store, &[Val::I32(slot as i32)], &mut fr)?;
+    Ok(fr[0].clone())
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────────
+
+/// A funcref the guest called: one of the four `__wacHost` was handed.
+fn dispatch(
+    caller: &mut Caller<'_, Host>,
+    sig: usize,
+    params: &[Val],
+    results: &mut [Val],
+) -> Result<(), wasmtime::Error> {
+    let slot = match params.first() {
+        Some(Val::I32(n)) => *n as usize,
+        _ => return Err(wasmtime::Error::msg("a dispatcher was called without a slot")),
+    };
+    let cap = caller
+        .data()
+        .caps
+        .get(sig)
+        .and_then(|s| s.get(slot))
+        .cloned()
+        .ok_or_else(|| wasmtime::Error::msg(format!("no function in slot {slot} of signature {sig}")))?;
+    let int = |i: usize| -> i64 {
+        match params.get(i) {
+            Some(Val::I32(n)) => *n as i64,
+            Some(Val::I64(n)) => *n,
+            _ => 0,
+        }
+    };
+
+    match cap {
+        // **End the program now** (spec ch07 `sys.exit`): an error unwinds its frames to the call
+        // of `main`, which reads the request and answers it as the status.
+        Cap::Exit => {
+            let code = match params.get(1) {
+                Some(Val::I32(n)) => *n,
+                _ => 1,
+            };
+            caller.data_mut().exit_request = Some(code);
+            return Err(wasmtime::Error::msg("the program exited"));
+        }
+        Cap::Interrupted => {
+            // **Nobody can ask this host to interrupt, so the answer is no** — and that is the answer
+            // rather than a stub. `interrupted` is answered by whoever owns the keyboard; here
+            // the terminal belongs to whatever started the program, and over ssh to `sshd`, which is a
+            // wac program on the far side of an encrypted socket. Only a page can say yes, because
+            // there the keydown listener and the code servicing this bridge are the same thread.
+            // Direct, not a request: `interrupted` is one of the four calls `__wacHost` is handed.
+            results[0] = Val::I32(0);
+        }
+        Cap::WaitAny => {
+            let ids = read_i32_array(caller, &params[1])?;
+            let millis = int(2) as i32;
+            results[0] = Val::I32(wait_any(caller, &ids, millis)?);
+        }
+        Cap::Request => {
+            let (op, id, a, b) = (int(1) as i32, int(2) as i32, int(3), int(4));
+            let text = read_string(caller, &params[5])?;
+            let bytes = read_u8_array(caller, &params[6])?;
+            if op == OP_DROP {
+                return drop_request(caller, id);
+            }
+            match serve(caller, op, a, b, text, bytes)? {
+                // **What a request takes stays the host's until somebody waits for it** (design/system/0013,
+                // settled before step 6): a connection, a child, a file opened, bytes off a stream. Answered at
+                // once, it was the program's before the call returned, and a `cancel` that never waited could not
+                // give it back. So it waits in a settled ticket, which `waitAny` delivers and `OP_DROP` undoes.
+                Reply::Now(kind, outcome) if id != 0 && takes(op) => {
+                    let ticket = caller.data().tickets.submit();
+                    let _ = caller.data().tickets.complete(ticket, outcome);
+                    match op {
+                        OP_READ_STDIN | OP_READ_CHUNK => { caller.data().reading.lock().unwrap().insert(ticket, STDIN_HANDLE); }
+                        OP_RECV | OP_ACCEPT => { caller.data().reading.lock().unwrap().insert(ticket, a as i32); }
+                        OP_SPAWN | OP_SPAWN_SELF => { caller.data_mut().spawned.insert(ticket, (b & DETACHED) != 0); }
+                        _ => {}
+                    }
+                    caller.data_mut().inflight.insert(id, (ticket, kind));
+                }
+                Reply::Now(kind, outcome) => answer(caller, id, flatten(kind, outcome))?,
+                Reply::Flat(flat) => answer(caller, id, flat)?,
+                Reply::Later(kind, ticket) if id != 0 => {
+                    caller.data_mut().inflight.insert(id, (ticket, kind));
+                }
+                // Nobody will ask for it, so nothing is kept for it.
+                Reply::Later(_, ticket) => {
+                    let _ = caller.data().tickets.discard(ticket);
+                }
+                Reply::Nothing => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What one request comes to: an answer now, the ticket that will produce one, or nothing to say.
+enum Reply {
+    Now(Kind, Outcome),
+    Flat(Flat),
+    Later(Kind, i32),
+    Nothing,
+}
+
+/// An answer in the one shape every request gets — `__wacAnswered`'s arguments after the id.
+#[derive(Default)]
+struct Flat {
+    fault: i32,
+    text: Vec<u8>,
+    bytes: Vec<u8>,
+    n: i64,
+    m: i64,
+    flags: i32,
+}
+
+fn now(kind: Kind, outcome: Outcome) -> Result<Reply, wasmtime::Error> {
+    Ok(Reply::Now(kind, outcome))
+}
+
+fn later(kind: Kind, ticket: i32) -> Result<Reply, wasmtime::Error> {
+    Ok(Reply::Later(kind, ticket))
+}
+
+/// A refusal or a failure: the category, and the host's words for it (empty lets std supply its own).
+fn fault(code: i32, words: &str) -> Reply {
+    Reply::Flat(Flat { fault: code, text: words.as_bytes().to_vec(), ..Flat::default() })
+}
+
+/// Whether bytes went where they were sent. A send that did not land is a fault with no words, which
+/// std turns into the sentence for that stream.
+fn landed(ok: bool) -> Reply {
+    if ok { Reply::Flat(Flat { flags: 1, ..Flat::default() }) } else { fault(FAULT_OTHER, "") }
+}
+
+/// An outcome in the one shape — design/system/0013's answer table, read by std's decoders.
+fn flatten(kind: Kind, outcome: Outcome) -> Flat {
+    let failed = |code: i32, words: String| Flat {
+        fault: if code == FAULT_NONE { FAULT_OTHER } else { code },
+        text: words.into_bytes(),
+        ..Flat::default()
+    };
+    match (kind, outcome) {
+        // An empty read is the end of the stream, and a string is why it stopped — `streams.rs`'s rule.
+        (Kind::Read, Outcome::Bytes(b)) if b.is_empty() => Flat { flags: 1, ..Flat::default() },
+        (Kind::Read, Outcome::Bytes(b)) => Flat { bytes: b, ..Flat::default() },
+        (Kind::Read, Outcome::Str(why)) => failed(FAULT_OTHER, String::from_utf8_lossy(&why).into_owned()),
+        (_, Outcome::I32(v)) => Flat { n: v as i64, ..Flat::default() },
+        (_, Outcome::I64(v)) => Flat { n: v, ..Flat::default() },
+        (_, Outcome::Bytes(b)) => Flat { bytes: b, flags: 1, ..Flat::default() },
+        (_, Outcome::Str(t)) => Flat { text: t, ..Flat::default() },
+        (_, Outcome::BytesOpt(None)) => Flat::default(),
+        (_, Outcome::BytesOpt(Some(b))) => Flat { bytes: b, flags: 1, ..Flat::default() },
+        (_, Outcome::Bool(ok)) => match landed(ok) {
+            Reply::Flat(f) => f,
+            _ => Flat::default(),
+        },
+        (_, Outcome::Change(code, words)) => Flat { fault: code, text: words.into_bytes(), ..Flat::default() },
+        (_, Outcome::Ended(how, m, text)) => Flat { n: how as i64, m: m as i64, text, ..Flat::default() },
+        (_, Outcome::FileResult(true, b, _, _)) => Flat { bytes: b, ..Flat::default() },
+        (_, Outcome::FileResult(false, _, words, code)) => failed(code, words),
+        (_, Outcome::Stat(exists, file, dir, size, modified, link, exec, code, mode)) => {
+            if code != FAULT_NONE {
+                return Flat { fault: code, ..Flat::default() };
+            }
+            let kind = exists as i32 | (file as i32) << 1 | (dir as i32) << 2 | (link as i32) << 3 | (exec as i32) << 4;
+            Flat { n: size, m: modified, flags: kind | (mode & 0xffff) << 16, ..Flat::default() }
+        }
+        (_, Outcome::Names(None)) => failed(FAULT_OTHER, String::new()),
+        (_, Outcome::Names(Some(names))) => {
+            let mut joined = Vec::new();
+            for name in names {
+                joined.extend_from_slice(&name);
+                joined.push(0);
+            }
+            Flat { bytes: joined, flags: 1, ..Flat::default() }
+        }
+        (_, Outcome::Socket(h, words, peer, port, code)) => {
+            if h < 0 {
+                return failed(code, words);
+            }
+            Flat { text: peer.into_bytes(), n: h as i64, m: port as i64, ..Flat::default() }
+        }
+        (_, Outcome::Datagram(b, peer, port, words)) => {
+            if !words.is_empty() {
+                return failed(FAULT_OTHER, words);
+            }
+            Flat { bytes: b, text: peer.into_bytes(), n: port as i64, ..Flat::default() }
+        }
+        // -2 is "this world has no `spawn` at all", which std reads as `Unsupported`.
+        (_, Outcome::Child(-2, ..)) => failed(FAULT_UNSUPPORTED, "this host cannot start programs".into()),
+        (_, Outcome::Child(h, _, _, words)) if h < 0 => failed(FAULT_OTHER, words),
+        (_, Outcome::Child(h, err, fs, _)) => Flat {
+            n: h as i64,
+            m: (err as u32 as i64) | ((fs as i64) << 32),
+            ..Flat::default()
+        },
+        (_, Outcome::Exec(status, out, err, words)) => {
+            if !words.is_empty() {
+                let code = if words == NOT_GRANTED { FAULT_NOT_GRANTED } else { FAULT_OTHER };
+                return failed(code, words);
+            }
+            let split = out.len() as i64;
+            let mut both = out;
+            both.extend_from_slice(&err);
+            Flat { bytes: both, n: status as i64, m: split, ..Flat::default() }
+        }
+    }
+}
+
+/// Deliver an answer to request `id` through the module's `__wacAnswered`. Only ever called from
+/// inside `request` or `waitAny`, which is what makes re-entering the module safe.
+fn answer(caller: &mut Caller<'_, Host>, id: i32, flat: Flat) -> Result<(), wasmtime::Error> {
+    if id == 0 {
+        return Ok(());
+    }
+    let host = caller
+        .data()
+        .wac_host
+        .clone()
+        .ok_or_else(|| wasmtime::Error::msg("an answer arrived for a module with no __wacHost"))?;
+    // Each of these uses the staging buffer, so each value is made before the next is copied in.
+    let text = make_string(caller, &flat.text)?;
+    let bytes = make_u8_array(caller, &flat.bytes)?;
+    let f = export_func(caller, "__wacAnswered")?;
+    call_dyn(
+        caller,
+        &f,
+        &[
+            host,
+            Val::I32(id),
+            Val::I32(flat.fault),
+            text,
+            bytes,
+            Val::I64(flat.n),
+            Val::I64(flat.m),
+            Val::I32(flat.flags),
+        ],
+    )?;
+    Ok(())
+}
+
+/// `waitAny`: until one of `ids` is answered or `millis` pass, then deliver every one of them that is
+/// ready. Answers the index of one that was, or -1.
+fn wait_any(caller: &mut Caller<'_, Host>, ids: &[i32], millis: i32) -> Result<i32, wasmtime::Error> {
+    // An id with no ticket was answered already, or never asked; -1 is a ticket that never settles.
+    let tickets: Vec<i32> =
+        ids.iter().map(|id| caller.data().inflight.get(id).map(|(t, _)| *t).unwrap_or(-1)).collect();
+    let table = caller.data().tickets.clone();
+    let which = table.wait_any(&tickets, millis);
+    for (&id, &ticket) in ids.iter().zip(&tickets) {
+        if ticket < 0 || !table.is_done(ticket) {
+            continue;
+        }
+        let Some((_, kind)) = caller.data_mut().inflight.remove(&id) else { continue };
+        // Collected, so nothing can be given up on any more and the handle note goes.
+        caller.data().reading.lock().unwrap().remove(&ticket);
+        if let Some(outcome) = table.take(ticket) {
+            answer(caller, id, flatten(kind, outcome))?;
+        }
+    }
+    Ok(which)
+}
+
+/// Close handle `h`: stop a child, shut a connection, drop a listener or a bound socket, forget what was parked for
+/// it — what `closeSocket` does, and what dropping an uncollected spawn does too.
+fn close_socket(caller: &mut Caller<'_, Host>, h: i32) {
+    // **Parked bytes die with the handle.** A handle is reused the instant it closes — that
+    // is `issues/system/0306b`'s other finding — so anything `0307b` put aside for this one
+    // would otherwise be served to whoever gets the number next, as if their peer had sent
+    // it. The v8 host says the same beside its parked datagrams.
+    caller.data().pushback.lock().unwrap().remove(&h);
+    if let Some(c) = child_of(caller, h) {
+        c.stop.store(true, Ordering::Relaxed);
+        c.stdin.finish();
+        c.stdout.finish();
+        c.stderr.finish();
+    }
+    // **All three kinds, and it matched only one until 2026-09-01.** `Sock` is `Listening`,
+    // `Open` and `Datagram`; this arm read `Some(Sock::Open(s))`, so closing a *listener* or a
+    // bound UDP socket fell through and did nothing at all — the handle stayed in the table and
+    // the port stayed bound. Measured: listen on port 0, `closeSocket` the listener, dial the
+    // port again, and this host answered `handle=4 fault=0` where the V8 host answers
+    // `FAULT_REFUSED`. So a readiness probe built on "can I connect yet?" is satisfied by the
+    // listener the test just closed, and `packages/wactest/test/wac/daemon_test.wac` fails two
+    // tests and hangs a third on it. `issues/system/0317b`.
+    //
+    // Only a stream has a `shutdown`: it is the two directions of an established connection,
+    // and a peer blocked on a read must find out rather than wait for a process that has
+    // finished with it. A listener and a datagram socket have no peer to tell — dropping the
+    // last handle is the whole of closing them, which is what `close(h)` does.
+    match socket_at(caller, h) {
+        Some(Sock::Open(s)) => {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+            caller.data().handles.lock().unwrap().close(h);
+        }
+        Some(Sock::Listening(_)) | Some(Sock::Datagram(_)) => {
+            caller.data().handles.lock().unwrap().close(h);
+        }
+        None => {}
+    }
+    // **A child's handle stays.** Its status is still a question worth asking — a parent that
+    // stops a service and wants to know it is gone asks `exitCode` next — and the JavaScript
+    // hosts keep theirs for exactly that. Clearing the slot here made `exitCode` on a stopped
+    // child fall through to the *other* meaning of that capability, which is "set this
+    // program's own exit status", so a supervisor asking after its child silently set its own.
+}
+
+/// Whether request `op` takes something — a connection, a child, a file, bytes off a stream — that a dropped request
+/// has to give back. Its answer is never delivered inside the request.
+fn takes(op: i32) -> bool {
+    matches!(
+        op,
+        OP_READ_STDIN | OP_READ_CHUNK | OP_RECV | OP_RECEIVE_FROM | OP_CONNECT | OP_LISTEN | OP_ACCEPT
+            | OP_BIND_DATAGRAM | OP_SPAWN | OP_SPAWN_SELF | OP_OPEN_FILE
+    )
+}
+
+/// `OP_DROP`: the program has given up on request `id`. **An answer nobody has read is still the
+/// host's** (design/system/0013, operator 2026-10-28), so whatever it holds goes back or is closed.
+/// One already delivered is the program's, and there is nothing here to do for it.
+fn drop_request(caller: &mut Caller<'_, Host>, id: i32) -> Result<(), wasmtime::Error> {
+    let Some((ticket, _)) = caller.data_mut().inflight.remove(&id) else { return Ok(()) };
+    let id = ticket;
+    // **What the ticket already held goes back where it came from.** `drop` is what a
+    // guest's `OP_DROP` reaches, and an answer that landed between the caller giving
+    // up and this call has come off a stream once — discarding it lost the bytes every time,
+    // 0 of 10 on both hosts. `issues/system/0308b`.
+    //
+    // Which handle it was reading is the thing an id does not say, and `reading` is why this
+    // can ask. Into the **queue** for a child's stream, because another reader may be parked
+    // on it and a side table is somewhere it would never look; into the per-handle table for
+    // a socket, which has no queue to go back to. That is `0307b`'s rule, unchanged.
+    let held = caller.data().tickets.discard(id);
+    let whose = caller.data().reading.lock().unwrap().remove(&id);
+    // **An accepted connection is handed on, not put down.** There is nowhere to put a
+    // socket back — it is already in the table with a client attached — so it goes to the
+    // next accept still waiting on that listener, exactly as the accept thread does when it
+    // finds its own ticket gone. `issues/system/0310b`.
+    if let (Some(Outcome::Socket(slot, _, _, _, _)), Some(listener)) = (&held, whose) {
+        if *slot >= 0 {
+            let next = caller.data().accepting.lock().unwrap()
+                .get_mut(&listener).and_then(|q| q.pop_front());
+            match (next, held.clone()) {
+                (Some(other), Some(answer)) => {
+                    let _ = caller.data().tickets.complete(other, answer);
+                    return Ok(());
+                }
+                // Nobody waiting yet — the retry comes *after* the give-up in this
+                // ordering, so it waits here for it rather than being dropped.
+                (None, Some(answer)) => {
+                    caller.data().parked_accepts.lock().unwrap()
+                        .entry(listener).or_default().push_back(answer);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
+    // **A child nobody collected is stopped**, unless it was started detached: the ticket owned it, and no one else
+    // can reach it now (spec ch44 `§wac-std-child-drop-n2r5vxe`).
+    if let Some(Outcome::Child(handle, _, _, _)) = &held {
+        let detached = caller.data_mut().spawned.remove(&id);
+        if *handle >= 0 && detached != Some(true) {
+            close_socket(caller, *handle);
+        }
+        return Ok(());
+    }
+    // **An abandoned `connect` is closed, not handed on.** The other capabilities here take
+    // something a *later* call wants — bytes, a connection off the backlog — so the answer
+    // is to pass it along. Nothing else wants this one: it is a line this program dialled
+    // and then stopped caring about. Left alone the handle never leaves the table and the
+    // peer holds an open connection to nobody, which the probe sees as a read that never
+    // ends. Told rather than left guessing. `issues/system/0310b`.
+    //
+    // An accept is distinguished by having a listener noted against it, and was handled
+    // above; a socket answer with no note is a dial.
+    if let (Some(Outcome::Socket(slot, _, _, _, _)), None) = (&held, whose) {
+        if *slot >= 0 {
+            if let Some(Sock::Open(s)) = socket_at(caller, *slot) {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            caller.data().handles.lock().unwrap().close(*slot);
+        }
+    }
+    if let (Some(Outcome::Bytes(bytes)), Some(h)) = (held, whose) {
+        if !bytes.is_empty() {
+            if let Some(q) = child_stream(caller, h) {
+                q.unread(bytes);
+            } else {
+                caller.data().pushback.lock().unwrap().entry(h).or_default().extend(bytes);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One request, by number — design/system/0013's request table, which `std/platform.wac`'s `OP_*`
+/// numbers. `a`, `b`, `text` and `bytes` are what that table says each one carries.
+fn serve(
+    caller: &mut Caller<'_, Host>,
+    op: i32,
+    a: i64,
+    b: i64,
+    text: Vec<u8>,
+    bytes: Vec<u8>,
+) -> Result<Reply, wasmtime::Error> {
+    match op {
+        OP_WRITE_STDOUT | OP_WRITE_STDERR => {
+            let to_stderr = op == OP_WRITE_STDERR;
+            // Answered before `request` returns, so a program learns at once that its reader has gone:
+            // a fault with no words, which std reads as `OutputClosed`.
+            return Ok(landed(emit(caller, &bytes, to_stderr)));
+        }
+        OP_ARG_COUNT => {
+            let n = caller.data().args.len() as i32;
+            return now(Kind::I32, Outcome::I32(n));
+        }
+        OP_ARG => {
+            let i = a as i32;
+            let bytes = caller.data().args.get(i as usize).cloned().unwrap_or_default();
+            return now(Kind::Bytes, Outcome::Bytes(bytes));
+        }
+        // **Sealed: no clock and no random bytes** (`Launch.sealed()`, spec ch44 `§wac-std-sealed-child-w4kq9ve`).
+        OP_NOW_MILLIS | OP_MONOTONIC_NANOS | OP_SLEEP_MILLIS | OP_RANDOM_BYTES if caller.data().grants.sealed => {
+            return Ok(fault(FAULT_UNSUPPORTED, "this program was started sealed: it has no clock and no random bytes"));
+        }
+        OP_NOW_MILLIS => {
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            return now(Kind::I64, Outcome::I64(ms));
+        }
+        OP_MONOTONIC_NANOS => {
+            let ns = caller.data().started.elapsed().as_nanos() as i64;
+            return now(Kind::I64, Outcome::I64(ns));
+        }
+        OP_SLEEP_MILLIS => {
+            // **The first capability that genuinely takes time**, and the reason 0087's first
+            // criterion is testable: two sleeps of different lengths complete out of the order they
+            // were asked for, on the runtime's own threads, with nothing waiting in between.
+            let ms = (a as i32).max(0) as u64;
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            // **It resolves to the monotonic nanoseconds at which it settled, not to the millis asked
+            // for** — `platform.wac`: "so `.wait()` is a sleep that tells you how far it overshot".
+            // Answering the argument back looked right in isolation and disagreed with the Deno host
+            // by three orders of magnitude, which is what running one program on both is for.
+            let origin = caller.data().started;
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(ms));
+                // Nothing was consumed to make this, so there is nothing to hand back.
+                let _ = table.complete(id, Outcome::I64(origin.elapsed().as_nanos() as i64));
+            });
+            return later(Kind::I64, id);
+        }
+        OP_RANDOM_BYTES => {
+            let n = (a as i32).max(0) as usize;
+            return now(Kind::Bytes, Outcome::Bytes(random_bytes(n)?));
+        }
+        // **How a child ended** (`Child.ended()`, spec ch44): exited with a code, trapped and how, or stopped by a limit.
+        OP_CHILD_ENDED => {
+            let Some(c) = child_of(caller, a as i32) else { return Ok(fault(FAULT_OTHER, "not a child")) };
+            let exit = c.exit.clone();
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            std::thread::spawn(move || {
+                let (how, m, text) = exit.ended();
+                table.complete(id, Outcome::Ended(how, m, text))
+            });
+            return later(Kind::Change, id);
+        }
+        OP_EXIT_CODE => {
+            // Two meanings on one capability, and the handle says which: a child's handle asks for
+            // *its* status, anything else sets this program's own. `platform.wac` gives them one
+            // name, so the runtime has to tell them apart by what it was handed.
+            let h = a as i32;
+            if let Some(c) = child_of(caller, h) {
+                let exit = c.exit.clone();
+                let id = caller.data().tickets.submit();
+                let table = caller.data().tickets.clone();
+                std::thread::spawn(move || table.complete(id, Outcome::I32(exit.wait())));
+                return later(Kind::I32, id);
+            }
+            return Ok(fault(FAULT_OTHER, "not a child"));
+        }
+        OP_CWD => {
+            // The *process's* directory, which is the one thing here that is a fact about the host
+            // rather than a capability over it. A sealed session immediately replaces it with its own.
+            let dir = match () {
+                _ if !caller.data().cwd.is_empty() => caller.data().cwd.clone(),
+                _ => std::env::current_dir()
+                    .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
+                    .unwrap_or_else(|_| b"/".to_vec()),
+            };
+            return now(Kind::Str, Outcome::Str(dir));
+        }
+        OP_READ_STDIN => {
+            // **What an abandoned read already took, first and in front of the rest.** This
+            // capability means "everything", so a retry after one was given up on has to see the
+            // bytes the first one drained — 1 run in 8 kept them before this. `issues/system/0310b`.
+            let waiting = caller
+                .data()
+                .pushback
+                .lock()
+                .unwrap()
+                .remove(&STDIN_HANDLE)
+                .unwrap_or_default();
+            // A spawned child: everything its parent sends, until the feed ends — unless it was told
+            // to inherit, in which case the queue is empty by construction and the process's own
+            // input is the answer. See `AsChild::inherits`.
+            if let Some(streams) = caller.data().as_child.as_ref().filter(|c| !c.inherits) {
+                let stdin = streams.stdin.clone();
+                let id = caller.data().tickets.submit();
+                let table = caller.data().tickets.clone();
+                let back = caller.data().pushback.clone();
+                // **Registered under standard input's handle**, so a `drop` that finds the
+                // answer already in hand knows where to put it — `Cap::Discard` hands it to
+                // `pushback`, which the next `readStdin` drains before reading more. Without this
+                // the early ordering was fixed and the late one still lost the lot, 0 of 6.
+                // `issues/system/0310b`.
+                caller.data().reading.lock().unwrap().insert(id, STDIN_HANDLE);
+                std::thread::spawn(move || {
+                    // **Everything, and it stops early if nobody is waiting any more.** Reading to
+                    // EOF for a ticket that has been given up on used to lose the lot — 1 run in 8
+                    // kept it. `read_unless` declines to take a chunk once the ticket is dead, and
+                    // whatever was already gathered goes back at the front of the queue so the next
+                    // `readStdin` sees it. `issues/system/0310b`.
+                    let mut all = waiting;
+                    loop {
+                        let Some(chunk) = stdin.read_unless(|| !table.is_live(id)) else {
+                            stdin.unread(all);
+                            return;
+                        };
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        all.extend_from_slice(&chunk);
+                    }
+                    // And the narrow order, where it is given up on between the last read and here.
+                    if let Some(Outcome::Bytes(unclaimed)) = table.complete(id, Outcome::Bytes(all)) {
+                        back.lock().unwrap().entry(STDIN_HANDLE).or_default().extend(unclaimed);
+                    }
+                });
+                return later(Kind::Bytes, id);
+            }
+            // Everything, which is what this capability means — `readChunk` is the bounded one. On a
+            // thread, because a pipe with nothing in it yet must not stop the program from doing
+            // anything else it had in flight.
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            let back = caller.data().pushback.clone();
+            // Same, for the process's own input.
+            caller.data().reading.lock().unwrap().insert(id, STDIN_HANDLE);
+            std::thread::spawn(move || {
+                use std::io::Read;
+                // The process's own input has no queue to decline from — the read has happened by
+                // the time anything can be asked — so this one hands back instead. Same as a socket.
+                let mut buf = waiting;
+                let _ = std::io::stdin().read_to_end(&mut buf);
+                // **This one does consume, and is not fixed here.** `readAll` takes standard input to
+                // EOF, so an abandoned one loses the lot — the same defect `issues/system/0307b`
+                // describes, on a capability that is not keyed by handle the way `recv` is. Left
+                // explicit rather than quietly discarded, and recorded in the issue.
+                if let Some(Outcome::Bytes(unclaimed)) = table.complete(id, Outcome::Bytes(buf)) {
+                    back.lock().unwrap().entry(STDIN_HANDLE).or_default().extend(unclaimed);
+                }
+            });
+            return later(Kind::Bytes, id);
+        }
+        OP_READ_CHUNK => {
+            // A spawned child reads what its parent sends — unless it inherits, when the queue is
+            // finished at spawn and the process's own input is what it meant. See `AsChild::inherits`.
+            if let Some(streams) = caller.data().as_child.as_ref().filter(|c| !c.inherits) {
+                let stdin = streams.stdin.clone();
+                let bytes = stdin.read();
+                return now(Kind::Read, Outcome::Bytes(bytes));
+            }
+            // The *bounded* read: whatever is there, or that the input has ended, answered before
+            // `request` returns.
+            let mut buf = [0u8; 65536];
+            let n = {
+                use std::io::Read;
+                std::io::stdin().read(&mut buf)
+            };
+            let outcome = match n {
+                Ok(n) => Outcome::Bytes(buf[..n].to_vec()),
+                Err(e) => Outcome::Str(e.to_string().into_bytes()),
+            };
+            return now(Kind::Read, outcome);
+        }
+        OP_ENV => {
+            // **A grant.** Without `env` in the manifest this is refused as `NotGranted`, as every
+            // handle a host withholds is (design/system/0013) — not answered as absent, which a program
+            // could not tell from a variable nobody set.
+            if !caller.data().grants.env {
+                return Ok(fault(FAULT_NOT_GRANTED, NOT_GRANTED));
+            }
+            let value = String::from_utf8(text.clone())
+                .ok()
+                .and_then(|n| std::env::var_os(n))
+                .map(|v| v.as_encoded_bytes().to_vec());
+            return now(Kind::BytesOpt, Outcome::BytesOpt(value));
+        }
+        // ── The network and `spawn`: not implemented, and *said in the type* ─────
+        //
+        // These do not trap, and the difference from every other gap in this runtime is the point.
+        // `Child.handle == -2` **means "this world has no `spawn` at all"** — `platform.wac` says so
+        // in those words, and says why: without it "a world that cannot spawn made every spawnable
+        // name *fail* rather than fall through", which hid `packages/box`'s own `wc` behind a
+        // `WACPATH` lookup that could never work. A missing capability is not a broken program.
+        //
+        // So where the interface has a value for "not here", answering it is more honest than a trap,
+        // not less: the trap is what a caller cannot act on. `Socket` has the same shape with a
+        // negative handle and a reason, and a shell falls back to its in-process applets on both.
+        OP_SPAWN_SELF => {
+            // Another instance of *this* module, which is how `packages/box` runs an applet as a real
+            // program: `main` dispatches on argv[0]. `bytes` is an empty module, then the arguments.
+            let Some((_, argv)) = spawn_parts(&bytes) else {
+                return Ok(fault(FAULT_OTHER, "the request's arguments do not parse"));
+            };
+            let want = a as i32;
+            let cwd = text.clone();
+            // The `INHERIT_*` mask: the input and output bits are the host's — `DETACHED` (4) is std's
+            // business. `issues/system/0312b`.
+            let inherit_bits = b as i32;
+            let inherit = inherit_bits & 1 != 0;
+            let inherit_out = inherit_bits & 2 != 0;
+            // Whether this program promises to answer the child's filesystem questions — see
+            // `spawnSelf` in platform.wac. Not a grant: it widens nothing.
+            let serve_fs = (b & 256) != 0;
+            let Some(world) = caller.data().world.clone() else {
+                return no_spawn_here();
+            };
+            return spawn_instance(caller, world, argv, want, cwd, inherit, serve_fs, inherit_out);
+        }
+        // **Synchronous, unlike almost everything here.** Nothing is submitted and no ticket comes
+        // back: instantiating a module and calling one of its exports both finish before the host call
+        // returns, so `load` and `call` answer a struct directly. `issues/system/0240c`.
+        OP_LOAD => {
+            let prog = bytes.clone();
+            let asked = a as i32;
+            let (handle, why) = match load_module(caller, &prog, asked) {
+                Ok(h) => (h, String::new()),
+                Err(e) => (-1, e),
+            };
+            if handle < 0 {
+                return Ok(fault(FAULT_OTHER, &why));
+            }
+            return Ok(Reply::Flat(Flat { n: handle as i64, ..Flat::default() }));
+        }
+        OP_CALL => {
+            let handle = a as i32;
+            let name = String::from_utf8_lossy(&text.clone()).into_owned();
+            let n = b as i32;
+            let (status, said, value) = call_loaded(handle, &name, n);
+            return Ok(Reply::Flat(Flat { flags: status, text: said.into_bytes(), n: value as i64, ..Flat::default() }));
+        }
+        OP_UNLOAD => {
+            LOADED.with(|t| t.borrow_mut().remove(&(a as i32)));
+            return Ok(Reply::Nothing);
+        }
+        // **Compiled, not instantiated**, which is `Cli.validated`'s whole contract: whether the
+        // engine accepts the bytes, asked without a manifest, a world, or anything running. wasmtime
+        // hands back the reason as an ordinary error, so unlike the V8 host there is no exception
+        // left on anything and no guard needed around a second call.
+        // **No named capability yet**: the first is `wac.site`. A parent serving a child answers its lookups itself.
+        OP_CAPABILITY => {
+            return Ok(fault(FAULT_UNSUPPORTED, &format!("no capability {} on this host", String::from_utf8_lossy(&text))));
+        }
+        OP_VALIDATE => {
+            let prog = bytes.clone();
+            let why = match wasmtime::Module::validate(caller.engine(), &prog) {
+                Ok(()) => String::new(),
+                Err(e) => format!("{e}"),
+            };
+            if why.is_empty() {
+                return Ok(Reply::Flat(Flat::default()));
+            }
+            return Ok(fault(FAULT_OTHER, &why));
+        }
+        OP_SPAWN => {
+            // `spawn(prog, argv, grants, cwd, inheritInput, serveFs)` — **a module carrying its own
+            // manifest**, which is what `wac build` writes and what `native/v8` has always started.
+            // Until 2026-08-21 this answered "not implemented in the native runtime; spawnSelf
+            // works", and the gap was not the confinement or the streams — `spawnSelf` already had
+            // all of that — but simply that nothing here built a `World` from bytes it was given.
+            // `issues/system/0144`.
+            let Some((prog, argv)) = spawn_parts(&bytes) else {
+                return Ok(fault(FAULT_OTHER, "the request's arguments do not parse"));
+            };
+            let want = a as i32;
+            let cwd = text.clone();
+            // **Flags rather than a bool** — `platform.wac`'s `INHERIT_IN`/`INHERIT_OUT`, one `i32`
+            // because a capability may not have seven parameters (`issues/lang/0291c`).
+            let inherit_bits = b as i32;
+            let inherit = inherit_bits & 1 != 0;
+            let inherit_out = inherit_bits & 2 != 0;
+            let serve_fs = (b & 256) != 0;
+            // **-2 still means what it means**: a world with no `spawn` at all says so, and it says
+            // the same thing to both spawns rather than refusing one and serving the other.
+            if caller.data().world.is_none() {
+                return no_spawn_here();
+            }
+            // The parent's engine, so a child shares its configuration and its compile cache — and a
+            // module spawned in a loop is compiled once. Nothing else of the parent's crosses.
+            let engine = caller.engine().clone();
+            return match world_from(&engine, &prog) {
+                Ok(world) => {
+                    spawn_instance(caller, world, argv, want, cwd, inherit, serve_fs, inherit_out)
+                }
+                // **A failed child rather than a trap.** A parent handed a file that is not a wac
+                // program has done nothing wrong, and `Child.error` is the field that says so —
+                // `packages/sh` turns a negative handle into 126 and carries the reason.
+                Err(why) => now(Kind::Child,
+                    Outcome::Child(-1, -1, -1, why)),
+            };
+        }
+        // ── The network ──────────────────────────────────────────────────────
+        //
+        // **The grant check comes first**, and the order is not cosmetic. A program built without
+        // `--allow-net` would be refused on *every* host; telling it something about this runtime
+        // instead is both irrelevant and misleading, and `example/probe.wac` reads the difference —
+        // it looks for the words "not granted" and reports `denied` rather than `failed`. The Deno
+        // host says "network access not granted to this application", so this says the same thing.
+        OP_CONNECT => {
+            if !caller.data().grants.net {
+                return now(Kind::Socket, denied_net());
+            }
+            let port = a as i32;
+            let host = String::from_utf8_lossy(&text.clone()).into_owned();
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            let table_handles = caller.data().handles.clone();
+            std::thread::spawn(move || {
+                let outcome = match std::net::TcpStream::connect((host.as_str(), port as u16)) {
+                    Ok(s) => {
+                        // The port this dialled *from*, which is what `Socket.port` is for on a
+                        // connected socket — `platform.wac` distinguishes it from the peer's.
+                        let local = s.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                        let slot = table_handles.lock().unwrap().push(Handle::Net(Sock::Open(Arc::new(s))));
+                        Outcome::Socket(slot, String::new(), String::new(), local, FAULT_NONE)
+                    }
+                    Err(e) => Outcome::Socket(-1, e.to_string(), String::new(), 0, fault_of(&e)),
+                };
+                // **An abandoned `connect` orphans a live socket too**, which is the same defect
+                // one capability over — the connection is made and put in the table, and an answer
+                // nobody takes leaves it there with the peer none the wiser. Not fixed here: unlike
+                // an accept there is no later call that would want *this* connection, so handing it
+                // on is meaningless and closing it is the only sensible remedy. `issues/system/0310b`.
+                let _ = table.complete(id, outcome);
+            });
+            return later(Kind::Socket, id);
+        }
+        OP_BIND_DATAGRAM => {
+            // One grant for every transport: the authority is "speak to something that is not this
+            // process", which `platform.wac` spells as a single flag and UDP does not change.
+            if !caller.data().grants.net {
+                return now(Kind::Socket, denied_net());
+            }
+            let port = a as i32;
+            let addr = String::from_utf8_lossy(&text.clone()).into_owned();
+            let bind = if addr.is_empty() { "0.0.0.0".to_string() } else { addr };
+            let outcome = match std::net::UdpSocket::bind((bind.as_str(), port as u16)) {
+                Ok(sk) => {
+                    let bound = sk.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                    let handle = keep(caller, Handle::Net(Sock::Datagram(Arc::new(sk))));
+                    Outcome::Socket(handle, String::new(), String::new(), bound, FAULT_NONE)
+                }
+                Err(e) => Outcome::Socket(-1, e.to_string(), String::new(), 0, fault_of(&e)),
+            };
+            return now(Kind::Socket, outcome);
+        }
+        OP_RECEIVE_FROM => {
+            let h = a as i32;
+            let Some(Sock::Datagram(sk)) = socket_at(caller, h) else {
+                let why = "not an open datagram socket".to_string();
+                let out = Outcome::Datagram(Vec::new(), String::new(), 0, why);
+                return now(Kind::Datagram, out);
+            };
+            // 65535 is the largest a UDP payload can be, so this cannot truncate one — and a
+            // truncation here would arrive looking exactly like a peer that sent less.
+            let mut buf = vec![0u8; 65535];
+            let outcome = match sk.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    buf.truncate(n);
+                    Outcome::Datagram(buf, from.ip().to_string(), from.port() as i32, String::new())
+                }
+                Err(e) => Outcome::Datagram(Vec::new(), String::new(), 0, e.to_string()),
+            };
+            return now(Kind::Datagram, outcome);
+        }
+        OP_SEND_TO => {
+            let h = a as i32;
+            let port = b as i32;
+            let addr = String::from_utf8_lossy(&text.clone()).into_owned();
+            let bytes = bytes.clone();
+            let landed = match socket_at(caller, h) {
+                Some(Sock::Datagram(sk)) => sk.send_to(&bytes, (addr.as_str(), port as u16)).is_ok(),
+                _ => false,
+            };
+            return now(Kind::Bool, Outcome::Bool(landed));
+        }
+        OP_LISTEN => {
+            if !caller.data().grants.net {
+                return now(Kind::Socket, denied_net());
+            }
+            let port = a as i32;
+            let addr = String::from_utf8_lossy(&text.clone()).into_owned();
+            // The empty string is **every interface**, which is what `platform.wac` says and what a
+            // daemon nobody can reach is not. `0.0.0.0` spells the same thing explicitly.
+            let bind = if addr.is_empty() { "0.0.0.0".to_string() } else { addr };
+            let outcome = match std::net::TcpListener::bind((bind.as_str(), port as u16)) {
+                Ok(l) => {
+                    // The port the kernel actually chose, which is the whole reason `listen` answers
+                    // one: a server that asked for 0 could otherwise never learn where it is.
+                    let bound = l.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                    let handle = keep(caller, Handle::Net(Sock::Listening(Arc::new(l))));
+                    Outcome::Socket(handle, String::new(), String::new(), bound, FAULT_NONE)
+                }
+                Err(e) => Outcome::Socket(-1, e.to_string(), String::new(), 0, fault_of(&e)),
+            };
+            return now(Kind::Socket, outcome);
+        }
+        OP_ACCEPT => {
+            let h = a as i32;
+            // A connection a dropped accept already took is answered before waiting for another.
+            let already = caller.data().parked_accepts.lock().unwrap()
+                .get_mut(&h).and_then(|q| q.pop_front());
+            if let Some(outcome) = already {
+                return now(Kind::Socket, outcome);
+            }
+            let listen_handle = h;
+            let waiting = caller.data().accepting.clone();
+            let Some(Sock::Listening(listener)) = socket_at(caller, h) else {
+                if !caller.data().grants.net {
+                    return now(Kind::Socket, denied_net());
+                }
+                return now(Kind::Socket,
+                    Outcome::Socket(-1, "not a listening socket".into(), String::new(), 0, FAULT_OTHER));
+            };
+            let id = caller.data().tickets.submit();
+            // Registered so a connection taken for a ticket nobody wants can be handed to this one
+            // wherever it is waiting. `issues/system/0310b`.
+            caller.data().accepting.lock().unwrap().entry(h).or_default().push_back(id);
+            // And which listener it belongs to, so a `drop` holding an accepted connection knows
+            // whose queue to pass it on to. `issues/system/0310b` — without this the late ordering
+            // lost the connection, 0 of 6, while the early one was fixed.
+            caller.data().reading.lock().unwrap().insert(id, h);
+            let table = caller.data().tickets.clone();
+            let table_handles = caller.data().handles.clone();
+            std::thread::spawn(move || {
+                let outcome = match listener.accept() {
+                    Ok((s, peer)) => {
+                        // The address only, without the port: `platform.wac` says the port a client
+                        // dialled *from* is of no use to anyone and would invite string parsing at
+                        // every call site.
+                        let who = peer.ip().to_string();
+                        let local = s.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                        let slot = table_handles.lock().unwrap().push(Handle::Net(Sock::Open(Arc::new(s))));
+                        Outcome::Socket(slot, String::new(), who, local, FAULT_NONE)
+                    }
+                    Err(e) => Outcome::Socket(-1, e.to_string(), String::new(), 0, fault_of(&e)),
+                };
+                // **A connection is consumed to make this**, and the comment here said it was
+                // not — a mechanical edit's blanket sentence, wrong on the site it mattered most.
+                // The socket is in the table by now, so an answer nobody takes leaves a client
+                // connected to a handle that will never be handed out, and an entry never freed.
+                // 0 of 8 kept before this. `issues/system/0310b`.
+                //
+                // Parked under the *listener*, so the next `accept` on it gets the connection that
+                // was already made rather than waiting for another. Closing it would be defensible
+                // and is worse: the client is told nothing and has to guess.
+                // **A connection is consumed to make this**, whatever the comment here used to
+                // say. The socket is in the table by now, so an answer nobody takes leaves a client
+                // attached to a handle that will never be handed out. 0 of 8 kept before this.
+                //
+                // **Given to a ticket that is still live, not left somewhere to be found.** Parking
+                // it under the listener was tried and measured at 0 of 8 unchanged: the retry is
+                // already blocked in `accept()` waiting for a *different* connection and cannot be
+                // handed this one. Completing its ticket reaches it wherever it is waiting.
+                // `issues/system/0310b`.
+                waiting.lock().unwrap().get_mut(&listen_handle).map(|q| q.retain(|&t| t != id));
+                let mut answer = table.complete(id, outcome);
+                while let Some(unclaimed) = answer.take() {
+                    let next = waiting
+                        .lock()
+                        .unwrap()
+                        .get_mut(&listen_handle)
+                        .and_then(|q| q.pop_front());
+                    match next {
+                        // Whoever is waiting gets it. If that one has also gone, round again —
+                        // each turn consumes a ticket, so this cannot spin.
+                        Some(other) => answer = table.complete(other, unclaimed),
+                        // Nobody at all. The connection is orphaned and that is still the open half
+                        // of `0310b`: it is in the table, and closing it would tell the client
+                        // nothing. Left rather than pretended about.
+                        None => break,
+                    }
+                }
+            });
+            return later(Kind::Socket, id);
+        }
+        OP_RECV => {
+            let h = a as i32;
+            // **What an abandoned reader already took, before asking the source for more.** Order is
+            // the whole of a stream's meaning, so these come first and whole; a second `recv` then
+            // continues where the abandoned one would have. `issues/system/0307b`.
+            let waiting = caller.data().pushback.lock().unwrap().remove(&h);
+            if let Some(bytes) = waiting {
+                if !bytes.is_empty() {
+                    return now(Kind::Read, Outcome::Bytes(bytes));
+                }
+            }
+            // On a thread either way: a child or a peer that has not written yet must not stop this
+            // program from reading another, which is exactly what a pipeline and a relay both do.
+            let id = caller.data().tickets.submit();
+            // **Which handle this ticket is reading**, so a `drop` that finds an answer already in
+            // hand knows where to put it back. `issues/system/0308b`.
+            caller.data().reading.lock().unwrap().insert(id, h);
+            let table = caller.data().tickets.clone();
+            // Which of the child's two streams is decided *before* anything starts: the first
+            // version started a reader on standard output and then started a second on the error
+            // stream when it noticed the handle was the wrong one, leaving a thread parked on a
+            // stream nobody would collect.
+            if let Some(stream) = child_stream(caller, h) {
+                let noted = caller.data().reading.clone();
+                std::thread::spawn(move || deliver(&stream, &table, id, &noted));
+                return later(Kind::Read, id);
+            }
+            // **The child's own end of its filesystem channel**: what its parent answered. Reserved,
+            // so the lookup above cannot have claimed it, and available only to a program something
+            // spawned — `Fs.overParent` in a program nobody spawned falls through to the refusal at
+            // the bottom, which is how it can tell.
+            if h == PARENT_FS_HANDLE {
+                if let Some(streams) = caller.data().as_child.as_ref() {
+                    let answers = streams.fsrep.clone();
+                    let noted = caller.data().reading.clone();
+                    std::thread::spawn(move || deliver(&answers, &table, id, &noted));
+                    return later(Kind::Read, id);
+                }
+            }
+            // **Standard input has a handle so `waitAny` can watch it beside a socket**, which is
+            // what `platform.wac` promises and what this runtime did not do: `recv(0)` fell all the
+            // way through to "nothing at the other end", so a relay written against that promise
+            // read nothing here and everything under Deno. It reads what `readChunk` reads, by the
+            // same ranking — a parent's queue if this is a child that does not inherit, else the
+            // process's own input.
+            if h == STDIN_HANDLE {
+                if let Some(streams) = caller.data().as_child.as_ref().filter(|c| !c.inherits) {
+                    let fed = streams.stdin.clone();
+                    let noted = caller.data().reading.clone();
+                    std::thread::spawn(move || deliver(&fed, &table, id, &noted));
+                    return later(Kind::Read, id);
+                }
+                let mut buf = [0u8; 65536];
+                let n = {
+                    use std::io::Read;
+                    std::io::stdin().read(&mut buf)
+                };
+                // Nothing was consumed to make this, so there is nothing to hand back.
+                // Forget which handle this was reading: it is finished with, and the note is
+                // only for a `drop` that finds an answer in hand. Without this, every `recv` that
+                // ends synchronously — standard input, a handle that is not there — leaves an entry
+                // behind, and the map grows for as long as the program reads. `issues/system/0308b`.
+                // Same note, same reason: this path answers `Read.Failed` and is done with the
+            // ticket, so nothing should be left pointing at a handle. `issues/system/0308b`.
+            let _ = caller.data().tickets.discard(id);
+            caller.data().reading.lock().unwrap().remove(&id);
+                return now(Kind::Read, match n {
+                    Ok(n) => Outcome::Bytes(buf[..n].to_vec()),
+                    Err(e) => Outcome::Str(e.to_string().into_bytes()),
+                });
+            }
+            let file = match caller.data().handles.lock().unwrap().get(h) {
+                Some(Handle::File(f)) => Some(f.clone()),
+                _ => None,
+            };
+            if let Some(f) = file {
+                let back = caller.data().pushback.clone();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = [0u8; 65536];
+                    let outcome = match (&*f).read(&mut buf) {
+                        Ok(n) => Outcome::Bytes(buf[..n].to_vec()),
+                        Err(e) => Outcome::Str(e.to_string().into_bytes()),
+                    };
+                    park_unclaimed(&back, h, table.complete(id, outcome));
+                });
+                return later(Kind::Read, id);
+            }
+            if let Some(Sock::Open(s)) = socket_at(caller, h) {
+                let back = caller.data().pushback.clone();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = [0u8; 65536];
+                    let outcome = match (&*s).read(&mut buf) {
+                        Ok(n) => Outcome::Bytes(buf[..n].to_vec()),
+                        Err(e) => Outcome::Str(e.to_string().into_bytes()),
+                    };
+                    park_unclaimed(&back, h, table.complete(id, outcome));
+                });
+                return later(Kind::Read, id);
+            }
+            // Nothing was consumed to make this, so there is nothing to hand back.
+            let _ = caller.data().tickets.discard(id);
+            // Neither, so there is nothing at the other end. `Read.Failed` rather than `Read.End`,
+            // which would tell a reader the peer had finished rather than that there was never one.
+            let why: &[u8] = if caller.data().grants.net {
+                b"no such handle"
+            } else {
+                b"network access not granted to this application"
+            };
+            return now(Kind::Read, Outcome::Str(why.to_vec()));
+        }
+        OP_SEND => {
+            let h = a as i32;
+            let bytes = bytes.clone();
+            // **The child's own end of its filesystem channel**: a request for its parent. Before
+            // the table lookup only because the handle is reserved and the table cannot hold it.
+            if h == PARENT_FS_HANDLE {
+                if let Some(streams) = caller.data().as_child.as_ref() {
+                    let landed = streams.fsreq.write(&bytes);
+                    return now(Kind::Bool, Outcome::Bool(landed));
+                }
+            }
+            // The parent's end: the answer to one.
+            let answering = match caller.data().handles.lock().unwrap().get(h) {
+                Some(Handle::Fs(c)) => Some(c.fsrep.clone()),
+                _ => None,
+            };
+            if let Some(replies) = answering {
+                let landed = replies.write(&bytes);
+                return now(Kind::Bool, Outcome::Bool(landed));
+            }
+            // Only a child's *main* handle takes bytes: there is nothing to write to its error
+            // stream, and answering false for that is truer than pretending.
+            let to_child = matches!(caller.data().handles.lock().unwrap().get(h), Some(Handle::Main(_)));
+            let landed = if to_child {
+                match child_of(caller, h) {
+                    Some(c) => c.stdin.write(&bytes),
+                    None => false,
+                }
+            } else if let Some(Sock::Open(s)) = socket_at(caller, h) {
+                use std::io::Write;
+                (&*s).write_all(&bytes).is_ok()
+            } else if let Some(Handle::File(f)) = caller.data().handles.lock().unwrap().get(h).cloned() {
+                use std::io::Write;
+                (&*f).write_all(&bytes).is_ok()
+            } else {
+                // False is "it did not land", which is what a caller checks.
+                false
+            };
+            return now(Kind::Bool, Outcome::Bool(landed));
+        }
+        // **End the outbound direction and keep reading** — `issues/system/0215`.
+        //
+        // `Shutdown::Write` against `CloseSocket`'s `Shutdown::Both`, and the handle stays open in
+        // the table: `recv` on it afterwards is the whole point of the call. Only a connected stream
+        // has two directions, so a listener, a datagram socket and a child are not touched — a child
+        // that wants its input ended has `closeFeed`, which is the same distinction one layer up.
+        OP_CLOSE_SEND => {
+            let h = a as i32;
+            if let Some(Sock::Open(s)) = socket_at(caller, h) {
+                let _ = s.shutdown(std::net::Shutdown::Write);
+            }
+        }
+
+        OP_CLOSE_SOCKET => {
+            // **Stops the child outright**, which is what `closeSocket` means and what `closeFeed`
+            // deliberately does not: `head -1` ending `seq` is the ordinary case.
+            //
+            // Two halves, and both are needed. The **flag** traps the guest wherever it is, at the
+            // next epoch — that is termination, and it is what the JavaScript hosts do by
+            // terminating the worker. Ending every **queue** is what the child's *parent* needs: a
+            // reader parked on its output has to find out, and it must find out whether the child
+            // was stopped here or had already exited on its own. Ending the queues alone was this
+            // runtime's whole answer, and issue 0123 is the difference it left.
+            close_socket(caller, a as i32);
+        }
+
+        // ── The filesystem ───────────────────────────────────────────────────
+        //
+        // Every one of these is `std::fs` behind a grant check, and the grant check is the whole
+        // difference between a capability and an ambient authority: a program built without
+        // `--allow-read` finds reading *denied*, not merely absent, and the fault says which
+        // (`FAULT_NOT_GRANTED`, which `platform.wac` keeps separate from the operating system's own
+        // `FAULT_DENIED` precisely so a caller can tell "this build cannot" from "this file will not").
+        //
+        // On threads, because a slow disk must not stop a program from doing what else it had in
+        // flight — which is the entire reason these return a ticket rather than a value.
+        // **A file as a stream of its own** — `Cli.openFile`. `how` is 0 to read, 1 to create or truncate,
+        // 2 to create or append; the grant is the one `readFile` or `writeFile` would need. Opening is quick,
+        // so it is answered at once; the reads and writes that follow are where a slow disk shows.
+        OP_OPEN_FILE => {
+            let path = text.clone();
+            let how = a as i32;
+            // 3 and 4 are `Files.openRandom`: to read anywhere, or to read and write anywhere.
+            let granted = if how == 0 || how == 3 { caller.data().grants.read } else { caller.data().grants.write };
+            if !granted {
+                let o = Outcome::Socket(-1, "Not granted to this application".into(), String::new(), 0, FAULT_NOT_GRANTED);
+                return now(Kind::Socket, o);
+            }
+            let here = resolve(caller, &path);
+            let mut o = std::fs::OpenOptions::new();
+            if how == 0 || how == 3 {
+                o.read(true);
+            } else if how == 4 {
+                // Created if absent, and never emptied: a database's file.
+                o.read(true).write(true).create(true);
+            } else {
+                o.write(true).create(true);
+                if how == 2 { o.append(true); } else { o.truncate(true); }
+            }
+            let outcome = match o.open(here) {
+                Ok(f) => {
+                    let slot = caller.data().handles.lock().unwrap().push(Handle::File(Arc::new(f)));
+                    Outcome::Socket(slot, String::new(), String::new(), 0, FAULT_NONE)
+                }
+                Err(e) => Outcome::Socket(-1, e.to_string(), String::new(), 0, fault_of(&e)),
+            };
+            return now(Kind::Socket, outcome);
+        }
+        // **A file `openRandom` opened**: reads and writes at an offset, its size, cutting it, and `fsync`.
+        // Positioned reads and writes (`pread`, `pwrite`) leave no cursor to share, so two requests in
+        // flight on one handle cannot move each other's. On threads, as the whole-file operations are.
+        OP_READ_AT | OP_WRITE_AT | OP_FILE_SIZE | OP_TRUNCATE_FILE | OP_SYNC_FILE => {
+            let h = a as i32;
+            let file = match caller.data().handles.lock().unwrap().get(h) {
+                Some(Handle::File(f)) => Some(f.clone()),
+                _ => None,
+            };
+            let Some(f) = file else {
+                return now(Kind::Change, Outcome::Change(FAULT_OTHER, "not an open file".into()));
+            };
+            // A read the page cache holds is answered now, with no thread at all (`read_at_cached`).
+            if op == OP_READ_AT {
+                let n = bytes.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize).unwrap_or(0);
+                if let Some(read) = read_at_cached(&f, n, b as u64) {
+                    return now(Kind::Change, match read {
+                        Ok(got) => Outcome::FileResult(true, got, String::new(), FAULT_NONE),
+                        Err(e) => Outcome::FileResult(false, Vec::new(), e.to_string(), fault_of(&e)),
+                    });
+                }
+            }
+            let offset = b as u64;
+            let data = bytes.clone();
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            on_file_pool(move || {
+                let outcome = match op {
+                    OP_READ_AT => {
+                        let n = data.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize).unwrap_or(0);
+                        match read_at(&f, n, offset) {
+                            Ok(got) => Outcome::FileResult(true, got, String::new(), FAULT_NONE),
+                            Err(e) => Outcome::FileResult(false, Vec::new(), e.to_string(), fault_of(&e)),
+                        }
+                    }
+                    OP_WRITE_AT => match write_at(&f, &data, offset) {
+                        Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                    OP_FILE_SIZE => match f.metadata() {
+                        Ok(m) => Outcome::I64(m.len() as i64),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                    OP_TRUNCATE_FILE => match f.set_len(offset) {
+                        Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                    _ => match f.sync_all() {
+                        Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    },
+                };
+                let _ = table.complete(id, outcome);
+            });
+            return later(Kind::Change, id);
+        }
+        // The end of a file `openFile` opened. `File` does not buffer, so every `send` already reached the
+        // system and dropping it is the whole of closing.
+        OP_CLOSE_FILE => {
+            let h = a as i32;
+            caller.data().pushback.lock().unwrap().remove(&h);
+            let is_file = matches!(caller.data().handles.lock().unwrap().get(h), Some(Handle::File(_)));
+            if is_file {
+                caller.data().handles.lock().unwrap().close(h);
+            }
+            return now(Kind::Bool, Outcome::Bool(is_file));
+        }
+        // The end of this program's output or its diagnostic output — see the V8 host.
+        OP_CLOSE_OUTPUT => {
+            let to_err = a != 0;
+            let h = caller.data_mut();
+            let ok = if h.out_closed[to_err as usize] {
+                true
+            } else {
+                h.out_closed[to_err as usize] = true;
+                if let Some(streams) = h.as_child.as_ref().filter(|c| !c.inherit_out) {
+                    if to_err { streams.stderr.finish() } else { streams.stdout.finish() }
+                    true
+                } else {
+                    close_std_stream(if to_err { 2 } else { 1 })
+                }
+            };
+            return now(Kind::Bool, Outcome::Bool(ok));
+        }
+        OP_READ_FILE => {
+            let path = text.clone();
+            if !caller.data().grants.read {
+                return now(Kind::FileResult, denied_read());
+            }
+            let here = resolve(caller, &path);
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            std::thread::spawn(move || {
+                let outcome = match std::fs::read(here) {
+                    Ok(bytes) => Outcome::FileResult(true, bytes, String::new(), FAULT_NONE),
+                    Err(e) => Outcome::FileResult(false, Vec::new(), e.to_string(), fault_of(&e)),
+                };
+                // Nothing was consumed to make this, so there is nothing to hand back.
+                let _ = table.complete(id, outcome);
+            });
+            return later(Kind::FileResult, id);
+        }
+        OP_WRITE_FILE => {
+            let path = text.clone();
+            let data = bytes.clone();
+            if !caller.data().grants.write {
+                return now(Kind::Change, denied_write_change());
+            }
+            let here = resolve(caller, &path);
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            std::thread::spawn(move || {
+                let outcome = match std::fs::write(here, &data) {
+                    Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                    Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                };
+                // Nothing was consumed to make this, so there is nothing to hand back.
+                let _ = table.complete(id, outcome);
+            });
+            return later(Kind::Change, id);
+        }
+        OP_STAT | OP_LINK_STAT => {
+            let path = text.clone();
+            if !caller.data().grants.read {
+                return now(Kind::Stat,
+                    Outcome::Stat(false, false, false, 0, 0, false, false, FAULT_NOT_GRANTED, 0));
+            }
+            // `linkStat` does not follow a symbolic link, which is the whole difference between the
+            // two and the reason `Stat` carries `isSymlink` at all.
+            let here = resolve(caller, &path);
+            let follow = op == OP_STAT;
+            let md = if follow {
+                std::fs::metadata(&here)
+            } else {
+                std::fs::symlink_metadata(&here)
+            };
+            let outcome = match md {
+                Ok(m) => {
+                    let millis = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    Outcome::Stat(
+                        true,
+                        m.is_file(),
+                        m.is_dir(),
+                        m.len() as i64,
+                        millis,
+                        m.file_type().is_symlink(),
+                        // Owner-execute, `0o100`. `PermissionsExt` is unix-only; this host is built for
+                        // wasmtime on unix, and the mode is what the wac struct's one bit comes from.
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            m.permissions().mode() & 0o100 != 0
+                        },
+                        FAULT_NONE,
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            (m.permissions().mode() & 0o7777) as i32
+                        },
+                    )
+                }
+                // **Absent is not a failure.** `exists: false` with no fault is what "there is nothing
+                // here" means; a fault would make every caller that merely asked treat it as an error.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Outcome::Stat(false, false, false, 0, 0, false, false, FAULT_NONE, 0)
+                }
+                Err(e) => Outcome::Stat(false, false, false, 0, 0, false, false, stat_fault(&e), 0),
+            };
+            return now(Kind::Stat, outcome);
+        }
+        OP_READ_DIR => {
+            let path = text.clone();
+            if !caller.data().grants.read {
+                return Ok(fault(FAULT_NOT_GRANTED, "Not granted to this application"));
+            }
+            let here = resolve(caller, &path);
+            let outcome = match std::fs::read_dir(here) {
+                Ok(entries) => {
+                    let mut names: Vec<Vec<u8>> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().as_encoded_bytes().to_vec())
+                        .collect();
+                    // By bytes, which is what `LC_ALL=C` means and what `packages/fs`'s `sortNames`
+                    // does: a listing whose order came from the filesystem would differ between two
+                    // hosts for a reason that has nothing to do with either.
+                    names.sort();
+                    Outcome::Names(Some(names))
+                }
+                // No words, so std names the path: "no such directory" and "not a directory" are
+                // the fault's to say.
+                Err(e) => return Ok(fault(fault_of(&e), "")),
+            };
+            return now(Kind::Names, outcome);
+        }
+        OP_MKDIR => {
+            let path = text.clone();
+            let parents = a != 0;
+            if !caller.data().grants.write {
+                return now(Kind::Change, denied_write_change());
+            }
+            let here = resolve(caller, &path);
+            let made = if parents {
+                std::fs::create_dir_all(&here)
+            } else {
+                std::fs::create_dir(&here)
+            };
+            let outcome = match made {
+                Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Outcome::Change(FAULT_EXISTS, e.to_string())
+                }
+                Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+            };
+            return now(Kind::Change, outcome);
+        }
+        OP_REMOVE => {
+            let path = text.clone();
+            let recursive = a != 0;
+            if !caller.data().grants.write {
+                return now(Kind::Change, denied_write_change());
+            }
+            let p = resolve(caller, &path);
+            let is_dir = std::fs::symlink_metadata(&p).map(|m| m.is_dir()).unwrap_or(false);
+            let gone = if is_dir {
+                if recursive { std::fs::remove_dir_all(&p) } else { std::fs::remove_dir(&p) }
+            } else {
+                std::fs::remove_file(&p)
+            };
+            let outcome = match gone {
+                Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                // A non-empty directory without `recursive` is its own category, because `rm` and
+                // `rmdir` say different things about it and both need to tell it from a denial.
+                Err(e) if e.raw_os_error() == Some(39) => Outcome::Change(FAULT_NOT_EMPTY, e.to_string()),
+                Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+            };
+            return now(Kind::Change, outcome);
+        }
+        OP_RENAME => {
+            let from = text.clone();
+            let to = bytes.clone();
+            if !caller.data().grants.write {
+                return now(Kind::Change, denied_write_change());
+            }
+            let from_p = resolve(caller, &from);
+            let to_p = resolve(caller, &to);
+            let outcome = match std::fs::rename(from_p, to_p) {
+                Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+            };
+            return now(Kind::Change, outcome);
+        }
+        OP_EXEC => {
+            // A host program, run to completion. `issues/system/0165`.
+            // **Sealed: no host program either** — `date` would hand back the clock the seal took (`issues/system/0462d`).
+            if caller.data().grants.sealed {
+                return Ok(fault(FAULT_UNSUPPORTED, "this program was started sealed: it may not run a host program, which has a clock and random bytes of its own"));
+            }
+            // `bytes` is the program, its arguments, its input and the `NAME=value` pairs. Decoded lossily —
+            // a path or an argument that is not UTF-8 is a case the wac side cannot express anyway.
+            let lossy = |v: Vec<Vec<u8>>| -> Vec<String> {
+                v.into_iter().map(|b| String::from_utf8_lossy(&b).into_owned()).collect()
+            };
+            let mut packed = Packed::new(&bytes);
+            let (Some(path), Some(argv), Some(stdin), Some(env)) =
+                (packed.part(), packed.list(), packed.part(), packed.list())
+            else {
+                return Ok(fault(FAULT_OTHER, "the request's arguments do not parse"));
+            };
+            let path = String::from_utf8_lossy(&path).into_owned();
+            let (argv, env) = (lossy(argv), lossy(env));
+            let clear_env = (a & 1) != 0;
+            let inherit = (a & 2) != 0;
+            // Empty means "wherever this process already is", matching `spawn`'s `cwd`.
+            let cwd = String::from_utf8_lossy(&text.clone()).into_owned();
+            if !caller.data().grants.run {
+                let refused = Outcome::Exec(
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    "Not granted to this application".to_string(),
+                );
+                return now(Kind::Exec, refused);
+            }
+            // **On a thread, so the ticket is handed back while the child is still running.**
+            // Everything above reads wasm memory and has to happen here; nothing below touches the
+            // module. This used to run the child to completion inside the call and settle the ticket
+            // in the same breath, which made a `Pending<Exec>` on this host a promise of something
+            // that had already happened — while the other three hosts dispatch and return at once
+            // (`packages/platform/host/respond.ts`). Three concurrent `sleep 1` were three seconds
+            // here and one on Deno: issue 0211, and `packages/platform/test/wac/exec_test.wac` is
+            // where it is held. The second half of what it cost is worse than the lost overlap: a
+            // ticket that only exists after the work is over cannot be watched by `waitAny`, so a
+            // wedged child had nothing bounding it.
+            let id = caller.data().tickets.submit();
+            let table = caller.data().tickets.clone();
+            std::thread::spawn(move || {
+                // Nothing was consumed to make this, so there is nothing to hand back.
+                let _ = table.complete(id, run_host_program(path, argv, stdin, env, clear_env, inherit, cwd));
+            });
+            return later(Kind::Exec, id);
+        }
+        OP_CHMOD => {
+            let path = text.clone();
+            let mode = (a as i32) as u32 & 0o7777;
+            if !caller.data().grants.write {
+                return now(Kind::Change, denied_write_change());
+            }
+            let p = resolve(caller, &path);
+            // The whole mode, written as given — unlike `setExecutable` above, which reads the mode and
+            // changes one bit because that is all it promises. `issues/system/0296c`.
+            use std::os::unix::fs::PermissionsExt;
+            let outcome = match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)) {
+                Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+            };
+            return now(Kind::Change, outcome);
+        }
+        OP_SET_EXECUTABLE => {
+            let path = text.clone();
+            let on = a != 0;
+            if !caller.data().grants.write {
+                return now(Kind::Change, denied_write_change());
+            }
+            let p = resolve(caller, &path);
+            // Read the mode, change the one bit, write it back — the execute bits following read, which
+            // is `chmod +x`'s rule and the same arithmetic the two JavaScript hosts do. Setting a whole
+            // mode would also widen read and write, which the capability does not describe.
+            use std::os::unix::fs::PermissionsExt;
+            let outcome = match std::fs::metadata(&p) {
+                Ok(m) => {
+                    let mode = m.permissions().mode() & 0o7777;
+                    let bits = if on { mode | ((mode & 0o444) >> 2) } else { mode & !0o111 };
+                    match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(bits)) {
+                        Ok(()) => Outcome::Change(FAULT_NONE, String::new()),
+                        Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+                    }
+                }
+                Err(e) => Outcome::Change(fault_of(&e), e.to_string()),
+            };
+            return now(Kind::Change, outcome);
+        }
+        OP_CLOSE_FEED => {
+            // Ends a child's input **without stopping it**: a program that reads to the end before
+            // answering — `wc` is the obvious one — needs the end while it is still running.
+            let h = a as i32;
+            if let Some(c) = child_of(caller, h) {
+                c.stdin.finish();
+            }
+        }
+        _ => return Ok(fault(FAULT_UNSUPPORTED, &format!("request {op} is not one this host serves"))),
+    }
+    Ok(Reply::Nothing)
+}
+
+/// Bytes from the operating system's own generator.
+///
+/// `/dev/urandom` rather than a crate: it is the kernel's CSPRNG on the platform this targets, and a
+/// runtime that seeded its own would be inventing entropy. A read that fails is an error rather than
+/// a shorter answer — the failure a caller must not be able to miss is silently weak randomness.
+fn random_bytes(n: usize) -> Result<Vec<u8>, wasmtime::Error> {
+    use std::io::Read;
+    let mut out = vec![0u8; n];
+    if n > 0 {
+        let mut f = std::fs::File::open("/dev/urandom")
+            .map_err(|e| wasmtime::Error::msg(format!("randomBytes: /dev/urandom: {e}")))?;
+        f.read_exact(&mut out)
+            .map_err(|e| wasmtime::Error::msg(format!("randomBytes: /dev/urandom: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// Where output goes: a parent's queue for a spawned child, or the terminal. One place for both streams.
+fn emit(caller: &mut Caller<'_, Host>, bytes: &[u8], to_stderr: bool) -> bool {
+    if caller.data().out_closed[to_stderr as usize] {
+        return false;
+    }
+    // A spawned child writes to its parent's queues, never to the terminal.
+    if let Some(streams) = caller.data().as_child.as_ref().filter(|c| !c.inherit_out) {
+        let to = if to_stderr { streams.stderr.clone() } else { streams.stdout.clone() };
+        return to.write(bytes);
+    }
+    write_raw(bytes, to_stderr)
+}
+
+/// Point descriptor `fd` (1 or 2) at `/dev/null`: whoever reads the pipe it was sees the end, and the number
+/// stays taken, so nothing opened later receives a stray write meant for the terminal.
+fn close_std_stream(fd: i32) -> bool {
+    use std::io::Write;
+    if fd == 1 { let _ = std::io::stdout().flush(); } else { let _ = std::io::stderr().flush(); }
+    let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") else { return false };
+    use std::os::fd::AsRawFd;
+    unsafe { libc::dup2(null.as_raw_fd(), fd) == fd }
+}
+
+/// What a read answers when the program was built without the grant.
+///
+/// A `FileResult` rather than a trap, because "you may not" is an answer a program can act on and a
+/// trap is not — and `FAULT_NOT_GRANTED` rather than `FAULT_DENIED`, because the two are different
+/// facts: one is about this build, the other about this file.
+fn denied_read() -> Outcome {
+    // **The wording `platform.wac` derives from the fault**, which is the canonical one: its own
+    // `reasonOf` answers "Not granted to this application" for `FAULT_NOT_GRANTED`, and the V8 host
+    // says the same. This host said something else, so a program comparing the *message* got
+    // different answers from two hosts for one refusal — `issues/system/0169`.
+    Outcome::FileResult(false, Vec::new(), "Not granted to this application".into(), FAULT_NOT_GRANTED)
+}
+
+/// The network, refused because the build did not ask for it.
+fn denied_net() -> Outcome {
+    Outcome::Socket(-1, "network access not granted to this application".into(), String::new(), 0,
+                    FAULT_NOT_GRANTED)
+}
+
+fn denied_write_change() -> Outcome {
+    Outcome::Change(FAULT_NOT_GRANTED, "this program was not granted writing".into())
+}
+
+/// Faults, matching `FAULT_*` in `platform.wac` and `host/faults.ts`.
+const FAULT_NONE: i32 = 0;
+/// What a capability this host does not have answers — std's `Unsupported`.
+const FAULT_UNSUPPORTED: i32 = 9;
+/// The refusal's words, which std derives from `FAULT_NOT_GRANTED` the same way.
+const NOT_GRANTED: &str = "Not granted to this application";
+const FAULT_NOT_FOUND: i32 = 1;
+const FAULT_DENIED: i32 = 2;
+const FAULT_EXISTS: i32 = 3;
+const FAULT_NOT_EMPTY: i32 = 4;
+const FAULT_OTHER: i32 = 5;
+/// The host cannot express this name — `issues/system/0295c`, and `0065` before it.
+///
+/// A name that came *out* of `read_dir` lossily carries U+FFFD, and handing it back in names a file
+/// that does not exist. Saying "not found" about it reads as *the caller got the name wrong* rather
+/// than *this runtime cannot express it*.
+const FAULT_NOT_REPRESENTABLE: i32 = 6;
+/// Not an operating-system failure at all: the program was built without the capability.
+const FAULT_NOT_GRANTED: i32 = 7;
+/// A directory where a file was wanted.
+const FAULT_IS_DIR: i32 = 8;
+/// A file where a directory was wanted — `a/b/c` with `b` a file.
+const FAULT_NOT_A_DIR: i32 = 10;
+/// The filesystem will not take a write at all — `EROFS`.
+const FAULT_READ_ONLY: i32 = 11;
+/// `ENAMETOOLONG`, `ELOOP` and `ENOSPC` — see their `FAULT_*` in platform.wac.
+///
+/// Matched by **raw errno** rather than by `ErrorKind`: `InvalidFilename`, `FilesystemLoop` and
+/// `StorageFull` are all still behind the unstable `io_error_more` feature, and a host that needs a
+/// nightly compiler to categorise a full disk is not a host anybody can build. The numbers are
+/// Linux's, which is what this runtime is built for; a platform with different ones falls to
+/// `FAULT_OTHER` and keeps the behaviour it has today rather than getting a wrong category.
+const FAULT_NAME_TOO_LONG: i32 = 12;
+const FAULT_LOOP: i32 = 13;
+const FAULT_NO_SPACE: i32 = 14;
+/// The three a socket needs. Every code above is about a filesystem, and so was `fault_of` —
+/// a refused connection, an unreachable host and one that never answered all fell to `FAULT_OTHER`,
+/// which is one category for three things a caller acts on differently. `issues/system/0255c`.
+const FAULT_REFUSED: i32 = 15;
+const FAULT_UNREACHABLE: i32 = 16;
+const FAULT_TIMED_OUT: i32 = 17;
+const ENAMETOOLONG: i32 = 36;
+const ELOOP: i32 = 40;
+const ENOSPC: i32 = 28;
+
+/// A path as the operating system takes it. Bytes, because a name is bytes (wac-mono 0065).
+fn os_path(bytes: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+/// A path, resolved against the directory this program's parent gave it, when it gave one.
+///
+/// The failure this once caused is worth recording because it was invisible in the obvious tests. `cat f`
+/// worked and `cd sub; cat f` said "No such file or directory", because the shell hands a *relative*
+/// path down and expects the capability to resolve it — so every applet reading a named file broke the
+/// moment a script changed directory, and every test that did not `cd` passed. It was found by running
+/// the shell over the real filesystem against GNU coreutils, which is the only thing that looks at
+/// this surface at all.
+///
+/// An absolute path is left alone: `join` already does that, and saying so here is cheaper than
+/// remembering it.
+fn resolve(caller: &mut Caller<'_, Host>, path: &[u8]) -> std::path::PathBuf {
+    let p = os_path(path);
+    if p.is_absolute() {
+        return p;
+    }
+    if caller.data().cwd.is_empty() { p } else { os_path(&caller.data().cwd).join(p) }
+}
+
+/// Which `FAULT_*` an operating-system error is — `host/faults.ts`'s `faultOf`, in Rust.
+///
+/// **Three kinds, out of the seven the vocabulary has**, until this was written: everything but
+/// `NotFound` and `PermissionDenied` arrived as `FAULT_OTHER`, so the program printed whatever
+/// `std::io::Error` says instead of the category's words. That is the arrival test failing quietly —
+/// design/0001 wants one image to answer the same in two substantially different hosts, and this host
+/// said `File exists (os error 17)` where the JavaScript one said `File exists`, for `mkdir` on a
+/// directory that is already there. The wac program is identical; only the classification differed.
+///
+/// The kinds below are all stable in this toolchain. Anything genuinely unrecognised still gets
+/// `FAULT_OTHER`, which is what that category is for: the message is then the only information.
+fn fault_of(e: &std::io::Error) -> i32 {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => FAULT_NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => FAULT_DENIED,
+        std::io::ErrorKind::AlreadyExists => FAULT_EXISTS,
+        std::io::ErrorKind::DirectoryNotEmpty => FAULT_NOT_EMPTY,
+        std::io::ErrorKind::IsADirectory => FAULT_IS_DIR,
+        std::io::ErrorKind::NotADirectory => FAULT_NOT_A_DIR,
+        std::io::ErrorKind::ReadOnlyFilesystem => FAULT_READ_ONLY,
+        // **The network ones**, which this had none of until 2026-08-25: every socket failure that
+        // was not a refused *grant* arrived as `FAULT_OTHER`, so `Socket.fault` could not tell a
+        // refusal from a dead route from a silence. `HostUnreachable` and `NetworkUnreachable` are
+        // one category here on purpose — "there is nothing at that address" is what a caller does
+        // something about, and which layer noticed is not.
+        std::io::ErrorKind::ConnectionRefused => FAULT_REFUSED,
+        std::io::ErrorKind::HostUnreachable => FAULT_UNREACHABLE,
+        std::io::ErrorKind::NetworkUnreachable => FAULT_UNREACHABLE,
+        std::io::ErrorKind::TimedOut => FAULT_TIMED_OUT,
+        _ => match e.raw_os_error() {
+            Some(ENAMETOOLONG) => FAULT_NAME_TOO_LONG,
+            Some(ELOOP) => FAULT_LOOP,
+            Some(ENOSPC) => FAULT_NO_SPACE,
+            _ => FAULT_OTHER,
+        },
+    }
+}
+
+/// The fault a failed `stat` should carry — `host/faults.ts`'s `statFault`, in Rust.
+///
+/// A `stat` that found nothing was *answered*, so absence is `FAULT_NONE` and only the cases where the
+/// answer is genuinely unknowable are faults. This host passed `fault_of` straight through, so every
+/// failure that was not `NotFound` made `Stat::answered` false — and `test -e f/g` where `f` is a file
+/// exited 2 with a diagnostic here while the JavaScript host said plain false, as bash does.
+///
+/// `FAULT_NOT_A_DIR` rides along without making the `Stat` unanswerable; `platform.wac`'s `Stat.answered`
+/// is the half that makes that safe, and `packages/platform/test/faults.test.ts` holds the JavaScript
+/// host's rule for it.
+fn stat_fault(e: &std::io::Error) -> i32 {
+    match fault_of(e) {
+        FAULT_DENIED => FAULT_DENIED,
+        FAULT_NOT_A_DIR => FAULT_NOT_A_DIR,
+        _ => FAULT_NONE,
+    }
+}
+
+/// Open a file for reading, or the `Change` that says why not.
+// ── Children ──────────────────────────────────────────────────────────────────
+
+/// The child a handle belongs to, or None if it names something else.
+fn child_of(caller: &Caller<'_, Host>, handle: i32) -> Option<ChildProc> {
+    let table = caller.data().handles.lock().unwrap();
+    match table.get(handle)? {
+        Handle::Main(c) | Handle::Err(c) | Handle::Fs(c) => Some(c.clone()),
+        Handle::Net(_) | Handle::File(_) => None,
+    }
+}
+
+/// The stream `recv` reads for this handle: a child's standard output, or its error stream.
+fn child_stream(caller: &Caller<'_, Host>, handle: i32) -> Option<Arc<Stream>> {
+    let table = caller.data().handles.lock().unwrap();
+    match table.get(handle)? {
+        Handle::Main(c) => Some(c.stdout.clone()),
+        Handle::Err(c) => Some(c.stderr.clone()),
+        Handle::Fs(c) => Some(c.fsreq.clone()),
+        Handle::Net(_) | Handle::File(_) => None,
+    }
+}
+
+/// The socket a handle names.
+fn socket_at(caller: &Caller<'_, Host>, handle: i32) -> Option<Sock> {
+    let table = caller.data().handles.lock().unwrap();
+    match table.get(handle)? {
+        Handle::Net(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Put something in the handle table and answer its handle.
+fn keep(caller: &Caller<'_, Host>, what: Handle) -> i32 {
+    caller.data().handles.lock().unwrap().push(what)
+}
+
+/// "This world has no `spawn` at all" — -2 on every handle, and no message.
+///
+/// `platform.wac` gives -2 its own meaning for a reason it states: without it "a world that cannot
+/// spawn made every spawnable name *fail* rather than fall through", which hid `packages/box`'s own
+/// `wc` behind a `WACPATH` lookup that could never work. A missing capability is not a broken program.
+fn no_spawn_here() -> Result<Reply, wasmtime::Error> {
+    now(Kind::Child, Outcome::Child(-2, -2, -2, String::new()))
+}
+
+/// Everything needed to run a module we were handed, or why it cannot be run.
+///
+/// The manifest is read from the module rather than from beside it, which is the whole reason one
+/// artefact can be spawned: a host given bytes can find `__wacHost`'s signatures, the callback
+/// signatures and the grants without being told anything else. `native.ts` says why that must not be
+/// hardcoded anywhere.
+///
+/// Every failure is a `String` rather than an error, because the caller turns it into `Child.error`:
+/// a file that is not a wac program is a failed child, not a fault in the parent.
+fn world_from(engine: &Engine, wasm: &[u8]) -> Result<Arc<World>, String> {
+    let Some(text) = wacmanifest::manifest_in(wasm) else {
+        return Err("not a wac program: no `wac.manifest` section in it".into());
+    };
+    let m: Arc<Manifest> = serde_json::from_str::<Manifest>(&text)
+        .map(Arc::new)
+        .map_err(|e| format!("its `wac.manifest` section does not parse: {e}"))?;
+    if m.version != SUPPORTED_VERSION {
+        return Err(format!(
+            "manifest version {} — this runtime speaks {}",
+            m.version, SUPPORTED_VERSION
+        ));
+    }
+    // Content-keyed, so a module spawned in a loop is compiled once and a `.cwasm` is shared with
+    // every other process on this machine that runs it.
+    let module = compiled(engine, wasm).map_err(|e| format!("it does not compile: {e}"))?;
+    Ok(Arc::new(World { engine: engine.clone(), module, manifest: m, wasm: Arc::from(wasm) }))
+}
+
+/// Start a program on its own thread, given the world it runs in.
+///
+/// **`world` is a parameter because it is no longer always this module.** `spawnSelf` passes the
+/// caller's own — the same engine, module and manifest — and `spawn` passes one built from the bytes
+/// it was handed. Everything below is identical for the two, which is what says the confinement is a
+/// property of the *store* rather than of where the code came from: a child's `Store` is built on its
+/// own thread and nothing from the parent's crosses, because a `Val` is not `Send`.
+fn spawn_instance(
+    caller: &mut Caller<'_, Host>,
+    world: Arc<World>,
+    argv: Vec<Vec<u8>>,
+    want: i32,
+    cwd: Vec<u8>,
+    inherit_input: bool,
+    serve_fs: bool,
+    // `INHERIT_OUT`: the child writes this process's streams rather than the queues below. Always
+    // false for `spawnSelf`, which has no such flag — only `spawn` grew one.
+    inherit_out: bool,
+) -> Result<Reply, wasmtime::Error> {
+
+    // **A ceiling of the parent's own, intersected here rather than trusted.** `platform.wac`: "a
+    // parent built without `--allow-net` cannot hand `GRANT_NET` to anyone; asking is not an error,
+    // and the child simply finds the capability denied."
+    let mine = &caller.data().grants;
+    let grants = manifest::Grants {
+        read: mine.read && (want & GRANT_READ) != 0,
+        write: mine.write && (want & GRANT_WRITE) != 0,
+        env: mine.env && (want & GRANT_ENV) != 0,
+        // **Inheritable now** — see the sibling above and `issues/system/0264c`. A child gets `run`
+        // if it asked and its parent held it, which is what confinement means rather than what it
+        // forbids.
+        run: mine.run && (want & GRANT_RUN) != 0,
+        net: mine.net && (want & GRANT_NET) != 0,
+        sealed: mine.sealed || (want & GRANT_SEALED) != 0,
+    };
+
+    // Its input is uncapped and its two outputs are not: the parent chooses how much to send, and a
+    // child that writes for ever must be made to wait. `host/children.ts` divides them the same way.
+    let stdin = Arc::new(Stream::uncapped());
+    let stdout = Arc::new(Stream::capped());
+    let stderr = Arc::new(Stream::capped());
+    // The filesystem channel: the child asks on `fsreq` and its parent answers on `fsrep`. Both
+    // ends exist whether or not either side uses them — a channel nobody speaks on costs two
+    // queues, and deciding at spawn time which children may ask would be a grant, which this is
+    // deliberately not. See `Child.fsHandle`.
+    let fsreq = Arc::new(Stream::uncapped());
+    let fsrep = Arc::new(Stream::uncapped());
+    if !serve_fs {
+        // **A parent that will not serve says so before the child runs.** Finishing the reply queue
+        // is what makes `Fs.overParent` answer immediately instead of waiting: the child asks one
+        // question, reads end-of-channel, and falls back to the host.
+        fsrep.finish();
+    }
+    let exit = Arc::new(Exit::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    if inherit_input {
+        // The child reads the *process's* input rather than what its parent sends, so nothing will
+        // arrive on this queue and a reader must not wait for it. Ending it here is what stops a
+        // `readChunk` in the child from blocking for ever — the same shape as wac-mono 0110.
+        stdin.finish();
+    }
+
+    let child = ChildProc {
+        stdin: stdin.clone(),
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+        fsreq: fsreq.clone(),
+        fsrep: fsrep.clone(),
+        exit: exit.clone(),
+        stop: stop.clone(),
+    };
+    let handle = keep(caller, Handle::Main(child.clone()));
+    let err_handle = keep(caller, Handle::Err(child.clone()));
+    let fs_handle = keep(caller, Handle::Fs(child));
+
+    let streams = AsChild { stdin, stdout, stderr, fsreq, fsrep, inherits: inherit_input, inherit_out };
+    std::thread::spawn(move || {
+        let (code, how, m, text) = run_child(world, argv, grants, cwd, streams, stop);
+        exit.end(code, how, m, text);
+    });
+
+    now(Kind::Child, Outcome::Child(handle, err_handle, fs_handle, String::new()))
+}
+
+/// The requests, numbered as `std/platform.wac`'s `OP_*` numbers them.
+const OP_DROP: i32 = 0;
+/// `Launch.detached`, in a spawn's `b`: dropping the child's ticket does not stop it.
+const DETACHED: i64 = 4;
+const OP_NOW_MILLIS: i32 = 1;
+/// `Child.ended()`: how a child ended — `Outcome::Ended`.
+const OP_CHILD_ENDED: i32 = 74;
+const OP_MONOTONIC_NANOS: i32 = 2;
+const OP_RANDOM_BYTES: i32 = 3;
+const OP_ARG_COUNT: i32 = 6;
+const OP_ARG: i32 = 7;
+const OP_ENV: i32 = 8;
+const OP_READ_FILE: i32 = 9;
+const OP_WRITE_FILE: i32 = 10;
+const OP_READ_STDIN: i32 = 11;
+const OP_WRITE_STDOUT: i32 = 12;
+const OP_STAT: i32 = 13;
+const OP_READ_DIR: i32 = 14;
+const OP_MKDIR: i32 = 15;
+const OP_REMOVE: i32 = 16;
+const OP_RENAME: i32 = 17;
+const OP_READ_CHUNK: i32 = 19;
+const OP_CONNECT: i32 = 21;
+const OP_LISTEN: i32 = 22;
+const OP_ACCEPT: i32 = 23;
+const OP_RECV: i32 = 24;
+const OP_SEND: i32 = 25;
+const OP_CLOSE_SOCKET: i32 = 26;
+const OP_SPAWN: i32 = 27;
+const OP_EXIT_CODE: i32 = 28;
+const OP_CLOSE_FEED: i32 = 29;
+const OP_SLEEP_MILLIS: i32 = 30;
+const OP_CWD: i32 = 41;
+const OP_LINK_STAT: i32 = 47;
+const OP_WRITE_STDERR: i32 = 48;
+const OP_SPAWN_SELF: i32 = 49;
+const OP_SET_EXECUTABLE: i32 = 52;
+const OP_BIND_DATAGRAM: i32 = 53;
+const OP_RECEIVE_FROM: i32 = 54;
+const OP_SEND_TO: i32 = 55;
+const OP_CLOSE_SEND: i32 = 57;
+const OP_EXEC: i32 = 59;
+const OP_CHMOD: i32 = 60;
+const OP_OPEN_FILE: i32 = 61;
+const OP_CLOSE_FILE: i32 = 62;
+const OP_CLOSE_OUTPUT: i32 = 63;
+const OP_LOAD: i32 = 64;
+const OP_CALL: i32 = 65;
+const OP_UNLOAD: i32 = 66;
+const OP_VALIDATE: i32 = 67;
+const OP_CAPABILITY: i32 = 68;
+const OP_READ_AT: i32 = 69;
+const OP_WRITE_AT: i32 = 70;
+const OP_FILE_SIZE: i32 = 71;
+const OP_TRUNCATE_FILE: i32 = 72;
+const OP_SYNC_FILE: i32 = 73;
+
+/// **`readAt` answered from the page cache, without a thread** — `issues/system/0471w`.
+///
+/// A positioned read used to take a thread of its own, spawned for it: about 55 µs on a 4-vCPU VM, against half a
+/// microsecond for the `pread` itself and five for the round trip to the program — so a 16-byte read cost what a
+/// 64 KB one did, and 64 in flight did not overlap, because the spawns were paid one after another on the program's
+/// thread. `preadv2` with `RWF_NOWAIT` reads only what the page cache already holds and refuses (`EAGAIN`) rather
+/// than wait for the disk, so it can be answered here, at once, without blocking the program on I/O. `None` when it
+/// would have to wait, or the system or the filesystem cannot say: the caller takes the slow path, which reads again
+/// in full on `on_file_pool`.
+#[cfg(target_os = "linux")]
+fn read_at_cached(f: &std::fs::File, n: usize, offset: u64) -> Option<std::io::Result<Vec<u8>>> {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; n];
+    let mut got = 0usize;
+    while got < n {
+        let iov = libc::iovec { iov_base: buf[got..].as_mut_ptr() as *mut libc::c_void, iov_len: n - got };
+        // SAFETY: one iovec over the unfilled tail of a buffer owned here; the descriptor is open for the call.
+        let r = unsafe { libc::preadv2(f.as_raw_fd(), &iov, 1, (offset + got as u64) as libc::off_t, libc::RWF_NOWAIT) };
+        if r > 0 {
+            got += r as usize;
+            continue;
+        }
+        if r == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => return None,
+            _ => return Some(Err(e)),
+        }
+    }
+    buf.truncate(got);
+    Some(Ok(buf))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_at_cached(_f: &std::fs::File, _n: usize, _offset: u64) -> Option<std::io::Result<Vec<u8>>> {
+    None
+}
+
+/// **Standing threads for the file operations that may block** — `issues/system/0471w`: a read the page cache could not
+/// answer, a write, a size, a truncate, a sync. They each spawned a thread, at about 55 µs a spawn; these are started
+/// once, on first use, and a job is a channel send. Eight, so that a few slow syncs do not hold up every read behind
+/// them; shared by every program in the process, children included, which is as many as one machine's disk wants.
+fn on_file_pool(job: impl FnOnce() + Send + 'static) {
+    type Job = Box<dyn FnOnce() + Send>;
+    static POOL: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for _ in 0..8 {
+            let rx = rx.clone();
+            std::thread::spawn(move || loop {
+                let next = rx.lock().unwrap().recv();
+                match next {
+                    Ok(job) => job(),
+                    Err(_) => return,
+                }
+            });
+        }
+        std::sync::Mutex::new(tx)
+    });
+    let _ = pool.lock().unwrap().send(Box::new(job));
+}
+
+/// Up to `n` bytes of `f` from `offset`, fewer only where it ends — `Files.openRandom`'s `readAt`.
+fn read_at(f: &std::fs::File, n: usize, offset: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    let mut got = 0;
+    while got < n {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[got..], offset + got as u64);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[got..], offset + got as u64);
+        match r {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
+}
+
+/// All of `b` written to `f` from `offset`.
+fn write_at(f: &std::fs::File, b: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::write_all_at(f, b, offset);
+    #[cfg(windows)]
+    {
+        let mut put = 0;
+        while put < b.len() {
+            put += std::os::windows::fs::FileExt::seek_write(f, &b[put..], offset + put as u64)?;
+        }
+        Ok(())
+    }
+}
+
+/// `GRANT_*`, matching `platform.wac`.
+const GRANT_READ: i32 = 1;
+const GRANT_WRITE: i32 = 2;
+const GRANT_NET: i32 = 4;
+const GRANT_ENV: i32 = 8;
+/// Running a *host* program — `Cli.exec`. Bit 16, and the last to be allocated: it is the one
+/// authority a confined module's confinement is about, so it was refused outright until there was a
+/// bit to narrow with. `issues/system/0264c`.
+const GRANT_RUN: i32 = 16;
+/// `GRANT_SEALED` in `platform.wac`: no clock and no random bytes, for this program and whatever it starts.
+const GRANT_SEALED: i32 = 32;
+
+/// A request's packed `bytes`: parts that are a little-endian `u32` length then the bytes, and lists that
+/// are a `u32` count then their parts — design/system/0013's request table.
+struct Packed<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Packed<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Packed { b, at: 0 }
+    }
+
+    fn u32(&mut self) -> Option<usize> {
+        let w = self.b.get(self.at..self.at + 4)?;
+        self.at += 4;
+        Some(u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize)
+    }
+
+    fn part(&mut self) -> Option<Vec<u8>> {
+        let n = self.u32()?;
+        let v = self.b.get(self.at..self.at.checked_add(n)?)?.to_vec();
+        self.at += n;
+        Some(v)
+    }
+
+    fn list(&mut self) -> Option<Vec<Vec<u8>>> {
+        let n = self.u32()?;
+        (0..n).map(|_| self.part()).collect()
+    }
+}
+
+/// `spawn`'s and `spawnSelf`'s `bytes`: the module (empty for this program), then the arguments.
+fn spawn_parts(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut p = Packed::new(bytes);
+    Some((p.part()?, p.list()?))
+}
+
+/// Exactly the bytes given, which is what `write` means. Answers whether they landed.
+fn write_raw(bytes: &[u8], to_stderr: bool) -> bool {
+    use std::io::Write;
+    let ok = if to_stderr {
+        std::io::stderr().write_all(bytes).is_ok()
+    } else {
+        std::io::stdout().write_all(bytes).is_ok()
+    };
+    // Unbuffered as far as the program is concerned: a shell that writes a prompt and then waits must
+    // not have the prompt sitting in this process's buffer.
+    let _ = if to_stderr { std::io::stderr().flush() } else { std::io::stdout().flush() };
+    ok
+}
+
+/// A host program, run to completion, off the wasm thread — the body of `Cap::Exec`.
+///
+/// Named apart from `run_child` above, which starts a confined **wasm module**: `Cli.exec` and
+/// `spawn` are separate capabilities for exactly that reason, and two functions called the same
+/// thing would undo the distinction the capability list is built on.
+///
+/// Lifted out of the capability call so the ticket can be handed back before any of this happens;
+/// see the note at `Cap::Exec` and issue 0211. Nothing in here reads wasm memory, which is what
+/// makes it liftable at all.
+fn run_host_program(
+    path: String,
+    argv: Vec<String>,
+    stdin: Vec<u8>,
+    env: Vec<String>,
+    clear_env: bool,
+    inherit: bool,
+    cwd: String,
+) -> Outcome {
+    // An argument *vector*, never a shell line: a value containing a space or a semicolon
+    // arrives whole. A caller who wants a shell names `/bin/sh -c`.
+    let mut cmd = std::process::Command::new(&path);
+    cmd.args(&argv).stdin(std::process::Stdio::piped());
+    // **Empty means "wherever this process already is"**, which is `spawn`'s rule for the same
+    // parameter — so a caller with no opinion keeps the behaviour it had. `issues/system/0290b`.
+    if !cwd.is_empty() {
+        cmd.current_dir(&cwd);
+    }
+    // **`inherit` is the real file descriptor**: the child writes to this process's own stdout and
+    // stderr, so there is nothing here to collect and the answer below carries none.
+    if inherit {
+        cmd.stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit());
+    } else {
+        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    }
+    // Inherited unless the caller says otherwise — `issues/system/0198`, where the authority to
+    // run a program has been carrying the authority to read the environment. With `clear_env` the
+    // pairs below are the whole of what the child gets.
+    if clear_env {
+        cmd.env_clear();
+    }
+    for pair in &env {
+        // Split at the *first* `=`: a value may contain one and a name may not. A string with no
+        // `=` is dropped rather than being a fault — there is nothing it could mean.
+        if let Some(at) = pair.find('=') {
+            if at > 0 {
+                cmd.env(&pair[..at], &pair[at + 1..]);
+            }
+        }
+    }
+    match cmd.spawn() {
+        Err(e) => Outcome::Exec(0, Vec::new(), Vec::new(), format!("{path}: {e}")),
+        Ok(mut child) if inherit => {
+            // Nothing to drain: the deadlock the buffered path below is careful about is a property
+            // of reading a child's output, and this child's output is not coming here. Its input
+            // still is, and closing it is still ours to do.
+            if let Some(mut w) = child.stdin.take() {
+                use std::io::Write;
+                let _ = w.write_all(&stdin);
+            }
+            match child.wait() {
+                Err(e) => Outcome::Exec(0, Vec::new(), Vec::new(), format!("{path}: {e}")),
+                Ok(status) => {
+                    Outcome::Exec(status.code().unwrap_or(-1), Vec::new(), Vec::new(), String::new())
+                }
+            }
+        }
+        Ok(mut child) => {
+            // **Draining starts before the write, not after.** A child that answers while it
+            // is still being fed — `cat`, `grep`, any filter — blocks on its own output once
+            // the pipe buffer is full, and a host that writes the whole of stdin first blocks
+            // on the write. Both waiting on the other.
+            //
+            // `wait_with_output` does drain both pipes, which is what the comment here used
+            // to say, and it is not enough: it does not start until the write has finished.
+            // Two megabytes through `cat` hung every host —
+            // `packages/platform/test/wac/exec_test.wac`.
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            let (err_tx, err_rx) = std::sync::mpsc::channel();
+            let mut out_pipe = child.stdout.take();
+            let mut err_pipe = child.stderr.take();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut v = Vec::new();
+                if let Some(p) = out_pipe.as_mut() {
+                    let _ = p.read_to_end(&mut v);
+                }
+                let _ = out_tx.send(v);
+            });
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut v = Vec::new();
+                if let Some(p) = err_pipe.as_mut() {
+                    let _ = p.read_to_end(&mut v);
+                }
+                let _ = err_tx.send(v);
+            });
+            // Dropped at the end of the block, which is what closes the child's input: a
+            // program that reads to the end needs the end to arrive.
+            if let Some(mut w) = child.stdin.take() {
+                use std::io::Write;
+                let _ = w.write_all(&stdin);
+            }
+            let out = out_rx.recv().unwrap_or_default();
+            let err = err_rx.recv().unwrap_or_default();
+            match child.wait() {
+                Err(e) => Outcome::Exec(0, Vec::new(), Vec::new(), format!("{path}: {e}")),
+                // A signalled child has no code; -1 rather than 0, never read as success.
+                Ok(status) => Outcome::Exec(
+                    status.code().unwrap_or(-1),
+                    out,
+                    err,
+                    String::new(),
+                ),
+            }
+        }
+    }
+}

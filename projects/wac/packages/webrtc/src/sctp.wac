@@ -1,0 +1,487 @@
+// SCTP — RFC 4960, the reliable transport a WebRTC data channel is made of.
+//
+// Step 4 of `design/system/0008`, and the largest protocol in the stack. This increment is the
+// framing and the association handshake: the common header, chunks, and INIT through COOKIE-ACK.
+// DATA, SACK and the retransmission machinery are the next one.
+//
+// ## Why a whole transport inside another one
+//
+// A data channel needs *reliable, ordered, message-oriented* delivery, and DTLS gives none of the
+// three — it protects datagrams and loses them exactly as UDP does. TCP would give the first two and
+// not the third, and cannot be run inside DTLS anyway. SCTP is the protocol that already had all
+// three, so WebRTC put it inside DTLS rather than inventing a fourth thing. That is the whole
+// architectural story, and it is why this file exists at all.
+//
+// ## The checksum is CRC-32c, not CRC-32
+//
+// Castagnoli's polynomial, `0x1EDC6F41`, reflected to `0x82F63B78` — a different one from
+// `packages/gzip`'s, which is why that is not reused here. The two agree on nothing, so getting it
+// wrong is caught by the first packet a real peer sees rather than by anything subtle.
+//
+// **It is computed with the checksum field set to zero** and then written into it, which is the
+// ordinary trick and the ordinary bug: computing it over a packet that already has a checksum gives
+// a value that verifies only against itself.
+
+/**
+ * CRC-32c over `data`, reflected, with the standard `0xFFFFFFFF` initial and final xor.
+ *
+ * Bitwise rather than table-driven. A table is 1 KB and this runs over handshake packets a few
+ * hundred bytes long a handful of times per association — the table would be the larger cost, and
+ * `packages/gzip`'s CRC-32 keeps one because it runs over megabytes.
+ */
+export i32 crc32c(u8[] data) {
+  // `0xFFFFFFFF` is already an `i32` literal — its bit pattern is what an `i32` holds, so there is
+  // nothing to reinterpret.
+  i32 crc = 0xFFFFFFFF;
+  for (i32 i = 0; i < data.len(); i++) {
+    crc = crc ^ data[i] as i32;
+    for (i32 bit = 0; bit < 8; bit++) {
+      // The reflected polynomial. `>>>` because the register is a bit pattern rather than a number:
+      // an arithmetic shift would smear the top bit down and produce a checksum that is wrong only
+      // for inputs that happen to set it.
+      crc = ((crc >>> 1) ^ (0x82F63B78 & (0 - (crc & 1))));
+    }
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+/** Chunk types, RFC 4960 §3.2 and RFC 8260 for the ones a data channel adds. */
+export i32 chunkData()            { return 0; }
+export i32 chunkInit()            { return 1; }
+export i32 chunkInitAck()         { return 2; }
+export i32 chunkSack()            { return 3; }
+export i32 chunkHeartbeat()       { return 4; }
+export i32 chunkHeartbeatAck()    { return 5; }
+export i32 chunkAbort()           { return 6; }
+export i32 chunkShutdown()        { return 7; }
+export i32 chunkShutdownAck()     { return 8; }
+export i32 chunkError()           { return 9; }
+export i32 chunkCookieEcho()      { return 10; }
+export i32 chunkCookieAck()       { return 11; }
+export i32 chunkShutdownComplete(){ return 14; }
+/** RFC 8260's I-DATA, which carries a message identifier so streams can interleave. */
+export i32 chunkForwardTsn()      { return 192; }
+
+/** One chunk, its four-byte header separated from its value. */
+export struct Chunk {
+  bool ok;
+  i32 kind;
+  i32 flags;
+  u8[] value;
+}
+
+/** How many bytes the chunk at `at` occupies, padding included, or -1. */
+export i32 chunkSize(u8[] b, i32 at) {
+  if (at < 0 || at + 4 > b.len()) { return -1; }
+  i32 len = (b[at + 2] as i32 << 8) | b[at + 3] as i32;
+  // **A length under four is a malformed chunk and not a small one.** Without this a zero length is
+  // a step of zero and the walk below never terminates, which is the classic way a packet parser
+  // hangs on input somebody else chose.
+  if (len < 4 || at + len > b.len()) { return -1; }
+  return (len + 3) & ~3;
+}
+
+/** Parse the chunk at `at`. Its value excludes the four-byte header and any padding. */
+export Chunk parseChunk(u8[] b, i32 at) {
+  if (chunkSize(b, at) < 0) { return Chunk(false, 0, 0, u8[]()); }
+  i32 len = (b[at + 2] as i32 << 8) | b[at + 3] as i32;
+  u8[] v = u8[].filled(len - 4, 0);
+  for (i32 i = 0; i < v.len(); i++) { v[i] = b[at + 4 + i]; }
+  return Chunk(true, b[at] as i32, b[at + 1] as i32, v);
+}
+
+/** A chunk with its header, padded to a multiple of four. */
+export u8[] chunk(i32 kind, i32 flags, u8[] value) {
+  i32 len = 4 + value.len();
+  u8[] out = u8[].filled((len + 3) & ~3, 0);
+  out[0] = kind as@ u8;
+  out[1] = flags as@ u8;
+  out[2] = ((len >> 8) & 0xFF) as@ u8;
+  out[3] = (len & 0xFF) as@ u8;
+  out.copyFrom(value, 0, 4, value.len());
+  return out;
+}
+
+/** The verification tag a packet carries — zero in an INIT and the peer's tag in everything else. */
+export i32 verificationTag(u8[] b) {
+  if (b.len() < 12) { return 0; }
+  return (b[4] as i32 << 24) | (b[5] as i32 << 16) | (b[6] as i32 << 8) | b[7] as i32;
+}
+
+/** Where the chunks start. The common header is twelve bytes and never varies. */
+export i32 chunksAt() { return 12; }
+
+/**
+ * A packet: the common header, the chunks, and a CRC-32c over the whole with the field zeroed.
+ *
+ * WebRTC fixes both ports at 5000 and ignores them — the association is identified by the DTLS
+ * connection it runs in, so there is nothing to multiplex and the numbers are vestigial. They are
+ * still arguments here rather than constants, because a file that hard-coded them would be wrong
+ * about SCTP rather than specific about WebRTC.
+ */
+export u8[] packet(i32 sourcePort, i32 destPort, i32 tag, u8[] chunks) {
+  u8[] out = u8[].filled(12 + chunks.len(), 0);
+  out[0] = ((sourcePort >> 8) & 0xFF) as@ u8;
+  out[1] = (sourcePort & 0xFF) as@ u8;
+  out[2] = ((destPort >> 8) & 0xFF) as@ u8;
+  out[3] = (destPort & 0xFF) as@ u8;
+  out[4] = ((tag >> 24) & 0xFF) as@ u8;
+  out[5] = ((tag >> 16) & 0xFF) as@ u8;
+  out[6] = ((tag >> 8) & 0xFF) as@ u8;
+  out[7] = (tag & 0xFF) as@ u8;
+  // Bytes 8..11 stay zero while the checksum is computed, which is what makes the value verifiable.
+  out.copyFrom(chunks, 0, 12, chunks.len());
+  i32 c = crc32c(out);
+  // **Little-endian**, alone among every other field in the protocol. RFC 4960 §6.8 says so and
+  // gives no reason; a big-endian checksum is the mistake that makes a packet verify against your
+  // own code and nobody else's.
+  out[8] = (c & 0xFF) as@ u8;
+  out[9] = ((c >> 8) & 0xFF) as@ u8;
+  out[10] = ((c >> 16) & 0xFF) as@ u8;
+  out[11] = ((c >> 24) & 0xFF) as@ u8;
+  return out;
+}
+
+/** Whether a packet's checksum is the one its bytes imply. */
+export bool checksumOk(u8[] b) {
+  if (b.len() < 12) { return false; }
+  u8[] copy = u8[].filled(b.len(), 0);
+  copy.copyFrom(b, 0, 0, b.len());
+  copy[8] = 0; copy[9] = 0; copy[10] = 0; copy[11] = 0;
+  i32 c = crc32c(copy);
+  return (c & 0xFF) == b[8] as i32 && ((c >> 8) & 0xFF) == b[9] as i32
+      && ((c >> 16) & 0xFF) == b[10] as i32 && ((c >> 24) & 0xFF) == b[11] as i32;
+}
+
+/**
+ * An INIT chunk's value: the initiate tag, the advertised window, the stream counts and the initial
+ * TSN, then any parameters.
+ *
+ * `outbound` and `inbound` are how many streams each end will open, and a data channel wants far
+ * fewer than the 65535 a maximum would allow — the number is a promise about memory, since a
+ * receiver allocates reassembly state per stream.
+ */
+export u8[] initValue(i32 initiateTag, i32 window, i32 outbound, i32 inbound, i32 initialTsn,
+                      u8[] params) {
+  u8[] out = u8[].filled(16 + params.len(), 0);
+  out[0] = ((initiateTag >> 24) & 0xFF) as@ u8;
+  out[1] = ((initiateTag >> 16) & 0xFF) as@ u8;
+  out[2] = ((initiateTag >> 8) & 0xFF) as@ u8;
+  out[3] = (initiateTag & 0xFF) as@ u8;
+  out[4] = ((window >> 24) & 0xFF) as@ u8;
+  out[5] = ((window >> 16) & 0xFF) as@ u8;
+  out[6] = ((window >> 8) & 0xFF) as@ u8;
+  out[7] = (window & 0xFF) as@ u8;
+  out[8] = ((outbound >> 8) & 0xFF) as@ u8;
+  out[9] = (outbound & 0xFF) as@ u8;
+  out[10] = ((inbound >> 8) & 0xFF) as@ u8;
+  out[11] = (inbound & 0xFF) as@ u8;
+  out[12] = ((initialTsn >> 24) & 0xFF) as@ u8;
+  out[13] = ((initialTsn >> 16) & 0xFF) as@ u8;
+  out[14] = ((initialTsn >> 8) & 0xFF) as@ u8;
+  out[15] = (initialTsn & 0xFF) as@ u8;
+  out.copyFrom(params, 0, 16, params.len());
+  return out;
+}
+
+/**
+ * An INIT-ACK: the same sixteen bytes an INIT has, then a **state cookie** parameter.
+ *
+ * The cookie is what makes the four-way handshake worth having. A server that allocated an
+ * association on the INIT would allocate one for every forged source address; instead it puts
+ * everything it would need to remember *into* the cookie, sends it, and remembers nothing until the
+ * client echoes it back. So the cookie's contents are the server's business entirely — a real one is
+ * authenticated with a key only the server holds, and a test's can be anything at all.
+ */
+export u8[] initAckValue(i32 initiateTag, i32 window, i32 outbound, i32 inbound, i32 initialTsn,
+                         u8[] cookie) {
+  i32 paramLen = 4 + cookie.len();
+  u8[] param = u8[].filled((paramLen + 3) & ~3, 0);
+  param[0] = 0x00; param[1] = 0x07;              // state cookie
+  param[2] = ((paramLen >> 8) & 0xFF) as@ u8;
+  param[3] = (paramLen & 0xFF) as@ u8;
+  param.copyFrom(cookie, 0, 4, cookie.len());
+  return initValue(initiateTag, window, outbound, inbound, initialTsn, param);
+}
+
+/** The advertised receiver window an INIT or INIT-ACK carries. */
+export i32 initWindow(u8[] value) {
+  if (value.len() < 8) { return 0; }
+  return (value[4] as i32 << 24) | (value[5] as i32 << 16) | (value[6] as i32 << 8) | value[7] as i32;
+}
+
+/** The initial TSN an INIT or INIT-ACK carries — the first data it will send. */
+export i32 initTsn(u8[] value) {
+  if (value.len() < 16) { return 0; }
+  return (value[12] as i32 << 24) | (value[13] as i32 << 16) | (value[14] as i32 << 8) | value[15] as i32;
+}
+
+/** The initiate tag out of an INIT or INIT-ACK value — what our packets must carry back. */
+export i32 initiateTag(u8[] value) {
+  if (value.len() < 4) { return 0; }
+  return (value[0] as i32 << 24) | (value[1] as i32 << 16) | (value[2] as i32 << 8) | value[3] as i32;
+}
+
+// ── DATA, SACK, and what a data channel puts inside them ─────────────────────────────────────────
+
+/**
+ * The flags on a DATA chunk. `B` and `E` mark the first and last fragment of a message, so a
+ * message that fits in one chunk has both — which is the ordinary case and the one an implementation
+ * forgets, because a lone fragment with neither set is a middle piece of a message that never ends.
+ */
+/**
+ * Whether TSN `a` comes before TSN `b`, by RFC 1982 serial arithmetic.
+ *
+ * TSNs are unsigned 32-bit and **wrap**, so `a < b` on the numbers is wrong twice over: held in an
+ * `i32` half of them are negative to begin with, and even unsigned the comparison inverts when a
+ * sequence crosses 2^32. Subtracting and testing the sign is right in both cases, because the
+ * subtraction wraps the same way the counter does.
+ */
+export bool tsnBefore(i32 a, i32 b) { return (a - b) < 0; }
+
+export i32 dataFlagEnd()   { return 0x01; }
+export i32 dataFlagBegin() { return 0x02; }
+/** Unordered delivery. A data channel sets it per channel, not per message. */
+export i32 dataFlagUnordered() { return 0x04; }
+
+// The payload protocol identifiers WebRTC assigns, RFC 8831. The *empty* variants exist because
+// SCTP cannot carry a zero-length message — a DATA chunk with no user data is a protocol error — so
+// an empty string is sent as one padding byte under a different identifier and the receiver knows
+// to discard it. That is the kind of detail that is invisible until a peer sends `""`.
+export i32 ppidDcep()        { return 50; }
+export i32 ppidString()      { return 51; }
+export i32 ppidBinary()      { return 53; }
+export i32 ppidStringEmpty() { return 56; }
+export i32 ppidBinaryEmpty() { return 57; }
+
+/** A DATA chunk's value: TSN, stream id, stream sequence, protocol identifier, then the payload. */
+export u8[] dataValue(i32 tsn, i32 streamId, i32 streamSeq, i32 ppid, u8[] payload) {
+  u8[] out = u8[].filled(12 + payload.len(), 0);
+  out[0] = ((tsn >> 24) & 0xFF) as@ u8;
+  out[1] = ((tsn >> 16) & 0xFF) as@ u8;
+  out[2] = ((tsn >> 8) & 0xFF) as@ u8;
+  out[3] = (tsn & 0xFF) as@ u8;
+  out[4] = ((streamId >> 8) & 0xFF) as@ u8;
+  out[5] = (streamId & 0xFF) as@ u8;
+  out[6] = ((streamSeq >> 8) & 0xFF) as@ u8;
+  out[7] = (streamSeq & 0xFF) as@ u8;
+  out[8] = ((ppid >> 24) & 0xFF) as@ u8;
+  out[9] = ((ppid >> 16) & 0xFF) as@ u8;
+  out[10] = ((ppid >> 8) & 0xFF) as@ u8;
+  out[11] = (ppid & 0xFF) as@ u8;
+  out.copyFrom(payload, 0, 12, payload.len());
+  return out;
+}
+
+/** The TSN a DATA chunk carries. */
+export i32 dataTsn(u8[] value) {
+  if (value.len() < 12) { return 0; }
+  return (value[0] as i32 << 24) | (value[1] as i32 << 16) | (value[2] as i32 << 8) | value[3] as i32;
+}
+
+/** Its stream id, stream sequence and protocol identifier. */
+export i32 dataStreamId(u8[] value) {
+  return value.len() < 12 ? -1 : (value[4] as i32 << 8) | value[5] as i32;
+}
+export i32 dataStreamSeq(u8[] value) {
+  return value.len() < 12 ? -1 : (value[6] as i32 << 8) | value[7] as i32;
+}
+export i32 dataPpid(u8[] value) {
+  if (value.len() < 12) { return -1; }
+  return (value[8] as i32 << 24) | (value[9] as i32 << 16) | (value[10] as i32 << 8) | value[11] as i32;
+}
+
+/** Its payload, which is everything after the twelve-byte prologue. */
+export u8[] dataPayload(u8[] value) {
+  if (value.len() < 12) { return u8[](); }
+  u8[] out = u8[].filled(value.len() - 12, 0);
+  out.copyFrom(value, 12, 0, out.len());
+  return out;
+}
+
+/**
+ * How many chunks a packet holds — because **a packet holds several**.
+ *
+ * A large message arrives as a run of DATA chunks and a peer bundles as many into one packet as
+ * fit, so a reader that takes the first sees a fraction of what arrived. That is the same shape as
+ * a DTLS datagram holding several records and a DTLS flight spanning datagrams, and it has now been
+ * got wrong at both layers. This walk lived in a test probe until `session.wac` needed it, which is
+ * the wrong home for the one thing nothing here gets right by accident.
+ */
+export i32 chunkCount(u8[] b) {
+  i32 n = 0;
+  i32 at = chunksAt();
+  while (chunkSize(b, at) > 0) { n = n + 1; at = at + chunkSize(b, at); }
+  return n;
+}
+
+/** Where chunk `index` starts, or -1. */
+export i32 chunkOffset(u8[] b, i32 index) {
+  i32 at = chunksAt();
+  for (i32 i = 0; i < index; i++) {
+    if (chunkSize(b, at) <= 0) { return -1; }
+    at = at + chunkSize(b, at);
+  }
+  return chunkSize(b, at) > 0 ? at : -1;
+}
+
+/** The kind of chunk `index`, or -1. */
+export i32 chunkKindAt(u8[] b, i32 index) {
+  i32 at = chunkOffset(b, index);
+  return at < 0 ? -1 : parseChunk(b, at).kind;
+}
+
+/** The flags on chunk `index`, which is where B and E live on a DATA chunk. */
+export i32 chunkFlagsAt(u8[] b, i32 index) {
+  i32 at = chunkOffset(b, index);
+  return at < 0 ? 0 : parseChunk(b, at).flags;
+}
+
+/** The value of chunk `index`, or empty. */
+export u8[] chunkValueAt(u8[] b, i32 index) {
+  i32 at = chunkOffset(b, index);
+  return at < 0 ? u8[]() : parseChunk(b, at).value;
+}
+
+/**
+ * A SACK's value with no gap blocks: the cumulative TSN acknowledged and the receiver's window.
+ *
+ * **Cumulative means everything up to and including it**, so a SACK is not a list of what arrived —
+ * it is one number plus the exceptions. This is the no-exceptions case, which is what a receiver
+ * with nothing out of order sends; `sackValueGaps` carries the exceptions.
+ */
+export u8[] sackValue(i32 cumulativeTsn, i32 window) {
+  return sackValueGaps(cumulativeTsn, window, i32[](), i32[](), 0);
+}
+
+/**
+ * A SACK's value with gap blocks: the cumulative TSN, the window, then each run above it.
+ *
+ * **Cumulative understates what arrived.** If 5 is lost and 6, 7, 8 follow it, a SACK carrying only
+ * "4" makes the peer resend all four — and three of them are already here. A gap block is one
+ * contiguous run above the cumulative point, written as start and end *offsets* from it so that two
+ * bytes each is enough, and reporting them turns one loss into one retransmission.
+ */
+export u8[] sackValueGaps(i32 cumulativeTsn, i32 window, i32[] starts, i32[] ends, i32 runs) {
+  u8[] out = u8[].filled(12 + runs * 4, 0);
+  out[0] = ((cumulativeTsn >> 24) & 0xFF) as@ u8;
+  out[1] = ((cumulativeTsn >> 16) & 0xFF) as@ u8;
+  out[2] = ((cumulativeTsn >> 8) & 0xFF) as@ u8;
+  out[3] = (cumulativeTsn & 0xFF) as@ u8;
+  out[4] = ((window >> 24) & 0xFF) as@ u8;
+  out[5] = ((window >> 16) & 0xFF) as@ u8;
+  out[6] = ((window >> 8) & 0xFF) as@ u8;
+  out[7] = (window & 0xFF) as@ u8;
+  out[8] = ((runs >> 8) & 0xFF) as@ u8;
+  out[9] = (runs & 0xFF) as@ u8;
+  // Duplicate TSNs are not reported. A peer uses them to tell a spurious retransmission from a
+  // necessary one; nothing here changes its behaviour on the answer, so claiming none is honest.
+  for (i32 i = 0; i < runs; i++) {
+    out[12 + i * 4] = ((starts[i] >> 8) & 0xFF) as@ u8;
+    out[13 + i * 4] = (starts[i] & 0xFF) as@ u8;
+    out[14 + i * 4] = ((ends[i] >> 8) & 0xFF) as@ u8;
+    out[15 + i * 4] = (ends[i] & 0xFF) as@ u8;
+  }
+  return out;
+}
+
+/** How many gap blocks a SACK carries. */
+export i32 sackGaps(u8[] value) {
+  if (value.len() < 12) { return 0; }
+  return (value[8] as i32 << 8) | value[9] as i32;
+}
+
+/** The start offset of gap block `i`, counted from the cumulative TSN. */
+export i32 sackGapStart(u8[] value, i32 i) {
+  if (i < 0 || i >= sackGaps(value) || value.len() < 16 + i * 4) { return 0; }
+  return (value[12 + i * 4] as i32 << 8) | value[13 + i * 4] as i32;
+}
+
+/** The end offset of gap block `i`, counted from the cumulative TSN. */
+export i32 sackGapEnd(u8[] value, i32 i) {
+  if (i < 0 || i >= sackGaps(value) || value.len() < 16 + i * 4) { return 0; }
+  return (value[14 + i * 4] as i32 << 8) | value[15 + i * 4] as i32;
+}
+
+/** The cumulative TSN a SACK acknowledges. */
+export i32 sackCumulative(u8[] value) {
+  if (value.len() < 12) { return -1; }
+  return (value[0] as i32 << 24) | (value[1] as i32 << 16) | (value[2] as i32 << 8) | value[3] as i32;
+}
+
+// ── The association itself is `association.wac` ───────────────────────────────────────────────────
+//
+// This file was the codecs *and* a one-stream association until 2026-11-08; the association moved out when it
+// grew many streams, both ends of the handshake, partial reliability and stream resets, and what is left here is
+// what both it and the tests that check the wire against aiortc read and write.
+
+// ── DCEP, RFC 8832: the two messages that open a data channel ─────────────────────────────────────
+
+export i32 dcepOpen() { return 0x03; }
+export i32 dcepAck()  { return 0x02; }
+
+/** Reliable and ordered, which is the only channel type this package builds. */
+export i32 channelReliable() { return 0x00; }
+
+/**
+ * A DATA_CHANNEL_OPEN: message type, channel type, priority, reliability, then two lengths and the
+ * label and protocol strings.
+ *
+ * Sent on the stream the channel *is* — a data channel has no identifier of its own beyond the SCTP
+ * stream it runs on, which is why opening one is a message rather than a negotiation.
+ */
+export u8[] dcepOpenMessage(i32 channelType, i32 priority, i32 reliability, string label,
+                            string protocol) {
+  u8[] lab = label.toBytes();
+  u8[] pro = protocol.toBytes();
+  u8[] out = u8[].filled(12 + lab.len() + pro.len(), 0);
+  out[0] = dcepOpen() as@ u8;
+  out[1] = channelType as@ u8;
+  out[2] = ((priority >> 8) & 0xFF) as@ u8;
+  out[3] = (priority & 0xFF) as@ u8;
+  out[4] = ((reliability >> 24) & 0xFF) as@ u8;
+  out[5] = ((reliability >> 16) & 0xFF) as@ u8;
+  out[6] = ((reliability >> 8) & 0xFF) as@ u8;
+  out[7] = (reliability & 0xFF) as@ u8;
+  out[8] = ((lab.len() >> 8) & 0xFF) as@ u8;
+  out[9] = (lab.len() & 0xFF) as@ u8;
+  out[10] = ((pro.len() >> 8) & 0xFF) as@ u8;
+  out[11] = (pro.len() & 0xFF) as@ u8;
+  out.copyFrom(lab, 0, 12, lab.len());
+  for (i32 i = 0; i < pro.len(); i++) { out[12 + lab.len() + i] = pro[i]; }
+  return out;
+}
+
+/** A DATA_CHANNEL_ACK, which is one byte and says the channel is open. */
+export u8[] dcepAckMessage() {
+  u8[] out = u8[].filled(1, 0);
+  out[0] = dcepAck() as@ u8;
+  return out;
+}
+
+/** The label out of a DATA_CHANNEL_OPEN, or empty. */
+export string dcepLabel(u8[] msg) {
+  if (msg.len() < 12 || msg[0] as i32 != dcepOpen()) { return ""; }
+  i32 n = (msg[8] as i32 << 8) | msg[9] as i32;
+  if (12 + n > msg.len()) { return ""; }
+  u8[] lab = u8[].filled(n, 0);
+  lab.copyFrom(msg, 12, 0, n);
+  return string.fromBytes(lab);
+}
+
+/** The state cookie parameter (type 7) out of an INIT-ACK's value, or empty. */
+export u8[] stateCookie(u8[] value) {
+  i32 at = 16;
+  while (at + 4 <= value.len()) {
+    i32 kind = (value[at] as i32 << 8) | value[at + 1] as i32;
+    i32 len = (value[at + 2] as i32 << 8) | value[at + 3] as i32;
+    if (len < 4 || at + len > value.len()) { return u8[](); }
+    if (kind == 7) {
+      u8[] c = u8[].filled(len - 4, 0);
+      for (i32 i = 0; i < c.len(); i++) { c[i] = value[at + 4 + i]; }
+      return c;
+    }
+    at = at + ((len + 3) & ~3);
+  }
+  return u8[]();
+}

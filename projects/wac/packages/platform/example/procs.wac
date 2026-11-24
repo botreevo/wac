@@ -1,0 +1,85 @@
+// Programs in a page: a copy of this page, started as a process, streaming into the one that started it.
+//
+//   wac run --allow-read --allow-write --allow-run tools/wac/buildpage.wac \
+//       packages/platform/example/procs.wac .cache/procs --grant read,write \
+//       --spawn upper
+//
+// `--spawn upper` names what a started copy runs: `upper`, below, with a `Sys` holding the arguments,
+// input and directory its parent gave it. Each copy is a worker of its own — no shared memory, so
+// everything between the two crosses as a message, and a copy that never stops can be stopped.
+
+import { ElementEvent, Node, Page, State, Ui, html.button, html.div, html.input, html.p, html.span } from "web";
+import { Authority, Child, Input, Launch, Output, Sys } from "std";
+import { Buf, Read } from "core";
+
+/** What a started copy runs: its input, upper-cased, to its output. Its status is the byte count. */
+export async i32 upper(Sys sys) {
+  Input stdin = sys.stdin();
+  Output stdout = sys.stdout();
+  i32 n = 0;
+  while (true) {
+    auto got = await stdin.chunk();
+    if (got.isErr()) { return 0 - 1; }
+    match (got.unwrap()) {
+      Data(bytes): {
+        u8[] up = u8[].filled(bytes.len(), 0);
+        for (i32 i = 0; i < bytes.len(); i++) {
+          u8 b = bytes[i];
+          up[i] = b >= 97 && b <= 122 ? b - 32 : b;
+        }
+        await stdout.write(up);
+        n = n + bytes.len();
+      }
+      End: { return n; }
+      Failed(why): { return 0 - 1; }
+    }
+  }
+  return n;
+}
+
+/** Run `text` through a started copy, and show what came back and how it ended. */
+async void run(Sys sys, string text, State<string> out, State<string> status) {
+  auto started = await sys.procs().spawnSelf(string[](), Authority.none(), Launch("/", false, false, false, false));
+  if (started.isErr()) {
+    status.set("could not start: \{started.err()!}");
+    return;
+  }
+  Child c = started.unwrap();
+  Output feeding = c.input();
+  await feeding.write(text.toBytes());
+  await feeding.close();
+  Input said = c.output();
+  Buf got = Buf.create();
+  bool reading = true;
+  while (reading) {
+    auto chunk = await said.chunk();
+    if (chunk.isErr()) { reading = false; continue; }
+    match (chunk.unwrap()) {
+      Data(bytes): { got.pushAll(bytes); }
+      End: { reading = false; }
+      Failed(why): { reading = false; }
+    }
+  }
+  out.set(string.fromBytes(got.bytes()));
+  auto exited = await c.exit();
+  status.set(exited.isOk() ? "\{exited.unwrap()}" : "\{exited.err()!}");
+}
+
+Node Runs(Ui ui, Sys sys) {
+  auto text = ui.state("hello from the page");
+  auto out = ui.state("");
+  auto status = ui.state("");
+  return <div>
+    <p><input id="text" value={text.get()} oninput={(ElementEvent e) => { text.set(e.value); }}></input>
+       <button id="run" onclick={(ElementEvent e) => { run(sys, text.get(), out, status); }}>run</button></p>
+    <p>out: <span id="out">{out.get()}</span></p>
+    <p>status: <span id="status">{status.get()}</span></p>
+  </div>;
+}
+
+export async i32 main(Page page) {
+  page.title("procs");
+  Sys sys = page.sys;
+  page.mount((Ui ui) => Runs(ui, sys));
+  return 0;
+}

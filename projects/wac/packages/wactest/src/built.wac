@@ -1,0 +1,682 @@
+// One built program per entry, for tests that run the same program more than once.
+//
+// **`wac run <entry>.wac` compiles the program from source before it runs.** Seven files in
+// `packages/git` did that per operation — `commit_test.wac` seven times, at 10.2s — and building once
+// took the directory from 36.5s to 12.7s. `packages/tor`'s capture tools and `packages/quic`'s
+// program test do the same thing, which is why this lives in `wactest` rather than in one package's
+// test directory.
+//
+// It is also closer to what a person does. `wac run` is the shape for a one-off; a test that runs the
+// same program many times is the case `wac build` exists for, and the grants end up in the module's
+// manifest rather than on each command line.
+//
+// ## Freshness
+//
+// mtimes, the rule `tools/wac/seedfresh_test.wac` uses for the seed: the built module is rebuilt when any
+// file **the program is made of** — or the binary that builds it — is newer.
+//
+// It used to be the newest file under trees the caller named, and this comment defended that as
+// "coarser than an import walk on purpose". The cost was measured on 2026-08-19 and it is not a
+// rounding error: `arrival_users_test.wac` named `packages`, so *any* of the 902 `.wac` files in the
+// tree sent it back to a 12s build of `sshd` — and the gate pulls before it runs, so that was most
+// gates. `sshd` reaches 190 files, a fifth of the tree; `packages/fs/example/ops.wac` reaches **nine**
+// against the hundreds its caller was naming, and `packages/platform/example/clocks.wac` reaches
+// **one**.
+//
+// So the closure is derived rather than declared, by scanning for `from "…"` and following it. That is
+// what `source_probe.wac` does for the corpus and what `closure_of` does in the Rust host, and the
+// scan is deliberately a *superset*: prose in a comment that looks like an import adds a path that does
+// not exist and is skipped, which costs a `stat`. What it must not do is *miss* one, so it takes the
+// text rather than the parse — an import written across two lines still has `from "` in it — and a file
+// it cannot read counts as newer than the artefact rather than older.
+//
+// `std/` and `core/` are not on disk: they are embedded in the compiler, so a change to them arrives as
+// a new `wac` binary, whose mtime is checked here anyway.
+//
+// The cache is `.cache/`, which is per workspace and therefore per agent. Nothing here writes to
+// `/tmp`, where three agents would share a name.
+
+import { Exec, Stat, ChildEnv, Env, Files, Launch, Procs } from "std";
+import { T } from "./assert.wac";
+import { Located, Manifest, packageEntry, readManifest } from "../../wacpkg/src/manifest.wac";
+import { flatten } from "core";
+
+/** The newest modification time anywhere under `dir`, or 0 for a directory that is not there. */
+export i64 newestUnder(Files fs, string dir) {
+  return newestUnderExcept(fs, dir, string[].filled(0, ""));
+}
+
+/**
+ * The same, ignoring any directory entry named in `skip`.
+ *
+ * **`target/` is why this exists.** A freshness check on a cargo binary compares it against its own
+ * crate's sources, and cargo's output directory is *inside* that crate — so a walk that enters
+ * `target/` finds the binary itself, answers "something is newer than the binary", and rebuilds every
+ * single time. `packages/raster/test/wac/hosts_test.wac` had a private copy of `newestUnder` that
+ * differed from this file's in exactly that line, which is the kind of divergence two copies of one
+ * walk are for. `issues/system/0208`.
+ */
+export i64 newestUnderExcept(Files fs, string dir, string[] skip) {
+  i64 newest = 0 as i64;
+  string[]? names = flatten(fs.readDir(dir).wait()).ok();
+  if (names is null) { return 0 as i64; }
+  string[] here = names!;
+  for (i32 i = 0; i < here.len(); i++) {
+    bool skipped = false;
+    for (i32 k = 0; k < skip.len(); k++) { if (here[i] == skip[k]) { skipped = true; } }
+    if (skipped) { continue; }
+    string path = "\{dir}/\{here[i]}";
+    Stat? s = flatten(fs.stat(path).wait()).ok();
+    if ((s is null)) { continue; }
+    if ((s is not null && s!.isDir)) {
+      i64 deep = newestUnderExcept(fs, path, skip);
+      if (deep > newest) { newest = deep; }
+      continue;
+    }
+    if (s!.modifiedMillis > newest) { newest = s!.modifiedMillis; }
+  }
+  return newest;
+}
+
+/** The `"…"` after each `from` in a source, which is every import spec plus any prose that looks like one. */
+string[] importsOf(string src) {
+  i32 found = 0;
+  for (i32 i = 0; i + 6 <= src.len(); i++) {
+    if (src.slice(i, i + 6) == "from \"") { found = found + 1; }
+  }
+  string[] out = string[].filled(found, "");
+  i32 n = 0;
+  for (i32 i = 0; i + 6 <= src.len(); i++) {
+    if (src.slice(i, i + 6) != "from \"") { continue; }
+    i32 from = i + 6;
+    i32 to = from;
+    while (to < src.len() && src.slice(to, to + 1) != "\"") { to = to + 1; }
+    if (to <= src.len() && n < out.len()) { out[n] = src.slice(from, to); n = n + 1; }
+  }
+  return out;
+}
+
+/** `a/b/c.wac` → `a/b`, and `c.wac` → `""`. */
+string dirOfPath(string path) {
+  for (i32 i = path.len() - 1; i >= 0; i--) {
+    if (path.slice(i, i + 1) == "/") { return path.slice(0, i); }
+  }
+  return "";
+}
+
+/**
+ * `spec` resolved against the file that wrote it, with `.` and `..` folded out.
+ *
+ * **A leading slash is kept if there was one.** The first version dropped it, on the reasoning that
+ * these paths go to `cli.stat` and are repo-relative — true of every caller that names an entry in the
+ * tree, and false of the one that generates its entry: `constanttime_test.wac` writes its drivers to an
+ * *absolute* `.cache/ct-…` path, so every import resolved to `home/claude/…` with no root, missed the
+ * `stat`, and left each driver as a closure of one. The cache then never noticed a change to the
+ * routine under test — which the test's own canary caught by rebuilding nothing when
+ * `packages/crypto/src/sha256.wac` was touched.
+ */
+string resolvedFrom(string fromPath, string spec) {
+  string joinedPath = "\{dirOfPath(fromPath)}/\{spec}";
+  bool rooted = joinedPath.len() > 0 && joinedPath.slice(0, 1) == "/";
+  string[] parts = string[].filled(64, "");
+  i32 n = 0;
+  i32 from = 0;
+  for (i32 i = 0; i <= joinedPath.len(); i++) {
+    if (i < joinedPath.len() && joinedPath.slice(i, i + 1) != "/") { continue; }
+    string part = joinedPath.slice(from, i);
+    from = i + 1;
+    if (part == "" || part == ".") { continue; }
+    if (part == "..") { if (n > 0) { n = n - 1; } continue; }
+    if (n >= parts.len()) { return ""; }
+    parts[n] = part;
+    n = n + 1;
+  }
+  string out = "";
+  for (i32 i = 0; i < n; i++) { out = (i == 0 ? parts[i] : "\{out}/\{parts[i]}"); }
+  return rooted ? "/\{out}" : out;
+}
+
+/** How many files one program's closure is allowed to reach. `sshd` is the largest here at 190. */
+static i32 CLOSURE_CAP = 1024;
+
+/**
+ * What one walk of a program's import closure found.
+ *
+ * `complete` is false when a file in the closure could not be read, which is the case `newestInClosure`
+ * turns into "newer than anything". It is separate from `newest` because a caller reporting to a human
+ * has to tell "nothing has changed" from "I could not look".
+ *
+ * `count` is here because a walk that did not resolve returns a closure of one file and is
+ * indistinguishable, from the time alone, from a walk that resolved and found nothing newer — so a
+ * caller asserting freshness has no way to notice that it has stopped asserting anything.
+ */
+export struct Closure {
+  i64 newest;
+  string what;
+  i32 count;
+  bool complete;
+}
+
+/**
+ * `entry` and every file it imports, transitively: how many, which was modified last, and when.
+ *
+ * The walk `newestInClosure` below is a view of. Split out because two callers want different parts of
+ * one walk — the build cache wants the time, and a freshness check reporting to a human wants the file
+ * name to put in the message and the count to prove the walk resolved.
+ */
+export Closure closureOf(Files fs, string entry) {
+  string[] seen = string[].filled(CLOSURE_CAP, "");
+  seen[0] = entry;
+  i32 n = 1;
+  i32 at = 0;
+  i64 newest = 0 as i64;
+  string what = "";
+  i32 files = 0;
+  while (at < n) {
+    string path = seen[at];
+    at = at + 1;
+    Stat? s = flatten(fs.stat(path).wait()).ok();
+    // `std/…` and `core/…` resolve to nothing on disk: they live in the compiler, and the binary's own
+    // mtime below is what covers them.
+    if (!(s is not null && s!.isFile)) { continue; }
+    files = files + 1;
+    if (s!.modifiedMillis > newest) { newest = s!.modifiedMillis; what = path; }
+    u8[]? f = flatten(fs.readFile(path).wait()).ok();
+    if ((f is null)) { return Closure(newest, what, files, false); }
+    string[] specs = importsOf(string.fromBytes(f!));
+    for (string spec in specs) {
+      string next = resolvedFrom(path, spec);
+      if (next == "") { continue; }
+      // A nested project is entered by its directory, at the module it exports.
+      string entered = nestedEntry(fs, next);
+      if (entered != "") { next = entered; }
+      bool have = false;
+      for (i32 k = 0; k < n; k++) { if (seen[k] == next) { have = true; } }
+      if (have || n >= seen.len()) { continue; }
+      seen[n] = next;
+      n = n + 1;
+    }
+  }
+  return Closure(newest, what, files, true);
+}
+
+/**
+ * Every file `entry` reaches, with what is in each — what a compiler API's `emitFiles` takes.
+ *
+ * The reading half of `wacFiles` in the TypeScript harness, and the thing `issues/system/0289b`
+ * records as blocking `wac task size` and `bench:compile`: `packages/wacc/src/api.wac` exposes
+ * `emitFiles(paths, sources, entry)`, and until this there was no way for a wac program to produce
+ * its arguments.
+ *
+ * **Deliberately not merged into `closureOf` above**, though it walks the same graph by the same two
+ * helpers. `newestInClosure` is asked on every cached build, and a build cache that carried the text
+ * of all 190 files `sshd` reaches — to answer a question about mtimes — would be paying for the
+ * larger answer every time it wanted the smaller one.
+ *
+ * **Not `gather`, which is the complete answer.** `packages/wac/src/wac.wac` resolves `@/` project
+ * roots and import maps and is what the `wac` command itself uses; this resolves neither, so a
+ * program that writes `@/` gets a closure with a hole in it. No caller needs that today — checked
+ * across `packages/tor`, `packages/tls` and `packages/crypto`, which is what the blocked tools
+ * compile — and `why` names the first file it could not read so a hole is reported rather than
+ * compiled.
+ */
+export struct Sources {
+  string[] paths;
+  string[] texts;
+  /** `""` when the whole closure was read, otherwise the first file that could not be. */
+  string why;
+  /**
+   * Each import of a **nested project's directory**, and the module its manifest `exports` — what `wac`
+   * maps such a specifier to (spec ch02 `§wac-import-nested-project-sd4s5n8`). A caller hands these to
+   * the compiler as a `Res`, or the specifier names no file it was given.
+   */
+  string[] mapFrom;
+  string[] mapSpec;
+  string[] mapTo;
+}
+
+export Sources sourcesOf(Files fs, string entry) {
+  string[] seen = string[].filled(CLOSURE_CAP, "");
+  string[] text = string[].filled(CLOSURE_CAP, "");
+  seen[0] = entry;
+  i32 n = 1;
+  i32 at = 0;
+  i32 kept = 0;
+  string[] paths = string[].filled(CLOSURE_CAP, "");
+  string[] mapFrom = string[]();
+  string[] mapSpec = string[]();
+  string[] mapTo = string[]();
+  while (at < n) {
+    string path = seen[at];
+    at = at + 1;
+    // `std/…` and `core/…` resolve to nothing on disk: they live in the compiler, and the compiler
+    // is what will be handed these, so it already has them.
+    if (!flatten(fs.stat(path).wait()).orElse(Stat.of(false, false, false, 0, 0, false, false, 0, 0)).isFile) { continue; }
+    u8[]? f = flatten(fs.readFile(path).wait()).ok();
+    if ((f is null)) { return Sources(string[].filled(0, ""), string[].filled(0, ""), path, string[](), string[](), string[]()); }
+    string src = string.fromBytes(f!);
+    paths[kept] = path;
+    text[kept] = src;
+    kept = kept + 1;
+    string[] specs = importsOf(src);
+    for (string spec in specs) {
+      string next = resolvedFrom(path, spec);
+      if (next == "") { continue; }
+      string entered = nestedEntry(fs, next);
+      if (entered != "") {
+        mapFrom = grown(mapFrom, path);
+        mapSpec = grown(mapSpec, spec);
+        mapTo = grown(mapTo, entered);
+        next = entered;
+      }
+      bool have = false;
+      for (i32 k = 0; k < n; k++) { if (seen[k] == next) { have = true; } }
+      if (have || n >= seen.len()) { continue; }
+      seen[n] = next;
+      n = n + 1;
+    }
+  }
+  string[] outPaths = string[].filled(kept, "");
+  string[] outTexts = string[].filled(kept, "");
+  for (i32 i = 0; i < kept; i++) { outPaths[i] = paths[i]; outTexts[i] = text[i]; }
+  return Sources(outPaths, outTexts, "", mapFrom, mapSpec, mapTo);
+}
+
+/** The module a nested project at `dir` exports, or "" when `dir` is not one. */
+string nestedEntry(Files fs, string dir) {
+  if (!flatten(fs.stat(dir).wait()).orElse(Stat.of(false, false, false, 0, 0, false, false, 0, 0)).isDir) { return ""; }
+  u8[]? m = flatten(fs.readFile(dir + "/wac.json5").wait()).ok();
+  if ((m is null)) { return ""; }
+  Manifest mf = readManifest(m!);
+  if (!mf.ok || mf.exports == "") { return ""; }
+  Located at = packageEntry(dir, mf.exports);
+  return at.ok ? at.path : "";
+}
+
+string[] grown(string[] xs, string x) {
+  string[] out = string[].filled(xs.len() + 1, x);
+  out.copyFrom(xs, 0, 0, xs.len());
+  return out;
+}
+
+/**
+ * The newest modification time among `entry` and every file it imports, transitively.
+ *
+ * A file that cannot be read answers `now`, so an artefact is rebuilt rather than trusted when the walk
+ * cannot see what it is made of — the safe direction, since the alternative is asserting against
+ * yesterday's build.
+ */
+export i64 newestInClosure(Env env, Files fs, string entry) {
+  Closure c = closureOf(fs, entry);
+  if (!c.complete) { return nowMillis(env, fs); }
+  i64 carried = newestCarried(fs);
+  return carried > c.newest ? carried : c.newest;
+}
+
+/**
+ * The newest mtime of what every build carries without importing it.
+ *
+ * `core` and `std` are embedded rather than reached through an import list, so a closure never sees
+ * them, nor the compiler that embeds them, nor the JavaScript host a Deno build bundles. A build made
+ * while `std` named a type wrongly stayed cached after the fix, and a dozen tests failed on it.
+ */
+export i64 newestCarried(Files fs) {
+  string[] carried = ["core", "std", "packages/wacc/src", "packages/platform/host"];
+  i64 newest = 0 as i64;
+  for (i32 i = 0; i < carried.len(); i++) {
+    i64 m = newestUnder(fs, carried[i]);
+    if (m > newest) { newest = m; }
+  }
+  return newest;
+}
+
+/** A stand-in for "newer than anything", used when the closure cannot be read. */
+i64 nowMillis(Env env, Files fs) {
+  Stat? s = flatten(fs.stat(wacBinary(env)).wait()).ok();
+  return (s is not null) ? s!.modifiedMillis + (1000000 as i64) : 1000000000000000;
+}
+
+/** The path of the `wac` binary these tests build and run with. */
+export string wacBinary(Env env) { return "\{flatten(env.cwd().wait()).unwrap()}/native/v8/target/release/wac"; }
+
+/**
+ * The newest mtime of `path`, whether it is a file or a directory.
+ *
+ * **`newestUnder` answers 0 for a file**, because it asks `readDir` and gets null — so a list of
+ * freshness inputs that mixes directories with `Cargo.toml` silently ignores the files, and a
+ * lockfile change goes unnoticed. Found while writing exactly that list.
+ */
+export i64 newestOf(Files fs, string path) {
+  Stat? s = flatten(fs.stat(path).wait()).ok();
+  if ((s is null)) { return 0 as i64; }
+  if (!(s is not null && s!.isDir)) { return s!.modifiedMillis; }
+  return newestUnder(fs, path);
+}
+
+/**
+ * The wasmtime-hosted `wac` — the same command as `native/v8`'s, on the engine with no JavaScript
+ * in it. `./bootstrap.sh --host wasmtime` is what builds it.
+ *
+ * **It was `wacland` until 2026-08-28**, which put design/system/0001's name for the *system* on
+ * the one component underneath it. Both crates produce a binary called `wac`, because the command
+ * is `packages/wac/src/wac.wac` and each host carries it as its seed; the engine is the difference.
+ */
+export string nativeHost(Env env) { return "\{flatten(env.cwd().wait()).unwrap()}/native/target/release/wac"; }
+
+/**
+ * The wasmtime host, **required**: a missing or stale one fails `t`, saying how to build it.
+ *
+ * **Never a skip.** Every caller used to skip its wasmtime half when this host was absent, each with
+ * its own warning, so a gate in a checkout without the binary passed having asked one host fewer and
+ * said so only in a log line. A test either needs the host or it does not; `tools/push.sh` builds it.
+ * `""` after the failure is recorded, so a caller can return early without running against nothing.
+ */
+export string requireNativeHost(Env env, Files fs, T t) {
+  string why = nativeHostWhyNot(env, fs);
+  t.isTrue(why == "", "the wasmtime host is required here and is not ready: \{why}");
+  return why == "" ? nativeHost(env) : "";
+}
+
+/**
+ * `""` when the wasmtime host is built and not older than `native/`, otherwise why not.
+ *
+ * **A test asks; it does not build.** Five test files each ran their own `cd native && cargo build
+ * --release`, in two languages, with five skip messages and two freshness checks that differed in
+ * whether they walked `target/` — so the same 2.6s cargo no-op was paid per file, and one of the
+ * checks rebuilt every run. `wac task seed`, and `wac task seed:native` for just this crate, own the
+ * build now; `tools/wac/seedfresh_test.wac` fails when the binary is older than its sources.
+ * `issues/system/0208`.
+ *
+ * The reason is returned rather than warned, so the caller can put it in its own skip line — the four
+ * that skip say different things about what is lost, and that is worth keeping.
+ */
+export string nativeHostWhyNot(Env env, Files fs) {
+  string root = flatten(env.cwd().wait()).unwrap();
+  Stat? host = flatten(fs.stat(nativeHost(env)).wait()).ok();
+  if ((host is null)) {
+    return "native/target/release/wac is not built — `./bootstrap.sh --host wasmtime` builds it";
+  }
+  // **The crate's own inputs, named — not a walk of `native/`.** A blanket walk answered "stale"
+  // forever: `native/v8/seed/*.wasm` is the *seed's output*, written by every `wac task seed`, and it
+  // lives under `native/` without being inside a `target/`. So every seed made the wasmtime binary look older
+  // than its sources, six callers skipped their native halves, and the two that *assert* the native
+  // half ran failed in the gate. The list is `tools/wac/seedfresh_test.wac`'s, which had it right, and it
+  // is `native/`'s crate — `native/v8` is the other one.
+  string[] inputs = [
+                             "native/src", "native/manifest/src", "native/Cargo.toml",
+                             "native/Cargo.lock", "native/build.rs"
+  ];
+  for (i32 i = 0; i < inputs.len(); i++) {
+    if (host!.modifiedMillis < newestOf(fs, "\{root}/\{inputs[i]}")) {
+      return "native/target/release/wac is older than \{inputs[i]}"
+          + " — `./bootstrap.sh --host wasmtime` rebuilds it";
+    }
+  }
+  // **And the compiler inside it, which the loop above cannot see.** Every input named there is Rust,
+  // and `native/build.rs` reads the seed as an *input* to the build — so `cargo build` refreshes this
+  // binary's timestamp while leaving an old compiler in it, and every question asked so far answers
+  // "current" about a host carrying a compiler from days ago. The four callers that consult this to
+  // decide whether to skip were told nothing was wrong and compared answers from it.
+  // `issues/system/0316b`.
+  string stale = seedStale(fs, WASMTIME_SEED());
+  if (stale != "") { return "\{stale} — `./bootstrap.sh --host wasmtime` rebuilds it"; }
+  return "";
+}
+
+/** The seed carried by the wasmtime host — `native/build.rs` reads it from `seed/`. */
+export string WASMTIME_SEED() { return "native/seed/wacc.wasm"; }
+
+/** The program both hosts carry as their seed; `native/Cargo.toml` says why it is the same one. */
+export string SEED_ENTRY() { return "packages/wac/src/wac.wac"; }
+
+/**
+ * `""` when `seed` is present and not older than anything `SEED_ENTRY()` is built from, otherwise
+ * which file it is behind.
+ *
+ * **One comparison, two callers**, on the same reasoning `nativeHostWhyNot` is consulted rather than
+ * re-walked: `tools/wac/seedfresh_test.wac` asks this to fail a gate and says how far behind in its
+ * own words, and `nativeHostWhyNot` asks it to decide whether a host is fit to be compared against.
+ * A second copy of the rule is the failure `issues/system/0208` already paid for once.
+ *
+ * **Absent is not stale** and is not this function's question — a fresh clone has no wasmtime seed,
+ * and the caller that cares about absence distinguishes it with its own `stat`.
+ */
+export string seedStale(Files fs, string seed) {
+  Stat? s = flatten(fs.stat(seed).wait()).ok();
+  if (!(s is not null && s!.isFile)) { return ""; }
+  Closure c = closureOf(fs, SEED_ENTRY());
+  // A graph of one file is a walk that did not resolve, and would make this answer "fresh" for ever.
+  if (c.count < 10) { return ""; }
+  if (s!.modifiedMillis >= c.newest) { return ""; }
+  return "\{seed} is older than \{c.what}";
+}
+
+/**
+ * `entry` built into `.cache/built-<name>/<name>.wasm` with `grants`, or the one already there.
+ *
+ * `name` is what the module is called on disk; two entries must not share one. `grants` are the
+ * `--allow-…` flags the program needs, which go into its manifest at build time — a built module is
+ * run as `wac <module.wasm> <args…>` with no flags at all.
+ *
+ * Answers the path either way. A build that fails leaves no module, and the caller's first run says
+ * so: `wac` reports the missing file and the test's own assertion on the exit status carries it.
+ *
+ * ## The flags are part of the cache key, and were not until 2026-08-20
+ *
+ * The key was `name` plus the mtimes of the entry's closure and of the `wac` binary. `grants` was not
+ * in it — so **two calls with the same `name` and different flags got the first one's module**, with
+ * nothing said. `builtByDeno` below has the identical hazard and documents it ("`name` must
+ * distinguish everything that changes the output"); this one had it and did not.
+ *
+ * It cost about ten minutes: `packages/crypto/test/wac/constanttime_test.wac` gained a journal-size
+ * argument, passed `--trace-slots 16777216` for a routine whose 7.4 million events overflow the
+ * default, and kept being told `truncated 7399082` with the *same* count each time. The flag was
+ * never reaching a build.
+ *
+ * The flags are written beside the module and compared verbatim rather than hashed — an exact
+ * comparison cannot collide, the file is two lines, and a missing sidecar forces a rebuild, which is
+ * the right way to be wrong.
+ */
+export string builtProgram(Env env, Files fs, Procs procs, string entry, string name, string[] grants) {
+  string wac = wacBinary(env);
+  string dir = "\{flatten(env.cwd().wait()).unwrap()}/.cache/built-\{name}";
+  fs.mkdir(dir, true).wait();
+  string stem = "\{dir}/\{name}";
+  Stat? have = flatten(fs.stat("\{stem}.wasm").wait()).ok();
+
+  string want = "";
+  for (i32 i = 0; i < grants.len(); i++) { want = want + "\{grants[i]}\n"; }
+  u8[]? had = flatten(fs.readFile("\{stem}.flags").wait()).ok();
+  bool sameFlags = (had is not null) && string.fromBytes(had!) == want;
+
+  i64 newest = newestInClosure(env, fs, entry);
+  Stat? bin = flatten(fs.stat(wac).wait()).ok();
+  if ((bin is not null) && bin!.modifiedMillis > newest) { newest = bin!.modifiedMillis; }
+  if ((have is not null) && sameFlags && have!.modifiedMillis > newest) { return "\{stem}.wasm"; }
+
+  string[] args = string[].filled(4 + grants.len(), "");
+  args[0] = "build";
+  args[1] = entry;
+  args[2] = "-o";
+  args[3] = stem;
+  args.copyFrom(grants, 0, 4, grants.len());
+  // **A build that failed takes the old artefact with it.** The answer used to be dropped here, and a
+  // stale `.wasm` is worse than none: the caller runs it, it runs — it is a real module, the one from
+  // before the program broke — and the test passes against code that no longer compiles. That is
+  // silence in the direction of green, and it cost a diagnosis: an edit to
+  // `packages/platform/test/wac/exec_probe.wac` looked like it had no effect, when what had happened
+  // was that the probe stopped compiling and yesterday's build kept answering for it.
+  //
+  // Deleted rather than reported, because 29 call sites take this path and every one of them then runs
+  // what it was handed: a missing artefact fails all 29, where a status fails only the ones that
+  // remembered to look. The compiler's own message went to this process's stderr on the way past, so
+  // the reason is in the run's output even though the return value cannot carry it. `.flags` goes too,
+  // or a later build with the same grants would find a sidecar agreeing with it and no module.
+  auto builtRan = flatten(procs.exec(wac, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? built = builtRan.ok();
+  if ((built is null) || built!.status != 0) {
+    fs.remove("\{stem}.wasm", false).wait();
+    fs.remove("\{stem}.flags", false).wait();
+    return "\{stem}.wasm";
+  }
+  fs.writeFile("\{stem}.flags", want.toBytes()).wait();
+  return "\{stem}.wasm";
+}
+
+/**
+ * The same, built with `wac app` — a file you run, rather than a module `wac` runs.
+ *
+ * `builtProgram` above answers a `.wasm` that the caller hands back to `wac`. This answers an
+ * artefact that is executable itself, which is what a test needs when the thing under test is *being
+ * a program*: what it does on a PATH, what its exit status is to a shell, whether a pipeline sees it.
+ * `harness/buildApp.ts` is the TypeScript this replaces. Four wac tests spawn `wac app` inline today
+ * and **none of them should call this**: `app_test.wac`, `commandparity_test.wac` and
+ * `setexecutable_test.wac` are testing that command — its usage line, its refusals, whether its output
+ * is executable — and a helper that caches the artefact and swallows the `Exec` is the wrong shape for
+ * asserting on a build that is *supposed* to fail. `bootstrap_test.wac` builds a probe to test
+ * something else and could move, which is one caller and not a reason.
+ *
+ * So this exists for the `corpus:*` tools, which is the same population `buildApp.ts` served: a
+ * program built in order to measure something else about it.
+ *
+ * **The artefact needs `wac` on PATH to run.** `wac app` writes a shell preamble that runs
+ * `command -v wac` and execs `wac app-run "$0"`, so the binary is not self-contained and a caller that
+ * clears the child's environment has to put one there. This does not do it for them: the TypeScript
+ * mutated its own process's PATH at import, which works when the test *is* the Deno process and does
+ * not when the runner is a wac program spawning a shell. Pass it in the child's env, and prefer this
+ * checkout's own — `wacBinary(cli)`'s directory — because an installed `wac` elsewhere on PATH is a
+ * different compiler and a test about this tree should not be answered by it.
+ *
+ * **`WAC_PROFILE` instrumentation is not carried over, and that is a real loss.** `buildApp.ts`'s
+ * comment called it "how every existing subprocess test becomes attributable without being edited";
+ * `wac app` cannot, because the flag was accepted and wrote no table to read the counters with, and it
+ * is refused rather than left looking like it works. `issues/system/0274c` holds the three decisions a
+ * profiled app would need. So a mutation run over `packages/box/` loses subprocess attribution — which
+ * is written down here rather than discovered later from a coverage number that quietly dropped, the
+ * failure `issues/system/0160` already cost two days.
+ *
+ * **Not known yet: whether this needs an `ETXTBSY` retry.** `harness/spawnRetry.ts` exists because a
+ * parallel suite failed three times in one day executing a binary it had just built, and every
+ * TypeScript test that builds and runs imports it. Nothing here does that yet, because the caches
+ * above mean most calls write nothing at all and the window only exists after a fresh build — so the
+ * honest answer is that it has not been observed on this path, not that it cannot happen. If a test
+ * that builds an app starts failing under load with *Text file busy*, this is the note that says the
+ * retry belongs here and why it was not written in advance.
+ */
+export string builtApp(Env env, Files fs, Procs procs, string entry, string name, string[] grants) {
+  string wac = wacBinary(env);
+  string dir = "\{flatten(env.cwd().wait()).unwrap()}/.cache/built-\{name}";
+  fs.mkdir(dir, true).wait();
+  string out = "\{dir}/\{name}";
+
+  string want = "";
+  for (i32 i = 0; i < grants.len(); i++) { want = want + "\{grants[i]}\n"; }
+  u8[]? had = flatten(fs.readFile("\{out}.flags").wait()).ok();
+  bool sameFlags = (had is not null) && string.fromBytes(had!) == want;
+
+  Stat? have = flatten(fs.stat(out).wait()).ok();
+  i64 newest = newestInClosure(env, fs, entry);
+  Stat? bin = flatten(fs.stat(wac).wait()).ok();
+  if ((bin is not null) && bin!.modifiedMillis > newest) { newest = bin!.modifiedMillis; }
+  if ((have is not null) && sameFlags && have!.modifiedMillis > newest) { return out; }
+
+  string[] args = string[].filled(4 + grants.len(), "");
+  args[0] = "app";
+  args[1] = entry;
+  args[2] = "-o";
+  args[3] = out;
+  args.copyFrom(grants, 0, 4, grants.len());
+  // The same rule as `builtProgram`: a failed build takes the artefact with it, because a stale one
+  // still runs and the test then passes against code that no longer compiles.
+  auto builtRan = flatten(procs.exec(wac, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? built = builtRan.ok();
+  if ((built is null) || built!.status != 0) {
+    fs.remove(out, false).wait();
+    fs.remove("\{out}.flags", false).wait();
+    return out;
+  }
+  fs.writeFile("\{out}.flags", want.toBytes()).wait();
+  return out;
+}
+
+/**
+ * The same idea for `packages/platform/build.ts`, which is the *Deno* builder: a program built for the
+ * deno or node host, or the worker half a `spawn` takes.
+ *
+ * **`build.ts` already caches the work** — `appKey` keys a build on the content of every file it
+ * reads — so what this saves is the process: a warm call is 180-410ms of Deno starting, and
+ * `packages/platform/test/wac/spawn_test.wac` makes fourteen of them across seven tests, most for the
+ * same three programs. The artefact lands in one place and the caller copies it where it wants, which
+ * is what keeps the per-test directories that stop one case reading another's files.
+ *
+ * `name` must distinguish everything that changes the output — the entry, the grants, the target and
+ * whether it is the worker half — because they all land under it. `WAC_PROFILE` is cleared for the
+ * same reason `spawn_test` clears it: an instrumented build carries a scoped `--allow-write` for its
+ * counter dump, and a test asserting on a shebang would see it.
+ */
+export string builtByDeno(Env env, Files fs, Procs procs, string entry, string name, string[] grants, string target, bool worker) {
+  string dir = "\{flatten(env.cwd().wait()).unwrap()}/.cache/built-\{name}";
+  fs.mkdir(dir, true).wait();
+  string out = dir + "/" + name + (worker ? ".worker.js" : "");
+  Stat? have = flatten(fs.stat(out).wait()).ok();
+
+  i64 newest = newestInClosure(env, fs, entry);
+  // **And what `build.ts` compiles with**, which is the other half of this path: it builds `wacc` from the ladder
+  // (`harness/waccFromLadder.ts`, so `packages/wacc/src` and `bootstrap/js`), binds through `harness/` and the TS
+  // glue generator, so an edit there changes what comes out even when no `.wac` in the entry's closure moved. This
+  // named `compiler/`, the reference compiler, which was deleted and left the check watching nothing.
+  string[] toolchain = ["packages/wacc/src", "bootstrap/js", "harness", "packages/wacc/tools"];
+  for (string under in toolchain) {
+    i64 ref = newestUnder(fs, under);
+    if (ref > newest) { newest = ref; }
+  }
+  Stat? builder = flatten(fs.stat("packages/platform/build.ts").wait()).ok();
+  if ((builder is not null) && builder!.modifiedMillis > newest) { newest = builder!.modifiedMillis; }
+  // **And `host/`, which is the rest of what goes into the artefact.** `build.ts` bundles `entry.ts`,
+  // `deno.ts`, `children.ts` and their imports into every program it writes, and this check watched
+  // only the file that does the bundling — so a host change left every cached build in place. Found by
+  // widening a refusal message in `children.ts` and having a test assert the *old* sentence, from a
+  // binary built before the edit: the message was right, the build was three minutes old, and the
+  // failure named neither. `build.ts` keys its own work on the content of every file it reads, so this
+  // is the only stale link in the chain.
+  i64 host = newestUnder(fs, "packages/platform/host");
+  if (host > newest) { newest = host; }
+  if ((have is not null) && have!.modifiedMillis > newest) { return out; }
+
+  string line = "exec env -u WAC_PROFILE deno run -A packages/platform/build.ts \"\{entry}\"";
+  for (i32 i = 0; i < grants.len(); i++) { line = line + " \{grants[i]}"; }
+  line = line + " --target \{target}";
+  if (worker) { line = line + " --worker"; }
+  line = line + " -o \"\{out}\"";
+  auto rRan = flatten(procs.exec("/bin/sh", ["-c", line], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = rRan.ok();
+  if ((r is null) || r!.status != 0) { return ""; }
+  return out;
+}
+
+/**
+ * Write `bytes` to `path` only if they are not already there, and answer whether the file now holds them.
+ *
+ * **For a generated entry, this is what makes a cache possible at all.** A test that writes its driver
+ * every run gives it a new mtime every run, so `builtProgram` below rebuilds every run however little
+ * changed — `packages/crypto/test/wac/constanttime_test.wac` generates fourteen drivers that differ only
+ * in an array literal and are byte-identical between runs. Comparing first costs one read.
+ */
+export bool writeIfDifferent(Files fs, string path, u8[] bytes) {
+  u8[]? had = flatten(fs.readFile(path).wait()).ok();
+  if ((had is not null) && had!.len() == bytes.len()) {
+    bool same = true;
+    for (i32 i = 0; i < bytes.len() && same; i++) { if (had![i] != bytes[i]) { same = false; } }
+    if (same) { return true; }
+  }
+  return flatten(fs.writeFile(path, bytes).wait()).isOk();
+}
+
+/** `from` to `to`, since `Cli` has no copy. Answers whether it landed. */
+export bool copyBuilt(Files fs, string from, string to, bool executable) {
+  u8[]? r = flatten(fs.readFile(from).wait()).ok();
+  if ((r is null)) { return false; }
+  if (!flatten(fs.writeFile(to, r!).wait()).isOk()) { return false; }
+  if (executable) { fs.setExecutable(to, true).wait(); }
+  return true;
+}

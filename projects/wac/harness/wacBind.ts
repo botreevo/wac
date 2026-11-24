@@ -1,0 +1,283 @@
+// wacBind — compile a .wac entry file and hand back its bindgen'd JS module.
+//
+// Going through generated glue rather than a hand-written marshalling layer is what makes u8[] usable
+// from the test side: bindgen embeds the copy-in/copy-out helpers, so an
+// `u8[] gzip(u8[])` export becomes `gzip(Uint8Array): Uint8Array`. Calling the
+// raw wasm export directly is not an option — a JS caller cannot build a
+// WasmGC array without those helpers.
+//
+// The generated module is written under .cache/ and imported, because a
+// bindgen'd file is a real TypeScript module, not a string to eval.
+//
+// **A struct handle belongs to the instance that made it and cannot be passed to another.** Each
+// wacBind call is its own wasm instance, so a `Peer` built by one probe is a different type from
+// another probe's `Peer` even when both import it from the same .wac file. Handing one across
+// fails with `type incompatibility when transforming from/to JS`, which names neither the value
+// nor the reason. A probe that has to compose several types must construct them itself, from
+// plain bytes and numbers — see `packages/webrtc/test/wac/session_probe.wac`, where `sessionOver`
+// takes the certificate and keys rather than a `Peer`.
+//
+// The write is atomic — a uniquely named temp file, then rename — because the suite
+// runs in parallel and several test files bind the same entry. Writing the final path
+// directly means one worker can import what another is halfway through writing, which
+// fails as a syntax error in generated code and looks like a compiler bug.
+//
+// The result is cached by the content of everything that produced it — see `buildCache.ts`. A hit
+// skips the compiler entirely, which is most of what this repo's suite used to spend its time on:
+// twenty test files bind the same handful of entries, and each one compiled the whole import graph
+// again. Profile mode never caches, because it wants the compiler's coverage table rather than only
+// its output.
+
+// **`ROOT`, because these paths are the *compiler's own* and not the caller's.** They were bare
+// relative strings, so the Deno-hosted path only worked with the wac checkout as the working
+// directory: from a project of your own it died with `NotFound … readfile
+// 'packages/wacc/src/api.wac'` and a ten-frame stack. GitHub issue 21, `issues/system/0228a`.
+import { ROOT } from "./root.ts";
+import { wacFilesWithRoots } from "./wacFiles.ts";
+import { profileDir, registerProfiled } from "./wacProfile.ts";
+import { cached, contentKey, filesParts, harnessKeyParts, hashDir } from "./buildCache.ts";
+import {
+  type CovPoint,
+  parseCovTable,
+  waccApi,
+  type WaccApi,
+  waccRes,
+  type WaccRes,
+} from "./waccBuild.ts";
+import {
+  generate as waccGenerate, parseAliases, parseFlags, parseGenerics, parseNamed, parseBindTypes, parseCallbacks, parseOutRefs, parseSigs,
+  unsupported,
+} from "../packages/wacc/tools/waccBindgen.ts";
+
+const CACHE_DIR = ".cache";
+
+/**
+ * A name no other worker can produce.
+ *
+ * `Deno.pid` plus a counter is not enough: `--parallel` runs test files in isolates
+ * that share a pid, and each starts its counter at zero — so two workers wrote the
+ * same temp path, one renamed it, and the other's rename failed with NotFound. Only
+ * visible in parallel, from a cold cache, about one run in three.
+ */
+const tempName = (base: string) => `${base}.${crypto.randomUUID()}.tmp`;
+
+/**
+ * The cache key for a binding, or null when it cannot be computed.
+ *
+ * Null means "do not cache", which is the honest answer when the compiler's own sources cannot be
+ * read: that is the case where a stale artifact does the most damage, since whoever is editing the
+ * compiler would be shown their previous build and told their fix did nothing.
+ */
+/**
+ * The graph a bind works from: the files, **and how their imports resolve.**
+ *
+ * One parameter rather than three, because the alternative is a `files` argument with two optional
+ * companions that a caller can leave off — which is what `issues/system/0229a` was: `wacFiles` returns
+ * the files and drops the project roots it had to find, and 18 of 20 callers took the smaller answer
+ * because nothing about the shorter name said it was lossy. A caller here cannot construct a `Graph`
+ * without saying what the roots are.
+ */
+type Graph = {
+  files: Map<string, string>;
+  /** The project root each path sits in, for `@/` — `design/lang/0009` D7. Empty when there is none. */
+  roots: Map<string, string>;
+  /** The directory relative keys are measured from. */
+  base: string;
+};
+
+async function bindKey(
+  entry: string,
+  g: Graph,
+  opts: BindOpts,
+): Promise<string | null> {
+  const harness = await harnessKeyParts();
+  if (harness === null) return null;
+  // **Which compiler emitted the code used to be part of the key**, because `WAC_WASM_FROM` and
+  // `WAC_BIND_FROM` could each pick the reference and a run served the other one's build would
+  // report a green suite that never ran a byte of what it named. There is one compiler now, so
+  // there is nothing to distinguish — and `waccKeyParts` below, which was the *other* half of the
+  // same lesson, still is.
+  // **And wacc's own sources, when wacc is the one emitting.** The parts above cover the reference
+  // compiler and the harness; neither changes when `packages/wacc/src` does, so a measurement taken
+  // after editing wacc's emitter was served the previous build and reported the old blocker. Two
+  // packages said so by disagreeing with a third that happened to miss the cache.
+  // **And the generator.** The glue is built by `packages/wacc/tools/waccBindgen.ts`, which none of
+  // the parts above cover: a fix to it was served the previous run's broken artifact and looked
+  // like no fix at all.
+  const wacc = [
+    ...await hashDir(`${ROOT}/packages/wacc/src`, ".wac"),
+    ...await hashDir(`${ROOT}/packages/wacc/tools`, ".ts"),
+  ];
+  // The roots are in the key for the reason the artefact cache's are: an entry written before them
+  // holds glue built from a graph whose `@/` imports resolved to nothing, and `filesParts` covers file
+  // contents, which a project's root is not among. Sorted, because a `Map` iterates by insertion.
+  const resolution = [
+    ...[...g.roots].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([p, r]) => `root ${p} ${r}`),
+    `base ${g.base}`,
+  ];
+  return await contentKey(
+    ["bind 2", entry, ...wacc, ...harness, ...resolution, ...filesParts(g.files)],
+  );
+}
+
+
+/**
+ * **This file calls the `In` variants throughout, because a bind resolves a real graph.**
+ *
+ * It called the root-less half once, so binding a package whose graph reaches through a `@/` import
+ * produced glue built from a file the compiler never saw — the same fault `issues/system/0229a` fixed a
+ * layer over, and the last caller of it. Nothing in *this* repository has such an import, which is why
+ * it cost nothing here and would cost an outsider everything.
+ *
+ * The argument used to sit on a `WaccApi` declared here, listing the eight calls this file makes.
+ * `issues/system/0231a` is why there is one declaration now, in `waccBuild.ts`: two lists of one
+ * object's methods meant the `0229a` fix had to be found twice, and a reader of either could not see
+ * that the other family existed. Choosing the `In` variants is a fact about this file, so it stays
+ * here; which methods exist is a fact about `api.wac`, so that lives with the type.
+ */
+// **wacc comes from `waccBuild.ts`, and there is one of it.** This file had its own copy of the
+// bootstrap — the same call with the same comment about not announcing the choice through the
+// environment — which was a second answer to "where does wacc come from". Both built it with the
+// reference; the surviving one builds it with the ladder, which is the only source left and needs
+// no selecting.
+
+
+
+/**
+ * @param coverage build the instrumented module and return its point table with the glue.
+ *
+ * **Coverage here is what stops profiling being the one path pinned to the reference.** `bindFrom`
+ * defaults to `wacc`, so an ordinary bind never asks the reference anything — but `wacBind`'s
+ * profiling branch skipped `generate` entirely and called `wacCompile` directly, and the reference
+ * is a documented subset. All seven of `packages/zstd`'s test files therefore failed to compile
+ * under `WAC_PROFILE` (`u32.leadingZeros`) and the package contributed nothing at all to the
+ * coverage profile `tools/mutate.ts` selects from — reported as one line of "using partial
+ * coverage" among 380. `issues/system/0163`.
+ */
+async function waccGlue(
+  g: Graph,
+  entry: string,
+  coverage = false,
+): Promise<{ ts: string; points: CovPoint[] }> {
+  const api = await waccApi();
+  const paths = [...g.files.keys()];
+  const sources = paths.map((p) => g.files.get(p)!);
+  const res = waccRes(api, paths, g.roots, g.base);
+
+  // **The checker first, which this path never asked.** It asked only what the *emitter* declined,
+  // so a local `deno test <file>` compiled things the gate refused — a same-type cast, and an import
+  // of a name the exporting module never exported, which is a package reaching into another's
+  // private surface and being told nothing. Both cost a ten-minute suite to discover, and neither
+  // was a compiler disagreement: `packages/platform/build.ts` diagnoses and this did not.
+  // `issues/lang/0110`.
+  const diagnostics = api.diagnoseGraphIn(paths, sources, res, entry);
+  if (diagnostics !== "") {
+    const lines = diagnostics.split("\n").filter((l) => l !== "").map((l) => {
+      const [file, line, col, phase, message, , hint] = l.split("\t");
+      return `  ${file}:${line}:${col} [${phase}] ${message}${hint ? ` — ${hint}` : ""}`;
+    });
+    throw new Error(`wacc did not compile ${entry}:\n${lines.join("\n")}`);
+  }
+
+  const blocked = api.blockedFilesIn(paths, sources, res, entry);
+  if (blocked !== "") throw new Error(`wacc cannot compile ${entry} yet — ${blocked}`);
+  const wasm = coverage
+    ? api.emitFilesCoveredIn(paths, sources, res, entry)
+    : api.emitFilesIn(paths, sources, res, entry);
+  const wire = api.bindTypesFilesIn(paths, sources, res, entry);
+  const sigs = parseSigs(api.exportSigsFilesIn(paths, sources, res, entry));
+  const declined = unsupported(sigs, parseBindTypes(wire), parseCallbacks(wire), parseOutRefs(wire));
+  if (declined.length > 0) {
+    throw new Error(`wacc's bindgen declined ${entry}: ${declined.join("; ")}`);
+  }
+  return {
+    ts: waccGenerate(
+      wasm, sigs, parseBindTypes(wire), parseCallbacks(wire), parseOutRefs(wire), parseAliases(wire),
+      // Without this the three counter wrappers are not written and the module has no
+      // `__cov_init` to call — the exports exist in the wasm and nothing can reach them.
+      { coverage, named: parseNamed(wire), generics: parseGenerics(wire), flags: parseFlags(wire) },
+    ),
+    // Parsed by `harness/waccBuild.ts`, not here: a counter index means nothing without this table,
+    // so a second copy of the parse would put attribution wrong everywhere while every count stayed
+    // plausible.
+    points: coverage ? parseCovTable(api.covTableFilesIn(paths, sources, res, entry), entry) : [],
+  };
+}
+
+/** Compile and bind, throwing with the diagnostics a person needs. Shared by both paths. */
+async function generate(
+  g: Graph,
+  entry: string,
+  opts: BindOpts,
+): Promise<string> {
+  return (await waccGlue(g, entry, false)).ts;
+}
+
+/**
+ * Bind a wac program for a test.
+ *
+ * `asTool` says this module is part of the *toolchain* rather than the thing under test — wacc
+ * itself, bound so it can compile something else. Under `WAC_PROFILE` every bound module is built
+ * with coverage instrumentation and registered for attribution, and once applications are built by
+ * wacc that swept the compiler's own 30,000 lines into every profile: `packages/wacc/src/api.wac`,
+ * `ast.wac` and the rest, credited to whichever test happened to trigger a build, with none of the
+ * subject's own lines left. A tool is not a subject [issue 0106].
+ */
+/** What a caller may pin, rather than announcing it to the whole process. */
+export type BindOpts = {
+  asTool?: boolean;
+};
+
+export async function wacBind(
+  entry: string,
+  opts: BindOpts = {},
+): Promise<Record<string, unknown>> {
+  const profiling = profileDir && !opts.asTool;
+  // Before the compiler is asked to do anything, so a stale checkout says so itself
+  // rather than surfacing as a type error in whichever package used a new feature.
+  const { files, roots } = await wacFilesWithRoots(entry);
+  const g: Graph = { files, roots, base: Deno.cwd() };
+
+  // The fast path: this exact program, compiled by this exact compiler, is already on disk.
+  if (!profiling) {
+    const key = await bindKey(entry, g, opts);
+    if (key !== null) {
+      const path = await cached("bind", key, ".gen.ts", async (tmp) => {
+        await Deno.writeTextFile(tmp, await generate(g, entry, opts));
+      });
+      return await import(`${Deno.cwd()}/${path}`) as Record<string, unknown>;
+    }
+  }
+
+  // Profile mode compiles with coverage instrumentation so wacProfile can record which
+  // tests reach which lines. Off by default and invisible to a normal run: the
+  // instrumented build is a different binary, and it is used for attribution only, never
+  // for deciding whether a mutant was killed.
+  // The same compiler the cached path above would have used, instrumented. Only when that path is
+  // wacc — `bindFrom` may be pinned to the reference, and then this stays the reference too, so the
+  // two never disagree about what was measured.
+  const built = await waccGlue(g, entry, profiling !== false && profiling !== "");
+  const ts = built.ts;
+  await Deno.mkdir(CACHE_DIR, { recursive: true });
+  const outPath = `${CACHE_DIR}/${profiling ? "prof_" : ""}${entry.replaceAll("/", "_")}.gen.ts`;
+  const tmpPath = tempName(outPath);
+  await Deno.writeTextFile(tmpPath, ts);
+  await Deno.rename(tmpPath, outPath);
+
+  const mod = await import(`${Deno.cwd()}/${outPath}`) as Record<string, unknown>;
+  if (profiling) {
+    // The counter array is allocated by __cov_init, not at instantiation; without it the
+    // first instrumented branch traps on a null pointer.
+    (mod.__cov_init as () => void)();
+    const points = built.points;
+    registerProfiled({
+      points,
+      counts: () => {
+        const len = (mod.__cov_len as () => number)();
+        const get = mod.__cov_get as (i: number) => number;
+        return Array.from({ length: len }, (_, i) => get(i));
+      },
+    });
+  }
+  return mod;
+}

@@ -1,0 +1,397 @@
+// The desktop's core without a browser: the memory disk, and the window manager's arithmetic and memory.
+
+import { Ticket, Vec } from "core";
+import { Page, PageServer, Runner, TestDoc, Ui } from "web";
+import { Clock } from "../src/desk/shell.wac";
+import { Vfs, Got, Info, copyTree, freeName, leafOf, vfsOf } from "../src/desk/vfs.wac";
+import { MemoryStore, Sys } from "std";
+import { Desk, MAX_WINDOWS, NO_WINDOW, Placed, Running, Start, Win, close, dragTo, endDrag, find, focus, followTo, frontOf, goHome, hintRight,
+         minimise, newDesk, open, openWindowFor, restore, sessionOf, startMove, startResize, startOf, taskbarClick,
+         toggleMax } from "../src/desk/wm.wac";
+import { Grants } from "../src/desk/grants.wac";
+import { builtin } from "../src/desk/builtin.wac";
+import { Entry, entries, found } from "../src/desk/launcher.wac";
+import { Prefs, defaultPrefs, deskClasses, loudnessOf, prefsCss, prefsJson, prefsOf } from "../src/desk/prefs.wac";
+import { appFor } from "../src/desk/files.wac";
+import { browserSaid, firstTouch, wholeScreen } from "../src/desk/full.wac";
+
+/** Run `t` to completion: the memory disk answers at once, so draining the runner finishes it. */
+T run<T>(Runner r, Ticket<T> t) {
+  r.drain();
+  if (!t.settled()) { trap "the ticket did not settle"; }
+  return t.value();
+}
+
+async string diskScenario(Vfs fs) {
+  // Writing into folders that do not exist makes them.
+  if (!(await fs.write("a/b/c.txt", "hi".toBytes())).ok) { return "nested write"; }
+  Got<Info> s = await fs.stat("a/b");
+  if (!s.ok || !s.value.isDir) { return "the folder was not made"; }
+  Got<string[]> names = await fs.list("a");
+  if (!names.ok || names.value.len() != 1 || names.value[0] != "b") { return "list: \{names.value.len()}"; }
+  if (string.fromBytes((await fs.read("a/b/c.txt")).value) != "hi") { return "read back"; }
+  // A name in use gets a number before its extension.
+  if (await freeName(fs, "a/b", "c.txt") != "c 2.txt") { return "free name: \{await freeName(fs, "a/b", "c.txt")}"; }
+  if (await freeName(fs, "a/b", "d.txt") != "d.txt") { return "free name of an unused one"; }
+  // Renaming a folder takes everything in it along.
+  if (!(await fs.rename("a", "z")).ok) { return "rename"; }
+  if (!(await fs.read("z/b/c.txt")).ok || (await fs.read("a/b/c.txt")).ok) { return "rename moved the wrong things"; }
+  if ((await fs.rename("missing", "q")).ok) { return "renaming nothing worked"; }
+  if (!(await copyTree(fs, "z", "copy")).ok || !(await fs.read("copy/b/c.txt")).ok) { return "copy"; }
+  // Removing a folder removes what is in it.
+  if (!(await fs.remove("z")).ok) { return "remove"; }
+  if ((await fs.stat("z/b")).ok || (await fs.stat("z")).ok) { return "remove left something"; }
+  if ((await fs.read("copy")).ok) { return "a folder read as a file"; }
+  return "";
+}
+
+export string test_the_disk_behaves_like_a_disk(Sys sys) {
+  Runner r = Runner.create();
+  schedule r.take;
+  return run(r, diskScenario(memoryDisk(sys)));
+}
+
+/** A disk in memory, as a page opened from a file gets. */
+Vfs memoryDisk(Sys sys) { return vfsOf(MemoryStore.create(sys.clock()).asUser("root"), false); }
+
+Desk desk(Sys sys) { return newDesk(memoryDisk(sys)); }
+
+export string test_windows_open_cascaded_and_stack(Sys sys) {
+  Desk d = desk(sys);
+  Win a = open(d, "files", "", "Home", "home");
+  Win b = open(d, "allowed", "", "Permissions", "shield");
+  if (b.x <= a.x || b.y <= a.y) { return "not cascaded: \{a.x},\{a.y} then \{b.x},\{b.y}"; }
+  if (a.x < 120) { return "a window opened over the desktop's icons"; }
+  if (d.focused != b.id || b.z <= a.z) { return "the new window is not in front"; }
+  // The same window again is the same window, brought forward.
+  focus(d, a.id);
+  Win again = open(d, "allowed", "", "Permissions", "shield");
+  if (again.id != b.id || d.wins.len() != 2 || d.focused != b.id) { return "a second Permissions window"; }
+  // A Files window may be opened as often as wanted.
+  open(d, "files", "", "Home", "home");
+  if (d.wins.len() != 3) { return "a second Files window"; }
+  return "";
+}
+
+export string test_minimise_close_and_the_taskbar(Sys sys) {
+  Desk d = desk(sys);
+  Win a = open(d, "files", "", "Home", "home");
+  Win b = open(d, "allowed", "", "Permissions", "shield");
+  minimise(d, b.id);
+  if (!b.min || d.focused != a.id) { return "minimising did not hand the focus on"; }
+  taskbarClick(d, b.id);
+  if (b.min || d.focused != b.id) { return "the taskbar did not bring it back"; }
+  taskbarClick(d, b.id);
+  if (!b.min) { return "the taskbar did not put the front window away"; }
+  close(d, a.id);
+  if (find(d, a.id) is not null || d.wins.len() != 1) { return "close"; }
+  return "";
+}
+
+export string test_dragging_moves_and_resizing_keeps_a_minimum(Sys sys) {
+  Desk d = desk(sys);
+  Win w = open(d, "files", "", "Home", "home");
+  i32 x = w.x;
+  i32 y = w.y;
+  startMove(d, w.id, x + 50, y + 10);
+  dragTo(d, x + 150, y + 70);
+  endDrag(d);
+  if (w.x != x + 100 || w.y != y + 60) { return "moved to \{w.x},\{w.y}"; }
+  // Held against the top edge, a window stops at the top; let go there, it maximises, and keeps its place.
+  i32 before = w.y;
+  startMove(d, w.id, w.x + 50, w.y + 10);
+  dragTo(d, w.x + 50, -500);
+  if (w.y != 0) { return "dragged off the top: \{w.y}"; }
+  endDrag(d);
+  if (!w.max || w.y != before) { return "let go at the top: max \{w.max}, y \{w.y}"; }
+  toggleMax(d, w.id);
+  // Resizing from the left edge moves the left side and keeps the right.
+  i32 right = w.x + w.w;
+  startResize(d, w.id, "w", w.x, w.y + 50);
+  dragTo(d, w.x - 40, w.y + 50);
+  endDrag(d);
+  if (w.x + w.w != right) { return "the right side moved"; }
+  // And never smaller than the minimum.
+  startResize(d, w.id, "se", w.x + w.w, w.y + w.h);
+  dragTo(d, w.x, w.y);
+  endDrag(d);
+  if (w.w != 320 || w.h != 200) { return "below the minimum: \{w.w}×\{w.h}"; }
+  return "";
+}
+
+export string test_snapping_and_maximising(Sys sys) {
+  Desk d = desk(sys);
+  Win w = open(d, "files", "", "Home", "home");
+  i32 x = w.x;
+  startMove(d, w.id, x + 50, w.y + 10);
+  dragTo(d, 2, 300);
+  endDrag(d);
+  if (w.snap != 1) { return "a drag to the left edge did not snap left"; }
+  if (w.x != x) { return "a snapped window forgot where it was: \{w.x}"; }
+  startMove(d, w.id, 100, 10);
+  dragTo(d, 600, 300);
+  hintRight(d);
+  endDrag(d);
+  if (w.snap != 2) { return "the right edge did not snap right: \{w.snap}"; }
+  startMove(d, w.id, 900, 10);
+  dragTo(d, 700, 1);
+  endDrag(d);
+  if (!w.max) { return "a drag to the top did not maximise"; }
+  toggleMax(d, w.id);
+  if (w.max || w.snap != 0) { return "restore"; }
+  return "";
+}
+
+/** A program running in `d`, started as `s`, with its first window open. */
+Win running(Desk d, Start s) {
+  Vec<i32> wins = Vec.create();
+  Vec<PageServer?> servers = Vec.create();
+  for (i32 i = 0; i < MAX_WINDOWS; i++) {
+    wins.push(NO_WINDOW);
+    servers.push(null);
+  }
+  Running r = Running(d.nextRun, s.path, leafOf(s.path), Grants.create(), s, null, wins, servers, Vec.create(), false, false);
+  d.nextRun++;
+  d.running.push(r);
+  return openWindowFor(d, r, 0, leafOf(s.path));
+}
+
+/** What a session hands back to be started again, one `app:arg@x,w;` each. */
+string[] noted() { return [""]; }
+
+export string test_the_session_comes_back(Sys sys) {
+  Desk d = desk(sys);
+  Win a = open(d, "files", "Desktop", "Desktop", "folder");
+  Win b = running(d, builtin("editor", "notes \"one\".txt"));
+  Win c = open(d, "allowed", "", "Permissions", "shield");
+  // A module from the disk is not started again: its window is its process's.
+  running(d, startOf("Desktop/counter.wasm"));
+  b.x = 300;
+  b.w = 640;
+  a.snap = 2;
+  minimise(d, c.id);
+  focus(d, b.id);
+  Desk e = desk(sys);
+  string[] again = noted();
+  i32 n = restore(e, sessionOf(d), (string app, string arg, Vec<Placed> at) => {
+    again[0] = again[0] + "\{app}:\{arg}@\{at.get(0).x},\{at.get(0).w}\{at.get(0).focused ? " focused" : ""};";
+  });
+  if (n != 3) { return "restored \{n} windows"; }
+  if (again[0] != "editor:notes \"one\".txt@300,640 focused;") { return "the editor, to start again: \{again[0]}"; }
+  if (e.wins.len() != 2) { return "\{e.wins.len()} windows opened at once, not the Files and Permissions windows"; }
+  for (i32 i = 0; i < e.wins.len(); i++) {
+    Win w = e.wins.get(i);
+    if (w.app == "files" && w.snap != 2) { return "the snap"; }
+    if (w.app == "allowed" && !w.min) { return "minimised"; }
+  }
+  if (restore(desk(sys), "{ not json".toBytes(), (string app, string arg, Vec<Placed> at) => { }) != 0) {
+    return "a damaged session restored something";
+  }
+  return "";
+}
+
+/**
+ * **Every window of one of the desktop's apps comes back**: the app is started once, handed where each of its
+ * windows was — the first by its slot, the rest by their titles, which a reopened window will have again.
+ */
+export string test_each_window_of_an_app_comes_back_where_it_was(Sys sys) {
+  Desk d = desk(sys);
+  Win first = running(d, builtin("ide", "Projects"));
+  Running r = d.running.get(0);
+  Win second = openWindowFor(d, r, 3, "hello");
+  first.x = 150;
+  second.x = 420;
+  Desk e = desk(sys);
+  string[] again = noted();
+  restore(e, sessionOf(d), (string app, string arg, Vec<Placed> at) => {
+    again[0] = again[0] + "\{app}:\{arg}";
+    for (i32 i = 0; i < at.len(); i++) { again[0] = again[0] + " \{at.get(i).slot}/\{at.get(i).title}@\{at.get(i).x}"; }
+    again[0] = again[0] + ";";
+  });
+  if (again[0] != "ide:Projects 0/ide.wasm@150 3/hello@420;" && again[0] != "ide:Projects 3/hello@420 0/ide.wasm@150;") {
+    return "started once with both windows' places: \{again[0]}";
+  }
+  return "";
+}
+
+/**
+ * **A session saved before the desktop's apps were programs** had their windows by name: each is started again,
+ * the Calculator without the sum its window used to keep.
+ */
+export string test_an_older_sessions_app_windows_are_started_again(Sys sys) {
+  string old = "{\"windows\":[{\"app\":\"viewer\",\"arg\":\"Desktop/Welcome.md\",\"x\":140},"
+             + "{\"app\":\"calc\",\"arg\":\"12+3\"},{\"app\":\"terminal\",\"arg\":\"Desktop\"},"
+             + "{\"app\":\"files\",\"arg\":\"\"}]}";
+  Desk e = desk(sys);
+  string[] again = noted();
+  i32 n = restore(e, old.toBytes(), (string app, string arg, Vec<Placed> at) => { again[0] = again[0] + "\{app}:\{arg};"; });
+  if (n != 4 || e.wins.len() != 1) { return "\{n} restored, \{e.wins.len()} opened"; }
+  if (again[0] != "viewer:Desktop/Welcome.md;calc:;terminal:Desktop;") { return again[0]; }
+  return "";
+}
+
+/**
+ * **Each of the desktop's own apps is handed what it is opened on, and no more**: the Viewer its file to read, the
+ * Editor its file to change, the Calculator nothing; the Terminal, a shell, the whole disk, as the owner chose.
+ */
+export string test_each_app_is_handed_what_it_is_opened_on() {
+  Grants v = builtin("viewer", "Desktop/a.md").given;
+  if (!v.allows("Desktop/a.md", false) || v.allows("Desktop/a.md", true) || v.allows("Desktop/b.md", false)) {
+    return "the Viewer's file, to read, and nothing beside it";
+  }
+  Grants e = builtin("editor", "Desktop/a.md").given;
+  if (!e.allows("Desktop/a.md", true) || e.allows("Desktop/b.md", false)) { return "the Editor's file, to change"; }
+  if (builtin("editor", "").given.paths.len() != 0) { return "a new file's Editor holds nothing until the desktop names one"; }
+  if (builtin("calc", "").given.paths.len() != 0) { return "the Calculator holds nothing"; }
+  if (!builtin("terminal", "Desktop").given.allows(".desktop/session.json", true)) { return "the Terminal, the whole disk"; }
+  Start s = builtin("viewer", "Desktop/a.md");
+  if (s.path != "site/apps/viewer.wasm" || s.args.len() != 1 || s.args[0] != "/Desktop/a.md") { return "\{s.path} \{s.args.len()}"; }
+  if (s.takesFiles || !builtin("explorer", "").takesFiles) { return "files dropped go to the Explorer, and past the Viewer"; }
+  return "";
+}
+
+/** The first entry a search finds, by title; "" for none. */
+string firstFound(string q) {
+  Entry[] got = found(entries(), q);
+  return got.len() == 0 ? "" : got[0].title;
+}
+
+/**
+ * **The launcher finds an entry by what it is for**: a tag reaches it ("shell" the Terminal), every word typed must
+ * start a word of it, and a match in the title counts most.
+ */
+export string test_the_launcher_finds_entries_by_their_tags() {
+  if (firstFound("shell") != "Terminal") { return "shell: \{firstFound("shell")}"; }
+  if (firstFound("command line") != "Terminal") { return "command line: \{firstFound("command line")}"; }
+  if (firstFound("zip") != "Archive Explorer") { return "zip: \{firstFound("zip")}"; }
+  if (firstFound("ter") != "Terminal") { return "ter: \{firstFound("ter")}"; }
+  if (firstFound("calc") != "Calculator") { return "calc: \{firstFound("calc")}"; }
+  if (firstFound("recycle") != "Trash") { return "recycle: \{firstFound("recycle")}"; }
+  if (firstFound("hell") != "") { return "a word is matched from its start only: \{firstFound("hell")}"; }
+  if (firstFound("nothing like this") != "") { return "an unmatched search finds nothing"; }
+  return "";
+}
+
+
+/**
+ * **The clock keeps one timer, however long it runs.** It armed its ten-second timer as it rendered, and each tick
+ * rendered it: the timers doubled every ten seconds, and a desktop left alone ground to a halt a few minutes in.
+ */
+export string test_the_clock_keeps_one_timer_as_it_ticks() {
+  TestDoc doc = TestDoc.create();
+  Page page = doc.page();
+  schedule page.take;
+  page.mount((Ui ui) => <Clock page={page}/>);
+  page.turn();
+  for (i32 s = 0; s < 90; s++) {
+    doc.advance(1000);
+    page.turn();
+  }
+  i32 waiting = doc.sleepAsks.len();
+  if (waiting > 1) { return "\{waiting} timers waiting after ninety seconds"; }
+  return "";
+}
+
+/**
+ * **Settings are kept as they were chosen, and a damaged file is the defaults**: every choice survives being written
+ * and read, and anything not understood — a wallpaper there is no longer, a volume past full — is as it would be
+ * without the file, not an error.
+ */
+/**
+ * **The desktop as a whole fills the screen when the person says so**: Full screen now, or — chosen — at the first tap
+ * or key after it opens, once, so leaving it with Escape or Back is not undone by the next tap. The browser is asked
+ * only when what the desktop wants changes, and a late word of an earlier full screen's end changes nothing.
+ */
+export string test_the_whole_desktop_fills_the_screen_as_chosen_and_once_left_stays_left(Sys sys) {
+  Desk d = desk(sys);
+  string asked = "";
+  d.full.screen = (bool on) => { asked = asked + (on ? "on;" : "off;"); };
+  if (firstTouch(d, 1.0) || asked != "") { return "with Never chosen, a tap is only a tap: \{asked}"; }
+  wholeScreen(d, true, 2.0);
+  if (!d.full.whole || asked != "on;") { return "Full screen now: \{asked}"; }
+  wholeScreen(d, false, 3.0);
+  if (d.full.whole || asked != "on;off;") { return "and left: \{asked}"; }
+  Desk e = desk(sys);
+  string got = "";
+  e.full.screen = (bool on) => { got = got + (on ? "on;" : "off;"); };
+  e.prefs.screen = "auto";
+  if (!firstTouch(e, 1.0) || !e.full.whole || got != "on;") { return "each time it opens: the first tap \{got}"; }
+  if (firstTouch(e, 2.0) || got != "on;") { return "and only the first: \{got}"; }
+  browserSaid(e, true, 3.0);
+  if (!e.full.whole || got != "on;") { return "begun, as asked: \{got}"; }
+  // Escape: the browser says it ended, and nothing puts it back.
+  if (!browserSaid(e, false, 4.0) || e.full.whole) { return "Escape leaves it"; }
+  if (firstTouch(e, 5.0) || e.full.whole || got != "on;") { return "a tap after leaving it is only a tap: \{got}"; }
+  // Asked again, then the browser's late word of the last one's end: out of date, nothing left.
+  wholeScreen(e, true, 6.0);
+  if (browserSaid(e, false, 6.5) || !e.full.whole) { return "a late end ended the new one"; }
+  return "";
+}
+
+export string test_settings_are_kept_and_a_damaged_file_is_the_defaults() {
+  Prefs p = defaultPrefs();
+  p.theme = "dark";
+  p.accent = "rose";
+  p.wall = "ocean";
+  p.volume = 35;
+  p.muted = true;
+  p.markdown = "markdown";
+  p.data = "editor";
+  p.text = "viewer";
+  p.screen = "auto";
+  Prefs back = prefsOf(prefsJson(p));
+  string was = string.fromBytes(prefsJson(p));
+  if (string.fromBytes(prefsJson(back)) != was) { return "read back as \{string.fromBytes(prefsJson(back))}, not \{was}"; }
+  if (deskClasses(back) != " theme-dark accent-rose wall-ocean") { return "the desktop wears “\{deskClasses(back)}”"; }
+  if (deskClasses(defaultPrefs()) != "") { return "the defaults need no class: “\{deskClasses(defaultPrefs())}”"; }
+  if (prefsCss().indexOf(".desk.accent-rose {") < 0 || prefsCss().indexOf(".desk.wall-ocean {") < 0) { return "no rule for a class it wears"; }
+  Prefs odd = prefsOf("{\"theme\":\"purple\",\"wallpaper\":\"gone\",\"volume\":250,\"markdown\":\"calc\"}".toBytes());
+  if (odd.theme != "auto" || odd.wall != "aurora" || odd.volume != 100 || odd.markdown != "viewer") {
+    return "not understood, not the defaults: \{string.fromBytes(prefsJson(odd))}";
+  }
+  if (string.fromBytes(prefsJson(prefsOf("not json".toBytes()))) != string.fromBytes(prefsJson(defaultPrefs()))) { return "damaged, not the defaults"; }
+  // The slider's square: half way is a quarter as loud; muted is silent whatever the slider says.
+  Prefs half = defaultPrefs();
+  half.volume = 50;
+  if (loudnessOf(half) != 0.25 || loudnessOf(defaultPrefs()) != 1.0 || loudnessOf(back) != 0.0) { return "loudness \{loudnessOf(half)}"; }
+  return "";
+}
+
+/** **What opens what is the person's**: Markdown, data and other text each go where Settings says; the rest as always. */
+export string test_files_open_in_the_app_settings_chose() {
+  Prefs p = defaultPrefs();
+  if (appFor(p, "a.md") != "viewer" || appFor(p, "b.json") != "viewer" || appFor(p, "c.txt") != "editor" || appFor(p, "d.wac") != "editor") {
+    return "the defaults: \{appFor(p, "a.md")} \{appFor(p, "b.json")} \{appFor(p, "c.txt")} \{appFor(p, "d.wac")}";
+  }
+  p.markdown = "markdown";
+  p.data = "editor";
+  p.text = "viewer";
+  if (appFor(p, "a.md") != "markdown" || appFor(p, "README.markdown") != "markdown" || appFor(p, "b.csv") != "editor" || appFor(p, "c.txt") != "viewer") {
+    return "as chosen: \{appFor(p, "a.md")} \{appFor(p, "b.csv")} \{appFor(p, "c.txt")}";
+  }
+  if (appFor(p, "e.zip") != "files" || appFor(p, "f.wasm") != "program" || appFor(p, "g.png") != "viewer") {
+    return "what Settings does not choose: \{appFor(p, "e.zip")} \{appFor(p, "f.wasm")} \{appFor(p, "g.png")}";
+  }
+  return "";
+}
+
+/**
+ * **On a phone, the address says what is in front**: a window by its id, or the home screen. Going home puts every
+ * window away and closes none; the address naming a window brings it back; naming one closed since is the home screen.
+ */
+export string test_on_a_phone_the_address_says_what_is_in_front(Sys sys) {
+  Desk d = desk(sys);
+  Win a = open(d, "files", "", "Home", "home");
+  Win b = open(d, "files", "Desktop", "Desktop", "folder");
+  if (frontOf(d) != b.id) { return "the last opened is in front"; }
+  goHome(d);
+  if (frontOf(d) != 0 || d.wins.len() != 2) { return "home: \{frontOf(d)} in front, \{d.wins.len()} open"; }
+  followTo(d, "w\{a.id}");
+  if (frontOf(d) != a.id || d.front != a.id) { return "back to the first: \{frontOf(d)}"; }
+  close(d, b.id);
+  followTo(d, "w\{b.id}");
+  if (frontOf(d) != 0) { return "a window closed since is the home screen"; }
+  followTo(d, "nonsense");
+  if (frontOf(d) != 0) { return "an address that names nothing is the home screen"; }
+  return "";
+}

@@ -1,0 +1,86 @@
+// The `/bin` claims that need a real process: the **spawned** route, and the host that runs a `wac app`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/binspawn_test.wac
+//
+// Everything else about `/bin` — that it lists exactly this build's programs, that a program in it is a file with a
+// mode and a size, that a path into it runs the program however it is spelled, that a build with no programs has no
+// `/bin` — is `bin_test.wac`, in process. This is what cannot go there: `cmd &`, a streaming pipeline and a `/bin` path
+// all take the spawned stage, which works by re-entering the program's own `main` with the applet's name first, and a
+// *test file* given such a `main` is not a shell that will stop. `issues/system/0193`.
+//
+// **Three routes reach a program and only one of them consulted `/bin`.** `dispatched` rewrote the path before
+// looking at any bytes; the streaming pipeline and `&` both went to `spawnStage`, which read the file — and what is
+// in `/bin` is a *sentence* about the program, so the same command failed behind an `&` and worked without one. Now
+// one function decides what a path into `/bin` means and every route asks it. It was box's TypeScript `bin.test.ts`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { ChildEnv, Exec, Launch, Sys, TimedOut } from "std";
+import { flatten } from "core";
+
+/** What a run said; `hung` when it did not finish within its bound. */
+struct Ran {
+  string out;
+  string err;
+  i32 status;
+  bool hung;
+}
+
+/** The sealed shell, built with no grants, running `script` — given at most `ms`, since a hang is the failure. */
+async Ran sh(Sys sys, string built, string script, i32 ms) {
+  auto r = await sys.clock().within(sys.procs().exec(built, ["-c", script], u8[](), ChildEnv.inherited(), Launch.plain()), ms);
+  if (r.isErr()) { return Ran("", "\{r.err()!}", 0 - 1, r.err()! is TimedOut); }
+  Exec x = r.unwrap();
+  return Ran(string.fromBytes(x.stdout), string.fromBytes(x.stderr), x.status, false);
+}
+
+string sealedsh(Sys sys) {
+  return builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sealedsh.wac", "binspawn-sealedsh", string[]());
+}
+
+export async string test_a_program_in_bin_is_the_same_program_down_every_route_a_command_can_take(Sys sys) {
+  T t = T.create();
+  string built = sealedsh(sys);
+  Ran bg = await sh(sys, built, "echo a b c > w; /bin/wc -w w & wait", 30000);
+  t.eqStr(bg.out, "3 w\n", "background: \{bg.err}");
+  Ran piped = await sh(sys, built, "seq 1 5 | /bin/wc -l | /bin/cat", 30000);
+  t.eqStr(piped.out, "5\n", "pipeline: \{piped.err}");
+  // The two path failures in a pipeline, the other half of the same bug. Both answers are bash's: the *last* stage
+  // decides the status, so a failing stage in front of a working one leaves the pipeline at 0 while still complaining.
+  Ran first = await sh(sys, built, "/bin | cat; echo status=$?", 30000);
+  t.isTrue(contains(first.err, "Is a directory"), first.err);
+  t.eqStr(first.out, "status=0\n", "a directory first");
+  Ran last = await sh(sys, built, "cat /proc/self/comm | /bin; echo status=$?", 30000);
+  t.isTrue(contains(last.err, "Is a directory"), last.err);
+  t.eqStr(last.out, "status=126\n", "a directory last");
+  Ran gone = await sh(sys, built, "cat /proc/self/comm | /bin/nosuch; echo status=$?", 30000);
+  t.isTrue(contains(gone.err, "No such file or directory"), gone.err);
+  t.eqStr(gone.out, "status=127\n", "a program that is not there");
+  // **And a `/bin` path streams**: `canStream` refused every word with a slash, so this ran sequentially and buffered
+  // `yes` until the array grew past what wasm will allocate. Issue 0127 is the general case.
+  Ran streamed = await sh(sys, built, "yes | /bin/head -2", 30000);
+  t.eqStr(streamed.out, "y\ny\n", "\{streamed.out} / \{streamed.err}");
+  return t.report();
+}
+
+/**
+ * **A stage with nowhere left to write is stopped**, on the host that runs a `wac app` — the native binary. Until
+ * 2026-08-29 `yes | /bin/head -2` printed both lines and never returned there: `closeSocket` dropped the parent's end
+ * and left the child's, so `write` went on answering `true` to a pipe with no reader and `yes` looped for ever.
+ * `issues/system/0275c`. Bounded, because the failure mode is not returning.
+ */
+export async string test_a_stage_with_nowhere_left_to_write_is_stopped_on_the_host_that_runs_a_wac_app(Sys sys) {
+  T t = T.create();
+  string built = sealedsh(sys);
+  // Ten seconds against a case that answers in well under one: reaching it means nothing ever refused a write.
+  Ran r = await sh(sys, built, "yes | /bin/head -2", 10000);
+  t.isFalse(r.hung, "the pipeline never returned");
+  t.eqStr(r.out, "y\ny\n", "\{r.out} / \{r.err}");
+  t.eqI32(r.status, 0, r.err);
+  // And a *bounded* producer still works, so the fix is about ending the stream rather than stopping every child early.
+  Ran seq = await sh(sys, built, "seq 1 5 | /bin/wc -l", 10000);
+  t.isFalse(seq.hung, "the bounded pipeline never returned");
+  t.eqStr(seq.out, "5\n", "\{seq.out} / \{seq.err}");
+  return t.report();
+}

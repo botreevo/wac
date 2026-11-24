@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"><title>kps dial</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "@kpstreams/core": "/kps/core/index.js",
+      "@kpstreams/core/webrtc": "/kps/core/webrtc.js",
+      "@kpstreams/webrtc-client": "/kps/webrtc-client/index.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <pre id="status">idle</pre>
+  <script type="module">
+    // The scenarios `webrtc-dial.mjs` runs, in a real browser: the JS webrtc-client, no polyfill.
+    import { dial } from '@kpstreams/webrtc-client'
+
+    const within = (p, ms, what) =>
+      Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what}: no answer in ${ms}ms`)), ms))])
+
+    async function readAll(stream) {
+      const reader = stream.readable.getReader()
+      const chunks = []
+      let n = 0
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        chunks.push(value)
+        n += value.length
+      }
+      const out = new Uint8Array(n)
+      let at = 0
+      for (const c of chunks) { out.set(c, at); at += c.length }
+      return out
+    }
+
+    // Written in 64 KiB pieces, as the kps repo's own interop page writes. **One write of a megabyte or more stalls
+    // the JS client against any listener** — the reference `@kpstreams/server` included, measured: it splits the
+    // write into frames, fills its local send queue to the 1 MiB bound in one go, and never hears the queue drain.
+    // That is the client's to fix; what is measured here is the listener.
+    async function echo(conn, bytes) {
+      const s = await conn.openStream()
+      const w = s.writable.getWriter()
+      const reading = readAll(s)
+      for (let off = 0; off < bytes.length; off += 65536) await w.write(bytes.subarray(off, Math.min(off + 65536, bytes.length)))
+      await w.close()
+      return await reading
+    }
+
+    const enc = new TextEncoder()
+    const dec = new TextDecoder()
+    const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
+
+    window.runAll = async function (addr) {
+      // Chromium shows a page no local interface without media permission, and then gathers nothing.
+      try { (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach(t => t.stop()) } catch {}
+      const results = []
+      const check = (ok, what, why = '') => results.push(ok ? `PASS ${what}` : `FAIL ${what}: ${why}`)
+      let conn
+      try {
+        conn = await within(dial(addr), 15000, 'dial')
+        check(true, 'the dial establishes (ICE, DTLS pinned to the certhash, SCTP, HELLO both ways)')
+      } catch (e) {
+        check(false, 'the dial establishes', String(e?.message ?? e))
+        return results
+      }
+      try {
+        const got = await within(echo(conn, enc.encode('hello kps')), 10000, 'echo')
+        check(dec.decode(got) === 'hello kps', 'a stream echoes and ends in EOF', JSON.stringify(dec.decode(got)))
+      } catch (e) { check(false, 'a stream echoes and ends in EOF', String(e?.message ?? e)) }
+      try {
+        const big = new Uint8Array(3 * 1024 * 1024)
+        for (let i = 0; i < big.length; i++) big[i] = (i * 31 + 7) & 0xff
+        const got = await within(echo(conn, big), 90000, '3 MiB echo')
+        check(same(got, big), '3 MiB echoes intact — past the 1 MiB stream window, so credit flows', `${got.length} bytes back`)
+      } catch (e) { check(false, '3 MiB echoes intact', String(e?.message ?? e)) }
+      try {
+        const many = await within(Promise.all(Array.from({ length: 20 }, (_, i) => echo(conn, enc.encode(`s${i}`)))), 20000, '20 streams')
+        check(many.every((b, i) => dec.decode(b) === `s${i}`), 'twenty concurrent streams, each its own bytes')
+      } catch (e) { check(false, 'twenty concurrent streams', String(e?.message ?? e)) }
+      try {
+        const n = 150
+        for (let i = 0; i < n; i++) {
+          const got = await within(echo(conn, enc.encode(`r${i}`)), 5000, `stream ${i}`)
+          if (dec.decode(got) !== `r${i}`) throw new Error(`stream ${i} echoed ${dec.decode(got)}`)
+        }
+        check(true, `${n} streams one after another — past the 100-stream limit, so retired slots and reused SCTP ids come back`)
+      } catch (e) { check(false, 'streams past the stream limit', String(e?.message ?? e)) }
+      try {
+        const got = []
+        const recv = (async () => { for (;;) got.push(dec.decode(await conn.receiveDatagram())) })()
+        recv.catch(() => {})
+        for (let i = 0; i < 20; i++) await conn.sendDatagram(enc.encode(`d${i}`))
+        await within((async () => { while (got.length < 20) await new Promise(r => setTimeout(r, 20)) })(), 5000, 'datagrams')
+        check(got.length >= 20, 'datagrams cross both ways', `${got.length} back`)
+      } catch (e) { check(false, 'datagrams cross both ways', String(e?.message ?? e)) }
+      try {
+        await conn.sendDatagram(new Uint8Array(5000))
+        check(false, 'an oversized datagram is refused', 'it was accepted')
+      } catch (e) { check(e?.code === 'too-large', 'an oversized datagram is refused with too-large', String(e?.code)) }
+      try {
+        const s = await conn.openStream()
+        const r = s.readable.getReader()
+        await s.resetWrite({ code: 'timeout' })
+        const res = await within(r.read().then(() => 'no error', (e) => e?.code ?? String(e)), 5000, 'reset echo')
+        check(res === 'timeout', 'a reset reaches the echo server, which resets back with the same code', res)
+      } catch (e) { check(false, 'a reset round-trips', String(e?.message ?? e)) }
+      await conn.close()
+      return results
+    }
+    // How long echoes of growing sizes take on one connection: where throughput falls off.
+    window.runTimed = async function (addr, sizes) {
+      try { (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach(t => t.stop()) } catch {}
+      const conn = await dial(addr)
+      const out = []
+      for (const n of sizes) {
+        const bytes = new Uint8Array(n)
+        const t0 = performance.now()
+        try {
+          const got = await within(echo(conn, bytes), 60000, `${n}`)
+          out.push(`TIME ${n} bytes ${Math.round(performance.now() - t0)}ms ${got.length === n ? 'ok' : 'short ' + got.length}`)
+        } catch (e) { out.push(`TIME ${n} bytes failed: ${e.message}`); break }
+      }
+      await conn.close()
+      return out
+    }
+    document.getElementById('status').textContent = 'ready'
+  </script>
+</body>
+</html>

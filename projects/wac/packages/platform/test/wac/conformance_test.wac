@@ -1,0 +1,711 @@
+// What a second host has to answer the same way, opcode by opcode — and what nothing yet checks.
+//
+// design/system/0001's open questions name this as the largest risk in the direction: "the native core
+// is the first large subsystem here with nothing independent to check it against, in a repo whose
+// rigour is mostly differential." Since then a good deal *has* been checked — the arrival test moves an
+// image between the two hosts, `native_hostfs_test.wac` compares twelve filesystem operations and every
+// grant refusal, `native_shell_test.wac` runs a slice of the shell corpus on both — but that coverage
+// grew a file at a time, and **nothing knew what it added up to.**
+//
+// This is the ledger. For every opcode on the two-host surface it names where the comparison lives, or
+// says plainly that there is none. It is not a second copy of those tests and it does not re-run them:
+// duplicating a differential is how two of them come to disagree.
+//
+// ## The surface is derived, and the derivation is where the TypeScript tripped
+//
+// The requests come from std's `OP_*` table — the one every host implements since design/system/0013 step 6 — and
+// the native host's from where `native/src/main.rs` uses each `OP_*` name. Until then the opcodes came from
+// `host/ops.ts` and the native capabilities from a `("Core", "name")` table, and the two were joined by a
+// `SCREAMING_SNAKE` to `camelCase` mapping right 36 times out of 38; now every side spells a request the same way.
+// `conformance.wac` holds the scanners and every one of them is asserted to have found enough.
+//
+// ## Three of the first entries were wrong, which is the argument for writing it down
+//
+// The table was filled in from memory of tests one agent had written, and then each claim checked
+// against the file it named. `OUTPUT_ERROR` and `READ_STDIN` had no comparison at all — every two-host
+// runner passed `stdin: "null"`, so the one thing none of them exercised was a program reading its
+// input — and `LINK_STAT` was an embellishment: `find .` is compared on both hosts and calls `stat`,
+// not `linkStat`. A ledger of remembered coverage is worse than none, because it reads like an audit.
+//
+// ## Why a ledger rather than more tests
+//
+// An unaccounted-for surface is the failure this repository keeps finding in its own measurements: a
+// suite that covers twelve of thirty-eight and reports twelve passes reads exactly like one that
+// covers everything. Naming the twenty-six is worth more than quietly adding a thirteenth, and it is
+// what makes adding the thirteenth an obvious next move rather than an idea somebody has to have.
+//
+// Host-side until 2026-08-19, `issues/system/0161`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Env, Files, Output, Procs, Sys } from "std";
+import { contains } from "../../../wactest/src/strings.wac";
+import { bridgeNumbers, has, joined, nativeRequests, requestNumbers, requests, sorted, sourceOf } from "./conformance.wac";
+
+/**
+ * Where each opcode's comparison lives, or why there is none.
+ *
+ * `where` names the **file** that runs the same wac on more than one host and compares; `sameAs` names
+ * another opcode whose test covers this one too; a `gap` is an opcode no such test reaches — not an
+ * accusation, a work list, and the reason each one is hard is worth as much as the entry itself.
+ *
+ * ## `test` is a path, and `hostsOf` reads it
+ *
+ * This carried `compared: bool` until 2026-08-26 and the bool was the defect `issues/system/0268a` is
+ * about: it answers *is there a comparison* and is read as *do the hosts agree*. There are four hosts —
+ * `native/v8`, `wacland` on wasmtime, Deno, Node — and **no entry here compares all four**. Node is in
+ * none of them, which is how `LINK_STAT` and `SET_EXECUTABLE` sat marked covered while the Node host
+ * answered a zeroed `Stat` and *this filesystem has no mode bits to set*.
+ *
+ * **Derived rather than written down**, and that is the whole design. The obvious fix was a host list
+ * per entry, filled in by hand from the table in `0268a` — which rebuilds the defect one layer up,
+ * because a hand-written host set is remembered coverage and the first entry whose test changes goes
+ * silently wrong. Exactly how `LINK_STAT` was wrong twice. So the entry names a file and `hostsOf`
+ * reads what that file spawns.
+ *
+ * A derive can under-report by missing a spelling — mine did, on its first draft, reading
+ * `native_shell_test.wac` as Deno-only because it reaches the binary through `nativeBinaryPath` rather
+ * than `wacBinary`. What makes it an instrument rather than a heuristic is the floor:
+ * `test_every_entry_names_a_file_that_says_which_hosts_it_drives` refuses an entry that derives *no*
+ * host at all, so a missed spelling fails loudly instead of quietly shrinking the number.
+ *
+ * ## What these numbers do not say, and cannot
+ *
+ * **They are about the tests this file points at.** Every check here verifies that a *cited* file's
+ * hosts are credited; nothing can tell that an *uncited* file covers an opcode, because that is a
+ * different question and a much harder one.
+ *
+ * That gap is not theoretical — it was the whole of `issues/system/0268a`. The ledger reported `0
+ * include the Node host` while `runtimes_test.wac`, `node_net_test.wac` and `echod_test.wac` compared
+ * Deno against Node across seventeen opcodes. Nothing was wrong with the derive; the entries pointed
+ * elsewhere. It took reading each of those tests and following into the program it builds.
+ *
+ * So: **a low figure here is a prompt to go looking, not a finding.** Before concluding a host is
+ * uncovered, grep for tests that build for it and check what their programs call through every handle —
+ * `WRITE_STDOUT`, `WRITE_STDERR` and `MONOTONIC_NANOS` were missed on the first pass of that walk because
+ * the scan looked for `cli.` and half the surface hung off `core.`.
+ */
+struct Cover {
+  string op;
+  /** `where`, `sameAs` or `gap`. */
+  string kind;
+  /** For `where` the test's path; for `sameAs` the opcode it borrows; "" for a gap. */
+  string ref;
+  /**
+   * A **second** test covering the same opcode on other hosts, or "".
+   *
+   * **One opcode is routinely covered by two tests, and they compare different hosts.**
+   * `BIND_DATAGRAM` is `datagram_test.wac` — v8, wasmtime and Deno through the handler table — *and*
+   * `echod_test.wac`, which builds a real program for Deno and Node and talks to a foreign UDP peer.
+   * Neither is the better test; they answer about different hosts. A single field forces a choice
+   * between two true statements and makes the derived total understate whichever is not picked, which
+   * is the same shape of quiet wrongness this whole entry structure exists to remove.
+   *
+   * Hosts are **unioned** across the two, so the number means *compared on this host by something*
+   * rather than *by the one test we happened to cite*.
+   */
+  string also;
+  string note;
+}
+
+Cover where(string op, string test, string note) { return Cover(op, "where", test, "", note); }
+/** A `where` with a second test covering other hosts — see `Cover.also`. */
+Cover where2(string op, string test, string also, string note) {
+  return Cover(op, "where", test, also, note);
+}
+/**
+ * This opcode is exercised by the test another opcode names.
+ *
+ * **Data rather than the sentence it was.** Four entries read `"as CONNECT — the same program, the
+ * same run"`, which nothing checked: no test asserted a `CONNECT` entry existed, so a rename would
+ * have left four rows pointing at nothing and still counting as covered.
+ */
+Cover sameAs(string op, string other, string note) { return Cover(op, "sameAs", other, "", note); }
+/**
+ * A `sameAs` that a second test also covers directly.
+ *
+ * `LISTEN` and `ACCEPT` borrow `CONNECT`'s program, and are *separately* compared on Deno and Node by
+ * `node_net_test.wac` — which builds `greet.wac` for both targets, and that program calls `listen`,
+ * `accept` and `send`. `CONNECT` itself is not: the connecting side there is the test harness's own
+ * client, not the program under comparison.
+ */
+Cover sameAs2(string op, string other, string also, string note) {
+  return Cover(op, "sameAs", other, also, note);
+}
+Cover gap(string op, string note) { return Cover(op, "gap", "", "", note); }
+
+/** Whether an entry claims a comparison at all — `where` or `sameAs`, not `gap`. */
+bool isCompared(Cover c) { return c.kind != "gap"; }
+
+/**
+ * Whether `src` calls `name` itself, not a longer name ending in it. `binaryPath(` is the tail of
+ * `nativeBinaryPath(`, which answers the *wasmtime* binary, so a bare substring credited every file
+ * that drives wasmtime through that helper with the V8 host as well.
+ */
+bool hasCall(string src, string name) {
+  u8[] bytes = src.toBytes();
+  i32 from = 0;
+  while (true) {
+    i32 found = src.slice(from, src.len()).indexOf(name);
+    if (found < 0) { return false; }
+    i32 at = from + found;
+    if (at == 0) { return true; }
+    u8 before = bytes[at - 1];
+    bool ident = (before >= 97 && before <= 122) || (before >= 65 && before <= 90)
+                 || (before >= 48 && before <= 57) || before == 95;
+    if (!ident) { return true; }
+    from = at + 1;
+  }
+}
+
+/**
+ * The hosts a backing test actually drives, as a sorted `+`-joined list, or "" if it drives none.
+ *
+ * Keyed on **call-shaped** patterns rather than bare words: `"deno"` appears in comments in most of
+ * these files, and matching it would report every one of them as covering the Deno host. Three
+ * spellings reach the V8 binary and two reach Deno, which is why this is a list rather than an `if`.
+ */
+string hostsOfFile(Output err, Env env, Files fs, Procs procs, string path) {
+  string src = sourceOf(fs, path);
+  string out = "";
+  // `nativeBinaryPath` and `requireNativeHost` answer the wasmtime binary too, and the second does not
+  // contain `nativeHost(` — the capital is in the way — so each is named rather than left to a substring.
+  if (src.indexOf("nativeHost(") >= 0 || src.indexOf("requireNativeHost(") >= 0
+      || src.indexOf("nativeBinaryPath(") >= 0) { out = out + "wasmtime"; }
+  // **Four spellings, and the literal path is the one that matters most.** `native_test.wac` reaches
+  // the V8 binary as `root(env) + "/native/v8/target/release/wac"` — no helper — and with only the
+  // three helper names this file derived it as wasmtime-only, against a note that says in as many
+  // words *"run by both native binaries"*. The floor test below is what surfaced that; the fix is a
+  // fourth pattern rather than a fourth guess.
+  if (src.indexOf("wacBinary(") >= 0 || hasCall(src, "binaryPath(")
+      || src.indexOf("native/v8/target/release/wac") >= 0) {
+    out = out + (out == "" ? "" : "+") + "v8";
+  }
+  if (src.indexOf("denoBatch(") >= 0 || src.indexOf("builtByDeno(") >= 0
+      || src.indexOf("\"--target\", \"deno\"") >= 0 || src.indexOf("cli.exec(\"deno\"") >= 0) {
+    out = out + (out == "" ? "" : "+") + "deno";
+  }
+  // **`cli.exec("node"` is the one that matters**, and the literal `--target node` is not. Every test
+  // that drives Node builds through a helper taking the target as a *variable* —
+  // `build(t, err, env, fs, procs, WC, nodeOut, "node", …)` — so the flag pair never appears in the source at all.
+  // Three tests derived as Deno-only for that reason, and the floor below could not see it: an entry
+  // that finds one host of two passes a check that only refuses finding none.
+  if (src.indexOf("cli.exec(\"node\"") >= 0 || src.indexOf("\"--target\", \"node\"") >= 0
+      || src.indexOf("builtByNode(") >= 0) {
+    out = out + (out == "" ? "" : "+") + "node";
+  }
+  return out;}
+
+/** `hostsOfFile` for an entry, following one `sameAs` hop. */
+string hostsOf(Output err, Env env, Files fs, Procs procs, Cover[] all, Cover c) {
+  if (c.kind == "gap") { return ""; }
+  if (c.kind == "where") {
+    string first = hostsOfFile(err, env, fs, procs, c.ref);
+    if (c.also == "") { return first; }
+    // Unioned, not concatenated: the second test usually repeats a host the first already had, and
+    // `contains(hosts, "deno")` must not depend on how many times it appears.
+    string second = hostsOfFile(err, env, fs, procs, c.also);
+    string[] names = ["wasmtime", "v8", "deno", "node"];
+    string out = "";
+    for (i32 i = 0; i < names.len(); i++) {
+      if (contains(first, names[i]) || contains(second, names[i])) {
+        out = out + (out == "" ? "" : "+") + names[i];
+      }
+    }
+    return out;
+  }
+  for (i32 i = 0; i < all.len(); i++) {
+    // One hop only: a `sameAs` naming a `sameAs` would be a chain nobody can read, and there is no
+    // reason to write one.
+    //
+    // **`hostsOf` and not `hostsOfFile`**, so the borrowed entry's *second* test comes with it.
+    // `RECEIVE_FROM` and `SEND_TO` borrow `BIND_DATAGRAM`, which is covered by `datagram_test.wac`
+    // and by `echod_test.wac` on different hosts; reading only the first would have given the two
+    // borrowers a narrower answer than the entry they name, which is a disagreement inside the
+    // ledger rather than a fact about the hosts.
+    if (all[i].op == c.ref && all[i].kind == "where") {
+      string inherited = hostsOf(err, env, fs, procs, all, all[i]);
+      if (c.also == "") { return inherited; }
+      string mine = hostsOfFile(err, env, fs, procs, c.also);
+      string[] names = ["wasmtime", "v8", "deno", "node"];
+      string out = "";
+      for (i32 k = 0; k < names.len(); k++) {
+        if (contains(inherited, names[k]) || contains(mine, names[k])) {
+          out = out + (out == "" ? "" : "+") + names[k];
+        }
+      }
+      return out;
+    }
+  }
+  return "";
+}
+
+Cover[] coverage() {
+  return [
+    // ── The filesystem: twelve operations and every grant refusal, on both hosts ──
+    where2("READ_FILE", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_hostfs: `cat f`, and refused with no grant"),
+    where2("WRITE_FILE", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_hostfs: `touch`, and write-only grants"),
+    where2("STAT", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_hostfs: `stat f`"),
+    where("LINK_STAT", "packages/platform/test/wac/native_hostfs_test.wac",
+      "native_hostfs: `test -h` over a real symlink and a real dangling one, against GNU on both " +
+      "hosts, with `test -e` beside each — the pair is what says these are two different calls " +
+      "rather than one answering for both. The fixture makes the links itself because there is no " +
+      "`ln` in this system, so no script could make its own; that absence is why this sat as a gap " +
+      "while `Fs.linkStat` had two callers"),
+    where2("READ_DIR", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_hostfs: `ls`"),
+    where("MKDIR", "packages/platform/test/wac/native_hostfs_test.wac", "native_hostfs: `mkdir d2; ls; rmdir d2`"),
+    where2("REMOVE", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_hostfs: `rm made`"),
+    where2("RENAME", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_hostfs: `mv f moved`"),
+    where("CHMOD", "packages/platform/test/wac/native_hostfs_test.wac",
+      "native_hostfs: `chmod 000 f; cat f`, `chmod 644 f; cat f`, `chmod 000 sub; ls sub` — asked " +
+      "through what the mode *does* rather than through `ls -l`, whose owner and date no two runs " +
+      "share. Driven as scripts, so GNU and both hosts answer the same question. This is the " +
+      "comparison the `SET_EXECUTABLE` entry below says a script case could not reach, and the reason " +
+      "it could not was that there was no `chmod` applet; `issues/system/0296c` added the capability " +
+      "and the applet together, so the shell route reaches this one from the start"),
+    where("SET_EXECUTABLE", "packages/platform/test/wac/setexecutable_test.wac",
+      "setexecutable: a program built for both hosts, run on a file whose starting mode the test pins " +
+      "with `chmod`, and the resulting mode compared — `setexecutable_test.wac`. **This entry was a " +
+      "gap and the gap was real.** It said the arithmetic is duplicated and only the Deno copy " +
+      "exercised, so a wrong mask elsewhere would not be caught; on 2026-08-24 the V8 native host was " +
+      "setting `mode | 0o100` and clearing `mode & !0o100` where the other three do " +
+      "`mode | ((mode & 0o444) >> 2)` and clear `0o111`. Measured 744 against 755, and 655 against " +
+      "644 on the way back. The capability's only other oracle, `checkout_test.wac`, passed " +
+      "throughout — git reads any execute bit as 100755 — which is why a sharper check on a " +
+      "neighbouring question is not coverage of this one. A shell case could not reach it: " +
+      "native_hostfs drives the hosts through scripts and there is no `chmod` applet. " +
+      "issues/system/0132"),
+    where2("EXEC", "packages/platform/test/wac/native_test.wac", "packages/platform/test/wac/runtimes_test.wac",
+      "native: one module built once and run by both native binaries — `native_test.wac`'s " +
+      "`test_running_a_host_program_agrees_between_the_two_native_hosts`, which compares the three " +
+      "verdicts `exec_probe.wac` prints (an inherited stream, an added environment, a cleared one) " +
+      "and the grandchild's line on the other stream. `exec_test.wac` drives the V8 host on its own, " +
+      "with cases run *twice* — once with `--allow-run` where they pass and once without where they " +
+      "fail, which is what says the grant gates rather than decorates — and `runtimes_test.wac` runs " +
+      "the same probe on the Deno and Node hosts and compares those two with each other, so all four " +
+      "implementations are now reached. " +
+      "**This was a gap until 2026-08-20 and it cost twice.** The arithmetic is written three times " +
+      "(Rust twice, Deno once) and all three had the same deadlock: stdin was written to the end " +
+      "before either output pipe was read, so a child that answers while it is being fed — `cat`, " +
+      "`grep`, any filter — blocked on its own output past the pipe buffer while the host blocked on " +
+      "the write, and two megabytes through `cat` hung every one of them. Then both Rust hosts ran " +
+      "the child inside the capability call, so the ticket came back already answered and two `exec` " +
+      "calls could not overlap however they were written — three one-second sleeps took 3012ms to " +
+      "submit and 1ms to wait, against the Deno host's 8ms and 1001ms. Neither was found by a row " +
+      "here; the first came from batching a corpus through `grep`, the second from porting a test " +
+      "that ran its cases three at a time. **A third arrived the day the row was closed**: the Node " +
+      "host raised EPIPE as an unhandled event when `/bin/echo` exited without reading its stdin, " +
+      "which killed the host — nothing had run `echo` through it before. issues/system/0165, 0173, " +
+      "0182, 0198, 0211"),
+    where("OPEN_FILE", "packages/platform/test/wac/stdhandles_test.wac",
+      "stdhandles: `closeout_probe.wac` writes, appends to and reads back one file through `Files.openWrite`, " +
+      "`openAppend` and `openRead`, run on the V8 binary and built for Deno and Node, each compared with " +
+      "the same expected lines; and native_hostfs's `cat < f` and `echo new > made`, which since design/system/0013 " +
+      "step 6 are this request and no longer a redirect of the program's own streams. Not yet built for the " +
+      "wasmtime host by stdhandles"),
+    sameAs("CLOSE_FILE", "OPEN_FILE", "as OPEN_FILE: every stream the probe opens it closes, and reads back after"),
+    where("CLOSE_OUTPUT", "packages/platform/test/wac/stdhandles_test.wac",
+      "stdhandles: the same probe writes `a`, closes its output twice, and writes again — `a` alone on " +
+      "its output and `refused` on its diagnostic output on each of the three hosts. It does not show " +
+      "the reader seeing the end *before* the program exits, which an `exec` cannot tell apart"),
+    where("READ_CHUNK", "packages/platform/test/wac/native_hostfs_test.wac",
+      "native_hostfs: `cat sub/deep > out` streams, and 300 KB through stdin — past one chunk, which " +
+      "is the only case that makes `readChunk` loop"),
+
+    // ── The system a session is ──
+    where("SPAWN_SELF", "packages/platform/test/wac/native_hostfs_test.wac",
+      "native_hostfs: `kill %1` ends a background job on both; native_shell runs a sealed session " +
+      "whose every command is a spawned child, so all three of a child's handles are exercised rather " +
+      "than only its output"),
+    where("EXIT_CODE", "packages/platform/test/wac/native_hostfs_test.wac", "native_hostfs: the status of every AGREED script"),
+    where("CHILD_ENDED", "packages/platform/test/wac/ended_test.wac", "ended: an exit, a trap with a message, an index out of bounds and an endless recursion, on every host"),
+    where2("CLOSE_SOCKET", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/node_net_test.wac", "native_hostfs: `kill %1` is delivered by closing the child"),
+    where("CLOSE_SEND", "packages/platform/test/wac/native_examples_test.wac",
+      "native_examples: `halfclose` runs both ends in one program and prints two lines — the " +
+      "server reaching `End`, and the client still reading afterwards. One line alone is passed " +
+      "by a wrong host in each direction: a no-op fails the first, a full close the second"),
+    where("CLOSE_FEED", "packages/platform/test/wac/native_shell_test.wac",
+      "native_shell: pipelines in the corpus slice — and native_examples' `feed`, which is the only " +
+      "place the *distinction* from `closeSocket` is asked on both hosts: the child has to stay alive " +
+      "to say what it heard, which a stop would prevent"),
+    where("CWD", "packages/platform/test/wac/native_hostfs_test.wac", "native_hostfs: every script `cd`s first, by design"),
+    where2("WRITE_STDOUT", "packages/platform/test/wac/native_shell_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_shell: 25 corpus scripts, byte for byte"),
+    where2("WRITE_STDERR", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_hostfs: stderr compared on every AGREED script"),
+    where2("ARG_COUNT", "packages/platform/test/wac/native_shell_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_shell: `sealedsh -c` passes its script as an argument"),
+    where2("ARG", "packages/platform/test/wac/native_shell_test.wac", "packages/platform/test/wac/runtimes_test.wac", "native_shell: same"),
+    where2("READ_STDIN", "packages/platform/test/wac/native_hostfs_test.wac", "packages/platform/test/wac/runtimes_test.wac",
+      "native_hostfs: ten scripts with real piped input — this gap is what found the bug that every " +
+      "filter under a spawning shell read nothing on the native host"),
+
+    // ── Named gaps. Each says what makes it hard, because that is the next person's starting point ──
+    where("NOW_MILLIS", "packages/platform/test/wac/native_examples_test.wac",
+      "native_examples: `clocks` asks the *shape* rather than the value, which is the only thing two " +
+      "clocks can agree on — this one dates, so the claim is that it is past a moment already gone. " +
+      "The gap here used to say a comparison was impossible by construction; what was missing was a " +
+      "program that compared the promises instead of the readings"),
+    where2("MONOTONIC_NANOS", "packages/platform/test/wac/native_examples_test.wac", "packages/platform/test/wac/runtimes_test.wac",
+      "native_examples: `clocks` reads it twice and requires the second not to be earlier — equal is " +
+      "fine, a coarse clock read inside one microsecond says so — and separately requires it not to " +
+      "be a plausible epoch stamp, which is what a host answering the wall clock in disguise would " +
+      "produce while passing everything else"),
+    where("SLEEP_MILLIS", "packages/platform/test/wac/native_examples_test.wac",
+      "native_examples: `clocks` brackets a 50ms sleep between two monotonic reads and asks two " +
+      "things — it lasted at least as long as asked, and the two hosts said the same. **No upper bound**: a " +
+      "sleep that overran is a loaded machine, not a broken host, and bounding it would measure the " +
+      "machine — `hostfs.wac` makes the same argument at greater length"),
+    where("RANDOM_BYTES", "packages/platform/test/wac/native_examples_test.wac",
+      "native_examples: `entropy` walks the documented range — 1 byte, the 65,536-byte Web Crypto " +
+      "cap, one byte past it, and the megabyte ceiling — and asks of each that the length came back " +
+      "and that a large block is not one repeated byte, which is what an unfilled chunk looks like. " +
+      "The bytes are random by definition and are not compared. This entry used to rest on `head -c " +
+      "16 /dev/urandom | wc -c` in native_shell, which still runs and still says a sealed session " +
+      "gets a CSPRNG **without a grant** — but sixteen bytes is on the near side of every boundary, " +
+      "and 0122 was two hosts throwing above 64 KiB inside a range all three of them bounds-checked " +
+      "as legal"),
+    where2("ENV", "packages/platform/test/wac/native_shell_test.wac", "packages/platform/test/wac/runtimes_test.wac",
+      "native_shell: the seal, on both hosts. `sealing.test.ts` had asked it on one, which is half a " +
+      "claim about a design whose whole point is that the same system appears on two — and the two " +
+      "runtimes reach the environment by completely different routes. Both binaries are built " +
+      "**with** the env grant and a session still sees none of it, with a canary that the grant is " +
+      "live on each: an unsealed shell prints the machine's `$HOME` on both, or the seal below would " +
+      "be passing against a runtime that never reads the environment for anybody"),
+    where("CONNECT", "packages/platform/test/wac/native_examples_test.wac",
+      "native_examples: `writeread` listens, accepts and connects to itself on loopback, so one " +
+      "program exercises all three on both hosts and the transcripts are compared. The port differs " +
+      "by construction and is masked; it is allocated per run by `daemon.wac`'s `Held` rather than " +
+      "fixed, because these run in the parallel lane. Before this the network was exercised end to " +
+      "end by `arrival_users` over ssh — but only with the native host as the *server*, so nothing " +
+      "compared the three calls themselves"),
+    sameAs2("LISTEN", "CONNECT", "packages/platform/test/wac/node_net_test.wac", "as CONNECT — the same program, the same run"),
+    where2("BIND_DATAGRAM", "packages/platform/test/wac/datagram_test.wac", "packages/platform/test/wac/echod_test.wac",
+      "datagram: one program binds two sockets on loopback, sends between them and reads what " +
+      "arrives, so one run exercises all three calls — `datagram_test.wac`, the shape `writeread` " +
+      "uses for connect/listen/accept. Built for the Deno host and the V8 native one and compared, " +
+      "with the **wasmtime** host asked for as well because that is the one `issues/lang/0109` " +
+      "reported. Port 0 and read the port back, since these run in the parallel lane. " +
+      "**This entry was a gap for a reason that had stopped being true.** It said the capability " +
+      "itself was missing, because three more fields on `Cli` would put every native program past " +
+      "sixteen funcrefs per signature. 0109 closed on 2026-08-13 — not by raising the sixteen, which " +
+      "is still sixteen, but by registering `Pending<T>`'s `settled` and `drop` once instead of once " +
+      "per instantiation, since neither depends on `T`. `Cli` has carried the three fields since and " +
+      "`packages/webrtc` and `packages/quic` use them; all four hosts printed the same transcript the " +
+      "first time they were asked. What was left was nobody having written the comparison"),
+    sameAs("RECEIVE_FROM", "BIND_DATAGRAM", "as BIND_DATAGRAM — the same program, the same run"),
+    sameAs("SEND_TO", "BIND_DATAGRAM", "as BIND_DATAGRAM"),
+    sameAs2("ACCEPT", "CONNECT", "packages/platform/test/wac/node_net_test.wac", "as CONNECT"),
+    where("RECV", "packages/platform/test/wac/native_shell_test.wac",
+      "native_shell: every filesystem operation of every spawned stage. `sealedsh` spawns its stages " +
+      "and serves their filesystem over a handle (wac-mono 0116), so a corpus script that reads a " +
+      "file is `send` and `recv` in both directions on both hosts — which is why this stopped being a " +
+      "gap without a test being written for it"),
+    where2("SEND", "packages/platform/test/wac/native_shell_test.wac", "packages/platform/test/wac/node_net_test.wac",
+      "native_shell: as RECV, and the same traffic — plus native_examples' `feed`, which asks the " +
+      "part a pipeline never reaches: what the **bool** says. `send` answers `Pending<bool>` and three " +
+      "JavaScript hosts were not answering it at all (`kid.in.push(...)` with the result discarded), " +
+      "so a send after `closeFeed` reported success and dropped the bytes — 0121, and 0120 in the " +
+      "same line. The example also asks the other direction, where the native host was the one out of " +
+      "step: its queues had no cap, so a child writing nine megabytes into a parent that would not " +
+      "read never waited, while every JavaScript host held it at eight"),
+    gap("READ_AT",
+      "random access, added for wac-sqlite's page cache: a probe that writes past the end, reads back, " +
+      "reads past the end, truncates, syncs and is refused a write on a read-only open agreed on the Node " +
+      "and wasmtime hosts when it was written, but no test here runs it on two hosts yet. The V8 binary's " +
+      "arm mirrors wasmtime's and has not been built (its V8 download failed); a page answers Unsupported"),
+    gap("WRITE_AT", "as READ_AT"),
+    gap("FILE_SIZE", "as READ_AT"),
+    gap("TRUNCATE_FILE", "as READ_AT"),
+    gap("SYNC_FILE", "as READ_AT: and no test can see that the bytes reached the disk, only that the call returns"),
+    gap("SPAWN",
+      "**not implemented in the native runtime**, which is the answer rather than a missing test. " +
+      "What `spawn` takes is a program's *source*, and on the JavaScript hosts that means a worker " +
+      "bundle — an artifact no wasmtime host could run whatever it did with it. `native/src/main.rs` " +
+      "answers -1 with a reason (not -2, which would mean this world cannot spawn at all and would " +
+      "make the shell give up on `spawnSelf` too, which works). So there is nothing here for two " +
+      "hosts to agree *about*, and what is compared instead is everything around it: native_hostfs " +
+      "runs a path that is not a program on both and pins each runtime's sentence, and the three " +
+      "cases the *filesystem* settles — missing, a directory, a path in a pipeline — are compared " +
+      "against GNU on both hosts, where all of them used to be `command not found` and 127"),
+    // ── Withdrawing a request ──
+    where("DROP", "packages/platform/test/wac/droppedchild_test.wac",
+      "droppedchild: a spawn nobody waited for, dropped — the child stops on both native hosts, and with " +
+      "`detached` it runs on, which is the arm that says the stop was the drop's. lostbytes_test drops a connect " +
+      "and a read of the program's own input the same way. This is the rule settled before step 6: an answer " +
+      "nobody has read is still the host's (design/system/0013, `issues/system/0370a`)"),
+
+    // ── Modules ──
+    where("LOAD", "packages/platform/test/wac/load_test.wac",
+      "load: `loadee.wac` loaded and each of its shapes called, directly on the binary running the file and " +
+      "built as `loadprobe.wac` for Deno and Node, every host held to one expected output"),
+    sameAs("CALL", "LOAD", "as LOAD: what is compared is what each call answered"),
+    sameAs("UNLOAD", "LOAD", "as LOAD: the probe unloads what it loaded"),
+    gap("VALIDATE",
+      "nothing compares it. Its one caller is `wac` itself, which asks the engine about a module it just built; " +
+      "the native hosts answer from two different engines, so the case worth having is a module one of them " +
+      "refuses and the other accepts"),
+
+    // ── Capabilities by name ──
+    gap("CAPABILITY",
+      "nothing to compare yet: no host provides a capability, and each answers `Unsupported` naming the one asked " +
+      "for. capability_test pins the v8 host's sentence and a parent's providers — the lookup, the same range asked " +
+      "again, a major version refused, a name passed through to the host. The comparison worth having arrives with " +
+      "the first capability a host provides, `wac.site`, which the page, Deno and Node should answer alike")
+  ];
+}
+
+Cover? entryFor(Cover[] all, string op) {
+  for (i32 i = 0; i < all.len(); i++) { if (all[i].op == op) { return all[i]; } }
+  return null;
+}
+
+export string test_the_readmes_request_table_lists_every_request_there_is(Sys sys) {
+  Files fs = sys.files();
+  // The table in `packages/platform/README.md` is the first thing a person reads to find out what a
+  // host must answer, and it is the kind of list that goes quietly short: three capabilities had been
+  // added to `platform.wac` without it, each by a different piece of work, none of which was looking at
+  // a README.
+  //
+  // `tools/wac/docsignatures_test.wac` checks that every name a README *quotes* exists. This is the other
+  // direction, which nothing had: that every request that exists is quoted. A reader cannot tell a
+  // request that is missing from the table from one that does not exist.
+  T t = T.create();
+  string src = sourceOf(fs, "packages/platform/README.md");
+  i32 from = src.indexOf("| op | request |");
+  t.isTrue(from >= 0, "the request table is gone from the README");
+  if (from < 0) { return t.report(); }
+  i32 span = src.slice(from, src.len()).indexOf("\n\n");
+  string table = src.slice(from, span < 0 ? src.len() : from + span);
+  string[] all = requests(fs);
+  string missing = "";
+  for (i32 i = 0; i < all.len(); i++) {
+    if (!contains(table, "`\{all[i]}`")) { missing = missing + (missing == "" ? "" : " ") + all[i]; }
+  }
+  t.eqStr(missing, "", "numbered in std and absent from the README's table");
+  return t.report();
+}
+
+export string test_the_bridge_numbers_every_request_as_std_does(Sys sys) {
+  Files fs = sys.files();
+  // **Two tables of one numbering.** std's `OP_*` is what a program sends; `host/ops.ts` is what the JavaScript
+  // bridge carries between a worker and its host. A request numbered differently on the two sides arrives as a
+  // different request, and every call goes somewhere plausible.
+  T t = T.create();
+  string[] std = requestNumbers(fs);
+  string[] bridge = bridgeNumbers(fs);
+  t.isTrue(std.len() >= 40, "only \{std.len()} requests found in std — has the extraction broken?");
+  t.isTrue(bridge.len() >= 40, "only \{bridge.len()} opcodes found in ops.ts — has the extraction broken?");
+  string differ = "";
+  for (i32 i = 0; i < std.len(); i++) {
+    // `DROP` is std's alone: the bridge withdraws a request by cancelling its slot, not by sending one.
+    if (std[i] == "DROP=0") { continue; }
+    if (!has(bridge, std[i])) { differ = differ + (differ == "" ? "" : " ") + std[i]; }
+  }
+  t.eqStr(differ, "", "requests ops.ts does not number as std does");
+  return t.report();
+}
+
+export string test_every_request_std_numbers_the_host_with_no_js_answers(Sys sys) {
+  Files fs = sys.files();
+  // design/0001's aim is that the same programs run on a bootable kernel-and-wasmtime stack *and*
+  // without it. That makes "is anything in the JavaScript hosts load-bearing that the wasm side cannot
+  // supply?" a question with a definite answer, and this is it: nothing.
+  //
+  // The known exception is behavioural rather than structural and is covered elsewhere: `spawn` of a
+  // *foreign* program answers with a reason on the native host (see `SPAWN` above).
+  T t = T.create();
+  string[] served = nativeRequests(fs);
+  string[] all = requests(fs);
+  // The counts first: an extraction that quietly matched nothing would make the loop below vacuous,
+  // which is how this test would come to certify a surface it never read.
+  t.isTrue(served.len() >= 30, "only \{served.len()} native requests found — has the extraction broken?");
+  t.isTrue(all.len() >= 40, "only \{all.len()} requests found in std — has the extraction broken?");
+  string missing = "";
+  for (i32 i = 0; i < all.len(); i++) {
+    if (!has(served, all[i])) { missing = missing + (missing == "" ? "" : " ") + all[i]; }
+  }
+  t.eqStr(missing, "",
+          "the native runtime has no arm for these, so a program that asks gets no answer it can read");
+  return t.report();
+}
+
+/** The requests both hosts have to answer — those the native host has an arm for. */
+string[] sharedOpcodes(string[] ops, string[] caps) {
+  string[] out = string[].filled(ops.len(), "");
+  i32 n = 0;
+  for (i32 i = 0; i < ops.len(); i++) {
+    if (has(caps, ops[i])) { out[n] = ops[i]; n = n + 1; }
+  }
+  string[] trimmed = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { trimmed[i] = out[i]; }
+  return trimmed;
+}
+
+export string test_every_opcode_on_the_two_host_surface_is_accounted_for(Sys sys) {
+  Files fs = sys.files();
+  T t = T.create();
+  string[] ops = requests(fs);
+  string[] caps = nativeRequests(fs);
+  t.isTrue(ops.len() >= 40, "only \{ops.len()} requests found — has the extraction broken?");
+
+  string[] shared = sharedOpcodes(ops, caps);
+  string[] jsOnly = string[].filled(ops.len() - shared.len(), "");
+  i32 p = 0;
+  for (i32 i = 0; i < ops.len(); i++) {
+    if (!has(caps, ops[i])) { jsOnly[p] = ops[i]; p = p + 1; }
+  }
+
+  // The derivation itself, asserted: a mapping that silently stopped matching would report the whole
+  // surface as JavaScript-only and this file would have nothing to say while looking complete.
+  t.isTrue(shared.len() >= 35,
+           "only \{shared.len()} shared opcodes — has the mapping broken?");
+  // **Empty, written down.** Every opcode the JavaScript hosts answer has a native arm: the twelve
+  // that did not were std's `Page`, deleted in design/system/0011 step 7. A capability the native
+  // host *dropped* would arrive here, so this stays a written expectation rather than a derived one.
+  t.eqStr(joined(sorted(jsOnly), " "), "",
+          "an opcode with no native arm — a capability the native host dropped, or one only JavaScript has");
+
+  Cover[] all = coverage();
+  string unlisted = "";
+  for (i32 i = 0; i < shared.len(); i++) {
+    if (entryFor(all, shared[i]) is null) {
+      unlisted = unlisted + (unlisted == "" ? "" : ", ") + shared[i];
+    }
+  }
+  t.eqStr(unlisted, "",
+          "opcodes with no entry in the ledger. A new capability needs a comparison on both hosts, " +
+          "or an entry saying what makes one hard — quietly uncovered is the one option this file " +
+          "exists to stop");
+
+  string listedButGone = "";
+  for (i32 i = 0; i < all.len(); i++) {
+    if (!has(shared, all[i].op)) {
+      listedButGone = listedButGone + (listedButGone == "" ? "" : ", ") + all[i].op;
+    }
+  }
+  t.eqStr(listedButGone, "", "the ledger names opcodes that are not on the shared surface");
+  return t.report();
+}
+
+export string test_the_ledger_says_how_much_of_the_surface_is_actually_compared(Sys sys) {
+  Output err = sys.stderr();
+  Output out = sys.stdout();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string[] shared = sharedOpcodes(requests(fs), nativeRequests(fs));
+  Cover[] all = coverage();
+  i32 covered = 0;
+  i32 withNode = 0;
+  i32 withoutV8 = 0;
+  for (i32 i = 0; i < shared.len(); i++) {
+    Cover? c = entryFor(all, shared[i]);
+    if (!(c is not null) || !isCompared(c!)) { continue; }
+    covered = covered + 1;
+    string hosts = hostsOf(err, env, fs, procs, all, c!);
+    if (contains(hosts, "node")) { withNode = withNode + 1; }
+    if (!contains(hosts, "v8")) { withoutV8 = withoutV8 + 1; }
+  }
+
+  // **Printed, not merely asserted.** A number nobody sees is a number nobody acts on, and the point
+  // of the ledger is that the gap is visible from a normal run rather than by reading this file.
+  //
+  // **Three numbers, because one was read as answering a question it does not.** `N of 44 have a
+  // comparison` was true and was taken for *the hosts agree*; there are four hosts and no entry
+  // compares all of them. The two below are derived from what the tests spawn, so they cannot drift
+  // from the tests the way a written-down host list would — `issues/system/0268a`.
+  out.line("    conformance: \{covered} of \{shared.len()}" +
+           " opcodes have a comparison; \{shared.len() - covered} are named gaps");
+  out.line("                 \{withNode} include the Node host; \{withoutV8}" +
+           " do not include the V8 binary");
+
+  // A floor rather than a target: this is allowed to go up without editing the test, and a change
+  // that takes it *down* — a comparison deleted, an opcode added with a gap entry and forgotten — has
+  // to be deliberate.
+  t.isTrue(covered >= 24,
+           "only \{covered} opcodes are compared across hosts; this was 19 when the " +
+           "ledger was written");
+  return t.report();
+}
+
+/**
+ * Every entry that claims a comparison names something that says which hosts it drives.
+ *
+ * **This is what makes `hostsOf` an instrument rather than a guess.** It reads call-shaped patterns
+ * out of a test file, and a derive like that under-reports the moment a file reaches a host by a
+ * spelling the pattern list does not have — silently, and in the direction that looks like less
+ * coverage rather than a broken tool. Mine did exactly that on its first draft:
+ * `native_shell_test.wac` came back Deno-only because it reaches the binary through
+ * `nativeBinaryPath` and the list had only `wacBinary` and `binaryPath`.
+ *
+ * So an entry deriving **no host at all** is a failure here rather than a quiet zero. Same shape as
+ * `tools/wac/links_test.wac`'s *"has the scan stopped matching?"* floor, and for the same reason: a
+ * scan that finds nothing looks identical to a tree with nothing in it.
+ *
+ * A `sameAs` is checked too, which nothing did when it was the prose `"as CONNECT"`: the opcode it
+ * borrows has to exist and has to be a `where`, so a rename cannot leave four rows pointing at
+ * nothing while still counting as covered.
+ */
+export string test_every_entry_names_a_file_that_says_which_hosts_it_drives(Sys sys) {
+  Output err = sys.stderr();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  Cover[] all = coverage();
+  string[] silent = string[].filled(all.len(), "");
+  i32 n = 0;
+  i32 distinct = 0;
+  string everySeen = "";
+  for (i32 i = 0; i < all.len(); i++) {
+    if (!isCompared(all[i])) { continue; }
+    if (all[i].kind == "sameAs") {
+      bool found = false;
+      for (i32 j = 0; j < all.len(); j++) {
+        if (all[j].op == all[i].ref && all[j].kind == "where") { found = true; }
+      }
+      t.isTrue(found, "\{all[i].op} borrows \{all[i].ref}, which is not a `where` entry");
+    }
+    string hosts = hostsOf(err, env, fs, procs, all, all[i]);
+    if (hosts == "") { silent[n] = all[i].op; n = n + 1; continue; }
+    everySeen = everySeen + "+\{hosts}";
+  }
+  t.eqI32(n, 0, "these entries name a test that drives no host this can recognise — a spelling the "
+                + "pattern list is missing, not an absence of coverage: " + joined(silent, ", "));
+
+  // **A partial miss, which the per-entry floor cannot see** — and this is not hypothetical, it
+  // happened three times while the derive was being written. An entry deriving `deno` when the file
+  // drives Deno *and* Node passes a check that only refuses deriving *nothing*. So the derive is
+  // cross-checked against an independent signal: any backing test whose source spawns a host must be
+  // credited with it. Different question, different scan, and the two have to agree.
+  // **Both files, and the first version of this checked only the first.** The Node coverage lives in
+  // the `also` test for every entry that has any, so scanning `ref` alone found nothing to complain
+  // about and the check passed while deriving zero Node — proved by removing the `cli.exec("node"`
+  // pattern and watching this stay green. A cross-check that cannot see where the answer comes from
+  // is not a cross-check.
+  for (i32 i = 0; i < all.len(); i++) {
+    if (all[i].kind == "gap") { continue; }
+    string hosts = hostsOf(err, env, fs, procs, all, all[i]);
+    string[] files = [all[i].kind == "where" ? all[i].ref : "", all[i].also];
+    for (i32 f = 0; f < files.len(); f++) {
+      if (files[f] == "") { continue; }
+      string src = sourceOf(fs, files[f]);
+      if (contains(src, "cli.exec(\"node\"") && !contains(hosts, "node")) {
+        t.fail("\{all[i].op}: \{files[f]} spawns node and the derive did not say so");
+      }
+      if (contains(src, "cli.exec(\"deno\"") && !contains(hosts, "deno")) {
+        t.fail("\{all[i].op}: \{files[f]} spawns deno and the derive did not say so");
+      }
+    }
+  }
+
+  // **And the whole list going stale at once**, which the per-entry floor cannot see: if every
+  // pattern stopped matching, every entry would fail above — but if the *tests* were rewritten onto
+  // one host, each would still derive one and the ledger would quietly become single-host.
+  string[] names = ["wasmtime", "v8", "deno", "node"];
+  for (i32 i = 0; i < names.len(); i++) {
+    if (contains(everySeen, names[i])) { distinct = distinct + 1; }
+  }
+  t.isTrue(distinct >= 3,
+           "the whole ledger derives only \{distinct} distinct host(s) — it compared "
+           + "wasmtime, v8 and deno when this was written");
+  return t.report();
+}

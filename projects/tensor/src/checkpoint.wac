@@ -1,0 +1,105 @@
+// Weights to bytes and back: what keeps a trained model once its program has ended.
+//
+// **A checkpoint is the variables in order, each with its name and shape**, so loading checks that the model it goes
+// into is the one it came out of — the same number of variables, each the same shape — and says which one differs
+// rather than loading weights into the wrong places. Names travel for the reader's sake; matching is by position,
+// since a model's variables are named by layer kind (`kernel`, `bias`) and repeat.
+//
+// The layout, all little-endian: `WTCK`, the version (1) and the count as `u32`s; then for each variable its name's
+// length and bytes, its rank, each dimension, and its values as `f32`s — whatever its type, so a checkpoint from a
+// half-precision model loads into a single-precision one and the other way round, each value rounded on the way in.
+
+import { Buf, Result } from "core";
+import { Tensor, Variable } from "./tensor.wac";
+import { shapeText } from "./shape.wac";
+
+static i32 VERSION = 1;
+
+/** `vs` as a checkpoint. Each variable is read from its device, so on a GPU this waits. */
+export async u8[] saveWeights(Variable[] vs) {
+  f32[][] values = f32[][].defaulted(vs.len());
+  for (i32 k = 0; k < vs.len(); k++) { values[k] = await vs[k].values(); }
+  return encodeWeights(vs, values);
+}
+
+/** `saveWeights` on a device that answers at once — the CPU. Traps on one that would have to wait. */
+export u8[] saveWeightsNow(Variable[] vs) {
+  f32[][] values = f32[][].defaulted(vs.len());
+  for (i32 k = 0; k < vs.len(); k++) { values[k] = vs[k].valuesNow(); }
+  return encodeWeights(vs, values);
+}
+
+u8[] encodeWeights(Variable[] vs, f32[][] values) {
+  Buf b = Buf.create();
+  b.pushAll("WTCK".toBytes());
+  b.pushU32(VERSION as@ u32);
+  b.pushU32(vs.len() as@ u32);
+  for (i32 k = 0; k < vs.len(); k++) {
+    Variable v = vs[k];
+    u8[] name = v.name.toBytes();
+    b.pushU32(name.len() as@ u32);
+    b.pushAll(name);
+    b.pushU32(v.rank() as@ u32);
+    for (i32 d in v.shape) { b.pushU32(d as@ u32); }
+    for (f32 x in values[k]) { b.pushU32(f32.toBits(x)); }
+  }
+  return b.bytes();
+}
+
+/** Bytes `from` up to `to`, copied. */
+u8[] part(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0 as u8);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+i32 u32At(u8[] b, i32 at) {
+  return (b[at] as i32) | ((b[at + 1] as i32) << 8) | ((b[at + 2] as i32) << 16) | ((b[at + 3] as i32) << 24);
+}
+
+/**
+ * A checkpoint's values assigned to `vs`, which must be the variables it was saved from — or another model's built the
+ * same way. Nothing is assigned unless every variable matches, so a refused checkpoint leaves the model as it was.
+ */
+export Result<void, string> loadWeights(Variable[] vs, u8[] bytes) {
+  if (bytes.len() < 12 || string.fromBytes(part(bytes, 0, 4)) != "WTCK") { return Result.Err("not a checkpoint"); }
+  if (u32At(bytes, 4) != VERSION) { return Result.Err("a checkpoint of version \{u32At(bytes, 4)}, and this reads \{VERSION}"); }
+  i32 count = u32At(bytes, 8);
+  if (count != vs.len()) { return Result.Err("a checkpoint of \{count} variables, for a model of \{vs.len()}"); }
+  // Every variable is read and checked before any is assigned.
+  f32[][] values = f32[][].defaulted(count);
+  i32 at = 12;
+  for (i32 k = 0; k < count; k++) {
+    if (at + 8 > bytes.len()) { return Result.Err("the checkpoint ends early"); }
+    i32 nameLen = u32At(bytes, at);
+    if (nameLen < 0 || at + 8 + nameLen > bytes.len()) { return Result.Err("the checkpoint ends early"); }
+    string name = string.fromBytes(part(bytes, at + 4, at + 4 + nameLen));
+    at += 4 + nameLen;
+    i32 rank = u32At(bytes, at);
+    at += 4;
+    if (rank < 0 || rank > 8 || at + 4 * rank > bytes.len()) { return Result.Err("variable \{k} (\{name}) is malformed"); }
+    i32[] shape = i32[].filled(rank, 0);
+    i32 n = 1;
+    for (i32 d = 0; d < rank; d++) {
+      shape[d] = u32At(bytes, at);
+      n *= shape[d];
+      at += 4;
+    }
+    if (shapeText(shape) != shapeText(vs[k].shape)) {
+      return Result.Err("variable \{k} (\{name}) is \{shapeText(shape)} in the checkpoint and \{shapeText(vs[k].shape)} in the model");
+    }
+    if (at + 4 * n > bytes.len()) { return Result.Err("the checkpoint ends early"); }
+    f32[] v = f32[].filled(n, 0.0);
+    for (i32 i = 0; i < n; i++) { v[i] = f32.fromBits(u32At(bytes, at + 4 * i) as@ u32); }
+    at += 4 * n;
+    values[k] = v;
+  }
+  if (at != bytes.len()) { return Result.Err("the checkpoint has \{bytes.len() - at} bytes after its last variable"); }
+  for (i32 k = 0; k < count; k++) {
+    Variable v = vs[k];
+    Tensor t = v.device.tensorOf(values[k], v.shape, v.dtype());
+    v.assign(t);
+    t.dispose();
+  }
+  return Result.Ok();
+}

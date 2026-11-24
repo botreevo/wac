@@ -1,0 +1,103 @@
+// The policy file: what it reads into, and what it refuses rather than drop.
+
+import { readPolicyFile, NameRule, readNameRule, ensRefusal, delayRefusal } from "../src/policyfile.wac";
+import { Rule } from "../src/admit.wac";
+import { Check } from "./check.wac";
+
+string kind(Rule r) {
+  return match (r) { Root: "root", Endorsed(_, n): "endorsed \{n}", Derived(by, n, k, slots, other): "derived \{by.len()} \{n} \{k} \{slots.len()} \{other}", Analysis(_, _, _, _, _, _): "analysis", Within(role, path): "within \{role} \{path}", Agree(rules): "agree \{rules.len()}" };
+}
+
+export string testAPolicyReadsWhole() {
+  Check c = Check.create();
+  string text = """
+    {
+      signers: { a: "0x1111111111111111111111111111111111111111", b: "0x2222222222222222222222222222222222222222" },
+      roots: ["bafkreidtzm4frjuhvbeuzizsgbjqcyuc6pnnhhkcz5rmuttz3wrkvr6zvq"],
+      machines: ["wasm-gc/wac-host/2"], formats: ["unixfs-v1-2025+hidden"],
+      reject_lists: ["0x3333333333333333333333333333333333333333"],
+      roles: {
+        result: [{ derived: { by: ["a", "b"], at_least: 2, runners: 2, slots: { program: "program" }, other: "input" } }],
+        input: ["root", { endorsed: { by: ["a"], at_least: 1 } }],
+      },
+    }
+  """;
+  match (readPolicyFile(text.toBytes())) {
+    Err(e): { c.fail(e); }
+    Ok(p): {
+      c.ok(p.signers.len() == 2 && p.signers[1].name == "b" && p.signers[1].address[0] == 0x22, "signers");
+      c.ok(p.roots.len() == 1 && p.rejectLists.len() == 1 && p.machines.len() == 1, "roots, lists, machines");
+      c.ok(p.roles.len() == 2 && p.roles[0].role == "result" && p.roles[1].anyOf.len() == 2, "roles");
+      c.eq(kind(p.roles[0].anyOf[0]), "derived 2 2 2 1 input", "the derived rule");
+      c.eq(kind(p.roles[1].anyOf[0]) + ", " + kind(p.roles[1].anyOf[1]), "root, endorsed 1", "the alternatives");
+    }
+  }
+  return c.report();
+}
+
+export string testAgreeAndConformance() {
+  Check c = Check.create();
+  string text = """
+    {
+      roles: {
+        compiler: [{ agree: [{ derived: { by: ["a"], slots: { program: "seed" } } },
+                             { derived: { by: ["a"], slots: { program: "ladder" } } }] }],
+      },
+      conformance: { "wasm-gc/wac-host/2": "bafkreidtzm4frjuhvbeuzizsgbjqcyuc6pnnhhkcz5rmuttz3wrkvr6zvq" },
+    }
+  """;
+  match (readPolicyFile(text.toBytes())) {
+    Err(e): { c.fail(e); }
+    Ok(p): {
+      c.eq(kind(p.roles[0].anyOf[0]), "agree 2", "an agree rule of two origins");
+      c.ok(p.conformance.len() == 1 && p.conformance[0].machine == "wasm-gc/wac-host/2", "a conformance suite per machine");
+    }
+  }
+  c.ok(readPolicyFile("{ roles: { x: [{ agree: [\"root\"] }] } }".toBytes()).isErr(), "agree with one rule");
+  c.ok(readPolicyFile("{ roles: { x: [{ agree: [\"root\", { agree: [\"root\", \"root\"] }] }] } }".toBytes()).isErr(), "agree in agree");
+  c.ok(readPolicyFile("{ conformance: [\"bafy\"] }".toBytes()).isErr(), "conformance that is not a map");
+  return c.report();
+}
+
+export string testWhatItRefuses() {
+  Check c = Check.create();
+  c.ok(readPolicyFile("{ signers: { a: \"0x12\" } }".toBytes()).isErr(), "a short address");
+  c.ok(readPolicyFile("{ roles: { x: [\"rot\"] } }".toBytes()).isErr(), "a misspelt rule");
+  c.ok(readPolicyFile("{ roles: { x: [{ endorse: {} }] } }".toBytes()).isErr(), "an unknown kind of rule");
+  c.ok(readPolicyFile("{ roles: { x: \"root\" } }".toBytes()).isErr(), "a role that is not a list");
+  c.ok(readPolicyFile("{ roots: [\"not-a-cid\"] }".toBytes()).isErr(), "a root that is not a CID");
+  return c.report();
+}
+
+NameRule rule(string text) {
+  match (readNameRule(text.toBytes())) { Err(e): { return NameRule(-1 as i64, e); } Ok(r): { return r; } }
+}
+
+export string testNamesWhichAreFollowed() {
+  Check c = Check.create();
+  i64 z = 0 as i64;
+  NameRule none = rule("{ roles: {} }");
+  c.ok(none.minDelay == z && none.ens == "", "no names field: no minimum, ens unset");
+  c.eq(ensRefusal(none), "", "with no names field, an ENS name is followed, as before");
+  c.eq(delayRefusal(none, z, -1 as i64, z), "", "and a registry name with no delay");
+  NameRule hour = rule("{ names: { min_delay: 3600 } }");
+  c.ok(ensRefusal(hour).indexOf("moves at once") >= 0, "a minimum delay, ens unset: ENS names cannot meet it");
+  c.eq(ensRefusal(rule("{ names: { min_delay: 3600, ens: \"allow\" } }")), "", "unless allowed explicitly");
+  c.ok(ensRefusal(rule("{ names: { ens: \"refuse\" } }")).indexOf("follows no ENS name") >= 0, "ens: refuse");
+  c.eq(delayRefusal(hour, 3600 as i64, -1 as i64, z), "", "a delay at the minimum");
+  c.ok(delayRefusal(hour, 3599 as i64, -1 as i64, z).indexOf("waits 3599s") >= 0, "a delay under it");
+  c.ok(delayRefusal(hour, 7200 as i64, 60 as i64, 99 as i64).indexOf("a delay of 60s is pending from 99") >= 0,
+       "a long delay now, but a short one pending: refused before it takes effect");
+  c.eq(delayRefusal(hour, 7200 as i64, 3600 as i64, 99 as i64), "", "a pending delay at the minimum");
+  return c.report();
+}
+
+export string testNamesWhatItRefuses() {
+  Check c = Check.create();
+  c.ok(readNameRule("{ names: { min_delay: -1 } }".toBytes()).isErr(), "a negative delay");
+  c.ok(readNameRule("{ names: { min_delay: 1.5 } }".toBytes()).isErr(), "a fraction of a second");
+  c.ok(readNameRule("{ names: { ens: \"sometimes\" } }".toBytes()).isErr(), "an ens that is neither allow nor refuse");
+  c.ok(readNameRule("{ names: { min_dely: 60 } }".toBytes()).isErr(), "a misspelt field: refused, not ignored");
+  c.ok(readNameRule("{ names: 60 }".toBytes()).isErr(), "names not an object");
+  return c.report();
+}

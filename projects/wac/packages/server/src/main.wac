@@ -1,0 +1,176 @@
+// The accept loop, in wac.
+//
+//     wac app packages/server/src/main.wac -o serve --allow-net
+//     ./serve [port] [--request-ms N] [--idle-ms N] [--max-connections N]
+//
+// Every decision — is this a complete request, what does it mean, what is the answer, does the connection stay open —
+// is `serve`'s, a pure function from bytes to bytes. What is here is the socket: accumulate what arrives, call `serve`,
+// and when it answers, write the response and drop exactly `consumed` bytes. Keeping the remainder rather than clearing
+// the buffer is what makes pipelining work — a client may already have sent the next request, and it is in the tail.
+//
+// It was packages/server/host/serve.ts (deleted 2026-11-11), which bound `serve` through `wacBind` — compiling it in the
+// same process before it printed `listening on`, so a cold or contended compile spent a test's whole start budget
+// with nothing on its log (`issues/system/0466d`). Built once by the test instead, it is listening before it is asked.
+//
+// The limits are the ones a server needs and is not finished without: a client that connects and says nothing would
+// otherwise hold its connection for ever.
+
+import { Clock, Listener, Net, Output, Socket, Sys, TimedOut } from "std";
+import { Read, flatten } from "core";
+import { Served, serve } from "./serve.wac";
+
+struct Limits {
+  /** How long a client may take to finish sending one request, once it has started. */
+  i32 requestMs;
+  /** How long a kept-alive connection may sit silent between requests. */
+  i32 idleMs;
+  /** Connections served at once. Beyond this, new ones are closed immediately. */
+  i32 maxConnections;
+}
+
+struct Options {
+  i32 port;
+  Limits limits;
+  /** The status to exit with before serving anything, or -1 to serve. */
+  i32 exitCode;
+}
+
+/** A positive decimal, or -1. */
+i32 positive(string s) {
+  if (s.len() == 0 || s.len() > 9) { return 0 - 1; }
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return 0 - 1; }
+    n = n * 10 + (b[i] as i32 - '0');
+  }
+  return n;
+}
+
+/** The port is the first argument that is neither a flag nor a flag's value — `120` in `--idle-ms 120` is not one. */
+Options parseArgs(string[] argv, Output err) {
+  Options o = Options(8080, Limits(10000, 30000, 256), 0 - 1);
+  bool havePort = false;
+  for (i32 i = 0; i < argv.len(); i++) {
+    string a = argv[i];
+    if (a == "--request-ms" || a == "--idle-ms" || a == "--max-connections") {
+      string v = i + 1 < argv.len() ? argv[i + 1] : "";
+      i32 n = positive(v);
+      if (n <= 0) {
+        err.line("\{a} wants a positive number, got \"\{v}\"");
+        o.exitCode = 2;
+        return o;
+      }
+      if (a == "--request-ms") { o.limits.requestMs = n; }
+      if (a == "--idle-ms") { o.limits.idleMs = n; }
+      if (a == "--max-connections") { o.limits.maxConnections = n; }
+      i = i + 1;
+      continue;
+    }
+    if (a.len() >= 2 && a.slice(0, 2) == "--") { continue; }
+    if (!havePort) {
+      i32 p = a == "0" ? 0 : positive(a);
+      if (p < 0 || p > 65535) {
+        err.line("not a port: \"\{a}\"");
+        o.exitCode = 2;
+        return o;
+      }
+      o.port = p;
+      havePort = true;
+    }
+  }
+  return o;
+}
+
+u8[] joined(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+u8[] from(u8[] a, i32 start) {
+  u8[] out = u8[].filled(a.len() - start, 0);
+  out.copyFrom(a, start, 0, a.len() - start);
+  return out;
+}
+
+/** Serve one connection until it is closed, the client stops talking, or `serve` says to close. */
+async void connection(Clock clock, Socket sock, Limits limits, i32[] open) {
+  u8[] buffer = u8[]();
+  bool done = false;
+  while (!done) {
+    // Answer everything already buffered before reading again: a pipelined client sends two requests in one packet,
+    // and waiting for more input after the first would deadlock.
+    bool progressed = true;
+    while (progressed && !done) {
+      progressed = false;
+      i64 now = (await clock.nowMillis()).orElse(0 as i64);
+      Served s = serve(buffer, now);
+      if (s.ready) {
+        auto sent = await sock.send(s.response);
+        if (sent.isErr()) { done = true; }
+        buffer = from(buffer, s.consumed);
+        progressed = s.consumed > 0 && buffer.len() > 0;
+        if (!s.keepAlive) { done = true; }
+      }
+    }
+    if (done) { break; }
+
+    // A partly-sent request gets the request budget; an idle kept-alive connection gets the idle one. They differ
+    // because the situations do: a slow upload is not a client that has gone away.
+    i32 budget = buffer.len() > 0 ? limits.requestMs : limits.idleMs;
+    auto got = await clock.within(sock.recv(), budget);
+    if (got.isErr()) {
+      // A request that was underway is told why; an idle connection is simply dropped, having nothing to answer.
+      if (got.err()! is TimedOut && buffer.len() > 0) {
+        await sock.send("HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toBytes());
+      }
+      break;
+    }
+    match (got.unwrap()) {
+      Data(bytes): { buffer = joined(buffer, bytes); }
+      default: { done = true; }
+    }
+  }
+  sock.close();
+  open[0] = open[0] - 1;
+}
+
+/** Take connections for as long as the listener lasts, each served alongside the others. */
+async void accepting(Clock clock, Listener listener, Limits limits, Output err) {
+  i32[] open = i32[].filled(1, 0);
+  while (true) {
+    auto took = await listener.accept();
+    Socket? c = took.ok();
+    if (c is null) {
+      err.line("accept: \{took.err()!}");
+      return;
+    }
+    // Refusing at once is kinder than accepting and being slow: the client finds out now.
+    if (open[0] >= limits.maxConnections) {
+      c!.close();
+      continue;
+    }
+    open[0] = open[0] + 1;
+    connection(clock, c!, limits, open);
+  }
+}
+
+export async i32 main(Sys sys) {
+  Output err = sys.stderr();
+  Options o = parseArgs(sys.args(), err);
+  if (o.exitCode >= 0) { return o.exitCode; }
+  Listener listener;
+  match (await sys.net().listen("127.0.0.1", o.port)) {
+    Ok(l): { listener = l; }
+    Err(e): {
+      err.line("listen: \{e}");
+      return 1;
+    }
+  }
+  await sys.stdout().line("listening on http://127.0.0.1:\{listener.port}");
+  accepting(sys.clock(), listener, o.limits, err);
+  await sys.drain();
+  return 0;
+}

@@ -1,0 +1,387 @@
+// Pip's music: the first tune, played for each kind of place, on a small sound chip, written down as a tracker would.
+//
+// **The first tune's sound, kept**: a thin pulse lead, plucked — loudest as each note starts, falling away and ringing
+// a little past it — over a plain triangle bass cut a touch short and a tick of noise on the off-beats, at the volume
+// the game first played it. The places differ only as a tune can without changing its sound: the towers up a tone
+// and faster, the wind in the major, the dark slower over held notes with a long echo, the title slower still.
+//
+// **A song is tracks of notes on a grid** — `E5 - A5 - G5 E5`, a token a step, `-` holding the note before and `.` a
+// rest — each played by an instrument. A chord is a root, minor, or major with `^`: `F4^`, which an arpeggio runs
+// through fast enough to sound as one.
+//
+// **Each level's song is seven layers.** Layer 0 is the bass and the ticks and layer 1 the melody — the first tune,
+// always there. Then, gently, as lanterns are lit: a second plucked voice under the melody (2), a high pluck on each
+// bar's chord (3), and the ticks doubled (4); a soft arpeggio when the door opens (5); and quick ticks while Pip is
+// ahead of the ghost of the best run (6). The game plays every layer from one moment and turns each up when it is
+// earned, so they never drift apart (`Sound.playAt`, `Voice.fade`).
+
+import { Vec, math } from "core";
+import { RATE, noteOf } from "./chip.wac";
+
+export static i32 PULSE = 0;
+export static i32 TRI = 1;
+export static i32 ARP = 2;
+/** The first tune's tick: noise changing every third sample, gone in 30 ms. */
+export static i32 TICK = 3;
+export static i32 LAYERS = 7;
+/** The layer that plays while Pip is ahead of the ghost. */
+export static i32 RACE = 6;
+
+/** How an instrument sounds: its wave, how loud, and its shape over a note. */
+export struct Inst {
+  i32 kind;
+  f64 volume;
+  /** A pulse's width: 0.5 square, 0.25 and 0.125 thinner and brighter. */
+  f64 duty;
+  /** Not plucked: seconds to rise, seconds to fall to `sustain`, the level held, and seconds to die away after. */
+  f64 attack;
+  f64 decay;
+  f64 sustain;
+  f64 release;
+  /** Echo: how much comes back, and after how long. */
+  f64 echo;
+  f64 echoTime;
+  /** **Plucked**: loudest at the start, falling away over the note. Either way a note sounds `hold` times its length. */
+  bool pluck;
+  f64 hold;
+}
+
+/** A line of notes, `perBeat` tokens to a beat, played by `inst` in `layer`; repeated to the song's end. */
+export struct Track {
+  Inst inst;
+  i32 layer;
+  i32 perBeat;
+  string notes;
+}
+
+export struct Song {
+  string name;
+  f64 bpm;
+  i32 bars;
+  /** Played round and round: notes and echoes run off the end into the start. Otherwise once, with a tail. */
+  bool loops;
+  Vec<Track> tracks;
+  /** How loud: a scale on what the tracks make — the first tune's 0.45. */
+  f64 master;
+
+  Song make(string name, f64 bpm, i32 bars, bool loops) { return Song(name, bpm, bars, loops, Vec.create(), 0.45); }
+
+  Song add(this, Inst inst, i32 layer, i32 perBeat, string notes) {
+    this.tracks.push(Track(inst, layer, perBeat, notes));
+    return this;
+  }
+
+  /** Samples in the song: its bars, and, played once, two seconds for its last notes to die away. */
+  i32 length(this) {
+    f64 secs = (this.bars as f64) * 4.0 * 60.0 / this.bpm + (this.loops ? 0.0 : 2.0);
+    return (secs * (RATE as f64)) as~ i32;
+  }
+}
+
+// ── Instruments: the first tune's ───────────────────────────────────────────
+
+Inst inst(i32 kind, f64 volume, f64 duty) { return Inst(kind, volume, duty, 0.0001, 0.001, 1.0, 0.009, 0.0, 0.25, false, 1.0); }
+
+/** The lead: a thin pulse, plucked, ringing a little past each note. */
+export Inst pluck(f64 volume, f64 duty) {
+  Inst i = inst(PULSE, volume, duty);
+  i.pluck = true;
+  i.hold = 1.15;
+  return i;
+}
+
+/** An arpeggio through a chord, plucked. */
+export Inst pluckedArp(f64 volume) {
+  Inst i = inst(ARP, volume, 0.125);
+  i.pluck = true;
+  return i;
+}
+
+/** The bass: a plain triangle, each note cut a touch short. */
+export Inst plainBass(f64 volume) {
+  Inst i = inst(TRI, volume, 0.5);
+  i.hold = 0.9;
+  return i;
+}
+
+export Inst ticking(f64 volume) { return inst(TICK, volume, 0.5); }
+
+export Inst echoing(Inst i, f64 amount, f64 time) {
+  i.echo = amount;
+  i.echoTime = time;
+  return i;
+}
+
+// ── Notes, as text ──────────────────────────────────────────────────────────
+
+/** The tokens of `s`: split at spaces, the `|` that mark bars left out. */
+export string[] tokens(string s) {
+  Vec<string> out = Vec.create();
+  i32 start = 0;
+  for (i32 i = 0; i <= s.len(); i++) {
+    if (i == s.len() || s.slice(i, i + 1) == " ") {
+      if (i > start) {
+        string t = s.slice(start, i);
+        if (t != "|") { out.push(t); }
+      }
+      start = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+string join(string[] ts) {
+  string out = "";
+  for (i32 i = 0; i < ts.len(); i++) { out = out + (i > 0 ? " " : "") + ts[i]; }
+  return out;
+}
+
+/** A note's name for semitones from A4: `C#5`. */
+export string nameOf(i32 semis) {
+  string[] names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+  i32 v = semis + 9 + 48;
+  return names[v % 12] + "\{v / 12}";
+}
+
+bool isNote(string t) {
+  if (t.len() < 2) { return false; }
+  u8 c = t.toBytes()[0];
+  return c >= 'A' && c <= 'G';
+}
+
+/** A token's note, and whether it is a major chord. */
+string noteIn(string t) { return t.slice(t.len() - 1, t.len()) == "^" ? t.slice(0, t.len() - 1) : t; }
+bool isMajor(string t) { return t.slice(t.len() - 1, t.len()) == "^"; }
+
+/** Each note of `s` with `f` applied to its semitones; everything else as it was. */
+string mapNotes(string s, fn<i32(i32)> f) {
+  string[] ts = tokens(s);
+  for (i32 i = 0; i < ts.len(); i++) {
+    if (!isNote(ts[i])) { continue; }
+    ts[i] = nameOf(f(noteOf(noteIn(ts[i])))) + (isMajor(ts[i]) ? "^" : "");
+  }
+  return join(ts);
+}
+
+/** `s` moved `by` semitones. */
+export string transposed(string s, i32 by) { return mapNotes(s, (i32 n) => n + by); }
+
+/** `s`, in A minor, into A major: C, F and G a semitone up. */
+export string majored(string s) {
+  return mapNotes(s, (i32 n) => {
+    i32 c = (n + 9 + 48) % 12;
+    return c == 0 || c == 5 || c == 7 ? n + 1 : n;
+  });
+}
+
+/** `s`, `n` times over. */
+export string times(string s, i32 n) {
+  string out = "";
+  for (i32 i = 0; i < n; i++) { out = out + (i > 0 ? " " : "") + s; }
+  return out;
+}
+
+// ── The first tune ──────────────────────────────────────────────────────────
+
+/** Pip's theme: eight bars of eighths in A minor, over A–F–C–G twice. */
+export string THEME() {
+  return "E5 - A5 - G5 E5 D5 - | C5 - D5 E5 - - C5 A4 | G4 - C5 - E5 - G5 E5 | D5 - - B4 D5 - G5 - | "
+       + "E5 - A5 - B5 A5 G5 E5 | F5 - E5 D5 C5 - A4 C5 | E5 - G5 - C6 - B5 G5 | A5 - - - G5 - . .";
+}
+
+/** Its bass: the root and its octave, eighths — with the B in its last bar. */
+export string BASS() {
+  return "A2 A3 A2 A3 A2 A3 A2 A3 | F2 F3 F2 F3 F2 F3 F2 F3 | C3 C4 C3 C4 C3 C4 C3 C4 | G2 G3 G2 G3 G2 G3 G2 G3 | "
+       + "A2 A3 A2 A3 A2 A3 A2 A3 | F2 F3 F2 F3 F2 F3 F2 F3 | C3 C4 C3 C4 C3 C4 C3 C4 | G2 G3 G2 G3 B2 B3 G2 G3";
+}
+
+/** The same roots, each held for its bar: for the slower songs. */
+export string HELD() {
+  return "A2 - - - - - - - | F2 - - - - - - - | C3 - - - - - - - | G2 - - - - - - - | "
+       + "A2 - - - - - - - | F2 - - - - - - - | C3 - - - - - - - | G2 - - - - - - -";
+}
+
+/** A line under the theme, in half notes, a third or a sixth below it. */
+export string COUNTER() {
+  return "C5 - - - E5 - - - | A4 - - - C5 - - - | E4 - - - G4 - - - | B4 - - - D5 - - - | "
+       + "C5 - - - E5 - - - | A4 - - - F4 - - - | G4 - - - C5 - - - | E5 - - - D5 - - -";
+}
+
+/** The chords, a bar each, high: what the plucks on each bar play. */
+export string CHORDS() { return "A5 . . . F5^ . . . C6^ . . . G5^ . . . A5 . . . F5^ . . . C6^ . . . G5^ . . ."; }
+
+/**
+ * The first tune — moved `by` semitones, at `bpm`, in the major when `major`, over `bass`, with its ticks or not, an
+ * echo on the lead — and, when `layers`, the gentle layers a level earns.
+ */
+Song first(string name, f64 bpm, i32 by, bool major, string bass, bool ticks, f64 echo, bool layers) {
+  Song s = Song.make(name, bpm, 8, true);
+  fn<string(string)> key = (string notes) => major ? majored(transposed(notes, by)) : transposed(notes, by);
+  s.add(plainBass(0.3), 0, 2, key(bass));
+  if (ticks) { s.add(ticking(0.05), 0, 2, times(". h . h . h . h", 8)); }
+  s.add(echoing(pluck(0.16, 0.25), echo, 0.33), 1, 2, key(THEME()));
+  if (!layers) { return s; }
+  s.add(pluck(0.08, 0.5), 2, 2, key(COUNTER()));
+  s.add(echoing(pluck(0.06, 0.125), 0.4, 0.33), 3, 1, key(CHORDS()));
+  s.add(ticking(0.035), 4, 4, times("h . h . h . h . h . h . h . h .", 8));
+  s.add(echoing(pluckedArp(0.05), 0.4, 0.25), 5, 1, key(CHORDS()));
+  s.add(ticking(0.04), RACE, 4, times("h h h h h h h h h h h h h h h h", 8));
+  return s;
+}
+
+/** The title: slower, the bass held, a light echo on the lead. */
+export Song title() { return first("title", 100.0, 0, false, HELD(), false, 0.3, false); }
+
+/** The fields: the first tune as it was. */
+export Song field() { return first("field", 128.0, 0, false, BASS(), true, 0.0, true); }
+
+/** The towers: up a tone, and faster. */
+export Song towers() { return first("towers", 150.0, 2, false, BASS(), true, 0.0, true); }
+
+/** The wind: in the major. */
+export Song wind() { return first("wind", 116.0, 0, true, BASS(), true, 0.0, true); }
+
+/** The dark: slower, the bass held, no ticks, a long echo on the lead. */
+export Song dark() { return first("dark", 84.0, 0, false, HELD(), false, 0.45, true); }
+
+/** The end of the last level: the first tune in the major, faster, every layer playing. */
+export Song finale() { return first("finale", 140.0, 0, true, BASS(), true, 0.0, true); }
+
+/** A level cleared: the tune's first notes, in the major, plucked, once. */
+export Song fanfare() {
+  Song s = Song.make("fanfare", 140.0, 2, false);
+  s.add(pluck(0.2, 0.25), 0, 4, "A4 . C#5 . E5 . A5 - - - E5 . A5 - - - | C#6 - - - - - - - . . . . . . . .");
+  s.add(pluck(0.1, 0.5), 0, 4, "E4 . A4 . C#5 . E5 - - - C#5 . E5 - - - | A5 - - - - - - - . . . . . . . .");
+  s.add(plainBass(0.3), 0, 2, "A2 - - - E2 - - - | A2 - - - - - . .");
+  s.add(ticking(0.05), 0, 4, "h . h . h . h . h . h . h . h . | h . . . . . . . . . . . . . . .");
+  return s;
+}
+
+/** Every song. */
+export Song[] songs() { return [title(), field(), towers(), wind(), dark(), finale(), fanfare()]; }
+
+/** The song called `name`; the fields' for a name it does not know. */
+export Song songNamed(string name) {
+  if (name == "title") { return title(); }
+  if (name == "towers") { return towers(); }
+  if (name == "wind") { return wind(); }
+  if (name == "dark") { return dark(); }
+  if (name == "finale") { return finale(); }
+  if (name == "fanfare") { return fanfare(); }
+  return field();
+}
+
+// ── Playing it ──────────────────────────────────────────────────────────────
+
+/** The frequency `semis` from A4. */
+f64 freqOf(f64 semis) { return 440.0 * math.pow(2.0, semis / 12.0); }
+
+/** Where sample `i` lands in `out`: round to the start when the song loops, or nowhere past its end. */
+i32 placed(i32 i, i32 n, bool loops) { return loops ? i % n : (i < n ? i : 0 - 1); }
+
+/** One note of `ins`, from sample `start` for `len` samples, at `semis` — a chord's root, major when `major`. */
+void note(f64[] out, bool loops, Inst ins, i32 start, i32 len, f64 semis, bool major) {
+  f64 rate = RATE as f64;
+  i32 sounds = ((len as f64) * ins.hold) as~ i32;
+  i32 release = ins.pluck ? 0 : (ins.release * rate) as~ i32;
+  i32 total = ins.kind == TICK ? (0.03 * rate) as~ i32 : sounds + release;
+  f64 phase = 0.0;
+  f64 level = 0.0;
+  i32 reg = 0x7FFF;
+  f64 noise = 1.0;
+  for (i32 i = 0; i < total; i++) {
+    i32 at = placed(start + i, out.len(), loops);
+    if (at < 0) { return; }
+    f64 x = (i as f64) / (total as f64);
+    f64 v = 0.0;
+    if (ins.kind == TICK) {
+      if (i % 3 == 0) {
+        i32 bit = (reg ^ (reg >> 1)) & 1;
+        reg = (reg >> 1) | (bit << 14);
+        noise = (reg & 1) == 1 ? 1.0 : 0.0 - 1.0;
+      }
+      v = noise * (1.0 - x) * (1.0 - x);
+    } else {
+      f64 s = semis;
+      if (ins.kind == ARP) {
+        // Through the chord fifty times a second: root, third, fifth.
+        i32 k = (((i as f64) / rate * 50.0).floor() as~ i32) % 3;
+        s = s + (k == 0 ? 0.0 : (k == 1 ? (major ? 4.0 : 3.0) : 7.0));
+      }
+      phase = phase + freqOf(s) / rate;
+      phase = phase - phase.floor();
+      v = ins.kind == TRI ? (phase < 0.5 ? 4.0 * phase - 1.0 : 3.0 - 4.0 * phase) : (phase < ins.duty ? 1.0 : 0.0 - 1.0);
+      if (ins.pluck) {
+        level = (1.0 - x) * (1.0 - x);
+      } else {
+        f64 a = ins.attack * rate;
+        f64 d = ins.decay * rate;
+        f64 y = i as f64;
+        if (i < sounds) {
+          level = y < a ? y / a : (y < a + d ? 1.0 - (1.0 - ins.sustain) * (y - a) / d : ins.sustain);
+        } else {
+          level = level * (1.0 - 1.0 / ((release + 1) as f64));
+        }
+      }
+      v = v * level;
+    }
+    out[at] = out[at] + v * ins.volume;
+  }
+}
+
+/** A track, into `out`: every note, then its echo. */
+void play(f64[] out, bool loops, f64 bpm, Track tr) {
+  string[] ts = tokens(tr.notes);
+  if (ts.len() == 0) { return; }
+  f64 step = 60.0 / bpm / (tr.perBeat as f64) * (RATE as f64);
+  i32 steps = loops ? (((out.len() as f64) / step).floor() as~ i32) : ts.len();
+  f64[] mine = f64[].filled(out.len(), 0.0);
+  for (i32 i = 0; i < steps; i++) {
+    string t = ts[i % ts.len()];
+    if (t == "-" || t == ".") { continue; }
+    i32 held = 1;
+    while (i + held < steps && ts[(i + held) % ts.len()] == "-") { held++; }
+    i32 start = ((i as f64) * step) as~ i32;
+    i32 len = ((held as f64) * step) as~ i32;
+    if (isNote(t)) { note(mine, loops, tr.inst, start, len, noteOf(noteIn(t)) as f64, isMajor(t)); }
+    else { note(mine, loops, tr.inst, start, len, 0.0, false); }
+  }
+  if (tr.inst.echo > 0.0) {
+    i32 d = (tr.inst.echoTime * (RATE as f64)) as~ i32;
+    // Twice round when it loops, so the echo of the end is heard at the start.
+    for (i32 pass = 0; pass < (loops ? 2 : 1); pass++) {
+      for (i32 i = 0; i < mine.len(); i++) {
+        i32 from = i - d;
+        if (from < 0) {
+          if (!loops || pass == 0) { continue; }
+          from = from + mine.len();
+        }
+        if (pass == 1 && i >= d) { continue; }
+        mine[i] = mine[i] + mine[from] * tr.inst.echo;
+      }
+    }
+  }
+  for (i32 i = 0; i < out.len(); i++) { out[i] = out[i] + mine[i]; }
+}
+
+/** The song, a buffer per layer, at its volume: what the game plays together, each turned up as it is earned. */
+export f64[][] stems(Song s) {
+  i32 n = s.length();
+  f64[][] out = f64[][].filled(LAYERS, f64[]());
+  for (i32 l = 0; l < LAYERS; l++) { out[l] = f64[].filled(n, 0.0); }
+  for (i32 i = 0; i < s.tracks.len(); i++) {
+    Track tr = s.tracks.get(i);
+    play(out[tr.layer], s.loops, s.bpm, tr);
+  }
+  for (i32 l = 0; l < LAYERS; l++) { for (i32 i = 0; i < n; i++) { out[l][i] = out[l][i] * s.master; } }
+  return out;
+}
+
+/** Layers 0 to `upTo` of `stems`, mixed. */
+export f64[] mixed(f64[][] stems, i32 upTo) {
+  f64[] out = f64[].filled(stems[0].len(), 0.0);
+  for (i32 l = 0; l <= upTo && l < stems.len(); l++) {
+    for (i32 i = 0; i < out.len(); i++) { out[i] = out[i] + stems[l][i]; }
+  }
+  return out;
+}

@@ -1,0 +1,159 @@
+// A device on a Metal GPU, through a server outside wac (`metal/server.swift`) that the program reaches over a socket.
+//
+// **Why a server, not a host capability.** `wac.gpu` is a browser's; a program run by `wac` has no GPU, and putting
+// one into the `wac` command would tie every host to one platform's graphics. A socket is something every host already
+// gives a program granted the network, so the GPU stays a separate program that is started, or not, on the machine
+// that has one — and nothing about `wac` changes.
+//
+// **The line is the WebGPU backend's** (`../gpu/line.wac`): the same operations, batched the same way, carried as
+// frames instead of capability requests, with MSL instead of WGSL and one more operation, `GPU_MATMUL`, for Metal
+// Performance Shaders' matrix product. On a socket:
+//
+//     server → program, once      u32 length, then "wac.metal 1 <device name>"
+//     program → server            0, u32 count, u32 length, then a batch as `GpuLine` encodes it — never answered
+//                                 1, u32 handle, u32 offset, u32 length — a read
+//     server → program, a read    u32 fault, u32 length, the fault's text, u32 length, the bytes
+//
+// Every number is little-endian. Reads are answered in the order they were asked, each after every batch before it.
+
+import { Answer, Net, Socket } from "std";
+import { Buf, Read, Result, Ticket, Vec } from "core";
+import { Device } from "../tensor.wac";
+import { GpuBackend } from "../gpu/backend.wac";
+import { GpuLine, Wire } from "../gpu/line.wac";
+import { Msl } from "./msl.wac";
+
+/** What a socket has delivered, taken in the sizes asked for whatever pieces it came in. */
+struct Incoming {
+  Socket socket;
+  /** What arrived and has not been taken, from `at`. */
+  u8[] rest;
+  i32 at;
+
+  /** The next `n` bytes, or why they will not come. */
+  async Result<u8[], string> take(this, i32 n) {
+    u8[] out = u8[].filled(n, 0 as u8);
+    i32 got = 0;
+    while (got < n) {
+      if (this.at == this.rest.len()) {
+        match (await this.socket.recv()) {
+          Ok(r): {
+            match (r) {
+              Data(bytes): { this.rest = bytes; this.at = 0; }
+              End: { return Result.Err("the Metal server closed the connection"); }
+              Failed(why): { return Result.Err(why); }
+            }
+          }
+          Err(e): { return Result.Err("\{e}"); }
+        }
+      }
+      i32 k = this.rest.len() - this.at;
+      if (k > n - got) { k = n - got; }
+      out.copyFrom(this.rest, this.at, got, k);
+      this.at += k;
+      got += k;
+    }
+    return Result.Ok(out);
+  }
+
+  async Result<i32, string> u32(this) {
+    u8[] b = try await this.take(4);
+    return Result.Ok((b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16) | ((b[3] as i32) << 24));
+  }
+
+  async Result<u8[], string> sized(this) {
+    i32 n = try await this.u32();
+    return await this.take(n);
+  }
+}
+
+Answer failed(string why) { return Answer(5, why, u8[](), 0 as i64, 0 as i64, 0); }
+
+export struct SocketWire : Wire {
+  Socket socket;
+  Incoming incoming;
+  /** Reads asked and not yet answered, oldest first: the order the server answers them in. */
+  Vec<Ticket<Answer>> waiting;
+  /** Whether `pump` is running, so there is never more than one reader of the socket. */
+  bool pumping = false;
+
+  override void send(this, i32 count, u8[] batch) {
+    Buf b = Buf.withCapacity(9 + batch.len());
+    b.push(0 as u8);
+    b.pushU32(count as@ u32);
+    b.pushU32(batch.len() as@ u32);
+    b.pushAll(batch);
+    this.socket.send(b.bytes());
+  }
+
+  override Ticket<Answer> read(this, i32 handle, i32 offset, i32 length) {
+    Buf b = Buf.withCapacity(13);
+    b.push(1 as u8);
+    b.pushU32(handle as@ u32);
+    b.pushU32(offset as@ u32);
+    b.pushU32(length as@ u32);
+    this.socket.send(b.bytes());
+    Ticket<Answer> t;
+    this.waiting.push(t);
+    if (!this.pumping) {
+      this.pumping = true;
+      pump(this);
+    }
+    return t;
+  }
+}
+
+/** Answer the waiting reads, in order, until none is left; every one after a failure fails with it. */
+async void pump(SocketWire w) {
+  while (w.waiting.len() > 0) {
+    Answer a = (await answer(w.incoming)).orElse(failed("the connection to the Metal server failed"));
+    Ticket<Answer> t = w.waiting.get(0);
+    w.waiting.remove(0);
+    t.resolve(a);
+  }
+  w.pumping = false;
+}
+
+async Result<Answer, string> answer(Incoming in) {
+  i32 fault = try await in.u32();
+  u8[] text = try await in.sized();
+  u8[] bytes = try await in.sized();
+  return Result.Ok(Answer(fault, string.fromBytes(text), bytes, 0 as i64, 0 as i64, 0));
+}
+
+/**
+ * A device on the Metal server at `host:port`, or why there is none. `warn` hears what the GPU reports going wrong. The
+ * device's backend is named for the GPU the server found, as `metal: <name>`.
+ */
+export async Result<Device, string> metalDevice(Net net, string host, i32 port, fn<void(string)> warn) {
+  Socket s;
+  match (await net.connect(host, port)) {
+    Ok(c): { s = c; }
+    Err(e): { return Result.Err("no Metal server at \{host}:\{port}: \{e}"); }
+  }
+  Incoming in = Incoming(s, u8[](), 0);
+  string hello = string.fromBytes(try await in.sized());
+  string expect = "wac.metal 1 ";
+  if (hello.indexOf(expect) != 0) {
+    s.close();
+    return Result.Err("\{host}:\{port} is not a Metal server: it said \"\{hello}\"");
+  }
+  SocketWire wire = SocketWire { socket: s, incoming: in, waiting: Vec.create() };
+  string name = "metal: " + hello.slice(expect.len(), hello.len());
+  return Result.Ok(Device.on(GpuBackend.speaking(GpuLine.over(wire), warn, name, Msl(), true)));
+}
+
+/** The port the server listens on unless it is told another. */
+export static i32 METAL_PORT = 7787;
+
+/** The port a command's first argument names, or `METAL_PORT` when it names none. */
+export i32 portFrom(string[] args) {
+  if (args.len() == 0) { return METAL_PORT; }
+  u8[] b = args[0].toBytes();
+  i32 port = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return METAL_PORT; }
+    port = port * 10 + (b[i] - '0') as i32;
+  }
+  return port;
+}

@@ -1,0 +1,162 @@
+// The retransmission timers, on a clock made of numbers.
+//
+// The association and `Peer` both take the time as an argument, because wac has no ambient capabilities and
+// nothing in this package reads a clock. The usual reading of that is a constraint; here it is the reason this
+// file exists at all — **a timer tested against a real clock is a slow test and a flaky one**, and every case
+// below runs in microseconds because the clock is `1`, `2`, `1000`.
+//
+// The tests in `dtlsserver_test.wac`, `channels_test.wac` and `browser.test.ts` prove that a *lost* thing is
+// recovered, by throwing it away and watching a real peer receive the retransmission. What they cannot show is
+// *when*: that the timer waits, that it backs off, that an acknowledgement stops it, and how the congestion window
+// responds. That is this file.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Association, MAX_PACKET } from "../../src/association.wac";
+import { Peer } from "../../src/peer.wac";
+import { answering, sackPacket, dataTsns } from "./sctp_probe.wac";
+import { newPeer, peerDue, peerFlightSize } from "./peer_probe.wac";
+
+static i32 OUR_TAG = 0x77777777;
+
+u8[] filled(i32 n, i32 v) {
+  u8[] out = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { out[i] = v as@ u8; }
+  return out;
+}
+
+/** An association a peer has completed the handshake with, so it has a tag to answer under. */
+Association associated() { return answering(OUR_TAG, 1, 1); }
+
+/** How many DATA chunks the association sends when its timers are asked about `now`. */
+i32 resentAt(Association a, i64 now) {
+  a.tick(now);
+  return dataTsns(a.take()).len();
+}
+
+export string test_a_chunk_is_not_due_before_its_timer_and_is_due_after() {
+  T t = T.create();
+  Association a = associated();
+  a.send(0, 51, "one".toBytes(), false, -1, 1000 as i64);
+  t.eqI32(dataTsns(a.take()).len(), 1, "one chunk sent");
+  t.eqI32(resentAt(a, 1000 as i64), 0, "not at the moment it was sent");
+  t.eqI32(resentAt(a, 1999 as i64), 0, "nor a millisecond before the timeout — a second, with nothing measured");
+  t.eqI32(resentAt(a, 2000 as i64), 1, "and due exactly at it");
+  return t.report();
+}
+
+export string test_and_the_timeout_doubles_per_attempt() {
+  T t = T.create();
+  Association a = associated();
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.take();
+  t.eqI32(resentAt(a, 999 as i64), 0, "not before a second");
+  t.eqI32(resentAt(a, 1000 as i64), 1, "resent at one second");
+  t.eqI32(resentAt(a, 2999 as i64), 0,
+          "a fixed interval would have resent here — and a path that has lost one packet is more likely to lose the " +
+          "next, so retrying at the same rate adds to the congestion that caused it");
+  t.eqI32(resentAt(a, 3000 as i64), 1, "resent two seconds after the last");
+  t.eqI32(resentAt(a, 6999 as i64), 0, "not yet at +4000 less one");
+  t.eqI32(resentAt(a, 7000 as i64), 1, "resent four seconds after that");
+  return t.report();
+}
+
+export string test_an_acknowledged_chunk_stops_being_due_at_all() {
+  T t = T.create();
+  Association a = associated();
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  i32 tsn = dataTsns(a.take())[0];
+  a.receive(sackPacket(OUR_TAG, tsn, 65536), 0 as i64);
+  t.eqI32(a.outstanding(), 0, "nothing left in flight");
+  t.eqI32(resentAt(a, 100000 as i64), 0,
+          "and nothing becomes due however long is waited — a timer that fired for acknowledged data would resend it " +
+          "for ever");
+  return t.report();
+}
+
+export string test_a_cumulative_acknowledgement_covers_everything_below_it() {
+  T t = T.create();
+  Association a = associated();
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.send(0, 51, "two".toBytes(), false, -1, 0 as i64);
+  a.send(0, 51, "three".toBytes(), false, -1, 0 as i64);
+  i32[] tsns = dataTsns(a.take());
+  t.eqI32(tsns.len(), 3, "three in flight");
+  a.receive(sackPacket(OUR_TAG, tsns[2], 65536), 0 as i64);
+  t.eqI32(a.outstanding(), 0, "one SACK for the last TSN clears all three, because cumulative means everything up to it");
+  return t.report();
+}
+
+export string test_a_dtls_flight_is_due_on_the_same_rule() {
+  T t = T.create();
+  Peer p = newPeer([0x30, 0x01, 0x02] as u8[], filled(32, 3), filled(32, 7), filled(32, 9),
+                   filled(32, 1), [1, 2, 3, 4] as u8[]);
+
+  // **Nothing is due before there is a flight**, which is the state a server is in for as long as
+  // nobody has talked to it — and a timer that fired then would send a handshake to nobody.
+  t.eqI32(peerFlightSize(p), 0, "no flight yet");
+  t.eqI32(peerDue(p, 100000, 1000).len(), 0, "no flight, nothing to resend");
+  return t.report();
+}
+
+export string test_the_timeout_is_measured_rather_than_assumed() {
+  // RFC 6298's estimator, which SCTP and TCP share. Before anything is measured the answer is a second.
+  T t = T.create();
+  Association a = associated();
+  t.eqI64(a.srtt, -1 as i64, "nothing measured yet");
+  t.eqI64(a.rto(), 1000 as i64, "so a second");
+
+  a.send(0, 51, "one".toBytes(), false, -1, 0 as i64);
+  a.receive(sackPacket(OUR_TAG, dataTsns(a.take())[0], 65536), 200 as i64);
+  t.eqI64(a.srtt, 200 as i64, "seeded by the first sample rather than folded into zero");
+  t.eqI64(a.rto(), 1000 as i64,
+          "and still a second, because RFC 4960 floors it there — srtt 200 + 4 × rttvar 100 is 600");
+
+  a.send(0, 51, "two".toBytes(), false, -1, 1000 as i64);
+  a.receive(sackPacket(OUR_TAG, dataTsns(a.take())[0], 65536), 2000 as i64);
+  t.eqI64(a.srtt, 300 as i64, "200 + (1000 - 200)/8 = 300: one slow answer moves the average an eighth of the way");
+
+  // **A chunk that was retransmitted contributes nothing** (Karn): its acknowledgement could answer either copy.
+  i64 before = a.srtt;
+  a.send(0, 51, "three".toBytes(), false, -1, 3000 as i64);
+  i32 t3 = dataTsns(a.take())[0];
+  t.eqI32(resentAt(a, 9000 as i64), 1, "its timer expires and it is resent");
+  a.receive(sackPacket(OUR_TAG, t3, 65536), 9100 as i64);
+  t.eqI64(a.srtt, before, "the average did not move");
+  return t.report();
+}
+
+export string test_the_congestion_window_paces_a_large_message() {
+  T t = T.create();
+  Association a = associated();
+  t.eqI32(a.cwnd, 4380, "RFC 4960's initial window: a few packets rather than one");
+  a.send(0, 51, filled(20000, 65), false, -1, 0 as i64);
+  i32[] first = dataTsns(a.take());
+  t.isTrue(first.len() <= 4, "\{first.len()} chunks went out at once; 4,380 bytes of window holds about four");
+  t.isTrue(a.queued.len() > 10, "and the rest is queued — built and numbered, waiting for the path to allow it");
+  i32 before = a.cwnd;
+  a.receive(sackPacket(OUR_TAG, first[0], 65536), 100 as i64);
+  t.isTrue(a.cwnd > before, "an acknowledgement grows the window");
+  t.isTrue(dataTsns(a.take()).len() > 0, "and more chunks are released once there is room");
+  return t.report();
+}
+
+export string test_and_a_timeout_closes_it_hard() {
+  T t = T.create();
+  Association a = associated();
+  a.send(0, 51, filled(20000, 65), false, -1, 0 as i64);
+  for (i32 i = 0; i < 3; i++) {
+    i32[] sent = dataTsns(a.take());
+    if (sent.len() == 0) { break; }
+    a.receive(sackPacket(OUR_TAG, sent[sent.len() - 1], 65536), 10 as i64);
+  }
+  a.take();
+  i32 grown = a.cwnd;
+  t.isTrue(grown > 4380, "the window grew to \{grown}");
+  t.isTrue(a.outstanding() > 0, "with some of the message still unacknowledged");
+  t.isTrue(resentAt(a, 100000 as i64) > 0, "something was resent when the timer ran out");
+  t.eqI32(a.cwnd, MAX_PACKET,
+          "the window drops to one packet — a timeout is the strongest evidence a path has that it is overloaded, " +
+          "unlike a gap, which says the path is delivering and dropped one");
+  t.isTrue(a.ssthresh >= 4 * MAX_PACKET, "and the threshold halves rather than collapsing");
+  return t.report();
+}

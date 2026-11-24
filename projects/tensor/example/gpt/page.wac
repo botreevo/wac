@@ -1,0 +1,174 @@
+// The tiny GPT trained in a page, on WebGPU: pick a text, watch the loss fall and the samples turn from noise into
+// names, or into something like Shakespeare. Without WebGPU it trains on the CPU, slowly, and says so.
+//
+// Built with `tools/build.wac` and served beside `names.txt` and `shakespeare.txt`, which it reads from its own site
+// (`wac.site`) — so it must be served, not opened as a file. `#test` in the address trains the names model for 20
+// steps on the GPU and on the CPU side by side, from the same seed and the same batches, and puts in the title whether
+// the two losses agreed at every step — the whole model, forwards and backwards, against the reference. That is what
+// `tools/gpucheck.js` reads.
+
+import { Page, Site, Element, ElementEvent, Listen } from "web";
+import { Result } from "core";
+import { Device, Tensor } from "../../src/tensor.wac";
+import { gpuDevice } from "../../src/gpu/backend.wac";
+import { Adam } from "../../src/optim.wac";
+import { Gpt, GptConfig, Vocab, batchOf, sample, shuffledLines } from "./model.wac";
+
+struct Run {
+  string corpus;
+  Gpt model;
+  Vocab vocab;
+  f32[] data;
+  Adam opt;
+  i32 step;
+  i32 batch;
+}
+
+GptConfig configFor(string corpus, i32 vocab) {
+  // Names are short: a context of 16 holds two or three, and a small model learns them. Shakespeare wants more of
+  // both, and is where a real GPU earns its keep.
+  if (corpus == "names.txt") { return GptConfig(vocab, 16, 64, 4, 2, 0.0); }
+  return GptConfig(vocab, 64, 128, 4, 4, 0.1);
+}
+
+f32 f32Fixed(f32 v) { return ((v * 1000.0).round() / 1000.0); }
+
+/** The names model trained 20 steps on `gpu` and on the CPU from one seed, each step's loss compared. */
+async string selfTest(Device gpu, u8[] text) {
+  Device cpu = Device.cpu();
+  Device[] both = [cpu, gpu];
+  f32[][] losses = f32[][].defaulted(2);
+  for (i32 k = 0; k < 2; k++) {
+    Device d = both[k];
+    d.seed(1337 as i64);
+    u8[] shuffled = shuffledLines(text, d);
+    Vocab vocab = Vocab.of(shuffled);
+    f32[] data = vocab.encode(shuffled);
+    Gpt model = Gpt.create(d, configFor("names.txt", vocab.size()));
+    Adam opt = Adam.create(0.003);
+    losses[k] = f32[].filled(20, 0.0);
+    for (i32 step = 0; step < 20; step++) {
+      Tensor l = opt.minimize(() => {
+        Tensor[] xy = batchOf(d, data, 32, model.config.context);
+        return model.loss(xy[0], xy[1], true);
+      }, model.params());
+      losses[k][step] = (await l.values())[0];
+      l.dispose();
+    }
+  }
+  for (i32 step = 0; step < 20; step++) {
+    f64 c = losses[0][step] as f64;
+    f64 g = losses[1][step] as f64;
+    f64 diff = c > g ? c - g : g - c;
+    // Twenty steps of Adam let rounding differences grow a little; a wrong kernel is wrong at step 0, by far more.
+    if (!(diff <= 0.005 * c)) { return "FAIL step \{step}: loss \{g} on the GPU, \{c} on the CPU"; }
+  }
+  if (!(losses[1][19] < losses[1][0])) { return "FAIL the loss did not fall: \{losses[1][0]} to \{losses[1][19]}"; }
+  return "PASS 20 steps agree: loss \{losses[1][0]} to \{losses[1][19]} on the GPU, \{losses[0][19]} on the CPU";
+}
+
+export async i32 main(Page page) {
+  page.title("tiny GPT");
+  Element root = page.root();
+  root.append("style").text("""
+      body { font: 15px/1.45 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+      pre { background: #f4f4f4; padding: 1rem; white-space: pre-wrap; min-height: 12rem; }
+      button { font: inherit; margin-right: .5rem; }
+      """);
+  root.append("h1").text("A tiny GPT, trained in this page");
+  Element where = root.append("p");
+  Element choose = root.append("p");
+  Element names = choose.append("button");
+  names.text("Names");
+  Element shakespeare = choose.append("button");
+  shakespeare.text("Shakespeare");
+  Element status = root.append("p");
+  status.attr("id", "status");
+  Element shown = root.append("pre");
+  shown.attr("id", "samples");
+
+  bool testing = page.location() == "test";
+  string wanted = "";
+  names.on("click", Listen.none(), (ElementEvent e) => { wanted = "names.txt"; });
+  shakespeare.on("click", Listen.none(), (ElementEvent e) => { wanted = "shakespeare.txt"; });
+
+  Result<Site, string> site = await Site.of(page.sys);
+  if (site.isErr()) {
+    where.text("This page reads its texts from the site it was served from, and it has none: " + site.err()!);
+    return 1;
+  }
+  Device d = Device.cpu();
+  Result<Device, string> gpu = await gpuDevice(page.sys.host, (string s) => { page.log(s); });
+  if (gpu.isOk()) {
+    d = gpu.ok()!;
+    where.text("Training on the GPU, through WebGPU.");
+  } else {
+    where.text("No WebGPU here (" + gpu.err()! + "), so training on the CPU — slowly.");
+  }
+  if (testing) {
+    if (gpu.isErr()) {
+      page.title("NO GPU: " + gpu.err()!);
+      return 1;
+    }
+    page.title(await selfTest(d, (await site.ok()!.get("names.txt")).orElse(u8[]())));
+    return 0;
+  }
+  status.text("Pick a text to train on.");
+
+  Run? run = null;
+  f64 since = page.now();
+  i32 sinceStep = 0;
+  while (true) {
+    if (wanted != "" && (run is null || run!.corpus != wanted)) {
+      if (run is not null) { for (Tensor v in run!.model.params()) { v.dispose(); } }
+      status.text("Reading " + wanted + "…");
+      u8[] text = (await site.ok()!.get(wanted)).orElse(u8[]());
+      if (text.len() == 0) {
+        status.text("Could not read " + wanted + " from the site.");
+        wanted = "";
+        run = null;
+        continue;
+      }
+      d.seed(1337 as i64);
+      if (wanted == "names.txt") { text = shuffledLines(text, d); }
+      Vocab vocab = Vocab.of(text);
+      Gpt model = Gpt.create(d, configFor(wanted, vocab.size()));
+      run = Run(wanted, model, vocab, vocab.encode(text), Adam.create(0.003), 0, 32);
+      shown.text("");
+      since = page.now();
+      sinceStep = 0;
+    }
+    if (run is null) {
+      await page.nextFrame();
+      continue;
+    }
+    Run r = run!;
+    // Ten steps between reads: each read waits for the GPU to finish, and reading every step would make it wait
+    // ten times as often for nothing.
+    Tensor last = r.opt.minimize(() => {
+      Tensor[] xy = batchOf(d, r.data, r.batch, r.model.config.context);
+      return r.model.loss(xy[0], xy[1], true);
+    }, r.model.params());
+    for (i32 i = 1; i < 10; i++) {
+      last.dispose();
+      last = r.opt.minimize(() => {
+        Tensor[] xy = batchOf(d, r.data, r.batch, r.model.config.context);
+        return r.model.loss(xy[0], xy[1], true);
+      }, r.model.params());
+    }
+    r.step += 10;
+    f32 loss = (await last.values())[0];
+    last.dispose();
+    f64 rate = ((r.step - sinceStep) as f64) * 1000.0 / (page.now() - since);
+    status.text("\{r.corpus}: step \{r.step}, loss \{f32Fixed(loss)}, \{f32Fixed(rate as~ f32)} steps a second, a model of \{r.model.size()} numbers");
+    if (r.step % 200 == 0 || r.step == 10) {
+      u8[] start = [10];
+      u8[] written = await sample(r.model, r.vocab, d, start, r.corpus == "names.txt" ? 120 : 300, 0.9);
+      shown.text("after \{r.step} steps:\n" + string.fromBytes(written));
+      since = page.now();
+      sinceStep = r.step;
+    }
+    // The CPU never waits on a read, so without this the page would never draw.
+    await page.nextFrame();
+  }
+}

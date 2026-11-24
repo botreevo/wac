@@ -1,0 +1,242 @@
+// `QuicConn` against itself: a client engine and a server engine in one process, datagrams carried between them by
+// hand — and lost, when a test says so.
+//
+// What a foreign stack makes of this endpoint is wac-kps's question (it dials quic-go and quiche listeners and is
+// dialled by quic-go's client); this is the protocol agreeing with itself first, which is the cheaper failure.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Vec, Buf } from "core";
+import { QuicConn, QuicConfig, QuicEvent, transportParams } from "../../src/endpoint.wac";
+import { QuicTls } from "../../src/tlsq.wac";
+import { parseLong } from "../../src/packet.wac";
+import { anonymousP256 } from "../../../tls/src/x509gen.wac";
+import { sha256 } from "../../../crypto/src/sha256.wac";
+
+u8[] bytes(i32 n, i32 seed) {
+  u8[] out = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { out[i] = ((i * 37 + seed * 101 + 11) & 0x7F) as@ u8; }
+  return out;
+}
+
+struct Pair {
+  QuicConn c;
+  QuicConn s;
+  Vec<QuicEvent> cs;
+  Vec<QuicEvent> ss;
+  i64 now;
+  i32 n;
+}
+
+Pair pair(bool rightPin) {
+  u8[] key = bytes(32, 2);
+  u8[] cert = anonymousP256(bytes(8, 3), 1700000000000 as i64, 1900000000000 as i64, key, bytes(32, 4));
+  QuicConfig cfg = QuicConfig { };
+  u8[] cscid = bytes(8, 5);
+  u8[] odcid = bytes(8, 6);
+  u8[] sscid = bytes(8, 7);
+  QuicTls ct = QuicTls.client(cfg.alpn, transportParams(cfg, cscid, u8[](), false), bytes(32, 8), bytes(32, 9),
+                              rightPin ? sha256(cert) : sha256(key));
+  QuicConn c = QuicConn.client(cfg, ct, cscid, odcid, 0 as i64);
+  QuicTls st = QuicTls.server(cfg.alpn, transportParams(cfg, sscid, odcid, true), bytes(32, 10), bytes(32, 11), cert,
+                              key, bytes(32, 12));
+  QuicConn s = QuicConn.server(cfg, st, sscid, odcid, cscid, 0 as i64);
+  return Pair(c, s, Vec<QuicEvent>.create(), Vec<QuicEvent>.create(), 0 as i64, 0);
+}
+
+/** Run for `ms` of simulated time in 5 ms steps; datagram number k (from 1, both directions) is lost if in `drop`. */
+void run(Pair p, i64 ms, i32[] drop) {
+  i64 until = p.now + ms;
+  while (p.now < until) {
+    for (u8[] d in p.c.take(p.now)) {
+      p.n++;
+      bool lost = false;
+      for (i32 x in drop) { if (x == p.n) { lost = true; } }
+      if (!lost) { p.s.receive(d, p.now); }
+    }
+    for (u8[] d in p.s.take(p.now)) {
+      p.n++;
+      bool lost = false;
+      for (i32 x in drop) { if (x == p.n) { lost = true; } }
+      if (!lost) { p.c.receive(d, p.now); }
+    }
+    for (QuicEvent e in p.c.events()) { p.cs.push(e); }
+    for (QuicEvent e in p.s.events()) { p.ss.push(e); }
+    p.now += 5 as i64;
+    p.c.tick(p.now);
+    p.s.tick(p.now);
+  }
+}
+
+bool connected(Vec<QuicEvent> v) {
+  for (i32 i = 0; i < v.len(); i++) { if (match (v.get(i)) { Connected: true, default: false }) { return true; } }
+  return false;
+}
+
+string closedWith(Vec<QuicEvent> v) {
+  for (i32 i = 0; i < v.len(); i++) {
+    match (v.get(i)) {
+      Closed(app, code, reason, remote): { return "\{app ? "app" : "transport"} \{code} \{remote ? "remote" : "local"}: \{reason}"; }
+      default: { }
+    }
+  }
+  return "";
+}
+
+/** Drain stream `id` on `q` into `into`; whether its end was reached. */
+bool drain(QuicConn q, i64 id, Buf into) {
+  into.pushAll(q.read(id));
+  return q.recvState(id) == 1;
+}
+
+export string test_a_handshake_then_a_stream_past_both_windows_both_ways() {
+  T t = T.create();
+  Pair p = pair(true);
+  run(p, 200 as i64, i32[]());
+  t.isTrue(connected(p.cs), "the client is connected");
+  t.isTrue(connected(p.ss), "and the server");
+  t.isTrue(p.c.confirmed, "the client's handshake is confirmed (HANDSHAKE_DONE)");
+
+  i64 id = p.c.openStream();
+  t.eqI64(id, 0 as i64, "the client's first stream is 0");
+  u8[] big = bytes(5 * 1048576, 13);
+  t.isTrue(p.c.write(id, big), "5 MiB queued — past the 1 MiB stream window and the 4 MiB connection window");
+  p.c.finish(id);
+  Buf atServer = Buf.create();
+  Buf atClient = Buf.create();
+  bool serverEnd = false;
+  bool clientEnd = false;
+  for (i32 round = 0; round < 4000 && !clientEnd; round++) {
+    run(p, 5 as i64, i32[]());
+    if (p.s.hasStream(id) && !serverEnd) {
+      u8[] got = p.s.read(id);
+      atServer.pushAll(got);
+      p.s.write(id, got);
+      if (p.s.recvState(id) == 1) { serverEnd = true; p.s.finish(id); }
+    }
+    if (p.c.hasStream(id)) { clientEnd = drain(p.c, id, atClient); }
+  }
+  t.eqI32(atServer.len, big.len(), "the server read every byte");
+  t.isTrue(serverEnd, "and the FIN");
+  t.eqI32(atClient.len, big.len(), "the echo came back whole");
+  t.isTrue(clientEnd, "and ended in EOF");
+  bool same = atClient.len == big.len();
+  for (i32 i = 0; same && i < big.len(); i++) { if (atClient.data[i] != big[i]) { same = false; } }
+  t.isTrue(same, "byte for byte");
+  run(p, 200 as i64, i32[]());
+  t.isFalse(p.c.hasStream(id) || p.s.hasStream(id), "and the stream is retired at both ends");
+  return t.report();
+}
+
+export string test_the_handshake_and_the_data_survive_loss() {
+  T t = T.create();
+  Pair p = pair(true);
+  // The client's first Initial, the server's first flight and a later packet each way.
+  run(p, 4000 as i64, [1, 2, 5, 9]);
+  t.isTrue(connected(p.cs) && connected(p.ss), "both ends connect despite losing both first flights");
+  i64 id = p.c.openStream();
+  p.c.write(id, bytes(200000, 21));
+  p.c.finish(id);
+  Buf got = Buf.create();
+  bool end = false;
+  i32[] lossy = i32[].filled(40, 0);
+  for (i32 i = 0; i < 40; i++) { lossy[i] = p.n + 3 + i * 7; }
+  for (i32 round = 0; round < 3000 && !end; round++) {
+    run(p, 5 as i64, lossy);
+    if (p.s.hasStream(id)) { end = drain(p.s, id, got); }
+  }
+  t.eqI32(got.len, 200000, "200 kB arrive with one datagram in seven lost");
+  t.isTrue(end, "and the FIN");
+  return t.report();
+}
+
+export string test_datagrams_resets_stop_sending_and_close() {
+  T t = T.create();
+  Pair p = pair(true);
+  run(p, 200 as i64, i32[]());
+  t.isTrue(p.c.maxDatagram() > 1000, "a datagram of over 1000 bytes fits: \{p.c.maxDatagram()}");
+  t.isTrue(p.c.sendDatagram("ping".toBytes()), "a datagram is queued");
+  t.isFalse(p.c.sendDatagram(u8[].filled(p.c.maxDatagram() + 1, 0)), "one byte too many is refused");
+  run(p, 50 as i64, i32[]());
+  i32 dgs = 0;
+  for (i32 i = 0; i < p.ss.len(); i++) {
+    match (p.ss.get(i)) { Datagram(d): { if (string.fromBytes(d) == "ping") { dgs++; } } default: { } }
+  }
+  t.eqI32(dgs, 1, "the server received it");
+
+  i64 id = p.c.openStream();
+  p.c.write(id, "x".toBytes());
+  run(p, 50 as i64, i32[]());
+  p.c.resetStream(id, 4 as i64);
+  run(p, 50 as i64, i32[]());
+  t.eqI32(p.s.recvState(id), 2, "the server sees the reset");
+  t.eqI64(p.s.resetCodeOf(id), 4 as i64, "with its code");
+
+  i64 id2 = p.c.openStream();
+  p.c.write(id2, "y".toBytes());
+  run(p, 50 as i64, i32[]());
+  p.s.stopSending(id2, 9 as i64);
+  run(p, 50 as i64, i32[]());
+  bool stopped = false;
+  for (i32 i = 0; i < p.cs.len(); i++) {
+    match (p.cs.get(i)) { StopSending(sid, code): { if (sid == id2 && code == 9 as i64) { stopped = true; } } default: { } }
+  }
+  t.isTrue(stopped, "STOP_SENDING reaches the client with its code");
+  t.isFalse(p.c.write(id2, "z".toBytes()), "and writing after it fails: the stream was reset in answer");
+
+  p.c.close(2 as i64, "bye", p.now);
+  run(p, 100 as i64, i32[]());
+  t.eqStr(closedWith(p.ss), "app 2 remote: bye", "the server sees the application's close and its code");
+  t.eqStr(closedWith(p.cs), "app 2 local: bye", "and the client its own");
+  return t.report();
+}
+
+export string test_a_server_whose_certificate_is_not_pinned_is_refused() {
+  T t = T.create();
+  Pair p = pair(false);
+  run(p, 300 as i64, i32[]());
+  t.isFalse(connected(p.cs), "the client does not connect");
+  t.eqStr(closedWith(p.cs), "transport 298 local: the server's certificate does not hash to the pinned certhash",
+          "it closes with bad_certificate (CRYPTO_ERROR 0x100 + 42)");
+  t.isTrue(closedWith(p.ss).indexOf("transport 298 remote") == 0, "and the server hears why: \{closedWith(p.ss)}");
+  return t.report();
+}
+
+export string test_the_peer_opening_past_its_stream_limit_is_refused_and_retired_slots_return() {
+  T t = T.create();
+  Pair p = pair(true);
+  run(p, 200 as i64, i32[]());
+  i32 opened = 0;
+  for (i32 i = 0; i < 250; i++) {
+    i64 id = p.c.openStream();
+    if (id < 0 as i64) { run(p, 20 as i64, i32[]()); id = p.c.openStream(); }
+    if (id < 0 as i64) { continue; }
+    opened++;
+    p.c.write(id, "a".toBytes());
+    p.c.finish(id);
+    run(p, 10 as i64, i32[]());
+    if (p.s.hasStream(id)) {
+      p.s.read(id);
+      p.s.finish(id);
+    }
+    run(p, 10 as i64, i32[]());
+    p.c.read(id);
+  }
+  t.eqI32(opened, 250, "250 streams in turn, past the 100 the server allows at once");
+  t.eqStr(closedWith(p.cs), "", "with no error");
+  return t.report();
+}
+
+/**
+ * A forged Initial whose token length is an 8-byte varint near 2^62: refused, not an attempt to allocate it.
+ *
+ * Would catch: the length narrowed to an i32 before its bound was checked — the sum with the offset wrapped
+ * negative, passed, and a forty-byte datagram asked for two gigabytes, trapping a whole listener.
+ */
+export string test_a_token_length_past_the_datagram_is_refused_not_allocated() {
+  T t = T.create();
+  u8[] b = [0xC3 as u8, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0,
+            0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8, 0xF0 as u8,
+            0x40 as u8, 0x10 as u8, 1, 2, 3, 4];
+  t.isFalse(parseLong(b, 0, true).ok, "the header is refused");
+  return t.report();
+}

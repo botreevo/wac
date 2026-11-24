@@ -1,0 +1,106 @@
+// Shrink a failing divmod case to the smallest operands that still give a wrong answer.
+//
+//     wac run --allow-run packages/bignum/tools/shrink.wac [dividend-hex] [divisor-hex]
+//
+// Kept because the first real bug in this package was a division digit that only a specific limb pattern reached,
+// and reasoning about the code did not find it — the minimal case did, in one step.
+//
+// **The loop needs no oracle**: a quotient and a remainder are right exactly when `q·d + r = a` and `0 ≤ r < d`, so
+// each candidate is checked with this package's own `mul`, `add` and `cmp` (each held to `BigInt` by the suite), and
+// Deno is asked once, at the end, for the answer to print beside ours. It was a TypeScript tool that asked `BigInt`
+// for every candidate through `harness/wacBind`. One difference: a candidate that makes `divmod` trap stops this run
+// with the trap, where the TypeScript caught it and kept shrinking — the operands printed before it are the case.
+
+import { T } from "../../wactest/src/assert.wac";
+import { Lines } from "../../wactest/src/oracle.wac";
+import { askScript } from "../../wactest/src/inline.wac";
+import { Sys } from "std";
+import { Big, DivMod, divmod, add, mul, cmp, copy, isZero, shr } from "../src/big.wac";
+import { parseHex, formatHex, formatDecimal } from "../src/text.wac";
+
+/** `a / d` and `a % d` by `BigInt`, in decimal, one a line. */
+static string BIGINT =
+  "const L = (await new Response(Deno.stdin.readable).text()).split(String.fromCharCode(10)).filter((l) => l.length > 0);\n" +
+  "const a = BigInt('0x' + L[0]), d = BigInt('0x' + L[1]);\n" +
+  "console.log([String(a / d), String(a % d), 'DONE ' + L.length].join(String.fromCharCode(10)));\n";
+
+/** Whether `divmod(x, y)` is wrong: `q·y + r ≠ x`, or `r` outside `[0, y)`. A zero divisor is never a case. */
+bool bad(Big x, Big y) {
+  if (isZero(y)) { return false; }
+  DivMod dm = divmod(x, y);
+  if (cmp(add(mul(dm.q, y), dm.r), x) != 0) { return true; }
+  if (dm.r.neg && !isZero(dm.r)) { return true; }
+  return cmp(dm.r, y) >= 0;
+}
+
+/** `x` with its limb `i` cleared, or `x` itself when that limb is zero or the top one. */
+Big clearedLimb(Big x, i32 i) {
+  if (i >= x.n - 1 || x.limbs[i] == 0 as u32) { return x; }
+  Big c = copy(x);
+  c.limbs[i] = 0 as u32;
+  return c;
+}
+
+string hexOf(Big x) { return string.fromBytes(formatHex(x)); }
+
+/** The limbs high first, each eight hex digits, as the TypeScript printed them. */
+string limbsOf(Big x) {
+  if (isZero(x)) { return "0x00000000"; }
+  string out = "";
+  for (i32 i = x.n - 1; i >= 0; i--) {
+    string h = string.fromBytes(formatHex(Big(u32[].filled(1, x.limbs[i]), 1, false)));
+    while (h.len() < 8) { h = "0" + h; }
+    out = out + (out == "" ? "" : " ") + "0x" + h;
+  }
+  return out;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  Big? pa = parseHex((args.len() > 0 ? args[0] : "0xffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000").toBytes());
+  Big? pd = parseHex((args.len() > 1 ? args[1] : "0xfffffffffffffffffffffffe").toBytes());
+  if (pa is null || pd is null) {
+    await sys.stderr().line("shrink: the operands are hex, with an optional 0x");
+    return 2;
+  }
+  Big a = pa!;
+  Big d = pd!;
+  if (!bad(a, d)) {
+    await sys.stdout().line("that pair already gives a right quotient and remainder");
+    return 1;
+  }
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    // Drop whole limbs off each operand — four at a time, then one, then a bit — while the wrong answer survives.
+    i32[] shifts = [32 * 4, 32, 1];
+    for (i32 s in shifts) {
+      while (true) {
+        Big na = shr(a, s);
+        if (!isZero(na) && bad(na, d)) { a = na; changed = true; } else { break; }
+      }
+      while (true) {
+        Big nd = shr(d, s);
+        if (!isZero(nd) && bad(a, nd)) { d = nd; changed = true; } else { break; }
+      }
+    }
+    // Then clear low limbs to zero, which usually simplifies the pattern.
+    for (i32 i = 0; i < 8; i++) {
+      Big na = clearedLimb(a, i);
+      if (cmp(na, a) != 0 && bad(na, d)) { a = na; changed = true; }
+    }
+  }
+  DivMod got = divmod(a, d);
+  await sys.stdout().line("dividend 0x\{hexOf(a)}  limbs \{limbsOf(a)}");
+  await sys.stdout().line("divisor  0x\{hexOf(d)}  limbs \{limbsOf(d)}");
+  T t = T.create();
+  Lines q = Lines.create();
+  q.add(hexOf(a));
+  q.add(hexOf(d));
+  string[] want = await askScript(t, sys.procs(), BIGINT, q, "BigInt");
+  await sys.stdout().line("got  q \{string.fromBytes(formatDecimal(got.q))}");
+  await sys.stdout().line("want q " + (want.len() > 0 ? want[0] : "(BigInt did not answer)"));
+  await sys.stdout().line("got  r \{string.fromBytes(formatDecimal(got.r))}");
+  await sys.stdout().line("want r " + (want.len() > 1 ? want[1] : "(BigInt did not answer)"));
+  return 0;
+}

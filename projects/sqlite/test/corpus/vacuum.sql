@@ -1,0 +1,18 @@
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = FULL;
+PRAGMA auto_vacuum;
+CREATE TABLE v (id INTEGER PRIMARY KEY, s TEXT);
+CREATE INDEX v_s ON v (s);
+WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 400) INSERT INTO v (s) SELECT 'row ' || i || hex(zeroblob(10 + i % 200)) FROM r;
+PRAGMA auto_vacuum = incremental;
+PRAGMA auto_vacuum;
+PRAGMA auto_vacuum = bogus;
+PRAGMA auto_vacuum;
+DELETE FROM v WHERE id % 3 = 0;
+SELECT count(*) FROM v;
+VACUUM;
+VACUUM main;
+BEGIN;
+VACUUM;
+ROLLBACK;
+PRAGMA auto_vacuum;

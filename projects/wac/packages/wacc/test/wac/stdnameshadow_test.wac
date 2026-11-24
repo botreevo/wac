@@ -1,0 +1,56 @@
+// A program's own type named as one of `std`'s — `issues/lang/0425w`.
+//
+// `std` builds a `Sys` with `Host.of(…)`, handing it lambdas, and a program taking a `Sys` reaches that code.
+// The emitter's walk that gives each lambda its type looked `Host` up by its spelling, so a program declaring a
+// `Host` of its own — declared before `std`'s, so holding the bare name — left `std`'s lambdas untyped and the
+// module unemittable, while `wac check` was clean.
+//
+// **Through the compiler, with `std` built in**: a test file in this repository reads `std` from the tree, which
+// declares it ahead of the program and hid the bug.
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath } from "../../../wactest/src/host.wac";
+import { emitLinked } from "../../src/emit.wac";
+import { ChildEnv, Exec, Files, Launch, Sys } from "std";
+import { flatten } from "core";
+
+string programWith(string decl) {
+  return decl + "\n" +
+    "import { Sys } from \"std\";\n" +
+    "export async i32 main(Sys sys) { await; Host h = Host(3); return h.x - 3; }\n";
+}
+
+export string test_a_program_host_beside_stds() {
+  T t = T.create();
+  string[] paths = ["/p/main.wac"];
+  u8[] out = emitLinked(paths, [programWith("struct Host { i32 x; }")], "/p/main.wac");
+  t.isTrue(out.len() > 8, "a program declaring its own `Host` builds: \{out.len()} bytes");
+  return t.report();
+}
+
+// **And one of `std`'s faults** (`issues/lang/0430d`): `std`'s `type ReadFault = union<NotFound, Denied, …>` is computed
+// by the static evaluator, whose view of the program's names was built before `std`'s declarations were keyed, so a
+// program's `Denied` stood in for `std`'s in every fault union — two spellings of one signature, and a module the
+// emitter could not finish ("a type was registered while a body was being emitted").
+//
+// **Run by the `wac` binary on a file outside this repository**, because only there is `std` the built-in one and
+// only `wac test`'s harness reached the fault unions this way; neither the compiler in memory nor a file here did.
+export string test_a_program_fault_named_as_stds(Sys sys) {
+  T t = T.create();
+  Files fs = sys.files();
+  i64 now = flatten(sys.clock().nowMillis().wait()).ok() ?? 0 as i64;
+  string dir = "/tmp/wac-stdnameshadow-\{now}";
+  fs.mkdir(dir, true).wait();
+  string file = dir + "/fault_test.wac";
+  string src = "struct Denied { i32 why; }\n" +
+               "export async string test_x() { await; Denied d = Denied(1); return d.why == 1 ? \"\" : \"bad\"; }\n";
+  fs.writeFile(file, src.toBytes()).wait();
+  auto ran = flatten(sys.procs().exec(binaryPath(sys.env()), ["test", "--allow-read", file], u8[](), ChildEnv.inherited(),
+                                      Launch.plain()).wait());
+  t.isTrue(ran.isOk(), "wac test ran");
+  if (ran.isOk()) {
+    Exec r = ran.unwrap();
+    string said = string.fromBytes(r.stdout) + string.fromBytes(r.stderr);
+    t.eqI32(r.status, 0, "a test file declaring its own `Denied` builds and passes: \{said}");
+  }
+  return t.report();
+}

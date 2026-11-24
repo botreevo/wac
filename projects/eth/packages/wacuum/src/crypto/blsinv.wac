@@ -1,0 +1,137 @@
+// Inversion in BLS12-381's base field, for `bls`'s Montgomery-form elements (twelve 32-bit limbs).
+//
+// The same binary extended Euclidean algorithm as `bls`'s fpInvert, done leaner: the modulus and R² are
+// statics the compiler works out, the working values are 64-bit words holding 32-bit limbs so no limb needs a
+// conversion, and nothing is allocated inside the loop — fpInvert makes a fresh copy of the modulus for every
+// subtraction that wraps, and reads it a limb at a time through a function. An inversion is most of what a
+// BLS G1ADD or G2ADD costs, since the answer has to be affine. Filed for `bls` as wac `issues/system/0375w`.
+
+import { bls.fpMul } from "wac";
+import { divmod } from "../limbs.wac";
+
+/** p, as twelve 32-bit limbs, least significant first. */
+static u64[] P = [0xffffaaab, 0xb9feffff, 0xb153ffff, 0x1eabfffe, 0xf6b0f624, 0x6730d2a0, 0xf38512bf, 0x64774b84,
+                  0x434bacd7, 0x4b1ba7b6, 0x397fe69a, 0x1a0111ea];
+
+/** R² mod p, R = 2^384: a plain value multiplied by it in Montgomery form gains a factor of R. */
+static u32[] R2 = rSquared();
+
+u32[] rSquared() {
+  u64[] r2 = u64[].filled(25, 0);
+  r2[24] = 1;
+  u64[] p = u64[].filled(12, 0);
+  for (i32 i = 0; i < 12; i++) { p[i] = P[i]; }
+  u64[] m = divmod(r2, p).remainder;
+  u32[] out = u32[].filled(12, 0);
+  for (i32 i = 0; i < 12; i++) { out[i] = m[i] as@ u32; }
+  return out;
+}
+
+static u64 MASK = 0xFFFFFFFF;
+
+/** a⁻¹ for a Montgomery-form element, in Montgomery form; null for zero. */
+export u32[]? fpInverse(u32[] a) {
+  u64[] u = u64[].filled(12, 0);
+  bool zero = true;
+  for (i32 i = 0; i < 12; i++) {
+    u[i] = a[i] as u64;
+    zero = zero && a[i] == 0;
+  }
+  if (zero) { return null; }
+  u64[] p = u64[].filled(12, 0);
+  for (i32 i = 0; i < 12; i++) { p[i] = P[i]; }
+  u64[] v = u64[].filled(12, 0);
+  for (i32 i = 0; i < 12; i++) { v[i] = p[i]; }
+  u64[] x1 = u64[].filled(12, 0);
+  x1[0] = 1;
+  u64[] x2 = u64[].filled(12, 0);
+  while (!isOne(u) && !isOne(v)) {
+    while ((u[0] & 1) == 0) {
+      halve(u);
+      halveMod(x1, p);
+    }
+    while ((v[0] & 1) == 0) {
+      halve(v);
+      halveMod(x2, p);
+    }
+    if (!less(u, v)) {
+      sub(u, v);
+      subMod(x1, x2, p);
+    } else {
+      sub(v, u);
+      subMod(x2, x1, p);
+    }
+  }
+  u64[] x = isOne(u) ? x1 : x2;
+  u32[] plain = u32[].filled(12, 0);
+  for (i32 i = 0; i < 12; i++) { plain[i] = x[i] as@ u32; }
+  // The algorithm inverts the stored value, aR, giving a⁻¹R⁻¹; two multiplications by R² make it a⁻¹R.
+  return fpMul(fpMul(plain, copy(R2)), copy(R2));
+}
+
+u32[] copy(const u32[] a) {
+  u32[] out = u32[].filled(a.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  return out;
+}
+
+bool isOne(u64[] a) {
+  if (a[0] != 1) { return false; }
+  u64 rest = 0;
+  for (i32 i = 1; i < 12; i++) { rest = rest | a[i]; }
+  return rest == 0;
+}
+
+bool less(u64[] a, u64[] b) {
+  for (i32 i = 11; i >= 0; i--) {
+    if (a[i] != b[i]) { return a[i] < b[i]; }
+  }
+  return false;
+}
+
+/** a >>= 1. */
+void halve(u64[] a) {
+  for (i32 i = 0; i < 11; i++) { a[i] = (a[i] >> 1) | ((a[i + 1] & 1) << 31); }
+  a[11] = a[11] >> 1;
+}
+
+/** a / 2 mod p: (a + p) / 2 when a is odd. a + p < 2^382 fits twelve limbs, as fpInvert's comment shows. */
+void halveMod(u64[] a, u64[] p) {
+  if ((a[0] & 1) == 1) {
+    u64 c = 0;
+    for (i32 i = 0; i < 12; i++) {
+      u64 s = a[i] + p[i] + c;
+      a[i] = s & MASK;
+      c = s >> 32;
+    }
+  }
+  halve(a);
+}
+
+/** a −= b, a ≥ b. */
+void sub(u64[] a, u64[] b) {
+  u64 borrow = 0;
+  for (i32 i = 0; i < 12; i++) {
+    u64 d = a[i] - b[i] - borrow;
+    a[i] = d & MASK;
+    borrow = (d >> 32) & 1;
+  }
+}
+
+/** a = a − b mod p, both below p: p added back when the subtraction borrows, in the same pass's limbs. */
+void subMod(u64[] a, u64[] b, u64[] p) {
+  u64 borrow = 0;
+  for (i32 i = 0; i < 12; i++) {
+    u64 d = a[i] - b[i] - borrow;
+    a[i] = d & MASK;
+    borrow = (d >> 32) & 1;
+  }
+  if (borrow != 0) {
+    u64 c = 0;
+    for (i32 i = 0; i < 12; i++) {
+      u64 s = a[i] + p[i] + c;
+      a[i] = s & MASK;
+      c = s >> 32;
+    }
+  }
+}

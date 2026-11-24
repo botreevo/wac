@@ -1,0 +1,178 @@
+// The WebRTC mapping engine driven by wac's own WebRTC stack — one peer: a `webrtc.Session` underneath, a
+// `WebrtcConn` on top.
+//
+// **This file is the whole of the join, and it is small on purpose.** The session gives channel events — the
+// association came up, the peer opened a channel, a message, a channel closed — and the engine wants them as calls
+// on itself or on the stream a channel carries. The engine sends by calling a `Channel`'s functions, and those
+// become the session's datagrams, collected here in `outbox` for whoever owns the socket. Neither side knows the
+// other exists.
+//
+// The reserved channels are negotiated (SPEC §8): id 0 ordered and reliable, id 1 unordered with no
+// retransmissions, declared on both ends and opened by nothing — the control channel is open the moment the
+// association is, which is when HELLO goes.
+
+import { Map, Vec, Ticket, hashI32, i32Eq } from "core";
+import { webrtc.Session, webrtc.ChannelEvent } from "wac";
+import { Channel, Driver, WebrtcConn, WebrtcStream, CONTROL_ID, DATAGRAM_ID } from "./conn.wac";
+import { Limits } from "./flow.wac";
+import { Endpoint } from "../api.wac";
+
+/** Below this much queued in the association, writers waiting on the local queue are woken. */
+static i32 LOCAL_SEND_LOW = 524288;
+
+export struct NativePeer {
+  Session session;
+  WebrtcConn? conn;
+  Map<i32, WebrtcStream> streams;
+  /** Channels this end opened that the peer has not yet acknowledged (DCEP ACK): nothing is sent on them until it has. */
+  Map<i32, bool> unacked;
+  /** Datagrams to send to the peer, in order. */
+  Vec<u8[]> outbox;
+  /** The time of the event being handled — what the channel functions pass the session. */
+  i64 now;
+  bool down;
+  /**
+   * Where to send what is not a reply to a check: the address the peer's DTLS last came from. ICE may nominate a
+   * different pair from the one whose check arrived first, so this follows the traffic rather than the first check.
+   */
+  string toHost;
+  i32 toPort;
+
+  /**
+   * A peer over `session`, with an engine on top. The session's two reserved channels are declared here; the
+   * caller has set its roles and identity. `now` starts the HELLO deadline.
+   */
+  NativePeer make(Session session, Limits limits, Endpoint remote, i64 now) {
+    session.negotiate(CONTROL_ID, true, -1);
+    session.negotiate(DATAGRAM_ID, false, 0);
+    NativePeer p = NativePeer(session, null, Map<i32, WebrtcStream>.create(hashI32, i32Eq), Map<i32, bool>.create(hashI32, i32Eq),
+                              Vec<u8[]>.create(), now,
+                              false, remote.ip, remote.port);
+    Channel control = Channel(() => !p.down && p.session.assoc.established(),
+                              (u8[] m) => { p.emit(p.session.send(CONTROL_ID, m, true, p.now)); },
+                              () => 0 as i64, () => { });
+    Channel datagram = Channel(() => !p.down && p.session.assoc.established(),
+                               (u8[] m) => { p.emit(p.session.send(DATAGRAM_ID, m, true, p.now)); },
+                               () => 0 as i64, () => { });
+    Driver d = Driver(control, datagram, (WebrtcStream s) => openFor(p, s), () => { p.closeTransport(); }, remote);
+    p.conn = WebrtcConn.make(d, limits, now);
+    return p;
+  }
+
+  /** A datagram from the peer. */
+  void receive(this, u8[] datagram, u8[] fromIp, i32 fromPort, i64 now) {
+    this.now = now;
+    this.emit(this.session.receive(datagram, fromIp, fromPort, now));
+    this.pump(now);
+  }
+
+  /** The clock: retransmissions, the window, the HELLO deadline. */
+  void tick(this, i64 now) {
+    this.now = now;
+    if (this.down) { return; }
+    this.emit(this.session.tick(now));
+    this.conn!.tick(now);
+    this.pump(now);
+  }
+
+  /** What to send, taken. */
+  u8[][] take(this) {
+    u8[][] a = this.outbox.toArray();
+    this.outbox = Vec<u8[]>.create();
+    return a;
+  }
+
+  void emit(this, u8[][] ds) {
+    for (i32 i = 0; i < ds.len(); i++) { this.outbox.push(ds[i]); }
+  }
+
+  /** The session's events, as calls on the engine. */
+  void pump(this, i64 now) {
+    ChannelEvent[] evs = this.session.events();
+    for (i32 i = 0; i < evs.len(); i++) {
+      match (evs[i]) {
+        Up: { this.conn!.controlOpened(); }
+        Opened(id, label, ordered, rexmit): {
+          WebrtcStream? s = this.conn!.incomingChannel(channelFor(this, id));
+          if (s is not null) {
+            this.streams.set(id, s!);
+            s!.opened();
+          }
+        }
+        Acked(id): {
+          if (this.unacked.has(id)) {
+            this.unacked.remove(id);
+            WebrtcStream? s = this.streams.get(id);
+            if (s is not null) { s!.opened(); }
+          }
+        }
+        Message(id, binary, data): {
+          if (id == CONTROL_ID) { this.conn!.controlMessage(data); }
+          else if (id == DATAGRAM_ID) { this.conn!.datagram(data); }
+          else {
+            WebrtcStream? s = this.streams.get(id);
+            if (s is not null) { s!.message(data); }
+          }
+        }
+        Closed(id): {
+          WebrtcStream? s = this.streams.get(id);
+          this.streams.remove(id);
+          if (s is not null) { s!.channelGone(); }
+        }
+        Down(aborted): {
+          this.down = true;
+          if (aborted) { this.conn!.transportFailed("the peer aborted the association"); } else { this.conn!.transportClosed(); }
+        }
+      }
+    }
+    // A send from inside an event (a credit update, a FIN, a RESET answering STOP_SENDING) adds to the session's
+    // queue without passing through `emit`; whatever the association now has goes out with the rest.
+    this.emit(this.session.tick(now));
+    // **A writer that stopped at the local queue's bound waits to be told it drained**, and only this end knows:
+    // the queue is the association's. Without this a stream whose writes outran the window stopped for ever once
+    // a megabyte was queued — the engine waiting on `drained`, the association idle with nothing left to send.
+    if (this.session.assoc.queuedBytes() < LOCAL_SEND_LOW) {
+      i32[] ids = this.streams.keys();
+      for (i32 i = 0; i < ids.len(); i++) {
+        WebrtcStream? s = this.streams.get(ids[i]);
+        if (s is not null) { s!.drained(); }
+      }
+    }
+  }
+
+  void closeTransport(this) {
+    if (this.down) { return; }
+    this.down = true;
+    this.session.assoc.abort();
+    Vec<u8[]> out = Vec<u8[]>.create();
+    this.session.drain(out);
+    for (i32 i = 0; i < out.len(); i++) { this.outbox.push(out.get(i)); }
+  }
+}
+
+/** The engine's view of application channel `id`. */
+Channel channelFor(NativePeer p, i32 id) {
+  return Channel(() => !p.down && p.session.hasChannel(id) && !p.unacked.has(id),
+                 (u8[] m) => { p.emit(p.session.send(id, m, true, p.now)); },
+                 () => p.session.assoc.queuedBytes() as i64,
+                 () => { p.emit(p.session.close(id, p.now)); });
+}
+
+/** The engine opening a stream: a DCEP channel, usable at once (data may follow the open on the same stream). */
+Ticket<Channel?> openFor(NativePeer p, WebrtcStream s) {
+  Ticket<Channel?> t;
+  Vec<u8[]> out = Vec<u8[]>.create();
+  i32 id = p.session.open("kps", true, -1, p.now, out);
+  for (i32 i = 0; i < out.len(); i++) { p.outbox.push(out.get(i)); }
+  if (id < 0) {
+    t.resolve(null);
+    return t;
+  }
+  p.streams.set(id, s);
+  // **Usable once the peer has acknowledged it**, as a browser's channel is: data sent straight behind the OPEN can
+  // reach a peer before its application has the channel — @kpstreams/server hands the channel to JavaScript
+  // asynchronously, and lost the first message on about one stream in a thousand.
+  p.unacked.set(id, true);
+  t.resolve(channelFor(p, id));
+  return t;
+}

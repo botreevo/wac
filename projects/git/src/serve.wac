@@ -1,0 +1,1268 @@
+// Serving git: the other half of the conversations `fetch.wac` and `receive.wac` hold as a client.
+//
+// Everything here is a function from a repository and a request body to a response body. HTTP — the
+// `info/refs` advertisement's `# service=` preamble, content types, authentication, chunked bodies — is the
+// caller's (`cmd/gitserve.wac`), so the protocol can be driven by a test with no socket in sight, and the
+// same functions would serve `git daemon`'s framing or an SSH channel unchanged.
+//
+// ## What is served
+//
+// - **upload-pack, protocol v2** — `ls-refs` and `fetch`. This is what a current `git` speaks by default, and
+//   it is the version built for stateless transports: each `fetch` request carries everything the server needs,
+//   and the server says `ready` as soon as it has a common commit, so an incremental fetch carries only what
+//   is new.
+// - **upload-pack, protocol v0** — for a client configured with `protocol.version=0`. No `multi_ack`, which is
+//   allowed and is the simplest conversation the protocol has; the cost is that a stateless v0 fetch with
+//   history in common may be sent more than it needed. v2 has no such cost.
+// - **receive-pack** — create, fast-forward, force and delete, as a compare-and-swap on each ref's old value,
+//   with `report-status`, `delete-refs`, `atomic` and `ofs-delta`. A pushed pack is indexed (completed first if
+//   it is thin), stored beside the others, and **every object a new tip reaches is checked to be present**
+//   before any ref moves.
+//
+// ## What is not
+//
+// Shallow and partial clones (`deepen`, `filter`), `want-ref`, push options, signed pushes, SHA-256
+// repositories, and deltas in the packs this sends: every object goes whole. That is valid and larger than
+// what git would send; reusing the deltas already in a stored pack is the obvious next step.
+//
+// **Any object may be wanted**, not only advertised tips. git refuses that by default
+// (`uploadpack.allowAnySHA1InWant`) because a repository may hide refs; nothing here hides refs, so there is
+// no secret for the check to keep.
+
+import { Buf, Vec, Map, hashBytes, bytesEq, hashI64, i64Eq } from "core";
+import { Exists, Files, Stat } from "std";
+import { encode, decode } from "../vendor/wac/packages/codec/src/hex.wac";
+import { Pkt, readPkt, writePkt, writeText, flushPkt } from "../vendor/wac/packages/git/src/pktline.wac";
+import { Got, Indexed, Pack, completePack, openIndexed } from "../vendor/wac/packages/git/src/pack.wac";
+import { indexWith } from "./indexpack.wac";
+import { PackIndex, find, writeIdx } from "../vendor/wac/packages/git/src/idx.wac";
+import { zlibCompress } from "../vendor/wac/packages/git/src/zlib.wac";
+import { Hash, sha1Of as sha1 } from "./sha1.wac";
+import { Repo, resolveRef, headRef } from "../vendor/wac/packages/git/src/repo.wac";
+import { Store, has, readObject } from "./store.wac";
+import { Walked, newCommits } from "./walk.wac";
+import { RefValue, PackedRef, parsePackedRefs, parseRef } from "../vendor/wac/packages/git/src/refs.wac";
+import { CommitHead, Entries, ENTRY_BLOB, ENTRY_GITLINK, ENTRY_TREE, scanCommit, scanTree } from "./scan.wac";
+import { ParsedTag, parseTag } from "../vendor/wac/packages/git/src/commit.wac";
+
+/** What this server calls itself in `agent=`. */
+export string AGENT() { return "wac-git/0.1"; }
+
+// ── Small things ────────────────────────────────────────────────────────────
+
+string hexOf(u8[] name) { return string.fromBytes(encode(name)); }
+
+/** Twenty bytes from forty hex characters, or null. */
+u8[]? nameFrom(string hex) {
+  if (hex.len() != 40) { return null; }
+  u8[]? b = decode(hex.toBytes());
+  if (b is null || b!.len() != 20) { return null; }
+  return b;
+}
+
+bool startsWith(string s, string prefix) {
+  return s.len() >= prefix.len() && s.slice(0, prefix.len()) == prefix;
+}
+
+bool endsWith(string s, string suffix) {
+  return s.len() >= suffix.len() && s.slice(s.len() - suffix.len(), s.len()) == suffix;
+}
+
+/** A packet's text without its trailing newline. */
+string lineOf(u8[] payload) {
+  i32 end = payload.len();
+  if (end > 0 && payload[end - 1] == 10) { end = end - 1; }
+  u8[] b = u8[].filled(end, 0);
+  for (i32 i = 0; i < end; i++) { b[i] = payload[i]; }
+  return string.fromBytes(b);
+}
+
+bool isZero(u8[] name) {
+  for (i32 i = 0; i < name.len(); i++) { if (name[i] != 0) { return false; } }
+  return true;
+}
+
+/** Bytes `from` up to `to`. */
+export u8[] sub(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+u8[] zeroName() { return u8[].filled(20, 0); }
+
+Map<u8[], bool> nameSet() { return Map.create(hashBytes, bytesEq); }
+
+// ── Refs ────────────────────────────────────────────────────────────────────
+
+/** One ref and the object it names. `peeled` is the non-tag object an annotated tag ends at, or empty. */
+export struct Ref {
+  string name;
+  u8[] target;
+  u8[] peeled;
+}
+
+async void walkLoose(Files fs, string gitDir, string rel, Vec<Ref> out, i32 depth) {
+  if (depth <= 0) { return; }
+  string[]? names = (await fs.readDir("\{gitDir}/\{rel}")).ok();
+  if (names is null) { return; }
+  for (string n in names!) {
+    string path = "\{rel}/\{n}";
+    Stat? s = (await fs.stat("\{gitDir}/\{path}")).ok();
+    if (s is null) { continue; }
+    if (s!.isDir) {
+      await walkLoose(fs, gitDir, path, out, depth - 1);
+      continue;
+    }
+    // A `.lock` is a write in progress — ours or git's — and not a ref.
+    if (endsWith(n, ".lock")) { continue; }
+    u8[]? f = (await fs.readFile("\{gitDir}/\{path}")).ok();
+    if (f is null) { continue; }
+    match (parseRef(f!)) {
+      Direct(target): { out.push(Ref(path, target, u8[]())); }
+      Symbolic(next): { }
+      Unparsed(why): { }
+    }
+  }
+}
+
+/** `a` sorts before `b` as raw bytes, which is the order git advertises refs in. */
+bool bytesBefore(string a, string b) {
+  u8[] x = a.toBytes();
+  u8[] y = b.toBytes();
+  i32 n = x.len() < y.len() ? x.len() : y.len();
+  for (i32 i = 0; i < n; i++) {
+    if (x[i] != y[i]) { return x[i] < y[i]; }
+  }
+  return x.len() < y.len();
+}
+
+/**
+ * Every ref under `refs/`, loose and packed, sorted by name, each annotated tag peeled.
+ *
+ * A loose ref shadows a packed one of the same name, which is the state a repository is in between a
+ * `git pack-refs` and the next update of that ref.
+ */
+export async Vec<Ref> listRefs(Store r) {
+  Vec<Ref> loose = Vec.create();
+  await walkLoose(r.fs, r.gitDir, "refs", loose, 16);
+  Map<string, bool> seen = Map.create(hashString0, stringEq0);
+  for (i32 i = 0; i < loose.len(); i++) { seen.set(loose.get(i).name, true); }
+  u8[]? packed = (await r.fs.readFile("\{r.gitDir}/packed-refs")).ok();
+  if (packed is not null) {
+    Vec<PackedRef> ps = parsePackedRefs(packed!);
+    for (i32 i = 0; i < ps.len(); i++) {
+      PackedRef p = ps.get(i);
+      if (!seen.has(p.name) && startsWith(p.name, "refs/")) { loose.push(Ref(p.name, p.target, u8[]())); }
+    }
+  }
+  // Insertion sort: a repository's refs are tens, rarely thousands, and this keeps the order stable.
+  for (i32 i = 1; i < loose.len(); i++) {
+    Ref cur = loose.get(i);
+    i32 j = i - 1;
+    while (j >= 0 && bytesBefore(cur.name, loose.get(j).name)) {
+      loose.set(j + 1, loose.get(j));
+      j = j - 1;
+    }
+    loose.set(j + 1, cur);
+  }
+  for (i32 i = 0; i < loose.len(); i++) {
+    Ref ref = loose.get(i);
+    if (startsWith(ref.name, "refs/tags/")) {
+      u8[]? p = await peel(r, ref.target);
+      if (p is not null && !bytesEq(p!, ref.target)) { ref.peeled = p!; }
+    }
+  }
+  return loose;
+}
+
+i32 hashString0(string s) { return hashBytes(s.toBytes()); }
+bool stringEq0(string a, string b) { return a == b; }
+
+/** Follow annotated tags until something that is not one, or null if an object is missing. */
+export async u8[]? peel(Store r, u8[] name) {
+  u8[] at = name;
+  for (i32 hop = 0; hop < 16; hop++) {
+    match ((await readObject(r, at))) {
+      Absent(why): { return null; }
+      Found(kind, data): {
+        if (kind != 4) { return at; }
+        match (parseTag(data)) {
+          Unreadable(why): { return null; }
+          Annotated(t): { at = t.object; }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/** HEAD, as git advertises it: its target when it resolves, and the ref it is symbolic for. */
+export struct Head {
+  u8[]? target;
+  /** `refs/heads/main`, or empty when HEAD is detached. */
+  string symref;
+}
+
+export async Head headOf(Store r) {
+  return Head(await resolveRef(r.repo, "HEAD"), await headRef(r.repo));
+}
+
+// ── Protocol v0: the advertisement ──────────────────────────────────────────
+
+/**
+ * The ref advertisement for `service` (`git-upload-pack` or `git-receive-pack`), in pkt-lines and ending
+ * with a flush. HTTP puts its `# service=` line in front of this; nothing else differs.
+ *
+ * The capabilities ride on the first line after a NUL, and a repository with no refs at all advertises
+ * them on the placeholder git uses for that, `capabilities^{}` naming twenty zero bytes.
+ */
+export async u8[] advertiseV0(Store r, string service) {
+  Vec<Ref> refs = await listRefs(r);
+  Head h = await headOf(r);
+  bool upload = service == "git-upload-pack";
+  string caps = upload
+    ? "side-band-64k ofs-delta no-progress include-tag allow-reachable-sha1-in-want agent=\{AGENT()} object-format=sha1"
+    : "report-status delete-refs atomic ofs-delta agent=\{AGENT()} object-format=sha1";
+  if (upload && h.symref != "" && h.target is not null) { caps = caps + " symref=HEAD:\{h.symref}"; }
+
+  Buf out = Buf.create();
+  bool first = true;
+  if (upload && h.target is not null) {
+    out.pushAll(writePkt("\{hexOf(h.target!)} HEAD\u{0}\{caps}\n".toBytes()));
+    first = false;
+  }
+  for (i32 i = 0; i < refs.len(); i++) {
+    Ref ref = refs.get(i);
+    if (first) {
+      out.pushAll(writePkt("\{hexOf(ref.target)} \{ref.name}\u{0}\{caps}\n".toBytes()));
+      first = false;
+    } else {
+      out.pushAll(writeText("\{hexOf(ref.target)} \{ref.name}\n"));
+    }
+    if (upload && ref.peeled.len() == 20) {
+      out.pushAll(writeText("\{hexOf(ref.peeled)} \{ref.name}^{}\n"));
+    }
+  }
+  if (first) {
+    out.pushAll(writePkt("\{hexOf(zeroName())} capabilities^{}\u{0}\{caps}\n".toBytes()));
+  }
+  out.pushAll(flushPkt());
+  return out.take();
+}
+
+// ── Protocol v2: the capability advertisement ───────────────────────────────
+
+/** What a v2 server says before any command: its version, then what it can do. */
+export u8[] advertiseV2() {
+  Buf out = Buf.create();
+  out.pushAll(writeText("version 2\n"));
+  out.pushAll(writeText("agent=\{AGENT()}\n"));
+  out.pushAll(writeText("ls-refs\n"));
+  out.pushAll(writeText("fetch\n"));
+  out.pushAll(writeText("object-format=sha1\n"));
+  out.pushAll(flushPkt());
+  return out.take();
+}
+
+/** A v2 request: the command, its capability lines, and its arguments after the delimiter. */
+export struct Command {
+  string name;
+  Vec<string> caps;
+  Vec<string> args;
+}
+
+export enum Commanded {
+  Is(Command c),
+  Bad(string why)
+}
+
+export Commanded parseCommand(u8[] body) {
+  i32[] pos = [0];
+  string name = "";
+  Vec<string> caps = Vec.create();
+  Vec<string> args = Vec.create();
+  bool inArgs = false;
+  while (true) {
+    match (readPkt(body, pos)) {
+      Line(p): {
+        string l = lineOf(p);
+        if (inArgs) { args.push(l); }
+        else if (startsWith(l, "command=")) { name = l.slice(8, l.len()); }
+        else { caps.push(l); }
+      }
+      Delim: { inArgs = true; }
+      Flush: { break; }
+      ResponseEnd: { break; }
+      Done: { break; }
+      Broken(why): { return Commanded.Bad(why); }
+    }
+  }
+  if (name == "") { return Commanded.Bad("no command= line"); }
+  return Commanded.Is(Command(name, caps, args));
+}
+
+/** Answer one v2 request to `git-upload-pack`. */
+export async Vec<u8[]> uploadPackV2(Store r, u8[] body) {
+  match (parseCommand(body)) {
+    Bad(why): { return one(errPkt("bad request: \{why}")); }
+    Is(c): {
+      if (c.name == "ls-refs") { return await lsRefs(r, c.args); }
+      if (c.name == "fetch") { return await fetchV2(r, c.args); }
+      return one(errPkt("unknown command \{c.name}"));
+    }
+  }
+}
+
+/** `ERR <why>`, which a client prints and stops on. */
+export u8[] errPkt(string why) {
+  Buf out = Buf.create();
+  out.pushAll(writeText("ERR \{why}\n"));
+  out.pushAll(flushPkt());
+  return out.take();
+}
+
+async Vec<u8[]> lsRefs(Store r, Vec<string> args) {
+  bool symrefs = false;
+  bool peelTags = false;
+  Vec<string> prefixes = Vec.create();
+  for (i32 i = 0; i < args.len(); i++) {
+    string a = args.get(i);
+    if (a == "symrefs") { symrefs = true; }
+    else if (a == "peel") { peelTags = true; }
+    else if (startsWith(a, "ref-prefix ")) { prefixes.push(a.slice(11, a.len())); }
+  }
+  Buf out = Buf.create();
+  Head h = await headOf(r);
+  if (h.target is not null && wanted("HEAD", prefixes)) {
+    string line = "\{hexOf(h.target!)} HEAD";
+    if (symrefs && h.symref != "") { line = line + " symref-target:\{h.symref}"; }
+    out.pushAll(writeText(line + "\n"));
+  }
+  Vec<Ref> refs = await listRefs(r);
+  for (i32 i = 0; i < refs.len(); i++) {
+    Ref ref = refs.get(i);
+    if (!wanted(ref.name, prefixes)) { continue; }
+    string line = "\{hexOf(ref.target)} \{ref.name}";
+    if (peelTags && ref.peeled.len() == 20) { line = line + " peeled:\{hexOf(ref.peeled)}"; }
+    out.pushAll(writeText(line + "\n"));
+  }
+  out.pushAll(flushPkt());
+  return one(out.take());
+}
+
+bool wanted(string name, Vec<string> prefixes) {
+  if (prefixes.len() == 0) { return true; }
+  for (i32 i = 0; i < prefixes.len(); i++) {
+    if (startsWith(name, prefixes.get(i))) { return true; }
+  }
+  return false;
+}
+
+/** What a fetch asked for. */
+struct Asked {
+  Vec<u8[]> wants;
+  Vec<u8[]> haves;
+  bool done;
+  bool includeTag;
+  bool progress;
+  string refused;
+}
+
+/**
+ * `fetch`: negotiate, then send a pack.
+ *
+ * **Ready as soon as anything is common.** A server may send the pack the moment it knows of one commit the
+ * client has, and the pack is then everything the wants reach that the common commits do not. Waiting for
+ * more `have`s could make the pack smaller only where history has branched and rejoined, and it costs a
+ * round trip every time.
+ */
+async Vec<u8[]> fetchV2(Store r, Vec<string> args) {
+  Asked a = Asked(Vec.create(), Vec.create(), false, false, true, "");
+  for (i32 i = 0; i < args.len(); i++) {
+    string l = args.get(i);
+    if (startsWith(l, "want ")) {
+      u8[]? n = nameFrom(l.slice(5, l.len()));
+      if (n is null) { return one(errPkt("a want that is not an object name: \{l}")); }
+      a.wants.push(n!);
+    } else if (startsWith(l, "have ")) {
+      u8[]? n = nameFrom(l.slice(5, l.len()));
+      if (n is not null) { a.haves.push(n!); }
+    } else if (l == "done") { a.done = true; }
+    else if (l == "include-tag") { a.includeTag = true; }
+    else if (l == "no-progress") { a.progress = false; }
+    else if (startsWith(l, "deepen") || startsWith(l, "shallow ") || startsWith(l, "filter ")
+             || startsWith(l, "want-ref ")) {
+      return one(errPkt("this server does not do shallow or partial clones (\{l})"));
+    }
+  }
+  if (a.wants.len() == 0) { return one(errPkt("a fetch with nothing wanted")); }
+  for (i32 i = 0; i < a.wants.len(); i++) {
+    match ((await readObject(r, a.wants.get(i)))) {
+      Absent(why): { return one(errPkt("upload-pack: not our ref \{hexOf(a.wants.get(i))}")); }
+      Found(kind, data): { }
+    }
+  }
+  Vec<u8[]> common = await commonOf(r, a.haves);
+
+  Buf out = Buf.create();
+  if (!a.done) {
+    out.pushAll(writeText("acknowledgments\n"));
+    if (common.len() == 0) { out.pushAll(writeText("NAK\n")); }
+    for (i32 i = 0; i < common.len(); i++) { out.pushAll(writeText("ACK \{hexOf(common.get(i))}\n")); }
+    if (common.len() == 0) {
+      out.pushAll(flushPkt());
+      return one(out.take());
+    }
+    out.pushAll(writeText("ready\n"));
+    out.pushAll("0001".toBytes());   // delim-pkt: the acknowledgments end and the packfile section begins
+  }
+  match ((await packFor(r, a.wants, common, a.includeTag))) {
+    Failed(why): { return one(errPkt(why)); }
+    Made(pack, count): {
+      out.pushAll(writeText("packfile\n"));
+      Vec<u8[]> res = one(out.take());
+      pushSideband(res, pack);
+      res.push(flushPkt());
+      return res;
+    }
+  }
+}
+
+/** The `have`s that name a commit this repository holds. */
+async Vec<u8[]> commonOf(Store r, Vec<u8[]> haves) {
+  Vec<u8[]> out = Vec.create();
+  for (i32 i = 0; i < haves.len(); i++) {
+    match ((await readObject(r, haves.get(i)))) {
+      Absent(why): { }
+      Found(kind, data): { if (kind == 1) { out.push(haves.get(i)); } }
+    }
+  }
+  return out;
+}
+
+/** `pack` on band 1, in packets no longer than side-band-64k allows, each piece framed into a piece of its own. */
+void pushSideband(Vec<u8[]> dst, Vec<u8[]> pack) {
+  i32 max = 65515;
+  for (i32 j = 0; j < pack.len(); j++) {
+    u8[] piece = pack.get(j);
+    Buf out = Buf.create();
+    i32 at = 0;
+    while (at < piece.len()) {
+      i32 n = piece.len() - at < max ? piece.len() - at : max;
+      i32 len = n + 5;
+      for (i32 shift = 12; shift >= 0; shift = shift - 4) {
+        i32 nib = (len >> shift) & 0xf;
+        out.push((nib < 10 ? 48 + nib : 87 + nib) as@ u8);
+      }
+      out.push(1 as u8);
+      out.pushBytes(piece, at, n);
+      at = at + n;
+    }
+    dst.push(out.take());
+  }
+}
+
+/** One array as a list of pieces. */
+export Vec<u8[]> one(u8[] b) {
+  Vec<u8[]> v = Vec.create();
+  v.push(b);
+  return v;
+}
+
+// ── Protocol v0: upload-pack ────────────────────────────────────────────────
+
+/**
+ * Answer one stateless v0 request to `git-upload-pack`, as `git upload-pack --stateless-rpc` does when it has
+ * advertised no `multi_ack`: the first common `have` is acknowledged as it is read; a flush with none in
+ * common is a `NAK`; `done` ends negotiation, and the pack follows.
+ */
+export async Vec<u8[]> uploadPackV0(Store r, u8[] body) {
+  i32[] pos = [0];
+  Vec<u8[]> wants = Vec.create();
+  Vec<u8[]> common = Vec.create();
+  bool sideband = false;
+  bool includeTag = false;
+  bool done = false;
+  bool flushedWants = false;
+  Buf out = Buf.create();
+  while (!done) {
+    match (readPkt(body, pos)) {
+      Line(p): {
+        string l = lineOf(p);
+        if (startsWith(l, "want ")) {
+          u8[]? n = nameFrom(l.slice(5, l.len() < 45 ? l.len() : 45));
+          if (n is null) { return one(errPkt("a want that is not an object name")); }
+          if (wants.len() == 0) {
+            sideband = l.indexOf(" side-band-64k") >= 0;
+            includeTag = l.indexOf(" include-tag") >= 0;
+          }
+          match ((await readObject(r, n!))) {
+            Absent(why): { return one(errPkt("upload-pack: not our ref \{hexOf(n!)}")); }
+            Found(kind, data): { }
+          }
+          wants.push(n!);
+        } else if (startsWith(l, "have ")) {
+          u8[]? n = nameFrom(l.slice(5, l.len()));
+          if (n is not null) {
+            Vec<u8[]> one = Vec.create();
+            one.push(n!);
+            if ((await commonOf(r, one)).len() == 1) {
+              common.push(n!);
+              if (common.len() == 1) { out.pushAll(writeText("ACK \{hexOf(n!)}\n")); }
+            }
+          }
+        } else if (l == "done") {
+          if (common.len() == 0) { out.pushAll(writeText("NAK\n")); }
+          done = true;
+        } else if (startsWith(l, "deepen") || startsWith(l, "shallow ") || startsWith(l, "filter ")) {
+          return one(errPkt("this server does not do shallow or partial clones"));
+        }
+      }
+      Flush: {
+        if (!flushedWants) { flushedWants = true; }
+        else if (common.len() == 0) { out.pushAll(writeText("NAK\n")); }
+      }
+      Delim: { }
+      ResponseEnd: { }
+      Done: {
+        // The body ended without `done`: a negotiation round, answered above, with no pack yet.
+        return one(out.take());
+      }
+      Broken(why): { return one(errPkt(why)); }
+    }
+  }
+  if (wants.len() == 0) { return one(out.take()); }
+  match ((await packFor(r, wants, common, includeTag))) {
+    Failed(why): { return one(errPkt(why)); }
+    Made(pack, count): {
+      Vec<u8[]> res = one(out.take());
+      if (sideband) {
+        pushSideband(res, pack);
+        res.push(flushPkt());
+      } else {
+        for (i32 i = 0; i < pack.len(); i++) { res.push(pack.get(i)); }
+      }
+      return res;
+    }
+  }
+}
+
+// ── Choosing what to send ───────────────────────────────────────────────────
+
+export enum Packed {
+  /** The pack in pieces of about a megabyte, in order; together they are the pack, checksum last. */
+  Made(Vec<u8[]> pack, i32 count),
+  Failed(string why)
+}
+
+/** The objects of one pack, in the order they will be written — names only; nothing is read twice. */
+struct Sending {
+  Store r;
+  Map<u8[], bool> sent;
+  /** Trees and blobs the client already has: everything under the trees of the commits it has. */
+  Map<u8[], bool> theirs;
+  Vec<u8[]> names;
+  string failed;
+}
+
+void add(Sending s, u8[] name) {
+  s.sent.set(name, true);
+  s.names.push(name);
+}
+
+/**
+ * The pack for `wants`, leaving out what `common` already reaches.
+ *
+ * Commits are walked from the wants and stop at any commit the common ones reach. Trees and blobs are then
+ * left out when they appear under the tree of a commit on that boundary — the commits the client has that the
+ * new ones were built on — which is where nearly everything unchanged lives. An object the client has from
+ * further back may be sent again, which is wasteful and harmless; an object it lacks is never left out.
+ */
+export async Packed packFor(Store r, Vec<u8[]> wants, Vec<u8[]> common, bool includeTag) {
+  Sending s = Sending(r, nameSet(), nameSet(), Vec.create(), "");
+  Vec<u8[]> commitWants = Vec.create();
+  Vec<u8[]> trees = Vec.create();
+
+  for (i32 i = 0; i < wants.len(); i++) {
+    u8[] at = wants.get(i);
+    // A wanted tag is sent, and so is what it points at.
+    for (i32 hop = 0; hop < 16; hop++) {
+      if (s.sent.has(at)) { break; }
+      match ((await readObject(r, at))) {
+        Absent(why): { return Packed.Failed("missing \{hexOf(at)}: \{why}"); }
+        Found(kind, data): {
+          if (kind == 4) {
+            add(s, at);
+            match (parseTag(data)) {
+              Unreadable(why): { return Packed.Failed("tag \{hexOf(at)}: \{why}"); }
+              Annotated(t): { at = t.object; continue; }
+            }
+          }
+          if (kind == 1) { commitWants.push(at); }
+          else if (kind == 2) { trees.push(at); }
+          else if (kind == 3) { add(s, at); }
+          break;
+        }
+      }
+    }
+  }
+
+  // The new commits, walked against the common ones until nothing new is left (`src/walk.wac`).
+  Walked w = await newCommits(r, commitWants, common);
+  for (i32 i = 0; i < w.commits.len(); i++) {
+    add(s, w.commits.get(i));
+    trees.push(w.trees.get(i));
+  }
+  // What the client has under the commits the new history was built on.
+  for (i32 i = 0; i < w.boundary.len(); i++) {
+    match ((await readObject(r, w.boundary.get(i)))) {
+      Absent(why): { }
+      Found(kind, data): {
+        CommitHead? c = scanCommit(data);
+        if (c is not null) { await markTheirs(r, c!.tree, s.theirs, 0); }
+      }
+    }
+  }
+
+  for (i32 i = 0; i < trees.len(); i++) {
+    if (!(await sendTree(s, trees.get(i), 0))) { return Packed.Failed(s.failed); }
+  }
+
+  if (includeTag) {
+    // An annotated tag pointing at something being sent goes too: `include-tag`, which is how a clone gets its
+    // tags without asking for each.
+    Vec<Ref> refs = await listRefs(r);
+    for (i32 i = 0; i < refs.len(); i++) {
+      Ref ref = refs.get(i);
+      if (!startsWith(ref.name, "refs/tags/") || ref.peeled.len() != 20) { continue; }
+      if (s.sent.has(ref.target) || !s.sent.has(ref.peeled)) { continue; }
+      u8[] at = ref.target;
+      for (i32 hop = 0; hop < 16; hop++) {
+        if (s.sent.has(at)) { break; }
+        match ((await readObject(r, at))) {
+          Absent(why): { break; }
+          Found(kind, data): {
+            if (kind != 4) { break; }
+            add(s, at);
+            match (parseTag(data)) {
+              Unreadable(why): { break; }
+              Annotated(t): { at = t.object; }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return await assemble(r, s.names, s.sent);
+}
+
+// ── Assembling a pack from what is stored ───────────────────────────────────
+//
+// **An object in a pack is copied as it is stored, compressed bytes and all.** Inflating every object and
+// deflating it again is the whole cost of serving a clone, and the bytes on disk are already a valid entry for
+// the pack being written — position-independent for a whole object, and for a delta once its base is named
+// rather than placed: an `ofs-delta` becomes a `ref-delta` with the same compressed data, which is valid
+// wherever its base lands in the new pack. A delta is kept only when its base is being sent too; otherwise the
+// object is resolved and sent whole, since a client that did not ask for a thin pack has nothing to resolve it
+// against. A loose object is always compressed afresh.
+
+/** Where one pack's entry is, and what kind of entry it is. */
+struct Stored {
+  i32 kind;
+  /** The inflated size the header states — for a delta, the delta's size. */
+  i32 size;
+  /** Where the compressed data starts, after the header and any base reference. */
+  i32 data;
+  /** Where the entry ends: the next entry, or the trailing checksum. */
+  i32 end;
+  /** For an `ofs-delta`, the base's offset. */
+  i64 baseOffset;
+  /** For a `ref-delta`, the base's name. */
+  u8[] baseName;
+}
+
+Stored? storedAt(Pack p, i64 off) {
+  i32 at = off as~ i32;
+  if (at < 12 || at >= p.bytes.len() - 20) { return null; }
+  i32 b = p.bytes[at] as i32;
+  i32 kind = (b >> 4) & 7;
+  i32 size = b & 0x0f;
+  i32 shift = 4;
+  at = at + 1;
+  while ((b & 0x80) != 0) {
+    if (at >= p.bytes.len() || shift > 28) { return null; }
+    b = p.bytes[at] as i32;
+    size = size | ((b & 0x7f) << shift);
+    shift = shift + 7;
+    at = at + 1;
+  }
+  i64 baseOffset = 0;
+  u8[] baseName = u8[]();
+  if (kind == 6) {
+    i32 c = p.bytes[at] as i32;
+    at = at + 1;
+    i64 ofs = (c & 0x7f) as i64;
+    while ((c & 0x80) != 0) {
+      if (at >= p.bytes.len()) { return null; }
+      c = p.bytes[at] as i32;
+      at = at + 1;
+      ofs = ((ofs + 1) << 7) | ((c & 0x7f) as i64);
+    }
+    baseOffset = off - ofs;
+  } else if (kind == 7) {
+    if (at + 20 > p.bytes.len()) { return null; }
+    baseName = sub(p.bytes, at, at + 20);
+    at = at + 20;
+  } else if (kind < 1 || kind > 4) {
+    return null;
+  }
+  // The entry ends where the next one starts: a binary search over the pack's offsets in order.
+  i32 lo = 0;
+  i32 hi = p.byOffset.len() - 1;
+  i64 end = (p.bytes.len() - 20) as i64;
+  while (lo <= hi) {
+    i32 mid = lo + (hi - lo) / 2;
+    if (p.byOffset[mid] > off) { end = p.byOffset[mid]; hi = mid - 1; } else { lo = mid + 1; }
+  }
+  if ((at as i64) >= end) { return null; }
+  return Stored(kind, size, at, end as~ i32, baseOffset, baseName);
+}
+
+/** For one pack, which object starts at each offset — built when a pack first needs it. */
+struct ByOffset {
+  Map<i64, i32> at;
+  bool built;
+}
+
+i32 nameIndexAt(Pack p, ByOffset m, i64 off) {
+  if (!m.built) {
+    for (i32 i = 0; i < p.idx.count; i++) { m.at.set(p.idx.offsets[i], i); }
+    m.built = true;
+  }
+  return m.at.getOr(off, -1);
+}
+
+/** Four bytes, most significant first, as a pack's header has them (`Buf.pushU32` is the other order). */
+void pushBigEndian(Buf out, i32 v) {
+  out.push(((v >> 24) & 0xff) as@ u8);
+  out.push(((v >> 16) & 0xff) as@ u8);
+  out.push(((v >> 8) & 0xff) as@ u8);
+  out.push((v & 0xff) as@ u8);
+}
+
+/** An entry header: the kind, and the size in git's little-endian groups after it. */
+void pushHeader(Buf out, i32 kind, i32 size) {
+  i32 first = ((kind & 7) << 4) | (size & 0x0f);
+  i32 rest = size >> 4;
+  if (rest != 0) { first = first | 0x80; }
+  out.push(first as@ u8);
+  while (rest != 0) {
+    i32 b = rest & 0x7f;
+    rest = rest >> 7;
+    if (rest != 0) { b = b | 0x80; }
+    out.push(b as@ u8);
+  }
+}
+
+/** The pack of `names`, in that order; `sent` is the same names as a set. */
+export async Packed assemble(Store r, Vec<u8[]> names, Map<u8[], bool> sent) {
+  Vec<u8[]> pieces = Vec.create();
+  Hash hash = Hash.create();
+  Buf out = Buf.create();
+  out.pushAll("PACK".toBytes());
+  pushBigEndian(out, 2);
+  pushBigEndian(out, names.len());
+  Vec<ByOffset> maps = Vec.create();
+  for (i32 k = 0; k < r.packs.len(); k++) { maps.push(ByOffset(Map.create(hashI64, i64Eq), false)); }
+
+  for (i32 i = 0; i < names.len(); i++) {
+    u8[] name = names.get(i);
+    bool copied = false;
+    for (i32 k = 0; k < r.packs.len() && !copied; k++) {
+      Pack p = r.packs.get(k);
+      i32 at = find(p.idx, name);
+      if (at < 0) { continue; }
+      Stored? e = storedAt(p, p.idx.offsets[at]);
+      if (e is null) { break; }
+      Stored st = e!;
+      i32 start = p.idx.offsets[at] as~ i32;
+      if (st.kind <= 4) {
+        out.pushBytes(p.bytes, start, st.end - start);
+        copied = true;
+      } else if (st.kind == 7) {
+        if (sent.has(st.baseName)) {
+          out.pushBytes(p.bytes, start, st.end - start);
+          copied = true;
+        }
+      } else {
+        i32 base = nameIndexAt(p, maps.get(k), st.baseOffset);
+        if (base >= 0) {
+          u8[] baseName = p.idx.nameAt(base);
+          if (sent.has(baseName)) {
+            pushHeader(out, 7, st.size);
+            out.pushAll(baseName);
+            out.pushBytes(p.bytes, st.data, st.end - st.data);
+            copied = true;
+          }
+        }
+      }
+      break;
+    }
+    if (!copied) {
+      match ((await readObject(r, name))) {
+        Absent(why): { return Packed.Failed("missing \{hexOf(name)}: \{why}"); }
+        Found(kind, data): {
+          pushHeader(out, kind, data.len());
+          out.pushAll(zlibCompress(data));
+        }
+      }
+    }
+    // A megabyte at a time into its own piece, hashed as it goes: the pack is never one array.
+    if (out.len >= 1048576) {
+      u8[] piece = out.take();
+      hash.update(piece);
+      pieces.push(piece);
+      out = Buf.create();
+    }
+  }
+  u8[] last = out.take();
+  hash.update(last);
+  pieces.push(last);
+  pieces.push(hash.finish());
+  return Packed.Made(pieces, names.len());
+}
+
+/** Every tree and blob under `tree`, by name only: blobs are not read. */
+async void markTheirs(Store r, u8[] tree, Map<u8[], bool> theirs, i32 depth) {
+  if (depth > 4096 || theirs.has(tree)) { return; }
+  theirs.set(tree, true);
+  match ((await readObject(r, tree))) {
+    Absent(why): { }
+    Found(kind, data): {
+      if (kind != 2) { return; }
+      Entries? es = scanTree(data);
+      if (es is null) { return; }
+      for (i32 i = 0; i < es!.hashes.len(); i++) {
+        i32 k = es!.kinds.get(i);
+        if (k == ENTRY_TREE()) { await markTheirs(r, es!.hashes.get(i), theirs, depth + 1); }
+        else if (k == ENTRY_BLOB()) { theirs.set(es!.hashes.get(i), true); }
+      }
+    }
+  }
+}
+
+async bool sendTree(Sending s, u8[] tree, i32 depth) {
+  if (s.sent.has(tree) || s.theirs.has(tree)) { return true; }
+  if (depth > 4096) { s.failed = "trees nested too deeply"; return false; }
+  match ((await readObject(s.r, tree))) {
+    Absent(why): { s.failed = "missing tree \{hexOf(tree)}: \{why}"; return false; }
+    Found(kind, data): {
+      if (kind != 2) { s.failed = "\{hexOf(tree)} is not a tree"; return false; }
+      add(s, tree);
+      Entries? es = scanTree(data);
+      if (es is null) { s.failed = "tree \{hexOf(tree)} does not parse"; return false; }
+      for (i32 i = 0; i < es!.hashes.len(); i++) {
+        u8[] h = es!.hashes.get(i);
+        i32 k = es!.kinds.get(i);
+        // A gitlink names a commit in another repository: not ours to send.
+        if (k == ENTRY_GITLINK()) { continue; }
+        if (k == ENTRY_TREE()) {
+          if (!(await sendTree(s, h, depth + 1))) { return false; }
+          continue;
+        }
+        // A blob is not read here: assembling the pack finds it, and copies it as it is stored.
+        if (!s.sent.has(h) && !s.theirs.has(h)) { add(s, h); }
+      }
+      return true;
+    }
+  }
+}
+
+// ── receive-pack ────────────────────────────────────────────────────────────
+
+/** One update command: move `name` from `old` to `next` (twenty zeros for absent, either side). */
+export struct Update {
+  u8[] old;
+  u8[] next;
+  string name;
+  /** `ok`, or why it was refused. */
+  string status;
+}
+
+export struct Pushed {
+  /** The report, in pkt-lines. */
+  u8[] report;
+  /** Updates that moved a ref. */
+  i32 moved;
+}
+
+/**
+ * Whether `name` may be a ref, by `git check-ref-format`'s rules — those that matter on a filesystem and on
+ * the wire. A name that could climb out of `refs/` or collide with a lock file is the case this exists for.
+ */
+export bool refNameOk(string name) {
+  if (!startsWith(name, "refs/") || name.len() > 1024) { return false; }
+  if (endsWith(name, "/") || endsWith(name, ".") || name.indexOf("..") >= 0 || name.indexOf("@{") >= 0
+      || name.indexOf("//") >= 0) {
+    return false;
+  }
+  u8[] b = name.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    u8 c = b[i];
+    if (c < 32 || c == 127 || c == ' ' || c == '~' || c == '^' || c == ':' || c == '?' || c == '*'
+        || c == '[' || c == 92) {
+      return false;
+    }
+  }
+  // No component may begin with a dot or end in `.lock`.
+  string rest = name;
+  while (rest.len() > 0) {
+    i32 slash = rest.indexOf("/");
+    string part = slash < 0 ? rest : rest.slice(0, slash);
+    if (part.len() == 0 || part.slice(0, 1) == "." || endsWith(part, ".lock")) { return false; }
+    rest = slash < 0 ? "" : rest.slice(slash + 1, rest.len());
+  }
+  return true;
+}
+
+/**
+ * Apply one push: the update commands, then the pack.
+ *
+ * The caller holds whatever lock keeps two pushes to one repository apart — the old values are compared and
+ * the refs written in between, and that is a compare-and-swap only if nothing else writes in the gap.
+ */
+export async Pushed receivePack(Store r, u8[] body) {
+  i32[] pos = [0];
+  Vec<Update> updates = Vec.create();
+  string caps = "";
+  bool reading = true;
+  while (reading) {
+    match (readPkt(body, pos)) {
+      Line(p): {
+        i32 nul = -1;
+        for (i32 i = 0; i < p.len(); i++) { if (p[i] == 0) { nul = i; break; } }
+        u8[] head = p;
+        if (nul >= 0) {
+          head = sub(p, 0, nul);
+          caps = lineOf(sub(p, nul + 1, p.len()));
+        }
+        string l = lineOf(head);
+        if (startsWith(l, "shallow ") || startsWith(l, "push-cert")) {
+          return refuseAll(updates, "unpack this server does not take shallow or signed pushes");
+        }
+        if (l.len() < 83) { return refuseAll(updates, "unpack a command that is too short"); }
+        u8[]? old = nameFrom(l.slice(0, 40));
+        u8[]? next = nameFrom(l.slice(41, 81));
+        if (old is null || next is null) { return refuseAll(updates, "unpack a command that is not two names"); }
+        updates.push(Update(old!, next!, l.slice(82, l.len()), "ok"));
+      }
+      Flush: { reading = false; }
+      Done: { reading = false; }
+      Delim: { reading = false; }
+      ResponseEnd: { reading = false; }
+      Broken(why): { return refuseAll(updates, "unpack \{why}"); }
+    }
+  }
+  bool atomic = (" " + caps + " ").indexOf(" atomic ") >= 0;
+
+  // The pack, if any: everything after the commands.
+  string unpack = "ok";
+  bool needPack = false;
+  for (i32 i = 0; i < updates.len(); i++) { if (!isZero(updates.get(i).next)) { needPack = true; } }
+  u8[] pack = sub(body, pos[0], body.len());
+  if (pack.len() > 0) {
+    string? stored = await storePack(r, pack);
+    if (stored is not null) { unpack = stored!; }
+  } else if (needPack) {
+    // Pushing an object the server already has needs no pack — git sends an empty one or none at all.
+  }
+
+  // Each command checked, then — when every check that matters has passed — applied.
+  Vec<Ref> before = await listRefs(r);
+  Vec<u8[]> tips = Vec.create();
+  for (i32 i = 0; i < before.len(); i++) { tips.push(before.get(i).target); }
+
+  for (i32 i = 0; i < updates.len(); i++) {
+    Update u = updates.get(i);
+    if (unpack != "ok") { u.status = "unpacker error"; continue; }
+    if (!refNameOk(u.name)) { u.status = "funny refname"; continue; }
+    u8[]? current = await refValue(r, u.name);
+    u8[] cur = current is null ? zeroName() : current!;
+    if (!bytesEq(cur, u.old)) {
+      u.status = isZero(cur) ? "the ref was expected to exist" : "stale info: the ref has moved";
+      continue;
+    }
+    if (isZero(u.next)) { continue; }
+    string? missing = await connected(r, u.next, tips);
+    if (missing is not null) { u.status = "missing necessary objects: \{missing!}"; }
+  }
+  bool allOk = true;
+  for (i32 i = 0; i < updates.len(); i++) { if (updates.get(i).status != "ok") { allOk = false; } }
+  if (atomic && !allOk) {
+    for (i32 i = 0; i < updates.len(); i++) {
+      Update u = updates.get(i);
+      if (u.status == "ok") { u.status = "atomic push failure"; }
+    }
+  }
+
+  i32 moved = 0;
+  string firstBranch = "";
+  for (i32 i = 0; i < updates.len(); i++) {
+    Update u = updates.get(i);
+    if (u.status != "ok") { continue; }
+    string? failed = isZero(u.next) ? await deleteRef(r, u.name) : await writeRef(r, u.name, u.next);
+    if (failed is not null) { u.status = failed!; continue; }
+    moved = moved + 1;
+    if (firstBranch == "" && !isZero(u.next) && startsWith(u.name, "refs/heads/")) { firstBranch = u.name; }
+  }
+
+  // A repository nobody has pushed to yet has a HEAD naming a branch that may never exist. Pointing it at the
+  // first branch pushed is what makes the first clone check something out.
+  if (firstBranch != "" && (await resolveRef(r.repo, "HEAD")) is null) {
+    await r.fs.writeFile("\{r.gitDir}/HEAD", "ref: \{firstBranch}\n".toBytes());
+  }
+
+  Buf out = Buf.create();
+  out.pushAll(writeText("unpack \{unpack}\n"));
+  for (i32 i = 0; i < updates.len(); i++) {
+    Update u = updates.get(i);
+    out.pushAll(writeText(u.status == "ok" ? "ok \{u.name}\n" : "ng \{u.name} \{u.status}\n"));
+  }
+  out.pushAll(flushPkt());
+  return Pushed(out.take(), moved);
+}
+
+Pushed refuseAll(Vec<Update> updates, string unpackLine) {
+  Buf out = Buf.create();
+  out.pushAll(writeText(unpackLine + "\n"));
+  for (i32 i = 0; i < updates.len(); i++) { out.pushAll(writeText("ng \{updates.get(i).name} unpacker error\n")); }
+  out.pushAll(flushPkt());
+  return Pushed(out.take(), 0);
+}
+
+/** Index a pushed pack — completing it first if it is thin — and store it. Null, or why not. */
+async string? storePack(Store r, u8[] pack) {
+  if (pack.len() < 32) { return "a pack shorter than its header and checksum"; }
+  i32 count = (pack[8] as i32 << 24) | (pack[9] as i32 << 16) | (pack[10] as i32 << 8) | pack[11] as i32;
+  if (count == 0) { return null; }
+  // Indexed with nothing supplied first; a thin pack names what it lacks, those come from this repository, and
+  // the second pass resolves against them and appends them (`src/indexpack.wac`).
+  Vec<u8[]> extNames = Vec.create();
+  i32[] extKinds = i32[]();
+  Vec<u8[]> extData = Vec.create();
+  match (indexWith(pack, extNames, extKinds, extData)) {
+    Damaged(why): { return "the pack could not be indexed: \{why}"; }
+    Done(whole, idx): { return await keepPack(r, whole, idx); }
+    Lacking(bases): {
+      extKinds = i32[].filled(bases.len(), 0);
+      for (i32 i = 0; i < bases.len(); i++) {
+        match ((await readObject(r, bases.get(i)))) {
+          Absent(why): { return "the pack is deltified against \{hexOf(bases.get(i))}, which is not here"; }
+          Found(kind, body): { extNames.push(bases.get(i)); extKinds[i] = kind; extData.push(body); }
+        }
+      }
+    }
+  }
+  match (indexWith(pack, extNames, extKinds, extData)) {
+    Damaged(why): { return "the completed pack could not be indexed: \{why}"; }
+    Lacking(bases): { return "the pack is still thin after completion"; }
+    Done(whole, idx): { return await keepPack(r, whole, idx); }
+  }
+}
+
+/** Store a pack and its index beside the others, and make it readable through `r` at once. */
+async string? keepPack(Store r, u8[] whole, PackIndex idx) {
+  {
+    {
+      u8[] checksum = sub(whole, whole.len() - 20, whole.len());
+      string dir = "\{r.gitDir}/objects/pack";
+      auto made = await r.fs.mkdir(dir, true);
+      if (made.isErr() && !(made.err()! is Exists)) { return "cannot create \{dir}"; }
+      string stem = "\{dir}/pack-\{hexOf(checksum)}";
+      // The pack, then its index: git finds a pack by its index, so a pack without one is invisible rather
+      // than half-read.
+      if ((await r.fs.writeFile("\{stem}.pack", whole)).isErr()) { return "cannot write the pack"; }
+      if ((await r.fs.writeFile("\{stem}.idx.tmp", writeIdx(idx, checksum))).isErr()) { return "cannot write the index"; }
+      if ((await r.fs.rename("\{stem}.idx.tmp", "\{stem}.idx")).isErr()) { return "cannot move the index into place"; }
+      // Visible to `readObject` on this `Repo` at once, without opening the repository again.
+      r.packs.push(openIndexed(whole, idx));
+      return null;
+    }
+  }
+}
+
+/** What a ref holds right now, not following a symbolic one; null when it does not exist. */
+async u8[]? refValue(Store r, string name) {
+  u8[]? loose = (await r.fs.readFile("\{r.gitDir}/\{name}")).ok();
+  if (loose is not null) {
+    match (parseRef(loose!)) {
+      Direct(target): { return target; }
+      Symbolic(next): { return await resolveRef(r.repo, name); }
+      Unparsed(why): { return null; }
+    }
+  }
+  u8[]? packed = (await r.fs.readFile("\{r.gitDir}/packed-refs")).ok();
+  if (packed is null) { return null; }
+  Vec<PackedRef> ps = parsePackedRefs(packed!);
+  for (i32 i = 0; i < ps.len(); i++) {
+    if (ps.get(i).name == name) { return ps.get(i).target; }
+  }
+  return null;
+}
+
+/**
+ * Null when every object `tip` reaches is here, or the name of the first one that is not.
+ *
+ * Only what is new needs looking at: the commits `tip` reaches that no existing ref does (`src/walk.wac`), and
+ * under their trees only what the commits they were built on did not already have — everything an existing ref
+ * reaches was checked when it arrived. A blob is looked up in an index, not read: being present is the question.
+ */
+async string? connected(Store r, u8[] tip, Vec<u8[]> refTips) {
+  // A tag pushed on its own: its object, and what it names, must be here.
+  u8[] at = tip;
+  for (i32 hop = 0; hop < 16; hop++) {
+    match ((await readObject(r, at))) {
+      Absent(why): { return hexOf(at); }
+      Found(kind, data): {
+        if (kind == 4) {
+          match (parseTag(data)) {
+            Unreadable(why): { return hexOf(at); }
+            Annotated(t): { at = t.object; continue; }
+          }
+        }
+        if (kind == 2) { return await treePresent(r, at, nameSet(), 0); }
+        if (kind != 1) { return null; }
+        hop = 16;
+      }
+    }
+  }
+  Vec<u8[]> wants = Vec.create();
+  wants.push(at);
+  Walked w = await newCommits(r, wants, refTips);
+  Map<u8[], bool> theirs = nameSet();
+  for (i32 i = 0; i < w.boundary.len(); i++) {
+    match ((await readObject(r, w.boundary.get(i)))) {
+      Absent(why): { }
+      Found(kind, data): {
+        CommitHead? c = scanCommit(data);
+        if (c is not null) { await markTheirs(r, c!.tree, theirs, 0); }
+      }
+    }
+  }
+  // Every parent a new commit names must be here: a new one is walked, an old one is on the boundary — or absent.
+  for (i32 i = 0; i < w.commits.len(); i++) {
+    match ((await readObject(r, w.commits.get(i)))) {
+      Absent(why): { return hexOf(w.commits.get(i)); }
+      Found(kind, data): {
+        CommitHead? c = scanCommit(data);
+        if (c is null) { return hexOf(w.commits.get(i)); }
+        for (i32 k = 0; k < c!.parents.len(); k++) {
+          if (!(await has(r, c!.parents.get(k)))) { return hexOf(c!.parents.get(k)); }
+        }
+      }
+    }
+    string? m = await treePresent(r, w.trees.get(i), theirs, 0);
+    if (m is not null) { return m; }
+  }
+  return null;
+}
+
+/** Null when `tree` and everything under it is here, skipping what `known` already holds; else what is missing. */
+async string? treePresent(Store r, u8[] tree, Map<u8[], bool> known, i32 depth) {
+  if (known.has(tree)) { return null; }
+  if (depth > 4096) { return hexOf(tree); }
+  known.set(tree, true);
+  match ((await readObject(r, tree))) {
+    Absent(why): { return hexOf(tree); }
+    Found(kind, data): {
+      if (kind != 2) { return hexOf(tree); }
+      Entries? es = scanTree(data);
+      if (es is null) { return hexOf(tree); }
+      for (i32 i = 0; i < es!.hashes.len(); i++) {
+        u8[] h = es!.hashes.get(i);
+        i32 k = es!.kinds.get(i);
+        if (k == ENTRY_GITLINK() || known.has(h)) { continue; }
+        if (k == ENTRY_TREE()) {
+          string? m = await treePresent(r, h, known, depth + 1);
+          if (m is not null) { return m; }
+        } else {
+          if (!(await has(r, h))) { return hexOf(h); }
+          known.set(h, true);
+        }
+      }
+      return null;
+    }
+  }
+}
+
+/** Point `name` at `target`: written beside it as a lock, then renamed over it, so no reader sees half. */
+async string? writeRef(Store r, string name, u8[] target) {
+  string path = "\{r.gitDir}/\{name}";
+  i32 slash = -1;
+  for (i32 i = 0; i < path.len(); i++) { if (path.slice(i, i + 1) == "/") { slash = i; } }
+  auto made = await r.fs.mkdir(path.slice(0, slash), true);
+  if (made.isErr() && !(made.err()! is Exists)) { return "cannot create the ref's directory"; }
+  if ((await r.fs.writeFile("\{path}.lock", "\{hexOf(target)}\n".toBytes())).isErr()) { return "failed to lock"; }
+  if ((await r.fs.rename("\{path}.lock", path)).isErr()) { return "failed to write"; }
+  return null;
+}
+
+/** Remove `name`, loose and packed. */
+async string? deleteRef(Store r, string name) {
+  string path = "\{r.gitDir}/\{name}";
+  Stat? s = (await r.fs.stat(path)).ok();
+  if (s is not null && s!.exists && (await r.fs.remove(path, false)).isErr()) { return "failed to delete"; }
+  u8[]? packed = (await r.fs.readFile("\{r.gitDir}/packed-refs")).ok();
+  if (packed is null) { return null; }
+  // Rewrite packed-refs without the ref and the `^` line that peels it.
+  string text = string.fromBytes(packed!);
+  Buf out = Buf.create();
+  bool dropping = false;
+  bool changed = false;
+  string rest = text;
+  while (rest.len() > 0) {
+    i32 nl = rest.indexOf("\n");
+    string line = nl < 0 ? rest : rest.slice(0, nl + 1);
+    rest = nl < 0 ? "" : rest.slice(nl + 1, rest.len());
+    if (line.slice(0, 1) == "^") {
+      if (!dropping) { out.pushAll(line.toBytes()); }
+      continue;
+    }
+    dropping = false;
+    string bare = endsWith(line, "\n") ? line.slice(0, line.len() - 1) : line;
+    if (bare.len() == 41 + name.len() && bare.slice(41, bare.len()) == name) {
+      dropping = true;
+      changed = true;
+      continue;
+    }
+    out.pushAll(line.toBytes());
+  }
+  if (!changed) { return null; }
+  if ((await r.fs.writeFile("\{r.gitDir}/packed-refs.lock", out.take())).isErr()) { return "failed to lock packed-refs"; }
+  if ((await r.fs.rename("\{r.gitDir}/packed-refs.lock", "\{r.gitDir}/packed-refs")).isErr()) { return "failed to rewrite packed-refs"; }
+  return null;
+}
+
+// ── A new repository ────────────────────────────────────────────────────────
+
+/** A bare repository at `dir`, as `git init --bare` makes one, its HEAD naming `branch`. Null, or why not. */
+export async string? initBare(Files fs, string dir, string branch) {
+  string[] dirs = ["", "/objects", "/objects/pack", "/objects/info", "/refs", "/refs/heads", "/refs/tags"];
+  for (string d in dirs) {
+    auto made = await fs.mkdir("\{dir}\{d}", true);
+    if (made.isErr() && !(made.err()! is Exists)) { return "cannot create \{dir}\{d}"; }
+  }
+  if ((await fs.writeFile("\{dir}/config",
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n".toBytes())).isErr()) {
+    return "cannot write \{dir}/config";
+  }
+  if ((await fs.writeFile("\{dir}/description", "Unnamed repository\n".toBytes())).isErr()) {
+    return "cannot write \{dir}/description";
+  }
+  if ((await fs.writeFile("\{dir}/HEAD", "ref: refs/heads/\{branch}\n".toBytes())).isErr()) {
+    return "cannot write \{dir}/HEAD";
+  }
+  return null;
+}

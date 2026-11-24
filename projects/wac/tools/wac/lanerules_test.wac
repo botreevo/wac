@@ -1,0 +1,221 @@
+// Both lanes say who is in them and why — checked against the lanes `tools/runTests.wac` actually runs.
+//
+// A file declaring `// test-lane: exclusive — why` runs alone after the parallel pass; one declaring `heavy` is left out
+// of a whole-suite run. Both are real costs that grow quietly — a flaky test is easier to move into a lane than to fix —
+// so the lanes are counted, and every member has to give a reason; a heavy one a measured, dated cost. None of this can
+// prove a file belongs there; what it does is keep the answer to "why is the suite slow?" in one place.
+//
+// It was tools/lane.test.ts (deleted 2026-11-11), which asked harness/testLane.ts (deleted 2026-11-11) — a TypeScript copy of how the runner finds lanes. It
+// asks the runner itself now (`lanesAsRun`), so a rule can no longer pass against a copy that has drifted.
+
+import { T } from "../../packages/wactest/src/assert.wac";
+import { Sys, Files } from "std";
+import { flatten } from "core";
+import { Declared, Lanes, lanesAsRun, underTargets } from "../runTests.wac";
+
+/** Every declaration on both sides in `lane`. */
+Declared[] inLane(Lanes l, string lane) {
+  i32 n = 0;
+  for (Declared d in l.wac) { if (d.lane == lane) { n = n + 1; } }
+  for (Declared d in l.ts) { if (d.lane == lane) { n = n + 1; } }
+  Declared[] out = Declared[].filled(n, Declared("", "", ""));
+  i32 at = 0;
+  for (Declared d in l.wac) { if (d.lane == lane) { out[at] = d; at = at + 1; } }
+  for (Declared d in l.ts) { if (d.lane == lane) { out[at] = d; at = at + 1; } }
+  return out;
+}
+
+/** Everything before the last `/`, or `""` for a bare name. */
+string dirOf(string path) {
+  i32 last = 0 - 1;
+  for (i32 i = 0; i < path.len(); i++) { if (path.slice(i, i + 1) == "/") { last = i; } }
+  return last < 0 ? "" : path.slice(0, last);
+}
+
+bool hasDigit(string s) {
+  for (i32 i = 0; i < s.len(); i++) { if ("0123456789".indexOf(s.slice(i, i + 1)) >= 0) { return true; } }
+  return false;
+}
+
+/** Whether `s` holds `measured YYYY-MM-DD`. */
+bool dated(string s) {
+  string d = "0123456789";
+  i32 at = s.indexOf("measured ");
+  while (at >= 0) {
+    i32 p = at + 9;
+    if (p + 10 <= s.len()) {
+      string w = s.slice(p, p + 10);
+      bool ok = w.slice(4, 5) == "-" && w.slice(7, 8) == "-";
+      for (i32 i = 0; i < 10; i++) {
+        if (i == 4 || i == 7) { continue; }
+        if (d.indexOf(w.slice(i, i + 1)) < 0) { ok = false; }
+      }
+      if (ok) { return true; }
+    }
+    i32 next = s.slice(at + 1, s.len()).indexOf("measured ");
+    at = next < 0 ? next : at + 1 + next;
+  }
+  return false;
+}
+
+string filesOf(Declared[] ds) {
+  string out = "";
+  for (Declared d in ds) { out = out + (out == "" ? "" : ", ") + d.file; }
+  return out;
+}
+
+export string test_every_exclusive_test_says_why_it_needs_the_machine(Sys sys) {
+  T t = T.create();
+  Declared[] lane = inLane(lanesAsRun(sys.env(), sys.files()), "exclusive");
+  string mute = "";
+  for (Declared d in lane) { if (d.why.len() < 12) { mute = mute + (mute == "" ? "" : ", ") + d.file; } }
+  t.eqStr(mute, "", "these declared themselves exclusive without saying why — write the reason after the dash");
+  return t.report();
+}
+
+export string test_the_exclusive_lane_is_small_enough_to_still_be_a_lane(Sys sys) {
+  T t = T.create();
+  // Deliberately loose: what it catches is "run it alone" becoming the standard answer to a flaky test.
+  //
+  // **Seven, and the seventh is not new.** tools/lane.test.ts (deleted 2026-11-11) held this at six and passed, because harness/testLane.ts (deleted 2026-11-11)
+  // walked `packages`, `harness` and `tools` — and the runner also walks `bootstrap`, where `bootstrap/ts/browser.test.ts`
+  // has run alone since 2026-08-28 (it drives Chromium and lost the race in the parallel browser pass; `runTests.wac`'s
+  // `tsRoots` tells it). Counted against the lane the runner runs, it was seven all along. Past this, argue again.
+  Declared[] lane = inLane(lanesAsRun(sys.env(), sys.files()), "exclusive");
+  t.isTrue(lane.len() <= 7, "\{lane.len()} files want the machine to themselves: \{filesOf(lane)} — fix the tests "
+           + "or the design rather than raising this number");
+  return t.report();
+}
+
+export string test_every_heavy_test_says_what_it_costs_in_a_dated_number(Sys sys) {
+  T t = T.create();
+  // A heavy file is not run on a whole-suite pass, so its declaration is all that stands between "this is expensive"
+  // and "somebody found this annoying" — and a number can be re-checked where prose cannot. **And when it was true**:
+  // `issues/system/0230c` found figures 8x out that every one had a number for; a date lets a reader see it is stale.
+  Declared[] lane = inLane(lanesAsRun(sys.env(), sys.files()), "heavy");
+  string vague = "";
+  string undated = "";
+  for (Declared d in lane) {
+    if (!hasDigit(d.why)) { vague = vague + (vague == "" ? "" : ", ") + d.file; }
+    if (!dated(d.why)) { undated = undated + (undated == "" ? "" : ", ") + d.file; }
+  }
+  t.eqStr(vague, "", "declared heavy without naming a cost — give megabytes resident, seconds, or cores held");
+  t.eqStr(undated, "", "named a cost without saying when it was measured — write `measured YYYY-MM-DD` beside it");
+  t.isTrue(lane.len() > 0, "no heavy declarations were found at all, which says the walk found nothing");
+  return t.report();
+}
+
+export string test_no_file_is_in_both_lanes(Sys sys) {
+  T t = T.create();
+  // Exclusive is "run this on every push, alone"; heavy is "do not run this on a push". A file claiming both is heavy.
+  Lanes l = lanesAsRun(sys.env(), sys.files());
+  Declared[] heavy = inLane(l, "heavy");
+  string both = "";
+  for (Declared e in inLane(l, "exclusive")) {
+    for (Declared h in heavy) { if (h.file == e.file) { both = both + (both == "" ? "" : ", ") + e.file; } }
+  }
+  t.eqStr(both, "", "declared exclusive and heavy at once");
+  return t.report();
+}
+
+export string test_the_heavy_lane_cannot_quietly_become_the_suite(Sys sys) {
+  T t = T.create();
+  // Sixteen since 2026-10-27, and that was argued: `issues/system/0275b` has the numbers. Past it, argue again.
+  Declared[] lane = inLane(lanesAsRun(sys.env(), sys.files()), "heavy");
+  t.isTrue(lane.len() <= 16, "\{lane.len()} files are excluded from a whole-suite run — past this, the question is not "
+           + "which test to exclude next but why the suite costs what it does");
+  return t.report();
+}
+
+export string test_no_targets_means_every_declared_file_and_a_directory_target_its_files() {
+  T t = T.create();
+  // `wac task test` passes no targets: read as "nothing matches", the lane went inert while the other entry point ran
+  // the same files four at a time. And a directory matches by prefix — the first version compared by equality.
+  string[] declared = ["packages/ssh/test/wac/cli_test.wac", "packages/box/test/box.test.ts"];
+  t.eqI32(underTargets(string[](), declared).len(), 2, "no targets is the whole tree");
+  string[] ssh = underTargets(["packages/ssh/"], declared);
+  t.eqI32(ssh.len(), 1, "a directory target takes the declared file under it");
+  if (ssh.len() == 1) { t.eqStr(ssh[0], "packages/ssh/test/wac/cli_test.wac", "and only that one"); }
+  t.eqI32(underTargets(["packages/json/"], declared).len(), 0, "an unrelated package takes none");
+  t.eqI32(underTargets(["packages/ssh/", "packages/box/"], declared).len(), 2, "two targets, both with a declared file");
+  return t.report();
+}
+
+export string test_the_wac_lanes_directories_each_hold_a_test_and_every_declared_one_is_among_them(Sys sys) {
+  T t = T.create();
+  Files fs = sys.files();
+  Lanes l = lanesAsRun(sys.env(), fs);
+  // Read each directory rather than the walk's own bookkeeping, so the two can disagree.
+  string empty = "";
+  for (string dir in l.wacDirs) {
+    bool found = false;
+    string[]? names = flatten(fs.readDir(dir).wait()).ok();
+    if (names is not null) {
+      for (string n in names!) { if (n.len() > 9 && n.slice(n.len() - 9, n.len()) == "_test.wac") { found = true; } }
+    }
+    if (!found) { empty = empty + (empty == "" ? "" : ", ") + dir; }
+  }
+  t.eqStr(empty, "", "directories the lane walks with no wac test in them");
+  // An independent source for the same fact: every declared wac test lives in a directory the lane visits.
+  string missing = "";
+  for (Declared d in l.wac) {
+    string dir = dirOf(d.file);
+    bool walked = false;
+    for (string w in l.wacDirs) { if (w == dir) { walked = true; } }
+    if (!walked) { missing = missing + (missing == "" ? "" : ", ") + d.file; }
+  }
+  t.eqStr(missing, "", "declared wac tests in directories the lane never visits");
+  // The canary: a walk that found nothing would satisfy both checks above.
+  t.isTrue(l.wacDirs.len() > 20, "only \{l.wacDirs.len()} directories of wac tests were found");
+  return t.report();
+}
+
+export string test_the_jobs_sweep_ignores_what_the_suite_ignores_by_asking(Sys sys) {
+  T t = T.create();
+  // `tools/jobsSweep.sh` measures the suite at several widths, which only means something if it runs the suite's files.
+  // It named one lane for a while and began measuring files the suite no longer ran. Checked as source, because running
+  // it is half an hour: it must ask for every declared file and name no lane itself.
+  u8[]? f = flatten(sys.files().readFile("tools/jobsSweep.sh").wait()).ok();
+  t.isTrue(f is not null, "tools/jobsSweep.sh is readable");
+  if (f is null) { return t.report(); }
+  string sweep = string.fromBytes(f!);
+  t.isTrue(sweep.indexOf("declaredLaneFiles") >= 0,
+           "jobsSweep.sh does not build its --ignore from every declared file, so a new lane will desync it");
+  t.isTrue(sweep.indexOf("exclusiveTests") < 0 && sweep.indexOf("heavyTests") < 0,
+           "jobsSweep.sh names a lane rather than asking for every declared file — that is the desync");
+  return t.report();
+}
+
+export string test_the_hostless_list_names_only_files_the_wac_lane_runs(Sys sys) {
+  T t = T.create();
+  // `harness/wac/hostless.test.ts` is skipped by the suite because every file it lists runs in the `wac test` lane; an
+  // entry outside the lane's directories would be a test that runs nowhere while both lanes report green.
+  Files fs = sys.files();
+  u8[]? f = flatten(fs.readFile("harness/wac/hostless.test.ts").wait()).ok();
+  t.isTrue(f is not null, "the hostless list is readable");
+  if (f is null) { return t.report(); }
+  string src = string.fromBytes(f!);
+  Lanes l = lanesAsRun(sys.env(), fs);
+  string marker = "await wacTestRun(\"";
+  i32 found = 0;
+  string orphans = "";
+  i32 at = src.indexOf(marker);
+  while (at >= 0) {
+    i32 from = at + marker.len();
+    i32 close = src.slice(from, src.len()).indexOf("\"");
+    if (close < 0) { break; }
+    string entry = src.slice(from, from + close);
+    found = found + 1;
+    string dir = dirOf(entry);
+    bool walked = false;
+    for (string w in l.wacDirs) { if (w == dir) { walked = true; } }
+    if (!walked || entry.len() < 9 || entry.slice(entry.len() - 9, entry.len()) != "_test.wac") {
+      orphans = orphans + (orphans == "" ? "" : ", ") + entry;
+    }
+    i32 next = src.slice(from, src.len()).indexOf(marker);
+    at = next < 0 ? next : from + next;
+  }
+  t.isTrue(found > 20, "only \{found} entries were read from the hostless list");
+  t.eqStr(orphans, "", "entries the `wac test` lane does not walk — they run nowhere");
+  return t.report();
+}

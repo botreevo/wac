@@ -1,0 +1,1215 @@
+// Everything `wac test` is: finding the files, building one module for them, calling their exports
+// and counting what happened.
+//
+// **This was 800 lines of packages/wacc/example/wacc.wac** — the *compiler's* example — because
+// when `issues/system/0230a` asked for subcommands to live in "the wac program", the compiler's
+// example was the only program there was. `issues/system/0257c` is the operator's ruling that this
+// was the wrong reading: `wac` contains the compiler plus more, and running tests is not something a
+// compiler does. So it lives beside the command that will own it rather than inside the thing it
+// calls.
+//
+// It owes that file nothing now. The two helpers it used to borrow are gone: `withoutIgnored` keeps
+// its own `Vec` instead of trimming an array with `exactly`, and the coverage report reads a tab
+// field with `cells`/`cellAt`, which `packages/wacc/src/manifest.wac` already had — a second
+// implementation of "the nth tab-separated field" that nobody needed.
+//
+// Nine names leave here; the other twenty are this file's own business.
+
+import { Authority, CallResult, Stat, Clock, Env, Files, Module, Modules, Output, Unsupported } from "std";
+import { Vec, flatten } from "core";
+import { atoi } from "../../fmt/src/itoa.wac";
+import { parse } from "../../json/src/json.wac";
+import { JsonObject, JsonValue } from "../../json/src/value.wac";
+import { cellAt, cells } from "../../wacc/src/manifest.wac";
+import { DeclaredTest, declaredTests, hostEntries, hostImports, testEntry } from "../../wacc/src/program.wac";
+import { normalisePath } from "../../wacc/src/path.wac";
+
+/**
+ * The walked paths as the aggregate can import them: relative to the project, or nothing.
+ *
+ * **The aggregate lives in `.cache/`, so every import is `../` and then the path.** For a relative
+ * path that is right. For an *absolute* one it produced `..//workspace/…/x_test.wac` — a doubled
+ * slash and a climb out of the project — and the compile failed on an import nobody wrote. Naming a
+ * directory by an absolute path is the ordinary thing to do from a script, so this converts rather
+ * than refusing: a path under the current directory is the same file named relatively.
+ *
+ * Empty when one of them is not under the project. An absolute *import* is not a way out — the
+ * resolver drops the leading slash and reads `tmp/…` relative to the importer, so emitting one would
+ * turn a clear failure into a confusing one. `beside` is what the caller reaches for then: an
+ * aggregate written into the walked directory imports its neighbours without leaving it, so the
+ * absolute path never has to appear in an import at all.
+ */
+export string[] importable(Env env, string[] walked) {
+  string cwd = flatten(env.cwd().wait()).unwrap();
+  string prefix = "\{cwd}/";
+  string[] out = string[].filled(walked.len(), "");
+  for (i32 i = 0; i < walked.len(); i++) {
+    string p = walked[i];
+    if (p.len() > 0 && p.slice(0, 1) != "/") { out[i] = p; continue; }
+    if (p.len() > prefix.len() && p.slice(0, prefix.len()) == prefix) {
+      out[i] = p.slice(prefix.len(), p.len());
+      continue;
+    }
+    return string[]();
+  }
+  return out;
+}
+
+/**
+ * Where a directory run's generated aggregate goes.
+ *
+ * **The pid is what keeps two workers apart, and it was missing.** The name was the monotonic clock
+ * alone — which is *per process* and starts near zero, so four parallel workers sharing one `.cache/`
+ * produced names like `wac-aggregate-41_test.wac` at the same moment. Two of them wrote the same
+ * path, and one deleted it while the other was still between writing and compiling:
+ *
+ *     wacc: cannot read .cache/wac-aggregate-41_test.wac
+ *
+ * That is a gate failure with no failing test in it, and it arrived the day the removal moved to
+ * where it covers every exit (GitHub wac#27) — the collision was always there, and cleaning up
+ * promptly is what turned it from a stale file into a race.
+ *
+ * The retired Rust host named these `wac-aggregate-<pid>-<group>` and `docs/development.md` still
+ * described that after the command moved into wac. The pid in that name was not decoration.
+ *
+ * `ownPid` answers 0 when `/proc/self/stat` cannot be read, and 0 is fine here: it costs the
+ * cross-process uniqueness and leaves the clock, which is what this had all along.
+ */
+export string aggregatePath(Clock clock, Files fs) {
+  return ".cache/wac-aggregate-\{ownPid(fs)}-"
+       + "\{flatten(clock.monotonicNanos().wait()).unwrap()}_test.wac";
+}
+
+/**
+ * This process's pid, from `/proc/self/stat` — 0 when it cannot be read.
+ *
+ * The same question `tools/wac/suitegate.wac` asks, and for the same reason it gives: there is no
+ * `getpid` capability, and a program naming itself in a file other programs share is asking about
+ * the operating system rather than about itself. Not imported from there because `tools/` is not a
+ * dependency of the command; six lines is cheaper than that edge.
+ */
+export i32 ownPid(Files fs) {
+  u8[]? f = flatten(fs.readFile("/proc/self/stat").wait()).ok();
+  if (f is null) { return 0; }
+  string s = string.fromBytes(f!);
+  i32 sp = s.indexOf(" ");
+  return sp <= 0 ? 0 : atoi(s.slice(0, sp));
+}
+
+/**
+ * The walked paths as imports written *from inside `dir`*, for an aggregate that lives there.
+ *
+ * **`wac test /tmp/somewhere` is the case, and it was previously the host's.** `importable` can only
+ * answer for a directory under the project, because the aggregate it is written for sits in `.cache/`
+ * and reaches its neighbours with `../`. A directory somewhere else has no relative name from there,
+ * and an absolute import is read relative to the importer — so the run was refused outright once
+ * `test` became the program's.
+ *
+ * Putting the aggregate *in* the walked directory removes the question: every file the walk found is
+ * at or below it by construction, so the import is the remainder of the path and the `../` prefix
+ * `aggregateSource` normally needs becomes nothing. The cost is a generated file in somebody else's
+ * directory for the length of one run, which is why this is the fallback rather than the rule.
+ *
+ * `dir` is taken with no trailing slash. A path that is not under it is left whole — it cannot happen
+ * for a walk of `dir`, and silently truncating one would import the wrong file rather than fail.
+ */
+export string[] beside(string dir, string[] walked) {
+  string prefix = "\{dir}/";
+  string[] out = string[].filled(walked.len(), "");
+  for (i32 i = 0; i < walked.len(); i++) {
+    string p = walked[i];
+    out[i] = p.len() > prefix.len() && p.slice(0, prefix.len()) == prefix
+           ? p.slice(prefix.len(), p.len())
+           : p;
+  }
+  return out;
+}
+
+/** `dir` with any trailing slashes taken off, so that `dir + "/" + name` is one slash. */
+export string noTrailingSlash(string dir) {
+  i32 n = dir.len();
+  while (n > 1 && dir.slice(n - 1, n) == "/") { n = n - 1; }
+  return dir.slice(0, n);
+}
+
+/**
+ * One entry that imports every test file and re-exports its tests, for a single build.
+ *
+ * **`issues/system/0192`.** A build per test file recompiles the same import graph once per file:
+ * `packages/box`'s sixteen files took 40.9s as sixteen builds and 11.1s as one, and the difference is
+ * entirely compilation — the assertions in them total under two seconds.
+ *
+ * Three details each cost the native implementation a wrong first attempt, and are copied rather than
+ * rediscovered:
+ *
+ *   * **the alias must differ from the wrapper's name**, or the wrapper calls itself and the test
+ *     recurses until the stack goes;
+ *   * **the suffix goes on the end**, because a test that wants a trap is recognised by
+ *     `test_traps_` at the *start* and `--filter` matches a substring of the name a person typed;
+ *   * **the host's entries are declared here** when a wrapper takes `Host`: the aggregate is the module the
+ *     runner loads, so it is the one that must export `__wacHost` and `__wacAnswered`.
+ *
+ * Sharing one module across files is safe because wac has no module-level variables: a trap unwinds
+ * the call and leaves nothing behind, which is the same reason `test_traps_*` has always been able to
+ * run beside its neighbours.
+ *
+ * `up` is one `../` because the aggregate is written into `.cache/`, one level down, and the paths it
+ * imports are relative to the working directory.
+ */
+export string aggregateSource(string[] files, string[] texts, string up) {
+  string out = "// Generated by `wac test <directory>` — one build for the whole walk.\n";
+  string wrappers = "";
+  bool hosted = false;
+  for (i32 i = 0; i < files.len(); i++) {
+    // **Parsed, not scanned** — and from the text a test build compiles (`testEntry`), so a test that
+    // takes `Sys` or is `async` is already its `(Host)` adapter here. A scan for
+    // `export string test` missed every `void` test, every verbatim name and every adapter, and a file
+    // of nothing else dropped out of the walk without a word (spec ch47).
+    DeclaredTest[] tests = declaredTests(testEntry(texts[i]));
+    if (tests.len() == 0) { continue; }
+    string aliased = "";
+    for (i32 k = 0; k < tests.len(); k++) {
+      string impl = "impl\{i}_\{k}";
+      aliased = aliased + (aliased == "" ? "" : ", ") + tests[k].name + " as " + impl;
+      // The `__f<n>` suffix inside a verbatim name's quotes, so `shownName` finds it either way.
+      string n = tests[k].name;
+      string wrapped = n.len() > 3 && n.slice(0, 2) == "@\""
+        ? "\{n.slice(0, n.len() - 1)}__f\{i}\"" : "\{n}__f\{i}";
+      string call = "\{impl}(\{tests[k].args})";
+      if (tests[k].params.indexOf("Host") >= 0) { hosted = true; }
+      wrappers = wrappers + "export string " + wrapped + "(" + tests[k].params + ") { "
+               + (tests[k].isVoid ? "\{call}; return \"\"; }\n" : "return \{call}; }\n");
+    }
+    // **`./` when `up` is empty, because a specifier without it is not a relative path.**
+    // spec/spec/imports.md says a path is relative *using* `./` or `../`; a bare `a_test.wac` is a
+    // mapping name or nothing. It resolved anyway — every host joined a bare specifier to the
+    // importing file's directory — and this generated one every time the aggregate was written
+    // *beside* the files it imports, which is the `beside` path taken for a directory outside the
+    // project. `issues/system/0234a` stopped that fallback, and this is the one place in the tree
+    // that was relying on it. Found by the refusal, which is what a refusal is for.
+    string spec = up + files[i];
+    if (spec.len() > 0 && spec.slice(0, 1) != "." && spec.slice(0, 1) != "/") { spec = "./\{spec}"; }
+    out = out + "import { \{aliased} } from \"\{spec}\";\n";
+  }
+  // The wrappers spell the host as the manifest does, `Host`; nothing here declares one of its own.
+  if (hosted) { out = out + hostImports() + "import { Host } from \"std\";\n" + hostEntries(); }
+  return "\{out}\n\{wrappers}";
+}
+
+/** Which file a wrapper came from: `name__f3` is file 3. `-1` when it carries no suffix. */
+i32 fileOfWrapper(string name) {
+  i32 at = -1;
+  for (i32 i = 0; i + 3 < name.len(); i++) {
+    if (name.slice(i, i + 3) == "__f") { at = i; }
+  }
+  if (at < 0) { return -1; }
+  string digits = name.slice(at + 3, name.len());
+  if (digits.len() == 0) { return -1; }
+  i32 v = 0;
+  u8[] b = digits.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return -1; }
+    v = v * 10 + (b[i] as i32 - '0');
+  }
+  return v;
+}
+
+/** A wrapper's name without its `__f<n>` suffix, which is what a reader is shown. */
+string shownName(string name) {
+  i32 at = -1;
+  for (i32 i = 0; i + 3 < name.len(); i++) {
+    if (name.slice(i, i + 3) == "__f") { at = i; }
+  }
+  return at < 0 ? name : name.slice(0, at);
+}
+
+/** `s` without leading or trailing whitespace. */
+string trimmedText(string s) {
+  i32 from = 0;
+  i32 to = s.len();
+  while (from < to && isBlank(s.slice(from, from + 1))) { from = from + 1; }
+  while (to > from && isBlank(s.slice(to - 1, to))) { to = to - 1; }
+  return s.slice(from, to);
+}
+
+bool isBlank(string c) { return c == " " || c == "\n" || c == "\t" || c == "\r"; }
+
+
+/**
+ * `files` without anything `--ignore` excludes.
+ *
+ * **A prefix match, as `deno test --ignore` is**, so naming a directory excludes what is under it. The
+ * native command applies it to a *named* file too, for a reason worth keeping: `tools/runTests.wac`
+ * assembles the targets and the ignore list from one source, and the two must not contradict each
+ * other — a caller that gets a different answer for naming one file than for naming its directory has
+ * to hold both rules in its head.
+ */
+/**
+ * `--only a_test.wac,b_test.wac`: the walked files whose tests this run calls, the rest compiled and not run.
+ *
+ * **Why a run would compile what it does not run.** The suite splits a large directory into chunks run at
+ * once, and a chunk named by its files is an aggregate of its own — so `packages/wacc/test/wac`'s eight chunks
+ * compiled the compiler eight times, about 19s each, a third of what that directory cost. Named as the
+ * directory with `--only`, every chunk is the same aggregate, which the build cache holds after the first.
+ * Each name is spelled as the walk spells it, `dir/` trimmed as `--ignore` trims it.
+ */
+export string[] onlyList(string spec) {
+  Vec<string> out = Vec.create();
+  if (trimmedText(spec) == "") { return out.toArray(); }
+  i32 at = 0;
+  while (at <= spec.len()) {
+    i32 comma = spec.slice(at, spec.len()).indexOf(",");
+    i32 end = comma < 0 ? spec.len() : at + comma;
+    string one = trimmedText(spec.slice(at, end));
+    if (one != "") { out.push(normalisePath(one)); }
+    if (comma < 0) { break; }
+    at = end + 1;
+  }
+  return out.toArray();
+}
+
+export string[] withoutIgnored(string[] files, string spec) {
+  if (trimmedText(spec) == "") { return files; }
+  // A `Vec`, not an array trimmed by `exactly` afterwards: this is the test runner's code and the
+  // runner is moving out of the compiler's example (`issues/system/0257c`), so it owes the file it
+  // is leaving as little as possible. One fewer helper to follow it.
+  Vec<string> out = Vec.create();
+  for (i32 i = 0; i < files.len(); i++) {
+    bool skip = false;
+    i32 at = 0;
+    while (at <= spec.len() && !skip) {
+      i32 comma = spec.slice(at, spec.len()).indexOf(",");
+      i32 end = comma < 0 ? spec.len() : at + comma;
+      string one = trimmedText(spec.slice(at, end));
+      // `dir/` names the directory as `dir` does — the spelling spec ch47's own example uses.
+      while (one.len() > 1 && one.slice(one.len() - 1, one.len()) == "/") { one = one.slice(0, one.len() - 1); }
+      if (one.len() > 2 && one.slice(0, 2) == "./") { one = one.slice(2, one.len()); }
+      if (one != "" && (files[i] == one || startsWithPath(files[i], "\{one}/"))) { skip = true; }
+      if (comma < 0) { break; }
+      at = end + 1;
+    }
+    if (!skip) { out.push(files[i]); }
+  }
+  return out.toArray();
+}
+
+/** Whether `path` begins with `prefix`. */
+bool startsWithPath(string path, string prefix) {
+  return path.len() >= prefix.len() && path.slice(0, prefix.len()) == prefix;
+}
+
+/**
+ * Every `*_test.wac` under `dir`, sorted, walked recursively.
+ *
+ * **The suffix, not the directory.** A `test/` folder holds probes and fixtures as well as tests — of
+ * this repository's files under `test/wac`, a large minority export nothing runnable and exist to be
+ * driven from a host — so walking directories would report each of them as an error. The naming rule
+ * is what makes discovery a question about the file rather than about where it sits, and it is the
+ * native command's rule exactly, because a caller assembling both lists must not get two answers.
+ *
+ * Sorted at each level, so a run is the same twice. `.`-prefixed directories, `node_modules` and
+ * `target` are skipped: nothing anybody wants compiled, and `target` in particular is enormous.
+ */
+export async string[] testFilesIn(Files fs, string dir) {
+  // **No cap**, because a cap here is a silent truncation and this is a *test* runner: running fewer
+  // files and reporting that they passed is the worst answer available. `maxFiles()` bounds a
+  // program's import graph and `issues/lang/0158` is the day it was applied by skipping rather than
+  // reporting; a growing vector has nothing to skip.
+  Vec<string> out = Vec.create();
+  await walkTests(fs, dir, out);
+  return out.toArray();
+}
+
+/**
+ * Every test file named by `paths`, with directories expanded and duplicates dropped.
+ *
+ * **`wac test` documents the plural** — `wac test [path…]`, "every `test*` export under each path" —
+ * and until 2026-08-28 it ran the first path and reported that file's count as the answer for all of
+ * them (`issues/system/0272b`). It was then made to *refuse* a second path, which is the smaller
+ * change and turns a silent wrong answer into a loud one; what it does not do is give the plural
+ * form back to the caller that needs it. `tools/runTests.wac` chunks a large directory into lists of
+ * twelve files and hands each list to one `wac test`, so under the refusal 29 of the gate's 58
+ * chunks exited 2 having run nothing — every large directory in the repository, silently absent from
+ * the lane's counts.
+ *
+ * **Deduplicated, because a caller may name a directory and a file inside it.** The same file twice
+ * in the aggregate is a duplicate import of the same module and every test in it runs twice.
+ */
+export async string[] testTargets(Files fs, string[] paths) {
+  Vec<string> out = Vec.create();
+  for (i32 p = 0; p < paths.len(); p++) {
+    string one = paths[p];
+    if (await isDirAt(fs, one)) {
+      string[] under = await testFilesIn(fs, one);
+      for (i32 i = 0; i < under.len(); i++) { pushOnce(out, under[i]); }
+    } else {
+      pushOnce(out, one);
+    }
+  }
+  return out.toArray();
+}
+
+/**
+ * The deepest directory every one of `paths` is at or below, or "" when there is none.
+ *
+ * `beside` needs such a directory to put the aggregate in, and one target supplies it directly —
+ * it *is* the directory that was walked. Several targets do not, so it is computed: the common
+ * prefix of the paths, cut back to the last separator so it names a directory rather than half a
+ * file name. Two trees with nothing above them but the root give "", which the caller refuses.
+ */
+export string commonDir(string[] paths) {
+  if (paths.len() == 0) { return ""; }
+  string pre = paths[0];
+  for (i32 i = 1; i < paths.len(); i++) {
+    string other = paths[i];
+    i32 n = pre.len() < other.len() ? pre.len() : other.len();
+    i32 k = 0;
+    while (k < n && pre.slice(k, k + 1) == other.slice(k, k + 1)) { k = k + 1; }
+    pre = pre.slice(0, k);
+  }
+  i32 cut = pre.len();
+  while (cut > 0 && pre.slice(cut - 1, cut) != "/") { cut = cut - 1; }
+  if (cut <= 1) { return ""; }
+  return pre.slice(0, cut - 1);
+}
+
+/** Append unless it is already there. Linear, over a list this is the length of a directory. */
+void pushOnce(Vec<string> out, string path) {
+  for (i32 i = 0; i < out.len(); i++) { if (out.get(i) == path) { return; } }
+  out.push(path);
+}
+
+/** One level of the walk, appending into `out`. */
+async void walkTests(Files fs, string dir, Vec<string> out) {
+  // "" is the current directory, which a host's `readDir` is asked for by name.
+  string[]? listed = (await fs.readDir(dir == "" ? "." : dir)).ok();
+  if (listed is null) { return; }
+  string[] names = sortedNames(listed!);
+  for (i32 i = 0; i < names.len(); i++) {
+    string name = names[i];
+    if (name == "" || name.slice(0, 1) == ".") { continue; }
+    if (name == "node_modules" || name == "target") { continue; }
+    // `wac test .` arrives here as "", the current directory normalised, and "" + "/" + name is a file
+    // at the root of the filesystem: *cannot read /a_test.wac*.
+    string path = dir == "" ? name : dir + (dir.slice(dir.len() - 1, dir.len()) == "/" ? "" : "/") + name;
+    if (await isDirAt(fs, path)) {
+      await walkTests(fs, path, out);
+      continue;
+    }
+    if (name.len() > 9 && name.slice(name.len() - 9, name.len()) == "_test.wac") {
+      out.push(path);
+    }
+  }
+}
+
+/** `names`, sorted — an insertion sort, because a directory is small and this runs per level. */
+string[] sortedNames(string[] names) {
+  string[] out = string[].filled(names.len(), "");
+  out.copyFrom(names, 0, 0, names.len());
+  for (i32 i = 1; i < out.len(); i++) {
+    string v = out[i];
+    i32 j = i - 1;
+    while (j >= 0 && out[j] > v) { out[j + 1] = out[j]; j = j - 1; }
+    out[j + 1] = v;
+  }
+  return out;
+}
+
+/**
+ * Every `test*` export a manifest declares, in the order the module declares them.
+ *
+ * **From the manifest rather than from a scan of the source**, which is the difference between this
+ * and `native/v8`'s `test_exports_of`: that reads the file with `match_indices("export string test")`
+ * because it runs *before* anything is compiled and has to decide what to build. Here the module is
+ * already built and describes itself, so there is nothing to guess and no comment that can look like
+ * a declaration. `issues/system/0240c` is what made the module reachable from wac at all.
+ */
+TestExport[] testExportsIn(string manifest) {
+  JsonValue? doc = parse(manifest.toBytes()).ok();
+  if (doc is null) { return TestExport[](); }
+  JsonObject root = JsonObject.create();
+  match (doc!) {
+    Object(o): { root = o; }
+    default: { return TestExport[](); }
+  }
+  JsonValue? xs = root.getStr("exports");
+  if (xs is null) { return TestExport[](); }
+  // No cap, for `testFilesIn`'s reason.
+  Vec<TestExport> out = Vec.create();
+  match (xs!) {
+    Array(items): {
+      for (i32 i = 0; i < items.len(); i++) {
+        match (items.get(i)) {
+          Object(e): {
+            JsonValue? nm = e.getStr("name");
+            if (nm is null) { continue; }
+            match (nm!) {
+              Str(bytes): {
+                string name = string.fromBytes(bytes);
+                if (name.len() > 4 && name.slice(0, 4) == "test") {
+                  out.push(TestExport(name, namesHost(e), namesOracle(e)));
+                }
+              }
+              default: { }
+            }
+          }
+          default: { }
+        }
+      }
+    }
+    default: { }
+  }
+  return out.toArray();
+}
+
+/** One `test*` export: its name, and whether it asked for the host. */
+struct TestExport {
+  string name;
+  /**
+   * **Whether it takes the host** — a test taking `Sys` is its `(Host)` adapter — which is what decides if
+   * a run with no grants may call it.
+   *
+   * A test that names no capability cannot be affected by a grant, so it runs whatever was passed;
+   * one that takes the host and is given nothing would fail on its first call, and failing is the wrong
+   * answer to "you forgot a flag". The native host skips it and names the flag; this reads the same
+   * fact from the manifest to say the same thing.
+   */
+  bool needsHost;
+  /**
+   * **Whether it declares a parameter this runner cannot supply**, which means it wants an *oracle*.
+   *
+   * A test taking `fn<i32(i32)>` — or any type that is not `Host` — is asking for an
+   * independent implementation to compare against, and a *host* is what has one. 31 of this
+   * repository's wac test files are entirely of that kind and 17 more are mixed. `Module.call` reports
+   * such a call as status 3, "a signature this cannot call", and treating that as a failure is the
+   * wrong answer twice over: the test is not broken, and a suite of them would be all red.
+   *
+   * Read from the manifest here rather than from the status, because a skip has to be decided
+   * *before* the call: a test that is going to be skipped must not have the counters snapshotted
+   * around it, and it belongs in the profile's `skipped` list rather than its `tests` map.
+   */
+  bool needsOracle;
+}
+
+/**
+ * Whether an export declares a parameter that is not `Host`.
+ *
+ * The host is the world this runner can build; anything else is an oracle only a host supplies.
+ * A test with no parameters at all answers false, which is the ordinary case.
+ */
+bool namesOracle(JsonObject e) {
+  JsonValue? ps = e.getStr("params");
+  if (ps is null) { return false; }
+  match (ps!) {
+    Array(items): {
+      for (i32 i = 0; i < items.len(); i++) {
+        match (items.get(i)) {
+          Str(bytes): {
+            string ty = string.fromBytes(bytes);
+            if (!isHostType(ty)) { return true; }
+          }
+          default: { }
+        }
+      }
+    }
+    default: { }
+  }
+  return false;
+}
+
+/**
+ * Whether a manifest's type is std's `Host`: `Host`, or `Host__std` in a graph that declares another `Host` — a
+ * user's own is keyed by its file, never by `std`.
+ */
+bool isHostType(string ty) { return ty == "Host" || ty == "Host__std"; }
+
+/** Whether an export's declared parameters include `Host`. */
+bool namesHost(JsonObject e) {
+  JsonValue? ps = e.getStr("params");
+  if (ps is null) { return false; }
+  match (ps!) {
+    Array(items): {
+      for (i32 i = 0; i < items.len(); i++) {
+        match (items.get(i)) {
+          Str(bytes): { if (isHostType(string.fromBytes(bytes))) { return true; } }
+          default: { }
+        }
+      }
+    }
+    default: { }
+  }
+  return false;
+}
+
+
+/** Whether `name` holds `part`. `--filter` matches a substring, as the native command's does. */
+bool holds(string name, string part) {
+  return part == "" || name.indexOf(part) >= 0;
+}
+
+/** The value after a flag, or "" — `--filter passes`. */
+export string flagValue(string[] argv, i32 argc, string flag) {
+  for (i32 i = 1; i + 1 < argc; i++) {
+    if (argv[i] == flag) {
+      return argv[i + 1];
+    }
+  }
+  return "";
+}
+
+/**
+ * Run one built test module's exports, and answer the exit code.
+ *
+ * **A test named `test_traps_*` passes by trapping**, which is the convention `native/v8`'s
+ * `run_tests` owns and the reason `Module.call` reports a trap as a value: 389 of this repository's 2553
+ * test exports are that shape, and no wac program can catch one. A test with that name that *returns*
+ * is a failure — "returned instead of trapping" is the native command's own sentence, matched here
+ * because `commandparity_test.wac` compares them.
+ */
+/**
+ * The branch-coverage report a `--coverage` run prints, from the counters and the table beside them.
+ *
+ * `table` is `index\tline\tcol\tkind\tfile` per counter, in counter order — what `covTableFilesIn`
+ * answers and what `wac build --coverage` writes to `<stem>.cov`. `hit[i]` is how many times counter
+ * `i` ran, so the two are read together and neither means anything alone.
+ *
+ * **Points, not lines.** One line can hold two branches and the question is which of them ran, so a
+ * per-line count would report half a fact. The native command counts the same way.
+ */
+/**
+ * The report, optionally narrowed to a set of files.
+ *
+ * **`only` is empty for a single entry and the walked files for a directory**, which is what the
+ * native command does and is the more useful answer: a directory walk compiles one aggregate over
+ * every test file, so the unnarrowed table is dominated by `std/platform.wac` and reads `6 of 292
+ * points (2%)` where the files a person wrote are `4 of 6 (66%)`. The aggregate's own wrapper is in
+ * there too, under a `.cache/` name nobody typed.
+ *
+ * **The skip happens after `i` is counted, not by filtering the table.** `hit[i]` is positional —
+ * the table is one row per counter in counter order — so dropping rows before this would slide every
+ * later counter onto the wrong point and the percentage would still look plausible.
+ */
+void sayCoverage(Output out, string table, i32[] hit, string[] only) {
+  string[] lines = splitLines(table);
+  string[] names = string[].filled(lines.len(), "");
+  i32[] total = i32[].filled(lines.len(), 0);
+  i32[] taken = i32[].filled(lines.len(), 0);
+  i32 files = 0;
+  i32 points = 0;
+  i32 reached = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    if (lines[i] == "") { continue; }
+    string file = cellAt(cells(lines[i]), 4);
+    if (file == "") { continue; }
+    if (only.len() > 0) {
+      bool wanted = false;
+      for (i32 k = 0; k < only.len(); k++) { if (only[k] == file) { wanted = true; } }
+      if (!wanted) { continue; }
+    }
+    i32 at = -1;
+    for (i32 k = 0; k < files; k++) { if (names[k] == file) { at = k; } }
+    if (at < 0) { at = files; names[at] = file; files = files + 1; }
+    total[at] = total[at] + 1;
+    points = points + 1;
+    if (i < hit.len() && hit[i] > 0) { taken[at] = taken[at] + 1; reached = reached + 1; }
+  }
+  if (points == 0) { return; }
+  out.line("");
+  out.line("branch coverage: \{reached} of \{points} points ("
+           + "\{points == 0 ? 0 : (reached * 100) / points}%)");
+  for (i32 k = 0; k < files; k++) {
+    string left = "\{taken[k]} / \{total[k]}";
+    string pad = "";
+    for (i32 j = left.len(); j < 10; j++) { pad = pad + " "; }
+    out.line("      \{left}\{pad}\{names[k]}");
+  }
+}
+
+/** `text` split on newlines. */
+string[] splitLines(string text) {
+  i32 n = 1;
+  for (i32 i = 0; i < text.len(); i++) { if (text.slice(i, i + 1) == "\n") { n = n + 1; } }
+  string[] out = string[].filled(n, "");
+  i32 at = 0;
+  i32 k = 0;
+  for (i32 i = 0; i <= text.len(); i++) {
+    if (i == text.len() || text.slice(i, i + 1) == "\n") {
+      out[k] = text.slice(at, i);
+      k = k + 1;
+      at = i + 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * `file:line` per counter, in counter order — the host's `table_lines`, kept to the character.
+ *
+ * A row of the coverage table is `index\tline\tcol\tkind\tfile`, so the pair a profile names is
+ * column 4 and column 1. Anything downstream compares these strings against
+ * `harness/wacProfile.ts`'s `${p.file}:${p.line}`, so the order of the two halves is the contract
+ * rather than a preference.
+ */
+string[] tableLines(string table) {
+  string[] rows = string[].filled(0, "");
+  i32 n = 0;
+  for (i32 i = 0; i < table.len(); i++) { if (table.slice(i, i + 1) == "\n") { n++; } }
+  string[] out = string[].filled(n, "");
+  i32 at = 0;
+  i32 row = 0;
+  while (at < table.len() && row < n) {
+    i32 nl = at;
+    while (nl < table.len() && table.slice(nl, nl + 1) != "\n") { nl++; }
+    string line = table.slice(at, nl);
+    // columns, tab-separated: 0 index, 1 line, 2 col, 3 kind, 4 file
+    string[] c = string[].filled(5, "");
+    i32 col = 0;
+    i32 from = 0;
+    for (i32 i = 0; i <= line.len(); i++) {
+      if (i == line.len() || line.slice(i, i + 1) == "\t") {
+        if (col < 5) { c[col] = line.slice(from, i); }
+        col++;
+        from = i + 1;
+      }
+    }
+    out[row] = "\{c[4]}:\{c[1]}";
+    row++;
+    at = nl + 1;
+  }
+  return out;
+}
+
+/**
+ * The distinct `file:line` pairs of a table, in first-seen order.
+ *
+ * Several counters share a line — a `&&` is two branch points on one — so the raw table repeats, and
+ * `all` in a profile is the set of lines the entry *has*, against which the per-test lists are read.
+ * O(n²) on purpose: this runs once per entry over a few thousand rows, and a hash would need a map the
+ * language does not have yet.
+ */
+string[] uniqLines(string[] lines) {
+  string[] out = string[].filled(lines.len(), "");
+  i32 n = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    bool seen = false;
+    for (i32 j = 0; j < n; j++) { if (out[j] == lines[i]) { seen = true; break; } }
+    if (!seen) { out[n] = lines[i]; n++; }
+  }
+  string[] exact = string[].filled(n, "");
+  exact.copyFrom(out, 0, 0, n);
+  return exact;
+}
+
+/** Every counter's value, read through the module's own `__cov_len` and `__cov_get`. */
+i32[] countersOf(Module m) {
+  CallResult? n = m.call("__cov_len", 0).ok();
+  if ((n is null) || n!.status != 0 || n!.value <= 0) { return i32[](); }
+  i32[] out = i32[].filled(n!.value, 0);
+  for (i32 i = 0; i < n!.value; i++) {
+    CallResult? one = m.call("__cov_get", i).ok();
+    out[i] = (one is not null) && one!.status == 0 ? one!.value : 0;
+  }
+  return out;
+}
+
+/** What one file's tests came to. */
+struct Tally {
+  i32 passed;
+  i32 failed;
+  i32 filtered;
+  /** The names skipped for want of a capability, joined — empty when none were. */
+  string ungranted;
+  i32 ungrantedCount;
+  /** Tests that answered `skip: …` — could not ask their question here, and said why (spec ch47 `§wac-test-skip-k4r8w2m`). */
+  i32 skipped;
+  /**
+   * `"name":[lines]` per test that ran, comma-joined — the body of a profile's `tests` map.
+   *
+   * Carried out rather than written here because the file is one document per *entry* and this runs
+   * once per file within it. Empty unless `WAC_PROFILE` is set and the module carries counters.
+   * `issues/system/0264c` — the host wrote this until `test` moved, and a mutation sweep with no
+   * profile does not fail, it under-selects and scores the mutant as unrun.
+   */
+  string profileTests;
+  /** The names that did not run, quoted and comma-joined: a reader needs to know the map is partial. */
+  string profileSkipped;
+}
+
+/**
+ * The compiler's export table, plus the three the *instrumentation* injected.
+ *
+ * **`--coverage` was the native command's alone until 2026-08-24**, and this is why:
+ * `__cov_init`, `__cov_len` and `__cov_get` are emitted by the coverage pass rather than written in
+ * any source, so nothing put them in the export table and nothing put them in the manifest --
+ * and `Module.call` looks an export up in the manifest to find its signature. It answered "no export
+ * named `__cov_len`" for a function the module plainly exports, so a JavaScript-hosted `wac test
+ * --coverage` printed `branch coverage: 0 of 270 points (0%)` beside the native's `6 of 270 (2%)`:
+ * the table and the totals right and every counter zero, which is a wrong number rather than a
+ * missing one. `issues/system/0243c` refused the flag rather than print that.
+ *
+ * The signatures are not read back out of the module and are not guessed. The instrumentation is
+ * this repository's, and compiler/wasmBuildBin.ts states them in one line:
+ * `__cov_init() -> void, __cov_len() -> i32, __cov_get(i32) -> i32`, and `__cov_hash(i32) -> i32`
+ * joined them for `issues/system/0274b`. All four are inside the closed set `Module.call` accepts, which
+ * is not luck -- that set exists to cover what these commands need.
+ *
+ * A `name<TAB>ret<TAB>params` line each, with an empty return cell meaning void. Declaring them here
+ * rather than teaching the platform about coverage keeps the boundary generic: the compiler is what
+ * knows what the compiler injected.
+ */
+export string sigsWithCounters(string sigs, bool covered) {
+  if (!covered) { return sigs; }
+  return "\{sigs}__cov_init\t\t\n__cov_len\ti32\t\n__cov_get\ti32\ti32\n__cov_hash\ti32\ti32\n";
+}
+
+/**
+ * A name padded so the times after it form a column.
+ *
+ * **A fixed column rather than the longest name**, because the lines are printed as each test
+ * finishes and the longest is not known until the last one has. 58 covers most of this repository's
+ * names; a longer one pushes its own time right rather than being truncated, since the name is the
+ * part a reader is looking for and the alignment is only there to help them scan.
+ */
+string column(string name) {
+  string out = name;
+  while (out.len() < 58) { out = out + " "; }
+  return out;
+}
+
+/** ` (12 ms)`, the way a test's wall time is spelled. */
+string tookMs(Clock clock, i64 began) {
+  i64 took = (flatten(clock.monotonicNanos().wait()).unwrap() - began) / 1000000;
+  return " (\{took} ms)";
+}
+
+/**
+ * How long a file's tests took, for the summary line: `1.4s` past a second, `340 ms` below it.
+ *
+ * Two scales because they answer different questions. Under a second the interesting digit is the
+ * hundred of milliseconds — is this file 40 ms or 400 — and above it nobody reads three digits of
+ * millisecond, they read "this one is the slow one".
+ */
+string elapsedText(Clock clock, i64 began) {
+  i64 ms = (flatten(clock.monotonicNanos().wait()).unwrap() - began) / 1000000;
+  if (ms < 1000 as i64) { return "\{ms} ms"; }
+  i64 tenths = (ms + 50 as i64) / 100 as i64;
+  return "\{tenths / 10 as i64}.\{tenths % 10 as i64}s";
+}
+
+/**
+ * Call the named tests on a loaded module and report each one, answering what they came to.
+ *
+ * Shared by the one-file and the whole-directory paths, which differ in what they print *around* this
+ * and not in what a test means. `shown` is the name a reader sees: for a directory the exports carry
+ * an `__f<n>` suffix naming the file they came from, and that is bookkeeping rather than the test's
+ * name.
+ */
+Tally runNamed(Output out, Clock clock, Module m, TestExport[] names, i32[] which, i32 count, i32 grants, string filter, bool loud, string covTable, bool profiling) {
+  i32 passed = 0;
+  i32 failed = 0;
+  i32 skippedTests = 0;
+  i32 filtered = 0;
+  string ungranted = "";
+  i32 ungrantedCount = 0;
+  // **Only when asked**, because a snapshot is a host call per counter and there are thousands: the
+  // profile is for `tools/mutate.ts` and costs nothing when nobody set `WAC_PROFILE`.
+  string[] lineOf = profiling ? tableLines(covTable) : string[].filled(0, "");
+  string profileTests = "";
+  i32 profileN = 0;
+  string profileSkipped = "";
+  i32 skippedN = 0;
+  for (i32 k = 0; k < count; k++) {
+    TestExport t = names[which[k]];
+    string shown = shownName(t.name);
+    if (!holds(shown, filter)) { filtered = filtered + 1; continue; }
+    // **A test wanting an oracle is skipped, not failed.** See `TestExport.needsOracle`: the host is
+    // what has an independent implementation to compare against, and this runner does not. Recorded
+    // in the profile for the same reason an ungranted one is — a line only it reaches is not unhit.
+    if (t.needsOracle) {
+      if (profiling) {
+        profileSkipped = profileSkipped + (skippedN > 0 ? "," : "") + "\"" + shown + "\"";
+        skippedN++;
+      }
+      continue;
+    }
+    if (t.needsHost && grants == 0) {
+      ungranted = ungranted + (ungranted == "" ? "" : ", ") + shown;
+      ungrantedCount = ungrantedCount + 1;
+      // **A skipped test is why a profile is partial**, and saying so is what stops a reader taking
+      // the map at face value: 17 files here are mixed, and a line reached only by the tests that did
+      // not run would otherwise read as unhit — under-selection, which arrives as a better score.
+      if (profiling) {
+        profileSkipped = profileSkipped + (skippedN > 0 ? "," : "") + "\"" + shown + "\"";
+        skippedN++;
+      }
+      continue;
+    }
+    // **Both spellings**, because three other implementations of this rule take both — the native
+    // runner, `harness/wacTestRun.ts`, and `packages/wactest/README.md`, which documents it as
+    // "`test_traps_` (or `testTraps`)". This one took the first, so a camelCase `testTrapsOnNull`
+    // that trapped as its name says was a pass on the native binary and a failure here. Nothing in
+    // the repository is named that way today — 392 to 0 — which is why no test noticed.
+    bool wantsTrap = (shown.len() > 11 && shown.slice(0, 11) == "test_traps_")
+                     || (shown.len() > 9 && shown.slice(0, 9) == "testTraps");
+    // The clock only when it will be printed: `--quiet` says nothing per test, and this is a host
+    // call per test on the JavaScript hosts. The suite passes that flag and is where the host calls
+    // would add up — 2,700 of them for a figure nobody reads.
+    i64 began = loud ? flatten(clock.monotonicNanos().wait()).unwrap() : 0 as i64;
+    i32[] before = profiling ? countersOf(m) : i32[]();
+    CallResult c;
+    match (m.call(t.name, 0)) {
+      Ok(r): { c = r; }
+      Err(e): {
+        failed = failed + 1;
+        out.line("FAIL \{shown} — the call did not reach it: \{e}");
+        continue;
+      }
+    }
+    if (profiling) {
+      i32[] after = countersOf(m);
+      string ls = "";
+      i32 lsN = 0;
+      for (i32 i = 0; i < after.len() && i < lineOf.len(); i++) {
+        i32 was = i < before.len() ? before[i] : 0;
+        if (after[i] <= was) { continue; }
+        ls = ls + (lsN > 0 ? "," : "") + "\"" + lineOf[i] + "\"";
+        lsN++;
+      }
+      profileTests = profileTests + (profileN > 0 ? "," : "") + "\"" + shown + "\":[" + ls + "]";
+      profileN++;
+    }
+    // `c.text` is what the *program* said, or empty for an engine trap — a bounds check, a null
+    // dereference — which writes nothing. So the message is appended rather than assumed: this read
+    // `"— trapped: " + c.text` and left a dangling colon on every engine trap.
+    string said = c.text == "" ? "" : ": \{c.text}";
+    if (c.trapped()) {
+      if (wantsTrap) {
+        passed = passed + 1;
+        if (loud) { out.line("ok   \{shown} — trapped, as it says\{said}\{tookMs(clock, began)}"); }
+      } else { failed = failed + 1; out.line("FAIL \{shown} — trapped\{said}"); }
+    } else if (c.status != 0) {
+      failed = failed + 1;
+      out.line("FAIL \{shown} — \{c.text}");
+    } else if (wantsTrap) {
+      // The report is ignored on purpose: a test named for a trap that returned cleanly has not
+      // observed the thing it is about, and an empty string from it would otherwise read as a pass.
+      failed = failed + 1;
+      out.line("FAIL " + shown + " — returned instead of trapping"
+               + (c.text == "" ? "" : " — \{c.text}"));
+    } else if (c.text.len() >= 6 && c.text.slice(0, 6) == "skip: ") {
+      // **Skipped, saying why, and always said** (spec ch47 `§wac-test-skip-k4r8w2m`): a test that could not ask its
+      // question here — its tool is absent, the machine cannot refuse what it needs refused. Not a pass, which would
+      // claim an answer, and not a failure, which would be about the machine rather than the code.
+      skippedTests = skippedTests + 1;
+      out.line("skip \{shown} — \{c.text.slice(6, c.text.len())}");
+    } else if (c.text != "") {
+      failed = failed + 1;
+      out.line("FAIL \{shown} — \{c.text}");
+    } else {
+      passed = passed + 1;
+      if (loud) { out.line("ok   \{column(shown)}\{tookMs(clock, began)}"); }
+    }
+  }
+  return Tally(passed, failed, filtered, ungranted, ungrantedCount, skippedTests, profileTests, profileSkipped);
+}
+
+/**
+ * The summary one run of tests prints: what passed, what failed, what was left out, and how long.
+ *
+ * **The time is on the summary and not only on each test**, because the two answer different
+ * questions: the per-test times say which one to look at, and this says whether the file is worth
+ * looking at at all. It is also the number a reader compares against the last run, and adding the
+ * per-test times by hand is not that.
+ */
+void sayTally(Output out, Clock clock, Tally t, i64 began) {
+  out.line("\{t.passed} passed, \{t.failed} failed"
+           + (t.skipped > 0 ? ", \{t.skipped} skipped" : "")
+           + (t.filtered > 0 ? ", \{t.filtered} filtered out" : "")
+           + " in " + elapsedText(clock, began));
+}
+
+/**
+ * The `WAC_PROFILE` file name for an entry: the path with every separator flattened to `_`.
+ *
+ * A profile directory holds one document per entry and the entries are paths, so the name has to be
+ * something a directory can hold — `core/test/result_test.wac` becomes
+ * `core_test_result_test_wac.json`. `harness/wacProfile.ts` derives the same name from its own side
+ * and opens the file by it, so this is a shared spelling rather than a local choice; the `.` goes too,
+ * which is why the `.wac` reads as part of the stem.
+ */
+string profileStem(string entry) {
+  string out = "";
+  for (i32 i = 0; i < entry.len(); i++) {
+    string c = entry.slice(i, i + 1);
+    out = out + (c == "/" || c == "\\" || c == "." ? "_" : c);
+  }
+  return out;
+}
+
+/**
+ * Write one entry's per-test line map, if `WAC_PROFILE` asked for one.
+ *
+ * **Failing to write it is not a failing test run.** The profile is for a tool that is not this run;
+ * a directory that does not exist or a disk that is full should not turn a green suite red, and the
+ * host this was ported from took the same view. It warns, because silence here reads to
+ * `tools/mutate.ts` as "this entry has no tests".
+ */
+void writeProfile(Output err, Files fs, string dir, string entry, Tally t, string[] allLines) {
+  if (dir == "") { return; }
+  string all = "";
+  for (i32 i = 0; i < allLines.len(); i++) {
+    all = all + (i > 0 ? "," : "") + "\"" + allLines[i] + "\"";
+  }
+  string doc = "{\"entry\":\"\{entry}\",\"all\":[\{all}],\"tests\":{"
+             + "\{t.profileTests}},\"skipped\":[\{t.profileSkipped}]}";
+  string path = "\{dir}/\{profileStem(entry)}.json";
+  // **Made, not assumed.** `WAC_PROFILE` names where the profile should go rather than somewhere that
+  // exists: `tools/mutate.ts` points it at a fresh subdirectory of a temporary directory and expects
+  // the run to create it, which the host's version did with `create_dir_all` and this did not.
+  // `parents` because the whole path can be new.
+  fs.mkdir(dir, true).wait();
+  auto wrote = flatten(fs.writeFile(path, doc.toBytes()).wait());
+  if (wrote.isErr()) {
+    err.line("wac: WAC_PROFILE is set but \{path} could not be written — \{wrote.isErr() ? "\{wrote.err()!}" : ""}");
+  }
+}
+
+export i32 runTests(Output err, Output out, Clock clock, Files fs, Modules mods, string entry, u8[] whole, string manifest, Authority given, string filter, string[] files, i32 ignored, string target, string covTable, bool loud, string profileDir,
+                      string[] only) {
+  // **The tests get what the caller granted, and no more.** `wac test --allow-read` means the tests
+  // may read; it does not mean they may write because *this command* can. `load` narrows the world it
+  // hands over, and it took a test writing a file to disk to find that it had not been asked to —
+  // `issues/system/0242c`.
+  i32 grants = given.grants();
+  Module m;
+  match (mods.load(whole, given)) {
+    Ok(loaded): { m = loaded; }
+    Err(e): {
+      match (e) {
+        Unsupported(u): { err.line("wac: this host cannot run tests — `test` needs `load`, which a page has no form of"); }
+        default: { err.line("wac: the module just built will not load — \{e}"); }
+      }
+      return 1;
+    }
+  }
+  TestExport[] names = testExportsIn(manifest);
+  // **The counter array is allocated by this call, not by instantiation.** Without it every
+  // instrumented function traps on its first branch with "dereferencing a null pointer" — a message
+  // naming the program under test rather than the missing call, which is what both other hosts
+  // learnt the hard way.
+  if (covTable != "") { m.call("__cov_init", 0); }
+
+  // **One file: no headers, no file count.** That is what a person naming one file wants, and it is
+  // what the native command prints — the summary below is the whole output.
+  if (files.len() == 0) {
+    // **A file that exports no tests is an error, not a silent pass.** The failure worth guarding is
+    // a misnamed export: zero tests run, nothing fails, and the file reports `0 passed, 0 failed` —
+    // which reads as a file that is fine. Nobody names one file expecting it to have nothing in it,
+    // so saying so costs nothing and catches the case that otherwise makes a whole suite green by
+    // running none of it. A *directory* is different and is not covered here: a walk that finds no
+    // test files says so in its own words, above.
+    if (names.len() == 0) {
+      m.unload();
+      err.line("wac: \{entry} exports no tests — a test is `test*()` answering a string, "
+                + "empty for a pass");
+      return 1;
+    }
+    i32[] all = i32[].filled(names.len(), 0);
+    for (i32 i = 0; i < names.len(); i++) { all[i] = i; }
+    i64 began = flatten(clock.monotonicNanos().wait()).unwrap();
+    Tally t = runNamed(out, clock, m, names, all, names.len(), grants, filter, loud, covTable, profileDir != "");
+    // **Read before the handle goes.** The counters live in the module, so `unload` is the end of
+    // them — and an unloaded handle answers "no such export" rather than failing, so this would have
+    // reported a run of nothing as a coverage of zero.
+    i32[] hit = covTable != "" ? countersOf(m) : i32[]();
+    m.unload();
+    if (t.ungrantedCount > 0) {
+      out.line("\{t.ungrantedCount} test(s) want a capability this run was not granted: "
+               + "\{t.ungranted} — try `wac test --allow-read …`");
+      if (t.passed == 0 && t.failed == 0 && t.skipped == 0) {
+        err.line("wac: every test in \{entry} wants a capability this run was not granted — "
+                  + "try `--allow-read`");
+      }
+    }
+    // **Said, and not a failure** (spec ch47): a filter that matched nothing and a file whose
+    // every test wanted a grant are reported by name, and the run still exits 0 — neither ran a test
+    // that went wrong.
+    if (t.passed == 0 && t.failed == 0 && t.skipped == 0 && filter != "") {
+      out.line("(no test matches --filter \{filter})");
+    }
+    sayTally(out, clock, t, began);
+    if (covTable != "") { sayCoverage(out, covTable, hit, string[]()); }
+    writeProfile(err, fs, profileDir, entry, t, uniqLines(tableLines(covTable)));
+    return t.failed == 0 ? 0 : 3;
+  }
+
+  // **A directory: one block per file, in the order they were walked.** The exports carry an `__f<n>`
+  // suffix naming the file each came from — `aggregateSource` puts it on the *end* so that
+  // `test_traps_` still reads at the start — and this is where that is spent.
+  i32 ok = 0;
+  i32 withFailures = 0;
+  i32 unmatched = 0;
+  i32 ungrantedFiles = 0;
+  // **Tests, not files**, and counted across the whole walk: a file whose *other* tests passed is
+  // `ok` above, so without this a run that skipped seventeen of them would report nothing but `13 ok`.
+  i32 ungrantedTests = 0;
+  // **Column-aligned**, which needs every name before the first line can be printed.
+  string[] failingFiles = string[].filled(files.len(), "");
+  i32 failingN = 0;
+  i32 code = 0;
+  // **One document for the walk, not one per file**, because the module is one: the aggregate carries
+  // every file's tests under `__f<n>` wrappers and there is a single counter array behind all of them.
+  // The entry a profile is keyed by is what the caller named, which for a walk is the directory.
+  string walkTests = "";
+  string walkSkipped = "";
+  // The whole walk, for the summary — the per-file times below say which file, and this says
+  // whether the run was worth waiting for. Wall time, named as such: the CPU split the native
+  // command used to print is `getrusage` and not something a wac program is offered.
+  i64 runBegan = flatten(clock.monotonicNanos().wait()).unwrap();
+  // **A name `--only` gives that the walk did not find is refused, not skipped**: skipping it would run
+  // nothing for it and pass, which is the one answer a list of files must never give.
+  for (i32 k = 0; k < only.len(); k++) {
+    bool walkedIt = false;
+    for (i32 f = 0; f < files.len(); f++) { if (files[f] == only[k]) { walkedIt = true; } }
+    if (!walkedIt) {
+      m.unload();
+      err.line("wac: --only names \{only[k]}, which this walk of \{target} did not find");
+      return 1;
+    }
+  }
+  for (i32 f = 0; f < files.len(); f++) {
+    if (only.len() > 0) {
+      bool chosen = false;
+      for (i32 k = 0; k < only.len(); k++) { if (files[f] == only[k]) { chosen = true; } }
+      if (!chosen) { continue; }
+    }
+    i32[] mine = i32[].filled(names.len(), 0);
+    i32 count = 0;
+    for (i32 i = 0; i < names.len(); i++) {
+      if (fileOfWrapper(names[i].name) == f) { mine[count] = i; count = count + 1; }
+    }
+    if (count == 0) { continue; }
+    // **No header when the walk found one file**, which is what the native command does and was found
+    // by asking it: a fresh project with a single test file printed `── t/x_test.wac` here and nothing
+    // there. One file named by a directory reads like one file named directly, plus the summary line
+    // that says a directory was walked.
+    if (files.len() > 1) { out.line("── \{files[f]}"); }
+    i64 began = flatten(clock.monotonicNanos().wait()).unwrap();
+    Tally t = runNamed(out, clock, m, names, mine, count, grants, filter, loud, covTable, profileDir != "");
+    if (t.ungrantedCount > 0) {
+      out.line("\{t.ungrantedCount} test(s) want a capability this run was not granted: "
+               + "\{t.ungranted} — try `wac test --allow-read …`");
+    }
+    // **The file, not the aggregate.** A run with no grants skips every test that wants a world, and
+    // the sentence telling you which flag to pass has to name the file you can look at. The native
+    // command named its own generated aggregate here until 2026-08-24 — a path the caller never typed
+    // and cannot open. `issues/system/0230a`'s differential is what made that visible.
+    bool allUngranted = t.ungrantedCount > 0 && t.passed == 0 && t.failed == 0 && t.skipped == 0;
+    if (allUngranted) {
+      err.line("wac: every test in \{files[f]} wants a capability this run was not granted — "
+                + "try `--allow-read`");
+    }
+    // **Per file, not once for the walk.** A filter that matched nothing *here* is worth saying about
+    // this file; `0 passed, 0 failed, 2 filtered out` says the same thing in a shape that reads like a
+    // file that has emptied itself.
+    bool nothingMatched = t.passed == 0 && t.failed == 0 && t.skipped == 0 && filter != "";
+    // **No tally under a file that ran nothing.** `0 passed, 0 failed` after "every test here wants a
+    // capability" is the same fact twice, and the second telling reads like a file with no tests in it.
+    if (allUngranted) {
+      // The message above is this file's whole report.
+    } else if (nothingMatched) {
+      out.line("(no test matches --filter \{filter})");
+    } else {
+      sayTally(out, clock, t, began);
+    }
+    if (t.profileTests != "") { walkTests = walkTests + (walkTests == "" ? "" : ",") + t.profileTests; }
+    if (t.profileSkipped != "") {
+      walkSkipped = walkSkipped + (walkSkipped == "" ? "" : ",") + t.profileSkipped;
+    }
+    if (t.failed > 0) {
+      withFailures = withFailures + 1;
+      failingFiles[failingN] = files[f];
+      failingN = failingN + 1;
+      if (code == 0) { code = 3; }
+    } else if (allUngranted) {
+      // **Its own kind.** A file that ran nothing for want of a flag is not `ok`, and it is not
+      // "needing a host oracle" either: an oracle needs a host and a capability needs a flag on this
+      // command line, so a reader told the wrong one goes looking for the wrong thing.
+      ungrantedFiles = ungrantedFiles + 1;
+      ungrantedTests = ungrantedTests + t.ungrantedCount;
+    } else if (nothingMatched) {
+      // **Counted apart from `ok`.** A file the filter emptied has not passed; calling it ok would
+      // report a run of nothing as a run of everything, which is the shape a `--filter` typo takes.
+      unmatched = unmatched + 1;
+    } else {
+      ok = ok + 1;
+      ungrantedTests = ungrantedTests + t.ungrantedCount;
+    }
+  }
+  // **Read before the handle goes**, for the reason the single-file branch above gives: the counters
+  // live in the module and `unload` is the end of them.
+  //
+  // **`--coverage` over a directory did nothing here until 2026-08-25**, which is the shape this
+  // command keeps producing: the flag was accepted, the run happened, and no report was printed —
+  // where the native command answers with the table. One aggregate module means one counter array for
+  // the whole walk, so this is the same two calls the single-file branch makes.
+  i32[] hit = covTable != "" ? countersOf(m) : i32[]();
+  m.unload();
+  // **Nothing matched anywhere is a mistake, not a clean walk.** Per file the message says which file
+  // the filter emptied; across the whole walk it says the pattern found nothing at all, and exits
+  // non-zero, because `N files: 0 ok` under a filter reads like a suite that passed.
+  // Said by name, and — spec ch47 — not a failure: the summary below still counts the walk.
+  if (unmatched > 0 && ok == 0 && withFailures == 0) {
+    err.line("wac: no test anywhere under \{target} matches --filter \{filter}");
+  }
+  // The report goes between the blocks and the summary, where the native command puts it, and it
+  // opens with the blank line the summary would otherwise have printed for itself.
+  if (covTable != "") { sayCoverage(out, covTable, hit, files); }
+  // The blank line separates the per-file blocks from the summary, and there are no blocks to
+  // separate when the walk found one file — the native command prints none there either.
+  else if (files.len() > 1) { out.line(""); }
+  // **One section of the native command's output is missing here, and cannot be written.** After the
+  // summary it ranks the files that cost a second or more:
+  //
+  //     1 file(s) cost a second or more of CPU to run — the other 4 did not:
+  //         1.1s cpu ( 1.1s here,  0.0s in children)   1.0s wall  src/nested/deep_test.wac
+  //
+  // That is *CPU* time, split between this process and its children, which is `getrusage` and not
+  // something the platform offers a wac program — `Clock` has a wall clock and no accounting. Wall
+  // time alone would be a different number under a different name, which is worse than an absence.
+  // It is a diagnostic aid rather than part of the result, so a walk that takes under a second a file
+  // — every case in `commandparity_test.wac` — agrees anyway. `issues/system/0230a`.
+  //
+  // `1 file:` and `4 files:`, as the native command spells them. `file(s)` is the spelling that
+  // avoids the choice, and it is a different sentence from the one this has to match.
+  i32 total = ok + withFailures + unmatched + ungrantedFiles;
+  out.line("\{total}" + (total == 1 ? " file: " : " files: ") + "\{ok} ok"
+           + (ignored > 0 ? ", \{ignored} not run (--ignore)" : "")
+           + (withFailures > 0 ? ", \{withFailures} with failures" : "")
+           + (ungrantedFiles > 0 ? ", \{ungrantedFiles} needing a grant" : "")
+           + (ungrantedTests > 0 ? ", \{ungrantedTests} test(s) skipped for a grant" : "")
+           + (unmatched > 0 ? ", \{unmatched} with nothing matching --filter" : "")
+           + " in " + elapsedText(clock, runBegan));
+  if (failingN > 0) {
+    i32 wide = 0;
+    for (i32 i = 0; i < failingN; i++) {
+      if (failingFiles[i].len() > wide) { wide = failingFiles[i].len(); }
+    }
+    string block = "";
+    for (i32 i = 0; i < failingN; i++) {
+      string pad = "";
+      for (i32 k = failingFiles[i].len(); k < wide; k++) { pad = pad + " "; }
+      block = block + "\n   \{failingFiles[i]}\{pad}   failures";
+    }
+    out.line(block);
+  }
+  writeProfile(err, fs, profileDir, entry, Tally(0, 0, 0, "", 0, 0, walkTests, walkSkipped), uniqLines(tableLines(covTable)));
+  return code;
+}
+
+/** Whether `p` is a directory — false for anything else, and for a path that cannot be looked at. */
+export async bool isDirAt(Files fs, string p) {
+  // "" is the current directory normalised — `wac test .` — which the host is asked for by name.
+  Stat? s = (await fs.stat(p == "" ? "." : p)).ok();
+  return (s is not null) && s!.isDir;
+}

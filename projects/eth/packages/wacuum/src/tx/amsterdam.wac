@@ -1,0 +1,275 @@
+// A transaction under Amsterdam: execution-specs' Amsterdam `validate_transaction`, `check_transaction`,
+// `create_evm`, `process_top_level`, `set_delegation` and `settle_transaction_gas`, in their order.
+//
+// Amsterdam splits gas in two (EIP-8037). Execution gas is what it was, repriced (EIP-8038, EIP-2780, EIP-7976,
+// EIP-7981) and capped at 2^24 a transaction (EIP-7825); state gas pays for the bytes a transaction adds to the state
+// — a new account, a slot made nonzero, code deployed, a delegation written — at 1530 a byte. A transaction's gas
+// limit above its intrinsic cost becomes an execution grant up to the cap, and whatever is over the cap a reservoir
+// that state charges draw on first, spilling into execution gas once it is dry. The block counts the two apart, the
+// execution side before refunds (EIP-7778), and its header's gas used is the larger.
+
+import { U256 } from "../u256.wac";
+import { Map } from "core";
+import { World, Log, Snapshot, hashU256, eqU256 } from "../state/world.wac";
+import { Evm, BlockEnv, TxEnv, Message, Meter, processMessage, processCreate, createAddress, delegationOf, delegationTo,
+         MAX_INITCODE_SIZE_AMSTERDAM, STATE_NEW_ACCOUNT, STATE_AUTH_BASE } from "../evm/evm.wac";
+import { Outcome, Halt, chargeStateOn } from "../evm/interp.wac";
+import { precompileAddresses } from "../evm/precompiles.wac";
+import { Spec, MAX_BLOBS_PER_TX } from "../evm/spec.wac";
+import { secpN } from "../crypto/secp256k1.wac";
+import { Transaction, Authorization, Processed, invalid, recoverAuthority, mulFits, GAS_PER_BLOB } from "./process.wac";
+
+/** EIP-7825: the execution gas a transaction may use. */
+export static i64 TX_MAX_GAS = 16777216;
+/** EIP-8037: the gas limit a transaction may ask for, execution and state together. */
+export static i64 TX_MAX_TOTAL_GAS = 4294967295;
+
+/** A transaction's intrinsic execution gas, and the floor its gas used cannot go below (EIP-7623, EIP-7976). */
+export struct Intrinsic {
+  i64 execution;
+  i64 floor;
+}
+
+/**
+ * The intrinsic cost under Amsterdam (`calculate_intrinsic_cost`). EIP-2780 prices the parts a transaction always
+ * has: 12000 for the sender; 3000 to reach a recipient (none for a transfer to oneself), 6000 more to move value to
+ * it, or 12000 to create one; then calldata at 4 a token, access list entries at what warming them saves (2900 an
+ * address, 2000 a key) and, by EIP-7981, their bytes at the floor price too; and an authorization's
+ * state-independent 7816. The floor is the same base, every calldata byte at 64, and the access list's bytes.
+ */
+export Intrinsic intrinsicAmsterdam(Transaction tx) {
+  i64 zeros = 0;
+  for (i32 i = 0; i < tx.data.len(); i++) { if (tx.data[i] == 0) { zeros++; } }
+  i64 n = tx.data.len() as i64;
+  i64 tokens = zeros + 4 * (n - zeros);
+  i64 recipient = 0;
+  i64 initcode = 0;
+  if (tx.to is null) {
+    recipient = 12000;
+    initcode = 2 * ((n + 31) / 32);
+  } else if (!tx.to!.eq(tx.sender)) {
+    recipient = 3000;
+    if (!tx.value.isZero()) { recipient += 6000; }
+  }
+  i64 access = 0;
+  i64 accessTokens = 0;
+  for (i32 i = 0; i < tx.accessList.len(); i++) {
+    i64 keys = tx.accessList[i].keys.len() as i64;
+    access += 2900 + 2000 * keys;
+    accessTokens += 80 + 128 * keys;
+  }
+  i64 accessData = 16 * accessTokens;
+  i64 auths = 7816 * (tx.authorizations.len() as i64);
+  i64 base = 12000 + recipient;
+  return Intrinsic(base + initcode + 4 * tokens + access + accessData + auths, base + 64 * n + accessData);
+}
+
+/**
+ * One transaction under Amsterdam. `execLeft` and `stateLeft` are what the block has room for in each dimension:
+ * the gas limit less the execution gas used so far, and less the state gas used so far.
+ */
+export Processed processAmsterdam(Spec spec, World w, BlockEnv block, Transaction tx, i64 execLeft, i64 stateLeft,
+                                  i64 blobGasLeft, fn<void(string)>? tracer) {
+  // ── validate_transaction: what the transaction alone decides ──
+  if (!tx.nonce.fitsU64() || tx.nonce.low() == 0xFFFFFFFFFFFFFFFF) { return invalid("nonce too high"); }
+  if (tx.to is null && tx.data.len() > MAX_INITCODE_SIZE_AMSTERDAM) { return invalid("init code too large"); }
+  if (!tx.gasLimit.fitsU64() || tx.gasLimit.low() > 4294967295) { return invalid("gas limit above EIP-8037's cap"); }
+  i64 gasLimit = tx.gasLimit.low() as@ i64;
+  if (tx.txType >= 2 && tx.maxFeePerGas.lt(tx.maxPriorityFeePerGas)) { return invalid("priority fee above max fee"); }
+  if (tx.txType == 3) {
+    if (tx.blobHashes.len() == 0) { return invalid("a blob transaction without blobs"); }
+    if (tx.blobHashes.len() > MAX_BLOBS_PER_TX) { return invalid("more blobs than EIP-7594 allows a transaction"); }
+    for (i32 i = 0; i < tx.blobHashes.len(); i++) {
+      if (tx.blobHashes[i].byteAt(U256.zero()).low() != 0x01) { return invalid("blob hash with the wrong version"); }
+    }
+  }
+  if ((tx.txType == 3 || tx.txType == 4) && tx.to is null) { return invalid("this transaction type cannot create"); }
+  if (tx.txType == 4 && tx.authorizations.len() == 0) { return invalid("a set-code transaction without authorizations"); }
+  Intrinsic ic = intrinsicAmsterdam(tx);
+  if (ic.execution > gasLimit) { return invalid("intrinsic gas too low"); }
+  if (ic.floor > gasLimit) { return invalid("gas limit below the calldata floor"); }
+  if (ic.execution > TX_MAX_GAS || ic.floor > TX_MAX_GAS) { return invalid("intrinsic gas above EIP-7825's cap"); }
+
+  // ── check_transaction: the block's room, the fees, the sender ──
+  i64 blobGas = GAS_PER_BLOB * (tx.blobHashes.len() as i64);
+  if ((gasLimit < TX_MAX_GAS ? gasLimit : TX_MAX_GAS) > execLeft) { return invalid("execution gas exceeds the block's"); }
+  if (gasLimit > stateLeft) { return invalid("state gas exceeds the block's"); }
+  if (blobGas > blobGasLeft) { return invalid("too many blobs"); }
+  U256 baseFee = block.baseFee;
+  U256 price;
+  U256 maxGasFee;
+  if (tx.txType >= 2) {
+    if (tx.maxFeePerGas.lt(baseFee)) { return invalid("max fee below base fee"); }
+    U256 headroom = tx.maxFeePerGas.sub(baseFee);
+    U256 priority = tx.maxPriorityFeePerGas.lt(headroom) ? tx.maxPriorityFeePerGas : headroom;
+    price = priority.add(baseFee);
+    if (!mulFits(tx.gasLimit, tx.maxFeePerGas)) { return invalid("max fee overflows"); }
+    maxGasFee = tx.gasLimit.mul(tx.maxFeePerGas);
+  } else {
+    if (tx.gasPrice.lt(baseFee)) { return invalid("gas price below base fee"); }
+    price = tx.gasPrice;
+    if (!mulFits(tx.gasLimit, tx.gasPrice)) { return invalid("gas fee overflows"); }
+    maxGasFee = tx.gasLimit.mul(tx.gasPrice);
+  }
+  U256 blobPrice = block.blobBaseFee;
+  if (tx.txType == 3) {
+    if (tx.maxFeePerBlobGas.lt(blobPrice)) { return invalid("max blob fee below the blob gas price"); }
+    maxGasFee = maxGasFee.add(U256.ofU64(blobGas as! u64).mul(tx.maxFeePerBlobGas));
+  }
+  if (!U256.ofU64(w.nonce(tx.sender)).eq(tx.nonce)) { return invalid("nonce mismatch"); }
+  U256 cost = maxGasFee.add(tx.value);
+  if (cost.lt(maxGasFee)) { return invalid("cost overflows"); }
+  if (w.balance(tx.sender).lt(cost)) { return invalid("insufficient funds"); }
+  u8[] senderCode = w.code(tx.sender);
+  if (senderCode.len() != 0 && delegationOf(senderCode) is null) { return invalid("sender has code"); }
+
+  // ── The sender pays for all of it up front; the gas splits into a grant and a reservoir ──
+  U256 sender = tx.sender;
+  w.setBalance(sender, w.balance(sender).sub(tx.gasLimit.mul(price)).sub(U256.ofU64(blobGas as! u64).mul(blobPrice)));
+  u64 nonce = w.nonce(sender);
+  w.setNonce(sender, nonce + 1);
+  w.keepDestructedBalance = true;
+  i64 evmGas = gasLimit - ic.execution;
+  i64 budget = TX_MAX_GAS - ic.execution;
+  i64 gas = evmGas < budget ? evmGas : budget;
+  i64 reservoir = evmGas - gas;
+  Meter sm = Meter.of(reservoir);
+  i64 committedSpill = 0;
+
+  w.warmAddress(block.coinbase);
+  U256[] pre = precompileAddresses(spec);
+  for (i32 i = 0; i < pre.len(); i++) { w.warmAddress(pre[i]); }
+  for (i32 i = 0; i < tx.accessList.len(); i++) {
+    w.warmAddress(tx.accessList[i].address);
+    for (i32 k = 0; k < tx.accessList[i].keys.len(); k++) { w.warmSlot(tx.accessList[i].address, tx.accessList[i].keys[k]); }
+  }
+  w.warmAddress(sender);
+
+  // ── create_evm: delegations, then what reaching the target costs; a failure here undoes all of it ──
+  Snapshot prep = w.snapshot();
+  bool ok = true;
+  if (tx.txType == 4) {
+    gas = setDelegationsAmsterdam(w, block.chainId, tx, sm, gas);
+    ok = gas >= 0;
+    if (ok) {
+      // What the delegations bought stays bought whatever the call does next.
+      committedSpill += sm.spilled;
+      sm.baseline = sm.left;
+      sm.spilled = 0;
+    }
+  }
+  Evm evm = Evm(w, block, TxEnv(sender, price, tx.blobHashes), spec.table, spec, tracer);
+  Message? m = null;
+  U256 target = tx.to is null ? createAddress(sender, nonce) : tx.to!;
+  if (ok) { w.warmAddress(target); }
+  if (ok && tx.to is null) {
+    if (w.nonce(target) != 0 || w.code(target).len() != 0 || w.hasStorage(target)) {
+      ok = false;
+    } else if (w.isDead(target)) {
+      gas = chargeStateOn(sm, gas, STATE_NEW_ACCOUNT);
+      ok = gas >= 0;
+    }
+    if (ok) { m = Message(sender, target, target, tx.value, tx.data, gas, false, 0, true, false, sm); }
+  } else if (ok) {
+    if (!tx.value.isZero() && w.isDead(target)) {
+      gas = chargeStateOn(sm, gas, STATE_NEW_ACCOUNT);
+      ok = gas >= 0;
+    }
+    U256 codeAddr = target;
+    bool delegated = false;
+    if (ok) {
+      U256? d = delegationOf(w.code(target));
+      if (d is not null) {
+        i64 access = w.warmAddress(d!) ? 3000 : 100;
+        if (gas < access) { ok = false; } else { gas -= access; }
+        codeAddr = d!;
+        delegated = true;
+      }
+    }
+    if (ok) { m = Message(sender, target, codeAddr, tx.value, tx.data, gas, false, 0, true, delegated, sm); }
+  }
+
+  Outcome o;
+  i64 stateUsed;
+  if (!ok) {
+    // Rolled back to before the delegations, every state charge refilled, and the execution grant forfeited.
+    w.revert(prep);
+    o = Outcome(Halt.Failure("the transaction could not start"), 0);
+    sm = Meter.of(reservoir);
+    stateUsed = 0;
+  } else {
+    o = tx.to is null ? processCreate(evm, m!) : processMessage(evm, m!);
+    stateUsed = reservoir - sm.left + sm.spilled + committedSpill;
+  }
+
+  // ── settle_transaction_gas ──
+  i64 usedBefore = gasLimit - o.gasLeft - sm.left;
+  i64 refund = w.refund;
+  if (refund < 0) { refund = 0; }
+  if (refund > usedBefore / 5) { refund = usedBefore / 5; }
+  i64 used = usedBefore - refund;
+  if (used < ic.floor) { used = ic.floor; }
+  i64 stateGas = stateUsed < 0 ? 0 : stateUsed;
+  i64 blockGas = usedBefore - stateGas;
+  if (blockGas < ic.floor) { blockGas = ic.floor; }
+  w.setBalance(sender, w.balance(sender).add(U256.ofU64((gasLimit - used) as! u64).mul(price)));
+  w.addBalance(block.coinbase, U256.ofU64(used as! u64).mul(price.sub(baseFee)));
+
+  Log[] logs = w.logs.toArray();
+  w.logs.clear();
+  w.endTransaction();
+  return Processed("", used, o.succeeded(), logs, o.output(), blockGas, stateGas);
+}
+
+/**
+ * EIP-7702's authorizations under Amsterdam (`set_delegation`): each valid one pays, against the top frame's gas,
+ * a new account's state gas when the authority does not exist, 9000 for the first write to its account in the
+ * transaction (the sender's and a value transfer's recipient's are paid for already), and 23 bytes of state gas for
+ * a delegation that is new — none before the transaction, none set since. Nothing is refunded. The execution gas
+ * left, or -1 when it runs out.
+ */
+i64 setDelegationsAmsterdam(World w, U256 chainId, Transaction tx, Meter sm, i64 gasIn) {
+  i64 gas = gasIn;
+  U256 halfN = secpN().shr(1);
+  Map<U256, bool> paid = Map.create(hashU256, eqU256);
+  paid.set(tx.sender, true);
+  if (!tx.value.isZero()) { paid.set(tx.to!, true); }
+  // Each authority's code before the transaction touched it, and those given a delegation since.
+  Map<U256, bool> delegatedBefore = Map.create(hashU256, eqU256);
+  Map<U256, bool> setFor = Map.create(hashU256, eqU256);
+  for (i32 i = 0; i < tx.authorizations.len(); i++) {
+    Authorization a = tx.authorizations[i];
+    if (!a.chainId.isZero() && !a.chainId.eq(chainId)) { continue; }
+    if (!a.nonce.fitsU64() || a.nonce.low() == 0xFFFFFFFFFFFFFFFF) { continue; }
+    if (a.yParity.gt(U256.one()) || a.r.isZero() || a.r.ge(secpN()) || a.s.isZero() || a.s.gt(halfN)) { continue; }
+    U256? authority = recoverAuthority(a);
+    if (authority is null) { continue; }
+    U256 who = authority!;
+    w.warmAddress(who);
+    u8[] code = w.code(who);
+    if (!delegatedBefore.has(who)) { delegatedBefore.set(who, delegationOf(code) is not null); }
+    if (code.len() != 0 && delegationOf(code) is null) { continue; }
+    if (w.nonce(who) != a.nonce.low()) { continue; }
+    if (!w.exists(who)) {
+      gas = chargeStateOn(sm, gas, STATE_NEW_ACCOUNT);
+      if (gas < 0) { return -1; }
+    }
+    if (!paid.has(who)) {
+      if (gas < 9000) { return -1; }
+      gas -= 9000;
+      paid.set(who, true);
+    }
+    if (a.address.isZero()) {
+      w.setCode(who, u8[].filled(0, 0));
+    } else {
+      if (!delegatedBefore.get(who)! && !setFor.has(who)) {
+        gas = chargeStateOn(sm, gas, STATE_AUTH_BASE);
+        if (gas < 0) { return -1; }
+      }
+      setFor.set(who, true);
+      w.setCode(who, delegationTo(a.address));
+    }
+    w.setNonce(who, w.nonce(who) + 1);
+  }
+  return gas;
+}

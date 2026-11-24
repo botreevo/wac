@@ -1,0 +1,161 @@
+// Every value-producing construct in every position in every context — and each program checked, built, loaded
+// and run.
+//
+//   wac run --allow-read --allow-write --allow-run --allow-env tools/wac/matrixfuzz.wac [--only <substring>]
+//
+// **What a week of reports had in common.** wac-tensor, wac-kps, wac-sqlite, the autonag port and the ESP32 session
+// each found programs `wac check` accepted and the build then refused or emitted wrong — and almost every one was
+// an *intersection*: a nullable number in a conditional arm (0439d), a union field under a checked cast (0440d), a
+// field default compiled in another file's coroutine (0435d), a lambda in an awaited call (0424d). Each construct
+// worked alone, and each context worked alone. `langfuzz.wac` generates arithmetic and checks its values; this
+// generates the crossings.
+//
+// **The matrix**: thirteen constructs that answer an `i32` — a union field read through `as!`, a nullable number, an
+// operator on a generic struct, an enum `match`, a tuple taken apart, a struct built with a field default, an
+// interpolated string's length, a `Result` read with `ok()`, a `?.` field, a `Vec` element, a `for … in` total, a
+// name declared again after a block declared it, a nullable declared bare in a loop — in four positions — a local, a
+// conditional arm, an array element, a `match` arm — in seven contexts — a plain function, an `async` function
+// holding the value across an `await`, one awaiting in a loop, a lambda, a lambda capturing it, a generic function's
+// instance, a method. 364 programs, each one file with `export i32 f()`.
+//
+// **Every one is well typed by construction, and its answer is known.** So any of these is a compiler bug, and the
+// program is its reproduction: `wac check` refusing it, the build declining it or producing a module the engine will
+// not load, the run trapping, or the answer being wrong. The tool says which, and exits 1 when anything failed.
+
+import { binaryPath } from "../../packages/wactest/src/host.wac";
+import { ChildEnv, Exec, Files, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+string prelude() {
+  return "import { Result, Ticket, Vec, operators } from \"core\";\n" +
+         "struct B { i32 v; }\n" +
+         "struct H { union<i32, B> u; }\n" +
+         "struct G<T> {\n  T v;\n  i32 n;\n" +
+         "  G<T> [operators.add](const this, const G<T> r) { return G<T>(this.v, this.n + r.n); }\n}\n" +
+         "enum E { A(i32 n), Z }\n" +
+         "struct D {\n  i32 k;\n  Vec<i32> q = Vec<i32>.create();\n}\n" +
+         "Ticket<i32> ready(i32 v) {\n  Ticket<i32> t;\n  t.resolve(v);\n  return t;\n}\n";
+}
+
+/** A construct: the statements that make the value, the `i32` expression reading it, and what it answers. */
+export struct Construct {
+  string name;
+  string setup;
+  string expr;
+  i32 want;
+}
+
+export Construct[] constructs() {
+  return [
+    Construct("union", "H h = H(B(7)); ", "(h.u as! B).v", 7),
+    Construct("nullable", "bool c = true; i32? x = c ? 5 : null; ", "(x ?? 0)", 5),
+    Construct("genericop", "G<i32> g = G<i32>(1, 2) + G<i32>(1, 4); ", "g.n", 6),
+    Construct("enum", "E e = E.A(9); ", "match (e) { A(n): n, Z: 0 }", 9),
+    Construct("tuple", "(i32 a, i32 b) = (3, 4); ", "(a * b)", 12),
+    Construct("default", "D d = D { k: 2 }; d.q.push(1); ", "(d.k + d.q.len())", 3),
+    Construct("interp", "string s = \"ab\"; ", "\"\\{s}c\".len()", 3),
+    Construct("result", "Result<i32, string> rs = Result.Ok(4); ", "(rs.ok() ?? 0)", 4),
+    Construct("safecall", "B? p = B(5); ", "(p?.v ?? 0)", 5),
+    Construct("vec", "Vec<i32> w = Vec<i32>.create(); w.push(2); w.push(8); ", "w.get(1)", 8),
+    Construct("forin", "i32 s = 0; for (i32 t in [1, 2, 3]) { s = s + t; } ", "s", 6),
+    Construct("reuse", "{ i32 z = 4; z = z + 1; } i32 z = 7; ", "z", 7),
+    Construct("fresh", "i32 nr = 0; for (i32 i = 0; i < 3; i++) { i32? q; if (i == 0) { q = 5; } nr = nr + (q ?? 0); } ", "nr", 5)
+  ];
+}
+
+/** Where the value goes: a body that returns it, with `@` standing for the expression. */
+export string[] positions() { return ["local", "ternary", "array", "matcharm"]; }
+
+string bodyAt(string position, string e) {
+  if (position == "local") { return "i32 r = " + e + "; return r;"; }
+  if (position == "ternary") { return "bool pick = true; return pick ? " + e + " : 0;"; }
+  if (position == "array") { return "i32[] xs = [" + e + ", 1]; return xs[0];"; }
+  return "E sel = E.Z; return match (sel) { A(m): m, Z: " + e + " };";
+}
+
+export string[] contexts() { return ["plain", "async", "asyncloop", "lambda", "capture", "generic", "method"]; }
+
+/** The whole program: the construct made and read inside the context, as `export i32 f()`. */
+export string programOf(Construct k, string position, string context) {
+  string body = bodyAt(position, k.expr);
+  if (context == "plain") { return prelude() + "export i32 f() { " + k.setup + body + " }\n"; }
+  if (context == "async") {
+    return prelude() + "async i32 g() { " + k.setup + "await ready(0); " + body + " }\n" +
+           "export i32 f() { return g().wait()!; }\n";
+  }
+  if (context == "asyncloop") {
+    return prelude() + "async i32 g() { " + k.setup + "for (i32 i = 0; i < 2; i++) { await ready(i); } " + body + " }\n" +
+           "export i32 f() { return g().wait()!; }\n";
+  }
+  if (context == "method") {
+    return prelude() + "struct M {\n  i32 base;\n  i32 run(const this) { " + k.setup + body + " }\n}\n" +
+           "export i32 f() { return M(0).run(); }\n";
+  }
+  if (context == "lambda") { return prelude() + "export i32 f() { fn<i32()> run = () => { " + k.setup + body + " }; return run(); }\n"; }
+  if (context == "capture") { return prelude() + "export i32 f() { " + k.setup + "fn<i32()> run = () => { " + body + " }; return run(); }\n"; }
+  return prelude() + "i32 gen<T>(T unused) { " + k.setup + body + " }\nexport i32 f() { return gen<string>(\"x\"); }\n";
+}
+
+Exec run(Procs procs, string prog, string[] args) {
+  return flatten(procs.exec(prog, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}
+
+string said(Exec r) {
+  string s = string.fromBytes(r.stdout) + string.fromBytes(r.stderr);
+  i32 nl = s.indexOf("\n");
+  string first = s;
+  // The first line that says something, short: the reproduction is the program, not the log.
+  if (s.indexOf("error") >= 0) { first = s.slice(s.indexOf("error"), s.len()); }
+  else if (s.indexOf("wacc:") >= 0) { first = s.slice(s.indexOf("wacc:"), s.len()); }
+  i32 end = first.indexOf("\n");
+  return end < 0 ? first : first.slice(0, end);
+}
+
+/** `--only x` keeps the programs whose name holds `x`. */
+string flagValue(string[] argv, string name) {
+  for (i32 i = 0; i + 1 < argv.len(); i++) { if (argv[i] == name) { return argv[i + 1]; } }
+  return "";
+}
+
+bool hasFlag(string[] argv, string name) {
+  for (i32 i = 0; i < argv.len(); i++) { if (argv[i] == name) { return true; } }
+  return false;
+}
+
+export async i32 main(Sys sys) {
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  string[] argv = sys.args();
+  string only = flagValue(argv, "--only");
+  string bin = binaryPath(sys.env());
+  i64 now = flatten(sys.clock().nowMillis().wait()).ok() ?? 0 as i64;
+  string dir = "/tmp/wac-matrixfuzz-\{now}";
+  fs.mkdir(dir, true).wait();
+  i32 ran = 0;
+  i32 failed = 0;
+  Construct[] ks = constructs();
+  for (i32 a = 0; a < ks.len(); a++) {
+    for (string position in positions()) {
+      for (string context in contexts()) {
+        string name = "\{ks[a].name}-\{position}-\{context}";
+        if (only != "" && name.indexOf(only) < 0) { continue; }
+        ran = ran + 1;
+        string file = "\{dir}/\{name}.wac";
+        fs.writeFile(file, programOf(ks[a], position, context).toBytes()).wait();
+        Exec c = run(procs, bin, ["check", file]);
+        if (c.status != 0) { failed = failed + 1; sys.log("FAIL \{name}: check refused it — \{said(c)}"); continue; }
+        Exec b = run(procs, bin, ["compile", file, "\{dir}/\{name}.wasm"]);
+        if (b.status != 0) { failed = failed + 1; sys.log("FAIL \{name}: the build — \{said(b)}"); continue; }
+        Exec r = run(procs, bin, ["run", file, "f"]);
+        string got = string.fromBytes(r.stdout);
+        while (got.len() > 0 && (got.slice(got.len() - 1, got.len()) == "\n")) { got = got.slice(0, got.len() - 1); }
+        if (r.status != 0 || got != "\{ks[a].want}") {
+          failed = failed + 1;
+          sys.log("FAIL \{name}: ran to \{got == "" ? said(r) : got}, wanted \{ks[a].want}");
+        }
+      }
+    }
+  }
+  sys.log("matrixfuzz: \{ran} program(s), \{failed} failed — the programs are in \{dir}");
+  return failed == 0 ? 0 : 1;
+}

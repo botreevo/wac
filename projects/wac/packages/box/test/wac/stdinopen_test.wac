@@ -1,0 +1,81 @@
+// A shell whose standard input is **still open** — the shape a terminal has, and the one no other harness in this
+// repository gives a shell.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/stdinopen_test.wac
+//
+// wac-mono 0110 and 0113. The cases need a first stage that *ignores its input* and a later stage that stops early,
+// and `seq`, `cat` and `head` are the shortest way to write both — applets, so this is where the test can run. The bug
+// it guards is in `packages/sh`'s `exec.wac` either way: this shell is that shell with commands wired in.
+//
+// **The harness is the whole point.** Every other test runs a shell with an input that is already at its end, and a
+// read of that returns at once. Here the shell is spawned with its input a queue this program holds and never writes
+// to, which stays open — and its end is bounded by `Clock.within`, so a hang fails the test rather than wedging the
+// suite. It was box's TypeScript `stdin_open.test.ts`, which held a pipe open under `timeout(1)`.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtProgram } from "../../../wactest/src/built.wac";
+import { Authority, Sys } from "std";
+import { Ran, openInput } from "./openinput.wac";
+import { flatten } from "core";
+
+/** `sh -c script`, its input open and never written to, given at most `ms` to finish. */
+async Ran open(Sys sys, u8[] wasm, string script, i32 ms) {
+  return await openInput(sys, wasm, ["-c", script], Authority(sys.files(), null, sys.env(), null), ms);
+}
+
+u8[] shell(Sys sys) {
+  string path = builtProgram(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sh.wac", "stdinopen-sh",
+                             ["--allow-read", "--allow-write", "--allow-env"]);
+  return flatten(sys.files().readFile(path).wait()).orElse(u8[]());
+}
+
+/**
+ * A pipeline whose first stage is spawned, with the shell's own input still open. wac-mono 0110: `wacsh -c 'seq 1 3
+ * | cat'` typed at a terminal never returned — a pipeline had the shell forward its own input to the first stage, and
+ * forwarding means reading to the end, which at a terminal never comes.
+ */
+export async string test_a_pipeline_runs_when_the_shells_own_standard_input_is_still_open(Sys sys) {
+  T t = T.create();
+  u8[] wasm = shell(sys);
+  t.isTrue(wasm.len() > 0, "the shell built");
+  // The canary, first: a script that *does* read its input must not finish, or this harness's input was not open
+  // and every pass below is a pass against a closed input. First, because after a child has run a pipeline the next
+  // child's open input can read as ended on the V8 host (`issues/system/0470e`).
+  Ran reads = await open(sys, wasm, "cat", 1500);
+  t.isTrue(reads.hung, "cat with the input open waited for it — the input here really is open; it said \{reads.out} (\{reads.status})");
+  Ran piped = await open(sys, wasm, "seq 1 3 | cat", 20000);
+  t.isFalse(piped.hung, "a two-stage pipeline finished");
+  t.eqStr(piped.out, "1\n2\n3\n", "seq 1 3 | cat");
+  // Three stages, and one that stops early: `head` ending `seq` makes the shell tear the pipeline down.
+  Ran three = await open(sys, wasm, "seq 1 100 | cat | head -2", 20000);
+  t.isFalse(three.hung, "a three-stage pipeline finished");
+  t.eqStr(three.out, "1\n2\n", "seq 1 100 | cat | head -2");
+  // A single stage still inherits the input, and with nothing written and no end it is the shell that must end.
+  Ran lone = await open(sys, wasm, "echo hi", 20000);
+  t.isFalse(lone.hung, "echo hi finished");
+  t.eqStr(lone.out, "hi\n", "echo hi");
+  return t.report();
+}
+
+/**
+ * A pipeline whose first stage produces **nothing**, with the input still open. wac-mono 0113: `: | cat` never
+ * returned — "the buffer is spent" and "the shell was never given an input" looked identical to `ensureStdin`, so a
+ * command handed nothing by a pipe went and read the real input. `cat < /dev/null` is the case that found the cause.
+ */
+export async string test_a_stage_after_one_that_produced_nothing_does_not_go_looking_for_a_terminal(Sys sys) {
+  T t = T.create();
+  u8[] wasm = shell(sys);
+  string[] scripts = [": | cat", "true | cat", "false | cat", ": | wc -c", "g() { :; }; g | cat", ": | cat | cat",
+                      "echo a | while read l; do echo [$l]; done", ": | while read l; do echo no; done; echo end",
+                      "printf '' | wc -c", "echo hi | head -0 | wc -c", "cat </dev/null; echo done",
+                      "read x </dev/null; echo [$x]",
+                      // …and the ones that always worked, so a fix that broke them would say so here.
+                      "echo x | cat", "seq 1 3 | cat", "{ echo a; } | cat"];
+  string[] wants = ["", "", "", "0\n", "", "", "[a]\n", "end\n", "0\n", "0\n", "done\n", "[]\n", "x\n", "1\n2\n3\n", "a\n"];
+  for (i32 i = 0; i < scripts.len(); i++) {
+    Ran got = await open(sys, wasm, scripts[i], 20000);
+    t.isFalse(got.hung, "\{scripts[i]} did not finish");
+    t.eqStr(got.out, wants[i], scripts[i]);
+  }
+  return t.report();
+}

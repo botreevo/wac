@@ -1,0 +1,148 @@
+// `&`, `jobs` and `wait`, against bash — design/0001 step 3's `jobs` and `&`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/jobs_test.wac
+//
+// **Here rather than in `packages/sh`**: these scripts name `seq`, which that package gave up to `packages/box`
+// (wac-mono 0103), so a background job there would spawn nothing and every comparison would pass with two empty
+// outputs. The shell built here is `src/bin/sh.wac`, which has the applets. A background job is a **real child**:
+// `spawnSelf` gives it its own instance, its own grants and, on the V8 host, its own thread. It was box's TypeScript
+// `jobs.test.ts`; bash and the built shell are real processes here as there.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { contains, trimmed } from "../../../wactest/src/strings.wac";
+import { sameName } from "../../../sh/test/wac/shname.wac";
+import { ChildEnv, Env, Exec, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+struct Said {
+  string out;
+  string err;
+  i32 status;
+}
+
+ChildEnv cleared(Env env) {
+  u8[]? path = flatten(env.get("PATH").wait()).orElse(null);
+  return ChildEnv.empty().set("LC_ALL", "C").set("PATH", path is null ? "/usr/bin:/bin" : string.fromBytes(path!));
+}
+
+Said run(Sys sys, string cmd, string script) {
+  Exec? x = flatten(sys.procs().exec(cmd, ["-c", script], u8[](), cleared(sys.env()), Launch.plain()).wait()).ok();
+  if (x is null) { return Said("", "<did not start>", 0 - 1); }
+  return Said(string.fromBytes(x!.stdout), string.fromBytes(x!.stderr), x!.status);
+}
+
+string wacsh(Sys sys) {
+  return builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/src/bin/sh.wac", "jobs-sh",
+                  ["--allow-read", "--allow-write", "--allow-env"]);
+}
+
+bool haveBash(Procs procs) { return flatten(procs.exec("bash", ["-c", "exit 0"], u8[](), ChildEnv.inherited(), Launch.plain()).wait()).isOk(); }
+
+i32 lineCount(string s) {
+  i32 n = 0;
+  string cur = "";
+  for (i32 i = 0; i < s.len(); i++) {
+    if (s.slice(i, i + 1) == "\n") { if (cur != "") { n = n + 1; } cur = ""; } else { cur = cur + "x"; }
+  }
+  return cur != "" ? n + 1 : n;
+}
+
+bool endsWith(string s, string tail) { return s.len() >= tail.len() && s.slice(s.len() - tail.len(), s.len()) == tail; }
+
+/**
+ * The statuses are the part most likely to be a plausible guess, and they are not guessable: bare `wait` is always 0
+ * even when a job failed, while `wait $!` and `wait %1` answer the job's own, and a pid that is not a child and a job
+ * number there is no job for are both 127. **Only deterministic cases**: two jobs writing at once interleave in an
+ * order neither shell promises.
+ */
+export string test_and_jobs_and_wait_do_what_bashs_do(Sys sys) {
+  T t = T.create();
+  if (!haveBash(sys.procs())) { sys.stderr().line("jobs_test: skipped — no bash"); return t.report(); }
+  string sh = wacsh(sys);
+  string[] cases = [
+    // The output arrives, and `wait` is where it arrives…
+    "seq 1 3 & wait", "echo hi & wait",
+    // …and at the end of the script even without one: here the shell owns its pipes, so exiting without waiting
+    // would discard the output — a deliberate difference stated in `runScript`.
+    "seq 1 3 &",
+    // `$!`, and the statuses.
+    "false & wait $!; echo st=$?", "true & wait $!; echo st=$?", "wait; echo st=$?", "jobs; echo st=$?",
+    // A job is forgotten once accounted for.
+    "seq 1 2 & wait %1; wait %1; echo st=$?",
+    // Every way of naming one that is not there.
+    "wait 999999; echo st=$?", "wait %9; echo st=$?", "kill %9; echo st=$?",
+  ];
+  for (string script in cases) {
+    Said theirs = run(sys, "bash", script);
+    Said ours = run(sys, sh, script);
+    t.eqStr(ours.out, theirs.out, "\{script}: output");
+    // bash names itself and the line; we name ourselves — mapped rather than stripped, so this still checks our
+    // builtins carry `sh: ` (`sameName`, the mapping `tools/wac/corpusstderr.wac` uses).
+    t.eqStr(trimmed(sameName(ours.err)), trimmed(sameName(theirs.err)), "\{script}: stderr");
+    t.eqI32(ours.status, theirs.status, "\{script}: status");
+  }
+  return t.report();
+}
+
+/**
+ * `jobs` prints the columns measured from bash. bash cannot be the oracle live: `seq 1 2 & jobs` prints `Running` or
+ * `Done` depending on a race between two processes. So the layout is the string bash printed while it was running:
+ * `[N]M`, two spaces, the state in a 24-wide field, then the command and its `&` — widths from `bash | cat -A`.
+ */
+export string test_jobs_prints_the_columns_measured_from_bash(Sys sys) {
+  T t = T.create();
+  Said r = run(sys, wacsh(sys), "seq 1 2 & jobs");
+  string listed = "";
+  i32 n = 0;
+  string cur = "";
+  for (i32 i = 0; i <= r.out.len(); i++) {
+    if (i == r.out.len() || r.out.slice(i, i + 1) == "\n") {
+      if (cur.len() > 0 && cur.slice(0, 1) == "[") { listed = cur; n = n + 1; }
+      cur = "";
+    } else { cur = cur + r.out.slice(i, i + 1); }
+  }
+  t.eqI32(n, 1, "expected one job line, got \{r.out}");
+  t.eqStr(listed, "[1]+  Running                 seq 1 2 &", "the job line");
+  // And the column really is 24 wide, as arithmetic, so a change to the padding fails here.
+  t.eqI32(listed.indexOf("seq"), "[1]+  ".len() + 24, "the state's field width");
+  return t.report();
+}
+
+/**
+ * What `&` cannot background says so rather than running in the foreground. bash backgrounds a whole list in a
+ * subshell; this cannot, because a subshell here is a `Shell.fork` in *this* instance. A refusal a reader can act on
+ * is better than a plausible-looking job (design/0001 D6).
+ */
+export string test_what_and_cannot_background_says_so(Sys sys) {
+  T t = T.create();
+  string sh = wacsh(sys);
+  for (string script in ["{ echo a; } &", "echo x | rev &", "echo a && echo b &", "echo x > out &"]) {
+    Said r = run(sys, sh, script);
+    t.eqStr(r.out, "", "\{script}: ran something");
+    t.isTrue(contains(r.err, "not implemented") || contains(r.err, "needs a simple command"), "\{script}: \{r.err}");
+    t.isTrue(r.status != 0, "\{script}: succeeded");
+  }
+  return t.report();
+}
+
+/**
+ * `kill %1` **ends** a background job — design/0001 step 3's own criterion. A job is a separate instance with its own
+ * process table, so a signal written on this shell's row for it reached nothing; `closeSocket` on the child's handle
+ * is what stops it. Measured by the line count, because a status alone cannot tell: a first `endJob` drained the
+ * output before closing, printed all 300,000 lines and reported 143.
+ */
+export string test_kill_ends_a_background_job_rather_than_relabelling_it(Sys sys) {
+  T t = T.create();
+  string sh = wacsh(sys);
+  // Left alone, the job produces all of it — the canary, without which "few lines" below could mean it never started.
+  t.eqI32(lineCount(run(sys, sh, "seq 1 300000 & wait").out), 300000, "an unkilled job produced all its lines");
+  // Killed, it does not — not an exact count, which would pin this machine's scheduling, but nowhere near all.
+  Said killed = run(sys, sh, "seq 1 300000 & kill %1; wait");
+  t.isTrue(lineCount(killed.out) < 1000, "the kill did not stop it: \{lineCount(killed.out)} lines");
+  t.eqI32(killed.status, 0, killed.err);
+  // And the status is a shell's for a child a signal ended; `kill -9` reaches a job too.
+  t.isTrue(endsWith(trimmed(run(sys, sh, "seq 1 300000 & kill %1; wait %1; echo st=$?").out), "st=143"), "kill: 143");
+  t.isTrue(endsWith(trimmed(run(sys, sh, "seq 1 300000 & kill -9 %1; wait %1; echo st=$?").out), "st=137"), "kill -9: 137");
+  return t.report();
+}

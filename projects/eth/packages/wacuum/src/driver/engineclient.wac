@@ -1,0 +1,55 @@
+// The Engine API as a consensus client calls it: JSON-RPC over HTTP to the execution client's authenticated port, each
+// request with a fresh JWT (HS256 over `{"iat": now}`, the secret shared through a file as both sides read it).
+
+import { Sys } from "std";
+import { Vec, Result } from "core";
+import { fetch.fetchWithinAsync, fetch.Caps } from "wac";
+import { json.parse, json.JsonValue } from "wac";
+import { crypto.hmacSha256 } from "wac";
+
+export struct EngineClient {
+  Sys sys;
+  /** `http://127.0.0.1:8551` */
+  string url;
+  u8[] secret;
+  i32 timeoutMs;
+
+  EngineClient at(Sys sys, string url, u8[] secret) { return EngineClient(sys, url, secret, 60000); }
+
+  /** `method` with `params` (JSON text): the result, or why not — an error answer's message included. */
+  async Result<JsonValue, string> call(this, string method, string params) {
+    i64 now = (await this.sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+    Caps caps = Caps(this.sys.clock(), this.sys.random(), this.sys.env(), this.sys.net(), this.sys.files());
+    string body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\{method}\",\"params\":\{params}}";
+    auto r = await fetchWithinAsync(caps, "POST", this.url, ["Content-Type: application/json", "Authorization: Bearer " + jwt(this.secret, now)],
+                                    body.toBytes(), this.timeoutMs);
+    if (r.isErr()) { return Result.Err("\{method}: \{r.err()!}"); }
+    match (parse(r.unwrap().body)) {
+      Err(e): { return Result.Err("\{method}: HTTP \{r.unwrap().status}, not JSON"); }
+      Ok(v): {
+        JsonValue? err = v.member("error");
+        if (err is not null && !err!.isNull()) { return Result.Err("\{method}: \{err!.member("message")?.text() ?? "an error"}"); }
+        return Result.Ok(v.member("result") ?? JsonValue.Null);
+      }
+    }
+  }
+}
+
+/** An Engine API token: HS256 over `{"iat": iat}`, which the execution client accepts within a minute of its clock. */
+export string jwt(u8[] secret, i64 iat) {
+  string signing = base64url("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".toBytes()) + "." + base64url("{\"iat\":\{iat}}".toBytes());
+  return signing + "." + base64url(hmacSha256(secret, signing.toBytes()));
+}
+
+export string base64url(u8[] b) {
+  u8[] abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toBytes();
+  Vec<u8> out = Vec.create();
+  for (i32 i = 0; i < b.len(); i += 3) {
+    i32 n = ((b[i] as i32) << 16) | (i + 1 < b.len() ? (b[i + 1] as i32) << 8 : 0) | (i + 2 < b.len() ? (b[i + 2] as i32) : 0);
+    out.push(abc[(n >> 18) & 63]);
+    out.push(abc[(n >> 12) & 63]);
+    if (i + 1 < b.len()) { out.push(abc[(n >> 6) & 63]); }
+    if (i + 2 < b.len()) { out.push(abc[n & 63]); }
+  }
+  return string.fromBytes(out.toArray());
+}

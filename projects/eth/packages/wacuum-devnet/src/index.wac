@@ -1,0 +1,179 @@
+// What the JSON-RPC cannot answer and an explorer needs: which transactions touched an address, and the
+// latest transactions on the chain. Built by reading each block once, as it is made, through the engine's
+// own `eth_` methods; a restart builds it again from the blocks the engine has.
+//
+// A devnet's blocks are mostly empty and a conference is a few days, so this stays small enough to keep in
+// memory: one entry per transaction per address it touched.
+
+import { Map, Vec, hashString, stringEq } from "core";
+import { json.JsonValue, json.JsonArray } from "wac";
+import { U256, Engine } from "@/packages/wacuum/src/lib.wac";
+import { smallOf } from "./format.wac";
+
+/** A transaction as a list shows it. */
+export struct TxRef {
+  string hash;
+  u64 block;
+  /** Where it is in its block. */
+  i32 position;
+  string from;
+  /** The recipient, or the contract it created; "" for neither (a create that failed). */
+  string to;
+  bool created;
+  string value;
+}
+
+export struct Index {
+  /** The next block to read. */
+  u64 next;
+  Map<string, Vec<TxRef>> byAddress;
+  /**
+   * Every transaction by its hash. wacuum finds a transaction by hash only in the blocks it ran since it
+   * started; a block from before its snapshot it has the body of and nothing more, so this is how the
+   * explorer finds those.
+   */
+  Map<string, TxRef> byHash;
+  /** The latest transactions, oldest first, at most `KEEP`. */
+  Vec<TxRef> recent;
+  u64 transactions;
+  /**
+   * Blocks with their transactions in full, as `eth_getBlockByNumber` gives them, by number: the engine
+   * recovers every sender's signature for each such answer, about a millisecond a transaction, and a page of a
+   * busy block asked for a few times a second is all of the node's time. A devnet's blocks are final as they
+   * are made, so one never changes once it is here.
+   */
+  Map<string, JsonValue> fullBlocks;
+  Vec<string> fullOrder;
+  /** The engine's `keptFrom` when this last forgot what the engine had: see `forget`. */
+  u64 forgotBelow;
+
+  Index create() {
+    return Index(0, Map.create(hashString, stringEq), Map.create(hashString, stringEq), Vec.create(), 0,
+                 Map.create(hashString, stringEq), Vec.create(), 1);
+  }
+}
+
+static i32 CACHED_BLOCKS = 256;
+
+/** Block `n` with its transactions in full; null when the engine has no such block. */
+export JsonValue? fullBlock(Index ix, Engine e, u64 n) {
+  string key = "\{n}";
+  JsonValue? hit = ix.fullBlocks.get(key);
+  if (hit is not null) { return hit; }
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Str(U256.ofU64(n).toHex().toBytes()));
+  ps.push(JsonValue.Bool(true));
+  JsonValue? b = call(e, "eth_getBlockByNumber", ps);
+  if (b is null || b!.isNull()) { return null; }
+  ix.fullBlocks.set(key, b!);
+  ix.fullOrder.push(key);
+  if (ix.fullOrder.len() > CACHED_BLOCKS * 2) {
+    Vec<string> keep = Vec.create();
+    for (i32 i = 0; i < ix.fullOrder.len(); i++) {
+      if (i < ix.fullOrder.len() - CACHED_BLOCKS) { ix.fullBlocks.remove(ix.fullOrder.get(i)); }
+      else { keep.push(ix.fullOrder.get(i)); }
+    }
+    ix.fullOrder = keep;
+  }
+  return b;
+}
+
+static i32 KEEP = 50;
+
+/** Read every block the engine has made since last time, and forget what it no longer keeps. */
+export void catchUp(Index ix, Engine e) {
+  // The engine drops blocks older than its `--history`; what points at them goes too, every thousand blocks
+  // rather than every block, since it means going through every address's list.
+  if (e.keptFrom >= ix.forgotBelow + 1000) { forget(ix, e.keptFrom); }
+  u64 head = smallOf(call(e, "eth_blockNumber", JsonArray.create())?.text());
+  while (ix.next <= head) {
+    u64 n = ix.next;
+    ix.next++;
+    JsonArray? txs = fullBlock(ix, e, n)?.member("transactions")?.array();
+    if (txs is null || txs!.len() == 0) { continue; }
+    // Receipts say what a create made; a block from before the snapshot has none, and its creates go unnamed.
+    JsonArray rps = JsonArray.create();
+    rps.push(JsonValue.Str(U256.ofU64(n).toHex().toBytes()));
+    JsonArray? receipts = call(e, "eth_getBlockReceipts", rps)?.array();
+    for (i32 i = 0; i < txs!.len(); i++) {
+      JsonValue tx = txs!.get(i);
+      string from = lowerHex(tx.member("from")?.text() ?? "");
+      string to = lowerHex(tx.member("to")?.text() ?? "");
+      bool created = false;
+      if (to == "" && receipts is not null && i < receipts!.len()) {
+        to = lowerHex(receipts!.get(i).member("contractAddress")?.text() ?? "");
+        created = to != "";
+      }
+      TxRef r = TxRef(lowerHex(tx.member("hash")?.text() ?? ""), n, i, from, to, created, tx.member("value")?.text() ?? "0x0");
+      ix.byHash.set(r.hash, r);
+      add(ix, from, r);
+      if (to != "" && to != from) { add(ix, to, r); }
+      ix.recent.push(r);
+      ix.transactions++;
+    }
+    if (ix.recent.len() > KEEP * 2) {
+      Vec<TxRef> keep = Vec.create();
+      for (i32 i = ix.recent.len() - KEEP; i < ix.recent.len(); i++) { keep.push(ix.recent.get(i)); }
+      ix.recent = keep;
+    }
+  }
+}
+
+/** Forget every transaction in a block below `below`. */
+void forget(Index ix, u64 below) {
+  Map<string, Vec<TxRef>> byAddress = Map.create(hashString, stringEq);
+  Map<string, TxRef> hashes = Map.create(hashString, stringEq);
+  string[] keys = ix.byAddress.keys();
+  for (i32 i = 0; i < keys.len(); i++) {
+    Vec<TxRef> kept = Vec.create();
+    Vec<TxRef> all = ix.byAddress.get(keys[i])!;
+    for (i32 k = 0; k < all.len(); k++) {
+      TxRef r = all.get(k);
+      if (r.block >= below) {
+        kept.push(r);
+        hashes.set(r.hash, r);
+      }
+    }
+    if (kept.len() > 0) { byAddress.set(keys[i], kept); }
+  }
+  ix.byAddress = byAddress;
+  ix.byHash = hashes;
+  ix.forgotBelow = below;
+}
+
+/** The transactions that touched `address` (0x-hex, any case), oldest first. */
+export TxRef[] touching(Index ix, string address) {
+  Vec<TxRef>? v = ix.byAddress.get(lowerHex(address));
+  return v is null ? TxRef[]() : v!.toArray();
+}
+
+/** The transaction with hash `hash` (0x-hex, any case), if a block has it. */
+export TxRef? byHash(Index ix, string hash) { return ix.byHash.get(lowerHex(hash)); }
+
+/** The latest `n` transactions, newest first. */
+export TxRef[] latest(Index ix, i32 n) {
+  i32 k = ix.recent.len() < n ? ix.recent.len() : n;
+  TxRef[] out = TxRef[].filled(k, TxRef("", 0, 0, "", "", false, ""));
+  for (i32 i = 0; i < k; i++) { out[i] = ix.recent.get(ix.recent.len() - 1 - i); }
+  return out;
+}
+
+void add(Index ix, string address, TxRef r) {
+  if (address == "") { return; }
+  Vec<TxRef>? v = ix.byAddress.get(address);
+  if (v is null) {
+    Vec<TxRef> fresh = Vec.create();
+    fresh.push(r);
+    ix.byAddress.set(address, fresh);
+  } else { v!.push(r); }
+}
+
+JsonValue? call(Engine e, string method, JsonArray ps) { return e.call(method, JsonValue.Array(ps)).result; }
+
+export string lowerHex(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] >= 65 && b[i] <= 70) { b[i] = b[i] + 32; }
+  }
+  return string.fromBytes(b);
+}

@@ -1,0 +1,50 @@
+// A pipeline needs no filesystem grant.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/pipeungranted_test.wac
+//
+//     $ boxsh            # built with no grants at all
+//     echo hi | cat
+//     cat: : Not granted to this application
+//
+// `cat` was not reading a file. It had no operand, so `lib/input.wac` takes its "standard input is standard input,
+// whatever the filesystem is" branch and calls `cli.openInput("")` — where `""` is the **reset** to the process's own
+// stream and not a path. In a sealed shell the applet's world is `platform`'s substitute (`shrun.wac`'s `boxRun` →
+// `childCli`), and that joined the sentinel onto the frame's directory: `parent.openInput(joinPath(cwd, ""))` is
+// `parent.openInput(cwd)`, a *directory*, which the parent then grant-checks and refuses.
+//
+// So every streaming applet — `cat`, `grep`, `head`, `wc`, `tr` — needed `--allow-read` to read a pipe. `sort` was
+// unaffected: it does not take that branch.
+//
+// Built with no grants deliberately. Every other box test grants something, which is why sixty commands over a
+// sealed shell never showed this. It was box's TypeScript `pipeUngranted.test.ts`, which drove the shell from
+// TypeScript; the shell is a built executable here as it was there.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtApp } from "../../../wactest/src/built.wac";
+import { Exec, ChildEnv, Launch, Sys } from "std";
+import { contains } from "../../../wactest/src/strings.wac";
+
+/** The shell, built with no grants, given `script` on its standard input. */
+async Exec shell(Sys sys, string built, string script) {
+  return (await sys.procs().exec(built, string[](), script.toBytes(), ChildEnv.inherited(), Launch.plain())).unwrap();
+}
+
+export async string test_a_pipeline_in_a_shell_with_no_grants_at_all(Sys sys) {
+  T t = T.create();
+  string built = builtApp(sys.env(), sys.files(), sys.procs(), "packages/box/example/boxsh.wac", "pipeungranted-boxsh",
+                          string[]());
+  Exec r = await shell(sys, built, "echo hi | cat\necho a b | tr ' ' '-'\n");
+  string said = string.fromBytes(r.stdout);
+  string err = string.fromBytes(r.stderr);
+  t.isFalse(contains(err, "Not granted"), "\{err}\n--- stdout:\n\{said}");
+  t.eqStr(said, "hi\na-b\n", "the pipelines' output — stderr: \{err}");
+
+  // **The grant canary.** Everything above asserts that a refusal did *not* happen, which passes for free if this
+  // build quietly had the grant after all — and the file would go green while testing nothing. So a read that
+  // genuinely needs the grant must still be refused by the same binary.
+  Exec needs = await shell(sys, built, "cat /etc/hostname\n");
+  t.isTrue(contains(string.fromBytes(needs.stderr), "Not granted"),
+           "reading a real file was allowed, so this build was not ungranted and the assertions above prove nothing — " +
+           "stderr: \{string.fromBytes(needs.stderr)}");
+  return t.report();
+}

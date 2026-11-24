@@ -1,0 +1,208 @@
+// Coverage instrumentation: a counter per branch point, and a table saying what each one is.
+//
+// The names are the reference's — `__cov_init`, `__cov_len`, `__cov_get` — so a consumer written
+// against one compiler works against the other. The representation is ours: the counters live in a
+// global `i32[]` rather than in linear memory, where the staging buffer already is.
+//
+// What is asserted here is what a coverage reader actually relies on: that a counter says how many
+// times its point ran, that the table's `i`th row describes counter `i`, and that a function nobody
+// called is visible as such rather than as a body whose branches happened not to fire.
+//
+// ## Host-side until 2026-08-18, `issues/system/0161`
+//
+// **`wac covdump` exists because of this test.** Nothing in wac can call `__cov_get`: the
+// instrumentation injects it, so no source names it, and `wac test --coverage` prints how many
+// points were *reached* — a percentage per file, which cannot say how often. A test about what a
+// counter means needs the counter. So the binary gained a command that runs `main` under the
+// counters and prints each one against its index, which is the pairing `covTableFiles` is keyed by.
+//
+// Three arguments mean three routes through one function, and a run reaches `main` and nothing else
+// — so each route is its own module, differing only in what `main` calls.
+//
+// The corpus-wide check that instrumenting is opt-in is `coveragecorpus_test.wac`, in the heavy lane.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
+import { joined, splitLines, trimmed } from "../../../wactest/src/strings.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { emitFilesCovered, covTableFiles } from "../../src/api.wac";
+import { scratchDir } from "./artifacts_probe.wac";
+import { flatten } from "core";
+
+static string ENTRY = "/t/m.wac";
+
+/** Each `case` on its own line, so a point's line is a point rather than three of them. */
+static string SRC =
+  "export i32 classify(i32 n) {\n" +
+  "  if (n > 10) { return 1; }\n" +
+  "  i32 t = 0;\n" +
+  "  for (i32 i = 0; i < n; i++) { t = t + i; }\n" +
+  "  switch (n) {\n" +
+  "    case 0: { return 100; }\n" +
+  "    case 1: { return 200; }\n" +
+  "    default: { return t; }\n" +
+  "  }\n" +
+  "}\n" +
+  "export i32 nobodyCalls(i32 n) { return n; }\n";
+
+/** The same program, with `main` taking one route through it. */
+string program(i32 arg) {
+  return SRC + "export i32 main() { return classify(" + itoa(arg) + ") & 0; }\n";
+}
+
+/** The `n`th tab-separated field of a line. */
+string field(string line, i32 n) {
+  i32 from = 0;
+  i32 seen = 0;
+  for (i32 i = 0; i <= line.len(); i++) {
+    if (i < line.len() && line.slice(i, i + 1) != "\t") { continue; }
+    if (seen == n) { return line.slice(from, i); }
+    seen = seen + 1;
+    from = i + 1;
+  }
+  return "";
+}
+
+/** `wac`, beside the working directory rather than on a `PATH` `Cli.exec` does not pass. */
+string binary(Env env) { return flatten(env.cwd().wait()).unwrap() + "/native/v8/target/release/wac"; }
+
+/**
+ * Run one route and hand back its counters.
+ *
+ * The last line is `<n> counter(s)` and is checked against the table's length — a dump that stopped
+ * halfway would otherwise report zeroes, which is what an unreached branch looks like.
+ */
+i32[] countsFor(T t, Env env, Files fs, Procs procs, string dir, i32 arg, i32 want) {
+  string[] paths = [ENTRY];
+  string[] sources = [program(arg)];
+  u8[] wasm = emitFilesCovered(paths, sources, ENTRY);
+  string at = dir + "/cov" + itoa(arg) + ".wasm";
+  auto wrote = flatten(fs.writeFile(at, wasm).wait());
+  if (wrote.isErr()) { t.fail("could not write " + at); return i32[](); }
+
+  auto rRan = flatten(procs.exec(binary(env), ["covdump", at], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = rRan.ok();
+  if ((r is null) || r!.status != 0) {
+    t.fail("covdump did not run for classify(" + itoa(arg) + ") — " + "\{rRan.isErr() ? "\{rRan.err()!}" : ""}" +
+           string.fromBytes(r!.stderr));
+    return i32[]();
+  }
+  string[] lines = splitLines(string.fromBytes(r!.stdout));
+  if (lines.len() == 0) { t.fail("covdump said nothing"); return i32[](); }
+  if (trimmed(lines[lines.len() - 1]) != itoa(want) + " counter(s)") {
+    t.fail("covdump reported \"" + lines[lines.len() - 1] + "\", the table has " + itoa(want));
+    return i32[]();
+  }
+
+  i32[] out = i32[].filled(want, 0);
+  for (i32 i = 0; i < lines.len() - 1; i++) {
+    i32 idx = atoiField(field(lines[i], 0));
+    if (idx >= 0 && idx < want) { out[idx] = atoiField(field(lines[i], 1)); }
+  }
+  return out;
+}
+
+/** A small non-negative integer, or -1. */
+i32 atoiField(string s) {
+  if (s.len() == 0) { return -1; }
+  i32 v = 0;
+  for (i32 i = 0; i < s.len(); i++) {
+    i32 c = s.toBytes()[i] as i32;
+    if (c < '0' || c > '9') { return -1; }
+    v = v * 10 + (c - '0');
+  }
+  return v;
+}
+
+/** The count at the `nth` point of `kind`, or -1 if the table has no such point. */
+i32 at(i32[] counts, string[] kinds, string kind, i32 nth) {
+  i32 seen = 0;
+  for (i32 i = 0; i < kinds.len(); i++) {
+    if (kinds[i] != kind) { continue; }
+    if (seen == nth) { return i < counts.len() ? counts[i] : -1; }
+    seen = seen + 1;
+  }
+  return -1;
+}
+
+export string test_coverage_a_counter_says_how_many_times_its_point_ran(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = scratchDir(env, fs);
+  string[] rows = splitLines(covTableFiles([ENTRY], [program(3)], ENTRY));
+  t.isTrue(rows.len() >= 6,
+           "only " + itoa(rows.len()) + " points — the instrumentation is not reaching the branches");
+  if (rows.len() < 6) { return t.report(); }
+
+  string[] kinds = string[].filled(rows.len(), "");
+  for (i32 i = 0; i < rows.len(); i++) { kinds[i] = field(rows[i], 3); }
+
+  i32[] three = countsFor(t, env, fs, procs, dir, 3, rows.len());
+  i32[] twenty = countsFor(t, env, fs, procs, dir, 20, rows.len());
+  i32[] zero = countsFor(t, env, fs, procs, dir, 0, rows.len());
+  if (three.len() == 0 || twenty.len() == 0 || zero.len() == 0) { return t.report(); }
+
+  string[] wrong = string[].filled(16, "");
+  i32 n = 0;
+  // The early return: the `then` arm runs and nothing after it does.
+  if (at(twenty, kinds, "then", 0) != 1) { wrong[n] = "classify(20) did not take the `then` arm"; n = n + 1; }
+  if (at(twenty, kinds, "loop", 0) != 0) { wrong[n] = "classify(20) entered the loop after returning"; n = n + 1; }
+  // A loop counter counts *iterations*, which is what makes it worth having.
+  if (at(three, kinds, "loop", 0) != 3) {
+    wrong[n] = "classify(3) ran the loop " + itoa(at(three, kinds, "loop", 0)) + " times, wanted 3";
+    n = n + 1;
+  }
+  if (at(three, kinds, "then", 0) != 0) { wrong[n] = "classify(3) took the `then` arm"; n = n + 1; }
+  if (at(three, kinds, "else", 0) != 1) { wrong[n] = "classify(3) missed the `else` arm"; n = n + 1; }
+  // The arms of a switch are distinguishable from each other.
+  if (at(zero, kinds, "case", 0) != 1) { wrong[n] = "classify(0) did not take the first case"; n = n + 1; }
+  if (at(three, kinds, "case", 0) != 0) { wrong[n] = "classify(3) took the first case"; n = n + 1; }
+  // A function nobody called has a point that never fires — the fact a "which lines ran" report is
+  // built from, and the one a body-only instrumentation cannot state.
+  i32 entries = 0;
+  for (i32 i = 0; i < kinds.len(); i++) { if (kinds[i] == "entry") { entries = entries + 1; } }
+  if (entries < 2) { wrong[n] = itoa(entries) + " entry points for two functions"; n = n + 1; }
+  if (at(three, kinds, "entry", 1) != 0) { wrong[n] = "an uncalled function's entry point fired"; n = n + 1; }
+
+  string[] said = string[].filled(n, "");
+  for (i32 i = 0; i < n; i++) { said[i] = wrong[i]; }
+  t.eqI32(n, 0, itoa(n) + " disagreement(s): " + joined(said, "; ") +
+                " — the table is " + joined(kinds, ", "));
+  return t.report();
+}
+
+// **An `async` method's machine is on the method's line** (`issues/lang/0379a`): its `loop` and `case` points were all
+// on its struct's line, so one line held every machine's states, and each coroutine form's `entry` was at `1:1`.
+string machines() {
+  return "import { Ticket } from \"core\";\n"                                        // 1
+       + "Ticket<i32> ready(i32 v) { Ticket<i32> t; t.resolve(v); return t; }\n"     // 2
+       + "struct Box {\n"                                                            // 3
+       + "  i32 v;\n"                                                                // 4
+       + "  async i32 twice(this) { i32 a = await ready(this.v); return a * 2; }\n"  // 5
+       + "  async i32 thrice(this) { i32 a = await ready(this.v); return a * 3; }\n" // 6
+       + "}\n"                                                                       // 7
+       + "async i32 one(i32 x) { i32 a = await ready(x); return a + 1; }\n"          // 8
+       + "export async i32 main() { Box b = Box(2); return (await b.twice()) + (await b.thrice()) + (await one(1)); }\n";
+}
+
+i32 pointsAt(string[] rows, string line, string kind) {
+  i32 n = 0;
+  for (string r in rows) {
+    if (field(r, 4) == ENTRY && field(r, 1) == line && field(r, 3) == kind) { n = n + 1; }
+  }
+  return n;
+}
+
+export string test_coverage_an_async_methods_machine_is_on_the_methods_line(Sys sys) {
+  T t = T.create();
+  string[] rows = splitLines(covTableFiles([ENTRY], [machines()], ENTRY));
+  t.eqI32(pointsAt(rows, "3", "case"), 0, "no machine state is on the struct's line");
+  t.eqI32(pointsAt(rows, "3", "loop"), 0, "no machine loop is on the struct's line");
+  t.isTrue(pointsAt(rows, "5", "case") > 0, "twice's states are on its own line");
+  t.isTrue(pointsAt(rows, "6", "case") > 0, "thrice's states are on its own line");
+  t.isTrue(pointsAt(rows, "8", "case") > 0, "a free function's states are on its line");
+  t.eqI32(pointsAt(rows, "1", "entry"), 0, "no coroutine form's entry is at line 1");
+  return t.report();
+}

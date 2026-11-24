@@ -1,0 +1,140 @@
+// One HTTP/1.1 request over a socket, read to the end, parsed.
+//
+// The request/read/parse loop existed twice before this file: `packages/box/src/lib/fetch.wac`, which is
+// GET-only and writes the body to standard output, and the beginning of a third copy in a JSON-RPC client.
+// The differences between them were the method, the body, and what to do with the answer — none of which
+// is a reason to write the socket loop again.
+//
+// **`Connection: close` and read to EOF.** That is the framing this supports, and it is a deliberate
+// restriction rather than an oversight: with the connection closing, the body's end *is* the socket's end,
+// so a truncated read is indistinguishable from a complete one unless the parser is told. `parseResponse`
+// is called once with `eof` set, which is what makes "the socket ended" mean "the body is complete" —
+// and a connection that *failed* half way is reported as a failure rather than parsed as a short body.
+//
+// Keep-alive, chunked request bodies and pipelining are **not implemented**. A caller that needs them
+// wants a connection object with state, which is a different shape from this function.
+
+import { Clock, Net, Socket } from "std";
+import { Deadline, deadlineAfter, passed, settled, timedOut, waitForAsync } from "./deadline.wac";
+import { Incoming, ParsedResponse, parseResponse } from "./incoming.wac";
+import { HostHttp, HostResponse, hostHttpOf, hostRequestAsync } from "./hosthttp.wac";
+import { Result, flatten } from "core";
+
+/**
+ * `method` `path` to `host:port`, with `body` if there is one, and the whole response back.
+ *
+ * The response, or why there is none: a socket failure, or how the parse refused.
+ *
+ * `contentType` is ignored when `body` is empty — a GET carries no `Content-Type`, and sending one is the
+ * kind of detail a server is entitled to reject.
+ */
+export Result<Incoming, string> request(Net net, u8[] method, string host, i32 port, string path, u8[] body, string contentType) {
+  return settled(requestAsync(net, method, host, port, path, body, contentType));
+}
+
+/**
+ * `request`, for an `async` caller (`issues/system/0461e`): the same request, awaited at each step rather than waited
+ * for, so several can be in flight at once — raced with `Ticket.any`, the losers cancelled — and a host that cannot
+ * wait (a page that is not cross-origin isolated) can run it. `request` is this, waited for.
+ */
+export async Result<Incoming, string> requestAsync(Net net, u8[] method, string host, i32 port, string path, u8[] body,
+                                                  string contentType) {
+  return await exchange(net, null, method, host, port, path, body, contentType);
+}
+
+/**
+ * `request`, given up on after `timeoutMs` — the whole of it, connect to last byte (`deadline.wac`). Running out is
+ * `Err("<host>: timed out after <ms>ms")`. A negative `timeoutMs` is no deadline, which is `request`.
+ */
+export Result<Incoming, string> requestWithin(Net net, Clock clock, u8[] method, string host, i32 port, string path,
+                                             u8[] body, string contentType, i32 timeoutMs) {
+  return settled(requestWithinAsync(net, clock, method, host, port, path, body, contentType, timeoutMs));
+}
+
+/** `requestWithin`, awaited — `requestAsync`'s reasons. */
+export async Result<Incoming, string> requestWithinAsync(Net net, Clock clock, u8[] method, string host, i32 port,
+                                                        string path, u8[] body, string contentType, i32 timeoutMs) {
+  return await exchange(net, deadlineAfter(clock, timeoutMs), method, host, port, path, body, contentType);
+}
+
+async Result<Incoming, string> exchange(Net net, Deadline? d, u8[] method, string host, i32 port, string path, u8[] body,
+                                  string contentType) {
+  // **The host's HTTP, where it has one** (`hosthttp.wac`): a page has no sockets, and its `fetch` is the HTTP.
+  HostHttp? viaHost = hostHttpOf(net);
+  if (viaHost is not null) {
+    string[] fields = body.len() > 0 ? ["Content-Type: \{contentType}"] : string[]();
+    auto answered = await hostRequestAsync(viaHost!, string.fromBytes(method), "http://\{host}:\{port}\{path}", fields, body,
+                                d is null ? 0 - 1 : d!.ms);
+    if (answered.isErr()) { return Result.Err("\{host}: \{answered.err()!}"); }
+    HostResponse r = answered.unwrap();
+    // No status line and no raw stream: the host parsed both, so there is no reason phrase and nothing consumed.
+    return Result.Ok(Incoming(r.status, 1, u8[](), r.headers, r.body, 0, false));
+  }
+  auto connected = await waitForAsync(d, net.connect(host, port));
+  if (connected.isErr()) { return Result.Err("\{host}: \{connected.err()!}"); }
+  Socket s = connected.unwrap();
+
+  string head = "\{string.fromBytes(method)} \{path} HTTP/1.1\r\n"
+    + "Host: \{host}\r\n"
+    + "User-Agent: wac\r\n"
+    + "Connection: close\r\n";
+  if (body.len() > 0) {
+    head = head + "Content-Type: \{contentType}\r\n"
+         + "Content-Length: \{body.len()}\r\n";
+  }
+  head = head + "\r\n";
+
+  u8[] out = u8[].filled(head.toBytes().len() + body.len(), 0);
+  u8[] headBytes = head.toBytes();
+  out.copyFrom(headBytes, 0, 0, headBytes.len());
+  out.copyFrom(body, 0, headBytes.len(), body.len());
+
+  auto sent = await waitForAsync(d, s.send(out));
+  if (sent.isErr()) {
+    s.close();
+    if (d is not null && passed(d!)) { return Result.Err("\{host}: \{timedOut(d!)}"); }
+    return Result.Err("\{host}: cannot send the request");
+  }
+
+  u8[] all = u8[]();
+  bool reading = true;
+  string why = "";
+  while (reading) {
+    match (await waitForAsync(d, s.recv())) {
+      Ok(r): {
+        match (r) {
+          Data(bytes): { all = append(all, bytes); }
+          default: { reading = false; }
+        }
+      }
+      Err(e): { why = e; reading = false; }
+    }
+  }
+  s.close();
+  // A connection that failed halfway is not a short body. With `Connection: close` the body's end is the
+  // socket's end, so this is exactly the case that would otherwise parse as a whole small page.
+  if (why != "") { return Result.Err("\{host}: \{why}"); }
+
+  match (parseResponse(all, method, true, 1 << 26)) {
+    Incomplete: { return Result.Err("the response ended mid-message"); }
+    Bad(code): { return Result.Err("unparseable response (\{code})"); }
+    Ok(res): { return Result.Ok(res); }
+  }
+}
+
+/** A GET, which is what most callers want. */
+export Result<Incoming, string> get(Net net, string host, i32 port, string path) {
+  return request(net, "GET".toBytes(), host, port, path, u8[](), "");
+}
+
+/** A POST with a body — `packages/ethrpc` is the caller this exists for. */
+export Result<Incoming, string> post(Net net, string host, i32 port, string path, u8[] body, string contentType) {
+  return request(net, "POST".toBytes(), host, port, path, body, contentType);
+}
+
+u8[] append(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}

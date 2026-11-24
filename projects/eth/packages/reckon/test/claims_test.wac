@@ -1,0 +1,67 @@
+// Recipes and statements (claims.wac) against @ipld/dag-cbor for their CIDs and ethers for EIP-712: every value here came
+// from tools/oracle/claims.mjs, and wac's signatures must equal ethers' byte for byte.
+
+import { json.parse, json.JsonValue, codec.hexEncode, codec.hexDecoded } from "wac";
+import { ipfs.Cid, ipfs.DAG_CBOR, ipfs.parseCid, ipfs.encode as encodeValue } from "@/lib.wac";
+import { Recipe, recipeId, recipeFrom, recipeValue, Statement, statementId, digest, domainSeparator, Signed, signStatement,
+         verifySigned, signedBlock, signedFrom, addressOfKey } from "../src/claims.wac";
+import { CLAIMS } from "./claims_vectors.wac";
+import { Check } from "./check.wac";
+
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+string rep(string two) { string out = ""; for (i32 i = 0; i < 32; i++) { out += two; } return out; }
+u8[] claimsKey() { return hexDecoded(rep("11")); }
+Cid A() { return parseCid("bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku").ok()!; }
+Cid B() { return parseCid("bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354").ok()!; }
+JsonValue V() { return parse(CLAIMS.toBytes()).ok()!; }
+string at(i32 i, string k) { return V().member("statements")!.array()!.get(i).member(k)?.text() ?? ""; }
+
+Recipe recipe() { return Recipe("wasm-gc/det/1", "unixfs-v1-2025+hidden", B()); }
+
+Statement[] statements() {
+  Cid r = recipeId(recipe());
+  Statement d = Statement.Derivation(r, A(), "wac 7a0bf47 on V8");
+  return [d, Statement.Endorsement(B(), "read all of it"), Statement.Rejection(A(), "malware"), Statement.Revocation(statementId(d))];
+}
+
+export string test_ids_agree_with_dag_cbor() {
+  Check c = Check.create();
+  c.eq(recipeId(recipe()).text(), V().member("recipe")!.text()!, "the recipe's CID");
+  Statement[] ss = statements();
+  for (i32 i = 0; i < ss.len(); i++) { c.eq(statementId(ss[i]).text(), at(i, "id"), "statement \{i}'s id"); }
+  return c.report();
+}
+
+export string test_signing_is_ethers_byte_for_byte() {
+  Check c = Check.create();
+  c.eq("0x" + hex(domainSeparator()), V().member("domain")!.text()!, "the domain");
+  c.eq("0x" + hex(addressOfKey(claimsKey())), V().member("address")!.text()!, "the key's address");
+  Statement[] ss = statements();
+  for (i32 i = 0; i < ss.len(); i++) {
+    c.eq("0x" + hex(digest(ss[i])), at(i, "digest"), "statement \{i}'s digest");
+    Signed s = signStatement(ss[i], claimsKey());
+    c.eq("0x" + hex(s.signature), at(i, "signature"), "statement \{i}'s signature");
+    c.ok(verifySigned(s).isOk(), "and it verifies");
+  }
+  return c.report();
+}
+
+export string test_a_signed_record_round_trips_and_forgeries_fail() {
+  Check c = Check.create();
+  Statement[] ss = statements();
+  Signed s = signStatement(ss[0], claimsKey());
+  u8[] block = signedBlock(s);
+  c.eq(Cid.of(DAG_CBOR(), block).text(), V().member("envelope")!.text()!, "the signed record's CID, as dag-cbor makes it");
+  match (signedFrom(block)) {
+    Err(e): { c.fail(e); }
+    Ok(back): { c.ok(verifySigned(back).isOk(), "read back, it verifies"); c.eq(statementId(back.statement).text(), statementId(ss[0]).text(), "the same statement"); }
+  }
+  // The signature over one statement, attached to another: refused.
+  c.ok(verifySigned(Signed(ss[1], s.signer, s.signature)).isErr(), "a signature moved to another statement");
+  c.ok(verifySigned(Signed(ss[0], hexDecoded("2222222222222222222222222222222222222222"), s.signature)).isErr(), "a signature attributed to someone else");
+  Recipe back = recipeFrom(ipfsEncode(recipe())).ok()!;
+  c.ok(back.input.eq(B()) && back.machine == "wasm-gc/det/1", "a recipe reads back from its block");
+  return c.report();
+}
+
+u8[] ipfsEncode(Recipe r) { return encodeValue(recipeValue(r)); }

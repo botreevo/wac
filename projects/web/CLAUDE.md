@@ -1,0 +1,87 @@
+# web
+
+The page a wac program is handed — `export async i32 main(Page page)` — and the builder that makes one
+`index.html` of it. [README.md](README.md) is the package; this file is how to work on it.
+
+**It was wac's `packages/web` until 2026-10-29**, split out with its history so that work on it does not
+wait on wac's gate (about twenty minutes, plus seed rebuilds). `template/` was wac's `templates/webapp`,
+and `example/` holds the five pages only this package's tests use, which were in wac's
+`packages/platform/example/`.
+
+## What it depends on
+
+**Nothing but a `wac` command.** `std` and `core` are built into the compiler, so the package imports no
+other and pins nothing; what a change here needs from wac is a `wac` new enough. It was split from wac
+`desktop-base` (`84e91aebf`) and is tested against a `wac` built from that commit. A change that needs
+something new in wac lands in wac first, through its gate.
+
+wac depends on this package by git, pinned to a commit (its site, and the page examples under its
+`packages/`), as `wac-desktop` does. Moving that pin is a wac change and goes through wac's gate; nothing
+pushed here reaches wac until someone moves it.
+
+**References to `design/…`, `issues/…`, `spec ch…` and `packages/…` in comments name wac's
+documents and files**, at `https://github.com/voltrevo/wac.git`. They were written when this was a
+directory of wac, and they are still the reasons.
+
+## Running things
+
+    wac check . && wac test --allow-read --allow-write test/wac   the package, with no browser — about a second
+    deno test -A --unstable-net --no-check test/     the template outside the repository, and pages in Chromium
+    tools/push.sh                                    all of it, then push
+
+`$WAC` names the `wac` the Deno tests and the gate run; the one on `PATH` otherwise. The browser tests find Chromium
+at `$WAC_CHROMIUM`, or under `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright` (`test/harness.ts`
+`findChromium`), and skip, loudly, where there is none.
+
+## Working agreements
+
+- **This is `projects/web` of wac's repository**, one project among several, with its own gate and versions;
+  the rules that hold across them — remotes, pushing, pins, the pin check — are in the repository's root
+  `CLAUDE.md`. It was wac-web (`web.git` before 2026-11-02) until it moved in, with its history; the package is
+  still imported as `web`, by a pin naming this repository with `subdir: ./projects/web`. Push through
+  `tools/push.sh`.
+- **wac's rule holds here: there are no users and no legacy.** When nothing needs a thing, delete it —
+  not deprecate it, not keep it behind a flag. If you find yourself proposing to keep something, say
+  what would break, and check that it is not just a test you could edit.
+- **Comments explain why, in full sentences, as the existing ones do.** Match the surrounding style.
+
+## What is being built here
+
+**`wac.page`**: `Page` over host requests, so the same program draws into a standalone page or into a window
+of the desktop (step 2 of the handover in `https://git.voltrevo.com/notes.git`,
+`2026-10-29-wac-desktop-handover.md`).
+
+- **Done:** the capability (`src/line.wac`), `Page` and `Element` over it (`Page.open(sys)`), `TestDoc` as a
+  host answering it, and the browser host answering it (`wacPageServer` in `tools/build.wac`). A page's program
+  is a plain module (`moduleFor`): built by `wac build`, driven from its manifest like any module (`wacRun`),
+  rendering on `Page.changed`. The bindgen wrapper, `PageHost`, `Spawned` and `system.wac` are gone.
+- **Done, for the desktop:** changes travel as one `PAGE_BATCH` a turn — a request, so it reaches a parent that
+  provides the capability — and `PageServer` (`src/serve.wac`) answers `wac.page` into an `Element` this program
+  holds, refusing a child's mistakes rather than trapping on them. `Procs.spawnProviding` with `server.provider()`
+  is a page's program in a window; wac-desktop's `src/desk/program.wac` does it.
+- **Done:** `Desktop.of(sys)` (`src/desktop.wac`), the client of `wac.desktop` — the picker, `open`, `note`, the
+  clipboard — which wac-desktop serves; `PageServer.hand`, a file handed to a window's program.
+- **Done:** `Desktop.openWindow` (a window's page is its slice of `wac.page`), `Desktop.askFor` (more than a
+  program is handed, asked for once), and `wac.site` (`src/site.wac`): the page's own site, read a file at a time or
+  as read-only files over the `index.json` its build writes (`tools/index.wac`). The browser's host answers it.
+- **Done:** `Desktop.edit` (a file shown in the desktop's editor) and `Desktop.newFile` (a free name on the desktop,
+  which the program may write): what the desktop's own viewer and editor need, now programs on its site.
+- **Done:** `wac.origin` (`src/origin.wac`): requests of any method to the page's own origin, and WebSockets to it,
+  answered in the program's worker; `TestDoc.serving` answers it in tests. For an app whose API is beside its page
+  (autonag's client, in autonag-wac).
+- **Done:** first frames and hydration: a page that exports `Frame[] prerendered()` from its entry file has each frame
+  drawn at build time by its own module run with no page (`drawFrames`, `drawPageFrames`), at that frame's size —
+  `page.size()`, which the host says before the first turn — and the frame that fits the window shown before any script
+  and adopted by the browser's host by its handles (`documentSide`: `claim`, `place`, `sweep`, `replay`), with what the
+  reader did before the program listened handed to it. `test/hydrate_live.test.ts` drives it; `example/drift.wac` is a
+  page whose frame differs on purpose, `example/layouts.wac` one with two layouts. **For the wac website, built as
+  wac-desktop** — fast first paint, on a phone too, is why it exists.
+- **Done:** `--module-file`: the module as `page.wasm` beside the page, fetched by its version, and what the document
+  says before it arrives held for the program. `test/modulefile_live.test.ts`.
+- **Done:** a site of routes, for the wac website's docs to be pages of the desktop: `page.path()` before the first turn
+  (`PAGE_PATH`, answered at once as the location is), `navigate`, `routeLinks` and `onPath` (`PAGE_NAVIGATE`,
+  `PAGE_LINKS`; the document's `wacSiteBase`, `wacRouteOf`, its link and `popstate` listeners), `hrefTo`, `Frame.on` —
+  each route its own `index.html` (`drawPageFrames`, `frames.txt`, `wrapBuiltPage`) — and its title and description
+  (`PAGE_DESCRIBE`), `--site-url`'s canonical addresses and `sitemap.xml`. `test/routes_live.test.ts`. **The host's
+  `COUNT` must match `PAGE_COUNT`**: a request past it goes elsewhere, and only a browser test sees that.
+- **Next:** a program's description of itself, which needs a section wac's builder does not write yet.

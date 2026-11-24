@@ -1,0 +1,148 @@
+// A listener's identity — SPEC §3: one self-signed P-256 certificate and its key.
+//
+// **The certificate's sha-256 is the server's name.** A client pins it (the certhash in the address), DTLS
+// presents it to a browser, and QUIC presents it to a native client, so one file has to serve all three for
+// as long as the address is meant to stay the same. That is why it is kept on disk and loaded rather than
+// made at every start.
+//
+// The certificate says nothing about its holder: an empty subject and a random 128-bit serial, so one seen on
+// the wire is not recognisably KPS (SPEC §3, SECURITY.md §3). Its validity runs from an hour before it was made
+// for two hundred years, as the reference implementations choose — nobody checks it, since trust comes from
+// the pin, and a certificate that expired would change nothing but the chance of a client library refusing it.
+//
+// On disk it is one file of two PEM blocks, `CERTIFICATE` and `EC PRIVATE KEY` (SEC1), which `openssl x509`
+// and `openssl ec` read, kept at mode 0600 in a directory at 0700.
+
+import { Result, Buf } from "core";
+import { Sys } from "std";
+import { crypto.sha256, crypto.p256PublicKey, codec.pemEncode, codec.pemFind,
+         tls.anonymousP256, tls.ecPrivateKeyP256, tls.parseEcPrivateKeyP256 } from "wac";
+import { encodeCerthash } from "./address.wac";
+
+export struct Identity {
+  /** The 32-byte P-256 scalar. */
+  u8[] key;
+  /** The certificate, DER. */
+  u8[] cert;
+
+  /** sha-256 of the certificate: what DTLS's `a=fingerprint` and the certhash both name. */
+  u8[] digest(const this) { return sha256(this.cert); }
+
+  /** The certhash this identity is dialled by. */
+  string certhash(const this) { return encodeCerthash(this.digest()); }
+
+  /** Both blocks, certificate first, as the file holds them. */
+  u8[] pem(this) {
+    Buf out = Buf.create();
+    out.pushAll(pemEncode("CERTIFICATE", this.cert));
+    out.pushAll(pemEncode("EC PRIVATE KEY", ecPrivateKeyP256(this.key)));
+    return out.take();
+  }
+}
+
+/** An hour, and two hundred years of 365 days, in seconds. */
+static i64 BACKDATE = 3600;
+static i64 LIFETIME = 6307200000;
+
+/**
+ * An identity from random material, or null if the material is unusable.
+ *
+ * `key` and `nonce` are 32 bytes each and must be valid P-256 scalars (a uniform 32 bytes is, except with
+ * probability about 2^-32); `serial` is 16 bytes, not all zero. The caller draws them — this file reads no
+ * randomness of its own, so a test can pin every byte.
+ */
+export Identity? makeIdentity(u8[] key, u8[] serial, u8[] nonce, i64 nowSeconds) {
+  if (p256PublicKey(key).len() != 65) { return null; }
+  u8[] cert = anonymousP256(serial, nowSeconds - BACKDATE, nowSeconds - BACKDATE + LIFETIME, key, nonce);
+  if (cert.len() == 0) { return null; }
+  return Identity(key, cert);
+}
+
+/**
+ * The identity a file holds.
+ *
+ * Both blocks must be there and must agree: the certificate's public key has to be the key's. A file that pairs
+ * one listener's certificate with another's key would start a server whose DTLS signatures nothing can verify,
+ * which fails far from here and long after; this says so at start.
+ */
+export Result<Identity, string> parseIdentity(u8[] text) {
+  u8[]? cert = pemFind(text, "CERTIFICATE");
+  if (cert is null) { return Result.Err("no CERTIFICATE block"); }
+  u8[]? keyDer = pemFind(text, "EC PRIVATE KEY");
+  if (keyDer is null) { return Result.Err("no EC PRIVATE KEY block"); }
+  u8[]? key = parseEcPrivateKeyP256(keyDer!);
+  if (key is null) { return Result.Err("the EC PRIVATE KEY block is not a P-256 key"); }
+  if (!contains(cert!, p256PublicKey(key!))) {
+    return Result.Err("the certificate does not carry this key's public half");
+  }
+  return Result.Ok(Identity(key!, cert!));
+}
+
+/**
+ * The identity at `path`, made and written there first if there is none.
+ *
+ * A file that exists and does not parse is an error, never replaced: replacing it would change the server's
+ * address, and every client holding the old one would stop being able to reach it without being told why.
+ * The directory is created at 0700 and the file is written at 0600 by way of a temporary name in it, so the key
+ * is never readable by anyone else and a crash mid-write leaves the old file or none — not half of one.
+ */
+export async Result<Identity, string> loadOrCreateIdentity(Sys sys, string dir, string name) {
+  string path = "\{dir}/\{name}";
+  match (await sys.files().readFile(path)) {
+    Ok(text): {
+      return match (parseIdentity(text)) {
+        Ok(id): Result.Ok(id),
+        Err(why): Result.Err("\{path}: \{why}"),
+      };
+    }
+    Err(_): {}
+  }
+  await sys.files().mkdir(dir, true);
+  match (await sys.files().chmod(dir, 448)) {
+    Err(e): { return Result.Err("\{dir}: cannot make it private: \{e}"); }
+    Ok(_): {}
+  }
+  i64 now = 0 as i64;
+  match (await sys.clock().nowMillis()) {
+    Ok(ms): { now = ms / (1000 as i64); }
+    Err(_): { return Result.Err("no wall clock to date the certificate by"); }
+  }
+  Identity? made = null;
+  for (i32 attempt = 0; attempt < 8 && made is null; attempt++) {
+    match (await sys.random().bytes(80)) {
+      Ok(r): { made = makeIdentity(part(r, 0, 32), part(r, 32, 16), part(r, 48, 32), now); }
+      Err(_): { return Result.Err("no source of randomness"); }
+    }
+  }
+  if (made is null) { return Result.Err("could not make a key"); }
+  string tmp = "\{path}.tmp";
+  match (await sys.files().writeFile(tmp, made!.pem())) {
+    Err(e): { return Result.Err("\{tmp}: \{e}"); }
+    Ok(_): {}
+  }
+  match (await sys.files().chmod(tmp, 384)) {
+    Err(e): { return Result.Err("\{tmp}: cannot make it private: \{e}"); }
+    Ok(_): {}
+  }
+  match (await sys.files().rename(tmp, path)) {
+    Err(e): { return Result.Err("\{path}: \{e}"); }
+    Ok(_): {}
+  }
+  return Result.Ok(made!);
+}
+
+u8[] part(u8[] b, i32 from, i32 n) {
+  u8[] out = u8[].filled(n, 0);
+  out.copyFrom(b, from, 0, n);
+  return out;
+}
+
+/** Whether `needle` occurs in `hay` — the certificate's SubjectPublicKeyInfo carries the point verbatim. */
+bool contains(const u8[] hay, const u8[] needle) {
+  for (i32 i = 0; i + needle.len() <= hay.len(); i++) {
+    bool all = true;
+    for (i32 j = 0; j < needle.len() && all; j++) { if (hay[i + j] != needle[j]) { all = false; } }
+    if (all) { return true; }
+  }
+  return false;
+}

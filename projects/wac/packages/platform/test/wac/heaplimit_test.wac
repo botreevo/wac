@@ -1,0 +1,92 @@
+// A program's heap is the size it is given, and running out of it is said in a sentence.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/platform/test/wac/heaplimit_test.wac
+//
+// `issues/system/0472w`, from wacuum: a wac value is a WasmGC object in V8's own heap, and the native host made every
+// isolate with V8's defaults — about 1.4 GB, whatever the machine had — so a program holding a million accounts died
+// with "Fatal JavaScript out of memory" and 15 GB free. The limit is half of physical memory now, or `WAC_MAX_HEAP`,
+// which `wac --max-heap <size>` sets for itself and everything it starts; and a program that reaches it ends with a
+// sentence naming the setting, as a `HostLimit` (`native/v8/src/main.rs`, `heap_max_bytes` and `near_heap_limit`).
+//
+// Run on the native host, because both halves are its: the heap is the engine's and so is the way it ends. 1600 MB is
+// past the old ceiling, which is the point of the first test. Measured 2026-11-13: about 3 s for the file; 10 GB held
+// under `--max-heap 11g` on a 16 GB machine, so the 4 GB cage of a compressed heap does not apply to this build.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath, freshDir } from "../../../wactest/src/host.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+/** Holds `argv[0]` megabytes, each a separate megabyte array, then says so. */
+static string PROGRAM = "import { Sys } from \"std\";\n"
+  + "export i32 main(Sys sys) {\n"
+  + "  i32 mb = 0;\n"
+  + "  for (u8 c in sys.args()[0].toBytes()) { mb = mb * 10 + (c as i32 - 48); }\n"
+  + "  u8[][] keep = u8[][].filled(mb, u8[]());\n"
+  + "  for (i32 i = 0; i < mb; i++) { keep[i] = u8[].filled(1 << 20, 1); }\n"
+  + "  sys.log(\"held \\{mb} MB\");\n"
+  + "  return 0;\n"
+  + "}\n";
+
+struct Said {
+  i32 status;
+  string out;
+}
+
+string program(T t, Env env, Files fs) {
+  string dir = "\{flatten(env.cwd().wait()).unwrap()}/.cache/heaplimit";
+  t.eqStr(freshDir(fs, dir), "", "a directory for the program");
+  string entry = "\{dir}/hold.wac";
+  t.isTrue(flatten(fs.writeFile(entry, PROGRAM.toBytes()).wait()).isOk(), "wrote \{entry}");
+  return entry;
+}
+
+/** `wac <before…> run <entry> <mb>`, with `WAC_MAX_HEAP` set to `heap` unless it is empty; stdout and stderr together. */
+Said hold(Env env, Procs procs, string[] before, string entry, i32 mb, string heap) {
+  string[] args = string[].filled(before.len() + 3, "");
+  for (i32 i = 0; i < before.len(); i++) { args[i] = before[i]; }
+  args[before.len()] = "run";
+  args[before.len() + 1] = entry;
+  args[before.len() + 2] = "\{mb}";
+  ChildEnv e = heap == "" ? ChildEnv.inherited() : ChildEnv.inherited().set("WAC_MAX_HEAP", heap);
+  Exec? x = flatten(procs.exec(binaryPath(env), args, u8[](), e, Launch.plain()).wait()).ok();
+  if (x is null) { return Said(0 - 1, "the binary did not start"); }
+  return Said(x!.status, string.fromBytes(x!.stdout) + string.fromBytes(x!.stderr));
+}
+
+/** The last 300 characters, where a host's last words are. */
+string tail(string s) { return s.len() > 300 ? s.slice(s.len() - 300, s.len()) : s; }
+
+export string test_a_heap_past_the_old_ceiling_is_held_when_it_is_given(Sys sys) {
+  Env env = sys.env();
+  T t = T.create();
+  string entry = program(t, env, sys.files());
+  Said r = hold(env, sys.procs(), ["--max-heap", "2g"], entry, 1600, "");
+  t.eqI32(r.status, 0, "1600 MB under --max-heap 2g — \{tail(r.out)}");
+  t.isTrue(r.out.indexOf("held 1600 MB") >= 0, "and it got to the end: \{tail(r.out)}");
+  return t.report();
+}
+
+export string test_reaching_the_limit_ends_the_program_with_a_sentence_naming_it(Sys sys) {
+  Env env = sys.env();
+  T t = T.create();
+  string entry = program(t, env, sys.files());
+  Said r = hold(env, sys.procs(), string[](), entry, 400, "128m");
+  t.isTrue(r.status != 0, "400 MB under WAC_MAX_HEAP=128m is not a success: \{r.status}");
+  t.isTrue(r.out.indexOf("held") < 0, "and it did not get to the end");
+  t.isTrue(r.out.indexOf("ran out of memory: its heap reached the limit of 128 MB") >= 0,
+           "the limit, as it was set, in the last words: \{tail(r.out)}");
+  t.isTrue(r.out.indexOf("--max-heap") >= 0 && r.out.indexOf("WAC_MAX_HEAP") >= 0, "and how to raise it");
+  return t.report();
+}
+
+export string test_a_size_that_is_not_one_is_refused_before_anything_runs(Sys sys) {
+  Env env = sys.env();
+  T t = T.create();
+  string entry = program(t, env, sys.files());
+  Said r = hold(env, sys.procs(), ["--max-heap", "lots"], entry, 1, "");
+  t.eqI32(r.status, 2, "a usage error — \{tail(r.out)}");
+  t.isTrue(r.out.indexOf("--max-heap wants a size") >= 0, r.out);
+  t.isTrue(r.out.indexOf("held") < 0, "and the program did not run");
+  return t.report();
+}

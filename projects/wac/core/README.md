@@ -1,0 +1,205 @@
+# core
+
+`core` — the declarations that ship inside the compiler, reached as `import { Read, Vec } from "core";`.
+
+**Why anything at all is in here.** wac has nominal types, and a `fn<…>` value does not capture —
+spec/spec/funcrefs.md — so two identical declarations of a type are two types and no adapter can
+convert between them.
+
+That sentence used to cite the old spec's `§wac-fnref-nocapture-j4wk8pm`, which said `c.inc` is a compile error.
+It is a value now (`§wacc-fnref-bound`, `design/lang/0002` tier one), and the tag went with it. The
+argument here is untouched: a bound reference captures a *receiver*, not an enclosing scope, so
+there is still nothing that could adapt one nominal type to another. That is fine while everything is one tree — the two sides can
+import the same file. It stops being fine across repositories: a streaming transform names the
+exact type its source produces (`gunzipStream(fn<Read()> read, …)`), so a `Read` declared in the
+transform's repo and a `Read` declared in the caller's repo cannot meet, and there is nothing
+either author can write to make them.
+
+So the admission test is narrow, and is a test rather than a taste: **does a value of this type
+have to cross a repository boundary through a funcref signature?** If not, it is a library and
+belongs in a package. Today `Read` is the only type that passes, which is why this file holds one
+enum and no functions.
+
+**Why it is embedded rather than fetched.** The same no-closures property makes a version diamond
+unresolvable rather than merely awkward, so `core` has to be one thing everywhere. Shipping it
+with the compiler makes its version the compiler's version, which is the only story that has no
+diamond in it. See `design/0001` for the whole argument.
+
+## Files that are modules
+
+`core` is named whole — `import { Vec, Map, Read } from "core"` — and a path below it (`"core/vec.wac"`)
+is refused, since a package is named whole (spec ch02, `§wac-no-subpath-wqatc72`). What the name reaches
+is [`core.wac`](core.wac), the entry, which re-exports from the files beside it and says `export * as
+math from "./math.wac"` for a namespace that is a module.
+
+**Every file here is a module as any project's file is**: its own imports, its own scope, read by the
+same lowering, checker, reachability and emitter as every other file. `tools/wac/gencore.wac` embeds
+them in `packages/wacc/src/coretext.wac`, each under a key no path can spell — `" core/vec.wac"`, a path
+behind a space — and the entry under `" core"`; `packages/wacc/src/carried.wac` joins them to a program.
+A coverage point in one is reported as `core/hash.wac:61`, the file somebody has open.
+
+Until 2026-11-02 the files were concatenated into one module with the imports between them blanked,
+and the compiler read that text without lowering it — which is why `operators` and `markup` were
+dotted names written out by hand, `@"operators.add"`. They are namespace modules now, like `math`:
+[`operators.wac`](operators.wac) declares `add` and the entry says `export * as operators`. Two of the
+files cannot declare one name: their names are emitted as written, and `gen:core` refuses the second.
+
+**Run `wac task gen:core` after editing anything here.** The compiler reads the embedding and never
+this directory, and `./bootstrap.sh` does not regenerate it — so an edit has no effect at all until
+you do. `./bootstrap.sh` refuses rather than building against a stale one, and a compiler that gets
+past it says *"the compiler's copy of that built-in does not export this name"*. `issues/system/0291b`.
+
+**This directory and the specifier are not the same thing.** What a program imports is the copy
+embedded in whichever compiler is running. A project's own `core/` directory is an ordinary
+directory, reached only by a relative path; `"core"` names the built-in whatever the project holds.
+
+## The collections
+
+**This section was packages/std/README.md, and the package it described is gone.** D4 says `core`
+holds "the whole of today's packages/std" — `Result`, `Vec`, `Map`, hashing, equality —
+and it does now, so the argument moves here rather than being deleted with the directory. What D4
+means by `std` from here on is the *capability* half: `Sys` and its handles — files, network, processes —
+which is [`../std/`](../std/README.md).
+
+Containers, and the sum type every program ends up wanting.
+
+```wac
+import { Vec } from "core";
+import { Map } from "core";
+import { Result } from "core";
+import { hashString, stringEq } from "core";
+```
+
+| type | what |
+|---|---|
+| `Vec<T>` | growable array; `push`/`pop`/`get`/`insert`/`remove`, amortised O(1) append |
+| `Map<K, V>` | hash map, open-addressed with linear probing; hash and equality as funcrefs |
+| `Result<T, E = union>` | a value or an error; `Result<T>` gathers its error type from what is returned |
+| `number.wac` | `NumberLiteral` and the `fromNumber` symbol a type implements to be a literal's target |
+| `hash.wac` | ready-made hash and equality for `string`, `i32` and `i64` |
+| `hypothetical.wac` | `hypothetical<T>()`, an expression of any type for `typeof` to read, which traps if run |
+| `operators.wac`, `markup.wac` | `operators` and `markup`: the symbols operators and markup call (spec ch22, ch23) |
+| `math.wac` | `math`: `log`, `log2`, `log10`, `log1p`, `exp`, `expm1` and `pow`, ported from fdlibm (spec ch43) |
+| `strings.wac` | `strings`: `contains`, `startsWith`, `endsWith`, `indexOfFrom`, `lastIndexOf`, `split`, `join`, `replace`, `replaceFirst`, `trim`, `trimStart`, `trimEnd`, `toLower`, `toUpper` and `repeat`, on bytes (spec ch37) |
+
+This package exists because wac gained generics ([wac issue
+0034](../issues/lang/closed/0034-generics.md)). Before that a container could only be
+written once per element type, which is why this repo had three hand-rolled ones.
+
+## Vec
+
+```wac
+Vec<i32> v = Vec.create();
+v.push(10);
+v.push(20);
+i32 first = v.get(0);              // traps if out of range
+i32 safe = v.at(5) ?? -1;          // null instead of a trap
+i32? last = v.pop();
+```
+
+`create()` allocates nothing; the first push allocates four slots and capacity doubles from
+there. `withCapacity(n, fill)` presizes.
+
+**Why `withCapacity` wants a `fill` value.** WasmGC arrays are initialised when they are
+created, and wac will not invent a value for a `T` it knows nothing about — a struct or an
+enum has no default. `push` never needs one because the element being pushed is available at
+exactly the moment growth happens; `withCapacity` has no such value to hand, so it asks. The
+slots above `len()` are unreachable through the API, so what you pass is never read.
+
+**`clear()` and `pop()` do not release elements.** There is nothing to overwrite a slot
+with, so a popped or cleared element stays reachable from the backing array until something
+is pushed over it. It matters only for a long-lived Vec of large elements.
+
+## Map
+
+```wac
+Map<string, i32> counts = Map.create(hashString, stringEq);
+counts.set("apple", 1);
+bool existed = counts.set("apple", 2);      // true — it overwrote
+i32? got = counts.get("apple");
+i32 orZero = counts.getOr("pear", 0);
+counts.remove("apple");
+```
+
+**Hash and equality are funcrefs, not a requirement on `K`.** wac has no traits, so there is
+no `K: Hash` to ask for. This turns out better than a trait would have been: `hash.wac` has
+the ready-made ones, and hashing case-insensitively, or on one field of a struct, needs no
+wrapper type — just a different pair of functions.
+
+```wac
+i32 hashPoint(Point p) { return hashI32(p.x * 31 + p.y); }
+bool pointEq(Point a, Point b) { return a.x == b.x && a.y == b.y; }
+Map<Point, string> labels = Map.create(hashPoint, pointEq);
+```
+
+A hash may return any `i32`; the table masks it. A poor distribution costs collisions rather
+than correctness — `test_collisions` runs a table where every key hashes to zero.
+
+`hashBytes`/`bytesEq` are the `u8[]` pair, and `hashString` delegates to `hashBytes` rather than
+repeating FNV-1a. Not tidiness: two copies of a hash can drift into disagreeing about the same
+bytes, and nothing would catch it — a Map answers every query correctly as long as *one* hash is
+used per map, so it would surface only where something hashed a key one way and looked it up the
+other. `json` holds member names as bytes on purpose, so it needs the byte-level pair; the test
+asserts the two agree (wac-mono issue 0004, reported by agent-b).
+
+**Linear probing with backward-shift deletion**, not chaining and not tombstones. One array
+rather than one per bucket, and a table that is filled and emptied repeatedly does not
+degrade — `test_fill_and_empty_repeatedly` asserts that 400 insert/remove pairs leave the
+table no larger than 32 slots.
+
+`keys()` and `values()` are in slot order, which is to say **an order you must not rely on**:
+it depends on the hash, the capacity and the insertion history. They correspond to each
+other index by index.
+
+## Absence, and Result
+
+A value that may be absent is `T?`, for every type, primitives included ([wac issue
+0045](../issues/lang/closed/0045-nullable-primitives-are-not-boxed.md)): `Vec.pop`, `Vec.at` and
+`Map.get` answer one. `T?` does not flatten, so `T??` holds three states and a `Map<string, JsonValue?>`
+still tells "no entry" from "an entry holding null"; and a nullable must be checked before it is used,
+so forgetting the absent case is refused like a missing `match` arm. That left nothing for an
+`Option<T>` enum to do, and `core` no longer has one.
+
+`Result<T, E>` leaves the error type to the caller, because the useful error differs: a
+parser wants a message and a position, an arithmetic routine wants a code, and a caller that
+only branches wants `Result<T, bool>`. `E` defaults to a `union` placeholder (spec ch19), so a
+function answering `Result<i32>` has the union of the errors it returns and propagates.
+
+A type of the program's own becomes a numeric literal's target by implementing `[fromNumber]`, a
+method without a receiver taking a `NumberLiteral` and answering a `Result` — spec ch09. The
+compiler converts each such literal statically, through `literalValue`; the built-in numbers' own
+conversions are the `numberLiteralTo…` functions, written `f64.[fromNumber](n)` and so on.
+
+## What is not here yet
+
+- **`Set<T>`.** `Map<T, bool>` is the whole implementation, and a wrapper is worth writing
+  when something wants one.
+- **Iteration without copying.** `keys()` and `values()` allocate. wac has no iterator
+  protocol, so the shape a lazy iterator would take is not settled; index-based loops over
+  `keys()` are what this repo does. It *did* also say "and no closures", which stopped being
+  true on 2026-08-16 — a wacc lambda captures, so a callback-shaped `each` is now writable and
+  the open question is which of the two shapes this package should offer.
+- **`sort`.** A generic sort over a `fn<bool(T, T)>` comparator belongs here. `gzip` and
+  `bignum` both sort by hand today.
+- **A string builder.** `bytes`' `Buf` is the byte-level answer; repeated `s + t` is
+  quadratic and nothing here fixes that.
+
+## Testing
+
+`test/*_test.wac` are unit tests written in wac, and all of them are — there is no TypeScript
+under `core/` at all. `test/traps_test.wac` is where the bounds checks are covered, including
+the case that tells a length check from a capacity check: an index inside the allocation but
+past the length.
+
+This paragraph said `test/wac/*_test.wac` and `test/traps.test.ts`, the latter host-side
+*"because a trap aborts the whole module, so each case needs its own call from the host"*. Both
+halves stopped being true on 2026-08-16, and the file that moved says why: a trap unwinds this
+module and nothing else, both runners carry on to the next test, and what was missing was a way
+to *say* a trap is expected.
+
+`map_test.wac` ends with a **differential test**: the same pseudo-random operation sequence
+run against `Map` and against a naive association list of two parallel `Vec`s, compared after
+every operation. Six deliberate mutations of `Map` were tried against these tests and all six
+were caught, five of them by the differential run — a probe-sequence bug needs a specific
+interleaving of insertions, overwrites and removals that no hand-written case is going to hit.
+

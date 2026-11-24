@@ -1,0 +1,631 @@
+// The WebRTC mapping's connection and stream engine — SPEC §6.2, §6.5, §7, §8 — over channels a driver supplies.
+//
+// **Nothing here touches a socket, an SCTP association or a browser.** A driver owns the data channels: the
+// native one builds them from `packages/webrtc`'s association, a page's from the browser's RTCPeerConnection. It
+// hands each channel in as a `Channel` value and forwards the channel's events — opened, a message, closed — to
+// the stream or connection it belongs to. That is the whole contract, and it is why one engine serves the
+// listener, the native dialer and a dialer in a page.
+//
+// Ported from `@kpstreams/core`'s `stream-core.ts` and `conn-core.ts`, which are the reference behaviour; the
+// spec is the authority where they differ.
+//
+// **Establishment is mutual HELLO.** Each end sends HELLO on the control channel the moment it opens, and a
+// connection is not established — no stream may be opened, no DATA sent — until it has both sent and received
+// one. A peer's first application channel can arrive before its HELLO (they are separate SCTP streams with no
+// ordering between them), so such a channel is *staged*: counted against this end's own limits, its DATA
+// buffered against its own windows, and nothing surfaced until the HELLOs have crossed.
+
+import { Result, Ticket, Vec, Queue } from "core";
+import { Code, Reason, codeFromWire } from "../errors.wac";
+import { Stream, Connection, ReadResult, CloseInfo, Endpoint } from "../api.wac";
+import { Frame, Control, parseFrame, parseControl, encodeData, encodeFin, encodeCode, encodeMaxStreamData,
+         encodeConnClose, encodeHello, encodeMaxData, encodeMaxStreams,
+         FRAME_RESET, FRAME_STOP_SENDING, MAX_PAYLOAD, WIRE_VERSION } from "./frame.wac";
+import { ConnFlow, StreamFlow, Limits, Wakeable } from "./flow.wac";
+
+/** A data channel, as the driver presents it. */
+export struct Channel {
+  fn<bool()> isOpen;
+  fn<void(u8[])> send;
+  /** Bytes queued locally and not yet on the wire: a local resource bound, never the flow control. */
+  fn<i64()> buffered;
+  fn<void()> close;
+}
+
+/** The reserved channels' fixed ids and labels (§8). */
+export static i32 CONTROL_ID = 0;
+export static string CONTROL_LABEL = "_kps_control";
+export static i32 DATAGRAM_ID = 1;
+export static string DATAGRAM_LABEL = "_kps_datagrams";
+
+/** A datagram's ceiling on WebRTC: below an MTU, so each travels as one unreliable SCTP message (§7). */
+export static i32 MAX_DATAGRAM = 1200;
+/** How many unread datagrams are kept before the oldest is dropped. */
+static i32 DATAGRAM_QUEUE = 256;
+/** How long the pre-HELLO state may last, from the connection's creation (§8 requires a bound). */
+export static i64 HELLO_TIMEOUT_MS = 15000;
+/** Above this much locally queued, a writer waits for the driver to report the queue drained. */
+static i64 LOCAL_SEND_BUFFER = 1048576;
+
+/** What the driver provides: the two reserved channels, a way to open an application channel, and teardown. */
+export struct Driver {
+  Channel control;
+  Channel datagram;
+  /**
+   * Open an application channel (DCEP, not negotiated) for `stream`, and route the new channel's events to it.
+   * Settles with null if it cannot be created. A ticket, because in a page the browser makes the channel and the
+   * program hears of it a turn later; the native driver answers at once.
+   */
+  fn<Ticket<Channel?>(WebrtcStream)> openChannel;
+  fn<void()> closeTransport;
+  Endpoint remote;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────── streams ───
+
+export struct WebrtcStream : Stream {
+  Channel ch;
+  StreamFlow sf;
+  WebrtcConn conn;
+  bool peerInitiated;
+  Queue<u8[]> inbuf = Queue<u8[]> { };
+  i64 inbufBytes = 0;
+  bool peerFin = false;
+  Reason? peerReset = null;
+  Reason? peerStop = null;
+  /** 0 while the write half is open, 1 after FIN went to the transport, 2 after RESET did. */
+  i32 localTerminal = 0;
+  bool readCancelled = false;
+  /** What a read reports after this end ended the read half: never EOF, which is the peer's FIN alone (§9.2). */
+  Reason? readError = null;
+  Reason? sendFailure = null;
+  bool channelOpen = false;
+  bool openFailed = false;
+  bool channelClosed = false;
+  bool retired = false;
+  Wakeable readWake = Wakeable.create();
+  Wakeable drainWake = Wakeable.create();
+  Wakeable openWake = Wakeable.create();
+  CloseInfo? ended = null;
+  Ticket<CloseInfo> endedTicket = Ticket<CloseInfo> { };
+
+  WebrtcStream make(Channel ch, WebrtcConn conn, bool peerInitiated) {
+    // The update goes through `s.ch`, not `ch`: a stream this end opens starts on a placeholder, and the channel it
+    // is given later is the one its credit has to travel on.
+    WebrtcStream? self = null;
+    StreamFlow sf = StreamFlow.create(conn.flow.local.maxStreamData, (i64 v) => {
+      Channel now = self!.ch;
+      if (now.isOpen()) { now.send(encodeMaxStreamData(v)); }
+    });
+    WebrtcStream s = WebrtcStream { ch: ch, sf: sf, conn: conn, peerInitiated: peerInitiated };
+    self = s;
+    if (ch.isOpen()) { s.channelOpen = true; }
+    return s;
+  }
+
+  // ── the driver's events ──
+
+  /** The channel opened. */
+  void opened(this) {
+    this.channelOpen = true;
+    this.openWake.wake();
+  }
+
+  /** The local send queue drained below its bound. */
+  void drained(this) { this.drainWake.wake(); }
+
+  /** One message on this stream's channel: exactly one frame. */
+  void message(this, u8[] m) {
+    match (parseFrame(m)) {
+      Violation(why): { this.conn.fatal(Reason.saying(Code.ProtocolError, why)); }
+      Data(payload): {
+        if (this.peerFin || this.peerReset is not null) {
+          this.conn.fatal(Reason.saying(Code.ProtocolError, "DATA after a terminal frame"));
+          return;
+        }
+        string over = this.sf.onReceived(this.conn.flow, payload.len() as i64);
+        if (over.len() > 0) {
+          this.conn.fatal(Reason.saying(Code.ProtocolError, over));
+          return;
+        }
+        if (this.readCancelled) {
+          // In flight when we sent STOP_SENDING: discarded on arrival, which is consumption.
+          this.sf.onConsumed(this.conn.flow, payload.len() as i64);
+          return;
+        }
+        this.inbuf.push(payload);
+        this.inbufBytes += payload.len() as i64;
+        this.readWake.wake();
+      }
+      Fin: {
+        if (this.peerFin || this.peerReset is not null) {
+          this.conn.fatal(Reason.saying(Code.ProtocolError, "a second terminal frame"));
+          return;
+        }
+        this.peerFin = true;
+        this.readWake.wake();
+        this.maybeRetire();
+      }
+      ResetFrame(code): {
+        if (this.peerFin || this.peerReset is not null) {
+          this.conn.fatal(Reason.saying(Code.ProtocolError, "a second terminal frame"));
+          return;
+        }
+        this.peerReset = Reason.of(code == 0 as i64 ? Code.Reset : codeFromWire(code));
+        // QUIC-like: what was buffered and unread is discarded — consumed, so its connection credit returns.
+        this.discardInbuf();
+        this.readWake.wake();
+        this.maybeRetire();
+      }
+      StopSending(code): {
+        if (this.peerStop is not null) { return; }
+        this.peerStop = Reason.of(code == 0 as i64 ? Code.Cancelled : codeFromWire(code));
+        this.failSend(this.peerStop!);
+        if (this.localTerminal == 0) {
+          // No terminal frame handed to the transport yet: answer with RESET (§6.2).
+          this.localTerminal = 2;
+          if (this.ch.isOpen()) { this.ch.send(encodeCode(FRAME_RESET, code)); }
+          this.maybeRetire();
+        }
+      }
+      MaxStreamData(v): {
+        if (this.sf.onPeerMaxStreamData(v)) { this.conn.flow.credit.wake(); }
+      }
+    }
+  }
+
+  /** The channel closed. Mid-stream, with the connection healthy, that is fatal: credit would be ambiguous. */
+  void channelGone(this) {
+    if (this.channelClosed) { return; }
+    this.channelClosed = true;
+    if (!this.wireComplete() && !this.conn.tearingDown) {
+      this.conn.fatal(Reason.saying(Code.ProtocolError, "a data channel closed mid-stream"));
+    }
+    this.failSend(Reason.saying(Code.NetworkError, "stream closed"));
+    if (!this.channelOpen) { this.openFailed = true; }
+    this.openWake.wake();
+    this.settle(this.peerReset is null ? CloseInfo.clean() : CloseInfo.because(this.peerReset!));
+    this.readWake.wake();
+    this.drainWake.wake();
+    this.maybeRetire();
+  }
+
+  // ── the application's calls ──
+
+  override Ticket<ReadResult> read(this) { return streamRead(this); }
+
+  override Ticket<Result<bool, Reason>> write(this, u8[] bytes) { return streamWrite(this, bytes); }
+
+  override void closeWrite(this) {
+    if (this.localTerminal != 0) { return; }
+    this.localTerminal = 1;
+    this.failSend(Reason.saying(Code.Closed, "the write half is closed"));
+    if (this.ch.isOpen()) { this.ch.send(encodeFin()); }
+    this.maybeRetire();
+  }
+
+  override void cancelRead(this, Reason reason) {
+    if (this.readCancelled) { return; }
+    this.readCancelled = true;
+    this.readError = reason.code.isNone() ? Reason.of(Code.Cancelled) : reason;
+    this.sf.cancelled = true;
+    this.discardInbuf();
+    if (!this.peerFin && this.peerReset is null && this.ch.isOpen()) {
+      this.ch.send(encodeCode(FRAME_STOP_SENDING, this.readError!.code.wire()));
+    }
+    this.readWake.wake();
+    this.maybeRetire();
+  }
+
+  override void resetWrite(this, Reason reason) {
+    if (this.localTerminal != 0) { return; }
+    this.localTerminal = 2;
+    Reason r = reason.code.isNone() ? Reason.of(Code.Reset) : reason;
+    this.failSend(r);
+    if (this.ch.isOpen()) { this.ch.send(encodeCode(FRAME_RESET, r.code.wire())); }
+    this.maybeRetire();
+  }
+
+  /**
+   * Both halves. With no code an orderly teardown: FIN, so the peer reads EOF after what was written. With a
+   * code the write half is *reset*, so the peer's read fails with it (§6.1, §9) — as Go's `CloseWithError` does;
+   * the JS reference's `close(reason)` sends FIN either way, which the spec's table does not allow.
+   *
+   * The channel itself closes at retirement, once the peer's terminal frame has arrived (a conforming peer
+   * answers STOP_SENDING with RESET): closing it sooner is a §6.5 violation against the peer.
+   */
+  override void close(this, Reason reason) {
+    if (reason.code.isNone()) {
+      this.closeWrite();
+      this.cancelRead(Reason.of(Code.Closed));
+      return;
+    }
+    this.resetWrite(reason);
+    this.cancelRead(reason);
+  }
+
+  override Ticket<CloseInfo> closed(this) { return this.endedTicket; }
+
+  /** Connection teardown: discard everything, fail every waiter, say nothing on the wire. */
+  void destroy(this, CloseInfo info) {
+    this.discardInbuf();
+    this.readCancelled = true;
+    this.readError = info.ok ? Reason.saying(Code.Closed, "the connection closed") : info.reason;
+    this.failSend(this.readError!);
+    if (!this.channelOpen) { this.openFailed = true; }
+    this.openWake.wake();
+    this.settle(info);
+    this.readWake.wake();
+    this.drainWake.wake();
+  }
+
+  // ── lifecycle ──
+
+  bool wireComplete(const this) { return this.localTerminal != 0 && (this.peerFin || this.peerReset is not null); }
+
+  void failSend(this, Reason r) {
+    if (this.sendFailure is not null) { return; }
+    this.sendFailure = r;
+    this.conn.flow.credit.wake();
+  }
+
+  void discardInbuf(this) {
+    if (this.inbufBytes == 0 as i64) { return; }
+    i64 n = this.inbufBytes;
+    this.inbuf = Queue<u8[]> { };
+    this.inbufBytes = 0 as i64;
+    this.sf.onConsumed(this.conn.flow, n);
+  }
+
+  /**
+   * Retirement, staged as §6.5 requires: wire-complete (both terminal frames on the wire), then the channel
+   * closed, then every inbound byte consumed or discarded. An end that is wire-complete and drained closes the
+   * channel itself if it is still open, so retirement always makes progress.
+   */
+  void maybeRetire(this) {
+    if (!this.wireComplete() || this.inbufBytes > 0 as i64) { return; }
+    if (!this.channelClosed) {
+      this.ch.close();
+      return;
+    }
+    if (!this.retired) {
+      this.retired = true;
+      this.conn.streamRetired(this);
+    }
+  }
+
+  void settle(this, CloseInfo info) {
+    if (this.ended is not null) { return; }
+    this.ended = info;
+    this.endedTicket.resolve(info);
+  }
+}
+
+async ReadResult streamRead(WebrtcStream s) {
+  while (true) {
+    if (s.readCancelled) { return ReadResult.Failed(s.readError ?? Reason.of(Code.Cancelled)); }
+    u8[]? chunk = s.inbuf.pop();
+    if (chunk is not null) {
+      i64 n = chunk!.len() as i64;
+      s.inbufBytes -= n;
+      // The read is fulfilled here, and only here does the chunk count as consumed (§6.5): bytes waiting in a
+      // queue the application has not read are not consumption, or the buffer would be unbounded one queue over.
+      s.sf.onConsumed(s.conn.flow, n);
+      s.maybeRetire();
+      return ReadResult.Data(chunk!);
+    }
+    if (s.peerReset is not null) { return ReadResult.Failed(s.peerReset!); }
+    if (s.peerFin) { return ReadResult.End; }
+    if (s.channelClosed) { return ReadResult.Failed(Reason.saying(Code.NetworkError, "stream closed")); }
+    await s.readWake.wait();
+  }
+}
+
+/** Why the write half cannot take bytes now, or null if it can. */
+Reason? notWritable(WebrtcStream s) {
+  if (s.peerStop is not null) { return s.peerStop; }
+  if (s.localTerminal != 0) { return Reason.saying(Code.Closed, "the write half is closed"); }
+  if (s.sendFailure is not null) { return s.sendFailure; }
+  if (s.channelClosed || !s.ch.isOpen()) { return Reason.saying(Code.NetworkError, "the stream is closed"); }
+  return null;
+}
+
+async Result<bool, Reason> streamWrite(WebrtcStream s, u8[] bytes) {
+  i32 off = 0;
+  while (off < bytes.len()) {
+    Reason? why = notWritable(s);
+    if (why is not null) { return Result.Err(why!); }
+    if (s.conn.flow.failed) { return Result.Err(s.conn.failure()); }
+    // Credit before the frame exists (§6.5); a partial grant splits the frame at the window's edge.
+    i32 want = bytes.len() - off < MAX_PAYLOAD ? bytes.len() - off : MAX_PAYLOAD;
+    i64 granted = s.conn.flow.reserve(s.sf, want as i64);
+    if (granted == 0 as i64) {
+      await s.conn.flow.credit.wait();
+      continue;
+    }
+    // The local queue bound — a resource limit, not flow control.
+    while (s.ch.isOpen() && s.ch.buffered() >= LOCAL_SEND_BUFFER && notWritable(s) is null) {
+      await s.drainWake.wait();
+    }
+    Reason? late = notWritable(s);
+    if (late is not null) {
+      s.conn.flow.release(s.sf, granted);
+      return Result.Err(late!);
+    }
+    i32 n = granted as! i32;
+    s.ch.send(encodeData(bytes, off, n));
+    s.conn.flow.commit(s.sf, granted);
+    off += n;
+  }
+  return Result.Ok(true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────── connections ───
+
+export struct WebrtcConn : Connection {
+  Driver host;
+  ConnFlow flow;
+  /** 0 connecting, 1 open, 2 closed. */
+  i32 state = 0;
+  bool tearingDown = false;
+  bool helloSent = false;
+  bool peerHello = false;
+  i64 helloDeadline;
+  Vec<WebrtcStream> streams = Vec<WebrtcStream>.create();
+  Vec<WebrtcStream> staged = Vec<WebrtcStream>.create();
+  Queue<WebrtcStream> incoming = Queue<WebrtcStream> { };
+  Wakeable acceptWake = Wakeable.create();
+  Wakeable establishWake = Wakeable.create();
+  Queue<u8[]> datagrams = Queue<u8[]> { };
+  Wakeable datagramWake = Wakeable.create();
+  CloseInfo? ended = null;
+  Ticket<CloseInfo> endedTicket = Ticket<CloseInfo> { };
+
+  /**
+   * A connection over `host`'s reserved channels, created at `now` (milliseconds) so the HELLO deadline can be
+   * kept. If the control channel is already open, HELLO goes at once; otherwise when the driver says it opened.
+   */
+  WebrtcConn make(Driver host, Limits limits, i64 now) {
+    Channel control = host.control;
+    ConnFlow flow = ConnFlow.create(limits,
+                                    (i64 v) => { trySend(control, encodeMaxData(v)); },
+                                    (i64 v) => { trySend(control, encodeMaxStreams(v)); });
+    WebrtcConn c = WebrtcConn { host: host, flow: flow, helloDeadline: now + HELLO_TIMEOUT_MS };
+    if (control.isOpen()) { c.controlOpened(); }
+    return c;
+  }
+
+  // ── the driver's events ──
+
+  void controlOpened(this) {
+    if (this.helloSent || this.ended is not null) { return; }
+    this.helloSent = true;
+    trySend(this.host.control, encodeHello(WIRE_VERSION, this.flow.local.maxStreamData, this.flow.local.maxData,
+                                           this.flow.local.maxStreams));
+    this.checkEstablished();
+  }
+
+  void controlMessage(this, u8[] m) {
+    match (parseControl(m)) {
+      Bad(why): { this.fatal(Reason.saying(Code.ProtocolError, why)); }
+      Hello(version, maxStreamData, maxData, maxStreams): {
+        if (this.peerHello) {
+          this.fatal(Reason.saying(Code.ProtocolError, "a second HELLO"));
+          return;
+        }
+        if (version != WIRE_VERSION) {
+          trySend(this.host.control, encodeConnClose(Code.Unsupported.wire()));
+          this.teardown(CloseInfo.because(Reason.saying(Code.Unsupported,
+                                                        "the peer speaks wire version \{version}, not \{WIRE_VERSION}")));
+          return;
+        }
+        this.peerHello = true;
+        this.flow.onPeerHello(maxStreamData, maxData, maxStreams);
+        this.checkEstablished();
+      }
+      Close(code): {
+        // Valid at any time — before HELLO it is the peer refusing the handshake (§8).
+        this.teardown(code == 0 as i64 ? CloseInfo.clean() : CloseInfo.because(Reason.of(codeFromWire(code))));
+      }
+      MaxData(v): {
+        if (!this.peerHello) {
+          this.fatal(Reason.saying(Code.ProtocolError, "a control message before HELLO"));
+          return;
+        }
+        this.flow.onPeerMaxData(v);
+      }
+      MaxStreams(v): {
+        if (!this.peerHello) {
+          this.fatal(Reason.saying(Code.ProtocolError, "a control message before HELLO"));
+          return;
+        }
+        this.flow.onPeerMaxStreams(v);
+      }
+    }
+  }
+
+  /** A reserved channel closed. With the connection healthy, that is fatal (§8). */
+  void reservedLost(this, string which) {
+    if (this.tearingDown || this.ended is not null) { return; }
+    this.fatal(Reason.saying(Code.ProtocolError, "the reserved \{which} channel was lost"));
+  }
+
+  void datagram(this, u8[] d) {
+    this.datagrams.push(d);
+    if (this.datagrams.len() > DATAGRAM_QUEUE) { this.datagrams.pop(); }   // the oldest goes
+    this.datagramWake.wake();
+  }
+
+  /**
+   * The peer opened an application channel. Answers the stream to route the channel's events to, or null if
+   * opening it broke the peer's stream limit — the connection is then closed and the channel is not to be used.
+   */
+  WebrtcStream? incomingChannel(this, Channel ch) {
+    if (this.ended is not null) { return null; }
+    if (!this.flow.peerStreamOpened()) {
+      this.fatal(Reason.saying(Code.ProtocolError, "the peer exceeded MAX_STREAMS"));
+      return null;
+    }
+    WebrtcStream s = WebrtcStream.make(ch, this, true);
+    this.streams.push(s);
+    if (this.state == 1) { this.surface(s); } else { this.staged.push(s); }
+    return s;
+  }
+
+  /** The peer connection failed. */
+  void transportFailed(this, string why) {
+    this.teardown(CloseInfo.because(Reason.saying(Code.NetworkError, why)));
+  }
+
+  /** The peer connection closed. */
+  void transportClosed(this) {
+    this.teardown(this.state != 0 ? CloseInfo.clean()
+                                  : CloseInfo.because(Reason.saying(Code.NetworkError, "closed before HELLO")));
+  }
+
+  /** The driver's clock: past the HELLO deadline without establishing, the connection times out. */
+  void tick(this, i64 now) {
+    if (this.state == 0 && now >= this.helloDeadline) {
+      this.fatal(Reason.saying(Code.Timeout, "no HELLO before the deadline"));
+    }
+  }
+
+  // ── the application's calls ──
+
+  /** Settles when HELLOs have crossed (`Ok`), or the connection ended first (`Err`). */
+  Ticket<Result<bool, Reason>> established(this) { return connEstablished(this); }
+
+  override Ticket<Result<Stream, Reason>> openStream(this) { return connOpen(this); }
+  override Ticket<Result<Stream, Reason>> acceptStream(this) { return connAccept(this); }
+
+  override Result<bool, Reason> sendDatagram(this, u8[] bytes) {
+    if (bytes.len() > MAX_DATAGRAM) {
+      return Result.Err(Reason.saying(Code.TooLarge, "a datagram may carry at most \{MAX_DATAGRAM} bytes here"));
+    }
+    if (this.ended is not null) { return Result.Err(this.failure()); }
+    if (!this.host.datagram.isOpen()) { return Result.Err(Reason.saying(Code.NetworkError, "the datagram channel is not open")); }
+    this.host.datagram.send(bytes);
+    return Result.Ok(true);
+  }
+
+  override Ticket<Result<u8[], Reason>> receiveDatagram(this) { return connDatagram(this); }
+
+  override void close(this, Reason reason) {
+    if (this.ended is not null) { return; }
+    this.tearingDown = true;
+    trySend(this.host.control, encodeConnClose(reason.code.wire()));
+    this.teardown(reason.code.isNone() ? CloseInfo.clean() : CloseInfo.because(reason));
+  }
+
+  override Ticket<CloseInfo> closed(this) { return this.endedTicket; }
+  override Endpoint remote(const this) { return this.host.remote; }
+
+  // ── internals ──
+
+  /** Why things are failing: the close reason once there is one. */
+  Reason failure(this) {
+    if (this.ended is null) { return Reason.saying(Code.Closed, "the connection is closing"); }
+    return this.ended!.ok ? Reason.saying(Code.Closed, "the connection closed") : this.ended!.reason;
+  }
+
+  void checkEstablished(this) {
+    if (this.state != 0 || this.ended is not null || !this.helloSent || !this.peerHello) { return; }
+    this.state = 1;
+    this.establishWake.wake();
+    // Streams the peer opened before its HELLO arrived, surfaced now in the order they came.
+    for (i32 i = 0; i < this.staged.len(); i++) { this.surface(this.staged.get(i)); }
+    this.staged = Vec<WebrtcStream>.create();
+  }
+
+  void surface(this, WebrtcStream s) {
+    this.incoming.push(s);
+    this.acceptWake.wake();
+  }
+
+  void streamRetired(this, WebrtcStream s) {
+    for (i32 i = 0; i < this.streams.len(); i++) {
+      if (this.streams.get(i) is s) { this.streams.remove(i); break; }
+    }
+    // Only a stream the peer opened returns stream-count credit to it (§6.5).
+    if (s.peerInitiated) { this.flow.peerStreamRetired(); }
+  }
+
+  /** A wire violation or a local fatal condition: send the code, best effort, and tear down. */
+  void fatal(this, Reason reason) {
+    if (this.ended is not null) { return; }
+    this.tearingDown = true;
+    trySend(this.host.control, encodeConnClose(reason.code.isNone() ? Code.ProtocolError.wire() : reason.code.wire()));
+    this.teardown(CloseInfo.because(reason));
+  }
+
+  void teardown(this, CloseInfo info) {
+    if (this.ended is not null) { return; }
+    this.ended = info;
+    this.tearingDown = true;
+    this.state = 2;
+    this.flow.fail();
+    for (i32 i = 0; i < this.streams.len(); i++) { this.streams.get(i).destroy(info); }
+    this.streams = Vec<WebrtcStream>.create();
+    this.staged = Vec<WebrtcStream>.create();
+    this.acceptWake.wake();
+    this.establishWake.wake();
+    this.datagramWake.wake();
+    this.host.closeTransport();
+    this.endedTicket.resolve(info);
+  }
+}
+
+void trySend(Channel ch, u8[] m) {
+  if (ch.isOpen()) { ch.send(m); }
+}
+
+async Result<bool, Reason> connEstablished(WebrtcConn c) {
+  while (true) {
+    if (c.state == 1) { return Result.Ok(true); }
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    await c.establishWake.wait();
+  }
+}
+
+async Result<Stream, Reason> connOpen(WebrtcConn c) {
+  while (true) {
+    if (c.state != 1) {
+      return Result.Err(c.ended is not null ? c.failure() : Reason.saying(Code.Unsupported, "the connection is not established"));
+    }
+    if (c.flow.reserveStream()) { break; }
+    await c.flow.credit.wait();
+  }
+  // A placeholder channel until the driver supplies the real one; `openChannel` routes events to the stream.
+  Channel pending = Channel(() => false, (u8[] m) => { }, () => 0 as i64, () => { });
+  WebrtcStream s = WebrtcStream.make(pending, c, false);
+  Channel? ch = await c.host.openChannel(s);
+  if (ch is null) {
+    c.flow.releaseStream();
+    return Result.Err(Reason.saying(Code.InternalError, "the transport could not open a channel"));
+  }
+  c.flow.commitStream();
+  s.ch = ch!;
+  if (ch!.isOpen()) { s.channelOpen = true; }
+  c.streams.push(s);
+  while (!s.channelOpen && !s.openFailed && c.ended is null) { await s.openWake.wait(); }
+  if (!s.channelOpen) { return Result.Err(c.ended is not null ? c.failure() : Reason.saying(Code.NetworkError, "the channel did not open")); }
+  return Result.Ok(s);
+}
+
+async Result<Stream, Reason> connAccept(WebrtcConn c) {
+  while (true) {
+    WebrtcStream? s = c.incoming.pop();
+    if (s is not null) { return Result.Ok(s!); }
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    await c.acceptWake.wait();
+  }
+}
+
+async Result<u8[], Reason> connDatagram(WebrtcConn c) {
+  while (true) {
+    u8[]? d = c.datagrams.pop();
+    if (d is not null) { return Result.Ok(d!); }
+    if (c.ended is not null) { return Result.Err(c.failure()); }
+    await c.datagramWake.wait();
+  }
+}

@@ -1,0 +1,459 @@
+// The KPS listener — SPEC §5.1 and §5.2: one UDP port, one identity, every client.
+//
+// **One socket, and a packet is routed by what it is.** A datagram from an address that is already a WebRTC peer
+// goes to that peer. A STUN binding request from anywhere else may be a new WebRTC client: its USERNAME carries the
+// ufrag the client chose, the password is derived from the certhash, and only a request whose MESSAGE-INTEGRITY
+// verifies under that password gets any state allocated — so a probe that does not know the certhash learns
+// nothing and costs nothing (SECURITY.md's probe resistance). Everything else is QUIC (§5.1): a packet whose
+// connection id is one of ours goes to that connection, and a client's first Initial — a long header, version 1, in
+// a datagram of at least 1200 bytes — makes a new one. Anything else is dropped. The same identity certificate is
+// presented on both transports, so one certhash pins both (§3).
+//
+// The client's ICE credentials are the server's too: the client synthesises the server's answer with the same
+// ufrag and password it put in its own offer, so a session here uses one ufrag and one password for both ends. The
+// server is ICE-lite — it answers checks and never sends them — and pins nobody: a KPS client authenticates the
+// server, not the other way round.
+//
+// Accepting is establishment: a connection is handed out once its HELLOs have crossed (SPEC §8), never before.
+
+import { Map, Vec, Queue, Result, Ticket, flatten, hashString, stringEq } from "core";
+import { Sys, Datagrams, Datagram } from "std";
+import { webrtc.Session, webrtc.Association, webrtc.Peer, webrtc.Consent, webrtc.looksLikeStun, webrtc.parseStun,
+         webrtc.attrUsername, webrtc.bindingRequest, webrtc.integrityOk, quic.QuicConn, quic.QuicConfig, quic.QuicTls,
+         quic.transportParams, quic.parseLong, quic.LongHeader } from "wac";
+import { QuicKpsConn } from "./quic/conn.wac";
+import { Receiver } from "./net.wac";
+import { Identity, loadOrCreateIdentity } from "./identity.wac";
+import { Address, formatAddress } from "./address.wac";
+import { Code, Reason } from "./errors.wac";
+import { Connection, Endpoint, CloseInfo } from "./api.wac";
+import { NativePeer } from "./webrtc/native.wac";
+import { Limits, Wakeable } from "./webrtc/flow.wac";
+import { icePassword, ufragAcceptable } from "./webrtc/ice.wac";
+
+/** How a listener is set up. `dir` holds the identity, made there on first start and loaded after. */
+export struct ListenOptions {
+  string host = "0.0.0.0";
+  i32 port = 0;
+  string dir = "";
+  string identityFile = "identity.pem";
+  Limits limits = Limits.defaults();
+  /** The most connections not yet established at once — half-open state is bounded. */
+  i32 maxPending = 64;
+  /** Say on standard error why each new client was or was not admitted, and when connections change state. */
+  bool trace = false;
+}
+
+/** One QUIC connection the listener holds, and where its client is. */
+struct QuicPeer {
+  QuicKpsConn c;
+  string host;
+  i32 port;
+  string[] cids;
+  bool announced;
+  bool kicked;
+}
+
+export struct Listener {
+  Sys sys;
+  Datagrams sock;
+  Receiver rx;
+  Identity id;
+  u8[] digest;
+  i32 port;
+  ListenOptions opts;
+  /** Every WebRTC peer, by its ufrag — one connection, however many of the client's addresses it checks from. */
+  Map<string, NativePeer> peers = Map<string, NativePeer>.create(hashString, stringEq);
+  /** Which peer each remote address belongs to: `host|port` to ufrag. */
+  Map<string, string> byAddr = Map<string, string>.create(hashString, stringEq);
+  /**
+   * The ufrags of connections that ended, most recent last, so a late check from one of the client's other
+   * candidates does not admit the same ufrag again as a new connection that would only wait out its HELLO deadline.
+   */
+  Vec<string> retired = Vec<string>.create();
+  Vec<string> announced = Vec<string>.create();
+  /** Every QUIC connection, by each connection id that reaches it (ours, and the client's first), as hex. */
+  Map<string, QuicPeer> quicByCid = Map<string, QuicPeer>.create(hashString, stringEq);
+  Vec<QuicPeer> quicPeers = Vec<QuicPeer>.create();
+  Queue<Connection> ready = Queue<Connection> { };
+  Wakeable readyWake = Wakeable.create();
+  bool stopped = false;
+
+  /** The address clients dial: `ip` (the one they reach this host at), the port, and the certhash. */
+  string address(const this, string ip) { return formatAddress(Address(ip, this.port, this.id.certhash())); }
+
+  /** The next established connection. */
+  Ticket<Result<Connection, Reason>> accept(this) { return acceptNext(this); }
+
+  /** Stop: every connection is closed, the socket with them. */
+  void close(this) {
+    if (this.stopped) { return; }
+    this.stopped = true;
+    string[] keys = this.peers.keys();
+    for (i32 i = 0; i < keys.len(); i++) {
+      NativePeer? p = this.peers.get(keys[i]);
+      if (p is not null) { p!.conn!.close(Reason.of(Code.Closed)); }
+    }
+    for (i32 i = 0; i < this.quicPeers.len(); i++) { this.quicPeers.get(i).c.close(Reason.of(Code.Closed)); }
+    this.readyWake.wake();
+  }
+}
+
+/**
+ * Listen. The identity in `opts.dir` is loaded, or made and written there; the socket is bound; and serving starts
+ * in the background — it runs whenever the program awaits, as `accept` does.
+ */
+export async Result<Listener, string> listen(Sys sys, ListenOptions opts) {
+  if (opts.dir.len() == 0) { return Result.Err("kps: listen needs a directory to keep its identity in"); }
+  Identity id = Identity(u8[](), u8[]());
+  match (await loadOrCreateIdentity(sys, opts.dir, opts.identityFile)) {
+    Ok(got): { id = got; }
+    Err(why): { return Result.Err("kps: \{why}"); }
+  }
+  Datagrams? sock = null;
+  match (await sys.net().bindDatagram(opts.host, opts.port)) {
+    Ok(s): { sock = s; }
+    Err(e): { return Result.Err("kps: cannot bind \{opts.host}:\{opts.port}: \{e}"); }
+  }
+  Listener l = Listener { sys: sys, sock: sock!, rx: Receiver.of(sys, sock!), id: id, digest: id.digest(), port: sock!.port, opts: opts };
+  serve(l);
+  return Result.Ok(l);
+}
+
+async Result<Connection, Reason> acceptNext(Listener l) {
+  while (true) {
+    Connection? c = l.ready.pop();
+    if (c is not null) { return Result.Ok(c!); }
+    if (l.stopped) { return Result.Err(Reason.saying(Code.Closed, "the listener is closed")); }
+    await l.readyWake.wait();
+  }
+}
+
+/** The loop: a datagram or a quarter-tick of silence, then whatever every peer's clock says is due. */
+async void serve(Listener l) {
+  while (!l.stopped) {
+    // A QUIC connection whose application just wrote wants to send now, not at the next quarter-tick.
+    bool kicked = false;
+    for (i32 i = 0; i < l.quicPeers.len(); i++) { if (l.quicPeers.get(i).kicked) { kicked = true; } }
+    Datagram? got = await l.rx.next(kicked ? 1 : 10);
+    i64 now = 0 as i64;
+    match (await l.sys.clock().nowMillis()) { Ok(ms): { now = ms; } Err(_): { } }
+    if (got is not null) {
+      Datagram d = got!;
+      if (d.error.len() == 0) { await route(l, d, now); }
+    }
+    string[] ufrags = l.peers.keys();
+    for (i32 i = 0; i < ufrags.len(); i++) {
+      NativePeer? p = l.peers.get(ufrags[i]);
+      if (p is null) { continue; }
+      p!.tick(now);
+      await flush(l, p!, p!.toHost, p!.toPort);
+      settle(l, ufrags[i], p!);
+    }
+    for (i32 i = l.quicPeers.len() - 1; i >= 0; i--) {
+      QuicPeer qp = l.quicPeers.get(i);
+      qp.c.q.tick(now);
+      qp.c.pump();
+      await quicFlush(l, qp, now);
+      quicSettle(l, qp, i);
+    }
+  }
+  l.rx.close();
+}
+
+/**
+ * One datagram. A check is answered at the address it came from — that is what makes the pair it tests work — and
+ * DTLS moves the peer's destination to wherever it came from. A check from an address not seen before joins the
+ * peer whose ufrag it names, or, with no such peer, may be a new client.
+ */
+async void route(Listener l, Datagram d, i64 now) {
+  string addr = "\{d.peer}|\{d.port}";
+  bool stun = looksLikeStun(d.bytes);
+  string? ufrag = l.byAddr.get(addr);
+  if (ufrag is null) {
+    if (!stun) {                                                 // §5.1: everything else is QUIC
+      await quicRoute(l, d, now);
+      return;
+    }
+    string named = verifiedUfrag(l, d);
+    if (named.len() == 0) { return; }
+    if (!l.peers.has(named)) {
+      for (i32 i = 0; i < l.retired.len(); i++) {
+        if (l.retired.get(i) == named) { return; }
+      }
+      NativePeer? fresh = await admit(l, d, named, now);
+      if (fresh is null) { return; }
+      l.peers.set(named, fresh!);
+    }
+    l.byAddr.set(addr, named);
+    ufrag = named;
+  }
+  NativePeer? p = l.peers.get(ufrag!);
+  if (p is null) {
+    l.byAddr.remove(addr);
+    return;
+  }
+  if (!stun) {
+    p!.toHost = d.peer;
+    p!.toPort = d.port;
+  }
+  p!.receive(d.bytes, ipBytes(d.peer), d.port, now);
+  if (stun) { await flush(l, p!, d.peer, d.port); } else { await flush(l, p!, p!.toHost, p!.toPort); }
+  settle(l, ufrag!, p!);
+}
+
+/**
+ * The ufrag a binding request names, if it proves the client knows the certhash: a USERNAME of the KPS shape, a ufrag
+ * in the ICE character set, and MESSAGE-INTEGRITY under the password derived from both. Empty otherwise.
+ */
+string verifiedUfrag(Listener l, Datagram d) {
+  auto msg = parseStun(d.bytes);
+  if (!msg.ok || msg.kind != bindingRequest()) { return refused(l, d, "not a binding request"); }
+  string user = string.fromBytes(msg.attr(attrUsername()));
+  i32 colon = user.indexOf(":");
+  if (colon <= 0) { return refused(l, d, "no KPS username"); }
+  string ufrag = user.slice(0, colon);
+  if (!ufragAcceptable(ufrag)) { return refused(l, d, "a ufrag outside the ICE character set"); }
+  if (!integrityOk(d.bytes, icePassword(l.digest, ufrag).toBytes())) {
+    return refused(l, d, "MESSAGE-INTEGRITY does not verify: the client does not know the certhash");
+  }
+  return ufrag;
+}
+
+string refused(Listener l, Datagram d, string why) {
+  if (l.opts.trace) { l.sys.warn("kps: refused \{d.peer}:\{d.port}: \{why}"); }
+  return "";
+}
+
+/** A new WebRTC client, its ufrag verified: fresh DTLS and SCTP randomness, and a peer over them. */
+async NativePeer? admit(Listener l, Datagram d, string ufrag, i64 now) {
+  if (pending(l) >= l.opts.maxPending) { return refuse(l, d, "too many connections half open"); }
+  if (l.opts.trace) { l.sys.warn("kps: admitted \{d.peer}:\{d.port} (ufrag \{ufrag})"); }
+  u8[] r = u8[]();
+  match (await l.sys.random().bytes(112)) {
+    Ok(b): { r = b; }
+    Err(_): { return null; }
+  }
+  string pwd = icePassword(l.digest, ufrag);
+  Peer peer = Peer.of(l.id.cert, l.id.key, part(r, 0, 32), part(r, 32, 32), part(r, 64, 32), part(r, 96, 8));
+  Association assoc = Association.create(false, bigI32(r, 104), bigI32(r, 108), 1048576);
+  Session session = Session.of(peer, assoc, Consent.of(5000 as i64, 30000 as i64, now), ufrag, pwd, ufrag, pwd, "");
+  session.pinPeer = false;
+  return NativePeer.make(session, l.opts.limits, Endpoint(d.peer, d.port), now);
+}
+
+NativePeer? refuse(Listener l, Datagram d, string why) {
+  if (l.opts.trace) { l.sys.warn("kps: refused \{d.peer}:\{d.port}: \{why}"); }
+  return null;
+}
+
+/** How many peers have not yet established — the half-open count. */
+i32 pending(const Listener l) {
+  i32 n = 0;
+  const string[] keys = l.peers.keys();
+  for (i32 i = 0; i < keys.len(); i++) {
+    if (!isAnnounced(l, keys[i])) { n++; }
+  }
+  return n;
+}
+
+bool isAnnounced(const Listener l, string key) {
+  for (i32 i = 0; i < l.announced.len(); i++) { if (l.announced.get(i) == key) { return true; } }
+  return false;
+}
+
+async void flush(Listener l, NativePeer p, string host, i32 port) {
+  u8[][] out = p.take();
+  for (i32 i = 0; i < out.len(); i++) { await l.sock.sendTo(host, port, out[i]); }
+}
+
+/** Hand an established connection to `accept`, once; forget a peer whose connection has ended. */
+void settle(Listener l, string key, NativePeer p) {
+  if (p.conn!.state == 1 && !isAnnounced(l, key)) {
+    if (l.opts.trace) { l.sys.warn("kps: established \{key}"); }
+    l.announced.push(key);
+    l.ready.push(p.conn!);
+    l.readyWake.wake();
+  }
+  if (p.conn!.ended is not null && p.outbox.len() == 0) {
+    if (l.opts.trace) { l.sys.warn("kps: ended \{key}: \{p.conn!.failure().describe()}"); }
+    l.peers.remove(key);
+    l.retired.push(key);
+    if (l.retired.len() > 1024) { l.retired.remove(0); }
+    string[] addrs = l.byAddr.keys();
+    for (i32 i = 0; i < addrs.len(); i++) {
+      string? u = l.byAddr.get(addrs[i]);
+      if (u is not null && u! == key) { l.byAddr.remove(addrs[i]); }
+    }
+    for (i32 i = 0; i < l.announced.len(); i++) {
+      if (l.announced.get(i) == key) { l.announced.remove(i); break; }
+    }
+  }
+}
+
+u8[] part(u8[] b, i32 from, i32 n) {
+  u8[] out = u8[].filled(n, 0);
+  out.copyFrom(b, from, 0, n);
+  return out;
+}
+
+i32 bigI32(u8[] b, i32 at) {
+  return (b[at] as i32 << 24) | (b[at + 1] as i32 << 16) | (b[at + 2] as i32 << 8) | b[at + 3] as i32;
+}
+
+i32 digits(string s) {
+  i32 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + (b[i] - '0') as i32; }
+  return n;
+}
+
+/** An address's bytes: four for IPv4, sixteen for IPv6 — what a STUN response's XOR-MAPPED-ADDRESS carries. */
+export u8[] ipBytes(string ip) {
+  if (ip.indexOf(":") < 0) {
+    u8[] out = u8[].filled(4, 0);
+    i32 part = 0;
+    i32 v = 0;
+    u8[] b = ip.toBytes();
+    for (i32 i = 0; i <= b.len(); i++) {
+      if (i == b.len() || b[i] == '.') {
+        if (part < 4) { out[part] = (v & 0xFF) as@ u8; }
+        part++;
+        v = 0;
+      } else {
+        v = v * 10 + (b[i] - '0') as i32;
+      }
+    }
+    return out;
+  }
+  return ipv6Bytes(ip);
+}
+
+/** An IPv6 literal's sixteen bytes, `::` expanded. */
+u8[] ipv6Bytes(string ip) {
+  u8[] out = u8[].filled(16, 0);
+  i32 dbl = ip.indexOf("::");
+  string head = dbl < 0 ? ip : ip.slice(0, dbl);
+  string tail = dbl < 0 ? "" : ip.slice(dbl + 2, ip.len());
+  i32[] h = groups(head);
+  i32[] t = groups(tail);
+  for (i32 i = 0; i < h.len() && i < 8; i++) { out[i * 2] = ((h[i] >> 8) & 0xFF) as@ u8; out[i * 2 + 1] = (h[i] & 0xFF) as@ u8; }
+  for (i32 i = 0; i < t.len() && i < 8; i++) {
+    i32 at = 8 - t.len() + i;
+    out[at * 2] = ((t[i] >> 8) & 0xFF) as@ u8;
+    out[at * 2 + 1] = (t[i] & 0xFF) as@ u8;
+  }
+  return out;
+}
+
+i32[] groups(string s) {
+  if (s.len() == 0) { return i32[](); }
+  Vec<i32> out = Vec<i32>.create();
+  i32 v = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == ':') { out.push(v); v = 0; continue; }
+    u8 c = b[i];
+    i32 d = c >= '0' && c <= '9' ? (c - '0') as i32 : (c >= 'a' && c <= 'f' ? (c - 'a') as i32 + 10 : (c - 'A') as i32 + 10);
+    v = v * 16 + d;
+  }
+  return out.toArray();
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────────── QUIC ───
+
+string hexOf(u8[] b) {
+  string digits = "0123456789abcdef";
+  u8[] d = digits.toBytes();
+  u8[] out = u8[].filled(b.len() * 2, 0);
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i * 2] = d[(b[i] as i32 >> 4) & 0xF];
+    out[i * 2 + 1] = d[b[i] as i32 & 0xF];
+  }
+  return string.fromBytes(out);
+}
+
+/** A datagram that is not WebRTC's: to the QUIC connection its id names, or a new one if it is a first Initial. */
+async void quicRoute(Listener l, Datagram d, i64 now) {
+  u8[] b = d.bytes;
+  if (b.len() < 9) { return; }
+  u8[] dcid = u8[]();
+  LongHeader? h = null;
+  if ((b[0] as i32 & 0x80) != 0) {
+    LongHeader lh = parseLong(b, 0, true);
+    if (!lh.ok) { return; }
+    h = lh;
+    dcid = lh.dcid;
+  } else {
+    dcid = part(b, 1, 8);
+  }
+  QuicPeer? qp = l.quicByCid.get(hexOf(dcid));
+  if (qp is null) {
+    // RFC 9000 §14.1: a server answers only an Initial in a datagram of at least 1200 bytes, which bounds what a
+    // forged source address can be made to receive; RFC 9000 §7.2: its id is at least 8 bytes.
+    if (h is null || h!.version != 1 || h!.packetType != 0 || b.len() < 1200 || dcid.len() < 8) { return; }
+    qp = await quicAdmit(l, d, h!, now);
+    if (qp is null) { return; }
+    // The admission opened this datagram already.
+    qp!.c.pump();
+    await quicFlush(l, qp!, now);
+    return;
+  }
+  // The client's address is wherever its packets come from now (NAT rebinding moves it).
+  qp!.host = d.peer;
+  qp!.port = d.port;
+  qp!.c.q.receive(b, now);
+  qp!.c.pump();
+  await quicFlush(l, qp!, now);
+}
+
+async QuicPeer? quicAdmit(Listener l, Datagram d, LongHeader h, i64 now) {
+  i32 pendingQuic = 0;
+  for (i32 i = 0; i < l.quicPeers.len(); i++) { if (!l.quicPeers.get(i).announced) { pendingQuic++; } }
+  if (pending(l) + pendingQuic >= l.opts.maxPending) { refuse(l, d, "too many connections half open"); return null; }
+  u8[] r = u8[]();
+  match (await l.sys.random().bytes(104)) {
+    Ok(bytes): { r = bytes; }
+    Err(_): { return null; }
+  }
+  QuicConfig cfg = QuicConfig { maxData: l.opts.limits.maxData, maxStreamData: l.opts.limits.maxStreamData,
+                                maxStreamsBidi: l.opts.limits.maxStreams };
+  u8[] scid = part(r, 0, 8);
+  QuicTls tls = QuicTls.server(cfg.alpn, transportParams(cfg, scid, h.dcid, true), part(r, 8, 32), part(r, 40, 32),
+                               l.id.cert, l.id.key, part(r, 72, 32));
+  QuicConn q = QuicConn.server(cfg, tls, scid, h.dcid, h.scid, now);
+  QuicPeer qp = QuicPeer(QuicKpsConn.make(q, Endpoint(d.peer, d.port), () => { }), d.peer, d.port,
+                         [hexOf(scid), hexOf(h.dcid)], false, false);
+  qp.c.kick = () => { qp.kicked = true; };
+  // **Nothing is held for an Initial that does not open.** Its keys come from the id in its own header, so a
+  // forged one costs its sender nothing to make — admitted on sight, sixty-four of them would fill every half-open
+  // slot for the idle timeout and turn real clients away. A real ClientHello authenticates; only then is it kept.
+  q.receive(d.bytes, now);
+  if (!q.authenticatedAny()) { return null; }
+  for (string k in qp.cids) { l.quicByCid.set(k, qp); }
+  l.quicPeers.push(qp);
+  if (l.opts.trace) { l.sys.warn("kps: admitted QUIC \{d.peer}:\{d.port}"); }
+  return qp;
+}
+
+async void quicFlush(Listener l, QuicPeer qp, i64 now) {
+  qp.kicked = false;
+  for (u8[] out in qp.c.q.take(now)) { await l.sock.sendTo(qp.host, qp.port, out); }
+  qp.c.pump();
+}
+
+/** Hand an established connection to `accept`, once; forget one that is over. */
+void quicSettle(Listener l, QuicPeer qp, i32 at) {
+  if (!qp.announced && qp.c.established && qp.c.ended is null) {
+    qp.announced = true;
+    if (l.opts.trace) { l.sys.warn("kps: established QUIC \{qp.host}:\{qp.port}"); }
+    l.ready.push(qp.c);
+    l.readyWake.wake();
+  }
+  if (qp.c.q.isClosed()) {
+    if (l.opts.trace) { l.sys.warn("kps: ended QUIC \{qp.host}:\{qp.port}"); }
+    if (qp.c.ended is null) { qp.c.teardown(CloseInfo.because(Reason.saying(Code.NetworkError, "the connection ended"))); }
+    for (string k in qp.cids) { l.quicByCid.remove(k); }
+    l.quicPeers.remove(at);
+  }
+}

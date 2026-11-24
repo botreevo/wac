@@ -1,0 +1,83 @@
+// P-256 (secp256r1) signature verification, for EIP-7951's P256VERIFY: R = u1·G + u2·Q with u1 = e/s and
+// u2 = r/s mod n, and the signature holds when R's x is r mod n.
+//
+// It is the generic Montgomery field and Jacobian curve that bn254 and secp256k1 use, with the a = −3
+// doubling, and both scalars in width-5 NAF over one run of doublings. G's odd multiples are a static the
+// compiler works out. wac's `crypto.p256VerifyDigest` does the same job in about 7 ms on the Node host;
+// this is about a sixteenth of that (wac `issues/system/0376w`). Nothing here is constant-time: it verifies,
+// and holds no secret.
+
+import { U256, wordsOf } from "../u256.wac";
+import { Field } from "./field.wac";
+import { Curve, Jac, wnaf } from "./curve.wac";
+
+// Constants as their words, parsed once by the compiler (see U256.ofWords).
+static u64[] P256_P = wordsOf(U256.fromHex("0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff")!);
+static u64[] P256_N = wordsOf(U256.fromHex("0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")!);
+static u64[] P256_B = wordsOf(U256.fromHex("0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")!);
+static u64[] P256_GX = wordsOf(U256.fromHex("0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")!);
+static u64[] P256_GY = wordsOf(U256.fromHex("0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")!);
+
+U256 p256P() { return U256.ofWords(P256_P); }
+U256 p256N() { return U256.ofWords(P256_N); }
+U256 p256B() { return U256.ofWords(P256_B); }
+
+Curve p256Curve() { return Curve.createAMinus3(Field.create(p256P()), p256B()); }
+
+Jac p256Generator(Curve c) {
+  return c.fromAffine(U256.ofWords(P256_GX),
+                      U256.ofWords(P256_GY));
+}
+
+/** G, 3G, … 15G as [x, y, z] limbs each: the compiler works them out once. */
+static u64[][] G_ODD = gOdd();
+
+u64[][] gOdd() {
+  Curve c = p256Curve();
+  Jac[] t = c.oddMultiples(p256Generator(c));
+  u64[][] out = u64[][].filled(24, t[0].x);
+  for (i32 i = 0; i < 8; i++) {
+    out[3 * i] = t[i].x;
+    out[3 * i + 1] = t[i].y;
+    out[3 * i + 2] = t[i].z;
+  }
+  return out;
+}
+
+u64[] copyOf(const u64[] a) {
+  u64[] out = u64[].filled(a.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  return out;
+}
+
+/**
+ * Whether (r, s) is a signature of `digest` by the key (qx, qy), all as EIP-7951 gives them: r and s must be
+ * in [1, n), and the key below p, on the curve, and not the point at infinity (which (0, 0) is not).
+ */
+export bool p256Verify(U256 digest, U256 r, U256 s, U256 qx, U256 qy) {
+  U256 n = p256N();
+  U256 p = p256P();
+  if (r.isZero() || !r.lt(n) || s.isZero() || !s.lt(n)) { return false; }
+  if (!qx.lt(p) || !qy.lt(p)) { return false; }
+  Curve c = p256Curve();
+  if (!c.onCurve(qx, qy)) { return false; }
+  Field fq = Field.create(n);
+  u64[] sInv = fq.inv(fq.fromU256(s));
+  U256 u1 = fq.toU256(fq.mul(fq.fromU256(digest.mod(n)), sInv));
+  U256 u2 = fq.toU256(fq.mul(fq.fromU256(r), sInv));
+
+  Jac[] gTable = Jac[].filled(8, c.infinity());
+  for (i32 i = 0; i < 8; i++) { gTable[i] = Jac(copyOf(G_ODD[3 * i]), copyOf(G_ODD[3 * i + 1]), copyOf(G_ODD[3 * i + 2])); }
+  Jac[] qTable = c.oddMultiples(c.fromAffine(qx, qy));
+  i32[] d1 = wnaf(u1);
+  i32[] d2 = wnaf(u2);
+  i32 len = d1.len() > d2.len() ? d1.len() : d2.len();
+  Jac acc = c.freshInfinity();
+  for (i32 i = len - 1; i >= 0; i--) {
+    c.doubleTo(acc);
+    if (i < d1.len() && d1[i] != 0) { c.addTo(acc, gTable[(d1[i] < 0 ? -d1[i] : d1[i]) >> 1], d1[i] < 0); }
+    if (i < d2.len() && d2[i] != 0) { c.addTo(acc, qTable[(d2[i] < 0 ? -d2[i] : d2[i]) >> 1], d2[i] < 0); }
+  }
+  if (c.isInfinity(acc)) { return false; }
+  return c.toAffine(acc)[0].mod(n).eq(r);
+}

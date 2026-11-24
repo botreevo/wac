@@ -1,0 +1,159 @@
+// A stand-in execution client for the light-client driver's mainnet dry run: it answers the Engine API as an
+// execution client would but runs nothing. Each payload is checked as far as that allows — wacuum's own
+// `checkPayload` (every field, the parent beacon root and the requests into the block hash, which must be the one
+// claimed; the versioned hashes against the blob transactions), under mainnet's config — and for its place in the
+// chain: its parent must be a block already accepted, the first one excepted. A block that fails is INVALID; one whose
+// parent is not here is ACCEPTED and counted as a break in the chain. One line a payload to stdout, and a summary
+// line every 50.
+//
+//     wac run --allow-net --allow-read tools/e2e/stubel.wac -- PORT JWT_SECRET_FILE [GENESIS_FILE]
+//
+// GENESIS_FILE is a geth-format genesis for another chain's config (test/chain/hoodi-genesis.json for Hoodi);
+// mainnet's by default.
+//
+// It holds every hash it accepted (about 32 bytes a block: an hour of mainnet is ~300 blocks).
+
+import { Sys, Socket } from "std";
+import { Map, hashString, stringEq } from "core";
+import { json.parse, json.JsonValue, json.JsonArray } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../../src/hex.wac";
+import { genesisFrom, Genesis } from "../../src/chain/genesis.wac";
+import { mainnet } from "../../src/chain/mainnet.wac";
+import { checkPayload, Checked } from "../../src/engine/engine.wac";
+import { SenderCache } from "../../src/tx/decode.wac";
+import { HttpRequest, headersEnd, parseHead, httpResponse } from "../../src/engine/rpc.wac";
+import { checkJwt } from "../../src/engine/jwt.wac";
+
+struct Stub {
+  Genesis g;
+  Map<string, u64> accepted;
+  i64 payloads;
+  i64 invalid;
+  i64 unlinked;
+  i64 choices;
+  u64 top;
+}
+
+string lowerHex(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] >= 65 && b[i] <= 90) { b[i] = b[i] + 32; } }
+  return string.fromBytes(b);
+}
+
+string ok(string result) { return "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\{result}}"; }
+
+string answer(Sys sys, Stub s, JsonValue req) {
+  string method = req.member("method")?.text() ?? "";
+  JsonArray ps = req.member("params")?.array() ?? JsonArray.create();
+  if (method == "engine_exchangeCapabilities") { return ok("[\"engine_newPayloadV4\",\"engine_forkchoiceUpdatedV3\"]"); }
+  if (method == "eth_getBlockByHash") {
+    string h = lowerHex(ps.len() > 0 ? (ps.get(0).text() ?? "") : "");
+    u64? n = s.accepted.get(h);
+    return ok(n is null ? "null" : "{\"hash\":\"\{h}\",\"number\":\"\{U256.ofU64(n!).toHex()}\"}");
+  }
+  if (method == "engine_newPayloadV4") {
+    s.payloads++;
+    JsonArray rs = ps.len() > 3 ? (ps.get(3).array() ?? JsonArray.create()) : JsonArray.create();
+    u8[][] requests = u8[][].defaulted(rs.len());
+    for (i32 i = 0; i < rs.len(); i++) { requests[i] = hexToBytes(rs.get(i).text() ?? "x") ?? u8[].filled(0, 0); }
+    Checked c = checkPayload(s.g.config, s.g.config.chainId, SenderCache.create(), 4, ps, requests);
+    string hash = lowerHex(bytesToHex(c.header.hash.toBytes()));
+    u64 n = c.header.number.low();
+    string why = c.invalid != "" ? c.invalid : c.noAncestor;
+    if (why != "") {
+      s.invalid++;
+      sys.log("\{n} \{hash} INVALID \{why}");
+      return ok("{\"status\":\"INVALID\",\"latestValidHash\":null,\"validationError\":\"\{why}\"}");
+    }
+    bool linked = s.accepted.len() == 0 || s.accepted.get(lowerHex(bytesToHex(c.header.parentHash.toBytes()))) is not null;
+    if (!linked) { s.unlinked++; }
+    s.accepted.set(hash, n);
+    if (n > s.top) { s.top = n; }
+    sys.log("\{n} \{hash} ok \{c.txs.len()} txs\{linked ? "" : ", parent not here"}");
+    if (s.payloads % 50 == 0) { sys.log("summary: \{s.payloads} payloads, \{s.invalid} invalid, \{s.unlinked} unlinked, \{s.choices} fork choices, top \{s.top}"); }
+    return ok("{\"status\":\"\{linked ? "VALID" : "ACCEPTED"}\",\"latestValidHash\":\{linked ? "\"" + hash + "\"" : "null"},\"validationError\":null}");
+  }
+  if (method == "engine_forkchoiceUpdatedV3") {
+    s.choices++;
+    string head = lowerHex(ps.len() > 0 ? (ps.get(0).member("headBlockHash")?.text() ?? "") : "");
+    bool has = s.accepted.get(head) is not null;
+    return ok("{\"payloadStatus\":{\"status\":\"\{has ? "VALID" : "SYNCING"}\",\"latestValidHash\":\{has ? "\"" + head + "\"" : "null"},\"validationError\":null},\"payloadId\":null}");
+  }
+  return "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"not in the stub: \{method}\"}}";
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 2) { sys.warn("usage: stubel.wac PORT JWT_SECRET_FILE"); return 2; }
+  i32 port = 0;
+  u8[] d = a[0].toBytes();
+  for (i32 i = 0; i < d.len(); i++) { port = port * 10 + ((d[i] - 48) as i32); }
+  string t = string.fromBytes((await sys.readFile(a[1])).ok()!);
+  while (t.len() > 0 && (t.slice(t.len() - 1, t.len()) == "\n")) { t = t.slice(0, t.len() - 1); }
+  u8[] secret = hexToBytes(t.indexOf("0x") == 0 ? t : "0x" + t)!;
+  string[] why = [""];
+  string genesis = mainnet();
+  if (a.len() > 2) { genesis = string.fromBytes((await sys.readFile(a[2])).ok()!); }
+  Stub s = Stub(genesisFrom(parse(genesis.toBytes()).ok()!, why)!, Map.create(hashString, stringEq), 0 as i64, 0 as i64, 0 as i64, 0 as i64, 0);
+  match (await sys.net().listen("127.0.0.1", port)) {
+    Err(e): { sys.warn("stubel: cannot listen on \{port}: \{e}"); return 1; }
+    Ok(l): {
+      sys.log("stubel: Engine API on \{l.addr}");
+      while (true) {
+        match (await l.accept()) {
+          Err(e): {}
+          Ok(sock): { await serve(sys, s, sock, secret); }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+async void serve(Sys sys, Stub s, Socket sock, u8[] secret) {
+  u8[] buf = u8[].filled(0, 0);
+  i32 end = -1;
+  HttpRequest? req = null;
+  bool done = false;
+  while (!done) {
+    match (await sock.recv()) {
+      Err(e): { done = true; }
+      Ok(r): {
+        match (r) {
+          End: { done = true; }
+          Failed(w): { done = true; }
+          Data(bytes): {
+            u8[] grown = u8[].filled(buf.len() + bytes.len(), 0);
+            grown.copyFrom(buf, 0, 0, buf.len());
+            grown.copyFrom(bytes, 0, buf.len(), bytes.len());
+            buf = grown;
+            if (end < 0) {
+              end = headersEnd(buf, buf.len());
+              if (end >= 0) { req = parseHead(buf, end); if (req is null) { done = true; } }
+            }
+            if (req is not null && buf.len() - end >= req!.contentLength) { done = true; }
+          }
+        }
+      }
+    }
+  }
+  if (req is null || buf.len() - end < req!.contentLength) { sock.close(); return; }
+  string auth = req!.authorization;
+  i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+  string bad = auth.indexOf("Bearer ") != 0 ? "missing bearer token" : checkJwt(auth.slice(7, auth.len()), secret, now);
+  if (bad != "") {
+    await sock.send(httpResponse(401, "Unauthorized", ("{\"error\":\"" + bad + "\"}").toBytes()));
+    sock.close();
+    return;
+  }
+  u8[] body = u8[].filled(req!.contentLength, 0);
+  body.copyFrom(buf, end, 0, body.len());
+  string out = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32700,\"message\":\"not JSON\"}}";
+  match (parse(body)) {
+    Err(e): {}
+    Ok(v): { out = answer(sys, s, v); }
+  }
+  await sock.send(httpResponse(200, "OK", out.toBytes()));
+  sock.close();
+}

@@ -1,0 +1,98 @@
+// The trie kept in the store by path, against the from-scratch builder: random puts and deletes of 32-byte
+// keys over many commits, the trie read back from the store half the time, and after every commit exactly
+// as many node entries in the store as the trie has stored nodes — nothing left behind where nodes moved.
+
+import { Map, Vec } from "core";
+import { hashString, stringEq } from "core";
+import { bytesToHex, hexToBytes } from "../src/hex.wac";
+import { Store, Change } from "../src/store/tree.wac";
+import { MemDisk } from "../src/store/disk.wac";
+import { PathTrie } from "../src/trie/pathtrie.wac";
+import { trieRoot, emptyRoot } from "../src/trie/trie.wac";
+import { Check } from "./check.wac";
+
+struct Rng {
+  u64 x;
+
+  u64 next(this) {
+    this.x = this.x ^ (this.x << 13);
+    this.x = this.x ^ (this.x >> 7);
+    this.x = this.x ^ (this.x << 17);
+    return this.x;
+  }
+  i32 below(this, i32 n) { return (this.next() % ((n as@ u32) as u64)) as! i32; }
+  u8[] bytes(this, i32 n) {
+    u8[] b = u8[].filled(n, 0);
+    for (i32 i = 0; i < n; i++) { b[i] = (this.next() & 255) as! u8; }
+    return b;
+  }
+}
+
+/** The root of the model, from scratch. */
+u8[] modelRoot(Map<string, u8[]> m) {
+  string[] ks = m.keys();
+  if (ks.len() == 0) { return emptyRoot(); }
+  u8[][] keys = u8[][].defaulted(ks.len());
+  u8[][] vals = u8[][].defaulted(ks.len());
+  for (i32 i = 0; i < ks.len(); i++) {
+    keys[i] = hexToBytes(ks[i])!;
+    vals[i] = m.get(ks[i])!;
+  }
+  return trieRoot(keys, vals);
+}
+
+async string run(u8[] owner, u64 seed, i32 rounds, i32 perRound) {
+  Check t = Check.create();
+  Rng r = Rng(seed);
+  MemDisk md = MemDisk.create();
+  Store s = (await Store.open(md.disk())).unwrap();
+  PathTrie trie = PathTrie.of(s, owner);
+  await trie.open();
+  Map<string, u8[]> m = Map.create(hashString, stringEq);
+  Vec<u8[]> keys = Vec.create();
+  u8[] prefix = owner.len() == 0 ? [3] : [4];
+  for (i32 round = 0; round < rounds; round++) {
+    for (i32 i = 0; i < perRound; i++) {
+      bool del = keys.len() > 0 && r.below(10) < 3;
+      u8[] k = del ? keys.get(r.below(keys.len())) : r.bytes(32);
+      if (del) {
+        await trie.delete(k);
+        m.remove(bytesToHex(k));
+      } else {
+        // Short values too, so that some nodes sit inside their parents' encodings.
+        u8[] v = r.bytes(r.below(8) == 0 ? 1 + r.below(3) : 1 + r.below(60));
+        keys.push(k);
+        await trie.set(k, v);
+        m.set(bytesToHex(k), v);
+      }
+    }
+    t.eqStr(trie.error, "", "no read failed in round \{round}");
+    t.eqStr(bytesToHex(trie.hash()), bytesToHex(modelRoot(m)), "the root after round \{round}");
+    t.eqStr(await s.commit(trie.changes(), u8[].filled(0, 0)), "", "commit \{round}");
+    // From the store: the same root, and as many node entries as stored nodes.
+    PathTrie fresh = PathTrie.of(s, owner);
+    await fresh.open();
+    t.eqStr(bytesToHex(fresh.hash()), bytesToHex(modelRoot(m)), "the root read back after round \{round}");
+    u8[] end = u8[].filled(prefix.len(), 0);
+    end[0] = prefix[0] + 1;
+    i32 entries = (await s.range(prefix, end, 0x7fffffff)).len();
+    i32 nodes = await fresh.storedNodes();
+    t.ok(entries == nodes, "round \{round}: \{entries} node entries for \{nodes} stored nodes");
+    if (round % 2 == 1) { trie = fresh; }
+  }
+  // Everything deleted: no nodes left.
+  for (i32 i = 0; i < keys.len(); i++) { await trie.delete(keys.get(i)); }
+  t.eqStr(bytesToHex(trie.hash()), bytesToHex(emptyRoot()), "empty");
+  t.eqStr(await s.commit(trie.changes(), u8[].filled(0, 0)), "", "the last commit");
+  u8[] end = u8[].filled(1, prefix[0] + 1);
+  t.ok((await s.range(prefix, end, 0x7fffffff)).len() == 0, "and no node entries in the store");
+  return t.report();
+}
+
+export string test_the_account_trie_by_path_agrees_with_the_builder() {
+  return run(u8[].filled(0, 0), 31337, 20, 200).wait().orElse("it never finished");
+}
+
+export string test_a_storage_trie_by_path_agrees_with_the_builder() {
+  return run(u8[].filled(32, 9), 271828, 12, 60).wait().orElse("it never finished");
+}

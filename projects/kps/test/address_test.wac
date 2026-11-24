@@ -1,0 +1,178 @@
+// Addresses, certhashes, fingerprints and ICE passwords, judged by `@kpstreams/core` (interop/js/core-oracle.mjs).
+//
+//     wac test --allow-run test/address_test.wac
+//
+// These are the things two KPS implementations must agree on byte for byte before anything else can work: a
+// browser dials the address a wac listener prints, and derives the ICE password a wac listener checks.
+
+import { Check, hex, unhex } from "./check.wac";
+import { ask, Answers, word, after } from "./oracle.wac";
+import { parseAddress, formatAddress, decodeCerthash, encodeCerthash, sdpFingerprint, Address } from "../src/address.wac";
+import { icePassword, ufragAcceptable, ufragFrom } from "../src/webrtc/ice.wac";
+import { Sys } from "std";
+
+/** The cases worth disagreeing over: brackets, port spellings, empty parts, and what is left after the port. */
+static string[] ADDRESSES = [
+  "203.0.113.5:41108:uEiDrbe2XkA5o9FapUnWWa1RSO9JnS3ZWYW_c0tq2c2FTHw",
+  "[2001:db8::1]:41108:uEiDrbe2XkA5o9FapUnWWa1RSO9JnS3ZWYW_c0tq2c2FTHw",
+  "[::1]:0443:uX",
+  "1.2.3.4:65535:u",
+  "1.2.3.4:65536:uabc",
+  "1.2.3.4:0:uabc",
+  "1.2.3.4:0x1bb:uabc",
+  "1.2.3.4:+443:uabc",
+  "1.2.3.4: 443:uabc",
+  "1.2.3.4:443:",
+  ":443:uabc",
+  "1.2.3.4:443",
+  "1.2.3.4",
+  "[::1:443:uabc",
+  "[::1]443:uabc",
+  "[::1]:",
+  "1.2.3.4:443:uabc:extra",
+  "1.2.3.4:99999999999999999999:uabc",
+];
+
+/**
+ * Every address case parses, or is refused, exactly as the reference parser does it.
+ *
+ * Would catch: a lenient port (hex, sign, whitespace, overflow wrapping to a small number), a bracket rule that
+ * differs, an empty host or certhash accepted, and a certhash that keeps or drops what follows the second colon
+ * differently — each of which is an address one implementation dials and the other refuses.
+ */
+export string test_addresses_parse_as_the_reference_parses_them(Sys sys) {
+  Check c = Check.create();
+  string[] qs = string[].filled(ADDRESSES.len(), "");
+  for (i32 i = 0; i < ADDRESSES.len(); i++) { qs[i] = "parse " + ADDRESSES[i]; }
+  Answers a = ask(c, sys.procs(), "core-oracle.mjs", qs);
+  if (!a.ok) { return c.report(); }
+  for (i32 i = 0; i < ADDRESSES.len(); i++) {
+    string want = a.lines[i];
+    string got = match (parseAddress(ADDRESSES[i])) {
+      Ok(x): "parse ok \{x.ip} \{x.port} \{x.certhash}",
+      Err(_): "parse err",
+    };
+    c.eqStr(got, want, ADDRESSES[i]);
+  }
+  return c.report();
+}
+
+/** Formatting is the inverse, brackets and all, and agrees with the reference's. */
+export string test_addresses_format_as_the_reference_formats_them(Sys sys) {
+  Check c = Check.create();
+  Address[] xs = [Address("10.0.0.1", 1, "uabc"), Address("fe80::1", 41108, "uEiD")];
+  string[] qs = ["format 10.0.0.1 1 uabc", "format fe80::1 41108 uEiD"];
+  Answers a = ask(c, sys.procs(), "core-oracle.mjs", qs);
+  if (!a.ok) { return c.report(); }
+  for (i32 i = 0; i < xs.len(); i++) {
+    c.eqStr("format " + formatAddress(xs[i]), a.lines[i], qs[i]);
+    match (parseAddress(formatAddress(xs[i]))) {
+      Ok(back): { c.eqStr(back.ip, xs[i].ip, "and it parses back to the same host"); }
+      Err(_): { c.fail("\{formatAddress(xs[i])} did not parse back"); }
+    }
+  }
+  return c.report();
+}
+
+/**
+ * Certhash encoding, decoding, the SDP fingerprint and the ICE password, against the reference, over digests
+ * chosen to put every base64 character class (including `-` and `_`) and both 0x00 and 0xFF in play.
+ *
+ * Would catch: padding written or accepted, the standard alphabet used where base64url belongs (or the reverse
+ * for the password), a multihash header other than 0x12 0x20, lower-case fingerprint hex, and an HMAC keyed or
+ * labelled wrongly — the last being the one that would make every browser's STUN check fail authentication.
+ */
+export string test_certhashes_fingerprints_and_passwords_agree_with_the_reference(Sys sys) {
+  Check c = Check.create();
+  u8[][] digests = [
+    unhex("0000000000000000000000000000000000000000000000000000000000000000"),
+    unhex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    unhex("fbefbeffefbeffefbeffefbeffefbeffefbeffefbeffefbeffefbeffefbeffef"),
+    unhex("0123456789abcdeffedcba98765432100f1e2d3c4b5a69788796a5b4c3d2e1f0"),
+  ];
+  string[] ufrags = ["abcd", "0123456789abcdef", "A+/z", "deadbeefcafef00d"];
+  string[] qs = string[].filled(digests.len() * 4, "");
+  for (i32 i = 0; i < digests.len(); i++) {
+    qs[i * 4] = "encode " + hex(digests[i]);
+    qs[i * 4 + 1] = "fp " + hex(digests[i]);
+    qs[i * 4 + 2] = "pwd \{hex(digests[i])} \{ufrags[i]}";
+    qs[i * 4 + 3] = "decode " + encodeCerthash(digests[i]);
+  }
+  Answers a = ask(c, sys.procs(), "core-oracle.mjs", qs);
+  if (!a.ok) { return c.report(); }
+  for (i32 i = 0; i < digests.len(); i++) {
+    c.eqStr("encode " + encodeCerthash(digests[i]), a.lines[i * 4], "the certhash of " + hex(digests[i]));
+    c.eqStr("fp " + sdpFingerprint(digests[i]), a.lines[i * 4 + 1], "the fingerprint of " + hex(digests[i]));
+    c.eqStr("pwd " + icePassword(digests[i], ufrags[i]), a.lines[i * 4 + 2], "the ICE password for " + ufrags[i]);
+    c.eqStr(a.lines[i * 4 + 3], "decode " + hex(digests[i]), "the reference decodes our certhash back");
+    u8[]? back = decodeCerthash(encodeCerthash(digests[i]));
+    c.ok(back is not null, "and so do we");
+    if (back is not null) { c.eqBytes(back!, digests[i], "to the same digest"); }
+  }
+  return c.report();
+}
+
+/**
+ * Certhashes that are not sha2-256 multihashes are refused — by both implementations.
+ *
+ * Would catch: padding or the standard alphabet accepted, a wrong multihash code or length accepted, and a
+ * certhash of the right shape but the wrong size (31 or 33 bytes) taken as a digest.
+ */
+export string test_malformed_certhashes_are_refused_by_both(Sys sys) {
+  Check c = Check.create();
+  string good = encodeCerthash(unhex("0123456789abcdeffedcba98765432100f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+  string[] bad = [
+    "", "u", "m" + good.slice(1, good.len()), good.slice(0, good.len() - 1),
+    "uEiEB" + good.slice(5, good.len()),       // multihash length byte 0x21
+    "uERA" + good.slice(4, good.len()),        // code 0x11 (sha1)
+  ];
+  string[] qs = string[].filled(bad.len(), "");
+  for (i32 i = 0; i < bad.len(); i++) { qs[i] = "decode " + bad[i]; }
+  Answers a = ask(c, sys.procs(), "core-oracle.mjs", qs);
+  if (!a.ok) { return c.report(); }
+  for (i32 i = 0; i < bad.len(); i++) {
+    c.ok(decodeCerthash(bad[i]) is null, "we refuse \"\{bad[i]}\"");
+    c.eqStr(a.lines[i], "decode err", "and so does the reference: \"\{bad[i]}\"");
+  }
+  return c.report();
+}
+
+/** The ufrag rule: RFC 8839's ice-char, 4 to 256 of them. */
+export string test_ufrags_are_held_to_the_ice_char_set() {
+  Check c = Check.create();
+  c.ok(ufragAcceptable("abcd"), "four letters");
+  c.ok(ufragAcceptable("A+/z09"), "plus, slash and digits");
+  c.ok(ufragAcceptable(ufragFrom(unhex("00ff7f8001020304"))), "what we generate");
+  c.eqStr(ufragFrom(unhex("00ff7f8001020304")), "00ff7f8001020304", "16 hex digits");
+  c.no(ufragAcceptable("abc"), "three is too short");
+  c.no(ufragAcceptable("ab-d"), "base64url's dash is not ice-char");
+  c.no(ufragAcceptable("ab_d"), "nor its underscore");
+  c.no(ufragAcceptable("ab d"), "nor a space");
+  string long = "";
+  for (i32 i = 0; i < 257; i++) { long += "a"; }
+  c.no(ufragAcceptable(long), "257 is too long");
+  c.ok(ufragAcceptable(long.slice(0, 256)), "256 is not");
+  return c.report();
+}
+
+/**
+ * Padding and the standard alphabet are not the multibase `u` encoding, and we refuse them where the JS
+ * reference does not.
+ *
+ * SPEC §3 says base64url without padding, and Go's reference decodes with `RawURLEncoding`, which refuses both;
+ * `@kpstreams/core` decodes with `atob` after a substitution and takes either. Agreeing with the spec and Go is
+ * the choice here — one digest with several spellings is several addresses for one server — and this asserts the
+ * JS leniency rather than ignoring it, so the day it is fixed upstream this test says so.
+ */
+export string test_padding_and_the_standard_alphabet_are_refused_though_js_takes_them(Sys sys) {
+  Check c = Check.create();
+  string good = encodeCerthash(unhex("0123456789abcdeffedcba98765432100f1e2d3c4b5a69788796a5b4c3d2e1f0"));
+  string[] bad = [good + "=", good.slice(0, 10) + "+" + good.slice(11, good.len())];
+  Answers a = ask(c, sys.procs(), "core-oracle.mjs", ["decode " + bad[0], "decode " + bad[1]]);
+  if (!a.ok) { return c.report(); }
+  for (i32 i = 0; i < bad.len(); i++) {
+    c.ok(decodeCerthash(bad[i]) is null, "we refuse \"\{bad[i]}\"");
+    c.no(a.lines[i] == "decode err", "the JS reference still accepts \"\{bad[i]}\" — if this fails, it was fixed");
+  }
+  return c.report();
+}

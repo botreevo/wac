@@ -1,0 +1,92 @@
+// What one JSON-RPC request may spend running code: `eth_call` and `eth_estimateGas` cost nothing to send and
+// as much as a block to answer, and the engine answers nothing else meanwhile — a call of bn254 additions with a
+// block's gas held the node for minutes (wacuum `issues/0008d`). So, as geth's `--rpc.gascap` does:
+//
+//   - `eth_call` runs with at most `cap` gas: the caller's `gas` if it is less, `cap` if it is more or absent;
+//   - `eth_estimateGas` is tried once first, as an `eth_call` with `cap` gas, and answered with an error if it
+//     does not succeed within it. wacuum's own search ignores the caller's `gas` and bisects from a whole
+//     transaction's limit, some two dozen runs; behind this check each of them stops at the gas the call
+//     needs, which is under the cap.
+
+import { json.parse, json.stringify, json.JsonValue, json.JsonArray, json.JsonObject } from "wac";
+import { U256, Engine, answerRpc } from "@/packages/wacuum/src/lib.wac";
+
+/** The answer to a JSON-RPC body from the public port: one request or a batch, each held to `cap` gas. */
+export u8[] answerCapped(Engine e, u8[] body, i64 cap) {
+  JsonValue? doc = parse(body).ok();
+  // Whatever does not parse, wacuum answers with its own error.
+  if (doc is null) { return answerRpc(e, body, false); }
+  JsonArray? batch = doc!.array();
+  if (batch is null) { return one(e, doc!, cap); }
+  JsonArray out = JsonArray.create();
+  for (i32 i = 0; i < batch!.len(); i++) {
+    JsonValue? answered = parse(one(e, batch!.get(i), cap)).ok();
+    out.push(answered ?? JsonValue.Null);
+  }
+  return stringify(JsonValue.Array(out));
+}
+
+u8[] one(Engine e, JsonValue req, i64 cap) {
+  string method = req.member("method")?.text() ?? "";
+  if (method != "eth_call" && method != "eth_estimateGas") { return answerRpc(e, stringify(req), false); }
+  JsonArray ps = req.member("params")?.array() ?? JsonArray.create();
+  JsonObject? call = ps.len() > 0 ? ps.get(0).object() : null;
+  if (call is null) { return answerRpc(e, stringify(req), false); }
+  JsonValue capped = withGas(call!, cap);
+  JsonValue tag = ps.len() > 1 ? ps.get(1) : JsonValue.Str("latest".toBytes());
+  if (method == "eth_estimateGas") {
+    JsonArray tryPs = JsonArray.create();
+    tryPs.push(capped);
+    tryPs.push(tag);
+    auto tried = e.call("eth_call", JsonValue.Array(tryPs));
+    if (tried.result is null) {
+      return error(req, -32000, "the call does not succeed within this node's limit of \{cap} gas: \{tried.message}");
+    }
+    return answerRpc(e, stringify(req), false);
+  }
+  JsonArray callPs = JsonArray.create();
+  callPs.push(capped);
+  for (i32 i = 1; i < ps.len(); i++) { callPs.push(ps.get(i)); }
+  return answerRpc(e, stringify(rebuilt(req, JsonValue.Array(callPs))), false);
+}
+
+/** `call` with its `gas` at most `cap`, and `cap` where it names none. */
+JsonValue withGas(JsonObject call, i64 cap) {
+  U256 limit = U256.ofU64(cap as@ u64);
+  JsonObject out = JsonObject.create();
+  for (i32 i = 0; i < call.len(); i++) {
+    auto m = call.at(i);
+    if (m.keyStr() == "gas") {
+      U256? asked = U256.fromHex(m.value.text() ?? "");
+      if (asked is not null && asked!.lt(limit)) { limit = asked!; }
+      continue;
+    }
+    out.push(m.key, m.value);
+  }
+  out.push("gas".toBytes(), JsonValue.Str(limit.toHex().toBytes()));
+  return JsonValue.Object(out);
+}
+
+/** `req` with `params` replaced. */
+JsonValue rebuilt(JsonValue req, JsonValue params) {
+  JsonObject out = JsonObject.create();
+  JsonObject o = req.object()!;
+  for (i32 i = 0; i < o.len(); i++) {
+    auto m = o.at(i);
+    if (m.keyStr() != "params") { out.push(m.key, m.value); }
+  }
+  out.push("params".toBytes(), params);
+  return JsonValue.Object(out);
+}
+
+/** A JSON-RPC error answering `req`. */
+u8[] error(JsonValue req, i32 code, string message) {
+  JsonObject err = JsonObject.create();
+  err.push("code".toBytes(), JsonValue.Number(code as f64, "\{code}".toBytes()));
+  err.push("message".toBytes(), JsonValue.Str(message.toBytes()));
+  JsonObject o = JsonObject.create();
+  o.push("jsonrpc".toBytes(), JsonValue.Str("2.0".toBytes()));
+  o.push("id".toBytes(), req.member("id") ?? JsonValue.Null);
+  o.push("error".toBytes(), JsonValue.Object(err));
+  return stringify(JsonValue.Object(o));
+}

@@ -1,0 +1,508 @@
+// A mutation run, end to end, over one directory.
+//
+// The driver in miniature: stage a copy, apply each mutant to it, run the tests, and score what came
+// back. Everything it *decides* is decided by the ported modules — `mutateoperators` generates,
+// `mutatescope` applies, `mutatestage` stages, `mutatenative` reads the exit code, `mutatescore` says
+// what counts — and this is the loop around them.
+//
+// **The whole loop at a size where it can be watched.** `tools/mutate.ts` does this across every
+// package in parallel; that is the one thing left here that it does and this does not — `jobsFor` is
+// in `mutatenative.wac` without a caller, because running several mutants at once needs concurrent
+// spawns rather than a different decision about any of them.
+//
+// **A mutant is bounded by `deadlineFor` the scope's own baseline**, spawned through `timeout`
+// rather than waited on with a bound: `Pending<Exec>` carries an id and `Cli.waitAny` takes a
+// millisecond deadline, so noticing an overrun is expressible in wac today — but nothing here can
+// *kill* a child, and the mutant this exists for is one that does not terminate. Abandoning it
+// leaves a process spinning on a machine three agents share, which is a cost that outlives the run
+// and lands on somebody else. The baseline itself is run unbounded, since sizing a measurement by a
+// number derived from that measurement is circular.
+//
+// **Every mutant is narrowed, and the report says how many actually were.** `buildProfile` runs each
+// test file under coverage once, and `runPlanFor` turns a mutant's lines into the entries that reach
+// them. A profile that cannot say widens to the whole scope: slower, never wrong. The count of each
+// is printed, because a run that narrowed nothing costs exactly what no profile costs and is
+// otherwise indistinguishable from one that narrowed everything — `issues/system/0161`'s complaint
+// about `--explain-selection` in one line.
+//
+// **Narrowing does not pay yet on a small scope, and the numbers say so rather than the intent.**
+// Measured 2026-09-02, cold, against the same run without a profile:
+//
+//     packages/rlp  --operators=guard      8.3s -> 14.5s    2 narrowed, 1 widened
+//     packages/bytes --operators=extreme   8.3s ->  9.6s    3 narrowed, 2 widened
+//
+// The profile costs one coverage run per *test file* and saves work per *mutant*, so it is a loss
+// until the mutants outnumber the test files several times over — three mutants against three test
+// files is the worst case, not a typical one. Both scopes returned the same verdicts narrowed and
+// unnarrowed, which is the check that matters here: an unnarrowed run is the only oracle a narrowed
+// one has.
+//
+// **The cache is what makes it pay on a second run**, keyed by `keyFor` below on the test files and
+// their whole import graph:
+//
+//     packages/rlp --operators=guard   cold 16.3s   cached 1.1s   same verdicts both times
+//
+// The 15 seconds is the profile build and nothing else — the delta is one coverage run per test
+// file, which is exactly what a hit skips. Everything else in the run (staging, triage compiles,
+// the mutants themselves) happens either way. See `keyFor` for why the key cannot be narrower than
+// the whole graph.
+//
+// **`rp.filter` is deliberately never used.** `filterFor` builds Deno's anchored-regex spelling and
+// `wac test --filter` matches a plain substring, so handing it over selects nothing and scores the
+// mutant a survivor. On this path selection is by *entry*, which `runPlanFor` has already reduced —
+// `isDenoFilter` exists to say that out loud rather than leave it to a comment in one of them.
+//
+// `issues/system/0161` step 6.
+
+import { Exec, Sys, ChildEnv, Clock, Env, Files, Output, Procs, Launch } from "std";
+import { Sources, gather } from "../../packages/wac/src/sources.wac";
+import { Flags, parseFlags, targetsUnder, testsUnder } from "./mutatefiles.wac";
+import { Profiled, buildProfile } from "./mutatecoverage.wac";
+import { RunPlan, linesOf, runPlanFor } from "./mutateplan.wac";
+import { WAC_CACHE_DIR, treeKeyOf } from "./mutateprofile.wac";
+import { fileCount, sampleMutants } from "./mutatesample.wac";
+import { deadlineFor } from "./mutatedeadline.wac";
+import { Vec, flatten } from "core";
+import { Edit, GenStats, Mutant, generate } from "./mutateoperators.wac";
+import { Applied, applyEdits } from "./mutatescope.wac";
+import { Triage, signatureOf, triageOf, wasmHashOf } from "./mutatetriage.wac";
+import { Outcome, Verdict, classify, outcomeOf } from "./mutatenative.wac";
+import { Score, exclusions, headline, percent, scoreOf } from "./mutatescore.wac";
+import { stageInto } from "./mutatestage.wac";
+import { itoa } from "../../packages/fmt/src/itoa.wac";
+
+/** Where the staged copy lives. One directory, reused, because this runs one mutant at a time. */
+export string STAGE() { return ".cache/mutate/run"; }
+
+/**
+ * Run the tests under `testDir` inside the staged tree, and say what the exit code means.
+ *
+ * **The grants are the wac lane's whole set**, for the reason `mutatecoverage.wac` gives about its
+ * own copy: a test skipped for want of a grant is a test that did not run, and a run where nothing
+ * ran is green — so a missing grant does not fail this, it silently converts every mutant in the
+ * scope into a survivor. `classify` can tell the two apart only if the tests get as far as running.
+ */
+export struct Ran {
+  Verdict verdict;
+  /** The deadline stopped it, which `outcomeOf` counts as a kill rather than as no verdict. */
+  bool timedOut;
+  /** Milliseconds the run took, for the baseline the deadline is computed from. */
+  i32 tookMs;
+}
+
+/** GNU `timeout`'s "I stopped it" code. */
+export i32 TIMED_OUT() { return 124; }
+
+/**
+ * Run `entries` inside the staged tree, bounded by `deadlineMs`, and say what the exit code means.
+ *
+ * **Spawned through `timeout` rather than waited on with a deadline, because nothing here can kill a
+ * child.** `Pending<Exec>` carries an id and `Cli.waitAny` takes a millisecond bound, so *noticing*
+ * the overrun is expressible in wac today — but dropping the wait leaves the process running, and the
+ * mutant this exists for is one that does not terminate. On a machine three agents share, a run that
+ * abandons a spinning process per hung mutant is worse than a run with no deadline at all, because
+ * the cost outlives it and lands on somebody else. `timeout` sends a signal.
+ *
+ * `mutatestage.wac` already reaches for the shell for `tar`, and this needs no shell — `timeout` is
+ * the program and the binary is its argument, so there is no quoting and no line to get wrong.
+ *
+ * **The grants are the wac lane's whole set**, for the reason `mutatecoverage.wac` gives about its
+ * own copy: a test skipped for want of a grant is a test that did not run, and a run where nothing
+ * ran is green — so a missing grant does not fail this, it silently converts every mutant in the
+ * scope into a survivor.
+ */
+export Ran runTests(Clock clock, Procs procs, string binary, string work, string[] entries, i32 deadlineMs) {
+  string[] grants = [
+                             "--allow-read", "--allow-write", "--allow-run", "--allow-env",
+                             "--allow-net"
+  ];
+  bool bounded = deadlineMs > 0;
+  i32 lead = bounded ? 2 : 0;
+  string[] args = string[].filled(lead + 1 + grants.len() + entries.len(), "");
+  if (bounded) {
+    // Seconds, rounded up: a deadline shorter than the one computed is a false kill.
+    args[0] = itoa((deadlineMs + 999) / 1000);
+    args[1] = binary;
+  }
+  args[lead] = "test";
+  for (i32 i = 0; i < grants.len(); i++) { args[lead + 1 + i] = grants[i]; }
+  for (i32 i = 0; i < entries.len(); i++) { args[lead + 1 + grants.len() + i] = entries[i]; }
+
+  i64 started = flatten(clock.monotonicNanos().wait()).unwrap() / (1000000 as i64);
+  Exec r = flatten(procs.exec(bounded ? "timeout" : binary, args, u8[](), ChildEnv(false, string[].filled(0, "")), Launch(work, false, false, false, false)).wait()).unwrap();
+  i32 took = (flatten(clock.monotonicNanos().wait()).unwrap() / (1000000 as i64) - started) as! i32;
+  if (!r.ran()) { return Ran(Verdict.Abort("the binary did not run: " + r.error), false, took); }
+  if (bounded && r.status == TIMED_OUT()) { return Ran(Verdict.Killed, true, took); }
+  return Ran(classify(r.status, string.fromBytes(r.stdout) + string.fromBytes(r.stderr)), false, took);
+}
+
+/**
+ * A mutation that changes nothing, which must therefore survive.
+ *
+ * **This is what makes the score falsifiable.** `3/3 killed, 100%` is the output of a suite that
+ * catches everything and also the output of a staged tree that fails to build for a reason having
+ * nothing to do with any mutation — every mutant "killed" by the same unrelated error. Without a
+ * control the two are the same text and there is no way to tell from the report which one happened.
+ *
+ * A trailing comment rather than a token swap, because it has to be a no-op in the emitted wasm and
+ * not merely one a reader believes is a no-op: `bumpLiteral`'s own history is a reminder that "this
+ * cannot change behaviour" is a claim about the compiler. A comment is the one edit that survives
+ * lexing without reaching the emitter.
+ *
+ * `scoreOf` treats a killed control as voiding the whole run rather than as one bad mutant, which is
+ * why this is worth a test run per file.
+ */
+export Mutant controlFor(string file, i32 length) {
+  return Mutant("control:" + file, "control",
+                [Edit(file, length, length, "\n// control mutant: this must survive\n", "")]);
+}
+
+/**
+ * Every `file:line` a mutant touches, across all its edits.
+ *
+ * **A mutation is reachable if *any* of its lines is**, which is why this is a union rather than a
+ * first line: an edit is a byte span and one can cover a whole function body, so a span whose first
+ * line the profile has never seen may still sit inside code every test runs. `linesOf` applies the
+ * same rule one level down, and `selectTests` applies it again over the result.
+ */
+export string[] locationsOf(string file, string source, Mutant m) {
+  i32 n = 0;
+  for (i32 e = 0; e < m.edits.len(); e++) {
+    n = n + linesOf(m.edits[e].file, source, m.edits[e].start, m.edits[e].end).len();
+  }
+  string[] out = string[].filled(n, "");
+  i32 at = 0;
+  for (i32 e = 0; e < m.edits.len(); e++) {
+    string[] each = linesOf(m.edits[e].file, source, m.edits[e].start, m.edits[e].end);
+    for (i32 i = 0; i < each.len(); i++) {
+      if (at < out.len()) { out[at] = each[i]; at = at + 1; }
+    }
+  }
+  return out;
+}
+
+/**
+ * The key the profile is cached under: the test files, and every source they import.
+ *
+ * **The whole graph rather than the package's own files.** A test reaches through `core/`, `std/` and
+ * other packages, and a change in any of them can move which lines it touches — so a key over the
+ * scope alone would *hit* on a tree the profile no longer describes. That does not fail: it narrows a
+ * mutant away from the test that would have killed it, and reports a survivor that is not one.
+ *
+ * `""` when any test file's graph cannot be gathered, which turns the cache off rather than keying on
+ * a partial answer. `treeKeyOf` sorts internally, so the order these arrive in does not matter.
+ */
+async string keyFor(Files fs, Env env, string[] testFiles) {
+  Vec<string> paths = Vec.create();
+  Vec<string> texts = Vec.create();
+  for (i32 i = 0; i < testFiles.len(); i++) {
+    Sources src = await gather(fs, env, testFiles[i], false);
+    if (src.why != "") { return ""; }
+    for (i32 j = 0; j < src.paths.len(); j++) {
+      bool have = false;
+      for (i32 k = 0; k < paths.len(); k++) {
+        if (paths.get(k) == src.paths[j]) { have = true; break; }
+      }
+      if (have) { continue; }
+      paths.push(src.paths[j]);
+      texts.push(src.texts[j]);
+    }
+  }
+  return treeKeyOf(testFiles, paths.toArray(), texts.toArray());
+}
+
+/**
+ * Why the run cannot produce a number, or `""` when it can.
+ *
+ * **A red scope scores 100%.** The mutation is applied, the tests fail, and the mutant is recorded as
+ * detected — by a failure that was there before the mutation and has nothing to do with it. Every
+ * mutant in the scope goes the same way, so the most reassuring possible output comes out of the most
+ * broken possible suite. `mutatescore.wac`'s `nothingMeasurable` is the whole-run form of this and
+ * this is the one-scope form; both answer with a refusal rather than a figure, for the same reason.
+ *
+ * **An abort and an absence are refusals too, and not the same refusal.** A scope where nothing ran
+ * has no baseline rather than a green one — `classify` distinguishes them precisely so this does not
+ * have to guess, and a `NoTestsHere` read as green would score every mutant in an untested directory
+ * as a survivor, which is true but arrived at by luck.
+ */
+export string refusalFor(Verdict baseline, string testDir) {
+  if (baseline.isSurvived()) { return ""; }
+  if (baseline.isKilled()) {
+    return "the baseline is not green: " + testDir + " fails before any mutation. Every mutant would"
+         + " be recorded killed by a failure that was there first and the run would report a perfect"
+         + " score.";
+  }
+  return "there is no baseline (" + baseline.word() + "): nothing in " + testDir + " ran, so nothing"
+       + " here can kill a mutant and every mutation would be recorded as surviving.";
+}
+
+/**
+ * The exit code: 1 for survivors, 2 for a run that could not be read, 0 for a clean sweep.
+ *
+ * **2 rather than 1 for a refusal**, because "the suite has a hole" and "this run says nothing" are
+ * different answers and a caller that cannot tell them apart learns nothing from either. A refused
+ * run has no survivors to report, so collapsing it into 1 would be indistinguishable from success.
+ */
+export i32 exitFor(i32 survivors, bool refused) {
+  if (refused) { return 2; }
+  return survivors > 0 ? 1 : 0;
+}
+
+/**
+ * `mutaterun [--package <name>|<dir>] [--operators=a,b] [--no-sample] [--sample=N] [--seed=S]`.
+ *
+ * Exits 1 when anything survived, which is what makes it usable as a check rather than only as a
+ * report, and 2 when the run could not be read at all — a staging failure or a baseline that was
+ * already red. Those are different from "the suite has a hole", and a caller that treats them the
+ * same learns nothing from either.
+ */
+export async i32 main(Sys sys) {
+  string[] argv = sys.args();
+  Output err = sys.stderr();
+  Output out = sys.stdout();
+  Clock clock = sys.clock();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  i32 argc = argv.len();
+  string[] args = string[].filled(argc, "");
+  for (i32 i = 0; i < argc; i++) { args[i] = argv[i]; }
+  Flags f = parseFlags(args);
+  if (f.problem != "") { out.line(f.problem); return 2; }
+  if (f.dir == "") {
+    out.line("usage: mutaterun [--package <name>|<dir>] [--operators=a,b] [--no-sample]"
+             + " [--sample=N] [--seed=S]");
+    return 2;
+  }
+
+  string root = flatten(env.cwd().wait()).unwrap();
+  string binary = root + "/native/v8/target/release/wac";
+  string testDir = f.dir + "/test/wac";
+
+  string[] files = targetsUnder(fs, f.dir);
+  if (files.len() == 0) {
+    out.line("no .wac files under " + f.dir + " that are code under test");
+    return 2;
+  }
+
+  string stage = root + "/" + STAGE();
+  fs.remove(stage, true).wait();          // a stale tree from a killed run is not a reason to fail
+  string why = stageInto(fs, procs, root, stage, ["packages", "tools", "std", "core", "spec"], string[].filled(0, ""), "native/v8/target/release/wac");
+  if (why != "") { out.line("could not stage: " + why); return 2; }
+
+  // The baseline first, and anything but green stops the run before it produces a number. It is also
+  // what the deadline is sized from, so it is run unbounded: bounding the measurement by a number
+  // derived from the measurement is circular, and a slow scope would time out before it had told
+  // anyone how slow it was.
+  Ran base = runTests(clock, procs, binary, stage, [testDir], 0);
+  string refusal = refusalFor(base.verdict, testDir);
+  if (refusal != "") { out.line(refusal); return exitFor(0, true); }
+  i32 deadline = deadlineFor(base.tookMs);
+
+  // **The profile, over the staged tree and before anything is mutated.** It has to describe the
+  // code the baseline ran, or it names lines that no longer exist. A pass that refuses costs
+  // narrowing and nothing default: `runPlanFor` widens every mutant to the whole scope, which is what
+  // this did before the profile existed.
+  string[] testFiles = testsUnder(fs, testDir);
+  Profiled prof = buildProfile(err, clock, env, fs, procs, binary, stage, testFiles, root + "/.cache/mutate/profiles", root + "/" + WAC_CACHE_DIR(), await keyFor(fs, env, testFiles));
+  if (!prof.ok) {
+    err.line("not narrowing: " + prof.why);
+    err.line("Every mutant will run the whole of " + testDir + " — slower, and never wrong.");
+  }
+
+  // **Every mutant is generated before any is run, because sampling is stratified by file.**
+  // `sampleMutants` round-robins across files so a small file is represented before a large one gets
+  // a second draw — which it can only do if it sees the whole population. Sampling per file would
+  // give each file the same count regardless of size, a different and worse rule.
+  GenStats stats = GenStats(0, 0, 0);
+  Vec<string> texts = Vec.create();
+  Vec<Mutant> population = Vec.create();
+  for (i32 fi = 0; fi < files.len(); fi++) {
+    u8[]? src = flatten(fs.readFile(files[fi]).wait()).ok();
+    if (src is null) { err.line("cannot read " + files[fi]); texts.push(""); continue; }
+    string text = string.fromBytes(src!);
+    texts.push(text);
+    Mutant[] got = generate(files[fi], text, f.operators, stats, f.perShape);
+    for (i32 i = 0; i < got.len(); i++) { population.push(got[i]); }
+  }
+
+  Mutant[] chosen = population.toArray();
+  if (f.sample > 0 && f.sample < chosen.len()) {
+    i32 seed = f.seed != 0 ? f.seed : (flatten(clock.nowMillis().wait()).unwrap() as! i32);
+    i32 before = chosen.len();
+    chosen = sampleMutants(chosen, f.sample, seed);
+    // **The seed is printed because the draw is the answer's scope.** A surprising survivor from a
+    // sample is only useful if the same subset can be asked again, and a run that sampled without
+    // saying so reads as a run that measured everything.
+    out.line("sampling " + itoa(chosen.len()) + " of " + itoa(before) + " mutant(s) across "
+             + itoa(fileCount(chosen)) + " file(s), seed " + itoa(seed)
+             + " — pass --seed " + itoa(seed) + " to draw the same subset again");
+  }
+
+  i32 killed = 0;
+  i32 measured = 0;
+  i32 invalid = 0;
+  string[] survivors = string[].filled(4096, "");
+  i32 survivorCount = 0;
+  i32 noVerdict = 0;
+  string[] noVerdictNames = string[].filled(4096, "");
+  i32 controlsKilled = 0;
+  i32 narrowed = 0;
+  i32 widened = 0;
+  i32 timedOut = 0;
+  i32 equivalent = 0;
+  i32 duplicate = 0;
+  // Signatures claimed so far, so the second mutant with one is a duplicate of the first.
+  string[] seenSig = string[].filled(8192, "");
+  string[] seenName = string[].filled(8192, "");
+  i32 seen = 0;
+
+  for (i32 fi = 0; fi < files.len(); fi++) {
+    string text = texts.get(fi);
+    if (text == "") { continue; }
+    string staged = stage + "/" + files[fi];
+
+    // This file's share of the draw. Selecting from `chosen` rather than regenerating keeps the
+    // sample the one that was reported: regenerating would re-run the literal operator's own
+    // sampling and quietly draw a different set.
+    Vec<Mutant> mine = Vec.create();
+    for (i32 i = 0; i < chosen.len(); i++) {
+      if (chosen[i].edits.len() > 0 && chosen[i].edits[0].file == files[fi]) { mine.push(chosen[i]); }
+    }
+    Mutant[] generated = mine.toArray();
+    // **No mutants here means no control here.** A control proves the staging and test pipeline for
+    // the file being mutated; a file the draw skipped is not being mutated, so its control would be
+    // a test run that answers a question nobody asked. Sampling 12 of `bls`'s 1356 would otherwise
+    // have cost ten of them.
+    if (generated.len() == 0) { continue; }
+
+    // **Triage before running, which is cheaper than it looks.** Compiling a mutant costs about a
+    // sixteenth of running its scope's tests, and every mutant it excludes is a test run that does
+    // not happen — so asking makes the run faster as well as making three of `scoreOf`'s six inputs
+    // real numbers rather than the constant zero. `mutatelist --triage` is the same composition
+    // without the running.
+    Sources gathered = await gather(fs, env, files[fi], false);
+    bool blind = gathered.why != "";
+    if (blind) { err.line("  cannot gather " + files[fi] + ": " + gathered.why + " — running its"
+                           + " mutants untriaged rather than discarding them"); }
+    string baseline = blind ? "" : wasmHashOf(gathered.paths, gathered.texts, files[fi]);
+
+    // The control goes first, so a staged tree that cannot build is found before the run spends a
+    // test run per mutant proving the same thing over and over.
+    Mutant[] mutants = Mutant[].filled(generated.len() + 1, controlFor(files[fi], text.len()));
+    mutants.copyFrom(generated, 0, 1, generated.len());
+
+    for (i32 m = 0; m < mutants.len(); m++) {
+      Applied a = applyEdits([files[fi]], [text], mutants[m]);
+      if (!a.ok) { invalid = invalid + 1; continue; }
+
+      bool isControl = mutants[m].origin == "control";
+      if (!blind) {
+        Applied whole = applyEdits(gathered.paths, gathered.texts, mutants[m]);
+        string sig = whole.ok ? wasmHashOf(whole.paths, whole.texts, files[fi]) : "";
+        string signature = signatureOf([files[fi]], [sig]);
+        Triage tr = triageOf(false, sig == "" ? files[fi] : "", isControl, signature,
+                             signatureOf([files[fi]], [baseline]),
+                             seenSig, seenName);
+        if (tr.record && seen < seenSig.len()) {
+          seenSig[seen] = signature;
+          seenName[seen] = mutants[m].name;
+          seen = seen + 1;
+        }
+        // Excluded rather than counted as killed, which is the line that keeps the score honest:
+        // a duplicate is the same experiment twice, an equivalent mutant is one no test could ever
+        // distinguish, and a mutation the language rejects was never a question about the tests.
+        if (tr.verdict == "equivalent") { equivalent = equivalent + 1; continue; }
+        if (tr.verdict == "duplicate") { duplicate = duplicate + 1; continue; }
+        if (tr.verdict == "invalid") { invalid = invalid + 1; continue; }
+      }
+
+      // Into the staged copy. The original is never written, which is the whole reason there is one:
+      // a run killed halfway through leaves the checkout exactly as it found it.
+      auto wrote = flatten(fs.writeFile(staged, a.texts[0].toBytes()).wait());
+      if (wrote.isErr()) {
+        err.line("could not stage " + mutants[m].name + ": " + "\{wrote.isErr() ? "\{wrote.err()!}" : ""}");
+        noVerdict = noVerdict + 1;
+        continue;
+      }
+
+      // **What to run for this mutant**, from the profile: the test files that reach its lines, or
+      // the whole scope when the profile cannot say. `rp.filter` is deliberately unused — it is
+      // Deno's anchored-regex spelling, and `wac test --filter` matches a plain substring, so
+      // handing it over selects nothing and scores the mutant a survivor. Selection here is by
+      // entry, which `runPlanFor` has already reduced. `isDenoFilter` is the note that says so.
+      RunPlan rp = runPlanFor(prof.p, locationsOf(files[fi], text, mutants[m]),
+                              prof.homeNames, prof.homeFiles, [testDir]);
+      if (rp.narrowed) { narrowed = narrowed + 1; } else { widened = widened + 1; }
+      Ran ran = runTests(clock, procs, binary, stage, rp.dirs, deadline);
+      if (ran.timedOut) { timedOut = timedOut + 1; }
+      Outcome o = outcomeOf(ran.timedOut, [ran.verdict], rp.notCovered);
+      // Put the file back before the next mutant, or two mutations compose into a third nobody
+      // generated and the name in the report describes one of them.
+      fs.writeFile(staged, text.toBytes()).wait();
+
+      if (o.noVerdict != "") {
+        // **Named, not just counted.** A mutant in neither total is the one line of this report a
+        // reader cannot check, and a count on its own cannot distinguish "two mutants did not
+        // compile" from "the runner is broken and every verdict after this is luck".
+        if (noVerdict < noVerdictNames.len()) {
+          noVerdictNames[noVerdict] = mutants[m].name + " — " + o.noVerdict;
+        }
+        noVerdict = noVerdict + 1;
+        continue;
+      }
+
+      // **A control is not in either total.** It is a no-op by construction, so counting its survival
+      // as a survivor would deflate the score by exactly the number of controls and counting it as a
+      // kill would inflate it by the same — `scoreOf`'s own account of why they sit outside.
+      if (isControl) {
+        if (o.killed) { controlsKilled = controlsKilled + 1; }
+        continue;
+      }
+
+      measured = measured + 1;
+      if (o.killed) { killed = killed + 1; continue; }
+      if (survivorCount < survivors.len()) {
+        survivors[survivorCount] = mutants[m].name;
+        survivorCount = survivorCount + 1;
+      }
+    }
+  }
+
+  Score s = scoreOf(killed, measured, equivalent, duplicate, invalid, controlsKilled);
+  out.line(headline(s, f.dir));
+  if (s.harnessBroken) { return 2; }
+  out.line("  " + exclusions(s));
+  // **The narrow/widen split, said out loud.** A run that narrowed nothing costs exactly what no
+  // profile costs, and without this line it is indistinguishable from one that narrowed everything.
+  // That is `issues/system/0161`'s complaint about `--explain-selection` in one number: a selection
+  // nobody can look at is the failure the tool exists to detect.
+  out.line("  " + itoa(narrowed) + " mutant(s) ran only the tests that reach them, "
+           + itoa(widened) + " ran the whole scope");
+  // **Timeouts are named, because a kill by deadline is a different fact from a kill by a test.**
+  // Counted as killed — a mutation that stops the program terminating is a detected defect — but a
+  // run where most kills are timeouts is one where the deadline is too short, and that reads as a
+  // well-tested suite unless the number is on the page.
+  if (timedOut > 0) {
+    out.line("  " + itoa(timedOut) + " of those kills were the " + itoa(deadline / 1000)
+             + "s deadline rather than a failing test");
+  }
+  i32 pct = percent(s);
+  out.line(pct < 0 ? "  no score: nothing was measured" : "  " + itoa(pct) + "%");
+  // **Said rather than left out of the arithmetic silently.** A mutant whose run answered neither
+  // pass nor failure is not a kill and not a survival, and a denominator that quietly shrank is the
+  // one number in this report a reader cannot check.
+  if (noVerdict > 0) {
+    out.line("  " + itoa(noVerdict) + " mutant(s) had no verdict and are in neither total:");
+    for (i32 i = 0; i < noVerdict && i < noVerdictNames.len(); i++) {
+      out.line("    " + noVerdictNames[i]);
+    }
+  }
+  if (survivorCount > 0) {
+    out.line("");
+    out.line(itoa(survivorCount) + " SURVIVING mutant(s) — behaviour no test in " + testDir
+             + " distinguishes:");
+    for (i32 i = 0; i < survivorCount; i++) { out.line("  " + survivors[i]); }
+  }
+  return exitFor(survivorCount, false);
+}

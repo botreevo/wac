@@ -1,0 +1,94 @@
+// The shell on the Node host, against bash.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/box/test/wac/nodeshell_test.wac
+//
+// The Node host is a different implementation of the same contract — its own stdio, filesystem, sockets and worker
+// plumbing. **These twenty are chosen for the host rather than for the language**: arithmetic, quoting and expansion
+// run in the same wasm on every host, so comparing them again re-tests the compiler. What differs is the capability
+// calls — a redirection is `writeFile`, a here-document a buffer, `cd` the shell's own resolution against `cwd`, a
+// glob `readDir`, a command substitution a capturing shell, a pipeline `send`/`recv` — so those are what is here, one
+// case per capability, each answer bash's. It was box's TypeScript `node_shell.test.ts`; Node and bash are the real
+// processes here as there.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtByDeno } from "../../../wactest/src/built.wac";
+import { freshDir, scratch } from "../../../wactest/src/host.wac";
+import { Exec, ChildEnv, Env, Launch, Procs, Sys } from "std";
+import { flatten } from "core";
+
+struct Said {
+  string out;
+  i32 status;
+}
+
+bool have(Procs procs, string cmd, string[] args) {
+  Exec? r = flatten(procs.exec(cmd, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+  return (r is not null) && r!.status == 0;
+}
+
+string replaced(string s, string what, string with) {
+  if (what == "") { return s; }
+  string out = "";
+  string rest = s;
+  while (true) {
+    i32 at = rest.indexOf(what);
+    if (at < 0) { return out + rest; }
+    out = out + rest.slice(0, at) + with;
+    rest = rest.slice(at + what.len(), rest.len());
+  }
+}
+
+/** `cmd args`, given `input`, in a fresh `dir`; its output with the directory's name taken out, and its status. */
+Said run(Sys sys, ChildEnv e, string dir, string cmd, string[] args, string input) {
+  freshDir(sys.files(), dir);
+  Exec? x = flatten(sys.procs().exec(cmd, args, input.toBytes(), e, Launch(dir, false, false, false, false)).wait()).ok();
+  if (x is null) { return Said("<did not start>", 0 - 1); }
+  // The directory's name is the one difference between the two runs that is not the shell's answer.
+  return Said(replaced(string.fromBytes(x!.stdout), dir, "<cwd>"), x!.status);
+}
+
+export string test_the_shell_on_node_answers_what_bash_answers_for_everything_that_touches_the_host(Sys sys) {
+  T t = T.create();
+  Procs procs = sys.procs();
+  if (!have(procs, "node", ["--version"]) || !have(procs, "bash", ["-c", "exit 0"])) {
+    sys.stderr().line("nodeshell_test: skipped — needs node and bash");
+    return t.report();
+  }
+  Env env = sys.env();
+  string built = builtByDeno(env, sys.files(), procs, "packages/box/src/bin/sh.wac", "nodeshell-sh",
+                             ["--allow-read", "--allow-write", "--allow-env"], "node", false);
+  u8[]? path = flatten(env.get("PATH").wait()).orElse(null);
+  ChildEnv e = ChildEnv.empty().set("LC_ALL", "C").set("PATH", path is null ? "/usr/bin:/bin" : string.fromBytes(path!));
+  string dir = scratch(env, "box-nodeshell");
+  string[] scripts = [
+    // Redirection: `writeFile`, the append form, reading one back.
+    "echo hi > f; cat f", "echo one > f; echo two >> f; cat f", "echo x > f; cat < f",
+    // A here-document, which is a buffer the shell holds rather than anything on the host.
+    "cat <<EOF\nin the script\nEOF",
+    // Command substitution: a capturing shell inside this one.
+    "echo $(echo inner)", "x=$(printf 'a\\nb\\n' | wc -l); echo $x",
+    // Pipelines, which are `send` and `recv` between stages.
+    "seq 1 5 | head -2", "seq 1 5 | sort -r | head -2", "printf 'b\\na\\nb\\n' | sort | head -2",
+    // The shell's own standard input, in three shapes.
+    "cat", "read x; echo \"[$x]\"; cat", "while read l; do echo \"got $l\"; done",
+    // `cd` and `pwd`: the shell's path resolution over the host's `cwd`.
+    "mkdir -p d/e; cd d/e; pwd", "mkdir -p d; cd d; echo deep > g; cat g",
+    // Globbing, which is `readDir` — the files made by redirection, since `touch` is not an applet here.
+    "echo x > a.txt; echo y > b.txt; echo *.txt", "echo x > a.txt; echo *.nope",
+    // Failures whose wording is the host's, so the status is what is compared.
+    "mkdir taken; mkdir taken; echo status=$?", "rm nosuchthing; echo status=$?",
+    // A compound's output redirected as a whole, and read back.
+    "for i in 1 2 3; do echo $i; done > out; cat out",
+    // `exit` from a script, which is the launcher's exit code.
+    "echo before; exit 3; echo after",
+  ];
+  string[] inputs = ["", "", "", "", "", "", "", "", "", "piped in\n", "one\ntwo\n", "a\nb\n", "", "", "", "", "", "", "", ""];
+  for (i32 i = 0; i < scripts.len(); i++) {
+    Said theirs = run(sys, e, dir, "bash", ["-c", scripts[i]], inputs[i]);
+    Said ours = run(sys, e, dir, "node", [built, "-c", scripts[i]], inputs[i]);
+    t.eqStr(ours.out, theirs.out, "\{scripts[i]}: output");
+    t.eqI32(ours.status, theirs.status, "\{scripts[i]}: exit status");
+  }
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}

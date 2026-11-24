@@ -1,0 +1,83 @@
+// Dialling a KPS listener over QUIC — SPEC §5.3, the native default (§5.4).
+//
+// TLS 1.3 with no PKI: the server's certificate must hash to the certhash, and nothing else about it is checked.
+// The ALPN is `h3` and there is no SNI, so nothing on the wire says KPS (§5.3). One socket, one connection; the
+// socket's loop below is the engine's clock and its only way to the network.
+
+import { Result } from "core";
+import { Sys, Datagrams, Datagram } from "std";
+import { quic.QuicConn, quic.QuicConfig, quic.QuicTls, quic.transportParams } from "wac";
+import { Address, parseAddress, decodeCerthash } from "../address.wac";
+import { Code, Reason } from "../errors.wac";
+import { Connection, Endpoint } from "../api.wac";
+import { QuicKpsConn } from "./conn.wac";
+import { Receiver } from "../net.wac";
+
+/** Dial `address` over QUIC. `Ok` once the handshake is complete; `Err` on a bad address, a pin mismatch, or a timeout. */
+export async Result<Connection, Reason> dialQuic(Sys sys, string address, i64 timeoutMs) {
+  Address? a = parseAddress(address).ok();
+  if (a is null) { return Result.Err(Reason.saying(Code.InternalError, "not a KPS address: \{address}")); }
+  u8[]? digest = decodeCerthash(a!.certhash);
+  if (digest is null) { return Result.Err(Reason.saying(Code.InternalError, "not a sha-256 certhash: \{a!.certhash}")); }
+  u8[] r = u8[]();
+  match (await sys.random().bytes(80)) {
+    Ok(b): { r = b; }
+    Err(e): { return Result.Err(Reason.saying(Code.InternalError, "no randomness: \{e}")); }
+  }
+  Datagrams? sock = null;
+  match (await sys.net().bindDatagram(a!.ip.indexOf(":") >= 0 ? "::" : "0.0.0.0", 0)) {
+    Ok(s): { sock = s; }
+    Err(e): { return Result.Err(Reason.saying(Code.NetworkError, "no socket: \{e}")); }
+  }
+  i64 now = (await sys.clock().nowMillis()).ok() ?? 0 as i64;
+  QuicConfig cfg = QuicConfig { };
+  u8[] scid = bytesAt(r, 0, 8);
+  u8[] dcid = bytesAt(r, 8, 8);
+  QuicTls tls = QuicTls.client(cfg.alpn, transportParams(cfg, scid, u8[](), false), bytesAt(r, 16, 32), bytesAt(r, 48, 32),
+                               digest!);
+  QuicConn q = QuicConn.client(cfg, tls, scid, dcid, now);
+  Link link = Link(sys, sock!, Receiver.of(sys, sock!), a!, false, now + timeoutMs);
+  QuicKpsConn c = QuicKpsConn.make(q, Endpoint(a!.ip, a!.port), () => { link.kicked = true; });
+  driveQuic(link, c);
+  Result<bool, Reason> ok = await c.ready();
+  if (ok.isErr()) { return Result.Err(ok.err()!); }
+  return Result.Ok(c);
+}
+
+struct Link {
+  Sys sys;
+  Datagrams sock;
+  Receiver rx;
+  Address a;
+  bool kicked;
+  /** When the handshake must be done by. */
+  i64 deadline;
+}
+
+/** The socket's loop: a datagram or a few milliseconds of silence, the clock, and whatever is to be sent. */
+async void driveQuic(Link l, QuicKpsConn c) {
+  while (!c.q.isClosed()) {
+    // Short waits while the application is busy (a kick), so its writes go out without waiting for a tick.
+    Datagram? got = await l.rx.next(l.kicked ? 1 : 10);
+    l.kicked = false;
+    i64 now = (await l.sys.clock().nowMillis()).ok() ?? 0 as i64;
+    if (got is not null) {
+      Datagram d = got!;
+      if (d.error.len() == 0 && d.port == l.a.port) { c.q.receive(d.bytes, now); }
+    }
+    c.q.tick(now);
+    c.pump();
+    if (!c.established && c.ended is null && now >= l.deadline) {
+      c.close(Reason.saying(Code.Timeout, "no QUIC handshake before the deadline"));
+    }
+    for (u8[] out in c.q.take(now)) { await l.sock.sendTo(l.a.ip, l.a.port, out); }
+    c.pump();
+  }
+  l.rx.close();
+}
+
+u8[] bytesAt(u8[] b, i32 from, i32 n) {
+  u8[] out = u8[].filled(n, 0);
+  out.copyFrom(b, from, 0, n);
+  return out;
+}

@@ -1,0 +1,185 @@
+// The deterministic WebAssembly machine, versions 2 and 3 — what a recipe naming either means, apart from any runner.
+//
+// **Version 3** (docs/machines/wasm-gc-wac-host-3.md) records how a run ended as a value the host reports
+// (`Child.ended()`), not as words read from the engine's diagnostics: `trap KIND`, KIND one of the kinds every host
+// classifies the same way, and for the program's own `trap "…"`, its message in `message`. Version 2's trap names are
+// still read from what the engine said, exactly as before, so a /2 recipe gives what it always gave.
+//
+// **The definition is docs/machines/wasm-gc-wac-host-2.md** (its CID in docs/machines/README.md). What follows is this
+// runner's reading of it; where they differ, that document holds.
+//
+// **Input.** A directory tree with a file `program`, a WebAssembly module that speaks wac's host protocol (what
+// `wac build` writes), and optionally a file `args`, one argument per line. The whole input tree is what the program
+// sees at `/in`, read-only. It starts at `/`, which holds `/in` and an empty `/out`, and nothing else: no network, no
+// environment, no processes, no other files.
+//
+// **Output.** A directory tree of exactly three entries: `status`, `log` (everything the program wrote to its
+// output), and `out/` (what it left under `/out`). `status` is one line: `exit N` when the program ended with status
+// N, or `trap NAME` when WebAssembly stopped it for a reason the module itself determines (`NAME` below).
+//
+// **No output.** Running out of time, memory or stack is the runner's limit, not the program's meaning, so a runner
+// that hits one makes no claim at all. So does any stop it cannot name: a runner says nothing rather than guess.
+//
+// **The floor.** Every runner of /2 provides at least the stack `corpus/depth.wac 10000` needs and the heap
+// `corpus/heap.wac 1024` (1 GiB) needs (docs/runner.md); within them every runner gives an answer.
+//
+// **Floats are WebAssembly 3.0's deterministic profile**: every NaN an operation produces is the canonical positive
+// NaN, whatever the engine and CPU; `neg`, `abs`, `copysign` and the reinterprets still move bits exactly. A runner
+// imposes it by rewriting the module before running it (`src/canon.wac`). Version 0 left NaNs to the engine, and
+// V8 and wasmtime disagreed (docs/runner.md).
+//
+// **No clock and no random bytes** (version 2): the program runs sealed (`Launch.sealed()`), so asking either answers
+// `Unsupported`, for it and anything it spawns, on every host. Version 1 could not take them away, and a program that
+// read them could give two outputs from one input (docs/runner.md).
+
+import { Ended, TrapKind } from "std";
+import { ipfs.FileIn } from "@/lib.wac";
+import { Written } from "./world.wac";
+
+/** The machine new recipes name. */
+export string MACHINE() { return "wasm-gc/wac-host/3"; }
+/** The machine before it, still run as it was defined. */
+export string MACHINE_2() { return "wasm-gc/wac-host/2"; }
+/** Whether this runner carries the machine `m`. */
+export bool isMachine(string m) { return m == MACHINE() || m == MACHINE_2(); }
+export string FORMAT() { return "unixfs-v1-2025+hidden"; }
+
+/** How a run ended: `exit` with a code, `trap` with a name, or `abort`, which yields nothing. */
+export struct Ending {
+  string kind;
+  i32 code;
+  string name;
+  /** For an abort: why, for a person. */
+  string why;
+  /** For version 3's explicit trap: the program's own message, which is part of the output. */
+  string? message;
+
+  Ending exited(i32 code) { return Ending("exit", code, "", "", null); }
+  Ending trapped(string name) { return Ending("trap", 0, name, "", null); }
+  Ending explicit(string message) { return Ending("trap", 0, "explicit", "", message); }
+  Ending aborted(string why) { return Ending("abort", 0, "", why, null); }
+
+  string status(this) { return this.kind == "exit" ? "exit \{this.code}\n" : "trap \{this.name}\n"; }
+}
+
+/**
+ * A trap's name, from what the host said about it, or "" when it is not one this machine names. Each name is a trap
+ * the module decides — the same on every engine — and each line pairs V8's words with wasmtime's.
+ */
+export string trapName(string said) {
+  if (has(said, "element access out of bounds") || has(said, "out of bounds array access")) { return "array-out-of-bounds"; }
+  if (has(said, "memory access out of bounds") || has(said, "out of bounds memory access")) { return "memory-out-of-bounds"; }
+  if (has(said, "table index is out of bounds") || has(said, "undefined element")) { return "table-out-of-bounds"; }
+  if (has(said, "divide by zero") || has(said, "remainder by zero")) { return "divide-by-zero"; }
+  if (has(said, "divide result unrepresentable") || has(said, "integer overflow")) { return "integer-overflow"; }
+  if (has(said, "float unrepresentable in integer range") || has(said, "invalid conversion to integer")) {
+    return "float-to-integer";
+  }
+  if (has(said, "dereferencing a null pointer") || has(said, "null reference") || has(said, "null function")) { return "null"; }
+  if (has(said, "illegal cast") || has(said, "cast failure")) { return "cast"; }
+  if (has(said, "unreachable")) { return "unreachable"; }
+  return "";
+}
+
+bool has(string s, string part) { return s.indexOf(part) >= 0; }
+
+/** The `args` file: one argument per line, a final newline optional. */
+export string[] argsOf(u8[]? file) {
+  if (file is null || file!.len() == 0) { return string[](); }
+  string s = string.fromBytes(file!);
+  if (s.slice(s.len() - 1, s.len()) == "\n") { s = s.slice(0, s.len() - 1); }
+  return lines(s);
+}
+
+/** The output tree's files: `status`, `log`, what was written below `out/`, and (version 3) an explicit trap's `message`. */
+export FileIn[] outputFiles(Ending e, u8[] log, Written w) {
+  FileIn[] written = w.files();
+  i32 extra = e.message is null ? 2 : 3;
+  FileIn[] out = FileIn[].filled(written.len() + extra, FileIn("", u8[]()));
+  out[0] = FileIn("status", e.status().toBytes());
+  out[1] = FileIn("log", log);
+  if (e.message is not null) { out[2] = FileIn("message", e.message!.toBytes()); }
+  for (i32 i = 0; i < written.len(); i++) { out[i + extra] = FileIn("out/" + written[i].path, written[i].content); }
+  return out;
+}
+
+/** Version 3's name for a kind of trap, or "" for one that yields no output (out of stack, or unclassified). */
+export string kindName(TrapKind k) {
+  return match (k) {
+    Explicit: "explicit", UnreachableCode: "unreachable-code", MemoryBounds: "memory-bounds", TableBounds: "table-bounds",
+    DivideByZero: "divide-by-zero", IntegerOverflow: "integer-overflow", BadConversion: "bad-conversion",
+    NullReference: "null-reference", BadCast: "bad-cast", StackExhausted: "", Unclassified: ""
+  };
+}
+
+/** Version 2's name for a kind of trap, where the kind alone decides it. */
+string kindName2(TrapKind k) {
+  return match (k) {
+    UnreachableCode: "unreachable", TableBounds: "table-out-of-bounds", DivideByZero: "divide-by-zero",
+    IntegerOverflow: "integer-overflow", BadConversion: "float-to-integer", NullReference: "null", BadCast: "cast",
+    default: ""
+  };
+}
+
+/**
+ * How a run of `machine` ended, from how the host says the child ended (`Child.ended()`).
+ *
+ * Version 3 takes the kind as the host reports it; the program's own `trap "…"` is `explicit`, with its message. A
+ * stack that ran out, a kind no host names, or a limit the host imposed yields nothing.
+ *
+ * Version 2 is what it always was: its trap names come from the engine's words (`trapName`), an explicit trap, which
+ * then reached the engine as `unreachable`, is `unreachable`, and anything unnamed yields nothing.
+ */
+export Ending endingOfEnded(string machine, Ended e) {
+  match (e) {
+    Exited(code): { return Ending.exited(code); }
+    HostLimit(why): { return Ending.aborted("the host stopped it: \{why}"); }
+    Trapped(kind, said): {
+      bool stack = match (kind) { StackExhausted: true, default: false };
+      if (stack) { return Ending.aborted("out of stack: \{said}"); }
+      if (machine == MACHINE()) {
+        bool own = match (kind) { Explicit: true, default: false };
+        if (own) { return Ending.explicit(said); }
+        string name = kindName(kind);
+        if (name == "") { return Ending.aborted("a trap no host classifies: \{said == "" ? "(nothing said)" : said}"); }
+        return Ending.trapped(name);
+      }
+      bool own2 = match (kind) { Explicit: true, default: false };
+      if (own2) { return Ending.trapped("unreachable"); }
+      if (has(said, "too large") || has(said, "out of memory")) { return Ending.aborted("out of memory: \{said}"); }
+      string name2 = trapName(said);
+      // A host that says nothing about a trap still says its kind; each kind but bounds is one of /2's names. /2 tells
+      // an array's bounds from memory's, which only the words can, so a bounds trap with no words yields nothing.
+      if (name2 == "") { name2 = kindName2(kind); }
+      if (name2 == "") { return Ending.aborted("an ending this machine does not name: \{said == "" ? "(nothing said)" : said}"); }
+      return Ending.trapped(name2);
+    }
+  }
+}
+
+/** Its directories, `out` always among them so an empty one is kept. */
+export string[] outputDirs(Written w) {
+  string[] out = string[].defaulted(w.dirs.len() + 1);
+  out[0] = "out";
+  for (i32 i = 0; i < w.dirs.len(); i++) { out[i + 1] = "out/" + w.dirs[i]; }
+  return out;
+}
+
+/** `s` cut at every newline. */
+string[] lines(string s) {
+  string[] out = string[]();
+  u8[] b = s.toBytes();
+  i32 at = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '\n') {
+      string[] next = string[].defaulted(out.len() + 1);
+      for (i32 j = 0; j < out.len(); j++) { next[j] = out[j]; }
+      u8[] piece = u8[].filled(i - at, 0);
+      piece.copyFrom(b, at, 0, i - at);
+      next[out.len()] = string.fromBytes(piece);
+      out = next;
+      at = i + 1;
+    }
+  }
+  return out;
+}

@@ -1,0 +1,164 @@
+// The store on networked block storage (EBS-, DO-volume-style) rather than local NVMe: every read the store makes of
+// its file given a latency, and every sync another — a layer under the store's `Disk`, since this container has no
+// device-mapper for dm-delay — on a store `scale.wac` filled. Blocks shaped like mainnet's (the 64-block trace of
+// docs/state-cache.md): ~530 account reads and ~2070 slot reads, a share of each from a hot set the size the trace's
+// reuse suggests, then 250 accounts and 1000 slots written, the root computed, commits flushed every FLUSH blocks.
+//
+//     wac --max-heap 6g run --allow-read --allow-write tools/measure/netdisk.wac -- PATH BLOCKS READ_MS SYNC_MS CACHE_MB HOT_PERMILLE [FLUSH]
+//
+// Per run: a block's time (mean, p50, p99, most), the flush's, and per block the store's file reads by phase (the
+// state reads, the trie work of the root, the commit) against the keys asked — the entry cache's miss rate. Every
+// file read is counted as a networked one: the operating system's page cache is taken as cold (the worst case; a
+// read it holds costs ~10 µs instead of the latency), which is what a box whose RAM is small beside its store sees.
+
+import { Sys } from "std";
+import { Map, Vec, Result, Ticket } from "core";
+import { U256 } from "../../src/u256.wac";
+import { AccountState, emptyCodeHash, hashU256, eqU256, slotMap } from "../../src/state/world.wac";
+import { Store } from "../../src/store/tree.wac";
+import { EntryCache } from "../../src/store/cache.wac";
+import { Disk } from "../../src/store/disk.wac";
+import { fileDisk } from "../../src/store/file.wac";
+import { StateDb, Staged } from "../../src/store/state.wac";
+
+static i64 ACCOUNTS = 20000;
+static i64 CONTRACTS = 2;
+U256 account(i64 i) { return U256.ofU64(((i as! u64) * 0x9e3779b97f4a7c15) ^ 0x1234567); }
+U256 contract(i64 i) { return U256.ofU64(0x5000000000000 + (i as! u64)); }
+
+struct Rng {
+  u64 x;
+  u64 next(this) {
+    this.x ^= this.x << 13;
+    this.x ^= this.x >> 7;
+    this.x ^= this.x << 17;
+    return this.x;
+  }
+}
+
+struct Io {
+  i64 reads;
+  i64 syncs;
+}
+
+/** `d` with `readMs` before every read and `syncMs` before every sync, each counted. */
+Disk delayed(Sys sys, Disk d, Io io, i32 readMs, i32 syncMs) {
+  return Disk(async (i64 at, i32 n) => {
+    io.reads++;
+    if (readMs > 0) { await sys.sleepMillis(readMs); }
+    return await d.read(at, n);
+  }, (i64 at, i32 n) => {
+    io.reads++;
+    // The synchronous path (the EVM's reads): the host's own timer waited for where it is asked.
+    if (readMs > 0) { sys.sleepMillis(readMs).wait(); }
+    return d.readNow(at, n);
+  }, async (i64 at, u8[] b) => await d.write(at, b), async () => {
+    io.syncs++;
+    if (syncMs > 0) { await sys.sleepMillis(syncMs); }
+    return await d.sync();
+  }, async () => await d.size());
+}
+
+i64 parse(string s) {
+  u8[] b = s.toBytes();
+  i64 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + ((b[i] - 48) as i64); }
+  return n;
+}
+
+i64 at(Vec<i64> sorted, i32 permille) { return sorted.len() == 0 ? -1 : sorted.get((sorted.len() - 1) * permille / 1000); }
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 6) {
+    sys.warn("usage: netdisk.wac PATH BLOCKS READ_MS SYNC_MS CACHE_MB HOT_PERMILLE [FLUSH]");
+    return 2;
+  }
+  i32 blocks = parse(a[1]) as! i32;
+  i32 readMs = parse(a[2]) as! i32;
+  i32 syncMs = parse(a[3]) as! i32;
+  i64 cacheMb = parse(a[4]);
+  i64 hot = parse(a[5]);
+  i32 flush = a.len() > 6 ? (parse(a[6]) as! i32) : 8;
+  Io io = Io(0 as i64, 0 as i64);
+  Disk raw = (await fileDisk(sys, a[0])).unwrap();
+  Store store = (await Store.open(delayed(sys, raw, io, readMs, syncMs))).unwrap();
+  store.cache = EntryCache.create(cacheMb * 1024 * 1024);
+  i64 batch = 0;
+  u8[] user = store.committed().user;
+  for (i32 i = 0; i < 8 && user.len() == 8; i++) { batch = (batch << 8) | (user[i] as i64); }
+  if (batch == 0) { sys.warn("netdisk: not a store scale.wac filled"); return 1; }
+  i64 nAccounts = batch * ACCOUNTS;
+  i64 nContracts = batch * CONTRACTS;
+  // The hot set: 10 000 accounts and 20 000 slots (each of one of 20 contracts) — mainnet's blocks reread a working
+  // set (the trace: 72% of reads repeat within 64 blocks), which is what an entry cache is for.
+  Rng r = Rng(0x2545f4914f6cdd1d);
+  U256[] hotSlots = U256[].filled(20000, U256.zero());
+  for (i32 i = 0; i < hotSlots.len(); i++) { hotSlots[i] = U256.ofU64(r.next()); }
+  StateDb db = StateDb.over(store);
+  db.flushEvery = flush;
+  string[] why = [""];
+  Vec<i64> total = Vec.create();
+  Vec<i64> flushes = Vec.create();
+  i64 readsExec = 0;
+  i64 readsStage = 0;
+  i64 readsCommit = 0;
+  i64 asked = 0;
+  i32 warm = blocks / 4;
+  for (i32 b = 0; b < blocks; b++) {
+    i64 t0 = await sys.monotonicNanos();
+    i64 r0 = io.reads;
+    // The state reads.
+    for (i32 i = 0; i < 530; i++) {
+      bool isHot = ((r.next() % 1000) as! i64) < hot;
+      db.account(account(((r.next() % (isHot ? 10000 : (nAccounts as! u64))) as! i64)));
+    }
+    for (i32 i = 0; i < 2070; i++) {
+      bool isHot = ((r.next() % 1000) as! i64) < hot;
+      i32 k = (r.next() % 20000) as! i32;
+      if (isHot) { db.slot(contract((k % 20) as i64), hotSlots[k]); }
+      else { db.slot(contract(((r.next() % (nContracts as! u64)) as! i64)), U256.ofU64(r.next())); }
+    }
+    i64 r1 = io.reads;
+    // The writes, and the root over them.
+    U256[] touched = U256[].filled(251, U256.zero());
+    AccountState?[] after = AccountState?[].defaulted(251);
+    for (i32 i = 0; i < 250; i++) {
+      touched[i] = account(((r.next() % 10000) as! i64));
+      after[i] = AccountState(true, 3, U256.ofU64(r.next() & 0xffffff), u8[].filled(0, 0), emptyCodeHash());
+    }
+    U256 c = contract(((r.next() % 20) as! i64));
+    touched[250] = c;
+    after[250] = AccountState(true, 1, U256.zero(), u8[].filled(0, 0), emptyCodeHash());
+    Map<U256, Map<U256, U256>> slots = Map.create(hashU256, eqU256);
+    Map<U256, U256> m = slotMap();
+    for (i32 i = 0; i < 1000; i++) { m.set(hotSlots[((r.next() % 1000) as! i32) * 20 + (((c.low() - 0x5000000000000) % 20) as! i32)], U256.ofU64(r.next() & 0xffff)); }
+    slots.set(c, m);
+    Staged? st = await db.stage(touched, after, slots, why);
+    if (st is null) { sys.warn("block \{b}: \{why[0]}"); return 1; }
+    i64 r2 = io.reads;
+    i64 s0 = io.syncs;
+    i64 c0 = await sys.monotonicNanos();
+    string bad = await db.commitStaged(st!, user);
+    if (bad != "") { sys.warn("block \{b}: \{bad}"); return 1; }
+    i64 t1 = await sys.monotonicNanos();
+    if (io.syncs > s0) { flushes.push((t1 - c0) / 1000000); }
+    // The first quarter warms the caches and is not counted.
+    if (b >= warm) {
+      total.push((t1 - t0) / 1000000);
+      readsExec += r1 - r0;
+      readsStage += r2 - r1;
+      readsCommit += io.reads - r2;
+      asked += 2600;
+    }
+  }
+  i64 n = total.len() as i64;
+  i64 sum = 0;
+  for (i32 i = 0; i < total.len(); i++) { sum += total.get(i); }
+  total.sort((i64 x, i64 y) => x < y ? -1 : (x > y ? 1 : 0));
+  flushes.sort((i64 x, i64 y) => x < y ? -1 : (x > y ? 1 : 0));
+  sys.log("read \{readMs} ms, sync \{syncMs} ms, cache \{cacheMb} MB, hot \{hot}‰, flush every \{flush}: " +
+          "block mean \{sum / n} ms, p50 \{at(total, 500)}, p99 \{at(total, 990)}, most \{at(total, 1000)}; flush p50 \{at(flushes, 500)} ms, most \{at(flushes, 1000)}; " +
+          "file reads a block: state \{readsExec / n} (\{readsExec * 1000 / asked}‰ of keys asked), root \{readsStage / n}, commit \{readsCommit / n}");
+  return 0;
+}

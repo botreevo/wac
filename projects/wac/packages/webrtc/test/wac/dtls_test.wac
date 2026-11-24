@@ -1,0 +1,356 @@
+// DTLS 1.2 framing, against OpenSSL.
+//
+// `design/system/0008` step 3, first increment: records, handshake headers, the ClientHello and the
+// cookie exchange. The key schedule and the record protection are `handshake_test.wac`'s — nothing
+// here completes a handshake. What it proves is that a real DTLS server reads what we send and
+// answers it.
+//
+// The server is `openssl s_server`, started by `./openssl.wac`, which is also where the note about
+// its standard input lives.
+//
+// Host-side until 2026-08-18, `issues/system/0161`. `test/wac/dtls_probe.wac` stays: `browser.test.ts`
+// imports it.
+//
+// **Not in the exclusive lane**, which the host-side version was not either. `Held` takes the port
+// from the kernel rather than guessing one, so two of these contend over nothing, and
+// `tools/wac/lanerules_test.wac` caps the lane to stop a sequential suite accumulating inside it.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Datagram, FAULT_OTHER, Clock, Env, Files, Net, Output, Procs, Sys, Datagrams } from "std";
+import { flatten } from "core";
+import { encode as hexEncode } from "../../../codec/src/hex.wac";
+import { alertAt, cookieAt, describeAt, epochAt, handshakeKindAt, hello, hClientHello,
+         hServerHello, hVerifyRequest, kAlert, kHandshake, kindAt, messageSeqAt, seqAt, sizeAt,
+         suiteAt, wholeAt } from "./dtls_probe.wac";
+import { Dtls, startServer, stopServer, waitForBind, wouldReap } from "./openssl.wac";
+import { Peer } from "../../src/peer.wac";
+import { newPeer, peerReceive, peerEstablished } from "./peer_probe.wac";
+import { clientHello as dtlsClientHello, handshake as dtlsHandshake, record as dtlsRecord,
+         versionDtls12, typeHandshake as dtlsTypeHandshake } from "../../src/dtls.wac";
+import { selfSignedP256 } from "../../../tls/src/x509gen.wac";
+
+/** A fixed ClientHello random, so a failing run prints the same bytes as the last one. */
+u8[] random32() {
+  u8[] out = u8[].filled(32, 0);
+  for (i32 i = 0; i < 32; i++) { out[i] = ((i * 7 + 3) & 255) as@ u8; }
+  return out;
+}
+
+string hexOf(u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+/** One datagram out, one back. Empty when nothing came within the deadline. */
+u8[] exchange(Clock clock, Datagrams sock, i32 port, u8[] msg, i32 ms) {
+  sock.sendTo("127.0.0.1", port, msg).wait();
+  return receiveWithin(clock, sock, ms);
+}
+
+/** The next datagram, or empty. The deadline is on the wait — `issues/system/0206`. */
+u8[] receiveWithin(Clock clock, Datagrams sock, i32 ms) {
+  match (flatten(clock.within(sock.receive(), ms).wait())) {
+    Ok(d): { return d.bytes; }
+    Err(e): { return u8[](); }
+  }
+}
+
+/**
+ * A socket and a server, or `ok` false with `t` already told.
+ *
+ * `openssl` takes a moment to bind and there is nothing to poll — UDP refuses nothing — so the
+ * first exchange retries rather than the setup sleeping a guessed amount.
+ */
+struct Bench {
+  bool ok;
+  Dtls server;
+  /** Null when the bench did not come up. */
+  Datagrams? sock;
+}
+
+Bench bench(T t, Output err, Clock clock, Env env, Files fs, Net net, Procs procs, string name) {
+  Dtls s = startServer(t, err, clock, env, fs, net, procs, name);
+  if (!s.ok) {
+    t.fail("the DTLS server did not start — \{s.error}");
+    return Bench(false, s, null);
+  }
+  auto sockBind = flatten(net.bindDatagram("127.0.0.1", 0).wait());
+  Datagrams? sock = sockBind.ok();
+  if (sock is null) {
+    t.fail("our socket did not bind — \{sockBind.isErr() ? "\{sockBind.err()!}" : ""}");
+    stopServer(procs, s);
+    return Bench(false, s, null);
+  }
+  return Bench(true, s, sock!);
+}
+
+void release(Net net, Procs procs, Bench b) {
+  if (b.sock is not null) { b.sock!.close(); }
+  stopServer(procs, b.server);
+}
+
+/**
+ * The first hello, once the server's port is bound.
+ *
+ * **Readiness must not speak DTLS.** `openssl s_server` serves one peer, so a probe that sends its
+ * own ClientHello wins the server and this socket is then ignored — the probe passes and the test it
+ * was protecting fails. So readiness is settled out of band, against the kernel, and the exchange
+ * happens once with a deadline generous enough that a timeout means failure.
+ *
+ * This file is also what found `issues/system/0207`, now fixed: a DTLS flight keeps one source port,
+ * so `b.sock` cannot be replaced per attempt the way `stun_test.wac`'s can, and a retry loop on it
+ * lost the answer to a reader abandoned by the previous deadline.
+ */
+u8[] firstVerify(T t, Clock clock, Files fs, Net net, Procs procs, Bench b, u8[] first) {
+  if (!waitForBind(procs, b.server, 200)) {
+    t.fail("openssl never bound \{b.server.port} — \{b.server.said(fs)}");
+    return u8[]();
+  }
+  return exchange(clock, b.sock!, b.server.port, first, 5000);
+}
+
+export string test_openssl_answers_our_clienthello_with_a_helloverifyrequest(Sys sys) {
+  Output err = sys.stderr();
+  Clock clock = sys.clock();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Net net = sys.net();
+  Procs procs = sys.procs();
+  T t = T.create();
+  Bench b = bench(t, err, clock, env, fs, net, procs, "dtls-cookie");
+  if (!b.ok) { return t.report(); }
+
+  // **The first hello, with no cookie.** A server that allocated state for this would be an
+  // amplifier; DTLS's answer is to send back a cookie and remember nothing.
+  u8[] first = hello(random32(), u8[](), 0, 0);
+  t.eqI32(kindAt(first, 0), kHandshake(), "our first record is a handshake record");
+  t.eqI32(handshakeKindAt(first, 0), hClientHello(), "and a ClientHello");
+  t.eqStr(hexOf(slice(first, 0, 3)), "16fefd", "a handshake record, DTLS 1.2");
+
+  u8[] verify = firstVerify(t, clock, fs, net, procs, b, first);
+  t.isTrue(verify.len() > 0, "the DTLS server did not answer our first ClientHello — " +
+                             b.server.said(fs));
+  if (verify.len() == 0) { release(net, procs, b); return t.report(); }
+
+  t.eqI32(kindAt(verify, 0), kHandshake(),
+          "expected a handshake record, got: \{describeAt(verify, 0)}");
+  t.eqI32(handshakeKindAt(verify, 0), hVerifyRequest(),
+          "a server that has not issued a cookie answers with HelloVerifyRequest, not ServerHello");
+  t.eqI32(epochAt(verify, 0), 0, "still epoch zero — nothing is encrypted yet");
+
+  u8[] cookie = cookieAt(verify, 0);
+  t.isTrue(cookie.len() > 0, "and it carries a cookie");
+
+  // **The second hello: the same random, the same everything, plus the cookie.** A different random
+  // here would be a different client as far as the transcript is concerned.
+  u8[] second = hello(random32(), cookie, 1, 1);
+  t.eqI32(messageSeqAt(second, 0), 1,
+          "message_seq advances — a retransmission would reuse 0 and this is a new message");
+
+  u8[] answer = exchange(clock, b.sock!, b.server.port, second, 5000);
+  t.isTrue(answer.len() > 0, "the DTLS server did not answer our cookied ClientHello");
+  if (answer.len() == 0) { release(net, procs, b); return t.report(); }
+
+  t.eqI32(alertAt(answer, 0), -1,
+          "the server sent an alert rather than a ServerHello. A 2/47 is illegal_parameter, 2/40 a " +
+          "handshake failure — either means it read our ClientHello and disliked something in it");
+  t.eqI32(handshakeKindAt(answer, 0), hServerHello(),
+          "the cookie was accepted and the handshake proceeded");
+  t.eqI32(suiteAt(answer, 0), 0xC02B,
+          "and it chose ECDHE-ECDSA-AES128-GCM-SHA256, the first suite we offered, which is what " +
+          "says our cipher_suites list was read rather than tolerated");
+
+  // **A flight is several records, and they span several datagrams.** Both halves of that matter and
+  // each is a way to read this wrong: a datagram holds more than one record, so a reader that stops
+  // after the first sees a handshake that ends at ServerHello; and the flight is larger than a
+  // datagram, so a reader that expects it all at once never sees ServerHelloDone. OpenSSL sends
+  // ServerHello and Certificate in one and the rest in another here — the split depends on the
+  // certificate's size, which is why this collects until the flight ends rather than asserting a
+  // number of datagrams.
+  bool sawCertificate = false;
+  bool sawKeyExchange = false;
+  bool sawDone = false;
+  string kinds = "";
+  i32 datagrams = 1;
+  u8[] current = answer;
+  for (i32 round = 0; round < 8 && !sawDone; round++) {
+    i32 at = 0;
+    for (i32 guard = 0; guard < 64; guard++) {
+      i32 size = sizeAt(current, at);
+      if (size < 0) { break; }
+      i32 kind = handshakeKindAt(current, at);
+      kinds = kinds + (kinds == "" ? "" : ", ") + "\{kind}";
+      if (kind == 11) { sawCertificate = true; }
+      if (kind == 12) { sawKeyExchange = true; }
+      if (kind == 14) { sawDone = true; }
+      at = at + size;
+    }
+    t.eqI32(at, current.len(),
+            "datagram \{datagrams}: the records did not exactly fill it, \{at}" +
+            " of \{current.len()}");
+    if (sawDone) { break; }
+    current = receiveWithin(clock, b.sock!, 5000);
+    if (current.len() == 0) {
+      t.fail("the flight stopped after \{datagrams} datagram(s) without a " +
+             "ServerHelloDone; handshake types seen: \{kinds}");
+      break;
+    }
+    datagrams = datagrams + 1;
+  }
+  t.isTrue(sawCertificate, "Certificate is in the flight: \{kinds}");
+  t.isTrue(sawKeyExchange, "and a ServerKeyExchange, since the suite is ECDHE: \{kinds}");
+  t.isTrue(sawDone, "and ServerHelloDone ends it: \{kinds}");
+
+  release(net, procs, b);
+  return t.report();
+}
+
+export string test_a_clienthello_with_a_wrong_cookie_is_refused(Sys sys) {
+  Output err = sys.stderr();
+  Clock clock = sys.clock();
+  Env env = sys.env();
+  Files fs = sys.files();
+  Net net = sys.net();
+  Procs procs = sys.procs();
+  // The canary. The test above is satisfied by a server that ignores cookies entirely — which is a
+  // real configuration — and this is what says it does not.
+  T t = T.create();
+  Bench b = bench(t, err, clock, env, fs, net, procs, "dtls-badcookie");
+  if (!b.ok) { return t.report(); }
+
+  u8[] verify = firstVerify(t, clock, fs, net, procs, b, hello(random32(), u8[](), 0, 0));
+  t.isTrue(verify.len() > 0, "no HelloVerifyRequest — \{b.server.said(fs)}");
+  if (verify.len() == 0) { release(net, procs, b); return t.report(); }
+
+  u8[] wrong = cookieAt(verify, 0);
+  t.isTrue(wrong.len() > 0, "the HelloVerifyRequest carried no cookie to corrupt");
+  if (wrong.len() == 0) { release(net, procs, b); return t.report(); }
+  wrong[0] = wrong[0] ^ 0xFF;
+
+  u8[] answer = exchange(clock, b.sock!, b.server.port, hello(random32(), wrong, 1, 1), 3000);
+  // OpenSSL answers a bad cookie with another HelloVerifyRequest rather than an alert — it has no
+  // state to be offended with, which is the point of the mechanism. Either way, what it must not do
+  // is proceed.
+  t.isFalse(answer.len() > 0 && handshakeKindAt(answer, 0) == hServerHello(),
+            "a cookie with one byte changed took the handshake forward, so the server is not " +
+            "checking cookies and the test above proves less than it says");
+
+  release(net, procs, b);
+  return t.report();
+}
+
+export string test_the_framing_round_trips_and_says_when_a_record_is_not_whole() {
+  T t = T.create();
+  u8[] three = u8[].filled(3, 0);
+  three[0] = 1; three[1] = 2; three[2] = 3;
+  u8[] h = hello(random32(), three, 5, 0x0102030405);
+  t.eqI32(kindAt(h, 0), 22, "a handshake record");
+  t.eqI32(epochAt(h, 0), 0, "epoch zero");
+  t.eqStr("\{seqAt(h, 0)}", "\{0x0102030405 as i64}",
+          "forty-eight bits of sequence number, which is why it is an i64 and not an i32");
+  t.eqI32(messageSeqAt(h, 0), 5, "the message sequence");
+  t.isTrue(wholeAt(h, 0), "the record is whole");
+  t.eqI32(sizeAt(h, 0), h.len(), "one record fills the datagram");
+
+  // A record whose length claims more than arrived is not a record.
+  t.eqI32(sizeAt(slice(h, 0, h.len() - 1), 0), -1, "a truncated record is refused rather than read");
+  t.eqI32(sizeAt(h, h.len()), -1, "and there is nothing after the last one");
+  t.eqI32(sizeAt(h, -1), -1, "nor before the first");
+  return t.report();
+}
+
+export string test_the_abandoned_server_pattern_discriminates(Sys sys) {
+  Procs procs = sys.procs();
+  // **A reaper that matches nothing is indistinguishable from a clean machine, and one that matches
+  // too much kills somebody else's server.** `packages/tls` runs its own `s_server` for TLS 1.3;
+  // that one is spawned correctly and is not this module's to kill, so the pattern needs both
+  // `s_server` *and* `-dtls1_2`.
+  T t = T.create();
+  t.isTrue(wouldReap(procs, "openssl s_server -dtls1_2 -quiet -accept 127.0.0.1:20001 -cert x.pem -key x.key"),
+    "the pattern does not match one of ours");
+  string[] others = [
+    "openssl s_server -tls1_3 -accept 127.0.0.1:4433 -cert x.pem -key x.key",
+    "openssl s_client -dtls1_2 -connect 127.0.0.1:20001",
+    "/usr/sbin/sshd -D"
+  ];
+  for (i32 i = 0; i < others.len(); i++) {
+    t.isFalse(wouldReap(procs, others[i]), "the pattern matches something it must not: \{others[i]}");
+  }
+  return t.report();
+}
+
+u8[] slice(u8[] b, i32 at, i32 end) {
+  u8[] out = u8[].filled(end - at, 0);
+  out.copyFrom(b, at, 0, end - at);
+  return out;
+}
+
+// ── A ClientKeyExchange whose length byte the peer chose ─────────────────────
+
+/** Deterministic filler, so a failure reproduces. */
+u8[] ramp2(i32 n, i32 mul, i32 add) {
+  u8[] out = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { out[i] = ((i * mul + add) & 255) as@ u8; }
+  return out;
+}
+
+/** A peer holding a generated identity and a known cookie, so a hello can carry it directly. */
+Peer freshPeer() {
+  u8[] priv = ramp2(32, 3, 7);
+  u8[] cert = selfSignedP256("wac", 1 as i64, 1000 as i64, 2000000000 as i64, priv, ramp2(32, 19, 23));
+  return newPeer(cert, priv, ramp2(32, 17, 29), ramp2(32, 13, 2), ramp2(32, 5, 11), ramp2(8, 1, 2));
+}
+
+/** One handshake message in one DTLS record. */
+u8[] inDtlsRecord(i32 kind, i32 seq, u8[] body) {
+  return dtlsRecord(dtlsTypeHandshake(), versionDtls12(), 0, seq as i64, dtlsHandshake(kind, seq, body));
+}
+
+/**
+ * **A ClientKeyExchange whose public key is not thirty-two bytes ended the process.**
+ *
+ * `peer.wac` reads it with `clientPublic(body)`, which hands on whatever length the peer's leading
+ * byte names — and returns *empty* when that length overruns the message — and passes the result
+ * straight to `x25519`, which traps on anything but thirty-two bytes.
+ *
+ * This is the plaintext phase: `kind == 16 && !this.keysReady`, before any key exists. A cookie
+ * exchange is one free round trip, so the cost to an attacker is two datagrams and nothing else.
+ *
+ * **The same seam as `packages/tor`'s `decodeCreated2` feeding `ntorClientFinish`**, found by looking
+ * for it rather than by tripping over it: a parser that correctly returns a short value, handed to a
+ * primitive that requires an exact width. The parser's own refusal path — returning empty — is the
+ * one that aborts hardest, because empty is never thirty-two.
+ *
+ * Driven in-process. `dtlsserver_test.wac` drives this peer with a real OpenSSL `s_client` over a
+ * real socket, which is thorough and is exactly why the malformed case had no input: OpenSSL sends a
+ * well-formed key.
+ */
+export string test_a_clientkeyexchange_of_the_wrong_width_is_refused() {
+  T t = T.create();
+
+  // The control: a hello carrying the peer's own cookie is answered with a flight.
+  Peer peer = freshPeer();
+  u8[][] flight = peerReceive(peer, inDtlsRecord(1, 0, dtlsClientHello(ramp2(32, 7, 3), ramp2(8, 1, 2))));
+  t.isTrue(flight.len() > 0, "the peer did not answer a ClientHello carrying its own cookie");
+
+  // Every width a peer could name for its public key, including the two the wire makes easiest.
+  i32[] widths = [0, 1, 31, 33, 64, 255];
+  for (i32 i = 0; i < widths.len(); i++) {
+    Peer p = freshPeer();
+    peerReceive(p, inDtlsRecord(1, 0, dtlsClientHello(ramp2(32, 7, 3), ramp2(8, 1, 2))));
+    u8[] body = u8[].filled(1 + widths[i], 0);
+    body[0] = widths[i] as@ u8;
+    for (i32 k = 0; k < widths[i]; k++) { body[1 + k] = (0xB0 + (k & 15)) as@ u8; }
+    // Reaching the next line is the assertion: a trap kills the test.
+    peerReceive(p, inDtlsRecord(16, 1, body));
+    t.isFalse(peerEstablished(p),
+              "a ClientKeyExchange of \{widths[i]} bytes established a connection");
+  }
+
+  // A length that overruns the message, which `clientPublic` refuses by returning empty — and empty
+  // is not thirty-two either, so this was the refusal path that aborted.
+  Peer over = freshPeer();
+  peerReceive(over, inDtlsRecord(1, 0, dtlsClientHello(ramp2(32, 7, 3), ramp2(8, 1, 2))));
+  u8[] lying = u8[].filled(5, 0);
+  lying[0] = 200;
+  peerReceive(over, inDtlsRecord(16, 1, lying));
+  t.isFalse(peerEstablished(over), "a ClientKeyExchange claiming 200 bytes in five established");
+  return t.report();
+}

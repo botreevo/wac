@@ -1,0 +1,144 @@
+// wacuum following a chain it did not build, as on Hoodi: geth builds every block, driven by a Prysm beacon node with
+// all the validators; wacuum on a store follows under a beacon node of its own, which hears the blocks by gossip and
+// gives them to it (newPayload, forkchoiceUpdated), with geth as its devp2p peer for anything it lacks. Checked: it
+// has geth's blocks; killed and started again it catches up; the finalized block is the same in both. Then, once the
+// chain has finalized, a second wacuum starts with nothing, under a third beacon node that checkpoint-syncs from the
+// first: told of a head it has not got, it snap-syncs the state from geth and goes on following, its blocks and an
+// account's balance geth's.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/clfollow.wac -- GETH PRYSM_BIN_DIR
+
+import { Sys } from "std";
+import { json.JsonValue } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { Check, Proc, Rpc, shell, tempDir, removeDir, somePort, addressOf, field, quantity } from "./kit.wac";
+import { prepare, gethNode, beaconNode, validatorNode, wacuumNode, peerAddress, beacon, hashAt, growTo, decimal, blobBlock } from "./clkit.wac";
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 2) {
+    sys.warn("usage: clfollow.wac GETH PRYSM_BIN_DIR");
+    return 2;
+  }
+  string geth = args[0];
+  string bin = args[1];
+  Check t = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-clf");
+  string app = dir + "/wacuum-bin";
+  await shell(sys, "wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o \{app} > /dev/null 2>&1");
+  u8[] key = u8[].filled(32, 0x11);
+  string me = addressOf(key);
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+  string ready = await prepare(sys, dir, bin, me, 45);
+  t.that(ready == "", "prysmctl makes the genesis, and the validator imports the interop keys \{ready}");
+
+  // geth builds, under beacon A and the validators.
+  i32 gethBase = await somePort(sys, 22551, 400);
+  Proc g = await gethNode(sys, geth, dir, gethBase);
+  Rpc gr = Rpc.at(sys, gethBase + 2);
+  string enode = field(await gr.get("admin_nodeInfo", "[]"), "enode");
+  t.that(enode != "", "geth is up: \{enode}");
+  i32 aBase = await somePort(sys, 23551, 400);
+  Proc a = await beaconNode(sys, bin, dir, "beacon-a", aBase, gethBase + 1, []);
+  string peer = await peerAddress(sys, a);
+  t.that(peer != "", "beacon A is up: \{peer}");
+  Proc v = await validatorNode(sys, bin, dir, aBase, aBase + 7);
+
+  // wacuum follows, under beacon B.
+  i32 fPort = await somePort(sys, 21551, 400);
+  i32 fP2p = await somePort(sys, 26551, 400);
+  string[] fArgs = ["--p2p-port", "\{fP2p}", "--peer", enode];
+  Proc f = await wacuumNode(sys, app, dir, "follower", fPort, fArgs);
+  Rpc fr = Rpc.at(sys, fPort);
+  i32 bBase = await somePort(sys, 24551, 400);
+  Proc b = await beaconNode(sys, bin, dir, "beacon-b", bBase, fPort, ["--peer", peer]);
+
+  u64[] nonce = [0];
+  bool grew = await growTo(sys, fr, gr, 20, 300000, key, nonce);
+  t.that(grew, "wacuum follows geth's chain to block 20: at \{quantity(await fr.text("eth_blockNumber", "[]"))}");
+  u64 txs = quantity(await gr.text("eth_getTransactionCount", "[\"\{me}\",\"latest\"]"));
+  t.that(txs > 0, "blocks with transfers in them, built by geth: \{txs}");
+  t.that((await hashAt(fr, 20)) == (await hashAt(gr, 20)) && (await hashAt(fr, 20)) != "", "the same block 20 as geth: \{await hashAt(fr, 20)}");
+
+  // Killed and started again, it catches up: from its beacon node, and from geth for what it missed.
+  u64 at = quantity(await fr.text("eth_blockNumber", "[]"));
+  await shell(sys, "kill -9 \{f.pid}; while kill -0 \{f.pid} 2>/dev/null; do sleep 0.05; done");
+  await growTo(sys, gr, gr, at + 6, 60000, key, nonce);
+  f = await wacuumNode(sys, app, dir, "follower", fPort, fArgs);
+  u64 target = quantity(await gr.text("eth_blockNumber", "[]")) + 2;
+  bool caught = await growTo(sys, fr, gr, target, 180000, key, nonce);
+  t.that(caught, "killed at block \{at}, down while geth went on, started again: caught up to \{quantity(await fr.text("eth_blockNumber", "[]"))}");
+  u64 fh = quantity(await fr.text("eth_blockNumber", "[]"));
+  t.that((await hashAt(fr, fh - 1)) == (await hashAt(gr, fh - 1)), "the same chain as geth: block \{fh - 1}");
+
+  // Blobs: blob transactions sent to geth go into a block it builds; wacuum, given it by its beacon node with the
+  // blobs' versioned hashes, takes it.
+  u64 bb = await blobBlock(sys, gr, fr, 90000);
+  t.that(bb > 0, "a block geth builds with blobs reaches wacuum: block \{bb}");
+  JsonValue? fb = await fr.get("eth_getBlockByNumber", "[\"\{U256.ofU64(bb).toHex()}\",false]");
+  JsonValue? gbk = await gr.get("eth_getBlockByNumber", "[\"\{U256.ofU64(bb).toHex()}\",false]");
+  t.that(field(fb, "hash") == field(gbk, "hash") && field(fb, "blobGasUsed") == field(gbk, "blobGasUsed") && field(fb, "excessBlobGas") == field(gbk, "excessBlobGas"),
+         "the same block, blob gas and excess blob gas: \{field(fb, "blobGasUsed")} \{field(fb, "hash")}");
+
+  // Finality, the same finalized block.
+  u64 fin = 0;
+  for (i32 i = 0; i < 240 && fin < 2; i++) {
+    JsonValue? cp = await beacon(sys, aBase + 1, "/eth/v1/beacon/states/head/finality_checkpoints");
+    fin = decimal(cp?.member("data")?.member("finalized")?.member("epoch")?.text() ?? "0");
+    if (fin < 2) { await growTo(sys, gr, gr, 0, 2000, key, nonce); await sys.sleepMillis(2000); }
+  }
+  t.that(fin >= 2, "the chain finalizes: epoch \{fin}");
+  await sys.sleepMillis(4000);
+  string ff = field(await fr.get("eth_getBlockByNumber", "[\"finalized\",false]"), "hash");
+  string gf = field(await gr.get("eth_getBlockByNumber", "[\"finalized\",false]"), "hash");
+  t.that(ff != "" && ff == gf, "the same finalized block in wacuum and geth: \{ff} \{gf}");
+
+  // A second wacuum, empty, under beacon C checkpoint-synced from A: snap sync from geth, then following.
+  i32 sPort = await somePort(sys, 27551, 400);
+  i32 sP2p = await somePort(sys, 28551, 400);
+  Proc s = await wacuumNode(sys, app, dir, "snapper", sPort, ["--p2p-port", "\{sP2p}", "--peer", enode, "--snap"]);
+  Rpc sr = Rpc.at(sys, sPort);
+  i32 cBase = await somePort(sys, 25551, 400);
+  string aUrl = "http://127.0.0.1:\{aBase + 1}";
+  Proc c = await beaconNode(sys, bin, dir, "beacon-c", cBase, sPort, ["--peer", peer, "--checkpoint-sync-url", aUrl, "--genesis-beacon-api-url", aUrl]);
+  u64 startedAt = quantity(await gr.text("eth_blockNumber", "[]"));
+  bool synced = false;
+  for (i32 i = 0; i < 300 && !synced; i++) {
+    synced = (await s.output(sys)).indexOf("snap sync done") >= 0 && quantity(await sr.text("eth_blockNumber", "[]")) + 2 >= quantity(await gr.text("eth_blockNumber", "[]"));
+    if (!synced) { await growTo(sys, gr, gr, 0, 2000, key, nonce); await sys.sleepMillis(1000); }
+  }
+  t.that(synced, "started empty at block \{startedAt}, wacuum snap-syncs under beacon C and reaches the head: at \{quantity(await sr.text("eth_blockNumber", "[]"))}");
+  u64 sh = quantity(await sr.text("eth_blockNumber", "[]"));
+  bool follows = await growTo(sys, sr, gr, sh + 5, 120000, key, nonce);
+  u64 sh2 = quantity(await sr.text("eth_blockNumber", "[]"));
+  t.that(follows, "and goes on following: \{sh} to \{sh2}");
+  t.that((await hashAt(sr, sh2 - 1)) == (await hashAt(gr, sh2 - 1)), "its block \{sh2 - 1} geth's");
+  // A balance at its head: on the store it holds the head's state, not every block's, so asked again if the head
+  // moved between the two questions.
+  string sb = "";
+  string gb = "";
+  u64 at2 = 0;
+  for (i32 i = 0; i < 10 && (sb == "" || sb != gb); i++) {
+    at2 = quantity(await sr.text("eth_blockNumber", "[]"));
+    string n = U256.ofU64(at2).toHex();
+    sb = await sr.text("eth_getBalance", "[\"\{me}\",\"\{n}\"]");
+    gb = await gr.text("eth_getBalance", "[\"\{me}\",\"\{n}\"]");
+  }
+  t.that(sb != "" && sb == gb, "and the sender's balance at its head, block \{at2}, geth's: \{sb}");
+  JsonValue? hdr = await beacon(sys, aBase + 1, "/eth/v1/beacon/headers/head");
+  u64 slot = decimal(hdr?.member("data")?.member("header")?.member("message")?.member("slot")?.text() ?? "0");
+  sys.log("  \{quantity(await gr.text("eth_blockNumber", "[]"))} blocks in \{slot} slots; \{nonce[0]} transfers sent");
+
+  await c.stop(sys);
+  await s.stop(sys);
+  await b.stop(sys);
+  await f.stop(sys);
+  await v.stop(sys);
+  await a.stop(sys);
+  await g.stop(sys);
+  // Kept when something failed: the nodes' logs and data are what says why.
+  if (t.failed == 0) { await removeDir(sys, dir); } else { sys.log("  kept: \{dir}"); }
+  return t.done();
+}

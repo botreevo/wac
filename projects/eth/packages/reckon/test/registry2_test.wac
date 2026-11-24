@@ -1,0 +1,165 @@
+// The registry v2's slots (src/registry2.wac) against contracts/Registry.sol: every slot here came from solc's storage
+// layout and ethers (tools/registry2/vectors.mjs), not from the code under test. Then the reader's rule for a name at a
+// time, and the answers turned into the Chain that admit takes.
+
+import { json.parse, json.JsonValue, codec.hexEncode, codec.hexDecoded } from "wac";
+import { ipfs.Cid, ipfs.RAW, ipfs.DAG_CBOR, ipfs.parseCid } from "@/lib.wac";
+import { REVOKED_AT, REJECTIONS, NAMES, REJECTION_FIELDS, NAME_FIELDS, cidKey, revokedSlot, rejectionSlot, nameSlot, plus,
+         nameAt, NameAt, Asks, slotsFor, chainOf } from "../src/registry2.wac";
+import { Chain } from "../src/admit.wac";
+import { REGISTRY2 } from "./registry2_vectors.wac";
+import { Check } from "./check.wac";
+
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+JsonValue V() { return parse(REGISTRY2.toBytes()).ok()!; }
+string str(JsonValue v, string k) { return v.member(k)?.text() ?? ""; }
+u8[] bytes0x(string s) { return hexDecoded(s.slice(2, s.len())); }
+string no0x(string s) { return s.slice(2, s.len()); }
+i64 num(JsonValue v, string k) { return (v.member(k)?.number() ?? (-1.0 as f64)) as~ i64; }
+
+export string test_the_layout_is_the_one_this_file_assumes() {
+  Check c = Check.create();
+  JsonValue slots = V().member("slots")!;
+  c.ok(num(slots, "revokedAt") == REVOKED_AT(), "revokedAt is slot \{num(slots, "revokedAt")}");
+  c.ok(num(slots, "rejections") == REJECTIONS(), "rejections is slot \{num(slots, "rejections")}");
+  c.ok(num(slots, "names") == NAMES(), "names is slot \{num(slots, "names")}");
+  string[] r = REJECTION_FIELDS();
+  for (i32 i = 0; i < r.len(); i++) { c.ok(num(V().member("rejection")!, r[i]) == (i as i64), "rejection.\{r[i]} at +\{i}"); }
+  string[] n = NAME_FIELDS();
+  for (i32 i = 0; i < n.len(); i++) { c.ok(num(V().member("name")!, n[i]) == (i as i64), "name.\{n[i]} at +\{i}"); }
+  c.ok(V().member("name")!.object()!.len() == n.len(), "a name has \{n.len()} words, no more");
+  return c.report();
+}
+
+export string test_a_cid_is_keyed_by_the_keccak_of_its_binary_form() {
+  Check c = Check.create();
+  JsonValue cids = V().member("cids")!;
+  for (i32 i = 0; i < cids.array()!.len(); i++) {
+    JsonValue v = cids.array()!.get(i);
+    Cid cid = parseCid(str(v, "text")).ok()!;
+    c.eq(hex(cid.bytes()), no0x(str(v, "bytes")), "\{str(v, "text")}'s bytes");
+    c.ok(cid.bytes().len() == 36, "36 bytes, as the contract requires");
+    c.eq(hex(cidKey(cid)), no0x(str(v, "key")), "\{str(v, "text")}'s key");
+  }
+  return c.report();
+}
+
+export string test_revocation_slots_are_solidities() {
+  Check c = Check.create();
+  JsonValue vs = V().member("revoked")!;
+  c.ok(vs.array()!.len() == 9, "nine vectors");
+  for (i32 i = 0; i < vs.array()!.len(); i++) {
+    JsonValue v = vs.array()!.get(i);
+    c.eq(hex(revokedSlot(bytes0x(str(v, "signer")), parseCid(str(v, "cid")).ok()!)), no0x(str(v, "slot")), "revokedAt[\{str(v, "signer")}][\{str(v, "cid")}]");
+  }
+  return c.report();
+}
+
+export string test_rejection_slots_are_solidities() {
+  Check c = Check.create();
+  JsonValue vs = V().member("rejected")!;
+  for (i32 i = 0; i < vs.array()!.len(); i++) {
+    JsonValue v = vs.array()!.get(i);
+    u8[] base = rejectionSlot(bytes0x(str(v, "list")), parseCid(str(v, "cid")).ok()!);
+    c.eq(hex(base), no0x(str(v, "since")), "rejections[\{str(v, "list")}][\{str(v, "cid")}].since");
+    c.eq(hex(plus(base, 1)), no0x(str(v, "reason")), "….reason");
+  }
+  return c.report();
+}
+
+export string test_name_slots_are_solidities() {
+  Check c = Check.create();
+  JsonValue vs = V().member("names")!;
+  string[] fields = NAME_FIELDS();
+  for (i32 i = 0; i < vs.array()!.len(); i++) {
+    JsonValue v = vs.array()!.get(i);
+    u8[] base = nameSlot(bytes0x(str(v, "publisher")), str(v, "name"));
+    for (i32 f = 0; f < fields.len(); f++) {
+      c.eq(hex(plus(base, f)), no0x(str(v.member("slots")!, fields[f])), "names[\{str(v, "publisher")}][\"\{str(v, "name")}\"].\{fields[f]}");
+    }
+  }
+  return c.report();
+}
+
+export string test_adding_to_a_slot_carries_across_bytes() {
+  Check c = Check.create();
+  u8[] s = u8[].filled(32, 0);
+  s[31] = 0xff as u8; s[30] = 0xff as u8;
+  u8[] t = plus(s, 2);
+  c.eq(hex(t).slice(58, 64), "010001", "0xffff + 2");
+  u8[] top = u8[].filled(32, 0xff as u8);
+  c.eq(hex(plus(top, 1)), hex(u8[].filled(32, 0)), "wraps at 2^256, as Solidity's slot arithmetic does");
+  return c.report();
+}
+
+// ---------------------------------------------------------------- a name at a time
+
+u8[] w(i64 n) {
+  u8[] out = u8[].filled(32, 0);
+  for (i32 i = 0; i < 8; i++) { out[31 - i] = ((n >> ((i * 8) as i64)) & 255) as@ u8; }
+  return out;
+}
+u8[] d(i32 b) { return u8[].filled(32, b as! u8); }
+Cid A() { return Cid(RAW(), d(0xaa)); }
+Cid B() { return Cid(DAG_CBOR(), d(0xbb)); }
+string t(Cid? c) { return c is null ? "none" : c!.text(); }
+
+/** current A (raw), delay 20; optionally B (dag-cbor) proposed for 100, and a delay of 5 proposed for 150. */
+u8[][] words(bool proposed, bool delay) {
+  return [w(0x55 as i64), d(0xaa), proposed ? w(0x71 as i64) : w(0 as i64), proposed ? d(0xbb) : w(0 as i64),
+          w(proposed ? (100 as i64) : (0 as i64)), w(20 as i64), w(delay ? (5 as i64) : (0 as i64)), w(delay ? (150 as i64) : (0 as i64))];
+}
+
+export string test_a_name_is_its_current_cid_until_the_proposal_is_due() {
+  Check c = Check.create();
+  NameAt settled = nameAt(words(false, false), 1000 as i64);
+  c.eq(t(settled.cid), A().text(), "nothing proposed: the current CID");
+  c.ok(settled.pending is null && settled.delay == (20 as i64) && settled.pendingDelay == (-1 as i64), "and nothing pending");
+  NameAt before = nameAt(words(true, false), 99 as i64);
+  c.eq(t(before.cid), A().text(), "a second before the proposal is due: still the current CID");
+  c.eq(t(before.pending), B().text(), "with the proposal visible");
+  c.ok(before.effectiveAt == (100 as i64), "and when it is due");
+  NameAt after = nameAt(words(true, false), 100 as i64);
+  c.eq(t(after.cid), B().text(), "from the moment it is due: the proposed CID, before any write settles it");
+  c.ok(after.pending is null, "and nothing pending any more");
+  return c.report();
+}
+
+export string test_a_delay_change_waits_like_any_other() {
+  Check c = Check.create();
+  NameAt before = nameAt(words(true, true), 149 as i64);
+  c.ok(before.delay == (20 as i64), "the old delay holds until its change is due: \{before.delay}");
+  c.ok(before.pendingDelay == (5 as i64) && before.delayAt == (150 as i64), "the new one is visible, and when");
+  NameAt after = nameAt(words(true, true), 150 as i64);
+  c.ok(after.delay == (5 as i64) && after.pendingDelay == (-1 as i64), "then it is the delay: \{after.delay}");
+  return c.report();
+}
+
+export string test_an_unclaimed_name_is_none_and_a_bad_codec_is_not_a_cid() {
+  Check c = Check.create();
+  u8[][] empty = u8[][].filled(8, w(0 as i64));
+  c.ok(nameAt(empty, 5 as i64).cid is null, "eight empty words: no name");
+  u8[][] odd = words(false, false);
+  odd[0] = w(0x99 as i64);
+  c.ok(nameAt(odd, 5 as i64).cid is null, "a codec the contract would have refused is not read as a CID");
+  return c.report();
+}
+
+// ---------------------------------------------------------------- answers into a Chain
+
+u8[] addr(i32 b) { return u8[].filled(20, b as! u8); }
+
+export string test_the_chain_holds_what_is_set_and_nothing_else() {
+  Check c = Check.create();
+  Asks a = Asks([addr(1), addr(2)], [A(), B()], [addr(9), addr(9)], [A(), B()]);
+  u8[][] slots = slotsFor(a);
+  c.ok(slots.len() == 4, "a slot per question");
+  c.eq(hex(slots[0]), hex(revokedSlot(addr(1), A())), "revocations first");
+  c.eq(hex(slots[3]), hex(rejectionSlot(addr(9), B())), "then each rejection's since");
+  Chain ch = chainOf(a, [w(0 as i64), w(1234 as i64), w(77 as i64), w(0 as i64)]);
+  c.ok(ch.revokedId.len() == 1 && ch.revokedId[0].eq(B()) && hex(ch.revokedBy[0]) == hex(addr(2)), "one revocation: 2's of B");
+  c.ok(ch.rejected.len() == 1 && ch.rejected[0].eq(A()) && hex(ch.rejectedBy[0]) == hex(addr(9)), "one rejection: 9's of A");
+  Chain none = chainOf(a, u8[][].filled(4, w(0 as i64)));
+  c.ok(none.revokedId.len() == 0 && none.rejected.len() == 0, "all absent: an empty chain");
+  return c.report();
+}

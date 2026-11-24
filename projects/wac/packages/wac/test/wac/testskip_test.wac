@@ -1,0 +1,69 @@
+// A test that cannot ask its question here says so, and is counted as that — spec ch47 `§wac-test-skip-k4r8w2m`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/wac/test/wac/testskip_test.wac
+//
+// Every cloud gate carried ~36 failures that were about the machine, not the code — aioice and coturn not installed,
+// a container running as root where a test needs a refusal — and a reader had to diff them by name to find a real one.
+// The other way out, returning early with `""`, was a pass that had asked nothing. A test answering `skip: <why>` is
+// neither: the runner prints `skip <name> — <why>`, counts it apart (`, 1 skipped`) and exits 0 for it. Run through
+// the binary, as a person runs it, over a fixture file with one test of each kind.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { binaryPath, freshDir, putFile, scratch } from "../../../wactest/src/host.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { Exec, ChildEnv, Launch, Sys } from "std";
+import { flatten } from "core";
+
+static string FIXTURE = "export string test_passes() { return \"\"; }\n" +
+                        "export string test_needs_a_tool() { return \"skip: frobnicate is not on this machine\"; }\n";
+
+static string FAILS = "export string test_needs_a_tool() { return \"skip: frobnicate is not on this machine\"; }\n" +
+                      "export string test_wrong() { return \"two is not three\"; }\n";
+
+Exec wacTest(Sys sys, string file) { return wacTestWith(sys, ["test", file]); }
+
+Exec wacTestWith(Sys sys, string[] args) {
+  return flatten(sys.procs().exec(binaryPath(sys.env()), args, u8[](), ChildEnv.inherited(),
+                                  Launch.plain()).wait()).unwrap();
+}
+
+export string test_a_skip_is_said_counted_apart_and_does_not_fail_the_run(Sys sys) {
+  T t = T.create();
+  string dir = scratch(sys.env(), "testskip");
+  t.eqStr(freshDir(sys.files(), dir), "", "a scratch directory");
+  t.eqStr(putFile(sys.files(), "\{dir}/skips_test.wac", FIXTURE), "", "the fixture");
+  Exec r = wacTest(sys, "\{dir}/skips_test.wac");
+  string out = string.fromBytes(r.stdout);
+  t.eqI32(r.status, 0, "a skip does not fail the run: \{out}\{string.fromBytes(r.stderr)}");
+  t.isTrue(contains(out, "skip test_needs_a_tool — frobnicate is not on this machine"), "said, with why: \{out}");
+  t.isTrue(contains(out, "1 passed, 0 failed, 1 skipped"), "counted apart: \{out}");
+  t.isFalse(contains(out, "FAIL"), "not a failure: \{out}");
+  // And a failure beside a skip still fails the run: a skip excuses what was not asked, not what went wrong.
+  t.eqStr(putFile(sys.files(), "\{dir}/fails_test.wac", FAILS), "", "the second fixture");
+  Exec f = wacTest(sys, "\{dir}/fails_test.wac");
+  string fout = string.fromBytes(f.stdout);
+  t.isTrue(f.status != 0, "a failure beside a skip still fails: \{fout}");
+  t.isTrue(contains(fout, "0 passed, 1 failed, 1 skipped"), "both counted: \{fout}");
+  // A filter that matched only a skip matched something: it is not *no test matches*.
+  Exec only = wacTestWith(sys, ["test", "--filter", "needs_a_tool", "\{dir}/skips_test.wac"]);
+  string oout = string.fromBytes(only.stdout);
+  t.eqI32(only.status, 0, "a filtered skip: \{oout}");
+  t.isFalse(contains(oout, "no test matches"), "a matched skip is a match: \{oout}");
+  t.isTrue(contains(oout, "0 passed, 0 failed, 1 skipped"), "and is counted: \{oout}");
+  sys.files().remove(dir, true).wait();
+  return t.report();
+}
+
+/** `T.skip` is how a test says it: its report is `skip: <why>` — unless it also failed, when the failure is the report. */
+export string test_t_skip_reports_a_skip_and_a_failure_beside_it_wins() {
+  T t = T.create();
+  T skipping = T.create();
+  skipping.skip("no frobnicate");
+  skipping.skip("a second reason, not kept");
+  t.eqStr(skipping.report(), "skip: no frobnicate", "the first reason, as a skip");
+  T both = T.create();
+  both.skip("no frobnicate");
+  both.isTrue(false, "a real failure");
+  t.isTrue(both.report().len() > 0 && both.report().indexOf("skip: ") != 0, "a failure is reported as one: \{both.report()}");
+  return t.report();
+}

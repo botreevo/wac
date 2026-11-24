@@ -1,0 +1,220 @@
+// Node discovery, version 4: the UDP protocol by which devp2p nodes find each other.
+//
+// A packet is hash ‖ signature ‖ type ‖ RLP: the signature is the sender's node key over keccak256(type ‖
+// RLP), which is how a node learns who sent it, and the hash is keccak256 of everything after it, which a
+// Pong quotes to say which Ping it answers. The four that matter are Ping and Pong, which prove that an
+// endpoint is really where a key says it is, and FindNode and Neighbors, which ask a node for the nodes it
+// knows nearest some target. A node answers FindNode only from a node it has exchanged Ping and Pong with
+// recently, so that it cannot be made to flood a forged address.
+//
+// EIP-8 says to accept packets with more list elements and trailing data than these, which the decoding
+// here does; it is checked against EIP-8's vectors.
+
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "@/lib.wac";
+import { keccak256 } from "../crypto/keccak.wac";
+import { Vec } from "core";
+import { U256 } from "../u256.wac";
+import { publicKey, sign, recover, concat } from "./secp.wac";
+import { small, numOf } from "./wire.wac";
+
+export static i32 PING = 1;
+export static i32 PONG = 2;
+export static i32 FIND_NODE = 3;
+export static i32 NEIGHBORS = 4;
+export static i32 ENR_REQUEST = 5;
+export static i32 ENR_RESPONSE = 6;
+
+/** An address a node can be reached at: IPv4 or IPv6 bytes, and its UDP and TCP ports. */
+export struct Endpoint {
+  u8[] ip;
+  i32 udp;
+  i32 tcp;
+}
+
+/** A node another node told of: its key and where it is. */
+export struct NodeRecord {
+  u8[] id;
+  Endpoint at;
+}
+
+/** A packet that opened: who sent it, what kind it is, its fields, and its hash. */
+export struct Packet {
+  u8[] sender;
+  i32 kind;
+  Item[] fields;
+  u8[] hash;
+}
+
+Item endpointItem(Endpoint e) {
+  return Item.List([Item.Bytes(e.ip), small(((e.udp as@ u32) as u64)), small(((e.tcp as@ u32) as u64))]);
+}
+
+export Endpoint? endpointOf(Item it) {
+  if (!isList(it) || itemsOf(it).len() < 3) { return null; }
+  Item[] f = itemsOf(it);
+  u8[] ip = bytesOf(f[0]);
+  if (ip.len() != 4 && ip.len() != 16) { return null; }
+  return Endpoint(ip, numOf(f[1]).low() as! i32, numOf(f[2]).low() as! i32);
+}
+
+/** The dotted text of an IPv4 address, for connecting; IPv6 is not dialled yet. */
+export string ipText(u8[] ip) {
+  if (ip.len() != 4) { return ""; }
+  return "\{ip[0] as i32}.\{ip[1] as i32}.\{ip[2] as i32}.\{ip[3] as i32}";
+}
+
+export u8[]? ipBytes(string text) {
+  u8[] out = u8[].filled(4, 0);
+  i32 part = 0;
+  i32 v = 0;
+  u8[] t = text.toBytes();
+  for (i32 i = 0; i <= t.len(); i++) {
+    if (i == t.len() || t[i] == 46) {
+      if (part > 3 || v > 255) { return null; }
+      out[part] = v as! u8;
+      part++;
+      v = 0;
+    } else {
+      if (t[i] < 48 || t[i] > 57) { return null; }
+      v = v * 10 + ((t[i] - 48) as i32);
+    }
+  }
+  return part == 4 ? out : null;
+}
+
+/** A signed packet of `kind` with `fields`, from `nodeKey`. */
+export u8[] seal(u8[] nodeKey, i32 kind, Item[] fields) {
+  u8[] body = concat([[kind as@ u8], encode(Item.List(fields))]);
+  u8[] sig = sign(keccak256(body), nodeKey);
+  u8[] signed = concat([sig, body]);
+  return concat([keccak256(signed), signed]);
+}
+
+/** A packet's sender, kind and fields, or null if its hash or signature does not check. */
+export Packet? open(u8[] packet) {
+  if (packet.len() < 32 + 65 + 2) { return null; }
+  u8[] hash = slice(packet, 0, 32);
+  u8[] rest = slice(packet, 32, packet.len());
+  u8[] want = keccak256(rest);
+  for (i32 i = 0; i < 32; i++) {
+    if (want[i] != hash[i]) { return null; }
+  }
+  u8[] sig = slice(packet, 32, 97);
+  u8[] body = slice(packet, 97, packet.len());
+  u8[]? sender = recover(keccak256(body), sig);
+  if (sender is null) { return null; }
+  Decoded d = decodePrefix(slice(body, 1, body.len()));
+  if (!d.ok || !isList(d.item)) { return null; }
+  return Packet(sender!, body[0] as i32, itemsOf(d.item), hash);
+}
+
+/** The RLP list at the front of `b`, ignoring whatever follows it, as EIP-8 asks. */
+Decoded decodePrefix(u8[] b) {
+  if (b.len() == 0) { return decode(b); }
+  i32 p = b[0] as i32;
+  i32 n = 0;
+  if (p >= 0xf8) {
+    i32 ll = p - 0xf7;
+    if (b.len() < 1 + ll) { return decode(u8[].filled(0, 0)); }
+    for (i32 i = 0; i < ll; i++) { n = n * 256 + (b[1 + i] as i32); }
+    n = n + 1 + ll;
+  } else if (p >= 0xc0) {
+    n = 1 + p - 0xc0;
+  } else {
+    return decode(u8[].filled(0, 0));
+  }
+  if (n > b.len()) { return decode(u8[].filled(0, 0)); }
+  return decode(slice(b, 0, n));
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+/** Packets expire 20 seconds after they are sent: the receiver ignores one older than its expiration. */
+Item expiry(u64 now) { return small(now + 20); }
+
+export u8[] ping(u8[] nodeKey, Endpoint from, Endpoint to, u64 now, u64 enrSeq) {
+  return seal(nodeKey, PING, [small(4), endpointItem(from), endpointItem(to), expiry(now), small(enrSeq)]);
+}
+
+export u8[] pong(u8[] nodeKey, Endpoint to, u8[] pingHash, u64 now, u64 enrSeq) {
+  return seal(nodeKey, PONG, [endpointItem(to), Item.Bytes(pingHash), expiry(now), small(enrSeq)]);
+}
+
+export u8[] findNode(u8[] nodeKey, u8[] target, u64 now) {
+  return seal(nodeKey, FIND_NODE, [Item.Bytes(target), expiry(now)]);
+}
+
+export u8[] neighbors(u8[] nodeKey, NodeRecord[] nodes, u64 now) {
+  Item[] ns = Item[].filled(nodes.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < nodes.len(); i++) {
+    NodeRecord n = nodes[i];
+    ns[i] = Item.List([Item.Bytes(n.at.ip), small((n.at.udp as@ u32) as u64), small((n.at.tcp as@ u32) as u64), Item.Bytes(n.id)]);
+  }
+  return seal(nodeKey, NEIGHBORS, [Item.List(ns), expiry(now)]);
+}
+
+export NodeRecord[] readNeighbors(Item[] fields) {
+  Vec<NodeRecord> out = Vec.create();
+  if (fields.len() < 1 || !isList(fields[0])) { return out.toArray(); }
+  Item[] ns = itemsOf(fields[0]);
+  for (i32 i = 0; i < ns.len(); i++) {
+    if (!isList(ns[i]) || itemsOf(ns[i]).len() < 4) { continue; }
+    Item[] f = itemsOf(ns[i]);
+    Endpoint? e = endpointOf(Item.List([f[0], f[1], f[2]]));
+    u8[] id = bytesOf(f[3]);
+    if (e is null || id.len() != 64) { continue; }
+    out.push(NodeRecord(id, e!));
+  }
+  return out.toArray();
+}
+
+/** Whether a packet's expiration has passed. */
+export bool expired(Item[] fields, i32 at, u64 now) {
+  if (at >= fields.len()) { return true; }
+  return numOf(fields[at]).low() < now;
+}
+
+/**
+ * This node's record (EIP-778) for ENRResponse: sequence number, "id" "v4", its IPv4 address, its key
+ * compressed, and its ports, the keys sorted and the whole signed by the node key.
+ */
+export Item enr(u8[] nodeKey, u64 seq, Endpoint at) {
+  u8[] pub = publicKey(nodeKey);
+  u8[] compressed = u8[].filled(33, 0);
+  compressed[0] = (pub[63] & 1) == 1 ? 0x03 : 0x02;
+  for (i32 i = 0; i < 32; i++) { compressed[1 + i] = pub[i]; }
+  Item[] content = [small(seq), Item.Bytes("id".toBytes()), Item.Bytes("v4".toBytes()), Item.Bytes("ip".toBytes()),
+                    Item.Bytes(at.ip), Item.Bytes("secp256k1".toBytes()), Item.Bytes(compressed),
+                    Item.Bytes("tcp".toBytes()), small((at.tcp as@ u32) as u64), Item.Bytes("udp".toBytes()),
+                    small((at.udp as@ u32) as u64)];
+  u8[] sig = slice(sign(keccak256(encode(Item.List(content))), nodeKey), 0, 64);
+  Item[] record = Item[].filled(content.len() + 1, Item.Bytes(sig));
+  for (i32 i = 0; i < content.len(); i++) { record[i + 1] = content[i]; }
+  return Item.List(record);
+}
+
+export u8[] enrResponse(u8[] nodeKey, u8[] requestHash, Item record) {
+  return seal(nodeKey, ENR_RESPONSE, [Item.Bytes(requestHash), record]);
+}
+
+/** log₂ of the XOR distance between two node ids' hashes: 0 for the same, up to 256. */
+export i32 distance(u8[] a, u8[] b) {
+  u8[] ha = keccak256(a);
+  u8[] hb = keccak256(b);
+  for (i32 i = 0; i < 32; i++) {
+    i32 x = (ha[i] ^ hb[i]) as i32;
+    if (x != 0) {
+      i32 bits = 0;
+      while (x > 0) {
+        bits++;
+        x = x >> 1;
+      }
+      return (31 - i) * 8 + bits;
+    }
+  }
+  return 0;
+}

@@ -1,0 +1,136 @@
+// The shell running a real external program, on the JavaScript host.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env packages/sh/test/wac/spawn_test.wac
+//
+// Everything else in this package tests a shell whose commands are its own builtins. `spawn` is the evidence the seam
+// was in the right place: the pipeline, the exit status and the command substitution below are the same code, with a
+// spawned worker on the other end. **What is spawned is a wac program built as a worker bundle, not an executable** —
+// which is why the shell searches `$WACPATH` and not `$PATH`: `/usr/bin/wc` handed to `spawn` is not JavaScript.
+//
+// The child is platform's own `example/wc.wac`, which reads standard input when given no file. It was
+// packages/sh/test/spawn.test.ts (deleted 2026-11-11), which built both through `harness/buildApp.ts` from TypeScript; they are built for
+// the Deno host here, by `builtByDeno`, and run as the shell's users run it.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { builtByDeno } from "../../../wactest/src/built.wac";
+import { contains } from "../../../wactest/src/strings.wac";
+import { Exec, ChildEnv, Launch, Sys } from "std";
+import { flatten } from "core";
+
+struct Said {
+  string out;
+  string err;
+  i32 status;
+}
+
+struct World {
+  string shell;
+  string dir;
+}
+
+/** The shell, with `read`, and a directory holding `wc` as a worker bundle — built once and reused. */
+World world(Sys sys) {
+  string dir = flatten(sys.env().cwd().wait()).unwrap() + "/.cache/wacsh-spawn";
+  sys.files().mkdir(dir, true).wait();
+  string shell = builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/sh/src/sh.wac", "spawn-wacsh",
+                             ["--allow-read", "--allow-write", "--allow-env"], "deno", false);
+  string worker = builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/platform/example/wc.wac", "spawn-wc",
+                              string[](), "deno", true);
+  u8[]? w = worker == "" ? null : flatten(sys.files().readFile(worker).wait()).ok();
+  if (w is not null) { sys.files().writeFile(dir + "/wc", w!).wait(); }
+  return World(shell, dir);
+}
+
+Said run(Sys sys, string cmd, string[] args) {
+  Exec? x = flatten(sys.procs().exec(cmd, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).ok();
+  if (x is null) { return Said("", "", 0 - 1); }
+  return Said(string.fromBytes(x!.stdout), string.fromBytes(x!.stderr), x!.status);
+}
+
+Said sh(Sys sys, World w, string script) { return run(sys, w.shell, ["-c", script]); }
+
+bool ready(T t, World w) {
+  t.isTrue(w.shell != "", "the shell was built");
+  return w.shell != "";
+}
+
+export string test_an_unset_wacpath_spawns_nothing_and_there_is_nothing_behind_it(Sys sys) {
+  T t = T.create();
+  World w = world(sys);
+  if (!ready(t, w)) { return t.report(); }
+  // An unset `WACPATH` is not "look in the usual places": `/usr/bin/wc` exists here and must not be found.
+  Said r = sh(sys, w, "echo one two three | wc -w");
+  t.eqI32(r.status, 127, r.out + r.err);
+  t.isTrue(contains(r.err, "command not found"), r.err);
+  t.eqStr(r.out, "", "something answered");
+  return t.report();
+}
+
+export string test_a_program_on_wacpath_is_spawned_and_is_a_command_like_any_other(Sys sys) {
+  T t = T.create();
+  World w = world(sys);
+  if (!ready(t, w)) { return t.report(); }
+  string p = "WACPATH=" + w.dir + "; ";
+  // Lines, words, bytes — platform's `wc`.
+  Said one = sh(sys, w, p + "echo one two three | wc");
+  t.eqStr(one.out, "1 3 14\n", one.err);
+  t.eqI32(one.status, 0, "its status");
+  // A pipeline stage: `wc` of `wc`'s own one-line output.
+  t.eqStr(sh(sys, w, p + "printf 'a\\nb\\nc\\n' | wc | wc").out, "1 3 6\n", "a spawned program is a pipeline stage");
+  t.eqStr(sh(sys, w, p + "x=$(echo a b | wc); echo [$x]").out, "[1 2 4]\n", "inside a command substitution");
+  t.eqStr(sh(sys, w, p + "echo a | wc; echo b c | wc").out, "1 1 2\n1 2 4\n", "two spawns, each with its own input");
+  t.eqStr(sh(sys, w, "echo a b | " + w.dir + "/wc").out, "1 2 4\n", "a path with a slash is not searched for");
+  t.eqStr(sh(sys, w, "WACPATH=/nonexistent:" + w.dir + "; echo a | wc").out, "1 1 2\n",
+          "WACPATH entries are tried in order and a missing directory is skipped");
+  // `wc` cannot count until its input ends: stopping the child rather than ending its input would answer nothing.
+  t.eqStr(sh(sys, w, p + "i=1; while [ $i -le 200 ]; do echo $i; i=$((i+1)); done | wc").out, "200 200 692\n",
+          "a spawned program reads all of its input before answering");
+  return t.report();
+}
+
+export string test_a_name_on_wacpath_that_is_not_there_is_127(Sys sys) {
+  T t = T.create();
+  World w = world(sys);
+  if (!ready(t, w)) { return t.report(); }
+  Said r = sh(sys, w, "WACPATH=" + w.dir + "; nosuchprogram x");
+  t.eqI32(r.status, 127, "not a spawn failure");
+  t.isTrue(contains(r.err, "command not found"), r.err);
+  return t.report();
+}
+
+export string test_a_file_that_is_not_a_worker_bundle_is_a_failed_command_not_a_dead_shell(Sys sys) {
+  T t = T.create();
+  World w = world(sys);
+  if (!ready(t, w)) { return t.report(); }
+  // wac-mono 0021: the worker's load error once escaped into the shell, which died with Deno's message. It is answered
+  // from the bytes now, before a worker starts — which also stopped a bundle that parses and never speaks from wedging it.
+  sys.files().writeFile(w.dir + "/notaprogram", "this is not javascript {{{\n".toBytes()).wait();
+  Said r = sh(sys, w, "WACPATH=" + w.dir + "; notaprogram; echo still-here");
+  t.isTrue(contains(r.out, "still-here"), "the shell survived: " + r.out + r.err);
+  t.eqI32(r.status, 0, "the script's status is echo's");
+  t.isTrue(contains(r.err, "notaprogram") && contains(r.err, "not a wac program"), r.err);
+  sys.files().writeFile(w.dir + "/notaprogram2", "}{ not javascript either\n".toBytes()).wait();
+  t.eqStr(sh(sys, w, "WACPATH=" + w.dir + "; notaprogram2; echo $?").out, "126\n", "it exists and would not start: 126");
+  return t.report();
+}
+
+export string test_a_spawned_program_has_the_shells_grants_and_no_more(Sys sys) {
+  T t = T.create();
+  World w = world(sys);
+  if (!ready(t, w)) { return t.report(); }
+  // wac-mono 0028: a child is as trusted as the shell — the host intersects, so this cannot widen anything.
+  string note = w.dir + "/note.txt";
+  sys.files().writeFile(note, "one two three\n".toBytes()).wait();
+  Said r = sh(sys, w, "WACPATH=" + w.dir + "; wc " + note);
+  t.eqI32(r.status, 0, r.out + r.err);
+  string alone = builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/platform/example/wc.wac", "spawn-wc-alone",
+                             ["--allow-read"], "deno", false);
+  t.eqStr(r.out, run(sys, alone, [note]).out, "the same answer as running it alone");
+  t.isTrue(r.out != "", "something was printed: " + r.err);
+  // A shell built without `read` cannot hand its child one: the file is not opened.
+  string bare = builtByDeno(sys.env(), sys.files(), sys.procs(), "packages/sh/src/sh.wac", "spawn-wacsh-bare",
+                            ["--allow-env"], "deno", false);
+  Said b = run(sys, bare, ["-c", "WACPATH=" + w.dir + "; wc " + note]);
+  t.isTrue(!contains(b.out + b.err, "one two three"), "a child read a file the shell may not: " + b.out + b.err);
+  return t.report();
+}

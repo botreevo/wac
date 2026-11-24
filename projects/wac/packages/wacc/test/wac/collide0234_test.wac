@@ -1,0 +1,129 @@
+// Declaring a struct a library uses internally does not break the library. `issues/lang/0234a`.
+//
+//     wac test --allow-read --allow-write --allow-run --allow-env \
+//       packages/wacc/test/wac/collide0234_test.wac
+//
+// One file declares `export struct Arm` and never uses it; a second imports a function from it and
+// also imports `packages/wacc/src/api.wac`. That used to build a module the engine would not load —
+// `wac check` reported the program clean and `wac build` declined a member access five levels away —
+// because `ast.wac` uses `Arm` at line 91 and declares it at line 227, so the *earlier* use resolved
+// against a declaration table that did not hold the real one yet, and an unrelated file walked before
+// `ast.wac` won the name.
+//
+// **Five `ast.wac` exports did it, and the rule is what identified the cause**: a type used earlier in
+// the file than its own declaration, where the earlier use is an enum variant payload — the record
+// whose type was never re-resolved. `Arm` 91/227, `JsxAttr` 106/222, `Lvalue` 142/173, `Param`
+// 164/281, `Stmt` 164/188; the others are declared before first use, or never used as a type there.
+// `issues/lang/0234a` has the table and the count for the whole repository.
+//
+// **Why it writes files and runs the binary.** The in-process route cannot express it: a four-source
+// imitation — a library file declaring the struct, a second reading a member of it, the colliding
+// declaration and an entry importing both — is clean on `dumpTypeErrorsFiles`, `blockedFiles` and
+// `emitDeclineFiles` alike, with and without the collision. The ingredient is wacc's real graph.
+//
+// **Building is not enough, so this checks the answer.** The entry asks the library to judge one broken
+// program and one clean one, and exits 0 only if it separated them — which is what says the library
+// still *works* with the colliding name in the link rather than merely compiling.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Exec, ChildEnv, Env, Files, Launch, Procs, Sys } from "std";
+import { wacBinary } from "../../../wactest/src/built.wac";
+import { putFile } from "../../../wactest/src/host.wac";
+import { flatten } from "core";
+
+/**
+ * The two files, with `name` as the colliding struct.
+ *
+ * Answers the reason rather than a `bool`, and has no `mkdir` of its own — `putFile` makes the
+ * directory above each file and names whichever step failed. Before that a `.cache` that could not be
+ * created reached the reader as "wrote the tree for Arm" failing, which points at the fixture's
+ * *writes* and at this issue's subject, neither of which would be what was wrong.
+ * `issues/system/0229`.
+ */
+string writeTree(Files fs, string dir, string name) {
+  string why = putFile(fs, dir + "/one.wac", "export struct " + name + " { i32 x; }\nexport i32 one() { return 1; }\n");
+  if (why != "") { return why; }
+  // `../..` from `.cache/<dir>/` back to the repository root, then into the compiler's own source.
+  // The entry answers 0 when the library discriminated, so the exit status is the assertion.
+  //
+  // **No expected count.** This asked for exactly two diagnostics from `s - 1` and went red within the
+  // day, because `issues/lang/0238a` made that program report once — a checker fix, arriving through a
+  // test about the *linker*. What this file needs of the library is that it can tell a broken program
+  // from a clean one, so that is what it asks: some diagnostics for one, none for the other. A library
+  // that returned a constant, or an empty array, fails both halves.
+  return putFile(fs, dir + "/agg.wac", "import { one } from \"./one.wac\";\n" +
+      "import { dumpTypeErrors } from \"../../packages/wacc/src/api.wac\";\n" +
+      "export i32 main() {\n" +
+      "  i32 bad = dumpTypeErrors(\"export i32 f(string s) { return s - 1; }\".toBytes()).len();\n" +
+      "  i32 ok = dumpTypeErrors(\"export i32 f(i32 x) { return x - 1; }\".toBytes()).len();\n" +
+      "  return bad > 0 && ok == 0 && one() == 1 ? 0 : 1;\n" +
+      "}\n");
+}
+
+string buildIn(Env env, Procs procs, string dir) {
+  auto rRan = flatten(procs.exec("/bin/sh", ["-c", "cd '" + dir + "' && '" + wacBinary(env) + "' build agg.wac -o m 2>&1"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = rRan.ok();
+  return string.fromBytes(r!.stdout) + string.fromBytes(r!.stderr);
+}
+
+/**
+ * Runs the module `buildIn` wrote rather than `wac run agg.wac`, which compiled the whole of wacc a second time
+ * to make the same bytes: the build is the expensive half of this test, and it was paid twice per name.
+ */
+i32 runIn(Env env, Procs procs, string dir) {
+  auto rRan = flatten(procs.exec("/bin/sh", ["-c", "cd '" + dir + "' && '" + wacBinary(env) + "' m.wasm > /dev/null 2>&1; echo $?"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = rRan.ok();
+  string out = string.fromBytes(r!.stdout);
+  return out.indexOf("0") == 0 ? 0 : 1;
+}
+
+/**
+ * The names that used to break: they build, and the library still answers correctly.
+ *
+ * Two of them, because the affected set was identified by a *rule* — a type used earlier in `ast.wac`
+ * than its own declaration — and a rule is worth two samples. `Arm` is used at line 91 and declared at
+ * 227; `JsxAttr` at 106 and 222. Both earlier uses are enum variant payloads, which is the record whose
+ * type was not re-resolved. The other three of the five are `Param`, `Stmt` and `Lvalue`.
+ */
+export string test_structs_named_like_ones_the_library_uses_do_not_break_it(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string[] names = ["Arm", "JsxAttr"];
+  for (i32 i = 0; i < names.len(); i++) {
+    string dir = flatten(env.cwd().wait()).unwrap() + "/.cache/collide0234-" + names[i];
+    fs.remove(dir, true).wait();
+    string whyTree = writeTree(fs, dir, names[i]);
+    t.isTrue(whyTree == "", whyTree);
+    string built = buildIn(env, procs, dir);
+    t.isTrue(built.indexOf("cannot emit") < 0,
+        "declaring `" + names[i] + "` broke the library again — 0234a: " + built);
+    t.eqI32(runIn(env, procs, dir), 0,
+        names[i] + ": it built but the library answered wrongly, which is worse");
+    fs.remove(dir, true).wait();
+  }
+  return t.report();
+}
+
+/**
+ * The control, and it is the reason this test can fail for the right reason.
+ *
+ * A name the compiler does not declare anywhere. If this ever fails the harness is broken rather than
+ * the compiler, and the test above would have been passing for no reason.
+ */
+export string test_the_same_program_with_a_name_the_compiler_never_declares(Sys sys) {
+  Env env = sys.env();
+  Files fs = sys.files();
+  Procs procs = sys.procs();
+  T t = T.create();
+  string dir = flatten(env.cwd().wait()).unwrap() + "/.cache/collide0234-ok";
+  fs.remove(dir, true).wait();
+  string whyTree = writeTree(fs, dir, "Zork");
+  t.isTrue(whyTree == "", whyTree);
+  string built = buildIn(env, procs, dir);
+  t.isTrue(built.indexOf("cannot emit") < 0, "the control did not build: " + built);
+  t.eqI32(runIn(env, procs, dir), 0, "the control answered wrongly, so the harness is what is wrong");
+  fs.remove(dir, true).wait();
+  return t.report();
+}

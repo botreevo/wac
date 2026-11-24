@@ -1,0 +1,96 @@
+// Writing an HTTP/1.1 request.
+//
+// The client half of the framing rules, and the same discipline as the response writer: the
+// caller supplies a method, a target, headers and a body, and this decides the framing. A client
+// that lets a caller set `Content-Length` by hand is a client that can be made to disagree with
+// its own body length, which is the request-smuggling primitive from the other side.
+//
+// `Host` is required for HTTP/1.1 and is a parameter rather than a header, because a request
+// without one is not a message a server has to accept.
+
+import { Buf, Result } from "core";
+import { Headers, eqFold } from "./headers.wac";
+
+export struct Outgoing {
+  u8[] method;
+  u8[] target;
+  u8[] host;
+  Headers headers;
+  u8[] body;
+
+  Outgoing create(string method, string target, string host) {
+    return Outgoing(method.toBytes(), target.toBytes(), host.toBytes(), Headers.create(), u8[]());
+  }
+
+  /**
+   * Add a header — **not one the writer owns** (`ownedHeader`): `Content-Length`, `Transfer-Encoding`, `Connection`
+   * and `Host` are decided by `write` from the body and the request, and one set by hand beside them is a message
+   * that disagrees with itself — two `Content-Length`s, or a `Transfer-Encoding` beside one, which this package's
+   * own reader refuses as smuggling. Refused, and nothing added (`issues/system/0342a`).
+   */
+  Result<void, string> set(this, string name, string value) {
+    if (ownedHeader(name.toBytes())) { return Result.Err("\{name} is the writer's to set, from the body and the request"); }
+    this.headers.push(name.toBytes(), value.toBytes());
+    return Result.Ok();
+  }
+}
+
+/**
+ * **The headers `write` decides**, so a caller may not: the framing (`Content-Length`, and `Transfer-Encoding`,
+ * which this writer never emits because it does not chunk — a caller's would contradict the `Content-Length` it
+ * does), the connection's fate, and the host. One list, asked by `set` and held against what `write` emits by
+ * `outgoing_test.wac`, so a header the writer starts emitting cannot be left out of it unseen.
+ */
+export bool ownedHeader(u8[] name) {
+  return eqFold(name, "content-length".toBytes()) || eqFold(name, "transfer-encoding".toBytes())
+      || eqFold(name, "connection".toBytes()) || eqFold(name, "host".toBytes());
+}
+
+
+/**
+ * Serialize. `keepAlive` false adds `Connection: close`, which is also how a client asks for a
+ * close-delimited response — the case the response parser needs `eof` for.
+ */
+export u8[] write(Outgoing req, bool keepAlive) {
+  Buf out = Buf.create();
+  out.pushAll(req.method);
+  out.push(' ');
+  out.pushAll(req.target);
+  out.pushAll(" HTTP/1.1".toBytes());
+  out.push(13);
+  out.push(10);
+
+  out.pushAll("Host: ".toBytes());
+  out.pushAll(req.host);
+  out.push(13);
+  out.push(10);
+
+  for (i32 i = 0; i < req.headers.len(); i++) {
+    out.pushAll(req.headers.nameAt(i));
+    out.push(':');
+    out.push(' ');
+    out.pushAll(req.headers.valueAt(i));
+    out.push(13);
+    out.push(10);
+  }
+
+  // Always exactly one framing header, and only when there is something to frame. A GET with
+  // `Content-Length: 0` is legal but some servers treat it as a body, so it is not sent.
+  if (req.body.len() > 0) {
+    out.pushAll("Content-Length: ".toBytes());
+    out.pushDecimal(req.body.len());
+    out.push(13);
+    out.push(10);
+  }
+
+  if (!keepAlive) {
+    out.pushAll("Connection: close".toBytes());
+    out.push(13);
+    out.push(10);
+  }
+
+  out.push(13);
+  out.push(10);
+  out.pushAll(req.body);
+  return out.take();
+}

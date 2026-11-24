@@ -1,0 +1,351 @@
+// The whole file system a derivation's program sees, held in memory by the runner: the input tree read-only at
+// `/in`, and an empty `/out` it may write. Nothing else exists. No path reaches the runner's own disk, because
+// nothing here is backed by a disk: the input comes from verified blocks, the output is kept until the program ends
+// and then becomes the output tree.
+//
+// What a tree in unixfs-v1-2025 cannot record, this world does not offer: modes, owners, links and times are
+// refused or answered with nothing (every time is 0), so a program cannot write something its output tree would lose.
+
+import { FileOps, Files, Input, Output, Stat, IsDir, NotADir, NotFound, ReadOnly, Unsupported, Exists, NotEmpty,
+         ReadFault, WriteFault, LookFault, MkdirFault, MoveFault, ModeFault, HostFault, OutputFault, FAULT_NONE } from "std";
+import { Read, Result, Ticket } from "core";
+import { ipfs.FileIn } from "@/lib.wac";
+
+/** What the program wrote under `/out`, by path below it. Directories are kept apart so empty ones survive. */
+export struct Written {
+  string[] paths;
+  u8[][] data;
+  string[] dirs;
+
+  Written create() { return Written(string[](), u8[][](), string[]()); }
+
+  i32 fileAt(this, string p) {
+    for (i32 i = 0; i < this.paths.len(); i++) { if (this.paths[i] == p) { return i; } }
+    return -1;
+  }
+
+  bool isDir(this, string p) {
+    if (p == "") { return true; }
+    for (i32 i = 0; i < this.dirs.len(); i++) { if (this.dirs[i] == p) { return true; } }
+    return false;
+  }
+
+  void put(this, string p, u8[] b) {
+    i32 at = this.fileAt(p);
+    if (at >= 0) { this.data[at] = b; return; }
+    this.paths = pushed(this.paths, p);
+    u8[][] nd = u8[][].filled(this.data.len() + 1, u8[]());
+    for (i32 i = 0; i < this.data.len(); i++) { nd[i] = this.data[i]; }
+    nd[this.data.len()] = b;
+    this.data = nd;
+  }
+
+  /** The files, as an importer takes them. */
+  FileIn[] files(this) {
+    FileIn[] out = FileIn[].filled(this.paths.len(), FileIn("", u8[]()));
+    for (i32 i = 0; i < this.paths.len(); i++) { out[i] = FileIn(this.paths[i], this.data[i]); }
+    return out;
+  }
+}
+
+string[] pushed(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+/**
+ * `p` as a path below the root with no `.`, `..` or empty parts, or null when it would climb out. A relative path
+ * starts at the root: the program is launched there.
+ */
+export string? clean(string p) {
+  string[] parts = string[]();
+  u8[] b = p.toBytes();
+  i32 at = 0;
+  while (at <= b.len()) {
+    i32 end = at;
+    while (end < b.len() && b[end] != '/') { end++; }
+    string part = p.slice(at, end);
+    if (part == "..") {
+      if (parts.len() == 0) { string? none = null; return none; }
+      string[] fewer = string[].defaulted(parts.len() - 1);
+      for (i32 i = 0; i < fewer.len(); i++) { fewer[i] = parts[i]; }
+      parts = fewer;
+    } else if (part != "" && part != ".") {
+      parts = pushed(parts, part);
+    }
+    at = end + 1;
+  }
+  string out = "";
+  for (i32 i = 0; i < parts.len(); i++) { out += (i == 0 ? "" : "/") + parts[i]; }
+  return out;
+}
+
+static i32 NONE = 0;
+static i32 DIR = 1;
+static i32 FILE = 2;
+
+/** A path in the world, and what it is. `inner` is below `/in` or `/out`; `area` says which, or neither. */
+struct Look {
+  i32 kind;
+  string area;
+  string inner;
+  u8[] data;
+  string[] names;
+}
+
+struct World {
+  FileIn[] input;
+  string[] inputDirs;
+  Written out;
+}
+
+bool under(string p, string dir) { return dir == "" || (p.len() > dir.len() && p.slice(0, dir.len() + 1) == dir + "/"); }
+
+/** The name directly below `dir` on the way to `p`. */
+string childName(string p, string dir) {
+  string rest = dir == "" ? p : p.slice(dir.len() + 1, p.len());
+  i32 slash = rest.indexOf("/");
+  return slash < 0 ? rest : rest.slice(0, slash);
+}
+
+string[] addName(string[] names, string n) {
+  for (i32 i = 0; i < names.len(); i++) { if (names[i] == n) { return names; } }
+  return pushed(names, n);
+}
+
+string[] sorted(string[] xs) {
+  string[] out = string[].defaulted(xs.len());
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  for (i32 i = 1; i < out.len(); i++) {
+    string x = out[i];
+    i32 j = i - 1;
+    while (j >= 0 && byteLess(x, out[j])) { out[j + 1] = out[j]; j--; }
+    out[j + 1] = x;
+  }
+  return out;
+}
+
+bool byteLess(string a, string b) {
+  u8[] x = a.toBytes();
+  u8[] y = b.toBytes();
+  i32 n = x.len() < y.len() ? x.len() : y.len();
+  for (i32 i = 0; i < n; i++) { if (x[i] != y[i]) { return x[i] < y[i]; } }
+  return x.len() < y.len();
+}
+
+Look look(World w, string raw) {
+  string? c = clean(raw);
+  if (c is null) { return Look(NONE, "", "", u8[](), string[]()); }
+  string p = c!;
+  if (p == "") { return Look(DIR, "", "", u8[](), ["in", "out"]); }
+  string area = childName(p, "");
+  string inner = p == area ? "" : p.slice(area.len() + 1, p.len());
+  if (area == "in") {
+    string[] names = string[]();
+    bool dir = inner == "";
+    for (i32 i = 0; i < w.input.len(); i++) {
+      if (w.input[i].path == inner) { return Look(FILE, area, inner, w.input[i].content, string[]()); }
+      if (under(w.input[i].path, inner)) { dir = true; names = addName(names, childName(w.input[i].path, inner)); }
+    }
+    for (i32 i = 0; i < w.inputDirs.len(); i++) {
+      if (w.inputDirs[i] == inner) { dir = true; }
+      if (under(w.inputDirs[i], inner)) { dir = true; names = addName(names, childName(w.inputDirs[i], inner)); }
+    }
+    return dir ? Look(DIR, area, inner, u8[](), sorted(names)) : Look(NONE, area, inner, u8[](), string[]());
+  }
+  if (area == "out") {
+    i32 at = w.out.fileAt(inner);
+    if (at >= 0) { return Look(FILE, area, inner, w.out.data[at], string[]()); }
+    if (!w.out.isDir(inner)) { return Look(NONE, area, inner, u8[](), string[]()); }
+    string[] names = string[]();
+    for (i32 i = 0; i < w.out.paths.len(); i++) {
+      if (under(w.out.paths[i], inner)) { names = addName(names, childName(w.out.paths[i], inner)); }
+    }
+    for (i32 i = 0; i < w.out.dirs.len(); i++) {
+      if (under(w.out.dirs[i], inner)) { names = addName(names, childName(w.out.dirs[i], inner)); }
+    }
+    return Look(DIR, area, inner, u8[](), sorted(names));
+  }
+  return Look(NONE, area, inner, u8[](), string[]());
+}
+
+/** The directory `inner` sits in, below `/out`. */
+string parentOf(string inner) {
+  i32 last = -1;
+  u8[] b = inner.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '/') { last = i; } }
+  return last < 0 ? "" : inner.slice(0, last);
+}
+
+/**
+ * The world over `input` (its files and its empty directories), writing into `out`. Hand the result to a child as
+ * its only `Files`.
+ */
+export Files worldFiles(FileIn[] input, string[] inputDirs, Written out) {
+  World w = World(input, inputDirs, out);
+  return Files.of(FileOps(
+    (string p) => wRead(w, p),
+    (string p, u8[] b) => wWrite(w, p, b, false),
+    (string p) => wOpenRead(w, p),
+    (string p) => wOpenWrite(w, p, false),
+    (string p) => wOpenWrite(w, p, true),
+    (string p) => wStat(w, p),
+    (string p) => wStat(w, p),
+    (string p) => wReadDir(w, p),
+    (string p, bool parents) => wMkdir(w, p, parents),
+    (string p, bool r) => wRemove(w, p, r),
+    (string from, string to) => refusedMove(from),
+    (string p, i32 mode) => refusedMode(p),
+    (string p, bool on) => refusedMode(p),
+    (string p, string owner) => refusedMode(p)), "");
+}
+
+async Result<u8[], ReadFault> wRead(World w, string p) {
+  Look l = look(w, p);
+  if (l.kind == NONE) { return Result.Err(NotFound(p + ": No such file or directory")); }
+  if (l.kind == DIR) { return Result.Err(IsDir(p + ": Is a directory")); }
+  return Result.Ok(l.data);
+}
+
+/** Why a write to `p` cannot happen, or "" when it can. */
+string writeRefusal(World w, Look l, string p) {
+  if (l.area != "out" || l.inner == "") { return "ro"; }
+  if (l.kind == DIR) { return "dir"; }
+  if (!w.out.isDir(parentOf(l.inner))) { return "missing"; }
+  return "";
+}
+
+async Result<void, WriteFault> wWrite(World w, string p, u8[] b, bool append) {
+  Look l = look(w, p);
+  string why = writeRefusal(w, l, p);
+  if (why == "ro") { return Result.Err(ReadOnly(p + ": Read-only file system")); }
+  if (why == "dir") { return Result.Err(IsDir(p + ": Is a directory")); }
+  if (why == "missing") { return Result.Err(NotFound(p + ": No such file or directory")); }
+  if (append && l.kind == FILE) {
+    u8[] joined = u8[].filled(l.data.len() + b.len(), 0);
+    joined.copyFrom(l.data, 0, 0, l.data.len());
+    joined.copyFrom(b, 0, l.data.len(), b.len());
+    w.out.put(l.inner, joined);
+  } else {
+    w.out.put(l.inner, b);
+  }
+  return Result.Ok();
+}
+
+async Result<Input, ReadFault> wOpenRead(World w, string p) {
+  Look l = look(w, p);
+  if (l.kind == NONE) { return Result.Err(NotFound(p + ": No such file or directory")); }
+  if (l.kind == DIR) { return Result.Err(IsDir(p + ": Is a directory")); }
+  u8[] data = l.data;
+  bool[] gone = bool[].filled(1, false);
+  return Result.Ok(Input(() => onePiece(data, gone), () => theRest(data, gone), closedFine));
+}
+
+async Result<Read, HostFault> onePiece(u8[] data, bool[] gone) {
+  if (gone[0] || data.len() == 0) { return Result.Ok(Read.End); }
+  gone[0] = true;
+  return Result.Ok(Read.Data(data));
+}
+
+async Result<u8[], HostFault> theRest(u8[] data, bool[] gone) {
+  bool was = gone[0];
+  gone[0] = true;
+  return Result.Ok(was ? u8[]() : data);
+}
+
+async Result<void, HostFault> closedFine() { return Result.Ok(); }
+
+/** A file opened to write: the bytes are kept here and land in `/out` when it is closed, as a file on disk would. */
+async Result<Output, WriteFault> wOpenWrite(World w, string p, bool append) {
+  Look l = look(w, p);
+  string why = writeRefusal(w, l, p);
+  if (why == "ro") { return Result.Err(ReadOnly(p + ": Read-only file system")); }
+  if (why == "dir") { return Result.Err(IsDir(p + ": Is a directory")); }
+  if (why == "missing") { return Result.Err(NotFound(p + ": No such file or directory")); }
+  string inner = l.inner;
+  u8[][] buf = [append && l.kind == FILE ? l.data : u8[]()];
+  w.out.put(inner, buf[0]);
+  return Result.Ok(Output((u8[] b) => buffered(buf, b), () => committed(w, inner, buf)));
+}
+
+async Result<void, OutputFault> buffered(u8[][] buf, u8[] b) {
+  u8[] joined = u8[].filled(buf[0].len() + b.len(), 0);
+  joined.copyFrom(buf[0], 0, 0, buf[0].len());
+  joined.copyFrom(b, 0, buf[0].len(), b.len());
+  buf[0] = joined;
+  return Result.Ok();
+}
+
+async Result<void, OutputFault> committed(World w, string inner, u8[][] buf) {
+  w.out.put(inner, buf[0]);
+  return Result.Ok();
+}
+
+async Result<Stat, LookFault> wStat(World w, string p) {
+  Look l = look(w, p);
+  if (l.kind == NONE) { return Result.Err(NotFound(p + ": No such file or directory")); }
+  bool dir = l.kind == DIR;
+  i32 mode = dir ? 493 : 420;                                   // 0755, 0644: what a tree without modes reads as
+  return Result.Ok(Stat(true, !dir, dir, l.data.len() as i64, 0 as i64, false, false, FAULT_NONE(), mode, ""));
+}
+
+async Result<string[], LookFault> wReadDir(World w, string p) {
+  Look l = look(w, p);
+  if (l.kind == NONE) { return Result.Err(NotFound(p + ": No such file or directory")); }
+  if (l.kind != DIR) { return Result.Err(NotADir(p + ": Not a directory")); }
+  return Result.Ok(l.names);
+}
+
+async Result<void, MkdirFault> wMkdir(World w, string p, bool parents) {
+  Look l = look(w, p);
+  if (l.area != "out" || l.inner == "") {
+    if (l.kind == DIR && parents) { return Result.Ok(); }
+    return l.kind != NONE ? Result.Err(Exists(p + ": File exists")) : Result.Err(ReadOnly(p + ": Read-only file system"));
+  }
+  if (l.kind == FILE) { return Result.Err(Exists(p + ": File exists")); }
+  if (l.kind == DIR) { return parents ? Result.Ok() : Result.Err(Exists(p + ": File exists")); }
+  string parent = parentOf(l.inner);
+  if (!w.out.isDir(parent)) {
+    if (!parents) { return Result.Err(NotFound(p + ": No such file or directory")); }
+    if (w.out.fileAt(parent) >= 0) { return Result.Err(NotADir(p + ": Not a directory")); }
+    try await wMkdir(w, "/out/" + parent, true);
+  }
+  w.out.dirs = pushed(w.out.dirs, l.inner);
+  return Result.Ok();
+}
+
+async Result<void, MoveFault> wRemove(World w, string p, bool recursive) {
+  Look l = look(w, p);
+  if (l.area != "out" || l.inner == "") { return Result.Err(ReadOnly(p + ": Read-only file system")); }
+  if (l.kind == NONE) { return Result.Err(NotFound(p + ": No such file or directory")); }
+  if (l.kind == DIR && l.names.len() > 0 && !recursive) { return Result.Err(NotEmpty(p + ": Directory not empty")); }
+  string inner = l.inner;
+  Written o = w.out;
+  string[] keptPaths = string[]();
+  u8[][] keptData = u8[][]();
+  for (i32 i = 0; i < o.paths.len(); i++) {
+    if (o.paths[i] == inner || under(o.paths[i], inner)) { continue; }
+    keptPaths = pushed(keptPaths, o.paths[i]);
+    u8[][] nd = u8[][].filled(keptData.len() + 1, u8[]());
+    for (i32 j = 0; j < keptData.len(); j++) { nd[j] = keptData[j]; }
+    nd[keptData.len()] = o.data[i];
+    keptData = nd;
+  }
+  string[] keptDirs = string[]();
+  for (i32 i = 0; i < o.dirs.len(); i++) {
+    if (o.dirs[i] == inner || under(o.dirs[i], inner)) { continue; }
+    keptDirs = pushed(keptDirs, o.dirs[i]);
+  }
+  o.paths = keptPaths;
+  o.data = keptData;
+  o.dirs = keptDirs;
+  return Result.Ok();
+}
+
+async Result<void, MoveFault> refusedMove(string p) { return Result.Err(Unsupported(p + ": renaming is not offered here")); }
+
+async Result<void, ModeFault> refusedMode(string p) {
+  return Result.Err(Unsupported(p + ": a tree here records no modes or owners"));
+}

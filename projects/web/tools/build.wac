@@ -1,0 +1,2935 @@
+// Build a page: `<entry.wac>` exporting `async i32 main(Page page)` becomes one `index.html` that runs it.
+//
+//     wac run --allow-read --allow-write --allow-run tools/build.wac src/app.wac dist
+//
+// **Three steps, all of them visible in the output directory.** `page.wac` is the page's program as a module
+// (`moduleFor`): it opens the page its host provides and runs the program's `main` with it. `wac build` makes it
+// `page.wasm`. `index.html` is that module, as base64, and the host — the browser's side, written below — so the
+// page is a single file any static server, or none, can serve; and the same `page.wasm` runs in a desktop's window.
+//
+// **The program runs in a worker unless `--in-page` says otherwise.** A worker is the default because
+// a page's program is a program: a loop that computes for a second, or forever, should cost the
+// program its own responsiveness and not the tab's — scrolling, selecting and closing the tab keep
+// working whatever it does. The worker is made from the page's own text, so there is still one file
+// and nothing the server has to send. `--in-page` runs the same program on the page's own thread, for
+// a page small enough that a worker is only overhead; nothing in the program changes either way,
+// because the host is two halves that talk by messages, and in a page they are joined directly.
+//
+// **A program, not a script in someone else's language**, so a project outside this repository builds
+// a page with the `wac` it already has and this package as a dependency (`template/`). It
+// runs `wac build` as a command, which is why it needs `--allow-run` — unless it is asked for one half, `--module-only`
+// or `--wrap`, which start nothing (`writePageModule`, `wrapBuiltPage`); `--wac <path>` names a binary
+// other than the one on `PATH`, and `--page <spec>` the module the page's module imports `Page` from when the
+// project does not map this package as `web`.
+
+import { Exec, Sys, ChildEnv, Files, Launch, Output, Procs } from "std";
+import { Buf, Vec, flatten } from "core";
+
+// A site's `index.json`, which its build writes last (`index.wac`): exported here, as the package's one entry.
+export { indexSite } from "./index.wac";
+
+/** What a build was asked for. */
+struct Asked {
+  string entry;
+  string out;
+  string wac;
+  string pageSpec;
+  string title;
+  /** Run the program on the page's own thread rather than in a worker. */
+  bool inPage;
+  /** What `page.sys` holds, as `GRANT_*` bits: none unless `--grant read,write` asks. */
+  i32 grants;
+  /**
+   * The export a copy of this page started by `spawnSelf` runs — `async i32 <name>(Sys sys)` — or "" for
+   * a page that starts nothing. A copy has no document, so it cannot run `main(Page …)`.
+   */
+  string spawn;
+  /** A development build: the page checks its views after every turn (`Page.checking`). */
+  bool dev;
+  /**
+   * **An app to install** (`--app <icon.png>`): a manifest, the icon, and a service worker that keeps a copy of what
+   * the page loads, so it opens without the network — `appColor` the colour of its bar.
+   */
+  string appIcon;
+  string appColor;
+  /**
+   * **To the screen's edges** (`--edge`): drawn under a phone's notch and home bar too — `viewport-fit=cover` — for a
+   * page that keeps its own content clear of them with `env(safe-area-inset-…)`.
+   */
+  bool edge;
+  /**
+   * **The module as a file of its own** (`--module-file`): `page.wasm` beside `index.html`, fetched when the page
+   * starts, rather than carried in it as base64 — so pages that share a module share one download, which the browser
+   * caches, and `index.html` is only its first frame and its host. A page opened from a `file://` URL cannot fetch it:
+   * one built so is for serving.
+   */
+  bool moduleFile;
+  /**
+   * **Where the site is served** (`--site-url https://example.org/wac`): each page's canonical address, and a
+   * `sitemap.xml` naming every page — what a search engine reads to find the pages a link alone would not reach.
+   */
+  string siteUrl;
+}
+
+/** The arguments, or a usage line in `title` and empty `entry` when they do not make sense. */
+Asked askedOf(string[] argv) {
+  Asked a = Asked("", "", "wac", "web", "wac", false, 0, "", false, "", "#5b55e6", false, false, "");
+  i32 argc = argv.len();
+  string[] args = string[].filled(argc, "");
+  for (i32 k = 0; k < argc; k++) { args[k] = argv[k]; }
+  i32 i = 0;
+  i32 positional = 0;
+  while (i < argc) {
+    string w = args[i];
+    if ((w == "--wac" || w == "--page" || w == "--title") && i + 1 < argc) {
+      string v = args[i + 1];
+      if (w == "--wac") { a.wac = v; } else if (w == "--page") { a.pageSpec = v; } else { a.title = v; }
+      i += 2;
+      continue;
+    }
+    if (w == "--spawn" && i + 1 < argc) {
+      a.spawn = args[i + 1];
+      i += 2;
+      continue;
+    }
+    if (w == "--in-page") {
+      a.inPage = true;
+      i++;
+      continue;
+    }
+    // Which steps to run is `buildPage`'s to read; the arguments are the same either way.
+    if (w == "--module-only" || w == "--wrap" || w == "--draw") {
+      i++;
+      continue;
+    }
+    if (w == "--dev") {
+      a.dev = true;
+      i++;
+      continue;
+    }
+    if ((w == "--app" || w == "--app-color") && i + 1 < argc) {
+      if (w == "--app") { a.appIcon = argv[i + 1]; } else { a.appColor = argv[i + 1]; }
+      i = i + 2;
+      continue;
+    }
+    if (w == "--edge") {
+      a.edge = true;
+      i++;
+      continue;
+    }
+    if (w == "--site-url" && i + 1 < argc) {
+      a.siteUrl = args[i + 1];
+      i += 2;
+      continue;
+    }
+    if (w == "--module-file") {
+      a.moduleFile = true;
+      i++;
+      continue;
+    }
+
+    // `--grant read,write` rather than `--allow-read`: after the entry, `wac run` takes `--allow-…` as
+    // a grant spelled in the wrong place and refuses it, which is right — those are the builder's own.
+    if (w == "--grant" && i + 1 < argc) {
+      string[] names = partsOfList(args[i + 1]);
+      for (string g in names) {
+        if (g == "read") { a.grants = a.grants | 1; }
+        else if (g == "write") { a.grants = a.grants | 2; }
+        else { a.title = "unknown grant: " + g; a.entry = ""; }
+      }
+      i += 2;
+      continue;
+    }
+    if (positional == 0) { a.entry = w; } else if (positional == 1) { a.out = w; }
+    positional++;
+    i++;
+  }
+  return a;
+}
+
+/** `read,write` as its names. */
+string[] partsOfList(string s) {
+  Vec<string> out = Vec.create();
+  string rest = s;
+  while (rest.len() > 0) {
+    i32 cut = rest.indexOf(",");
+    string p = cut < 0 ? rest : rest.slice(0, cut);
+    if (p != "") { out.push(p); }
+    rest = cut < 0 ? "" : rest.slice(cut + 1, rest.len());
+  }
+  string[] parts = string[].filled(out.len(), "");
+  for (i32 i = 0; i < out.len(); i++) { parts[i] = out.get(i); }
+  return parts;
+}
+
+/** The parts of a relative path, with `.` dropped and `..` taken against what comes before it. */
+string[] partsOf(string path) {
+  Vec<string> out = Vec.create();
+  string rest = path;
+  while (true) {
+    i32 cut = rest.indexOf("/");
+    string p = cut < 0 ? rest : rest.slice(0, cut);
+    if (p == "..") {
+      if (out.len() > 0 && out.get(out.len() - 1) != "..") { out.pop(); } else { out.push(p); }
+    } else if (p != "" && p != ".") {
+      out.push(p);
+    }
+    if (cut < 0) { break; }
+    rest = rest.slice(cut + 1, rest.len());
+  }
+  string[] parts = string[].filled(out.len(), "");
+  for (i32 i = 0; i < out.len(); i++) { parts[i] = out.get(i); }
+  return parts;
+}
+
+/** Whether `path` is absolute or climbs above this directory. */
+bool leavesHere(string path) {
+  if (path.len() > 0 && path.slice(0, 1) == "/") { return true; }
+  string[] parts = partsOf(path);
+  return parts.len() > 0 && parts[0] == "..";
+}
+
+/** How a file in directory `from` names the file `to` — both relative to where the build runs. */
+export string relativeTo(string from, string to) {
+  string[] a = partsOf(from);
+  string[] b = partsOf(to);
+  i32 common = 0;
+  while (common < a.len() && common + 1 < b.len() && a[common] == b[common]) { common++; }
+  string out = "";
+  for (i32 i = common; i < a.len(); i++) { out = out + "../"; }
+  for (i32 i = common; i < b.len(); i++) { out = out + b[i] + (i + 1 < b.len() ? "/" : ""); }
+  return out.len() >= 3 && out.slice(0, 3) == "../" ? out : "./" + out;
+}
+
+/**
+ * **The page's program as a module**: a `main(Sys sys)` any host can start, which opens the page that host provides
+ * (`Page.open`), runs the program's `main(Page page)` with it, and renders each time a view has something to render
+ * (`Page.changed`) for as long as the page is open. `wac build` makes it a module like any other — so a standalone
+ * page's host runs it as it runs every module it is handed, and a desktop can start the same file in a window.
+ *
+ * **A host with no page** — a copy of the page started by `spawnSelf`, which has no document, or a command line —
+ * runs `spawn`'s export, `async i32 <spawn>(Sys sys)`, when the build names one, and otherwise says what it is and
+ * stops.
+ *
+ * **It never returns while the page is open**: a page's program usually returns as soon as it has mounted its view,
+ * and the page lives on in its handlers.
+ */
+export string moduleFor(string entrySpec, string pageSpec, string spawn, bool dev, bool frames) {
+  string withoutPage = spawn != "" ? "      return await \{spawn}(sys);\n"
+    : "      sys.stderr().line(\"this is a page, and its host has none: \" + why);\n      return 1;\n";
+  // **A page that draws its first frames** (`Frame`) draws them here too: run with no page, as the build runs it
+  // (`drawFrames`), it answers `--frames` and `--frame <k>` — so the module that is shipped is the one that drew them.
+  string drawing = frames ? "      if (drawing(sys.args())) { return drawFrames(sys, (Page p) => { program(p); }, prerendered()); }\n" : "";
+  return "// Written by web's tools/build.wac — the page's program, as a module any host that provides `wac.page` runs.\n"
+       + "import { main as program" + (frames ? ", prerendered" : "") + (spawn != "" ? ", " + spawn : "") + " } from \"\{entrySpec}\";\n"
+       + "import { Page" + (frames ? ", drawFrames, drawing" : "") + " } from \"\{pageSpec}\";\n"
+       + "import { Sys } from \"std\";\n\n"
+       + "export async i32 main(Sys sys) {\n"
+       + "  match (await Page.open(sys)) {\n"
+       + "    Ok(page): { return await run(page); }\n"
+       + "    Err(why): {\n" + drawing + withoutPage + "    }\n"
+       + "  }\n"
+       + "}\n\n"
+       + "async i32 run(Page page) {\n"
+       + (dev ? "  page.checking = true;\n" : "")
+       + "  program(page);\n"
+       + "  await page.keepRendering();\n"
+       + "  return 0;\n"
+       + "}\n";
+}
+
+/**
+ * **Whether the entry file declares the frames to draw at build time**: `export Frame[] prerendered()`, read from
+ * its text rather than by compiling it — the build compiles the program once, as the page's module, and that module
+ * must name `prerendered` only if it is there. Declared anywhere but the entry file, it is not seen; named here and
+ * not exported, the one compile says so.
+ */
+export bool declaresFrames(string source) {
+  u8[] b = source.toBytes();
+  i32 from = 0;
+  while (true) {
+    i32 at = indexFrom(source, "prerendered(", from);
+    if (at < 0) { return false; }
+    i32 line = at;
+    while (line > 0 && b[line - 1] != '\n') { line = line - 1; }
+    string before = source.slice(line, at);
+    if (before.indexOf("export") >= 0 && before.indexOf("Frame[]") >= 0 && before.indexOf("//") < 0) { return true; }
+    from = at + 1;
+  }
+}
+
+i32 indexFrom(string s, string what, i32 from) {
+  i32 at = s.slice(from, s.len()).indexOf(what);
+  return at < 0 ? 0 - 1 : from + at;
+}
+
+/**
+ * **What goes in `#app`, from the frames drawn** — each a media query and its markup, in the order the program gave
+ * them. One frame for any window is its markup, as it is. Several are each wrapped, `data-wac-frame` and the query
+ * beside it, after a stylesheet showing the first whose query matches: the browser picks the frame before any script
+ * runs, and the host keeps that one (`documentSide`), by the same rule, when the program starts.
+ */
+export string framesHtml(string[] media, string[] markup) {
+  if (media.len() == 1 && media[0] == "") { return markup[0]; }
+  // Later rules win, so the frames' rules go last to first: the first frame whose query matches is the one shown.
+  string css = "[data-wac-frame] { display: none; }";
+  for (i32 k = media.len() - 1; k >= 0; k--) {
+    string show = "[data-wac-frame] { display: none; } [data-wac-frame=\"\{k}\"] { display: contents; }";
+    css = css + (media[k] == "" ? " " + show : " @media " + cssSafe(media[k]) + " { " + show + " }");
+  }
+  string out = "<style data-wac-frames>" + css + "</style>";
+  for (i32 k = 0; k < media.len(); k++) {
+    out = out + "<div data-wac-frame=\"\{k}\" data-wac-media=\"" + attrSafe(media[k]) + "\">" + markup[k] + "</div>";
+  }
+  return out;
+}
+
+/** A media query as it may sit in a stylesheet: nothing in it can end the element. */
+string cssSafe(string s) {
+  i32 at = s.indexOf("<");
+  return at < 0 ? s : s.slice(0, at) + "\\3c " + cssSafe(s.slice(at + 1, s.len()));
+}
+
+/** A media query as an attribute value. */
+string attrSafe(string s) {
+  string out = "";
+  u8[] b = s.toBytes();
+  for (u8 c in b) {
+    if (c == '&') { out = out + "&amp;"; }
+    else if (c == '"') { out = out + "&quot;"; }
+    else if (c == '<') { out = out + "&lt;"; }
+    else { out = out + string.fromBytes([c]); }
+  }
+  return out;
+}
+
+/** `bytes` as base64, which is how the page carries its module: as text in an element the browser does not run. */
+export string base64(u8[] bytes) {
+  string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  u8[] a = alphabet.toBytes();
+  i32 n = bytes.len();
+  u8[] out = u8[].filled(((n + 2) / 3) * 4, '=' as u8);
+  i32 o = 0;
+  for (i32 i = 0; i < n; i += 3) {
+    i32 b0 = bytes[i] as i32;
+    i32 b1 = i + 1 < n ? bytes[i + 1] as i32 : 0;
+    i32 b2 = i + 2 < n ? bytes[i + 2] as i32 : 0;
+    out[o] = a[b0 >> 2];
+    out[o + 1] = a[((b0 & 3) << 4) | (b1 >> 4)];
+    if (i + 1 < n) { out[o + 2] = a[((b1 & 15) << 2) | (b2 >> 6)]; }
+    if (i + 2 < n) { out[o + 3] = a[b2 & 63]; }
+    o += 4;
+  }
+  return string.fromBytes(out);
+}
+
+/**
+ * The program's half of the host: `wac.page` (`src/line.wac`) answered over the system's requests. Each change
+ * the program asks for becomes a message for the document, and each event, frame, file, value and location the
+ * document sends back answers the request waiting for it. It runs wherever the program does — in a worker, or
+ * on the page — and touches nothing of the document itself; a frame is the document's to give, and the clock and
+ * timers are the system's.
+ *
+ * `wacPageServer(next, answer, post, where, site)` answers the lookup and the capability's range, passes every
+ * other request to `next`, sends the document what `post` takes, and starts at location `where`; it answers
+ * `request`, and `receive` for what the document sends back. `site` is the page's own URL, or null for a page opened
+ * from a file: what `wac.site` (`src/site.wac`) fetches from, relative to it and never outside its folder. A buffer is handed over rather than copied when it is the whole
+ * of its own memory.
+ */
+export string programSide() {
+  return """
+      const wacPageServer = (next, answer, post, where, site, size, route) => {
+        // **Where `wac.page`'s numbers start here** — above every request std numbers, below the 2^20 a parent
+        // numbers the capabilities it provides from — and how many there are: `src/line.wac`'s `PAGE_COUNT`, which
+        // a request asked directly rather than sent in a batch is routed by. It stayed at 23 while the changes after
+        // that were added, which nobody saw because each of them travels in a batch; `PAGE_ZONE` is asked.
+        // `PAGE_COUNT` in `src/line.wac`: a request numbered past it is not this host's, and goes on to `next`.
+        const BASE = 4096, COUNT = 41;
+        const NONE = new Uint8Array(0), dec = new TextDecoder(), enc = new TextEncoder();
+        const lo = (v) => Number(BigInt.asIntN(32, v)), hi = (v) => Number(v >> 32n);
+        const pair = (high, low) => (BigInt(high) << 32n) | BigInt(low >>> 0);
+        const quadAt = (v, k) => Number((v >> BigInt(48 - 16 * k)) & 0xffffn);
+        // **One message a turn.** The program runs until it waits; what it asked of the document meanwhile
+        // goes as one batch, in order, when it does — so a diff that makes five hundred changes costs one
+        // message, and an element made in a turn exists before a later call in that turn draws into it.
+        let batch = null, moving = [];
+        const send = (m, transfer) => {
+          if (batch === null) {
+            batch = [];
+            queueMicrotask(() => { const b = batch, t = moving; batch = null; moving = []; post(["ops", b], t); });
+          }
+          batch.push(m);
+          if (transfer) moving.push(...transfer);
+        };
+        // **What the document said that the program has not asked for yet**, and the requests waiting for it.
+        // An event or a file is answered later, never inside the request that asked — so each runs the
+        // program on in a turn of its own, and renders before the next.
+        const events = [], eventAsks = [], files = [], fileAsks = [], frames = new Map(), values = new Map(), stores = new Map(), audios = new Map();
+        let at = where, locationAsks = [], lastFrame = 0, lastValue = 0;
+        // **The page's path on its site** (`PAGE_PATH`), as the document worked it out from its address (`wacRouteOf`).
+        let path = route ?? "/", pathAsks = [];
+        // Whether the page is seen, as the document last said — `""` until it has — and who waits to hear it change.
+        let seen = "", seenAsks = [];
+        const seenNow = () => {
+          const waiting = seenAsks;
+          seenAsks = [];
+          for (const w of waiting) { if (seen !== "" && seen !== w.known) answer(w.id, 0, seen, NONE, 0n, 0n, 0); else seenAsks.push(w); }
+        };
+        const strip = (h) => h.startsWith("#") ? h.slice(1) : h;
+        const giveEvent = (id, [seq, kind, target, listener, value, x, y, mods, selStart, selEnd, at, pointer]) => {
+          const k = enc.encode(kind), b = new Uint8Array(24 + k.length), v = new DataView(b.buffer);
+          v.setInt32(0, seq, true); v.setInt32(4, selStart, true); v.setInt32(8, selEnd, true);
+          v.setBigInt64(12, BigInt(Math.round(at * 1000)), true);
+          v.setInt32(20, pointer ?? -1, true);
+          b.set(k, 24);
+          answer(id, 0, value, b, pair(listener, target), pair(x, y), mods);
+        };
+        const giveFile = (id, [ok, name, bytes, error]) => answer(id, 0, name, ok ? bytes : enc.encode(error), 0n, 0n, ok ? 0 : 1);
+        // A location is answered at once, even inside the request: the program learns where it is before it runs.
+        const located = () => {
+          const waiting = locationAsks;
+          locationAsks = [];
+          for (const w of waiting) { if (strip(at) !== w.known) answer(w.id, 0, strip(at), NONE, 0n, 0n, 0); else locationAsks.push(w); }
+        };
+        // A path is answered at once, as a location is: the program knows which page it is before its first turn.
+        const pathed = () => {
+          const waiting = pathAsks;
+          pathAsks = [];
+          for (const w of waiting) { if (path !== w.known) answer(w.id, 0, path, NONE, 0n, 0n, 0); else pathAsks.push(w); }
+        };
+        const flush = () => {
+          while (eventAsks.length && events.length) giveEvent(eventAsks.shift(), events.shift());
+          while (fileAsks.length && files.length) giveFile(fileAsks.shift(), files.shift());
+        };
+        const page = (k, id, a, b, text, bytes) => {
+          switch (k) {
+            case 0: return send(["make", lo(a), hi(b), text, lo(b)]);
+            case 1: return send(["makeText", lo(a), hi(b), text, lo(b)]);
+            case 2: return send(["text", lo(a), text]);
+            case 3: return send(["attr", lo(a), text, dec.decode(bytes), b !== 0n]);
+            case 4: return send(["prop", lo(a), text, dec.decode(bytes), hi(a)]);
+            case 5: return send(["move", lo(a), lo(b)]);
+            case 6: return send(["remove", lo(a)]);
+            case 7: return send(["listenOn", lo(a), text, dec.decode(bytes)]);
+            case 8: return send(["focus", lo(a)]);
+            case 9: { const req = ++lastValue; values.set(req, id); return send(["valueOf", req, lo(a)]); }
+            case 10: return send(["pixels", lo(a), hi(b), lo(b), bytes], wacOwn(bytes));
+            case 11: return send(["pixelsIn", lo(a), quadAt(b, 0), quadAt(b, 1), quadAt(b, 2), quadAt(b, 3), bytes], wacOwn(bytes));
+            case 12: return send(["scroll", lo(a), text]);
+            case 13: return send(["select", lo(a), hi(b), lo(b), hi(a)]);
+            case 14: return send(["typeText", lo(a), text, hi(a)]);
+            case 15: return send(["title", text]);
+            case 16: console.log(text); return;
+            case 17: return send(["download", text, bytes], wacOwn(bytes));
+            case 18: eventAsks.push(id); return queueMicrotask(flush);
+            case 19: fileAsks.push(id); return queueMicrotask(flush);
+            case 20: { const f = ++lastFrame; frames.set(f, id); return send(["frame", f]); }
+            case 21: locationAsks.push({ id, known: text }); return located();
+            // The reader's zone is this thread's as much as the document's — a worker's `Date` knows it — so it is
+            // answered here, at once. Minutes ahead of UTC, which is `getTimezoneOffset` the other way round.
+            case 30: return answer(id, 0, "", NONE, BigInt(-new Date(Number(a)).getTimezoneOffset()), 0n, 0);
+            case 31: seenAsks.push({ id, known: text }); return seenNow();
+            case 32: return send(["back"]);
+            case 37: pathAsks.push({ id, known: text }); return pathed();
+            // The program's new path, known here at once; the address bar is the document's to change.
+            case 38: path = text; pathed(); return send(["navigate", text, a !== 0n]);
+            case 39: return send(["links", a !== 0n]);
+            case 40: return send(["describe", text]);
+            // The reader's zone by name: this thread's `Intl` knows it as the document's does, so answered at once.
+            case 33: return answer(id, 0, Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", NONE, 0n, 0n, 0);
+            // `localStorage` is the document's alone — a worker has none — so a read goes there and back.
+            case 34: { const req = ++lastValue; stores.set(req, id); return send(["stored", req, text]); }
+            case 35: return send(["store", text, dec.decode(bytes), a !== 0n]);
+            // The audio is the document's: its state, or a resume, goes there and back (`PAGE_AUDIO`).
+            case 36: { const req = ++lastValue; audios.set(req, id); return send(["audio", req, a !== 0n]); }
+            case 23: return send(["sound", lo(a), Number(b), bytes], wacOwn(bytes));
+            case 24: {
+              // When, by the page's clock, and how far in: two little-endian f64s, when the program gave them.
+              const when = bytes.length >= 16 ? new DataView(bytes.buffer, bytes.byteOffset, 16) : null;
+              return send(["play", hi(a), lo(a), hi(b) / 1000, lo(b) !== 0,
+                           when ? when.getFloat64(0, true) : 0, when ? when.getFloat64(8, true) : 0]);
+            }
+            case 25: return send(["stop", lo(a)]);
+            case 26: return send(["gain", lo(a), hi(b) / 1000, lo(b)]);
+            // **A canvas handed to a worker to draw**: this program's own, or — named by the handle it spawned the child
+            // as — a child's, whose surface is passed down to it when the document has handed it over.
+            case 28: {
+              const child = hi(b), key = lo(b);
+              if (child < 0) return send(["surface", lo(a), key]);
+              const fwd = ++wacSurfaceNext;
+              wacSurfaceForward.set(fwd, { child, key });
+              return send(["surface", lo(a), fwd]);
+            }
+            // Full screen, asked for: the document's to try, and the browser's to allow.
+            case 29: return send(["fullScreen", lo(a), b !== 0n]);
+            // The program's new location, known here at once; the document's history is the document's to change.
+            case 27: at = "#" + text; located(); return send(["go", text, a !== 0n]);
+            // The changes the program held, in order, as each would have come alone; answered at once.
+            case 22: {
+              const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+              let at = 0;
+              for (let i = 0; i < Number(a) && at + 21 <= bytes.length; i++) {
+                const op = bytes[at], ca = v.getBigInt64(at + 1, true), cb = v.getBigInt64(at + 9, true);
+                const tlen = v.getUint32(at + 17, true);
+                const ctext = dec.decode(bytes.subarray(at + 21, at + 21 + tlen));
+                const blen = v.getUint32(at + 21 + tlen, true), from = at + 25 + tlen;
+                // A copy, not a view: a buffer handed to the document is moved, and this one is the batch's.
+                page(op, 0, ca, cb, ctext, bytes.slice(from, from + blen));
+                at = from + blen;
+              }
+              return answer(id, 0, "", NONE, 0n, 0n, 0);
+            }
+          }
+        };
+        // **`wac.site`**: a GET on the page's own origin, under its site's root — the browser's cache does the caching. A
+        // page at a route (`Frame.on`) is that route's folder below the root, so its site is that many folders up:
+        // `/docs/a/` reads its site's files from `../../`.
+        const SITE = BASE + 100;
+        const siteUp = (route ?? "/").split("/").filter((s) => s !== "").map(() => "../").join("");
+        const siteDir = site === null ? null : new URL(siteUp || "./", new URL("./", site));
+        const siteGet = (id, path) => {
+          let rel = path;
+          while (rel.startsWith("/")) rel = rel.slice(1);
+          const u = new URL(rel, siteDir);
+          if (!u.href.startsWith(siteDir.href)) return answer(id, 9, path + " is not under the page's site", NONE, 0n, 0n, 0);
+          fetch(u).then((r) => r.ok
+              ? r.arrayBuffer().then((buf) => answer(id, 0, "", new Uint8Array(buf), 0n, 0n, 0))
+              : answer(id, 2, path + ": the site answered " + r.status, NONE, 0n, 0n, 0),
+            (e) => answer(id, 5, path + ": " + String(e?.message ?? e), NONE, 0n, 0n, 0));
+        };
+        // **`wac.origin`** (`src/origin.wac`): requests of any method to the page's own origin, and WebSockets to it —
+        // `fetch` and `WebSocket`, which a worker has as the document does, so nothing goes by the document. A path,
+        // never a URL: whatever it says, it is resolved against the origin and refused if it lands anywhere else.
+        const ORIGIN = BASE + 120;
+        const origin = site === null || !/^https?:/.test(site) ? null : new URL(site).origin;
+        const onOrigin = (path) => {
+          if (!path.startsWith("/")) return null;
+          const u = new URL(path, origin);
+          return u.origin === origin ? u : null;
+        };
+        const originFetch = (id, text, bytes) => {
+          const sp = text.indexOf(" "), method = text.slice(0, sp), path = text.slice(sp + 1);
+          const u = onOrigin(path);
+          if (u === null) return answer(id, 9, path + " is not a path on the page's origin", NONE, 0n, 0n, 0);
+          const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          const n = bytes.length >= 4 ? v.getUint32(0, true) : 0;
+          const headers = new Headers();
+          for (const line of dec.decode(bytes.subarray(4, 4 + n)).split("\\n")) {
+            const c = line.indexOf(":");
+            // A field the browser will not let a page set is the browser's to drop; it is not an error here.
+            if (c > 0) { try { headers.append(line.slice(0, c).trim(), line.slice(c + 1).trim()); } catch {} }
+          }
+          const init = { method, headers };
+          if (method !== "GET" && method !== "HEAD") init.body = bytes.slice(4 + n);
+          fetch(u, init).then((r) => r.arrayBuffer().then((buf) => {
+            let h = "";
+            r.headers.forEach((value, name) => { h += name + ": " + value + "\\n"; });
+            answer(id, 0, h, new Uint8Array(buf), BigInt(r.status), 0n, 0);
+          }), (e) => answer(id, 5, method + " " + path + ": " + String(e?.message ?? e), NONE, 0n, 0n, 0));
+        };
+        // Each socket queues what arrives until the program asks, and answers each `next` in order; once it has
+        // closed and its queue is empty, every `next` answers how it closed.
+        const sockets = new Map();
+        let lastSocket = 0;
+        const pump = (s) => {
+          while (s.asks.length && s.queue.length) {
+            const d = s.queue.shift(), ask = s.asks.shift();
+            if (typeof d === "string") answer(ask, 0, "", enc.encode(d), 0n, 0n, 0);
+            else answer(ask, 0, "", new Uint8Array(d), 0n, 0n, 1);
+          }
+          if (s.closed !== null) while (s.asks.length) answer(s.asks.shift(), 0, s.closed.reason, NONE, BigInt(s.closed.code), 0n, 2);
+        };
+        const socketOpen = (id, path) => {
+          const u = onOrigin(path);
+          if (u === null) return answer(id, 9, path + " is not a path on the page's origin", NONE, 0n, 0n, 0);
+          u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+          let ws;
+          try { ws = new WebSocket(u); } catch (e) { return answer(id, 5, path + ": " + String(e?.message ?? e), NONE, 0n, 0n, 0); }
+          ws.binaryType = "arraybuffer";
+          const key = ++lastSocket, s = { ws, queue: [], asks: [], closed: null, opened: false };
+          sockets.set(key, s);
+          ws.onopen = () => { s.opened = true; answer(id, 0, "", NONE, BigInt(key), 0n, 0); };
+          ws.onmessage = (ev) => { s.queue.push(ev.data); pump(s); };
+          ws.onclose = (ev) => {
+            if (!s.opened) { sockets.delete(key); return answer(id, 5, path + ": the socket closed before it opened (" + ev.code + ")", NONE, 0n, 0n, 0); }
+            s.closed = { code: ev.code, reason: ev.reason };
+            pump(s);
+          };
+        };
+        const originOp = (k, id, a, b, text, bytes) => {
+          if (k === 0) return originFetch(id, text, bytes);
+          if (k === 1) return socketOpen(id, text);
+          const s = sockets.get(lo(a));
+          if (k === 2) {
+            if (!s || s.ws.readyState !== 1) return answer(id, 5, "the socket is closed", NONE, 0n, 0n, 0);
+            s.ws.send(b === 1n ? bytes : dec.decode(bytes));
+            return answer(id, 0, "", NONE, 0n, 0n, 0);
+          }
+          if (k === 3) {
+            if (!s) return answer(id, 0, "no such socket", NONE, 1006n, 0n, 2);
+            s.asks.push(id);
+            return pump(s);
+          }
+          if (k === 4) {
+            if (s) { try { s.ws.close(Number(b) || 1000, text); } catch { s.ws.close(); } }
+            return answer(id, 0, "", NONE, 0n, 0n, 0);
+          }
+          return answer(id, 9, "wac.origin has no request " + k, NONE, 0n, 0n, 0);
+        };
+        // **`wac.gpu`**: WebGPU's compute half — buffers, WGSL programs, runs and reads — for a program that asks for it
+        // (wac-tensor's `src/gpu/line.wac` is the client, and says what each operation's fields hold). Opened the first
+        // time it is looked up, which answers once the device is ready, so no operation ever arrives before it.
+        //
+        // **Runs are encoded as they come and submitted together**: at the end of each batch, before a read, and before
+        // a write to a buffer a run already encoded uses — the queue's writes land before anything submitted after them,
+        // so that write must wait for that run to be submitted first. Every other write goes straight in: a kernel's
+        // parameters are a buffer made for it, which nothing encoded has seen, so a step is a few submits, not one a run. A buffer freed is destroyed only after the submit that follows,
+        // since a run already encoded may still read it. What the GPU reports going wrong, from an error scope around
+        // each batch, waits to be the fault in the next read's answer: a read is the one place the program listens.
+        const GPU = BASE + 200, GPU_COUNT = 7;
+        const gpuBuffers = new Map(), gpuPrograms = new Map();
+        let gpuOpening = null, gpuDev = null, gpuEncoder = null, gpuDoomed = [], gpuErrors = [], gpuScopes = [];
+        const gpuEncoded = new Set();
+        const gpuOpen = () => gpuOpening ??= (async () => {
+          if (!globalThis.navigator?.gpu) throw new Error("this browser has no WebGPU");
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) throw new Error("WebGPU found no adapter here");
+          const L = adapter.limits;
+          gpuDev = await adapter.requestDevice({ requiredLimits: {
+            maxStorageBufferBindingSize: L.maxStorageBufferBindingSize, maxBufferSize: L.maxBufferSize,
+          } });
+          gpuDev.lost.then((info) => gpuErrors.push("the GPU was lost: " + info.message));
+          return gpuDev;
+        })();
+        const gpuSubmit = () => {
+          if (gpuEncoder !== null) { gpuDev.queue.submit([gpuEncoder.finish()]); gpuEncoder = null; }
+          gpuEncoded.clear();
+          for (const h of gpuDoomed) { gpuBuffers.get(h)?.destroy(); gpuBuffers.delete(h); gpuPrograms.delete(h); }
+          gpuDoomed = [];
+        };
+        const gpuWatch = (f) => {
+          gpuDev.pushErrorScope("validation");
+          gpuDev.pushErrorScope("out-of-memory");
+          f();
+          for (let i = 0; i < 2; i++) gpuScopes.push(gpuDev.popErrorScope().then((e) => { if (e) gpuErrors.push(e.message); }));
+        };
+        const USAGE = () => GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+        const gpuOp = (k, id, a, b, text, bytes) => {
+          const d = gpuDev;
+          switch (k) {
+            case 0: return gpuBuffers.set(lo(a), d.createBuffer({ size: Math.max(4, Math.ceil(Number(b) / 4) * 4), usage: USAGE() }));
+            case 1: {
+              if (gpuEncoded.has(lo(a))) gpuSubmit();
+              const buf = gpuBuffers.get(lo(a));
+              if (!buf) return gpuErrors.push("a write to buffer " + lo(a) + ", which is not there");
+              return d.queue.writeBuffer(buf, Number(b), bytes);
+            }
+            case 2: return gpuDoomed.push(lo(a));
+            case 3: {
+              const module = d.createShaderModule({ code: text });
+              return gpuPrograms.set(lo(a), d.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } }));
+            }
+            case 4: {
+              const pipe = gpuPrograms.get(lo(a));
+              const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+              const entries = [];
+              for (let i = 0; i * 4 < bytes.length; i++) {
+                const h = v.getInt32(i * 4, true);
+                gpuEncoded.add(h);
+                entries.push({ binding: i, resource: { buffer: gpuBuffers.get(h) } });
+              }
+              if (!pipe || entries.some((e) => !e.resource.buffer)) return gpuErrors.push("a run named a program or buffer that is not there");
+              const group = d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+              gpuEncoder ??= d.createCommandEncoder();
+              const pass = gpuEncoder.beginComputePass();
+              pass.setPipeline(pipe);
+              pass.setBindGroup(0, group);
+              pass.dispatchWorkgroups(quadAt(b, 0), quadAt(b, 1), quadAt(b, 2));
+              return pass.end();
+            }
+            case 5: {
+              const src = gpuBuffers.get(lo(a)), off = hi(b), len = lo(b), size = Math.ceil(len / 4) * 4;
+              if (!src) return answer(id, 9, "a read of buffer " + lo(a) + ", which is not there", NONE, 0n, 0n, 0);
+              const staging = d.createBuffer({ size: Math.max(4, size), usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+              gpuWatch(() => {
+                gpuEncoder ??= d.createCommandEncoder();
+                gpuEncoder.copyBufferToBuffer(src, off, staging, 0, size);
+                gpuSubmit();
+              });
+              const scopes = gpuScopes;
+              gpuScopes = [];
+              return Promise.all([staging.mapAsync(GPUMapMode.READ), ...scopes]).then(() => {
+                const out = new Uint8Array(staging.getMappedRange().slice(0, len));
+                staging.destroy();
+                if (gpuErrors.length) { const why = gpuErrors.join("; "); gpuErrors = []; return answer(id, 5, why, NONE, 0n, 0n, 0); }
+                answer(id, 0, "", out, 0n, 0n, 0);
+              }, (e) => answer(id, 5, String(e?.message ?? e), NONE, 0n, 0n, 0));
+            }
+            // What the program held, in order, as each would have come alone; then submitted, and answered at once.
+            case 6: {
+              const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+              gpuWatch(() => {
+                let at = 0;
+                for (let i = 0; i < Number(a) && at + 21 <= bytes.length; i++) {
+                  const op = bytes[at], ca = v.getBigInt64(at + 1, true), cb = v.getBigInt64(at + 9, true);
+                  const tlen = v.getUint32(at + 17, true);
+                  const ctext = dec.decode(bytes.subarray(at + 21, at + 21 + tlen));
+                  const blen = v.getUint32(at + 21 + tlen, true), from = at + 25 + tlen;
+                  gpuOp(op, 0, ca, cb, ctext, bytes.slice(from, from + blen));
+                  at = from + blen;
+                }
+                gpuSubmit();
+              });
+              return answer(id, 0, "", NONE, 0n, 0n, 0);
+            }
+          }
+        };
+        const allows = (versions) => {
+          // `^1`, `^1.0`, `^1.1.0` or `1.1.0`: what the 1.1.0 capability here allows — any 1.x at or below it, or it.
+          const here = [1, 1, 0], exact = !versions.startsWith("^");
+          const want = (exact ? versions : versions.slice(1)).split(".").map((n) => Number(n || 0));
+          while (want.length < 3) want.push(0);
+          if (exact) return want.join(".") === here.join(".");
+          return want[0] === here[0] && (want[1] < here[1] || (want[1] === here[1] && want[2] <= here[2]));
+        };
+        const request = (op, id, a, b, text, bytes) => {
+          if (op === 68 && text === "wac.site") {
+            if (siteDir === null) return answer(id, 9, "a page opened from a file has no site", NONE, 0n, 0n, 0);
+            if (!allows(dec.decode(bytes))) return answer(id, 9, "wac.site here is 1.1.0, which " + dec.decode(bytes) + " does not allow", NONE, 0n, 0n, 0);
+            // Where the page is, its `#` part left out: the address to give someone to open it too.
+            return answer(id, 0, "1.1.0", enc.encode(site.split("#")[0]), BigInt(SITE), 1n, 0);
+          }
+          if (op === SITE) return siteGet(id, text);
+          if (op === 68 && text === "wac.origin") {
+            if (origin === null) return answer(id, 9, "a page not served over http has no origin", NONE, 0n, 0n, 0);
+            // This host speaks 1.0.0, which `^1`, `^1.0`, `^1.0.0` and `1.0.0` allow.
+            const v = dec.decode(bytes);
+            const [major, minor, patch] = (v.startsWith("^") ? v.slice(1) : v).split(".");
+            const allowed = v.startsWith("^") ? major === "1" && (minor ?? "0") === "0" && (patch ?? "0") === "0" : v === "1.0.0";
+            if (!allowed) return answer(id, 9, "wac.origin here is 1.0.0, which " + v + " does not allow", NONE, 0n, 0n, 0);
+            return answer(id, 0, "1.0.0", enc.encode(origin), BigInt(ORIGIN), 5n, 0);
+          }
+          if (op >= ORIGIN && op < ORIGIN + 5 && origin !== null) return originOp(op - ORIGIN, id, a, b, text, bytes);
+          if (op === 68 && text === "wac.page") {
+            // `^1`, `^1.2`, or an exact `1.2.3`: this host speaks 1.0.0, which only `^1`, `^1.0`, `^1.0.0` and `1.0.0` allow.
+            const v = dec.decode(bytes);
+            const [major, minor, patch] = (v.startsWith("^") ? v.slice(1) : v).split(".");
+            const allowed = v.startsWith("^") ? major === "1" && (minor ?? "0") === "0" && (patch ?? "0") === "0" : v === "1.0.0";
+            if (!allowed) {
+              return answer(id, 9, "wac.page here is 1.0.0, which " + v + " does not allow", NONE, 0n, 0n, 0);
+            }
+            // The window's size when the page opened, `390x844`, which the program has before its first turn (`Page.size`).
+            return answer(id, 0, "1.0.0", size ? enc.encode(size) : NONE, BigInt(BASE), BigInt(COUNT), 0);
+          }
+          if (op === 68 && text === "wac.gpu") {
+            // This host speaks 1.0.0, which `^1`, `^1.0`, `^1.0.0` and `1.0.0` allow.
+            const v = dec.decode(bytes);
+            const [major, minor, patch] = (v.startsWith("^") ? v.slice(1) : v).split(".");
+            const allowed = v.startsWith("^") ? major === "1" && (minor ?? "0") === "0" && (patch ?? "0") === "0" : v === "1.0.0";
+            if (!allowed) return answer(id, 9, "wac.gpu here is 1.0.0, which " + v + " does not allow", NONE, 0n, 0n, 0);
+            return gpuOpen().then(() => answer(id, 0, "1.0.0", NONE, BigInt(GPU), BigInt(GPU_COUNT), 0),
+                                  (e) => answer(id, 9, String(e?.message ?? e), NONE, 0n, 0n, 0));
+          }
+          if (op >= GPU && op < GPU + GPU_COUNT && gpuDev !== null) return gpuOp(op - GPU, id, a, b, text, bytes);
+          if (op >= BASE && op < BASE + COUNT) return page(op - BASE, id, a, b, text, bytes);
+          return next(op, id, a, b, text, bytes);
+        };
+        const receive = (m) => {
+          switch (m[0]) {
+            case "el": events.push(m.slice(1)); return flush();
+            case "file": files.push(m.slice(1)); return flush();
+            case "where": at = m[1]; return located();
+            case "path": path = m[1]; return pathed();
+            case "seen": seen = m[1]; return seenNow();
+            case "value": { const id = values.get(m[1]); values.delete(m[1]); if (id !== undefined) answer(id, 0, m[2], NONE, 0n, 0n, 0); return; }
+            case "stored": { const id = stores.get(m[1]); stores.delete(m[1]); if (id !== undefined) answer(id, 0, m[2] ?? "", NONE, 0n, 0n, m[2] === null ? 1 : 0); return; }
+            case "audio": {
+              const id = audios.get(m[1]);
+              audios.delete(m[1]);
+              if (id !== undefined) answer(id, 0, m[2], m[3] === null ? NONE : enc.encode(m[3]), 0n, 0n, m[3] === null ? 0 : 1);
+              return;
+            }
+            case "timer": { const id = frames.get(m[1]); frames.delete(m[1]); if (id !== undefined) answer(id, 0, "", NONE, 0n, 0n, 0); return; }
+          }
+        };
+        return { request, receive };
+      };
+      """;
+}
+
+/**
+ * The system's half: `System`'s calls on the Origin Private File System,
+ * each answered later through `answer(req, fault, text, bytes, n, m, flags)` — `system.wac` says what
+ * each call's answer holds. It runs where the program does: a worker has the file system too.
+ *
+ * **A fault is a number from `std`'s table**, chosen here from the error the browser threw, and the
+ * browser's own message rides along for a fault the table has no words for. Paths are relative to the
+ * file system's root, which is also where a page's working directory is: `.` and empty parts are
+ * dropped, `..` climbs and stops at the root.
+ */
+export string systemSide() {
+  return """
+      // **A trap as `Child.ended()` says it**, classified as wac's `packages/platform/host/children.ts` `trapEnding` does
+      // — the same words, the same `TrapKind` numbers — so a page and every other host agree on how a child ended.
+      const wacEndedOf = (error) => {
+        const line = String(error).split(String.fromCharCode(10))[0];
+        if (line.startsWith("trapped: ")) return { how: 1, m: 0, text: line.slice(9) };
+        const own = line.indexOf("wac trap: ");
+        if (own >= 0) return { how: 1, m: 0, text: line.slice(own + 10) };
+        const w = line.toLowerCase();
+        const kind = w.includes("unreachable") ? 1
+          : w.includes("memory access out of bounds") || w.includes("array element access out of bounds") ? 2
+          : w.includes("table index is out of bounds") || w.includes("table access out of bounds") ? 3
+          : w.includes("divide by zero") || w.includes("remainder by zero") ? 4
+          : w.includes("divide result unrepresentable") || w.includes("integer overflow") ? 5
+          : w.includes("float unrepresentable") || w.includes("invalid conversion") ? 6
+          : w.includes("null") && (w.includes("dereferenc") || w.includes("function")) ? 7
+          : w.includes("illegal cast") || w.includes("signature mismatch") ? 8
+          : w.includes("call stack size exceeded") || w.includes("stack overflow") ? 9
+          : 10;
+        return { how: 1, m: kind, text: kind === 1 ? "" : line };
+      };
+      // A queue of byte chunks with one reader at a time: what a child's streams arrive on.
+      const wacQueue = () => {
+        const items = [], waiters = [];
+        let ended = false;
+        return {
+          push(b) { if (waiters.length) waiters.shift()({ bytes: b }); else items.push(b); },
+          // Put a piece back at the front: read on a reader's behalf, and not wanted after all.
+          unshift(b) { if (waiters.length) waiters.shift()({ bytes: b }); else items.unshift(b); },
+          end() { ended = true; while (waiters.length) waiters.shift()({ end: true }); },
+          next() {
+            if (items.length) return Promise.resolve({ bytes: items.shift() });
+            if (ended) return Promise.resolve({ end: true });
+            return new Promise((r) => waiters.push(r));
+          },
+        };
+      };
+      // Why `bytes` cannot be started as a program, or "": a wasm module carrying the manifest that describes it.
+      const wacNotRunnable = (bytes) => {
+        if (!WebAssembly.validate(bytes)) {
+          return bytes.length >= 4 && bytes[0] === 0 && bytes[1] === 97 && bytes[2] === 115 && bytes[3] === 109
+            ? "that is not a valid wasm module" : "a page starts wasm modules, and that is not one";
+        }
+        return WebAssembly.Module.customSections(new WebAssembly.Module(bytes), "wac.manifest").length > 0 ? ""
+          : "that module carries no wac.manifest section, so a page cannot describe it";
+      };
+      const wacOwn = (b) => b.byteOffset === 0 && b.byteLength === b.buffer.byteLength ? [b.buffer] : [];
+      // `me` is who this program is: a page (no arguments, no input, its output on the console), or a
+      // copy of one started by `spawnSelf`, or a module started by `spawn`, whose arguments, directory and
+      // streams its parent supplied.
+      //
+      // `wacServer` is the requests as plain JavaScript, `request` and `exit`: what every module the page runs is
+      // served by (`wacServe`), its own program among them.
+      const wacServer = (answer, me) => {
+        const enc = new TextEncoder();
+        const NONE = new Uint8Array(0);
+        const clock = () => performance.timeOrigin + performance.now();
+        let rootP = null;
+        // Requests withdrawn before they were answered (`OP_DROP`): what their answer would have held is closed
+        // instead of handed to a program that no longer wants it.
+        const dropped = new Set();
+        const root = () => (rootP ??= navigator.storage.getDirectory());
+        // Handles below 2 are reserved, as on every host: 0 is standard input, 1 the parent's files.
+        const handles = new Map();
+        // Modules loaded into this worker, by handle.
+        const loaded = new Map();
+        let nextLoaded = 1;
+        let nextHandle = 2;
+        const parts = (path) => {
+          const out = [];
+          const whole = String(path).startsWith("/") ? String(path) : me.cwd + "/" + String(path);
+          for (const p of whole.split("/")) {
+            if (p === "" || p === ".") continue;
+            if (p === "..") out.pop(); else out.push(p);
+          }
+          return out;
+        };
+        const dirAt = async (ps, create) => {
+          let d = await root();
+          for (const p of ps) d = await d.getDirectoryHandle(p, { create });
+          return d;
+        };
+        // The directory holding a path's last part, and that part — or a refusal for the root itself.
+        const parentOf = async (path, create) => {
+          const ps = parts(path);
+          if (ps.length === 0) throw Object.assign(new Error("the root"), { name: "TypeMismatchError" });
+          return [await dirAt(ps.slice(0, -1), create), ps[ps.length - 1]];
+        };
+        const faultOf = (e, isDir) => {
+          switch (e?.name) {
+            case "NotFoundError": return 1;
+            case "NotAllowedError": case "NoModificationAllowedError": case "SecurityError": return 2;
+            case "InvalidModificationError": return 4;
+            case "TypeMismatchError": return isDir ? 8 : 10;
+            case "QuotaExceededError": return 14;
+            default: return 5;
+          }
+        };
+        const fail = (req, e, isDir) =>
+          answer(req, faultOf(e, isDir), String(e?.message ?? e), NONE, 0n, 0n, 0);
+        const ok = (req, bytes = NONE, n = 0n, m = 0n, flags = 0) => answer(req, 0, "", bytes, n, m, flags);
+        const run = (req, isDir, work) => { work().then((a) => a, (e) => fail(req, e, isDir)); };
+        const writeTo = async (dir, name, bytes) => {
+          const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+          await w.write(bytes);
+          await w.close();
+        };
+        const fileOf = async (path) => {
+          const [dir, name] = await parentOf(path, false);
+          return await (await dir.getFileHandle(name)).getFile();
+        };
+        // Standard output and error: the console for a page, the parent for a child.
+        const emit = (toErr, bytes) => {
+          if (me.child) me.post([toErr ? "err" : "out", bytes], wacOwn(bytes));
+          else if (toErr) console.warn(new TextDecoder().decode(bytes));
+          else console.log(new TextDecoder().decode(bytes));
+        };
+        // `OP_SPAWN`'s and `OP_SPAWN_SELF`'s bytes: the module (empty: this program), then the arguments, each
+        // length-prefixed. `moduleOf` is the first part, `partsOf` the rest.
+        const moduleOf = (b) => {
+          const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+          return b.slice(4, 4 + v.getUint32(0, true));
+        };
+        const partsOf = (b) => {
+          const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+          let at = 4 + v.getUint32(0, true);
+          const n = v.getUint32(at, true);
+          at += 4;
+          const out = [];
+          for (let i = 0; i < n; i++) {
+            const len = v.getUint32(at, true);
+            out.push(b.slice(at + 4, at + 4 + len));
+            at += 4 + len;
+          }
+          return out;
+        };
+        // **One request at a time, by number** — design/system/0013 step 6's table, the same one every host serves.
+        // What a page refuses, and in which words, `system.wac` has already decided; what reaches here is done.
+        const request = (op, id, a, b, text, bytes) => {
+          const n = Number(a);
+          switch (op) {
+            case 0: dropped.add(id); return;
+            case 1: return ok(id, NONE, BigInt(Date.now()));
+            // **One clock for the document and every worker**: each has its own `performance.now()`, counted from when
+            // it started, so it is counted from that start's own time — and an event stamped in the document reads the
+            // same in a program in a worker, or in a child of a desktop's.
+            case 2: return ok(id, NONE, BigInt(Math.round(clock() * 1e6)));
+            case 3: return ok(id, crypto.getRandomValues(new Uint8Array(n)));
+            case 6: return ok(id, NONE, BigInt(me.args.length));
+            case 7: return ok(id, me.args[n] ?? NONE);
+            case 41: return answer(id, 0, me.cwd, NONE, 0n, 0n, 0);
+            case 9: return run(id, true, async () => ok(id, new Uint8Array(await (await fileOf(text)).arrayBuffer())));
+            case 10: return run(id, true, async () => {
+              const [dir, name] = await parentOf(text, false);
+              await writeTo(dir, name, bytes);
+              ok(id);
+            });
+            // No links in the Origin Private File System, so a stat and a link stat are one question.
+            case 13: case 47: return run(id, false, async () => {
+              try {
+                const f = await fileOf(text);
+                return ok(id, NONE, BigInt(f.size), BigInt(f.lastModified), 1 | 2);
+              } catch (e) {
+                if (e?.name !== "TypeMismatchError" && e?.name !== "NotFoundError") throw e;
+              }
+              try {
+                await dirAt(parts(text), false);
+                return ok(id, NONE, 0n, 0n, 1 | 4);
+              } catch (e) {
+                if (e?.name !== "TypeMismatchError" && e?.name !== "NotFoundError") throw e;
+              }
+              ok(id);
+            });
+            case 14: return run(id, false, async () => {
+              const d = await dirAt(parts(text), false);
+              const names = [];
+              for await (const k of d.keys()) names.push(k);
+              ok(id, enc.encode(names.sort().map((x) => x + String.fromCharCode(0)).join("")), 0n, 0n, 1);
+            });
+            case 15: return run(id, false, async () => {
+              const parentsToo = n !== 0;
+              const [dir, name] = await parentOf(text, parentsToo);
+              if (!parentsToo) {
+                let there = true;
+                try { await dir.getDirectoryHandle(name); } catch { there = false; }
+                if (there) return answer(id, 3, "", NONE, 0n, 0n, 0);
+              }
+              await dir.getDirectoryHandle(name, { create: true });
+              ok(id);
+            });
+            case 16: return run(id, false, async () => {
+              const [dir, name] = await parentOf(text, false);
+              await dir.removeEntry(name, { recursive: n !== 0 });
+              ok(id);
+            });
+            // No rename in the Origin Private File System: a copy and a delete, which is not atomic.
+            case 17: return run(id, true, async () => {
+              const to = new TextDecoder().decode(bytes);
+              const content = new Uint8Array(await (await fileOf(text)).arrayBuffer());
+              const [dir, name] = await parentOf(to, false);
+              await writeTo(dir, name, content);
+              const [fdir, fname] = await parentOf(text, false);
+              await fdir.removeEntry(fname);
+              ok(id);
+            });
+            case 12: case 48: emit(op === 48, bytes); return ok(id, NONE, 0n, 0n, 1);
+            case 19: return read(id, me.stdin);
+            case 30: setTimeout(() => ok(id, NONE, BigInt(Math.round(clock() * 1e6))), n); return;
+            case 27: return spawn(id, partsOf(bytes), n, text, Number(b), moduleOf(bytes));
+            case 24: return read(id, n === 1 && me.served ? me.fsIn : handles.get(n)?.q);
+            case 25: {
+              const to = handles.get(n);
+              // The line to a parent exists only when the parent serves this child files: anything else is a
+              // send that did not go, as on every other host, so a child that asks is told at once.
+              if (n === 1 && me.served) me.post(["fs", bytes], wacOwn(bytes));
+              else if (to !== undefined && to.kind === "write") {
+                return to.w.write(bytes).then(() => ok(id, NONE, 0n, 0n, 1), () => answer(id, 5, "", NONE, 0n, 0n, 0));
+              }
+              else if (to === undefined || to.child === undefined || to.child.gone) return answer(id, 5, "", NONE, 0n, 0n, 0);
+              else if (to.kind === "out") to.child.send(["stdin", bytes], wacOwn(bytes));
+              else if (to.kind === "fs") to.child.send(["fs", bytes], wacOwn(bytes));
+              return ok(id, NONE, 0n, 0n, 1);
+            }
+            case 29: { const c = handles.get(n)?.child; if (c && !c.gone) c.send(["stdinEnd"]); return; }
+            case 26: { const to = handles.get(n); if (to && to.kind === "out") stop(to.child, 143); return; }
+            case 28: {
+              const c = handles.get(n)?.child;
+              if (c === undefined) return answer(id, 5, "not a child", NONE, 0n, 0n, 0);
+              c.exit.then((code) => ok(id, NONE, BigInt(code)));
+              return;
+            }
+            // **`CHILD_ENDED`: how a child ended** (`Child.ended()`, wac 71bc06729), answered as wac's own browser host
+            // answers it — `n` 0 exited with code `m`, 1 trapped with kind `m` (std's `TrapKind`) saying `text`, 2 a host
+            // limit saying why. `Child.exit()` is answered from this too, so a page that did not serve it could not wait
+            // for a child at all (wac `issues/system/0460e`).
+            case 74: {
+              const c = handles.get(n)?.child;
+              if (c === undefined) return answer(id, 5, "not a child", NONE, 0n, 0n, 0);
+              c.ended.then((e) => answer(id, 0, e.text, NONE, BigInt(e.how), BigInt(e.m), 0));
+              return;
+            }
+            // A file as a handle of its own. A read takes the whole file at once and queues it in pieces, so
+            // `recv` serves it as it serves a child; a write goes to the browser's writable stream, which keeps
+            // nothing until it is closed — so a file half-written by a program that stopped is not left behind.
+            case 61: return run(id, true, async () => {
+              let held;
+              if (n === 0) {
+                const content = new Uint8Array(await (await fileOf(text)).arrayBuffer());
+                const q = wacQueue();
+                for (let at = 0; at < content.length; at += 65536) q.push(content.slice(at, at + 65536));
+                q.end();
+                held = { kind: "file", q };
+              } else {
+                const [dir, name] = await parentOf(text, false);
+                const fh = await dir.getFileHandle(name, { create: true });
+                const w = await fh.createWritable({ keepExistingData: n === 2 });
+                if (n === 2) await w.seek((await fh.getFile()).size);
+                held = { kind: "write", w };
+              }
+              if (dropped.delete(id)) { if (held.kind === "write") await held.w.abort(); return; }
+              const h = nextHandle++;
+              handles.set(h, held);
+              ok(id, NONE, BigInt(h));
+            });
+            case 62: {
+              const f = handles.get(n);
+              if (f === undefined || (f.kind !== "file" && f.kind !== "write")) return answer(id, 5, "", NONE, 0n, 0n, 0);
+              handles.delete(n);
+              if (f.kind === "file") return ok(id, NONE, 0n, 0n, 1);
+              f.w.close().then(() => ok(id, NONE, 0n, 0n, 1), (e) => fail(id, e, true));
+              return;
+            }
+            // **A module in this worker, called by name** (`wacLoad`) — how `wac test` runs tests. Answered at once, as
+            // on every host; what it holds was narrowed before it got here.
+            // **Whether the engine will load it** — the engine's own answer, with its reason. Not whether a page could start
+            // it as a program (`wacNotRunnable`), which wants a manifest: `wac build` asks this of each module it makes
+            // before writing it, and a module needs no manifest to load.
+            case 67: {
+              if (WebAssembly.validate(bytes)) return answer(id, 0, "", NONE, 0n, 0n, 0);
+              let why = "the engine will not load it";
+              try { new WebAssembly.Module(bytes); } catch (e) { why = String(e?.message ?? e); }
+              return answer(id, 5, why, NONE, 0n, 0n, 0);
+            }
+            case 64: {
+              const why = wacNotRunnable(bytes);
+              if (why !== "") return answer(id, 5, why, NONE, 0n, 0n, 0);
+              const h = nextLoaded++;
+              loaded.set(h, wacLoad(me, bytes.slice(), n));
+              return ok(id, NONE, BigInt(h));
+            }
+            case 65: {
+              const m = loaded.get(n);
+              if (m === undefined) return answer(id, 0, "no module loaded as " + n, NONE, 0n, 0n, 2);
+              const [status, said, value] = m.call(text, Number(b));
+              return answer(id, 0, said, NONE, BigInt(value), 0n, status);
+            }
+            case 66: loaded.delete(n); return;
+            // **Surfaces**: a canvas this worker draws itself (web's `HOST_SURFACE_*`), answered here, at once — in a
+            // worker only, where a canvas can be handed; a page on the page's own thread draws the usual way.
+            case 900001: {
+              if (typeof WorkerGlobalScope === "undefined" || typeof OffscreenCanvas === "undefined" || typeof wacSurfaceOf !== "function") {
+                return answer(id, 9, "no surfaces here", NONE, 0n, 0n, 0);
+              }
+              const k = ++wacSurfaceNext;
+              wacSurfaceOf(k);
+              return ok(id, NONE, BigInt(k));
+            }
+            case 900002: case 900003: {
+              const whole = op === 900002;
+              const q = (k) => Number((b >> BigInt(48 - 16 * k)) & 0xffffn);
+              const drawn = typeof wacSurfaceDraw === "function"
+                && (whole ? wacSurfaceDraw(n, 0, 0, Number(b >> 32n), Number(BigInt.asIntN(32, b)), true, bytes)
+                          : wacSurfaceDraw(n, q(0), q(1), q(2), q(3), false, bytes));
+              return answer(id, drawn ? 0 : 9, drawn ? "" : "the surface has not arrived", NONE, 0n, 0n, 0);
+            }
+            case 68: return answer(id, 9, "no capability " + text + " in a page", NONE, 0n, 0n, 0);
+            default: return answer(id, 9, "a page does not serve request " + op, NONE, 0n, 0n, 0);
+          }
+        };
+        // `ended` is how (`Child.ended()`, wac's `Ended`): absent for a plain exit with `code`.
+        return { request, exit: (code, ended) => {
+          if (!me.child) throw new Error("the program exited with " + code);
+          me.post(["exit", code, ended]);
+          close();
+        } };
+
+        // ── Programs started from this one ───────────────────────────────────────────────────────
+        // A child is a worker on this very script, told who it is by its first message. Its output,
+        // its errors and its questions about files arrive as messages and wait in queues until read;
+        // its input and the answers to its questions go back the same way.
+        function read(req, q) {
+          if (q === undefined) return answer(req, 0, "", NONE, 0n, 0n, 1);
+          q.next().then((r) => r.end ? answer(req, 0, "", NONE, 0n, 0n, 1) : answer(req, 0, "", r.bytes, 0n, 0n, 0));
+        }
+        // Only the page's thread, which started the child, can end it: asked to, it stops the child and whatever the
+        // child started.
+        function stop(c, code, ended) {
+          if (c.gone) return;
+          c.gone = true;
+          if (c.id >= 0) { wacTellPage(["stop", c.id]); wacChildFailed.delete(c.id); }
+          wacChildren.delete(c.h);
+          c.port?.close();
+          c.out.end(); c.err.end(); c.fs.end();
+          c.settle(code);
+          c.settleEnded(ended ?? (code === 143 ? { how: 2, m: 0, text: "stopped by its parent" } : { how: 0, m: code, text: "" }));
+        }
+        // `wasm` is a module to run (`OP_SPAWN`), or null for another copy of this page (`OP_SPAWN_SELF`). Either
+        // way the child is a worker on this very script; its first message says which it is.
+        // `flags` is `Launch`'s: 1 the child reads this program's input, 2 it writes this program's output and
+        // errors, and 256 this program serves it files.
+        function spawn(req, args, grants, cwd, flags, wasm) {
+          const serveFs = (flags & 256) !== 0, inheritIn = (flags & 1) !== 0, inheritOut = (flags & 2) !== 0;
+          if (typeof WorkerGlobalScope === "undefined") {
+            return answer(req, 9, "a page built --in-page cannot start programs", NONE, 0n, 0n, 0);
+          }
+          // **A module is checked before anything starts**, as the other hosts check one: a file that is not a wac
+          // program is refused here, at `spawn`, rather than started in a worker that then fails to compile it.
+          if (wasm !== null) {
+            const why = wacNotRunnable(wasm);
+            if (why !== "") return answer(req, 5, why, NONE, 0n, 0n, 0);
+          }
+          // **The page's own thread starts it** (design/system/0015 decision 3), and hands this program one end of a
+          // channel and the child the other: they talk directly, and the page is involved only to start and to stop.
+          // A page opened from a file may not start a worker from a worker, and its own thread may — so this is one
+          // route on `http://` and `file://` alike.
+          let settle;
+          const c = { id: -1, port: null, waiting: [], out: wacQueue(), err: wacQueue(), fs: wacQueue(), gone: false,
+                      exit: new Promise((r) => { settle = r; }) };
+          c.settle = settle;
+          c.ended = new Promise((r) => { c.settleEnded = r; });
+          // What this program sends before the channel arrives waits for it.
+          c.send = (m, transfer) => { if (c.port !== null) c.port.postMessage(m, transfer ?? []); else c.waiting.push([m, transfer]); };
+          const h = nextHandle++, eh = nextHandle++, fh = serveFs ? nextHandle++ : -1;
+          // Known by the handle its program holds (`Child.handle`): what a surface for one of its canvases is sent by.
+          c.h = h;
+          wacChildren.set(h, c);
+          handles.set(h, { kind: "out", child: c, q: c.out });
+          handles.set(eh, { kind: "err", child: c, q: c.err });
+          if (fh >= 0) handles.set(fh, { kind: "fs", child: c, q: c.fs });
+          // **Inherited output is written as it arrives**, to this program's own streams, which keeps the order
+          // between the two; the child's queues are left empty, and end when it does.
+          const heard = (e) => {
+            const [k, v] = e.data;
+            if (k === "out") { if (inheritOut) emit(false, v); else c.out.push(v); }
+            else if (k === "err") { if (inheritOut) emit(true, v); else c.err.push(v); }
+            else if (k === "fs") c.fs.push(v);
+            else if (k === "exit") stop(c, v, e.data[2]);
+          };
+          // **Inherited input is read for the child while it runs** — from this program's input, which a page has
+          // none of — and a piece read after it ended goes back for whoever reads next.
+          if (inheritIn && me.stdin !== undefined) {
+            (async () => {
+              while (!c.gone) {
+                const r = await me.stdin.next();
+                if (c.gone) { if (!r.end) me.stdin.unshift(r.bytes); return; }
+                if (r.end) { c.send(["stdinEnd"]); return; }
+                c.send(["stdin", r.bytes]);
+              }
+            })();
+          }
+          wacAskPage(["start", "module", { wasm, args, grants, cwd, serveFs }], wacOwn(wasm)).then(([id, port, why]) => {
+            if (port === null) {
+              if (dropped.delete(req)) return;
+              return answer(req, 5, "the program could not be started: " + why, NONE, 0n, 0n, 0);
+            }
+            c.id = id;
+            c.port = port;
+            port.onmessage = heard;
+            // A child that dies without saying so — a trap the browser reports, not an exit — is heard of from the
+            // page's thread, which saw it.
+            wacChildFailed.set(id, (why) => {
+              c.err.push(enc.encode((why || "the program stopped") + "\\n"));
+              stop(c, 134, wacEndedOf(why || "the program stopped"));
+            });
+            for (const [m, t] of c.waiting) port.postMessage(m, t ?? []);
+            c.waiting = [];
+            if (dropped.delete(req)) return stop(c, 143);
+            // `m` packs the error stream's handle (low 32 bits) and the served-files channel's (high 32).
+            ok(req, NONE, BigInt(h), (BigInt(eh) & 0xffffffffn) | (BigInt(fh) << 32n));
+          });
+        }
+      };
+      """;
+}
+
+/**
+ * A module the page was handed, run in a worker of its own (design/system/0015): `OP_SPAWN`'s other half.
+ *
+ * **Driven from its manifest**, as wac's `packages/platform/host/driver.ts` drives one on Deno and Node: the module
+ * describes its own boundary in a `wac.manifest` section, and since design/system/0013 step 6 that boundary is a
+ * handful of plain values — `__wacHost` takes the host's four calls, `__wacAnswered` takes an answer, and the rest
+ * are opaque references handed straight back. So the conversions are strings, arrays and functions, and they are
+ * `marshal.ts`'s, written again here because a page carries no TypeScript.
+ *
+ * **Its requests are served by `wacServer`**, the same switch that serves the page's own program and a copy of the
+ * page — one implementation of what a request means in a browser.
+ *
+ * **It never blocks.** Its `waitAny` answers `HOST_CANNOT_WAIT` (-2); an `async` program then hands control back,
+ * and is run on with `__wacAdvance` once an answer has arrived. An answer the browser has at once — the clock, an
+ * argument, a write to a stream — is delivered inside the request that asked, as on every host; anything else is
+ * delivered between turns, when the module is running nothing. A program whose `main` is not `async` blocks on its
+ * first wait for the browser, and stops saying so.
+ *
+ * **It holds what it was handed and no more**: the browser half decides nothing, so what a page's own program has
+ * refused for it by `system.wac`, a module has refused for it here (`wacServe`). And it may `load` a module into
+ * its own worker and call it by name (`wacLoad`), answered at once as on every host — which is how `wac test`
+ * runs tests.
+ */
+export string moduleSide() {
+  return """
+      // ── A module, driven from its manifest: `marshal.ts`'s conversions, by the shape of a type string. ──────
+      const wacDrive = (mod, manifest) => {
+        let ex = null;
+        const call = (name, ...a) => {
+          if (typeof ex[name] !== "function") throw new Error("the module exports no " + name);
+          return ex[name](...a);
+        };
+        const mem = () => new Uint8Array(ex["$bind$mem"].buffer);
+        const SCALARS = new Set(["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "bool"]);
+        const bindName = (n) => n.replace(/[^A-Za-z0-9_]+/g, "$").replace(/^[$]+|[$]+$/g, "");
+        const shapeOf = (type) => {
+          const t = type.trim();
+          if (t.endsWith("?")) return shapeOf(t.slice(0, -1));
+          if (t === "void" || t === "") return { kind: "void" };
+          if (t === "string") return { kind: "string" };
+          if (SCALARS.has(t)) return { kind: "scalar", name: t };
+          if (t.endsWith("[]")) {
+            const elem = shapeOf(t.slice(0, -2));
+            const suffix = elem.kind === "scalar" ? elem.name : elem.kind === "string" ? "string"
+              : elem.kind === "array" ? elem.suffix + "Arr" : bindName(elem.name ?? "void");
+            return { kind: "array", elem, suffix };
+          }
+          return { kind: "ref", name: t };
+        };
+        const give = (make, data) => {
+          call("$bind$mem_ensure", data.length);
+          mem().set(data, 0);
+          return call(make, data.length);
+        };
+        const fromWasm = (sh, w) => {
+          if (w === null || w === undefined) return null;
+          switch (sh.kind) {
+            case "void": return undefined;
+            case "scalar": return sh.name === "bool" ? w !== 0 : w;
+            case "ref": return w;
+            case "string": {
+              const n = call("$bind$str_len", w);
+              call("$bind$mem_ensure", n);
+              call("$bind$str_to_mem", w);
+              return new TextDecoder().decode(mem().slice(0, n));
+            }
+            case "array": {
+              if (sh.elem.kind === "scalar" && sh.elem.name === "u8") {
+                const n = call("$bind$arr_u8_len", w);
+                call("$bind$mem_ensure", n);
+                call("$bind$arr_u8_to_mem", w);
+                return mem().slice(0, n);
+              }
+              const n = call("$bind$arr_" + sh.suffix + "_len", w);
+              const out = [];
+              for (let i = 0; i < n; i++) out.push(fromWasm(sh.elem, call("$bind$arr_" + sh.suffix + "_get", w, i)));
+              return out;
+            }
+          }
+        };
+        // A function becomes a funcref, made by the module from a slot — the one conversion a host cannot do.
+        const slots = manifest.callbacks.map(() => []);
+        const toWasm = (type, v) => {
+          const base = type.endsWith("?") ? type.slice(0, -1) : type;
+          if (base.startsWith("fn[") && typeof v === "function") {
+            const j = manifest.callbacks.findIndex((c) => c.type === base);
+            if (j < 0) throw new Error(base + " has no dispatcher in this module");
+            let slot = slots[j].indexOf(v);
+            if (slot < 0) { slot = slots[j].length; slots[j].push(v); }
+            return call(manifest.callbacks[j].helper, slot);
+          }
+          const sh = shapeOf(base);
+          if (v === null || v === undefined) return sh.kind === "void" ? undefined : null;
+          switch (sh.kind) {
+            case "void": return undefined;
+            case "scalar": return sh.name === "bool" ? (v ? 1 : 0) : v;
+            case "ref": return v;
+            case "string": return give("$bind$str_from_mem", new TextEncoder().encode(String(v)));
+            case "array": {
+              if (sh.elem.kind === "scalar" && sh.elem.name === "u8") return give("$bind$arr_u8_from_mem", Uint8Array.from(v));
+              const elem = base.slice(0, -2);
+              const filled = typeof ex["$bind$arr_" + sh.suffix + "_new0"] === "function";
+              if (filled && v.length === 0) return call("$bind$arr_" + sh.suffix + "_new0");
+              const arr = filled ? call("$bind$arr_" + sh.suffix + "_new", v.length, toWasm(elem, v[0]))
+                                 : call("$bind$arr_" + sh.suffix + "_new", v.length);
+              for (let i = filled ? 1 : 0; i < v.length; i++) call("$bind$arr_" + sh.suffix + "_set", arr, i, toWasm(elem, v[i]));
+              return arr;
+            }
+          }
+        };
+        const wac = {};
+        manifest.callbacks.forEach((cb, j) => {
+          wac[cb.field] = (slot, ...rest) => {
+            const f = slots[j][slot];
+            if (f === undefined) throw new Error("no function in slot " + slot + " of " + cb.type);
+            const out = f(...(cb.params ?? []).map((t, i) => fromWasm(shapeOf(t), rest[i])));
+            return cb.ret === "void" ? undefined : toWasm(cb.ret, out);
+          };
+        });
+        ex = new WebAssembly.Instance(mod, { wac }).exports;
+        const app = {};
+        for (const sig of manifest.exports) {
+          if (typeof ex[sig.name] !== "function") continue;
+          app[sig.name] = (...a) => {
+            const out = ex[sig.name](...sig.params.map((t, i) => toWasm(t, a[i])));
+            return sig.ret === "" || sig.ret === "void" ? undefined : fromWasm(shapeOf(sig.ret), out);
+          };
+        }
+        // What `trap "…"` left behind, or "" — asked of a module that has just trapped, so it may trap itself.
+        const trapSaid = () => {
+          try { return typeof ex["$trap$message"] === "function" ? fromWasm({ kind: "string" }, ex["$trap$message"]()) ?? "" : ""; }
+          catch { return ""; }
+        };
+        return { app, manifest, trapSaid };
+      };
+      const wacManifestOf = (mod) => {
+        const section = WebAssembly.Module.customSections(mod, "wac.manifest");
+        return section.length === 0 ? null : JSON.parse(new TextDecoder().decode(section[0]));
+      };
+
+      // ── Serving a module: one `wacServer` per module, so each keeps its own requests and handles. ────────────
+      //
+      // `wasm` is the module's bytes, for its `spawnSelf`; `grants` is what it was handed; `deliver` gives it an
+      // answer. **What it was not handed is refused here**, as `system.wac`'s `refusal` refuses what the page was
+      // not built with: its requests come straight to `wacServer`, which does what it is asked and decides nothing.
+      // Files need `GRANT_READ` (1) to look and `GRANT_WRITE` (2) to change, and what it starts or loads holds no
+      // more than it does. A program with no files of its own is served its parent's over handle 1, and asks
+      // nothing here. Answers the browser has at once — the clock, randomness, an argument, the directory, a write
+      // to a stream, the module calls, and a surface made or drawn — are delivered inside the request that asked; the rest when `later`
+      // says, which is between turns, when the module is running nothing.
+      const AT_ONCE = new Set([1, 2, 3, 6, 7, 41, 12, 48, 64, 65, 66, 67, 900001, 900002, 900003]);
+      const wacServe = (me, wasm, grants, deliver, later) => {
+        const NONE = new Uint8Array(0);
+        let asking = -1;
+        const answer = (...a) => {
+          if (asking >= 0 && AT_ONCE.has(asking)) deliver(a);
+          else later(a);
+        };
+        const server = wacServer(answer, me);
+        const looks = (op, a) => op === 9 || op === 13 || op === 47 || op === 14 || (op === 61 && Number(a) === 0);
+        const changes = (op) => op === 10 || op === 15 || op === 16 || op === 17 || op === 61 || op === 52 || op === 60;
+        // The page's own program was granted what the build said; anything else, what the program that started it handed it.
+        const notHanded = (what) => "Not granted to this application: " + (me.child
+          ? "the program that started it did not hand it `" + what + "`" : "the page was built without `--grant " + what + "`");
+        const ok = (id) => answer(id, 0, "", NONE, 0n, 0n, 0);
+        const request = (op, id, a, b, text, bytes) => {
+          const was = asking;
+          asking = op;
+          try {
+            if (looks(op, a) && (grants & 1) === 0) return answer(id, 7, notHanded("read"), NONE, 0n, 0n, 0);
+            if (!looks(op, a) && changes(op) && (grants & 2) === 0) return answer(id, 7, notHanded("write"), NONE, 0n, 0n, 0);
+            // No environment and no standard input to read whole, as for the page's own program.
+            if (op === 8 || op === 11) return ok(id);
+            if (op === 27) return server.request(op, id, BigInt(Number(a) & grants), b, text, bytes);
+            // **Itself again is this module again**, not a copy of the page whose script the worker runs on.
+            if (op === 49) {
+              const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+              const rest = bytes.slice(4 + v.getUint32(0, true));
+              const whole = new Uint8Array(4 + wasm.length + rest.length);
+              new DataView(whole.buffer).setUint32(0, wasm.length, true);
+              whole.set(wasm, 4);
+              whole.set(rest, 4 + wasm.length);
+              return server.request(27, id, BigInt(Number(a) & grants), b, text, whole);
+            }
+            if (op === 64) return server.request(op, id, BigInt(Number(a) & grants), b, text, bytes);
+            server.request(op, id, a, b, text, bytes);
+          } finally { asking = was; }
+        };
+        return { request, exit: server.exit };
+      };
+
+      // A module loaded into this worker: driven, given a host of its own, and called by name — the native host's
+      // `call_loaded`. An export taking nothing, an `i32` or its `Host`, and answering nothing, an `i32` or a
+      // `string`: status 0 with the answer, 1 for a trap with what it said, 2 for no such export, 3 for one this
+      // cannot call.
+      const wacLoad = (me, wasm, grants) => {
+        const mod = new WebAssembly.Module(wasm);
+        const d = wacDrive(mod, wacManifestOf(mod));
+        let host = null;
+        const deliver = (a) => d.app.__wacAnswered(host, ...a);
+        const s = wacServe(me, wasm, grants, deliver, (a) => setTimeout(() => deliver(a), 0));
+        if (typeof d.app.__wacHost === "function") {
+          host = d.app.__wacHost(s.request, (ids, millis) => -2, (code) => { throw new Error("exited with " + code); }, () => false);
+        }
+        return {
+          call(name, arg) {
+            const sig = d.manifest.exports.find((e) => e.name === name);
+            if (sig === undefined || typeof d.app[name] !== "function") return [2, "no export named " + name, 0];
+            const takesInt = sig.params.length === 1 && sig.params[0] === "i32";
+            // The host value is whatever this module's `__wacHost` answers: `Host`, or `Host__std` beside another `Host`.
+            const hostType = (d.manifest.exports.find((e) => e.name === "__wacHost") || {}).ret;
+            const takesHost = sig.params.length === 1 && sig.params[0] === hostType;
+            if (sig.params.length > 0 && !takesInt && !takesHost) return [3, "cannot call " + name + "(" + sig.params.join(", ") + ")", 0];
+            if (takesHost && host === null) return [3, name + " takes a Host and this module exports no __wacHost", 0];
+            const ret = sig.ret === "" ? "void" : sig.ret;
+            if (ret !== "void" && ret !== "i32" && ret !== "string") return [3, name + " answers " + ret, 0];
+            let out;
+            try { out = d.app[name](...(takesInt ? [arg] : takesHost ? [host] : [])); }
+            catch { return [1, d.trapSaid(), 0]; }
+            return ret === "string" ? [0, out ?? "", 0] : [0, "", ret === "i32" ? out : 0];
+          },
+        };
+      };
+
+      // ── A module, run: driven from its manifest, served by `wacServe`, and run on as answers arrive. ───────────
+      //
+      // `layered`, when given, stands between the module and `wacServe`: it is handed the server's `request` and an
+      // `answer` for its own answers — delivered at once inside a request, and between turns otherwise, as the
+      // server's are — and answers the `request` the module makes. The page's program runs under `wac.page` that way.
+      // `said` is where a module that cannot run says why. Answers whatever the layer answered.
+      const wacRun = (wasm, me, grants, layered, said) => {
+        const mod = new WebAssembly.Module(wasm);
+        const manifest = wacManifestOf(mod);
+        if (manifest === null) {
+          said("this is not a wac program: it carries no wac.manifest section");
+          return null;
+        }
+        const { app, trapSaid } = wacDrive(mod, manifest);
+        let host = null, run = null, finished = false, turning = false, depth = 0;
+        const arrived = [];
+        const deliver = (a) => { if (!finished) app.__wacAnswered(host, ...a); };
+        const turn = () => {
+          turning = false;
+          if (finished) return;
+          while (arrived.length > 0) deliver(arrived.shift());
+          if (run === null) return;
+          run = app.__wacAdvance(run);
+          settle();
+        };
+        const later = (a) => {
+          if (finished) return;
+          arrived.push(a);
+          if (!turning) { turning = true; setTimeout(turn, 0); }
+        };
+        const s = wacServe(me, wasm, grants, deliver, later);
+        const top = layered ? layered(s.request, (...a) => depth > 0 ? deliver(a) : later(a)) : { request: s.request };
+        const request = (...r) => {
+          depth++;
+          try { return top.request(...r); } finally { depth--; }
+        };
+        const settle = () => {
+          if (finished || run === null || !app.__wacDone(run)) return;
+          finished = true;
+          s.exit(app.__wacStatus(run));
+        };
+        // A page cannot wait: `HOST_CANNOT_WAIT`, and an `async` program yields.
+        const waitAny = (ids, millis) => -2;
+        const exitWith = (code) => {
+          finished = true;
+          s.exit(code);
+          throw new Error("exited");
+        };
+        const interrupted = () => false;
+        try {
+          // **A program that takes nothing has no host**: its `main` has no parameter and the module exports no
+          // `__wacHost`, so there is nothing to make and nothing it will ask.
+          if (typeof app.__wacHost === "function") host = app.__wacHost(request, waitAny, exitWith, interrupted);
+          if (typeof app.__wacStart === "function") {
+            run = app.__wacStart(host);
+            settle();
+          } else {
+            const sig = manifest.exports.find((e) => e.name === "main");
+            if (sig === undefined) throw new Error("the module has no main");
+            const code = app.main(...(sig.params.length > 0 ? [host] : []));
+            finished = true;
+            s.exit(code ?? 0);
+          }
+        } catch (e) {
+          if (!finished) {
+            said(String(e?.message ?? e));
+            finished = true;
+            // A program's own `trap "…"` left its words behind; anything else is the engine's, classified.
+            const own = trapSaid();
+            s.exit(134, own !== "" ? { how: 1, m: 0, text: own } : wacEndedOf(String(e?.message ?? e)));
+          }
+        }
+        return top;
+      };
+
+      // ── A module the page was handed, as a process: `OP_SPAWN`'s other half. ─────────────────────────────────
+      const wacModule = (init, port) => {
+        const stdin = wacQueue(), fsIn = wacQueue();
+        const me = { child: true, served: !!init.serveFs, args: init.args, cwd: init.cwd || "/", stdin, fsIn,
+                     post: (m, transfer) => port.postMessage(m, transfer ?? []) };
+        port.onmessage = (e) => wacFromParent(e.data, stdin, fsIn);
+        const said = (text) => me.post(["err", new TextEncoder().encode(text + String.fromCharCode(10))]);
+        if (wacRun(init.wasm, me, Number(init.grants), null, said) === null) {
+          me.post(["exit", 126, { how: 2, m: 0, text: "the program could not be started" }]);
+          close();
+        }
+      };
+
+      // ── The page's own program: a module like any other, under `wac.page`. ─────────────────────────────────────
+      //
+      // It holds what the build granted (`grants`), draws by sending `post` what the document applies, starts at
+      // location `where`, and answers `receive` for what the document sends back.
+      const wacPage = (wasm, grants, post, where, site, size, route) => {
+        const me = { child: false, args: [], cwd: "/", post: null };
+        const top = wacRun(wasm, me, grants, (next, answer) => wacPageServer(next, answer, post, where, site, size, route), (text) => console.error(text));
+        return top === null ? () => {} : top.receive;
+      };
+      """;
+}
+
+/**
+ * The document's half: each message from the program applied to the document, and each event, frame
+ * and file sent back with `emit`. No decisions are made here — everything a page does is in
+ * `src/page.wac`, where it is tested without a browser.
+ *
+ * **Every answer is sent later, never during the call that asked.** On the page the two halves are
+ * joined directly, so an answer sent at once would run the program inside the call that asked.
+ */
+export string documentSide() {
+  return """
+      // **The site's root, and where on the site this page is.** A page the build wrote for a route (`Frame.on`) says
+      // which, `data-wac-route` on `#app`; what its address has before that route is the folder the site is served
+      // from — `/wac-website-proto` on a host that serves many — and a path on the site is the rest. A page with no
+      // route is the site's root.
+      const wacSiteBase = (() => {
+        const p = location.pathname.replace(/index[.]html$/, "");
+        const r = document.getElementById("app")?.dataset.wacRoute ?? "/";
+        return p.endsWith(r) ? p.slice(0, p.length - r.length) : p.replace(/[/]$/, "");
+      })();
+      const wacRouteOf = (pathname) => {
+        let p = pathname.replace(/index[.]html$/, "");
+        if (p.startsWith(wacSiteBase)) p = p.slice(wacSiteBase.length);
+        return p.startsWith("/") ? p : "/" + p;
+      };
+      // The canvases handed to workers to draw, by the document's number for each: sized as their workers say.
+      const wacSurfaceEls = new Map();
+      let wacSurfaceDocNext = 0;
+      const wacDocument = (root, emit) => {
+        // **The handles**: each number the program chose, and the node it named. 0 is the root.
+        const nodes = new Map([[0, root]]);
+        const handleOf = new WeakMap([[root, 0]]);
+        // Events are numbered, and an input remembers the number of the last one typed into it — a value
+        // the program sends without having seen that event is older than what the user typed, and dropped.
+        let seq = 0;
+        const numbered = (ev) => (ev.__wacSeq ??= ++seq);
+        // **Where an event began**, inside a shadow root too: `target` is retargeted to the shadow root's host for a
+        // listener outside it, and the text field typed into is the one that matters (`Element.shadow`).
+        const origin = (ev) => (ev.composedPath ? ev.composedPath()[0] : ev.target) ?? ev.target;
+        root.addEventListener("input", (ev) => { origin(ev).__wacTyped = numbered(ev); }, true);
+        // **Hydration** (`src/prerender.wac`): a page whose entry declares its first frames arrives with one already in
+        // `#app` — each element marked with its handle, `data-wac-h`, and each text node after a comment naming its.
+        // Until the program's first batch has been applied, a handle it makes is matched to the node already there and
+        // that node kept: moved only if it is not where the program puts it, an attribute set only if it differs. Then
+        // whatever the batch did not make or keep goes, with the marks (`sweep`), and what the reader did meanwhile is
+        // handed to the listeners the batch put in place (`replay`). **A node kept is the node the reader may already
+        // have focused, typed into, scrolled or selected in**, which drawing it again would throw away.
+        let hydrating = root.hasAttribute("data-wac-pre");
+        // Each handle's mark not yet claimed: its element, or the comment before its text node.
+        const marked = new Map();
+        // Every node the first batch made or kept; for a kept element, the attributes the batch gave it; and the kept
+        // elements whose content it replaced with text.
+        const claimed = new WeakSet();
+        const given = new Map();
+        const texted = new WeakSet();
+        // Each parent's last child the first batch put at its end.
+        const lastPlaced = new Map();
+        let kept = 0, made = 0, differed = 0;
+        // **One frame of several** (`framesHtml`): the first whose media query matches, by the rule the stylesheet
+        // showed it by, is the one kept — unwrapped into `#app` — and the others go before anything is read from it.
+        // The program is told the window's size at this same moment, and draws the layout the frame was drawn for.
+        if (hydrating) {
+          const frames = [...root.children].filter((n) => n.hasAttribute("data-wac-frame"));
+          if (frames.length > 0) {
+            const kept = frames.find((f) => { const q = f.getAttribute("data-wac-media") ?? ""; return q === "" || matchMedia(q).matches; })
+                      ?? frames[frames.length - 1];
+            for (const n of [...root.children]) if (n !== kept && (n.hasAttribute("data-wac-frame") || n.hasAttribute("data-wac-frames"))) n.remove();
+            while (kept.firstChild) root.insertBefore(kept.firstChild, kept);
+            kept.remove();
+          }
+        }
+        if (hydrating) {
+          const marks = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
+          for (let n = marks.nextNode(); n; n = marks.nextNode()) {
+            if (n.nodeType === 1 && n.hasAttribute("data-wac-h")) marked.set(Number(n.getAttribute("data-wac-h")), n);
+            else if (n.nodeType === 8 && n.data.startsWith("wac:")) marked.set(Number(n.data.slice(4)), n);
+          }
+        }
+        // The node marked with handle `id`, taken if `fits` it, and `null` otherwise — left where it is, for the sweep.
+        const claim = (id, fits) => {
+          const n = marked.get(id);
+          if (n === undefined || !fits(n)) return null;
+          marked.delete(id);
+          return n;
+        };
+        const place = (parent, n, before) => {
+          const p = nodes.get(parent);
+          if (!p) return;
+          if (hydrating) {
+            claimed.add(n);
+            // **At the end of what the first batch has put here so far**: whatever follows that is markup not yet
+            // claimed, so a node already there — after unclaimed markup at most — stays where it is.
+            if (before < 0) {
+              const last = lastPlaced.get(p) ?? null;
+              lastPlaced.set(p, n);
+              let at = n.parentNode === p ? n.previousSibling : undefined;
+              while (at && !claimed.has(at)) at = at.previousSibling;
+              if (at !== undefined && (at ?? null) === last) return;
+              p.insertBefore(n, last ? last.nextSibling : p.firstChild);
+              return;
+            }
+            const b = nodes.get(before) ?? null;
+            if (n.parentNode === p && n.nextSibling === b) return;
+          }
+          p.insertBefore(n, before < 0 ? null : (nodes.get(before) ?? null));
+        };
+        // **The first batch is done**: what it neither made nor kept goes — unclaimed markup, an attribute the program
+        // did not give a node it kept, text it did not make there — and so do the marks. Said on the console only when
+        // the first frame drawn ahead of time was not the one drawn here, which is drift worth knowing about.
+        const sweep = () => {
+          hydrating = false;
+          let removed = 0;
+          for (const n of marked.values()) {
+            if (n.nodeType === 8) {
+              const t = n.nextSibling;
+              if (t && t.nodeType === 3 && !claimed.has(t)) t.remove();
+            } else if (n.isConnected) removed++;
+            n.remove();
+          }
+          for (const [el, names] of given) {
+            for (const a of [...el.attributes]) if (!names.has(a.name)) el.removeAttribute(a.name);
+            if (!texted.has(el)) for (const k of [...el.childNodes]) if (k.nodeType === 3 && !claimed.has(k)) k.remove();
+          }
+          marked.clear(); given.clear(); lastPlaced.clear();
+          root.removeAttribute("data-wac-pre");
+          if (made > 0 || removed > 0 || differed > 0) console.log(`wac: hydrated — ${kept} kept, ${made} made, ${removed} removed, ${differed} changed`);
+        };
+        // **What the reader did before the program listened** (`earlyScript`): each event handed, in order, to the
+        // listeners the first batch put on its target and everything above it, nearest first — the program hears it as
+        // it would have. Not dispatched again: what the browser did with it, it has done, and a click dispatched again
+        // would tick a checkbox back. An event on a node that is gone is dropped, as a late one is.
+        const replay = (events) => {
+          for (const ev of events) {
+            const t = origin(ev);
+            if (!t || !t.isConnected || !root.contains(t)) continue;
+            if (ev.type === "input") t.__wacTyped = numbered(ev);
+            for (let n = t; n; n = n === root ? null : n.parentNode) {
+              for (const f of n.__wacHeard?.get(ev.type) ?? []) f(ev);
+            }
+          }
+        };
+        const forget = (n) => {
+          if (handleOf.has(n)) nodes.delete(handleOf.get(n));
+          for (const k of n.childNodes ?? []) forget(k);
+        };
+        const blit = (ctx, w, h, rgba, x, y) => {
+          const img = ctx.createImageData(w, h);
+          img.data.set(rgba);
+          ctx.putImageData(img, x, y);
+        };
+        // Where in the element the pointer is, in the element's own pixels: a canvas's backing store
+        // rather than its size on screen, so a scaled canvas still answers in the units it is drawn in.
+        const within = (el, ev) => {
+          // A shadow root has no box of its own: its host's is where it is drawn.
+          if (!el.getBoundingClientRect && el.host) el = el.host;
+          if (ev.clientX === undefined || !el.getBoundingClientRect) return [0, 0];
+          const r = el.getBoundingClientRect();
+          // A handed-over canvas's own pixels are as large as its worker last said.
+          const cw = el.__wacSurface ? el.__wacSurface.w : el.width, ch = el.__wacSurface ? el.__wacSurface.h : el.height;
+          const sx = cw !== undefined && r.width > 0 ? cw / r.width : 1;
+          const sy = ch !== undefined && r.height > 0 ? ch / r.height : 1;
+          return [Math.round((ev.clientX - r.left) * sx), Math.round((ev.clientY - r.top) * sy)];
+        };
+        // **One audio context, made when a page first makes a sound or asks about its audio**, with the lowest latency
+        // the browser offers: a game's sound is heard as soon after the key as can be. A browser keeps it suspended
+        // until the person has done something on the page, and may suspend or interrupt it again later — a hidden
+        // tab, a phone call, another app taking the speaker. **Nothing here resumes it on its own**: the program asks
+        // (`Page.resumeAudio`, `PAGE_AUDIO`), from a gesture's handler or when the page is seen again, as a page's own
+        // script would call `AudioContext.resume()`.
+        let ctx = null;
+        const sounds = new Map(), voices = new Map();
+        // **A sound asked for while the audio is held** is kept until it is resumed, and played then only if it is
+        // still the moment it was for: the tap that resumes it should be heard, the sounds of a minute in a hidden tab
+        // should not all be heard at once. Measured against the *request* to resume, not against when the browser
+        // got round to it, so a slow resume (a Bluetooth speaker waking) does not drop the sound the tap was for. A
+        // loop is not a moment; it plays whenever the audio runs.
+        const STALE_MS = 400;
+        let resumeAsked = null;
+        // **Now, once for everything that arrived together** — the page's clock and the audio's both: voices started
+        // for one moment are placed by them, and read separately, either clock could move between two voices and start
+        // them apart.
+        let batchNow = null, batchAudio = null;
+        const audio = () => {
+          if (ctx) return ctx;
+          ctx = new AudioContext({ latencyHint: "interactive" });
+          ctx.addEventListener("statechange", () => {
+            if (ctx.state !== "running") return;
+            const asked = resumeAsked ?? performance.now();
+            for (const [voice, v] of voices) {
+              if (v.held !== undefined && asked - v.held > STALE_MS) { voices.delete(voice); v.src.stop(); }
+              else delete v.held;
+            }
+          });
+          return ctx;
+        };
+        // What an element filling the window, where there is no full screen, is styled with: above everything, edge to edge.
+        const WAC_FILL = [["position", "fixed"], ["inset", "0"], ["z-index", "2147483647"], ["width", "auto"],
+                          ["height", "auto"], ["margin", "0"], ["max-width", "none"], ["max-height", "none"]];
+        const WAC_SVG = "http://www.w3.org/2000/svg";
+        const ops = {
+          make: (id, parent, tag, before) => {
+            // `#shadow` is the parent's shadow root, opened — a page of its own inside it (`Element.shadow`).
+            if (tag === "#shadow") {
+              const host = nodes.get(parent);
+              if (!host || !host.attachShadow) return;
+              const sr = host.shadowRoot ?? host.attachShadow({ mode: "open" });
+              // `input` crosses the shadow root's edge to the listener on the root; `change` does not, so a file
+              // chosen in there is heard here.
+              sr.addEventListener("change", (ev) => changed(ev));
+              nodes.set(id, sr); handleOf.set(sr, id);
+              return;
+            }
+            // **SVG is a namespace, not a tag**: an `svg` element, and everything made inside one, is made in it, or
+            // the browser makes an unknown HTML element that draws nothing. The program names tags the same way either way.
+            const above = nodes.get(parent);
+            const svg = tag === "svg" || (above && above.namespaceURI === WAC_SVG && above.localName !== "foreignObject");
+            const old = hydrating ? claim(id, (n) => n.nodeType === 1 && n.localName === tag) : null;
+            if (old) { kept++; old.removeAttribute("data-wac-h"); given.set(old, new Set()); }
+            else if (hydrating) made++;
+            const el = old ?? (svg ? document.createElementNS(WAC_SVG, tag) : document.createElement(tag));
+            nodes.set(id, el); handleOf.set(el, id); place(parent, el, before);
+          },
+          makeText: (id, parent, text, before) => {
+            // A mark's text is the node after it, unless it was empty — then there is no node to keep.
+            const mark = hydrating ? claim(id, (n) => n.nodeType === 8) : null;
+            let t = mark && mark.nextSibling?.nodeType === 3 && !claimed.has(mark.nextSibling) ? mark.nextSibling : null;
+            if (mark) mark.remove();
+            // **Text in a stylesheet or a textarea has no mark** (`src/prerender.wac`): in there a comment would be text.
+            // The text already in a kept one, not yet claimed, is this text.
+            const above = nodes.get(parent);
+            const unmarked = !mark && hydrating && given.has(above) && (above.localName === "style" || above.localName === "textarea")
+              ? [...above.childNodes].find((k) => k.nodeType === 3 && !claimed.has(k)) : undefined;
+            if (unmarked) t = unmarked;
+            // A mark claimed is a match, kept, even when its text was empty and there is no node to keep but a new one.
+            if (mark || unmarked) kept++;
+            else if (hydrating) made++;
+            if (t) { if (t.data !== text) { t.data = text; differed++; } }
+            else t = document.createTextNode(text);
+            nodes.set(id, t); handleOf.set(t, id); place(parent, t, before);
+          },
+          text: (id, text) => {
+            const n = nodes.get(id);
+            if (!n) return;
+            if (n.nodeType === 3) { n.data = text; return; }
+            if (hydrating && given.has(n)) {
+              texted.add(n);
+              if (n.childNodes.length === 1 && n.firstChild.nodeType === 3 && n.firstChild.data === text) return;
+              differed++;
+            }
+            for (const k of n.childNodes) forget(k);
+            n.textContent = text;
+          },
+          attr: (id, name, value, present) => {
+            const n = nodes.get(id);
+            // A handed-over canvas is sized by the worker that draws it, and refuses to be resized here.
+            if (n && n.__wacSurface && (name === "width" || name === "height")) return;
+            if (n && hydrating && given.has(n)) {
+              given.get(n).add(name);
+              if (present ? n.getAttribute(name) === value : !n.hasAttribute(name)) return;
+              differed++;
+            }
+            if (n && n.setAttribute) { if (present) n.setAttribute(name, value); else n.removeAttribute(name); }
+          },
+          prop: (id, name, value, seen) => {
+            const n = nodes.get(id);
+            if (!n) return;
+            // A kept field keeps the attribute that started it off, and what the reader typed or ticked before the program
+            // listened: the program hears of that from `replay`, after this.
+            if (hydrating && given.has(n)) {
+              given.get(n).add(name);
+              if (n.__wacEarly) return;
+            }
+            if (name === "value") {
+              if ((n.__wacTyped ?? 0) > seen) return;
+              if (n.value !== value) n.value = value;
+            } else if (name === "scrollTop" || name === "scrollLeft") n[name] = Number(value) || 0;
+            else n[name] = value === "true";
+          },
+          select: (id, start, end, seen) => {
+            const n = nodes.get(id);
+            if (!n || !n.setSelectionRange || (n.__wacTyped ?? 0) > seen) return;
+            n.setSelectionRange(start, end);
+          },
+          // **As if typed**, so the edit is undoable and an `input` event follows: `execCommand` acts on the
+          // focused field, so focus it first; `setRangeText`, which is not undoable, where a browser has
+          // dropped `execCommand`.
+          typeText: (id, text, seen) => {
+            const n = nodes.get(id);
+            if (!n || (n.__wacTyped ?? 0) > seen) return;
+            const active = n.getRootNode ? n.getRootNode().activeElement : document.activeElement;
+            if (n !== active && n.focus) n.focus();
+            if (document.execCommand && document.execCommand("insertText", false, text)) return;
+            if (!n.setRangeText) return;
+            n.setRangeText(text, n.selectionStart, n.selectionEnd, "end");
+            n.dispatchEvent(new Event("input", { bubbles: true }));
+          },
+          move: (id, before) => {
+            const n = nodes.get(id);
+            if (n && n.parentNode) n.parentNode.insertBefore(n, before < 0 ? null : (nodes.get(before) ?? null));
+          },
+          remove: (id) => {
+            const n = nodes.get(id);
+            if (!n) return;
+            forget(n);
+            n.remove();
+          },
+          listenOn: (id, kind, prevent) => {
+            const n = nodes.get(id);
+            if (!n) return;
+            // `prevent` names keys: `Tab` matches with any modifiers held, and `Ctrl+s` only with exactly
+            // Ctrl (of Ctrl, Alt, Shift and Meta) — so a page can take Ctrl+S without taking every `s`. A
+            // single letter matches either case, since Shift turns `s` into `S`.
+            // Besides keys, `prevent` may say `*` — every default, however it is spelled — and `capture`: a pointer
+            // pressed down on this element stays this element's until it lifts, its moves and its lifting heard here
+            // even off the element — a finger held on a button and slid off it still lets go of the button.
+            const words = prevent.split(" ").filter((k) => k !== "");
+            const everything = prevent === "*" || words.includes("*");
+            const capture = words.includes("capture");
+            const keys = everything ? [] : words.filter((k) => k !== "capture").map((k) => {
+              const parts = k.split("+");
+              if (parts.length === 1 || k === "+") return { key: k, mods: -1 };
+              const bit = { Shift: 1, Ctrl: 2, Alt: 4, Meta: 8 };
+              let mods = 0;
+              for (const p of parts.slice(0, -1)) mods |= bit[p] ?? 0;
+              return { key: parts[parts.length - 1], mods };
+            });
+            const keyMatches = (ev) => keys.some((k) => {
+              const held = (ev.shiftKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0);
+              if (k.mods >= 0 && k.mods !== held) return false;
+              return k.key.length === 1 ? k.key.toLowerCase() === ev.key.toLowerCase() : k.key === ev.key;
+            });
+            // **`resize`** is the element's own size on screen, in device pixels, in `x` and `y`: once when it is
+            // listened for, and each time it changes — what a canvas is sized by to be drawn crisp.
+            if (kind === "resize") {
+              const box = !n.getBoundingClientRect && n.host ? n.host : n;
+              let seen = "";
+              new ResizeObserver(() => {
+                const r = box.getBoundingClientRect(), d = devicePixelRatio || 1;
+                const w = Math.round(r.width * d), h = Math.round(r.height * d);
+                if (`${w}x${h}` === seen) return;
+                seen = `${w}x${h}`;
+                emit(["el", ++seq, kind, id, id, String(d), w, h, 0, -1, -1, performance.timeOrigin + performance.now(), -1]);
+              }).observe(box);
+              return;
+            }
+            const heard = (ev) => {
+              let t = ev.target;
+              // Inside a shadow root, `parentNode` stops at the root, whose host is the next node out.
+              while (t && t !== n && !handleOf.has(t)) t = t.parentNode ?? t.host;
+              if (!t || !handleOf.has(t)) return;
+              const keyed = kind === "keydown" || kind === "keyup";
+              if (everything || kind === "submit" || (keyed && keyMatches(ev))) ev.preventDefault();
+              if (capture && kind === "pointerdown" && n.setPointerCapture) { try { n.setPointerCapture(ev.pointerId); } catch {} }
+              const el = ev.target;
+              // A wheel's value is how far it turned, in whole pixels down: a line is counted as 16, a page as 800.
+              const value = keyed ? ev.key
+                : kind === "fullscreenchange" ? (el && (document.fullscreenElement === el || el.hasAttribute?.("data-wac-full")) ? "1" : "")
+                : kind === "wheel" ? String(Math.round(ev.deltaY * (ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? 800 : 1)))
+                // A scroll's is where the element that scrolled now is: how far down, in whole CSS pixels.
+                : kind === "scroll" ? String(Math.round(el?.scrollTop ?? 0))
+                : (el && "value" in el ? String(el.value) : "");
+              // In the listening element's own pixels, whatever is under the pointer inside it: a bar's
+              // handler gets the bar's coordinates over its title, and a desktop's the desktop's over a window.
+              const [x, y] = within(n, ev);
+              const mods = (ev.shiftKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0);
+              // The caret of the text field it happened in; -1 where there is none.
+              const caret = el && typeof el.selectionStart === "number";
+              emit(["el", numbered(ev), kind, handleOf.get(t), id, value, x, y, mods,
+                    caret ? el.selectionStart : -1, caret ? el.selectionEnd : -1, performance.timeOrigin + ev.timeStamp,
+                    typeof ev.pointerId === "number" ? ev.pointerId : -1]);
+            };
+            n.addEventListener(kind, heard);
+            // Kept by kind, for `replay` to hand an event the reader made before this listener was here.
+            const byKind = n.__wacHeard ??= new Map();
+            if (!byKind.has(kind)) byKind.set(kind, []);
+            byKind.get(kind).push(heard);
+          },
+          focus: (id) => { const n = nodes.get(id); if (n && n.focus) n.focus(); },
+          // **Full screen, as the program asked** (`PAGE_FULLSCREEN`): the browser's own where it has it — which says no
+          // unless a tap or a key came just before, and is left with Back or Escape — and otherwise, an iPhone's
+          // browser, the element made to fill the window instead, said the same way: by `fullscreenchange`.
+          fullScreen: (id, on) => {
+            const el = nodes.get(id);
+            if (!el) return;
+            const filled = el.hasAttribute("data-wac-full");
+            if (on) {
+              if (document.fullscreenElement === el || filled) return;
+              if (el.requestFullscreen && document.fullscreenEnabled) { el.requestFullscreen().catch(() => {}); return; }
+              el.setAttribute("data-wac-full", "");
+              for (const [k, v] of WAC_FILL) el.style.setProperty(k, v, "important");
+              el.dispatchEvent(new Event("fullscreenchange", { bubbles: true }));
+              return;
+            }
+            if (document.fullscreenElement === el) { document.exitFullscreen().catch(() => {}); return; }
+            if (!filled) return;
+            el.removeAttribute("data-wac-full");
+            for (const [k] of WAC_FILL) el.style.removeProperty(k);
+            el.dispatchEvent(new Event("fullscreenchange", { bubbles: true }));
+          },
+          // A handle's canvas, which `Element.pixels` has already checked is one.
+          // **A canvas handed to a worker to draw** (`PAGE_SURFACE`): from now on it shows what that worker draws, and
+          // pixels sent here for it are not drawn. Numbered for the document, so a test can find what was drawn.
+          surface: (id, key) => {
+            const el = nodes.get(id);
+            if (!el || el.tagName !== "CANVAS" || el.__wacSurface || !el.transferControlToOffscreen) return;
+            let off;
+            try { off = el.transferControlToOffscreen(); } catch { return; }
+            const docId = ++wacSurfaceDocNext;
+            el.__wacSurface = { id: docId, w: el.width, h: el.height };
+            el.setAttribute("data-wac-surface", String(docId));
+            wacSurfaceEls.set(docId, el);
+            emit(["surface", key, off, docId], [off]);
+          },
+          pixels: (id, w, h, rgba) => {
+            const el = nodes.get(id);
+            if (!el || el.__wacSurface) return;
+            // Resizing clears a canvas, so only when the size changes.
+            if (el.width !== w) el.width = w;
+            if (el.height !== h) el.height = h;
+            blit(el.getContext("2d"), w, h, rgba, 0, 0);
+          },
+          pixelsIn: (id, x, y, w, h, rgba) => { const el = nodes.get(id); if (el && !el.__wacSurface) blit(el.getContext("2d"), w, h, rgba, x, y); },
+          // Under the handle's own element only: a name reaches no further than the handle does.
+          scroll: (id, named) => {
+            const n = nodes.get(id);
+            const el = !n || named === "" ? n : [...n.querySelectorAll("[id]")].find((e) => e.id === named);
+            if (el && el.scrollIntoView) el.scrollIntoView({ block: "start" });
+          },
+          valueOf: (req, id) => {
+            const n = nodes.get(id);
+            const value = n && "value" in n ? String(n.value) : "";
+            queueMicrotask(() => emit(["value", req, value]));
+          },
+          title: (title) => { document.title = title; },
+          // **Sound**: each one decoded once into a buffer, and a voice a source playing it through its own gain.
+          sound: (id, rate, bytes) => {
+            const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const n = bytes.byteLength >> 1;
+            const buf = audio().createBuffer(1, Math.max(n, 1), rate);
+            const ch = buf.getChannelData(0);
+            for (let i = 0; i < n; i++) ch[i] = v.getInt16(i * 2, true) / 32767;
+            sounds.set(id, buf);
+          },
+          play: (voice, sound, volume, loop, at, offset) => {
+            const buf = sounds.get(sound);
+            if (!buf) return;
+            const ctx = audio();
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.loop = loop;
+            const gain = ctx.createGain();
+            gain.gain.value = volume;
+            src.connect(gain).connect(ctx.destination);
+            src.onended = () => { if (voices.get(voice)?.src === src) voices.delete(voice); };
+            voices.get(voice)?.src.stop();
+            voices.set(voice, !loop && ctx.state !== "running" ? { src, gain, held: performance.now() } : { src, gain });
+            // **The page's clock to the audio's**: both read now, so a time on one is a time on the other. A time
+            // already gone is now, from as far in as it would have got by now.
+            const ahead = at > 0 ? (at - (batchNow ?? performance.timeOrigin + performance.now())) / 1000 : 0;
+            const into = Math.max(0, offset + (ahead < 0 ? -ahead : 0));
+            if (batchAudio === null) batchAudio = ctx.currentTime;
+            src.start(ahead > 0 ? batchAudio + ahead : batchAudio, loop ? into % buf.duration : Math.min(into, buf.duration));
+          },
+          stop: (voice) => {
+            const v = voices.get(voice);
+            if (v) { voices.delete(voice); v.src.stop(); }
+          },
+          gain: (voice, volume, ms) => {
+            const v = voices.get(voice);
+            if (!v || !ctx) return;
+            const g = v.gain.gain, t = ctx.currentTime;
+            g.cancelScheduledValues(t);
+            g.setValueAtTime(g.value, t);
+            g.linearRampToValueAtTime(volume, t + Math.max(ms, 1) / 1000);
+          },
+          frame: (id) => { requestAnimationFrame(() => emit(["timer", id])); },
+          // A new place in the history, or this one changed — neither fires `hashchange`; Back to it later does.
+          go: (where, push) => {
+            const url = where ? "#" + where : location.pathname + location.search;
+            if (push) history.pushState(null, "", url); else history.replaceState(null, "", url);
+          },
+          back: () => { history.back(); },
+          // A path on the site, in the address bar: a new place in the history, or this one's.
+          navigate: (path, push) => {
+            const url = wacSiteBase + path;
+            if (push) history.pushState(null, "", url); else history.replaceState(null, "", url);
+          },
+          links: (on) => { linksOn = on; },
+          describe: (text) => {
+            let m = document.querySelector('meta[name="description"]');
+            if (!m) { m = document.createElement("meta"); m.name = "description"; document.head.append(m); }
+            m.content = text;
+          },
+          // The page's store: `localStorage`, which a browser may refuse (storage off, a private window's quota) —
+          // then nothing is stored, and a read finds nothing, as it would in a fresh profile.
+          // **The audio, as the program asks about it** (`PAGE_AUDIO`): its state, or a resume — the browser's own
+          // `AudioContext.resume()`, answered when it settles with the state then, or the browser's reason for
+          // refusing. A resume also starts a silent sound, which Safari wants for a context made before any gesture;
+          // either counts only while the person's gesture is recent, which is why a program asks from its handler.
+          audio: (req, resume) => {
+            const c = audio();
+            if (!resume) { queueMicrotask(() => emit(["audio", req, c.state, null])); return; }
+            resumeAsked = performance.now();
+            if (c.state !== "running" && c.state !== "closed") {
+              const s = c.createBufferSource();
+              s.buffer = c.createBuffer(1, 1, c.sampleRate);
+              s.connect(c.destination);
+              s.start();
+            }
+            c.resume().then(() => emit(["audio", req, c.state, null]),
+                            (e) => emit(["audio", req, c.state, String(e?.message ?? e)]));
+          },
+          stored: (req, key) => {
+            let v = null;
+            try { v = localStorage.getItem(key); } catch {}
+            queueMicrotask(() => emit(["stored", req, v]));
+          },
+          store: (key, value, remove) => {
+            try { if (remove) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch {}
+          },
+          download: (name, bytes) => {
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(new Blob([bytes]));
+            a.download = name;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+          },
+        };
+        // Files arrive whether or not the program has asked yet; the page keeps them until it does.
+        // A file's name is its path below what the user handed over — `photos/2024/a.jpg` for a file
+        // in a folder, picked with `webkitdirectory` or dropped, and `a.jpg` for a file on its own.
+        const send = (f, path) => f.arrayBuffer().then(
+          (buf) => emit(["file", true, path, new Uint8Array(buf), ""], [buf]),
+          (e) => emit(["file", false, path, new Uint8Array(0), String(e?.message ?? e)]));
+        const take = (files) => { for (const f of files ?? []) send(f, f.webkitRelativePath || f.name); };
+        // A dropped folder is a directory entry rather than a file — reading it as one fails — so it is
+        // walked. `readEntries` answers in batches, and an empty batch is the end of the directory.
+        const rel = (p) => p.startsWith("/") ? p.slice(1) : p;
+        const failed = (path, e) => emit(["file", false, path, new Uint8Array(0), String(e?.message ?? e)]);
+        const walk = (entry) => {
+          if (entry.isFile) {
+            entry.file((f) => send(f, rel(entry.fullPath)), (e) => failed(rel(entry.fullPath), e));
+          } else if (entry.isDirectory) {
+            // Some browsers refuse to list a dropped folder on a page opened from a `file://` URL: the
+            // error says it was a folder, so a program can say what to do instead.
+            const reader = entry.createReader();
+            const more = () => reader.readEntries(
+              (batch) => { if (batch.length > 0) { batch.forEach(walk); more(); } },
+              (e) => failed(rel(entry.fullPath), `a dropped folder could not be listed here (${e?.name}: ${e?.message})`));
+            more();
+          }
+        };
+        // **A handle where the browser has one** (Chrome, Edge): the entry API's `readEntries` fails with
+        // an EncodingError on a page opened from a `file://` URL, and a built page is often opened that way.
+        const walkHandle = async (h, path) => {
+          if (h.kind === "file") {
+            try { send(await h.getFile(), path); } catch (e) { failed(path, e); }
+            return;
+          }
+          try { for await (const kid of h.values()) await walkHandle(kid, path + "/" + kid.name); }
+          catch (e) { failed(path, e); }
+        };
+        // **Only a folder is walked.** A dropped file is read as the file it is: through an entry, some
+        // browsers cannot read even a lone file on a page opened from a `file://` URL. Entries and handles
+        // are taken during the event, because a drop's items are unreadable once it returns; a handle the
+        // browser then refuses — as it may in a sandboxed frame — falls back to the entry. A browser with
+        // no entries at all cannot tell a folder from a file, and is given `files` as it always was.
+        const dropped = (dt) => {
+          const items = [...(dt?.items ?? [])].filter((it) => it.kind === "file");
+          const files = [...(dt?.files ?? [])];
+          const entries = items.map((it) => it.webkitGetAsEntry?.() ?? null);
+          if (items.length === 0 || files.length !== items.length || entries.some((x) => x === null)) {
+            take(dt?.files);
+            return;
+          }
+          const handles = items.map((it, i) =>
+            entries[i].isDirectory && it.getAsFileSystemHandle ? it.getAsFileSystemHandle() : null);
+          items.forEach((it, i) => {
+            if (!entries[i].isDirectory) take([files[i]]);
+            else if (handles[i]) handles[i].then((h) => h ? walkHandle(h, h.name) : walk(entries[i]), () => walk(entries[i]));
+            else walk(entries[i]);
+          });
+        };
+        const changed = (ev) => { const t = origin(ev); if (t?.files) take(t.files); };
+        root.addEventListener("change", changed);
+        // A link to `#/somewhere`, and the browser's back and forward, move the location; the program follows.
+        addEventListener("hashchange", () => emit(["where", location.hash]));
+        // Back and Forward between the site's pages, which the program navigated to: where the reader is now.
+        addEventListener("popstate", () => emit(["path", wacRouteOf(location.pathname)]));
+        // **A link to a page of this site, followed here** once the program has asked (`PAGE_LINKS`): the history moved
+        // and the program told, rather than the page loaded again. Not a link a handler has prevented, one opened in a
+        // new tab or window — a modifier held, a target — nor one to download, elsewhere, or within this page.
+        let linksOn = false;
+        root.addEventListener("click", (ev) => {
+          if (!linksOn || ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+          if (location.protocol === "file:") return;
+          const a = ev.target instanceof Element ? ev.target.closest("a[href]") : null;
+          if (!a || !root.contains(a) || (a.target && a.target !== "_self") || a.hasAttribute("download")) return;
+          const u = new URL(a.href, location.href);
+          if (u.origin !== location.origin || !(u.pathname + "/").startsWith(wacSiteBase + "/")) return;
+          if (u.pathname === location.pathname && u.search === location.search && u.hash) return;
+          ev.preventDefault();
+          history.pushState(null, "", u.pathname + u.search + u.hash);
+          emit(["path", wacRouteOf(u.pathname)]);
+        });
+        // **Whether the page is seen**: said once now and at each change. `pagehide` as well as `visibilitychange`,
+        // because a page being left is not always hidden first, and what it has not saved by then is lost.
+        // The first after this returns: whoever made this document starts the program only then, and a message before
+        // the program exists would be taken for the one that starts it.
+        const seeing = (on) => emit(["seen", on ? "1" : "0"]);
+        queueMicrotask(() => seeing(document.visibilityState !== "hidden"));
+        document.addEventListener("visibilitychange", () => seeing(document.visibilityState !== "hidden"));
+        addEventListener("pagehide", () => seeing(false));
+        addEventListener("pageshow", () => seeing(document.visibilityState !== "hidden"));
+        // Without preventing dragover a dropped file replaces the page.
+        document.addEventListener("dragover", (ev) => ev.preventDefault());
+        document.addEventListener("drop", (ev) => { ev.preventDefault(); dropped(ev.dataTransfer); });
+        const apply = (m) => ops[m[0]](...m.slice(1));
+        return (m) => {
+          batchNow = performance.timeOrigin + performance.now();
+          try {
+            if (m[0] !== "ops") apply(m);
+            else if (!hydrating) { for (const x of m[1]) apply(x); }
+            else {
+              // **The first batch, over the first frame drawn ahead of time.** A field the reader has already typed into or
+              // ticked keeps what they did; the events that did it are handed over once the listeners are in place.
+              const early = window.wacEarly ?? [];
+              window.wacEarly = null;
+              for (const ev of early) if (ev.type === "input" || ev.type === "change") { const t = origin(ev); if (t) t.__wacEarly = true; }
+              for (const x of m[1]) apply(x);
+              sweep();
+              replay(early);
+            }
+          } finally { batchNow = null; batchAudio = null; }
+        };
+      };
+      """;
+}
+
+/**
+ * **The page's thread starts every program** (design/system/0015 decision 3), for every worker that asks: the
+ * page's own program, a copy of the page it started, a module, and anything those start in turn. It makes a
+ * `MessageChannel` and hands one end to the worker that asked and the other to the new one, so the two talk
+ * directly; the page's thread hears from them only to start a child and to stop one.
+ *
+ * **Why the page's thread**: a page opened from a file has an opaque origin, and a worker there may not start a
+ * worker — while the page's own thread may. One route for `http://` and `file://` alike, so the tests over `http://`
+ * exercise what a page from a file depends on. And only the thread that started a worker can end it, which is
+ * what `^C` needs: asked to stop a child, it stops it and everything it started, as ending a worker that had
+ * started its own used to.
+ *
+ * `broker(from, message)` answers whether the message was the broker's: `["broker", n, "start", kind, init]`, answered
+ * `["brokered", n, id, port]` (or `null` and why), or `["broker", 0, "stop", id]`. A child that dies without exiting —
+ * a trap the browser reports — is told to its parent as `["childFailed", id, why]`.
+ */
+export string brokerSide() {
+  return """
+      const wacBroker = (script) => {
+        const kids = new Map();
+        let next = 0;
+        const stop = (id) => {
+          const k = kids.get(id);
+          if (k === undefined) return;
+          kids.delete(id);
+          k.worker.terminate();
+          for (const [other, o] of kids) if (o.parent === k.worker) stop(other);
+        };
+        const broker = (from, m) => {
+          if (Array.isArray(m) && m[0] === "surfaceSize") {
+            const s = wacSurfaceEls.get(m[1])?.__wacSurface;
+            if (s) { s.w = m[2]; s.h = m[3]; }
+            return true;
+          }
+          if (!Array.isArray(m) || m[0] !== "broker") return false;
+          const [, n, op, ...rest] = m;
+          if (op === "stop") { stop(rest[0]); return true; }
+          const [kind, init] = rest;
+          let worker;
+          try { worker = new Worker(script); }
+          catch (e) { from.postMessage(["brokered", n, -1, null, String(e?.message ?? e)]); return true; }
+          const id = ++next;
+          kids.set(id, { worker, parent: from });
+          worker.onmessage = (e) => { broker(worker, e.data); };
+          worker.onerror = (e) => {
+            e.preventDefault();
+            if (kids.has(id)) from.postMessage(["childFailed", id, e.message || "the program stopped"]);
+          };
+          const channel = new MessageChannel();
+          worker.postMessage([kind, init, channel.port2], [channel.port2, ...(init.wasm ? [init.wasm.buffer] : [])]);
+          from.postMessage(["brokered", n, id, channel.port1], [channel.port1]);
+          return true;
+        };
+        return broker;
+      };
+      """;
+}
+
+/**
+ * A worker's side of `brokerSide`: `wacAskPage` asks the page's thread to start a child and answers its id and this
+ * worker's end of the channel; `wacTellPage` asks it to stop one; `wacFromPage` takes the answers, and says whether a
+ * message was one. `wacFromParent` is what a child's parent sends down the channel.
+ */
+export string brokerClient() {
+  return """
+      const wacAsked = new Map();
+      let wacAskedNext = 0;
+      const wacChildFailed = new Map();
+      const wacAskPage = (m, transfer) => new Promise((done) => {
+        const n = ++wacAskedNext;
+        wacAsked.set(n, done);
+        postMessage(["broker", n, ...m], transfer ?? []);
+      });
+      const wacTellPage = (m) => postMessage(["broker", 0, ...m]);
+      // ── Surfaces: canvases this worker draws itself (web's `HOST_SURFACE_*`, `PAGE_SURFACE`) ──
+      // Each by its key: the canvas once it has arrived, and what to draw when it does. A key forwarded is a child's,
+      // by the handle its program spawned it as; the children so known. `wacSurfaceById`, by the document's number for
+      // each, is for a test to read back what was drawn — the document cannot, once a canvas is handed over.
+      const wacSurfaces = new Map(), wacSurfaceForward = new Map(), wacChildren = new Map();
+      let wacSurfaceNext = 0;
+      self.wacSurfaceById = new Map();
+      const wacSurfaceOf = (key) => {
+        let s = wacSurfaces.get(key);
+        if (s === undefined) { s = { canvas: null, ctx: null, docId: 0, pending: null }; wacSurfaces.set(key, s); }
+        return s;
+      };
+      const wacSurfaceCame = (key, canvas, docId) => {
+        const f = wacSurfaceForward.get(key);
+        if (f !== undefined) {
+          wacSurfaceForward.delete(key);
+          wacChildren.get(f.child)?.send(["surface", f.key, canvas, docId], [canvas]);
+          return;
+        }
+        const s = wacSurfaceOf(key);
+        s.canvas = canvas;
+        s.ctx = canvas.getContext("2d");
+        s.docId = docId;
+        self.wacSurfaceById.set(docId, canvas);
+        const p = s.pending;
+        s.pending = null;
+        if (p !== null) wacSurfaceDraw(key, 0, 0, p.w, p.h, true, p.data);
+      };
+      // Drawn — or, before the canvas has arrived, kept to draw when it does, and false: the program sends it the
+      // usual way meanwhile. Resized, the document is told, which places the pointer in the canvas's pixels by it.
+      const wacSurfaceDraw = (key, x, y, w, h, whole, rgba) => {
+        const s = wacSurfaces.get(key);
+        if (s === undefined) return false;
+        if (s.ctx === null) {
+          if (whole) s.pending = { w, h, data: new Uint8ClampedArray(rgba) };
+          else if (s.pending !== null) {
+            const p = s.pending, cols = Math.min(w, p.w - x) * 4;
+            for (let r = 0; r < h && y + r < p.h && cols > 0; r++) p.data.set(rgba.subarray(r * w * 4, r * w * 4 + cols), ((y + r) * p.w + x) * 4);
+          }
+          return false;
+        }
+        if (whole && (s.canvas.width !== w || s.canvas.height !== h)) {
+          s.canvas.width = w;
+          s.canvas.height = h;
+          postMessage(["surfaceSize", s.docId, w, h]);
+        }
+        if (w > 0 && h > 0) s.ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, w * h * 4), w, h), x, y);
+        return true;
+      };
+      const wacFromPage = (m) => {
+        if (!Array.isArray(m)) return false;
+        if (m[0] === "surface") { wacSurfaceCame(m[1], m[2], m[3]); return true; }
+        if (m[0] === "brokered") {
+          const done = wacAsked.get(m[1]);
+          wacAsked.delete(m[1]);
+          if (done) done([m[2], m[3], m[4] ?? ""]);
+          return true;
+        }
+        if (m[0] === "childFailed") { wacChildFailed.get(m[1])?.(m[2]); return true; }
+        return false;
+      };
+      const wacFromParent = (m, stdin, fsIn) => {
+        if (m[0] === "stdin") stdin.push(m[1]);
+        else if (m[0] === "stdinEnd") stdin.end();
+        else if (m[0] === "fs") fsIn.push(m[1]);
+        else if (m[0] === "surface") wacSurfaceCame(m[1], m[2], m[3]);
+      };
+      """;
+}
+
+/**
+ * The page, with the program in a worker: the program's half in a script the browser does not run, the module as
+ * base64 in an element it does not run either, and the document's half starting a worker from that script's text
+ * and handing it the module. A blob rather than a second file, so the page stays one file that also works from a
+ * `file://` URL — and a **classic** worker: a module worker made from a blob is refused on a `file://` page, and a
+ * `data:` one would lose the page's origin and the storage that goes with it.
+ */
+export string workerIndexFor(PageHead h, string first, string wasm, i32 grants, string moduleUrl) {
+  return head(h, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
+       + "<script type=\"text/plain\" id=\"wac-program\">\n" + systemSide() + programSide() + moduleSide()
+       // The first message says who this worker is: the page's program, or a module a program started.
+       + brokerClient()
+       + "let receive = null;\n"
+       + "onmessage = (e) => {\n"
+       + "  if (wacFromPage(e.data)) return;\n"
+       + "  if (receive !== null) return receive(e.data);\n"
+       + "  if (e.data[0] === \"module\") { receive = () => {}; return wacModule(e.data[1], e.data[2]); }\n"
+       + "  receive = wacPage(e.data[2], \{grants}, (m, transfer) => postMessage(m, transfer ?? []), e.data[1], e.data[3], e.data[4], e.data[5]);\n"
+       + "};\n</script>\n"
+       + documentScript(documentSide() + brokerSide() + moduleBytes(moduleUrl)
+       + """
+         const source = document.getElementById("wac-program").textContent;
+         const script = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+         const worker = new Worker(script);
+         const broker = wacBroker(script);
+         // **Held until the program is started**: the worker takes its first message for the one that starts it, and
+         // the document speaks first — whether it is seen — while the module may still be on its way.
+         let started = false;
+         const held = [];
+         const toProgram = (m, transfer) => { if (started) worker.postMessage(m, transfer ?? []); else held.push([m, transfer]); };
+         const apply = wacDocument(document.getElementById("app"), toProgram);
+         worker.onmessage = (e) => { if (!broker(worker, e.data)) apply(e.data); };
+         worker.onerror = (e) => console.error(e.message);
+         // The window's size as the document chose its frame by, now, whenever the module arrives.
+         const size = `${innerWidth}x${innerHeight}`;
+         wacModuleBytes().then((wasm) => {
+           worker.postMessage(["page", location.hash, wasm, location.protocol === "file:" ? null : location.href, size, wacRouteOf(location.pathname)], [wasm.buffer]);
+           started = true;
+           for (const [m, transfer] of held) worker.postMessage(m, transfer ?? []);
+         }, (e) => console.error("wac: the page's module could not be loaded: " + e.message));
+         """)
+       + "</body>\n</html>\n";
+}
+
+/** The page, with the program on the page's own thread: the two halves joined directly. */
+export string inPageIndexFor(PageHead h, string first, string wasm, i32 grants, string moduleUrl) {
+  return head(h, first) + (moduleUrl == "" ? moduleElement(wasm) : "")
+       + documentScript(systemSide() + moduleSide() + programSide() + documentSide() + moduleBytes(moduleUrl)
+       + "let receive = null;\n"
+       // What the document says before the program is started is held for it, as the worker's page does.
+       + "const held = [];\n"
+       + "const apply = wacDocument(document.getElementById(\"app\"), (m) => { if (receive !== null) receive(m); else held.push(m); });\n"
+       + "const size = `${innerWidth}x${innerHeight}`;\n"
+       + "wacModuleBytes().then((wasm) => {\n"
+       + "  receive = wacPage(wasm, \{grants}, (m) => apply(m), location.hash, location.protocol === \"file:\" ? null : location.href, size, wacRouteOf(location.pathname));\n"
+       + "  for (const m of held) receive(m);\n"
+       + "}, (e) => console.error(\"wac: the page's module could not be loaded: \" + e.message));\n")
+       + "</body>\n</html>\n";
+}
+
+/** The page's module, as base64 in an element the browser does not run. */
+string moduleElement(string wasm) {
+  return "<script type=\"text/plain\" id=\"wac-module\">" + wasm + "</script>\n";
+}
+
+/**
+ * `wacModuleBytes()`: the page's module, as bytes, when they are here — from the element that holds it, or, built with
+ * `--module-file`, fetched from `url`, beside the page.
+ */
+string moduleBytes(string url) {
+  if (url != "") {
+    return "      const wacModuleBytes = () => fetch(new URL(\"" + url + "\", location.href)).then((r) => {\n"
+         + """
+        if (!r.ok) throw new Error(`${r.url}: ${r.status} ${r.statusText}`);
+        return r.arrayBuffer();
+      }).then((b) => new Uint8Array(b));
+      """;
+  }
+  return """
+      const wacModuleBytes = () => {
+        const text = atob(document.getElementById("wac-module").textContent.trim());
+        const bytes = new Uint8Array(text.length);
+        for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+        return Promise.resolve(bytes);
+      };
+      """;
+}
+
+/**
+ * **Which module a page was built with**, for its URL — `page.wasm?v=<this>` — so a browser that has an older
+ * `page.wasm` cached fetches the one this page's first frames and host were made for. FNV-1a, 32 bits, in hex: a name
+ * for a version, not a check of its bytes.
+ */
+export string versionOf(u8[] bytes) {
+  i64 h = 2166136261 as i64;
+  i64 prime = 16777619 as i64;
+  i64 mask = 4294967295 as i64;
+  for (u8 c in bytes) { h = ((h ^ (c as i64)) * prime) & mask; }
+  string digits = "0123456789abcdef";
+  string out = "";
+  for (i32 i = 0; i < 8; i++) {
+    i32 d = ((h >> ((28 - 4 * i) as i64)) & (15 as i64)) as! i32;
+    out = out + digits.slice(d, d + 1);
+  }
+  return out;
+}
+
+/**
+ * The document's script, held as text, and the one script the page runs as written: `loaderScript`,
+ * which runs it from a `blob:` URL.
+ *
+ * **So that the Content Security Policy can name what runs** (`design/system/0012`, "Policy is in wac;
+ * the browser enforces it again"). A policy allows inline script by hash, and the document's script
+ * holds the program in the in-page build — a different hash for every program, and a SHA-256 this
+ * program would have to carry a copy of. The loader is the same few lines for every page, so its hash
+ * is a constant (`loaderHash`, checked by `tools/wac/webpolicy_test.wac`), and the policy allows that
+ * and `blob:`, which only a script already running can make.
+ */
+string documentScript(string body) {
+  return "<script type=\"text/plain\" id=\"wac-document\">\n\"use strict\";\n" + body + "</script>\n"
+       + "<script>" + loaderScript() + "</script>\n";
+}
+
+/** The script that runs `#wac-document`. Change it and `loaderHash` changes with it. */
+export string loaderScript() {
+  return "const s = document.createElement(\"script\"); "
+       + "s.src = URL.createObjectURL(new Blob([document.getElementById(\"wac-document\").textContent], { type: \"text/javascript\" })); "
+       + "document.body.appendChild(s);";
+}
+
+/** `loaderScript`'s SHA-256, base64 — what the policy allows it by. */
+export string loaderHash() { return "xLE7i4agIkrLt+lCU03oQkaXG/ugC3kfxyQdZETBPVM="; }
+
+/**
+ * The page's Content Security Policy: its loader, scripts it made itself, its own wasm, and nothing
+ * fetched from anywhere — not an image, not a style sheet, not a frame. A program has no network grant,
+ * so a document it draws cannot be one either: `<img src="https://elsewhere/?secret">` is refused here
+ * as well as by the handle layer's policy, and an injected `<script>` or `onerror` does not run.
+ *
+ * **Except its own origin, to read** (`connect-src 'self'`): `wac.site`'s GETs, which the host makes for a program
+ * and keeps under the page's folder. A program runs no script of its own, so the host is all that can.
+ */
+export string policy() {
+  return "default-src 'none'; connect-src 'self'; script-src 'sha256-" + loaderHash() + "' 'sha256-" + earlyHash()
+       + "' blob: 'wasm-unsafe-eval'; "
+       + "worker-src blob:; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; "
+       + "media-src data: blob:; base-uri 'none'; form-action 'none'";
+}
+
+/**
+ * **The viewport**: as wide as the device, and — `interactive-widget` — made smaller by an on-screen keyboard, rather
+ * than covered by it, where the browser offers the choice: what is typed into stays in view.
+ */
+static string VIEWPORT = "width=device-width, initial-scale=1, interactive-widget=resizes-content";
+
+/** `page` drawn to the screen's edges (`Asked.edge`). */
+export string edgeToEdge(string page) {
+  string from = "content=\"" + VIEWPORT + "\"";
+  i32 at = page.indexOf(from);
+  if (at < 0) { return page; }
+  return page.slice(0, at) + "content=\"" + VIEWPORT + ", viewport-fit=cover\"" + page.slice(at + from.len(), page.len());
+}
+
+// ── an app to install ───────────────────────────────────────────────────────
+
+/** `s` with its first `from` made `to` — or as it is, without one. */
+string swap(string s, string from, string to) {
+  i32 at = s.indexOf(from);
+  return at < 0 ? s : s.slice(0, at) + to + s.slice(at + from.len(), s.len());
+}
+
+static string APP_ICON = "icon.png";
+static string APP_WORKER = "sw.js";
+
+/**
+ * **What an installed app may load besides**: its manifest, its icon, and its service worker — each one of its own
+ * files (`'self'`), and nothing from anywhere else.
+ */
+export string appPolicy() {
+  return swap(swap(policy(), "worker-src blob:", "worker-src blob: 'self'"), "img-src data: blob:", "img-src data: blob: 'self'")
+       + "; manifest-src 'self'";
+}
+
+/**
+ * `page` as an app to install: its manifest and icon named in its head — the icon for a phone's home screen too —
+ * its policy allowing them, and its document registering the service worker, from a site (a page opened from a file
+ * has no origin to install from). Edge to edge, a phone's status bar is drawn over the page, which keeps clear of it.
+ */
+export string asApp(string page, string color, bool edge, string prefix) {
+  string tags = "<link rel=\"manifest\" href=\"" + prefix + "manifest.webmanifest\">\n"
+              + "<link rel=\"icon\" href=\"" + prefix + APP_ICON + "\">\n<link rel=\"apple-touch-icon\" href=\"" + prefix + APP_ICON + "\">\n"
+              + "<meta name=\"theme-color\" content=\"" + color + "\">\n"
+              + "<meta name=\"mobile-web-app-capable\" content=\"yes\">\n<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n"
+              + (edge ? "<meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\">\n" : "");
+  string register = "if (\"serviceWorker\" in navigator && location.protocol !== \"file:\") {\n"
+                  + "  navigator.serviceWorker.register(\"" + prefix + APP_WORKER + "\").catch((e) => console.warn(\"no copy to open without the network: \" + e.message));\n}\n";
+  string script = "<script type=\"text/plain\" id=\"wac-document\">\n\"use strict\";\n";
+  return swap(swap(swap(page, policy(), appPolicy()), "<title>", tags + "<title>"), script, script + register);
+}
+
+/** The manifest: the page's title as the app's name, standing alone on a phone's screen, `color` its bar's colour. */
+export string manifestOf(string title, string color) {
+  Vec<u8> out = Vec.create();
+  u8[] b = title.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '"' || b[i] == '\\') { out.push('\\'); }
+    out.push(b[i]);
+  }
+  string name = string.fromBytes(out.toArray());
+  return "{\n  \"name\": \"" + name + "\",\n  \"short_name\": \"" + name + "\",\n  \"start_url\": \"./\",\n  \"scope\": \"./\",\n"
+       + "  \"display\": \"standalone\",\n  \"background_color\": \"" + color + "\",\n  \"theme_color\": \"" + color + "\",\n"
+       + "  \"icons\": [\n"
+       + "    { \"src\": \"" + APP_ICON + "\", \"sizes\": \"192x192 512x512\", \"type\": \"image/png\", \"purpose\": \"any\" },\n"
+       + "    { \"src\": \"" + APP_ICON + "\", \"sizes\": \"512x512\", \"type\": \"image/png\", \"purpose\": \"maskable\" }\n  ]\n}\n";
+}
+
+/**
+ * **The service worker: the network first, its copy when there is none.** Every file of the site the page fetches is
+ * kept as it arrives, and a request the network cannot answer is answered from what was kept — so an installed app
+ * opens, and what it has opened before works, offline; online it never shows anything older than the site.
+ */
+export string serviceWorker() {
+  return """
+    "use strict";
+    const KEPT = "wac-page";
+    self.addEventListener("install", () => self.skipWaiting());
+    self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+    self.addEventListener("fetch", (e) => {
+      const req = e.request;
+      if (req.method !== "GET" || new URL(req.url).origin !== location.origin) return;
+      e.respondWith(fetch(req).then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          e.waitUntil(caches.open(KEPT).then((c) => c.put(req, copy)));
+        }
+        return res;
+      }, () => caches.match(req, { ignoreSearch: true }).then((kept) => kept ?? Response.error())));
+    });
+  """;
+}
+
+/** What a page's head says about it: its title, its description, its path on its site, its canonical address. */
+export struct PageHead {
+  string title;
+  string description;
+  string route;
+  string canonical;
+
+  /** A page with a title and nothing else to say: the site's root. */
+  PageHead titled(string title) { return PageHead(title, "", "/", ""); }
+}
+
+/** Everything before the script: the document the program draws into. */
+string head(PageHead h, string first) {
+  return "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+       + "<meta http-equiv=\"Content-Security-Policy\" content=\"" + policy() + "\">\n"
+       + "<meta name=\"viewport\" content=\"" + VIEWPORT + "\">\n"
+       + "<title>" + textSafe(h.title) + "</title>\n"
+       + (h.description == "" ? "" : "<meta name=\"description\" content=\"" + attrSafe(h.description) + "\">\n")
+       + (h.canonical == "" ? "" : "<link rel=\"canonical\" href=\"" + attrSafe(h.canonical) + "\">\n")
+       + "</head>\n<body>\n"
+       // **The first frame comes before the module**, which is most of the file: the browser paints what it has parsed,
+       // so the reader sees the page while the rest arrives. A page at a route says which (`wacSiteBase`).
+       + "<div id=\"app\"" + (h.route == "/" ? "" : " data-wac-route=\"" + attrSafe(h.route) + "\"")
+       + (first == "" ? "></div>\n" : " data-wac-pre>" + first + "</div>\n<script>" + earlyScript() + "</script>\n");
+}
+
+/** Text as it may sit in an element: nothing in it read as markup. */
+string textSafe(string s) {
+  string out = "";
+  u8[] b = s.toBytes();
+  i32 from = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    string esc = b[i] == '&' ? "&amp;" : (b[i] == '<' ? "&lt;" : (b[i] == '>' ? "&gt;" : ""));
+    if (esc != "") { out = out + string.fromBytes(bytesIn(b, from, i)) + esc; from = i + 1; }
+  }
+  return out + string.fromBytes(bytesIn(b, from, b.len()));
+}
+
+/**
+ * **What the reader does before the program is listening** — on a first frame drawn ahead of time, which looks ready
+ * while its module is still on the way: each click, key and edit on it kept, for the host to hand the program once its
+ * first batch has put its listeners in place (`documentSide`'s `replay`). The page's second inline script, allowed by
+ * its hash as the loader is (`earlyHash`); change it and the hash changes with it.
+ */
+export string earlyScript() {
+  return "window.wacEarly = []; "
+       + "for (const k of [\"click\", \"dblclick\", \"keydown\", \"keyup\", \"input\", \"change\", \"submit\"]) "
+       + "document.getElementById(\"app\").addEventListener(k, (e) => { if (window.wacEarly) window.wacEarly.push(e); }, true);";
+}
+
+/** `earlyScript`'s SHA-256, base64 — what the policy allows it by. */
+export string earlyHash() { return "GtRCwmcBFFLpZHUUCg6p7zDxfxAyVr6T1pO6dEBweSU="; }
+
+/**
+ * **A page in three steps, and the two that spawn nothing are steps of their own** — for a builder that may not start
+ * a process (a sealed machine, as reckon's): `writePageModule` writes `<out>/page.wac`; `wac build <out>/page.wac -o
+ * <out>/page` is run by whoever builds, as its own sealed step; and `wrapBuiltPage` wraps `<out>/page.wasm` into
+ * `index.html` (and the app's files, with `--app`). On the command line they are `--module-only` and `--wrap`, with
+ * the same arguments as the whole build; `buildPage` is all three, which is what it always was.
+ */
+export i32 writePageModule(string[] argv, Output err, Output out, Files fs) {
+  Asked a = askedOf(argv);
+  if (a.entry == "" || a.out == "") { return usage(err); }
+  // **The page's module is a module of this project**, so it is written inside it: from anywhere else its
+  // imports would cross a project boundary, and the build would fail naming an import rather than this.
+  if (leavesHere(a.out)) {
+    err.write("build.wac: \{a.out}: the output directory must be inside this directory, since the page's module is written there and imports the program\n".toBytes());
+    return 2;
+  }
+  string made = madeDir(fs, a.out);
+  if (made != "") { err.line("build.wac: \{made}"); return 1; }
+  // A path names the file from here, and the module sits in `out`; anything else is a mapped name.
+  bool pagePath = a.pageSpec.len() > 0 && (a.pageSpec.slice(0, 1) == "." || a.pageSpec.slice(0, 1) == "/");
+  string pageSpec = pagePath ? relativeTo(a.out, a.pageSpec) : a.pageSpec;
+  string entrySpec = relativeTo(a.out, a.entry);
+  string wrote = written(fs, a.out + "/page.wac", moduleFor(entrySpec, pageSpec, a.spawn, a.dev, framesOf(fs, a.entry)).toBytes());
+  if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  return 0;
+}
+
+/** Whether `entry` declares its first frames (`declaresFrames`); an entry that cannot be read declares none. */
+bool framesOf(Files fs, string entry) {
+  u8[]? source = flatten(fs.readFile(entry).wait()).ok();
+  return source is not null && declaresFrames(string.fromBytes(source!));
+}
+
+/**
+ * **The first frames drawn**, by the module built at `<out>/page.wasm` run with no page: how many it has, then each,
+ * in a run of its own so nothing one leaves behind reaches the next — and what goes in `#app` written to
+ * `<out>/first.html` (`framesHtml`). It starts processes, so a builder in steps runs it as a step of its own (`--draw`).
+ */
+export i32 drawPageFrames(string[] argv, Output err, Output out, Files fs, Procs procs) {
+  Asked a = askedOf(argv);
+  if (a.entry == "" || a.out == "") { return usage(err); }
+  if (!framesOf(fs, a.entry)) { return 0; }
+  string wasm = a.out + "/page.wasm";
+  auto counted = ran(procs, a.wac, [wasm, "--frames"], err);
+  if (counted is null) { return 1; }
+  string listed = string.fromBytes(counted!);
+  i32 n = numberOf(lineOf(listed, 0));
+  if (n <= 0) { err.line("build.wac: \{a.entry} declares no frames: prerendered() is empty"); return 1; }
+  // **The frames by page**: each path, in the order the program first names it, and the frames drawn for it.
+  Vec<string> paths = Vec.create();
+  string[] pathOf = string[].filled(n, "/");
+  for (i32 k = 0; k < n; k++) {
+    pathOf[k] = lineOf(listed, k + 1);
+    bool seen = false;
+    for (i32 i = 0; i < paths.len(); i++) { if (paths.get(i) == pathOf[k]) { seen = true; } }
+    if (!seen) { paths.push(pathOf[k]); }
+  }
+  Vec<Routed> routes = Vec.create();
+  for (i32 p = 0; p < paths.len(); p++) {
+    Vec<string> media = Vec.create();
+    Vec<string> markup = Vec.create();
+    string title = "";
+    string description = "";
+    for (i32 k = 0; k < n; k++) {
+      if (pathOf[k] != paths.get(p)) { continue; }
+      auto drawn = ran(procs, a.wac, [wasm, "--frame", "\{k}"], err);
+      if (drawn is null) { return 1; }
+      string text = string.fromBytes(drawn!);
+      media.push(lineOf(text, 0));
+      // A page's title and description are its first frame's: what a reader whose window matches no query sees is
+      // the same page, in another layout.
+      if (media.len() == 1) { title = lineOf(text, 1); description = lineOf(text, 2); }
+      markup.push(afterLines(text, 3));
+    }
+    routes.push(Routed(paths.get(p), title, description, framesHtml(media.toArray(), markup.toArray())));
+  }
+  string wrote = written(fs, a.out + "/frames.txt", framesFileOf(routes.toArray()));
+  if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  return 0;
+}
+
+/** **One page of a site, drawn**: its path, its title and description, and what goes in its `#app` (`framesHtml`). */
+export struct Routed {
+  string path;
+  string title;
+  string description;
+  string html;
+}
+
+/**
+ * `<out>/frames.txt`: what `drawPageFrames` drew, for `--wrap` to read — a first line naming the format, then each page:
+ * its path, title and description a line each, its HTML's length in bytes on a line, then that HTML.
+ */
+export u8[] framesFileOf(Routed[] routes) {
+  Buf out = Buf.create();
+  out.pushStr("wac-frames 1\n");
+  for (Routed r in routes) {
+    u8[] html = r.html.toBytes();
+    out.pushStr(r.path + "\n" + r.title + "\n" + r.description + "\n" + "\{html.len()}\n");
+    out.pushAll(html);
+  }
+  return out.bytes();
+}
+
+/** What `framesFileOf` wrote, read back; null if it is not that. */
+export Routed[]? routesOf(u8[] file) {
+  Vec<Routed> out = Vec.create();
+  i32 at = 0;
+  string first = byteLine(file, at);
+  if (first != "wac-frames 1") { return null; }
+  at = at + first.toBytes().len() + 1;
+  while (at < file.len()) {
+    string[] fields = string[].filled(4, "");
+    for (i32 i = 0; i < 4; i++) {
+      fields[i] = byteLine(file, at);
+      at = at + fields[i].toBytes().len() + 1;
+      if (at > file.len()) { return null; }
+    }
+    i32 length = numberOf(fields[3]);
+    if (length < 0 || at + length > file.len()) { return null; }
+    out.push(Routed(fields[0], fields[1], fields[2], string.fromBytes(bytesIn(file, at, at + length))));
+    at = at + length;
+  }
+  return out.toArray();
+}
+
+/** `bytes` from `from` up to `to`. */
+u8[] bytesIn(u8[] bytes, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0 as u8);
+  for (i32 i = from; i < to; i++) { out[i - from] = bytes[i]; }
+  return out;
+}
+
+/** A run of decimal digits as a number; -1 for anything else. */
+i32 numberOf(string s) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0 || b.len() > 9) { return 0 - 1; }
+  i32 n = 0;
+  for (u8 c in b) {
+    if (c < '0' || c > '9') { return 0 - 1; }
+    n = n * 10 + ((c - '0') as i32);
+  }
+  return n;
+}
+
+/** The line of `bytes` starting at `at`, without its line break. */
+string byteLine(u8[] bytes, i32 at) {
+  i32 end = at;
+  while (end < bytes.len() && bytes[end] != '\n') { end++; }
+  return string.fromBytes(bytesIn(bytes, at, end));
+}
+
+/** The `k`th line of `text`, from 0, without its line break: `""` past the last. */
+string lineOf(string text, i32 k) {
+  string rest = text;
+  for (i32 i = 0; i < k; i++) {
+    i32 nl = rest.indexOf("\n");
+    if (nl < 0) { return ""; }
+    rest = rest.slice(nl + 1, rest.len());
+  }
+  i32 nl = rest.indexOf("\n");
+  return nl < 0 ? rest : rest.slice(0, nl);
+}
+
+/** What follows `text`'s first `k` lines. */
+string afterLines(string text, i32 k) {
+  string rest = text;
+  for (i32 i = 0; i < k; i++) {
+    i32 nl = rest.indexOf("\n");
+    if (nl < 0) { return ""; }
+    rest = rest.slice(nl + 1, rest.len());
+  }
+  return rest;
+}
+
+/** The way from a page at `path` back to its site's root: `../` for each folder, `""` at the root. */
+export string upFrom(string path) {
+  string out = "";
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 cut = rest.indexOf("/");
+    string part = cut < 0 ? rest : rest.slice(0, cut);
+    if (part != "") { out = out + "../"; }
+    rest = cut < 0 ? "" : rest.slice(cut + 1, rest.len());
+  }
+  return out;
+}
+
+/** The sitemap naming every page, each at `site` (`--site-url`) and its path. */
+export string sitemapOf(string site, Routed[] routes) {
+  string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n";
+  for (Routed r in routes) { out = out + "  <url><loc>" + textSafe(siteRoot(site) + r.path) + "</loc></url>\n"; }
+  return out + "</urlset>\n";
+}
+
+/** `--site-url` without the `/` it may end in, so a path can follow it. */
+string siteRoot(string site) {
+  return site.len() > 0 && site.slice(site.len() - 1, site.len()) == "/" ? site.slice(0, site.len() - 1) : site;
+}
+
+/** What `wac <args>` wrote, or null — having said why — when it failed. */
+u8[]? ran(Procs procs, string wac, string[] args, Output err) {
+  auto r = flatten(procs.exec(wac, args, u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? e = r.ok();
+  if (e is not null && e!.ok()) { return e!.stdout; }
+  if (e is not null) {
+    err.write(e!.stderr);
+    err.write(e!.stdout);
+  }
+  err.line("build.wac: drawing the first frames: \{wac} \{args[0]} \{args[1]}" + (r.isErr() ? ": \{r.err()!}" : ""));
+  return null;
+}
+
+/** The page around a module already built at `<out>/page.wasm`: `index.html`, and with `--app` the app's files. */
+export i32 wrapBuiltPage(string[] argv, Output err, Output out, Files fs) {
+  Asked a = askedOf(argv);
+  if (a.entry == "" || a.out == "") { return usage(err); }
+  string wasmPath = a.out + "/page.wasm";
+  auto wasmRead = flatten(fs.readFile(wasmPath).wait());
+  u8[]? wasm = wasmRead.ok();
+  if ((wasm is null)) {
+    err.write("build.wac: \{wasmPath}: \{wasmRead.isErr() ? "\{wasmRead.err()!}" : ""}\n".toBytes());
+    return 1;
+  }
+  // **The pages, when the entry declares its first frames**: what `drawPageFrames` wrote to `<out>/frames.txt` — in
+  // `buildPage`, or in its own step (`--draw`) for a builder in steps, between building the module and `--wrap`. One
+  // page otherwise, at the site's root, with nothing drawn ahead of time.
+  Routed[] routes = [Routed("/", "", "", "")];
+  if (framesOf(fs, a.entry)) {
+    string framesPath = a.out + "/frames.txt";
+    auto framesRead = flatten(fs.readFile(framesPath).wait());
+    if (framesRead.isErr()) {
+      err.write("build.wac: \{framesPath}: \{framesRead.err()!} — \{a.entry} declares its first frames, which --draw writes there\n".toBytes());
+      return 1;
+    }
+    Routed[]? read = routesOf(framesRead.ok()!);
+    if (read is null) { err.line("build.wac: \{framesPath} is not what --draw writes"); return 1; }
+    routes = read!;
+  }
+  // Built with `--module-file`, the module is the one `page.wasm` at the site's root, named by its version, which
+  // every page fetches: one download however many pages a reader opens.
+  string version = a.moduleFile ? versionOf(wasm!) : "";
+  string encoded = a.moduleFile ? "" : base64(wasm!);
+  if (a.appIcon != "") {
+    auto icon = flatten(fs.readFile(a.appIcon).wait());
+    if (icon.isErr()) {
+      err.write("build.wac: \{a.appIcon}: \{icon.err()!}\n".toBytes());
+      return 1;
+    }
+    string[] names = [a.out + "/" + APP_ICON, a.out + "/manifest.webmanifest", a.out + "/" + APP_WORKER];
+    u8[][] bodies = [icon.ok()!, manifestOf(a.title, a.appColor).toBytes(), serviceWorker().toBytes()];
+    for (i32 i = 0; i < names.len(); i++) {
+      string wrote = written(fs, names[i], bodies[i]);
+      if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+    }
+  }
+  for (Routed r in routes) {
+    string up = upFrom(r.path);
+    string url = a.moduleFile ? up + "page.wasm?v=" + version : "";
+    // The program's own title for its page, if it gave one in its first turn; the build's otherwise.
+    PageHead h = PageHead(r.title != "" ? r.title : a.title, r.description, r.path, a.siteUrl == "" ? "" : siteRoot(a.siteUrl) + r.path);
+    string page = a.inPage ? inPageIndexFor(h, r.html, encoded, a.grants, url) : workerIndexFor(h, r.html, encoded, a.grants, url);
+    if (a.edge) { page = edgeToEdge(page); }
+    if (a.appIcon != "") { page = asApp(page, a.appColor, a.edge, up); }
+    string dir = a.out + (r.path == "/" ? "" : r.path);
+    if (r.path != "/") {
+      string made = madeDir(fs, dir);
+      if (made != "") { err.line("build.wac: \{made}"); return 1; }
+    }
+    // **Said only once it is so.** This ignored what the write answered and printed the line below either way, so a
+    // builder whose disk refused `index.html` was told it had one — 100 KB lost to a line that said otherwise.
+    string index = (r.path == "/" ? a.out + "/" : dir) + "index.html";
+    string wrote = written(fs, index, page.toBytes());
+    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  }
+  if (a.siteUrl != "") {
+    string wrote = written(fs, a.out + "/sitemap.xml", sitemapOf(a.siteUrl, routes).toBytes());
+    if (wrote != "") { err.line("build.wac: \{wrote}"); return 1; }
+  }
+  out.line("\{a.out}/index.html" + (routes.len() > 1 ? " and \{routes.len() - 1} page(s) more" : "") + ": \{wasm!.len()} bytes of module"
+           + (a.moduleFile ? ", in page.wasm beside it" : ""));
+  return 0;
+}
+
+/** `bytes` written to `path`: `""` once it is, or the path and the host's reason when it is not. */
+string written(Files fs, string path, u8[] bytes) {
+  auto w = flatten(fs.writeFile(path, bytes).wait());
+  return w.isErr() ? "\{path}: \{w.err()!}" : "";
+}
+
+/** `dir` made, with what it is under: `""` once it is there, or why not. */
+string madeDir(Files fs, string dir) {
+  auto m = flatten(fs.mkdir(dir, true).wait());
+  return m.isErr() ? "\{dir}: \{m.err()!}" : "";
+}
+
+i32 usage(Output err) {
+  err.write("usage: build.wac <entry.wac> <out-dir> [--module-only | --draw | --wrap] [--in-page] [--dev] [--edge] [--module-file] [--site-url <url>] [--app <icon.png> [--app-color <#rgb>]] [--grant read,write] [--spawn <export>] [--title <t>] [--wac <binary>] [--page <spec>]\n".toBytes());
+  return 2;
+}
+
+export i32 buildPage(string[] argv, Output err, Output out, Files fs, Procs procs) {
+  bool moduleOnly = false;
+  bool wrapOnly = false;
+  bool drawOnly = false;
+  for (string w in argv) {
+    if (w == "--module-only") { moduleOnly = true; }
+    if (w == "--wrap") { wrapOnly = true; }
+    if (w == "--draw") { drawOnly = true; }
+  }
+  i32 steps = 0;
+  if (moduleOnly) { steps++; }
+  if (wrapOnly) { steps++; }
+  if (drawOnly) { steps++; }
+  if (steps > 1) {
+    err.write("build.wac: --module-only, --draw and --wrap are steps of a build; ask for one\n".toBytes());
+    return 2;
+  }
+  if (wrapOnly) { return wrapBuiltPage(argv, err, out, fs); }
+  if (drawOnly) { return drawPageFrames(argv, err, out, fs, procs); }
+  i32 wrote = writePageModule(argv, err, out, fs);
+  if (wrote != 0 || moduleOnly) { return wrote; }
+  Asked a = askedOf(argv);
+  string source = a.out + "/page.wac";
+  auto builtRan = flatten(procs.exec(a.wac, ["build", source, "-o", a.out + "/page"], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? built = builtRan.ok();
+  if (built is null || !built!.ok()) {
+    if (built is not null) {
+      err.write(built!.stderr);
+      err.write(built!.stdout);
+    }
+    if (builtRan.isErr()) { flatten(err.write("build.wac: \{a.wac}: \{builtRan.err()!}\n".toBytes()).wait()).isOk(); }
+    return 1;
+  }
+  i32 drew = drawPageFrames(argv, err, out, fs, procs);
+  if (drew != 0) { return drew; }
+  return wrapBuiltPage(argv, err, out, fs);
+}
+
+export i32 main(Sys sys) { return buildPage(sys.args(), sys.stderr(), sys.stdout(), sys.files(), sys.procs()); }

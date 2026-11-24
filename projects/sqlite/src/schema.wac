@@ -1,0 +1,683 @@
+// Tables, columns and indexes as the engine holds them. A stored table's rows and an index's entries
+// are in b-trees on a pager (see btree.wac), read when wanted; a table of computed rows (a subquery's, a
+// view's, a table-valued function's) keeps them in memory.
+
+import { Vec, Map, hashI64, i64Eq } from "core";
+import { Value, compareValues, compareColl, classRank, COLL_BINARY } from "./value.wac";
+import { readVarint, Varint, beSigned, sliceBytes, varintAt, varintSizeAt } from "./bytes.wac";
+import { Pager } from "./pager.wac";
+import { Cursor, KeyCmp, KeyCmpOf, tableInsert, tableDelete, indexInsert, indexDelete, countEntries } from "./btree.wac";
+import { encodeRecordIn, decodeRecordIn, serialSize, toUtf16, ENC_UTF8, ENC_UTF16BE } from "./record.wac";
+import { applyAffinity } from "./ops.wac";
+import { Expr, IndexCol, Select, CreateTrigger } from "./ast.wac";
+import { lower, upper } from "./lexer.wac";
+
+export static i32 AFF_BLOB = 0;      // "none" in the documentation: values are kept as given
+export static i32 AFF_TEXT = 1;
+export static i32 AFF_NUMERIC = 2;
+export static i32 AFF_INTEGER = 3;
+export static i32 AFF_REAL = 4;
+
+// SQLite's rules for a declared type's affinity, in its order: the first that matches wins.
+export i32 affinityOf(string typeName) {
+  string u = upper(typeName);
+  if (u.indexOf("INT") >= 0) { return AFF_INTEGER; }
+  if (u.indexOf("CHAR") >= 0 || u.indexOf("CLOB") >= 0 || u.indexOf("TEXT") >= 0) { return AFF_TEXT; }
+  if (u.indexOf("BLOB") >= 0 || u == "") { return AFF_BLOB; }
+  if (u.indexOf("REAL") >= 0 || u.indexOf("FLOA") >= 0 || u.indexOf("DOUB") >= 0) { return AFF_REAL; }
+  return AFF_NUMERIC;
+}
+
+export struct Column {
+  string name;
+  string typeName;
+  i32 affinity = 0;
+  bool notNull = false;
+  Expr? dflt;
+  i32 coll = 0;
+  Expr? gen;              // a generated column's expression
+  bool stored = false;    // STORED; otherwise a generated column is VIRTUAL and not in the record
+  string strictType = ""; // in a STRICT table: INTEGER, REAL, TEXT, BLOB or ANY
+  i32 notNullConflict = -1; // NOT NULL's ON CONFLICT, or -1
+}
+
+export struct Row {
+  i64 rowid;
+  // Every column, in order. A column that aliases the rowid holds it here too, though the file stores
+  // NULL in its place.
+  Value[] vals;
+  // The record as the file stores it, once encoded or as it was read. A row is never changed once it is
+  // in a table (an update makes a new one), so this stays true, and an unchanged row costs nothing to
+  // write again.
+  u8[]? rec;
+}
+
+// One entry of an index: the indexed values then the rowid, and the record the file stores for it, kept
+// once known since an entry never changes.
+export struct Entry {
+  Value[] key;
+  u8[]? rec;
+}
+
+export struct Index {
+  string name;
+  string table;
+  string? sql;          // null for an index a constraint made (sqlite_autoindex_…)
+  i32[] cols;           // column positions in the table
+  bool[] desc;
+  i32[] colls;          // each column's collation
+  bool unique = false;
+  // A partial index holds only the rows its WHERE accepts; an index on expressions computes its key.
+  // Either makes it unfit for the planner, which looks rows up by column values.
+  fn<bool(Row)>? pred;
+  fn<Value[](Row)>? keyFn;
+  i32 onConflict = -1;  // a constraint's ON CONFLICT, or -1
+  // Its entries, sorted, each the indexed values then the rowid: an index b-tree on `pg`, records in
+  // the database's encoding `enc`. `fileRoot` is where an index of a WITHOUT ROWID table is in the file,
+  // which holds its entries differently (see database.wac).
+  Pager? pg = null;
+  i64 root = 0;
+  i32 enc = 1;
+  i64 fileRoot = 0;
+
+  // Orders two entries as the index does: column by column, each in its direction, then by rowid.
+  i32 compare(this, Value[] a, Value[] b) {
+    for (i32 i = 0; i < a.len() && i < b.len(); i++) {
+      i32 c = this.compareAt(i, a[i], b[i]);
+      if (c != 0) { return i < this.desc.len() && this.desc[i] ? -c : c; }
+    }
+    return a.len() < b.len() ? -1 : (a.len() > b.len() ? 1 : 0);
+  }
+
+  // One column's comparison. In a UTF-16 database BINARY compares text as its bytes in that encoding,
+  // which is not code point order, and SQLite's indexes there are sorted so.
+  i32 compareAt(this, i32 i, Value a, Value b) {
+    i32 coll = i < this.colls.len() ? this.colls[i] : COLL_BINARY;
+    if (this.enc != ENC_UTF8 && coll == COLL_BINARY) {
+      match (a) {
+        Text(sa): {
+          match (b) {
+            Text(sb): { return compareBytes(toUtf16(sa, this.enc == ENC_UTF16BE), toUtf16(sb, this.enc == ENC_UTF16BE)); }
+            default: {}
+          }
+        }
+        default: {}
+      }
+    }
+    return i < this.colls.len() ? compareColl(a, b, coll) : compareValues(a, b);
+  }
+
+  bool special(const this) { return this.pred is not null || this.keyFn is not null; }
+
+  bool holds(this, Row r) { return this.pred is null || this.pred!(r); }
+
+  Value[] entryFor(this, Row r) {
+    if (this.keyFn is not null) {
+      Value[] k = this.keyFn!(r);
+      Value[] e2 = Value[].filled(k.len() + 1, Value.Null);
+      e2.copyFrom(k, 0, 0, k.len());
+      e2[k.len()] = Value.Int(r.rowid);
+      return e2;
+    }
+    Value[] e = Value[].filled(this.cols.len() + 1, Value.Null);
+    for (i32 i = 0; i < this.cols.len(); i++) { e[i] = r.vals[this.cols[i]]; }
+    e[this.cols.len()] = Value.Int(r.rowid);
+    return e;
+  }
+
+  i32 comparePrefix(this, Value[] entry, Value[] key) {
+    for (i32 i = 0; i < key.len(); i++) {
+      i32 c = this.compareAt(i, entry[i], key[i]);
+      if (c != 0) { return i < this.desc.len() && this.desc[i] ? -c : c; }
+    }
+    return 0;
+  }
+
+  // An entry's values from its record.
+  Value[] keyOf(this, const u8[] rec) {
+    Value[]? v = decodeRecordIn(rec, this.enc);
+    if (v is null) { this.pg!.failed("malformed index record in \{this.name}"); return Value[](); }
+    return v!;
+  }
+
+  KeyCmp cmpTo(this, Value[] target) {
+    // Text compared as BINARY is compared as bytes, without making a string of the stored side.
+    u8[][] tb = u8[][].defaulted(target.len());
+    for (i32 i = 0; i < target.len(); i++) {
+      match (target[i]) {
+        Text(t): { tb[i] = t.toBytes(); }
+        Blob(b): { tb[i] = b; }
+        default: {}
+      }
+    }
+    return (u8[] s, i32 a, i32 b) => this.compareRec(s, a, b, target, tb, false);
+  }
+
+  // The same, comparing only `target`'s length of columns: an entry that begins with it is equal.
+  KeyCmp prefixTo(this, Value[] target) {
+    u8[][] tb = u8[][].defaulted(target.len());
+    for (i32 i = 0; i < target.len(); i++) {
+      match (target[i]) {
+        Text(t): { tb[i] = t.toBytes(); }
+        Blob(b): { tb[i] = b; }
+        default: {}
+      }
+    }
+    return (u8[] s, i32 a, i32 b) => this.compareRec(s, a, b, target, tb, true);
+  }
+
+  // How a stored record compares with `target`, as compare(keyOf(rec), target) would, reading only the
+  // fields it gets to. `tb` holds the target's text and blobs as bytes.
+  i32 compareRec(this, const u8[] rec, i32 start, i32 end, Value[] target, u8[][] tb, bool prefix) {
+    if (this.enc != ENC_UTF8 || end <= start) { return this.slowCompare(rec, start, end, target, prefix); }
+    i64 hv = varintAt(rec, start);
+    if (hv < 1 || hv > (end - start) as i64) { return this.slowCompare(rec, start, end, target, prefix); }
+    i32 hdrEnd = start + hv as! i32;
+    i32 at = start + varintSizeAt(rec, start);
+    i32 body = hdrEnd;
+    i32 i = 0;
+    while (at < hdrEnd) {
+      i64 t = 0;
+      if ((rec[at] & 0x80) == 0) { t = rec[at] as i64; at++; }
+      else { t = varintAt(rec, at); at += varintSizeAt(rec, at); }
+      i32 n = serialSize(t);
+      if (t < 0 || t == 10 || t == 11 || body + n > end) { return this.slowCompare(rec, start, end, target, prefix); }
+      // Every column the target has is equal and the record has more: it comes after, unless only the
+      // target's columns count.
+      if (i >= target.len()) { return prefix ? 0 : 1; }
+      i32 c = this.fieldCmp(rec, t, body, n, i, target[i], tb[i]);
+      if (c != 0) { return i < this.desc.len() && this.desc[i] ? -c : c; }
+      body += n;
+      i++;
+    }
+    return i < target.len() ? -1 : 0;
+  }
+
+  i32 slowCompare(this, const u8[] rec, i32 start, i32 end, Value[] target, bool prefix) {
+    Value[] k = this.keyOf(sliceBytes(rec, start, end));
+    if (prefix) { return k.len() < target.len() ? -1 : this.comparePrefix(k, target); }
+    return this.compare(k, target);
+  }
+
+  i32 fieldCmp(this, const u8[] rec, i64 t, i32 off, i32 n, i32 col, Value tv, u8[] b) {
+    i32 rank = t == 0 ? 0 : (t <= 9 ? 1 : ((t & 1) == 1 ? 2 : 3));
+    i32 trank = classRank(tv);
+    if (rank != trank) { return rank < trank ? -1 : 1; }
+    if (rank == 0) { return 0; }
+    if (rank == 1) {
+      Value v = Value.Null;
+      if (t >= 1 && t <= 6) { v = Value.Int(beSigned(rec, off, n)); }
+      else if (t == 7) { v = Value.Real(f64.fromBits(beSigned(rec, off, 8) as@ u64)); }
+      else { v = Value.Int(t == 9 ? 1 : 0); }
+      return compareValues(v, tv);
+    }
+    i32 coll = col < this.colls.len() ? this.colls[col] : COLL_BINARY;
+    if (rank == 3 || coll == COLL_BINARY) {
+      i32 m = n < b.len() ? n : b.len();
+      for (i32 k = 0; k < m; k++) {
+        if (rec[off + k] != b[k]) { return rec[off + k] < b[k] ? -1 : 1; }
+      }
+      return n < b.len() ? -1 : (n > b.len() ? 1 : 0);
+    }
+    Value v = Value.Text(string.fromBytes(sliceBytes(rec, off, off + n)));
+    return compareColl(v, tv, coll);
+  }
+
+  KeyCmpOf cmpOf(this) { return (u8[] rec) => this.cmpTo(this.keyOf(rec)); }
+
+  // A cursor over the entries, which finds its place again when they change under it.
+  Cursor cursor(this) {
+    Cursor c = Cursor.over(this.pg!, this.root, false);
+    c.cmpOf = this.cmpOf();
+    return c;
+  }
+
+  // The first entry not before `key`, comparing only `key`'s length of columns.
+  bool seekFrom(this, Cursor c, Value[] key) {
+    KeyCmp cmp = this.cmpTo(key);
+    return c.seek((u8[] s, i32 a, i32 b) => cmp(s, a, b) >= 0);
+  }
+
+  // The first entry after every entry that begins with `key`.
+  bool seekAfter(this, Cursor c, Value[] key) {
+    KeyCmp cmp = this.prefixTo(key);
+    return c.seek((u8[] s, i32 a, i32 b) => cmp(s, a, b) > 0);
+  }
+
+  i64 count(this) { return countEntries(this.pg!, this.root); }
+
+  // The rowid an entry ends with, read without decoding the rest; null when it does not end with one.
+  i64? rowidOf(this, const u8[] rec) {
+    if (rec.len() == 0) { return null; }
+    i64 hv = varintAt(rec, 0);
+    if (hv < 1 || hv > rec.len() as i64) { return null; }
+    i32 hdrEnd = hv as! i32;
+    i32 at = varintSizeAt(rec, 0);
+    i32 body = hdrEnd;
+    i64 t = 0;
+    i32 off = 0;
+    while (at < hdrEnd) {
+      t = varintAt(rec, at);
+      at += varintSizeAt(rec, at);
+      if (t < 0 || t == 10 || t == 11) { return null; }
+      off = body;
+      body += serialSize(t);
+    }
+    if (body > rec.len()) { return null; }
+    if (t >= 1 && t <= 6) { return beSigned(rec, off, serialSize(t)); }
+    if (t == 8) { return 0 as i64; }
+    if (t == 9) { return 1 as i64; }
+    return null;
+  }
+
+  void add(this, Row r) {
+    if (!this.holds(r)) { return; }
+    Value[] e = this.entryFor(r);
+    indexInsert(this.pg!, this.root, encodeRecordIn(e, this.enc), this.cmpTo(e));
+  }
+
+  void drop(this, Row r) {
+    if (!this.holds(r)) { return; }
+    indexDelete(this.pg!, this.root, this.cmpTo(this.entryFor(r)), this.cmpOf());
+  }
+
+  // The rowid of a row other than `self` holding the same key, when this index is unique. NULLs are
+  // distinct from each other, so a key with one never conflicts.
+  i64? conflict(this, Row r, i64 self) {
+    if (!this.unique || !this.holds(r)) { return null; }
+    Value[] e = this.entryFor(r);
+    Value[] key = Value[].filled(this.cols.len(), Value.Null);
+    for (i32 i = 0; i < key.len(); i++) {
+      match (e[i]) { Null: { return null; } default: {} }
+      key[i] = e[i];
+    }
+    Cursor c = this.cursor();
+    bool ok = this.seekFrom(c, key);
+    while (ok) {
+      Value[] hit = this.keyOf(c.payload);
+      if (hit.len() < key.len() || this.comparePrefix(hit, key) != 0) { break; }
+      match (hit[hit.len() - 1]) {
+        Int(id): { if (id != self) { return id; } }
+        default: {}
+      }
+      ok = c.next();
+    }
+    return null;
+  }
+}
+
+i32 compareBytes(const u8[] a, const u8[] b) {
+  for (i32 i = 0; i < a.len() && i < b.len(); i++) {
+    if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+  }
+  return a.len() < b.len() ? -1 : (a.len() > b.len() ? 1 : 0);
+}
+
+// A foreign key of a child table: its columns, and the parent's (empty for the parent's primary key).
+export struct ForeignKey {
+  i32[] cols;
+  string parent;
+  string[] parentCols;
+  string onDelete;
+  string onUpdate;
+  bool deferred;
+}
+
+export struct Table {
+  string name;
+  string sql;
+  Column[] cols;
+  i32 rowidAlias = -1;   // the INTEGER PRIMARY KEY column, or -1
+  bool autoincrement = false;
+  Vec<Row> rows;         // a table of computed rows: them, sorted by rowid
+  bool strict = false;
+  Expr[] checks;
+  ForeignKey[] fks;
+  i32[] pk;              // the PRIMARY KEY's columns, in order; empty when there is none
+  // A WITHOUT ROWID table is held like any other, with rowids of its own that never leave memory; the
+  // file stores it as its primary key's index, each record the key's columns and then the rest.
+  bool withoutRowid = false;
+  string pkIndex = "";   // that index, when withoutRowid
+  i32 rowidConflict = -1; // an INTEGER PRIMARY KEY's ON CONFLICT, or -1
+  // A stored table's rows are a table b-tree on `pg`, records in the database's encoding `enc`; `rows`
+  // is then unused. `gen` computes a row's VIRTUAL generated columns as it is read.
+  Pager? pg = null;
+  i64 root = 0;
+  i32 enc = 1;
+  fn<void(Row)>? gen = null;
+  // A WITHOUT ROWID table is held as a rowid table in memory (see database.wac); `fileRoot` is its own
+  // b-tree in the file, written again from it at a commit after `shadowDirty` is set.
+  i64 fileRoot = 0;
+  bool shadowDirty = false;
+  // Rows read lately, decoded, by the leaf page they are on: a table read again (a join's inner table,
+  // a scan repeated) is not decoded again. A page's rows are good while its change stamp is the one they
+  // were read at; there are at most RECENT_PAGES pages of them.
+  Map<i64, PageRows>? recent = null;
+  i64 recentEpoch = -1;
+
+  // The columns in the order the file's record holds them: for a WITHOUT ROWID table, the primary
+  // key's first; and never a VIRTUAL generated column.
+  i32[] recordOrder(const this) {
+    Vec<i32> out;
+    if (this.withoutRowid) { for (i32 c in this.pk) { out.push(c); } }
+    for (i32 i = 0; i < this.cols.len(); i++) {
+      if (this.cols[i].gen is not null && !this.cols[i].stored) { continue; }
+      bool taken = false;
+      if (this.withoutRowid) { for (i32 c in this.pk) { if (c == i) { taken = true; } } }
+      if (!taken) { out.push(i); }
+    }
+    return out.toArray();
+  }
+
+  bool hasVirtual(const this) {
+    for (i32 i = 0; i < this.cols.len(); i++) { if (this.cols[i].gen is not null && !this.cols[i].stored) { return true; } }
+    return false;
+  }
+
+  bool hasGenerated(const this) {
+    for (i32 i = 0; i < this.cols.len(); i++) { if (this.cols[i].gen is not null) { return true; } }
+    return false;
+  }
+
+  i32 colIndex(const this, string name) {
+    string n = lower(name);
+    for (i32 i = 0; i < this.cols.len(); i++) { if (lower(this.cols[i].name) == n) { return i; } }
+    return -1;
+  }
+
+  bool stored(const this) { return this.pg is not null; }
+
+  i32 find(this, i64 rowid) {
+    i32 lo = 0;
+    i32 hi = this.rows.len();
+    while (lo < hi) {
+      i32 mid = (lo + hi) / 2;
+      if (this.rows.get(mid).rowid < rowid) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+  }
+
+  Row? get(this, i64 rowid) {
+    if (this.pg is null) {
+      i32 at = this.find(rowid);
+      if (at < this.rows.len() && this.rows.get(at).rowid == rowid) { return this.rows.get(at); }
+      return null;
+    }
+    Cursor c = Cursor.over(this.pg!, this.root, true);
+    c.lazy = true;
+    if (!c.seekRowid(rowid) || c.rowid != rowid) { return null; }
+    return this.rowAt(c, this.pageRows(c.topNumber()));
+  }
+
+  // The decoded rows of a leaf page, as far as they have been read.
+  PageRows pageRows(this, i64 page) {
+    if (this.recent is null || this.recentEpoch != this.pg!.epoch) {
+      this.recent = Map<i64, PageRows>.create(hashI64, i64Eq);
+      this.recentEpoch = this.pg!.epoch;
+    }
+    Map<i64, PageRows> m = this.recent!;
+    i64 stamp = this.pg!.stampOf(page);
+    PageRows? hit = m.get(page);
+    if (hit is not null && hit!.stamp == stamp) { return hit!; }
+    if (m.len() >= RECENT_PAGES) { m.clear(); }
+    PageRows pr = PageRows(stamp, Row?[].defaulted(this.pg!.pageSize / 4));
+    m.set(page, pr);
+    return pr;
+  }
+
+  // The row a cursor is on, from its page's decoded rows or decoded now.
+  Row rowAt(this, Cursor c, PageRows pr) {
+    i32 i = c.topSlot();
+    if (i < pr.rows.len() && c.seen == this.pg!.version) {
+      Row? r = pr.rows[i];
+      if (r is not null && r!.rowid == c.rowid) { return r!; }
+      Row d = this.decode(c.rowid, c.body());
+      pr.rows[i] = d;
+      return d;
+    }
+    return this.decode(c.rowid, c.body());
+  }
+
+  // What was read of every row is read again next time (its columns changed).
+  void forgetAll(this) { this.recent = null; }
+
+  i64 maxRowid(this) {
+    if (this.pg is null) {
+      Row? last = this.rows.last();
+      return last is null ? 0 : last!.rowid;
+    }
+    Cursor c = Cursor.over(this.pg!, this.root, true);
+    return c.last() ? c.rowid : 0;
+  }
+
+  i64 count(this) {
+    if (this.pg is null) { return this.rows.len() as i64; }
+    return countEntries(this.pg!, this.root);
+  }
+
+  bool isEmpty(this) {
+    if (this.pg is null) { return this.rows.len() == 0; }
+    return !Cursor.over(this.pg!, this.root, true).first();
+  }
+
+  RowCursor cursor(this) {
+    if (this.pg is null) { return RowCursor { t: this }; }
+    Cursor c = Cursor.over(this.pg!, this.root, true);
+    c.lazy = true;
+    return RowCursor { t: this, c: c };
+  }
+
+  // Puts a row in, in place of the one with its rowid if there is one.
+  void put(this, Row r) {
+    if (this.pg is null) {
+      i32 at = this.find(r.rowid);
+      if (at < this.rows.len() && this.rows.get(at).rowid == r.rowid) { this.rows.set(at, r); }
+      else { this.rows.insert(at, r); }
+      return;
+    }
+    tableInsert(this.pg!, this.root, r.rowid, this.record(r));
+    this.shadowDirty = true;
+  }
+
+  void remove(this, i64 rowid) {
+    if (this.pg is null) {
+      i32 at = this.find(rowid);
+      if (at < this.rows.len() && this.rows.get(at).rowid == rowid) { this.rows.remove(at); }
+      return;
+    }
+    tableDelete(this.pg!, this.root, rowid);
+    this.shadowDirty = true;
+  }
+
+  // A row from its record: the record is widened to the table's columns (a row written before ALTER
+  // TABLE ADD COLUMN is shorter, and its missing values are the column's default), and its VIRTUAL
+  // columns computed.
+  Row decode(this, i64 rowid, u8[] payload) {
+    Value[]? v = decodeRecordIn(payload, this.enc);
+    if (v is null) { this.pg!.failed("malformed record in \{this.name}"); v = Value[](); }
+    bool virt = this.hasVirtual();
+    Row r = this.fromRecord(rowid, v!, virt);
+    r.rec = payload;
+    if (virt && this.gen is not null) { this.gen!(r); }
+    return r;
+  }
+
+  Row fromRecord(this, i64 rowid, Value[] stored0, bool virt) {
+    Value[] stored = stored0;
+    if (virt || this.withoutRowid) {
+      // The record is not the columns in order: a VIRTUAL generated column is not in it, and a WITHOUT
+      // ROWID table's key comes first. Each value goes to its column; a virtual one is computed later.
+      i32[] order = this.recordOrder();
+      Value[] spread = Value[].filled(this.cols.len(), Value.Null);
+      for (i32 k = 0; k < order.len(); k++) {
+        i32 col = order[k];
+        spread[col] = k < stored0.len() ? stored0[k] : this.missing(col);
+      }
+      stored = spread;
+    }
+    Value[] vals = stored;
+    if (stored.len() != this.cols.len()) {
+      vals = Value[].filled(this.cols.len(), Value.Null);
+      for (i32 i = 0; i < vals.len(); i++) { vals[i] = i < stored.len() ? stored[i] : this.missing(i); }
+    }
+    // SQLite stores an integral value in a REAL column as an integer, to save space, and reads it back as
+    // a real.
+    for (i32 i = 0; i < vals.len(); i++) {
+      if (this.cols[i].affinity == AFF_REAL) {
+        match (vals[i]) { Int(x): { vals[i] = Value.Real(x as~ f64); } default: {} }
+      }
+    }
+    if (this.rowidAlias >= 0) { vals[this.rowidAlias] = Value.Int(rowid); }
+    return Row(rowid, vals, null);
+  }
+
+  // A column a record is too short for: its default, with the column's affinity, as ADD COLUMN gave it.
+  Value missing(this, i32 col) {
+    if (this.cols[col].dflt is null) { return Value.Null; }
+    Value? v = constValue(this.cols[col].dflt!);
+    return v is null ? Value.Null : applyAffinity(v!, this.cols[col].affinity);
+  }
+
+  // The record a row is stored as: the alias column, if any, is NULL in the file.
+  u8[] record(this, Row r) {
+    if (r.rec is not null) { return r.rec!; }
+    u8[] out = u8[]();
+    if (this.hasVirtual() || this.withoutRowid) {
+      i32[] order = this.recordOrder();
+      Value[] v = Value[].filled(order.len(), Value.Null);
+      for (i32 k = 0; k < order.len(); k++) { v[k] = order[k] == this.rowidAlias ? Value.Null : r.vals[order[k]]; }
+      out = encodeRecordIn(v, this.enc);
+    } else if (this.rowidAlias < 0) {
+      out = encodeRecordIn(r.vals, this.enc);
+    } else {
+      Value[] v = Value[].filled(r.vals.len(), Value.Null);
+      v.copyFrom(r.vals, 0, 0, r.vals.len());
+      v[this.rowidAlias] = Value.Null;
+      out = encodeRecordIn(v, this.enc);
+    }
+    r.rec = out;
+    return out;
+  }
+}
+
+// How many leaf pages' decoded rows a table keeps (see Table.recent).
+static i32 RECENT_PAGES = 1024;
+
+export struct PageRows {
+  i64 stamp;
+  Row?[] rows;
+}
+
+// A place in a table's rows, in rowid order, moved either way.
+export struct RowCursor {
+  Table t;
+  Cursor? c = null;
+  i32 at = -1;
+  bool valid = false;
+  Row? cached = null;
+  i64 page = 0;            // the leaf the cursor was last on, and its decoded rows
+  PageRows? rowsHere = null;
+  i64 rowsVersion = -1;
+
+  bool settle(this, bool ok) {
+    this.valid = ok;
+    this.cached = null;
+    return ok;
+  }
+
+  bool settleAt(this, i32 at) {
+    this.at = at;
+    return this.settle(at >= 0 && at < this.t.rows.len());
+  }
+
+  bool first(this) { return this.c is null ? this.settleAt(0) : this.settle(this.c!.first()); }
+
+  bool last(this) { return this.c is null ? this.settleAt(this.t.rows.len() - 1) : this.settle(this.c!.last()); }
+
+  // The first row whose rowid is `rowid` or more.
+  bool seek(this, i64 rowid) { return this.c is null ? this.settleAt(this.t.find(rowid)) : this.settle(this.c!.seekRowid(rowid)); }
+
+  bool next(this) {
+    if (!this.valid) { return false; }
+    return this.c is null ? this.settleAt(this.at + 1) : this.settle(this.c!.next());
+  }
+
+  bool prev(this) {
+    if (!this.valid) { return false; }
+    return this.c is null ? this.settleAt(this.at - 1) : this.settle(this.c!.prev());
+  }
+
+  i64 rowid(this) { return this.c is null ? this.t.rows.get(this.at).rowid : this.c!.rowid; }
+
+  Row row(this) {
+    if (this.c is null) { return this.t.rows.get(this.at); }
+    if (this.cached is null) {
+      Cursor c = this.c!;
+      i64 p = c.topNumber();
+      // Nothing has changed since the page's rows were found: no need to look again.
+      if (this.rowsHere is null || p != this.page || this.rowsVersion != this.t.pg!.version) {
+        this.rowsHere = this.t.pageRows(p);
+        this.page = p;
+        this.rowsVersion = this.t.pg!.version;
+      }
+      this.cached = this.t.rowAt(c, this.rowsHere!);
+    }
+    return this.cached!;
+  }
+}
+
+// A default as a value, when it is one: a literal, perhaps signed.
+export Value? constValue(const Expr e) {
+  match (e) {
+    Lit(v): { return v; }
+    Unary(op, x): {
+      Value? v = constValue(x);
+      if (v is null || op == "+") { return v; }
+      if (op != "-") { return null; }
+      match (v!) {
+        Int(i): { return Value.Int(0 - i); }
+        Real(r): { return Value.Real(-r); }
+        default: { return null; }
+      }
+    }
+    default: { return null; }
+  }
+}
+
+// Whether two reads of a row found the same row: the same rowid, and the same record. A row a statement
+// deleted and put back unchanged counts as the same.
+export bool sameRow(Row a, Row b) {
+  if (a is b) { return true; }
+  if (a.rowid != b.rowid || a.vals.len() != b.vals.len()) { return false; }
+  for (i32 i = 0; i < a.vals.len(); i++) {
+    if (compareValues(a.vals[i], b.vals[i]) != 0 || typeRank(a.vals[i]) != typeRank(b.vals[i])) { return false; }
+  }
+  return true;
+}
+
+i32 typeRank(const Value v) { return match (v) { Null: 0, Int: 1, Real: 2, Text: 3, Blob: 4 }; }
+
+// A view: its query, kept parsed, and its text as sqlite_schema stores it.
+export struct View {
+  string name;
+  string sql;
+  string[]? cols;
+  Select sel;
+}
+
+// A trigger, kept parsed.
+export struct Trigger {
+  CreateTrigger def;
+}
+
+// An entry of sqlite_schema, in the order the file lists them, which is the order they are written back.
+export struct SchemaEntry {
+  string kind;      // "table" or "index"
+  string name;
+  string table;
+}
+
+// A table of computed rows, held in memory: a subquery's, a view's, a table-valued function's.
+export Table rowsTable(string name, Column[] cols, Vec<Row> rows) {
+  return Table { name: name, sql: "", cols: cols, rows: rows, checks: Expr[](), fks: ForeignKey[](), pk: i32[]() };
+}

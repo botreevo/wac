@@ -1,0 +1,91 @@
+// A chain's fork schedule, as a light client needs it: which fork an epoch is in, the version a signature at that
+// epoch is made under, and the light-client layout each fork uses.
+//
+// Bellatrix has a version and an epoch but no light-client layout of its own (its data is Altair's), so the schedule
+// lists it while the layouts (`ssz/src/forks.wac`) skip it. That difference is why a schedule entry and a layout are
+// two numbers here: a Bellatrix-era signature must be checked under Bellatrix's version, with Altair's types.
+
+import { ALTAIR, CAPELLA, DENEB, ELECTRA, FULU } from "../../ssz/src/forks.wac";
+import { computeForkDigest } from "./domain.wac";
+
+
+export struct Schedule {
+  /** First epoch of Altair, Bellatrix, Capella, Deneb, Electra and Fulu; -1 for a fork never scheduled. */
+  i64[] epochs;
+  /** Their four-byte versions, in the same order. */
+  u8[][] versions;
+  /** `SLOTS_PER_EPOCH`: 8 minimal, 32 mainnet. */
+  i64 slotsPerEpoch;
+  /** `SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD`, which is also `UPDATE_TIMEOUT`: 64 minimal, 8192 mainnet. */
+  i64 slotsPerPeriod;
+  /** `SYNC_COMMITTEE_SIZE`: 32 minimal, 512 mainnet. */
+  i32 size;
+
+  /** The minimal config's versions (`0x0N000001`), with `epochs` as a test or a network gives them. */
+  Schedule minimal(i64[] epochs) {
+    u8[][] vs = u8[][].filled(6, u8[]());
+    for (i32 i = 0; i < 6; i++) { vs[i] = [(i + 1) as@ u8, 0 as u8, 0 as u8, 1 as u8]; }
+    return Schedule(epochs, vs, 8 as i64, 64 as i64, 32);
+  }
+
+  /** Ethereum mainnet (consensus-specs configs/mainnet.yaml), Altair to Fulu; Gloas is not yet scheduled. */
+  Schedule mainnet() {
+    i64[] e = [74240 as i64, 144896 as i64, 194048 as i64, 269568 as i64, 364032 as i64, 411392 as i64];
+    u8[][] vs = u8[][].filled(6, u8[]());
+    for (i32 i = 0; i < 6; i++) { vs[i] = [(i + 1) as@ u8, 0 as u8, 0 as u8, 0 as u8]; }
+    return Schedule(e, vs, 32 as i64, 8192 as i64, 512);
+  }
+
+  /**
+   * Every fork up to `layout`'s scheduled at genesis, the rest never: what a single-fork test runs under. Altair's
+   * layout means Altair itself, not Bellatrix, whose version a signature would otherwise be checked under.
+   */
+  Schedule genesisTo(i32 layout) {
+    i64[] e = i64[].filled(6, -1 as i64);
+    i32 last = layout == ALTAIR() ? 0 : layout + 1;
+    for (i32 i = 0; i <= last && i < 6; i++) { e[i] = 0 as i64; }
+    return Schedule.minimal(e);
+  }
+
+  /** The schedule entry in force at `epoch`: 0 Altair … 5 Fulu. */
+  i32 entryAt(this, i64 epoch) {
+    i32 at = 0;
+    for (i32 i = 0; i < this.epochs.len(); i++) {
+      if (this.epochs[i] >= 0 as i64 && epoch >= this.epochs[i]) { at = i; }
+    }
+    return at;
+  }
+
+  /** The light-client layout in force at `slot`. */
+  i32 layoutAtSlot(this, i64 slot) { return layoutOf(this.entryAt(slot / this.slotsPerEpoch)); }
+
+  /** `compute_sync_committee_period_at_slot`. */
+  i64 periodAt(this, i64 slot) { return slot / this.slotsPerPeriod; }
+
+  /** `compute_fork_version(epoch)`. */
+  u8[] versionAt(this, i64 epoch) { return this.versions[this.entryAt(epoch)]; }
+
+  /**
+   * The layout a fork digest names, or -1: what a peer's `update_fork_digest` says the bytes are. Every listed
+   * version is tried, scheduled or not, because a store may be upgraded ahead of its fork's epoch.
+   */
+  i32 layoutOfDigest(this, u8[] digest, u8[] genesisValidatorsRoot) {
+    for (i32 i = 0; i < this.versions.len(); i++) {
+      u8[]? d = computeForkDigest(this.versions[i], genesisValidatorsRoot);
+      if (d is not null && same(d!, digest)) { return layoutOf(i); }
+    }
+    return -1;
+  }
+}
+
+/** A schedule entry's light-client layout: Altair's for Altair and Bellatrix, then one each. */
+export i32 layoutOf(i32 entry) {
+  if (entry <= 1) { return ALTAIR(); }
+  return entry - 1;
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

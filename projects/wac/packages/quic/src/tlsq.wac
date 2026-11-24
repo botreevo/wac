@@ -1,0 +1,453 @@
+// TLS 1.3 as QUIC carries it (RFC 9001): the handshake, in either role, with no records.
+//
+// QUIC has no TLS records. Handshake messages travel in CRYPTO frames at one of three levels — Initial, Handshake,
+// application — and what TLS hands QUIC is not ciphertext but **secrets**, from which QUIC makes its own packet keys.
+// So this is the TLS state machine with the record layer cut off: bytes in at a level, bytes out at a level, and the
+// handshake and application traffic secrets as they become known.
+//
+// ## What it negotiates
+//
+// One suite (TLS_AES_128_GCM_SHA256), one group (x25519), and the signature scheme a KPS identity has
+// (ecdsa_secp256r1_sha256) — which is what every QUIC stack offers. No HelloRetryRequest, no PSK, no 0-RTT, no
+// client certificate. An ALPN is required of the client and checked by the server (RFC 9001 §8.1); the transport
+// parameters ride in extension 57 both ways and are handed up unparsed.
+//
+// ## What it checks
+//
+// A client checks that the server's certificate hashes to the pinned digest (KPS's whole authentication — no PKI,
+// no name), that the CertificateVerify is that certificate's signature over the transcript, and that the Finished
+// matches. A server checks the client's Finished.
+//
+// ## Hostile input
+//
+// **Nothing here traps on what a peer sends.** `packages/tls`'s parsers trap on a malformed message, which is right
+// for a test and wrong for a listener: one bad Initial would take every connection down with it. Every read here is
+// through `Bytes`, which answers zeros once it has run out and remembers that it did, and every message is checked
+// for that before anything in it is believed.
+
+import { Vec } from "core";
+import { handshakeMessage, serverHello, clientHello, certificate, certificateVerifyContent, certificateVerify,
+         finished } from "../../tls/src/handshake.wac";
+import { deriveSecret, earlySecret, handshakeSecret, masterSecret, finishedVerify, zeroKey } from "../../tls/src/keyschedule.wac";
+import { Cert, certVerifySignature, parseCert } from "../../tls/src/x509.wac";
+import { derInteger, derSequence } from "../../tls/src/derwrite.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { x25519Base, x25519Shared } from "../../crypto/src/x25519.wac";
+import { p256Sign } from "../../crypto/src/p256.wac";
+import { ctEqualN } from "../../crypto/src/ct.wac";
+
+static i32 SUITE = 0x1301;
+static i32 GROUP = 0x001d;
+static i32 SCHEME = 0x0403;
+
+/** TLS alerts, as QUIC sends them: CRYPTO_ERROR is 0x100 plus the alert. */
+export static i32 ALERT_HANDSHAKE_FAILURE = 40;
+export static i32 ALERT_BAD_CERTIFICATE = 42;
+export static i32 ALERT_ILLEGAL_PARAMETER = 47;
+export static i32 ALERT_DECODE_ERROR = 50;
+export static i32 ALERT_DECRYPT_ERROR = 51;
+export static i32 ALERT_PROTOCOL_VERSION = 70;
+export static i32 ALERT_UNEXPECTED_MESSAGE = 10;
+export static i32 ALERT_MISSING_EXTENSION = 109;
+export static i32 ALERT_NO_APPLICATION_PROTOCOL = 120;
+
+/** The three levels handshake bytes travel at. */
+export static i32 LEVEL_INITIAL = 0;
+export static i32 LEVEL_HANDSHAKE = 1;
+export static i32 LEVEL_APPLICATION = 2;
+
+/**
+ * Bytes read from the front, bounds-checked: past the end answers zeros and sets `bad`, which every caller checks
+ * once at the end of a message rather than after every field.
+ */
+export struct Bytes {
+  u8[] b;
+  i32 at;
+  i32 end;
+  bool bad = false;
+
+  Bytes of(u8[] b) { return Bytes { b: b, at: 0, end: b.len() }; }
+
+  bool empty(const this) { return this.at >= this.end; }
+
+  i32 u8(this) {
+    if (this.at + 1 > this.end) { this.bad = true; this.at = this.end; return 0; }
+    i32 v = this.b[this.at] as i32;
+    this.at += 1;
+    return v;
+  }
+  i32 u16(this) { i32 hi = this.u8(); return (hi << 8) | this.u8(); }
+  i32 u24(this) { i32 hi = this.u8(); return (hi << 16) | this.u16(); }
+
+  u8[] take(this, i32 n) {
+    if (n < 0 || this.at + n > this.end) { this.bad = true; this.at = this.end; return u8[](); }
+    u8[] out = u8[].filled(n, 0);
+    out.copyFrom(this.b, this.at, 0, n);
+    this.at += n;
+    return out;
+  }
+  u8[] vec8(this) { return this.take(this.u8()); }
+  u8[] vec16(this) { return this.take(this.u16()); }
+  u8[] vec24(this) { return this.take(this.u24()); }
+  /** The next `n` bytes as their own reader; `bad` here if they are not all there. */
+  Bytes sub(this, i32 n) { return Bytes.of(this.take(n)); }
+}
+
+/** A list of TLS extensions, `(type, body)`, read from a reader positioned at the two-byte block length. */
+struct Ext {
+  i32 kind;
+  u8[] body;
+}
+
+Ext[] extensions(Bytes r) {
+  Bytes block = r.sub(r.u16());
+  Vec<Ext> out = Vec<Ext>.create();
+  while (!block.empty() && !block.bad) {
+    i32 kind = block.u16();
+    u8[] body = block.vec16();
+    out.push(Ext(kind, body));
+  }
+  if (block.bad) { r.bad = true; }
+  return out.toArray();
+}
+
+u8[] concat(const u8[] a, const u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+u8[] u16Bytes(i32 v) { return [((v >> 8) & 0xFF) as@ u8, (v & 0xFF) as@ u8]; }
+
+/** Bytes for one level, to go out in CRYPTO frames. */
+export struct TlsOut {
+  i32 level;
+  u8[] data;
+}
+
+export struct QuicTls {
+  bool isServer;
+  /** The ALPN offered (a client) or required (a server). */
+  u8[] alpn;
+  /** Our transport parameters, encoded, without the extension header. */
+  u8[] localParams;
+  u8[] scalar;
+  u8[] random;
+  /** A server's certificate and P-256 key, and the ECDSA nonce for this handshake's one signature. */
+  u8[] certDer = u8[]();
+  u8[] signingKey = u8[]();
+  u8[] signingNonce = u8[]();
+  /** A client's pin: the sha-256 the server's certificate must hash to. */
+  u8[] pinDigest = u8[]();
+
+  /** 0 nothing yet; client 1 wait ServerHello, 2 wait EE, 3 wait Certificate, 4 wait CV, 5 wait Finished;
+   *  server 1 wait ClientHello, 2 wait client Finished; 9 done. */
+  i32 state = 0;
+  u8[][] inbound = [u8[](), u8[](), u8[]()];
+  u8[] transcript = u8[]();
+  Vec<TlsOut> out = Vec<TlsOut>.create();
+
+  u8[] hsSecret = u8[]();
+  u8[] clientHs = u8[]();
+  u8[] serverHs = u8[]();
+  u8[] clientApp = u8[]();
+  u8[] serverApp = u8[]();
+  /** The peer's transport parameters, unparsed; empty until they arrive. */
+  u8[] peerParams = u8[]();
+  u8[] peerCert = u8[]();
+  /** The alert the handshake failed with (0 while it has not), and why, for a person. */
+  i32 alert = 0;
+  string why = "";
+
+  QuicTls client(u8[] alpn, u8[] localParams, u8[] scalar, u8[] random, u8[] pinDigest) {
+    return QuicTls { isServer: false, alpn: alpn, localParams: localParams, scalar: scalar, random: random,
+                     pinDigest: pinDigest };
+  }
+
+  QuicTls server(u8[] alpn, u8[] localParams, u8[] scalar, u8[] random, u8[] certDer, u8[] signingKey,
+                 u8[] signingNonce) {
+    return QuicTls { isServer: true, alpn: alpn, localParams: localParams, scalar: scalar, random: random,
+                     certDer: certDer, signingKey: signingKey, signingNonce: signingNonce, state: 1 };
+  }
+
+  bool failed(const this) { return this.alert != 0; }
+  bool complete(const this) { return this.state == 9; }
+  bool handshakeKeys(const this) { return this.clientHs.len() > 0; }
+  bool applicationKeys(const this) { return this.clientApp.len() > 0; }
+
+  void fail(this, i32 alert, string why) {
+    if (this.alert != 0) { return; }
+    this.alert = alert;
+    this.why = why;
+  }
+
+  /** What to send, taken. */
+  TlsOut[] take(this) {
+    TlsOut[] a = this.out.toArray();
+    this.out = Vec<TlsOut>.create();
+    return a;
+  }
+
+  void emit(this, i32 level, u8[] msg) {
+    this.out.push(TlsOut(level, msg));
+    this.transcript = concat(this.transcript, msg);
+  }
+
+  /** A client's first flight: the ClientHello, at the Initial level. */
+  void start(this) {
+    if (this.isServer || this.state != 0) { return; }
+    u8[] ext = concat(concat(u16Bytes(57), u16Bytes(this.localParams.len())), this.localParams);
+    this.emit(LEVEL_INITIAL, clientHello(this.random, u8[](), SUITE, GROUP, x25519Base(this.scalar), u8[](),
+                                         this.alpn, ext));
+    this.state = 1;
+  }
+
+  /** Handshake bytes the peer sent at `level`, in order (the caller reassembles CRYPTO frames by offset). */
+  void receive(this, i32 level, u8[] data) {
+    if (this.failed() || level < 0 || level > 2) { return; }
+    this.inbound[level] = concat(this.inbound[level], data);
+    while (!this.failed()) {
+      u8[] buf = this.inbound[level];
+      if (buf.len() < 4) { return; }
+      i32 len = (buf[1] as i32 << 16) | (buf[2] as i32 << 8) | buf[3] as i32;
+      if (len > 65536) { this.fail(ALERT_DECODE_ERROR, "a handshake message longer than any this handshake has"); return; }
+      if (buf.len() < 4 + len) { return; }
+      u8[] msg = u8[].filled(4 + len, 0);
+      msg.copyFrom(buf, 0, 0, 4 + len);
+      u8[] rest = u8[].filled(buf.len() - 4 - len, 0);
+      rest.copyFrom(buf, 4 + len, 0, rest.len());
+      this.inbound[level] = rest;
+      this.message(level, msg[0] as i32, msg);
+    }
+  }
+
+  void message(this, i32 level, i32 kind, u8[] msg) {
+    u8[] body = u8[].filled(msg.len() - 4, 0);
+    body.copyFrom(msg, 4, 0, body.len());
+    if (this.isServer) {
+      if (this.state == 1 && level == LEVEL_INITIAL && kind == 1) { this.clientHello(msg, body); return; }
+      if (this.state == 2 && level == LEVEL_HANDSHAKE && kind == 20) { this.clientFinished(body); return; }
+    } else {
+      if (this.state == 1 && level == LEVEL_INITIAL && kind == 2) { this.serverHello(msg, body); return; }
+      if (this.state == 2 && level == LEVEL_HANDSHAKE && kind == 8) { this.encryptedExtensions(msg, body); return; }
+      if (this.state == 3 && level == LEVEL_HANDSHAKE && kind == 11) { this.certificate(msg, body); return; }
+      if (this.state == 4 && level == LEVEL_HANDSHAKE && kind == 15) { this.certificateVerify(msg, body); return; }
+      if (this.state == 5 && level == LEVEL_HANDSHAKE && kind == 20) { this.serverFinished(msg, body); return; }
+      // A NewSessionTicket after the handshake is the server's to send and ours to ignore: no resumption here.
+      if (this.state == 9 && level == LEVEL_APPLICATION && kind == 4) { return; }
+    }
+    this.fail(ALERT_UNEXPECTED_MESSAGE, "handshake message \{kind} at level \{level} in state \{this.state}");
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────── a client ───
+
+  void serverHello(this, u8[] msg, u8[] body) {
+    Bytes r = Bytes.of(body);
+    r.u16();
+    u8[] random = r.take(32);
+    r.vec8();
+    i32 suite = r.u16();
+    r.u8();
+    Ext[] exts = extensions(r);
+    if (r.bad) { this.fail(ALERT_DECODE_ERROR, "a ServerHello that does not parse"); return; }
+    if (isRetryRandom(random)) { this.fail(ALERT_HANDSHAKE_FAILURE, "a HelloRetryRequest, which this client does not answer"); return; }
+    if (suite != SUITE) { this.fail(ALERT_ILLEGAL_PARAMETER, "the server chose suite \{suite}"); return; }
+    bool v13 = false;
+    u8[] share = u8[]();
+    for (Ext e in exts) {
+      Bytes x = Bytes.of(e.body);
+      if (e.kind == 43) { v13 = x.u16() == 0x0304 && !x.bad; }
+      if (e.kind == 51) {
+        i32 group = x.u16();
+        u8[] key = x.vec16();
+        if (!x.bad && group == GROUP) { share = key; }
+      }
+    }
+    if (!v13) { this.fail(ALERT_PROTOCOL_VERSION, "the server did not choose TLS 1.3"); return; }
+    if (share.len() != 32) { this.fail(ALERT_ILLEGAL_PARAMETER, "the server's key share is not an x25519 point"); return; }
+    u8[]? dhe = x25519Shared(this.scalar, share);
+    if (dhe is null) { this.fail(ALERT_ILLEGAL_PARAMETER, "the server's key share is a small-order point"); return; }
+    this.transcript = concat(this.transcript, msg);
+    this.handshakeSecrets(dhe!);
+    this.state = 2;
+  }
+
+  void handshakeSecrets(this, u8[] dhe) {
+    this.hsSecret = handshakeSecret(earlySecret(zeroKey()), dhe);
+    u8[] th = sha256(this.transcript);
+    this.clientHs = deriveSecret(this.hsSecret, "c hs traffic".toBytes(), th);
+    this.serverHs = deriveSecret(this.hsSecret, "s hs traffic".toBytes(), th);
+  }
+
+  void applicationSecrets(this) {
+    u8[] master = masterSecret(this.hsSecret);
+    u8[] th = sha256(this.transcript);
+    this.clientApp = deriveSecret(master, "c ap traffic".toBytes(), th);
+    this.serverApp = deriveSecret(master, "s ap traffic".toBytes(), th);
+  }
+
+  void encryptedExtensions(this, u8[] msg, u8[] body) {
+    Bytes r = Bytes.of(body);
+    Ext[] exts = extensions(r);
+    if (r.bad) { this.fail(ALERT_DECODE_ERROR, "EncryptedExtensions that do not parse"); return; }
+    bool params = false;
+    for (Ext e in exts) {
+      if (e.kind == 57) { this.peerParams = e.body; params = true; }
+      if (e.kind == 16) {
+        Bytes x = Bytes.of(e.body);
+        Bytes list = x.sub(x.u16());
+        u8[] chosen = list.vec8();
+        if (x.bad || list.bad || !same(chosen, this.alpn)) {
+          this.fail(ALERT_NO_APPLICATION_PROTOCOL, "the server chose an application protocol that was not offered");
+          return;
+        }
+      }
+    }
+    if (!params) { this.fail(ALERT_MISSING_EXTENSION, "the server sent no transport parameters"); return; }
+    this.transcript = concat(this.transcript, msg);
+    this.state = 3;
+  }
+
+  void certificate(this, u8[] msg, u8[] body) {
+    Bytes r = Bytes.of(body);
+    r.vec8();
+    Bytes list = r.sub(r.u24());
+    u8[] der = list.vec24();
+    if (r.bad || list.bad || der.len() == 0) { this.fail(ALERT_DECODE_ERROR, "a Certificate that does not parse"); return; }
+    // **The pin, and nothing else**: no chain, no name, no dates (SPEC §3).
+    if (!ctEqualN(sha256(der), this.pinDigest, 32) || this.pinDigest.len() != 32) {
+      this.fail(ALERT_BAD_CERTIFICATE, "the server's certificate does not hash to the pinned certhash");
+      return;
+    }
+    this.peerCert = der;
+    this.transcript = concat(this.transcript, msg);
+    this.state = 4;
+  }
+
+  void certificateVerify(this, u8[] msg, u8[] body) {
+    Bytes r = Bytes.of(body);
+    i32 scheme = r.u16();
+    u8[] sig = r.vec16();
+    if (r.bad) { this.fail(ALERT_DECODE_ERROR, "a CertificateVerify that does not parse"); return; }
+    Cert c = parseCert(this.peerCert);
+    u8[] content = certificateVerifyContent(sha256(this.transcript), true);
+    if (!c.wellFormed || !certVerifySignature(c, scheme, content, sig)) {
+      this.fail(ALERT_DECRYPT_ERROR, "the CertificateVerify is not the certificate's signature over this handshake");
+      return;
+    }
+    this.transcript = concat(this.transcript, msg);
+    this.state = 5;
+  }
+
+  void serverFinished(this, u8[] msg, u8[] body) {
+    u8[] want = finishedVerify(this.serverHs, sha256(this.transcript));
+    if (body.len() != 32 || !ctEqualN(body, want, 32)) {
+      this.fail(ALERT_DECRYPT_ERROR, "the server's Finished does not match the handshake");
+      return;
+    }
+    this.transcript = concat(this.transcript, msg);
+    this.applicationSecrets();
+    this.emit(LEVEL_HANDSHAKE, finished(finishedVerify(this.clientHs, sha256(this.transcript))));
+    this.state = 9;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────── a server ───
+
+  void clientHello(this, u8[] msg, u8[] body) {
+    Bytes r = Bytes.of(body);
+    r.u16();
+    r.take(32);
+    u8[] sessionId = r.vec8();
+    Bytes suites = r.sub(r.u16());
+    bool suiteOk = false;
+    while (!suites.empty() && !suites.bad) { if (suites.u16() == SUITE) { suiteOk = true; } }
+    r.vec8();
+    Ext[] exts = extensions(r);
+    if (r.bad || suites.bad) { this.fail(ALERT_DECODE_ERROR, "a ClientHello that does not parse"); return; }
+    bool v13 = false;
+    bool alpnOk = false;
+    bool alpnSeen = false;
+    bool params = false;
+    bool sigOk = false;
+    u8[] share = u8[]();
+    for (Ext e in exts) {
+      Bytes x = Bytes.of(e.body);
+      if (e.kind == 43) {
+        Bytes vs = x.sub(x.u8());
+        while (!vs.empty() && !vs.bad) { if (vs.u16() == 0x0304) { v13 = true; } }
+      } else if (e.kind == 51) {
+        Bytes shares = x.sub(x.u16());
+        while (!shares.empty() && !shares.bad) {
+          i32 group = shares.u16();
+          u8[] key = shares.vec16();
+          if (!shares.bad && group == GROUP && key.len() == 32) { share = key; }
+        }
+      } else if (e.kind == 13) {
+        Bytes algs = x.sub(x.u16());
+        while (!algs.empty() && !algs.bad) { if (algs.u16() == SCHEME) { sigOk = true; } }
+      } else if (e.kind == 16) {
+        alpnSeen = true;
+        Bytes list = x.sub(x.u16());
+        while (!list.empty() && !list.bad) { if (same(list.vec8(), this.alpn)) { alpnOk = true; } }
+      } else if (e.kind == 57) {
+        this.peerParams = e.body;
+        params = true;
+      }
+    }
+    if (!v13) { this.fail(ALERT_PROTOCOL_VERSION, "the client does not offer TLS 1.3"); return; }
+    if (!suiteOk) { this.fail(ALERT_HANDSHAKE_FAILURE, "the client does not offer TLS_AES_128_GCM_SHA256"); return; }
+    if (!sigOk) { this.fail(ALERT_HANDSHAKE_FAILURE, "the client does not accept ecdsa_secp256r1_sha256"); return; }
+    if (!alpnSeen || !alpnOk) { this.fail(ALERT_NO_APPLICATION_PROTOCOL, "the client does not offer the application protocol"); return; }
+    if (!params) { this.fail(ALERT_MISSING_EXTENSION, "the client sent no transport parameters"); return; }
+    // A client that offered no x25519 share would need a HelloRetryRequest; every QUIC stack sends one first.
+    if (share.len() != 32) { this.fail(ALERT_HANDSHAKE_FAILURE, "the client offered no x25519 key share"); return; }
+    u8[]? dhe = x25519Shared(this.scalar, share);
+    if (dhe is null) { this.fail(ALERT_ILLEGAL_PARAMETER, "the client's key share is a small-order point"); return; }
+
+    this.transcript = msg;
+    this.emit(LEVEL_INITIAL, serverHello(this.random, sessionId, SUITE, GROUP, x25519Base(this.scalar)));
+    this.handshakeSecrets(dhe!);
+
+    // EncryptedExtensions: the ALPN chosen, and our transport parameters.
+    u8[] alpnBody = concat(u16Bytes(this.alpn.len() + 1), concat([this.alpn.len() as@ u8], this.alpn));
+    u8[] exts2 = concat(concat(concat(u16Bytes(16), u16Bytes(alpnBody.len())), alpnBody),
+                        concat(concat(u16Bytes(57), u16Bytes(this.localParams.len())), this.localParams));
+    this.emit(LEVEL_HANDSHAKE, handshakeMessage(8, concat(u16Bytes(exts2.len()), exts2)));
+    this.emit(LEVEL_HANDSHAKE, certificate(this.certDer));
+    u8[] raw = p256Sign(this.signingKey, certificateVerifyContent(sha256(this.transcript), true), this.signingNonce);
+    if (raw.len() != 64) { this.fail(ALERT_HANDSHAKE_FAILURE, "the identity's key could not sign"); return; }
+    u8[] r1 = u8[].filled(32, 0);
+    u8[] s1 = u8[].filled(32, 0);
+    r1.copyFrom(raw, 0, 0, 32);
+    s1.copyFrom(raw, 32, 0, 32);
+    this.emit(LEVEL_HANDSHAKE, certificateVerify(SCHEME, derSequence(concat(derInteger(r1), derInteger(s1)))));
+    this.emit(LEVEL_HANDSHAKE, finished(finishedVerify(this.serverHs, sha256(this.transcript))));
+    // The application secrets are over the transcript through the server's Finished: a server may send 1-RTT data
+    // before the client's Finished arrives, and must read none until it has.
+    this.applicationSecrets();
+    this.state = 2;
+  }
+
+  void clientFinished(this, u8[] body) {
+    u8[] want = finishedVerify(this.clientHs, sha256(this.transcript));
+    if (body.len() != 32 || !ctEqualN(body, want, 32)) {
+      this.fail(ALERT_DECRYPT_ERROR, "the client's Finished does not match the handshake");
+      return;
+    }
+    this.state = 9;
+  }
+}
+
+bool same(const u8[] a, const u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+/** RFC 8446 §4.1.3: a ServerHello with this random is a HelloRetryRequest. */
+bool isRetryRandom(u8[] r) {
+  u8[] hrr = [0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+              0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C];
+  return same(r, hrr);
+}

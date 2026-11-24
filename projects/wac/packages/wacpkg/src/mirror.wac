@@ -1,0 +1,126 @@
+// Where `wac update` fetches a pinned url from: git's own `url.<base>.insteadOf`, applied as git applies it.
+//
+// **Pins name GitHub; development fetches from git.voltrevo.com**, which has the commits first (`CLAUDE.md`,
+// `tools/use-mirror.sh`). That script sets one git setting —
+//
+//     [url "https://git.voltrevo.com/"]
+//     	insteadOf = https://github.com/voltrevo/
+//
+// — which every `git` fetch obeys and `wac update`'s fetcher did not, so a commit pushed to the mirror and not yet
+// synced to GitHub could be filled into the cache by `tools/fill-cache.sh` and not by `wac update`, which answered
+// *not our ref*. This reads the same setting, so the two agree.
+//
+// **Only the fetch is redirected.** The cache stays keyed by the url as pinned — `cachePath(wacHome, map.git, …)` —
+// because that is the key a build looks a dependency up by, and the lock is written with the pinned url too. A
+// mirror is a way of getting the same commit; it is not a different dependency.
+//
+// **The longest matching `insteadOf` wins**, which is git's rule (`git help config`, `url.<base>.insteadOf`): with
+// two rules matching a url, the one whose prefix is longer is the one applied, whatever order they were written in.
+//
+// **Where the settings come from** is `packages/git`'s `configChain` — `/etc/gitconfig`, the XDG file,
+// `~/.gitconfig` — and then the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs, which
+// git reads after the files and which a suite uses to say `safe.directory` without writing a file. A repository's
+// own `.git/config` is not read: a project has no git directory a fetcher should be reading settings out of.
+
+import { Env, Files } from "std";
+import { Vec, flatten } from "core";
+import { Setting } from "../../git/src/config.wac";
+import { configChain } from "../../git/src/configfiles.wac";
+
+/** The `insteadOf` rules in force: `prefixes[i]` at the start of a url is replaced by `bases[i]`. */
+export struct Mirror {
+  string[] bases;
+  string[] prefixes;
+}
+
+/** No rules — every url is fetched from where it is pinned. */
+export Mirror noMirror() { return Mirror(string[](), string[]()); }
+
+/** The `insteadOf` rules among `settings`. A setting's name is `url.<base>.insteadof`, the base kept as written. */
+export Mirror mirrorOf(const Vec<Setting> settings) {
+  Vec<string> bases = Vec.create();
+  Vec<string> prefixes = Vec.create();
+  string head = "url.";
+  string tail = ".insteadof";
+  for (i32 i = 0; i < settings.len(); i++) {
+    const Setting s = settings.get(i);
+    string n = s.name;
+    if (!s.valued || s.value == "") { continue; }
+    if (n.len() <= head.len() + tail.len()) { continue; }
+    if (n.slice(0, head.len()) != head || n.slice(n.len() - tail.len(), n.len()) != tail) { continue; }
+    bases.push(n.slice(head.len(), n.len() - tail.len()));
+    prefixes.push(s.value);
+  }
+  string[] b = string[].filled(bases.len(), "");
+  string[] p = string[].filled(prefixes.len(), "");
+  for (i32 i = 0; i < b.len(); i++) { b[i] = bases.get(i); p[i] = prefixes.get(i); }
+  return Mirror(b, p);
+}
+
+/** `url` as git would fetch it: its longest matching `insteadOf` prefix replaced by that rule's base. */
+export string fetchUrlOf(const Mirror m, string url) {
+  i32 best = 0 - 1;
+  for (i32 i = 0; i < m.prefixes.len(); i++) {
+    string p = m.prefixes[i];
+    if (p.len() > url.len() || url.slice(0, p.len()) != p) { continue; }
+    if (best < 0 || p.len() > m.prefixes[best].len()) { best = i; }
+  }
+  if (best < 0) { return url; }
+  return m.bases[best] + url.slice(m.prefixes[best].len(), url.len());
+}
+
+/** `name` from the environment, or `""` when it is unset. */
+string envText(Env env, string name) {
+  u8[]? v = flatten(env.get(name).wait()).orElse(null);
+  return v is null ? "" : string.fromBytes(v!);
+}
+
+/**
+ * The `GIT_CONFIG_COUNT` pairs as settings, in order — git reads them after every file, so they come last.
+ * A count that is not a small number is no pairs at all, which is what git does with one it cannot read.
+ */
+Vec<Setting> envSettings(Env env) {
+  Vec<Setting> out = Vec.create();
+  string count = envText(env, "GIT_CONFIG_COUNT");
+  i32 n = 0;
+  string digits = "0123456789";
+  for (i32 i = 0; i < count.len(); i++) {
+    i32 d = digits.indexOf(count.slice(i, i + 1));
+    if (d < 0 || n > 1000) { return out; }
+    n = n * 10 + d;
+  }
+  for (i32 i = 0; i < n; i++) {
+    string key = envText(env, "GIT_CONFIG_KEY_\{i}");
+    if (key == "") { continue; }
+    out.push(Setting(lowerOutside(key), envText(env, "GIT_CONFIG_VALUE_\{i}"), true));
+  }
+  return out;
+}
+
+/**
+ * A dotted key lowercased as git stores it: the section and the last part, and not a subsection between them —
+ * `url.https://Example/.insteadOf` is `url.https://Example/.insteadof`.
+ */
+string lowerOutside(string key) {
+  i32 first = key.indexOf(".");
+  i32 last = 0 - 1;
+  for (i32 i = 0; i < key.len(); i++) { if (key.slice(i, i + 1) == ".") { last = i; } }
+  if (first < 0 || last == first) { return asciiLower(key); }
+  return asciiLower(key.slice(0, first + 1)) + key.slice(first + 1, last) + asciiLower(key.slice(last, key.len()));
+}
+
+/** `s` with its ASCII capitals lowered, as git lowers a section and key name. */
+string asciiLower(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] >= 65 as u8 && b[i] <= 90 as u8) { b[i] = b[i] + 32 as u8; }
+  }
+  return string.fromBytes(b);
+}
+
+/** The rules git would apply to a fetch made here: its config files, then the environment's pairs. */
+export Mirror readMirror(Env env, Files fs) {
+  Vec<Setting> all = configChain(env, fs, "").wait().orElse(Vec.create());
+  all.extend(envSettings(env));
+  return mirrorOf(all);
+}

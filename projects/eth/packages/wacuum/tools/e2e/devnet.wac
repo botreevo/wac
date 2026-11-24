@@ -1,0 +1,132 @@
+// wacuum and geth on one devnet, over devp2p. Each has its own consensus client — this program, playing one
+// for each — and they must agree. geth is the independent half: it takes wacuum's transactions and blocks
+// and must arrive at the same hashes and state roots.
+//
+// The chain is Osaka from its genesis, and the two find each other by discovery v4, each given only the
+// other as a bootnode.
+//
+//   1. geth makes blocks; wacuum, told of geth's head, syncs them from geth over the network.
+//   2. A transaction sent to wacuum reaches geth's pool, and one sent to geth reaches wacuum's; and the same
+//      for blob transactions, sidecars and all.
+//   3. wacuum makes blocks; geth, told of wacuum's head, syncs them from wacuum, and both end on the same
+//      state root.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/devnet.wac -- path/to/geth
+//
+// geth builds from source with `go install github.com/ethereum/go-ethereum/cmd/geth@latest`.
+
+import { Sys } from "std";
+import { json.JsonValue, json.stringify } from "wac";
+import { crypto.sha256 } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../../src/hex.wac";
+import { systemContracts } from "../../src/chain/dev.wac";
+import { publicKey } from "../../src/p2p/secp.wac";
+import { Check, Proc, Rpc, shell, quote, tempDir, removeDir, somePort, addressOf, type2, zeroBlobTx, field, quantity, choose, chosen, arrives, makeBlocks, TO, ZERO } from "./kit.wac";
+
+static string OTHER = "0x4444444444444444444444444444444444444444";
+
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 1) {
+    sys.warn("usage: tools/e2e/devnet.wac PATH-TO-GETH");
+    return 2;
+  }
+  string geth = args[0];
+  Check c = Check.on(sys);
+  string dir = await tempDir(sys, "wacuum-devnet");
+  u8[] key = u8[].filled(32, 0x11);
+  // Blob transactions come from an account of their own: geth keeps an account's transactions in one pool.
+  u8[] blobKey = u8[].filled(32, 0x33);
+  string genesis = "{\"config\":{\"chainId\":1337,\"homesteadBlock\":0,\"eip150Block\":0,\"eip155Block\":0,\"eip158Block\":0," +
+    "\"byzantiumBlock\":0,\"constantinopleBlock\":0,\"petersburgBlock\":0,\"istanbulBlock\":0,\"berlinBlock\":0,\"londonBlock\":0," +
+    "\"mergeNetsplitBlock\":0,\"terminalTotalDifficulty\":0,\"shanghaiTime\":0,\"cancunTime\":0,\"pragueTime\":0,\"osakaTime\":0," +
+    "\"depositContractAddress\":\"0x0000000000000000000000000000000000000000\",\"blobSchedule\":{" +
+    "\"cancun\":{\"target\":3,\"max\":6,\"baseFeeUpdateFraction\":3338477}," +
+    "\"prague\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716}," +
+    "\"osaka\":{\"target\":6,\"max\":9,\"baseFeeUpdateFraction\":5007716}}}," +
+    "\"nonce\":\"0x0\",\"timestamp\":\"0x0\",\"extraData\":\"0x\",\"gasLimit\":\"0x1c9c380\",\"difficulty\":\"0x0\"," +
+    "\"mixHash\":\"\{ZERO}\",\"coinbase\":\"0x0000000000000000000000000000000000000000\",\"number\":\"0x0\",\"gasUsed\":\"0x0\"," +
+    "\"parentHash\":\"\{ZERO}\",\"baseFeePerGas\":\"0x3b9aca00\",\"excessBlobGas\":\"0x0\",\"blobGasUsed\":\"0x0\"," +
+    "\"alloc\":{\"\{addressOf(key)}\":{\"balance\":\"0x56bc75e2d63100000\"},\"\{addressOf(blobKey)}\":{\"balance\":\"0x56bc75e2d63100000\"}," +
+    systemContracts() + "}}";
+  await sys.writeFile(dir + "/genesis.json", genesis.toBytes());
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", bytesToHex(secret).toBytes());
+  i32 base = await somePort(sys, 20000, 20000);
+  i32 gethP2p = base;
+  i32 gethAuthPort = base + 1;
+  i32 gethRpcPort = base + 2;
+  i32 wacP2p = base + 3;
+  i32 wacPort = base + 4;
+
+  // wacuum's node key is chosen here, so that each client can be given the other as its bootnode: neither is
+  // told of a peer, and they find each other by discovery v4.
+  u8[] wacKey = (await sys.random().bytes(32)).ok()!;
+  await sys.files().mkdir(dir + "/wacuum", true);
+  await sys.writeFile(dir + "/wacuum/nodekey", bytesToHex(wacKey).slice(2, 66).toBytes());
+  string wacEnode = "enode://\{bytesToHex(publicKey(wacKey)).slice(2, 130)}@127.0.0.1:\{wacP2p}";
+  await shell(sys, "\{quote(geth)} --datadir \{quote(dir + "/geth")} init \{quote(dir + "/genesis.json")} > /dev/null 2>&1");
+  Proc gethProc = await Proc.start(sys, [geth, "--datadir", dir + "/geth", "--networkid", "1337", "--bootnodes", wacEnode,
+                                         "--port", "\{gethP2p}", "--authrpc.port", "\{gethAuthPort}", "--authrpc.jwtsecret", dir + "/jwt.hex",
+                                         "--http", "--http.port", "\{gethRpcPort}", "--http.api", "eth,admin,net,txpool", "--syncmode", "full"],
+                                   dir + "/geth.log");
+  Rpc gethRpc = Rpc.at(sys, gethRpcPort);
+  Rpc gethAuth = Rpc.authed(sys, gethAuthPort, secret);
+  Rpc wac = Rpc.authed(sys, wacPort, secret);
+  Proc? wacProc = null;
+
+  bool up = false;
+  for (i32 t = 0; t < 60000 && !up; t += 200) {
+    up = (await gethRpc.call("eth_chainId", "[]")).result() is not null;
+    if (!up) { await sys.sleepMillis(200); }
+  }
+  if (c.that(up, "geth is up")) {
+    string enode = field(await gethRpc.get("admin_nodeInfo", "[]"), "enode");
+    JsonValue? gethHead = await makeBlocks(sys, gethAuth, gethRpc, key, 3);
+    c.that(quantity(field(gethHead, "number")) == 3, "geth made three blocks");
+
+    wacProc = await Proc.start(sys, ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                                     "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/wacuum",
+                                     "--public-rpc", "--port", "\{wacPort}", "--bootnode", enode, "--p2p-port", "\{wacP2p}"],
+                               dir + "/wacuum.log");
+    c.that(await wacProc!.says(sys, "serving blocks", 300000), "wacuum and geth found each other and agreed on the chain");
+
+    // 1. geth's chain into wacuum.
+    string gh = field(gethHead, "hash");
+    c.that(await choose(wac, gh) == "SYNCING", "wacuum is SYNCING to geth's head");
+    c.that(await chosen(sys, wac, gh, 60000), "and then has it");
+    // What a monitor reads: a peer counted, and no sync left once the head is here.
+    c.that(quantity(await wac.text("net_peerCount", "[]")) >= 1, "net_peerCount counts geth: \{await wac.text("net_peerCount", "[]")}");
+    JsonValue? syncing = await wac.get("eth_syncing", "[]");
+    c.that(syncing is not null && (syncing!.boolean() ?? true) == false, "and eth_syncing is false at the head");
+    c.that(await wac.text("eth_getBalance", "[\"\{TO}\",\"latest\"]") == "0xbbb", "with geth's state");
+
+    // 2. Transactions, both ways.
+    string toWac = await wac.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, 3, OTHER, U256.ofU64(7), u8[].filled(0, 0), 21000)}\"]");
+    c.that(await arrives(sys, gethRpc, toWac, 20000), "a transaction sent to wacuum reaches geth");
+    string toGeth = await gethRpc.text("eth_sendRawTransaction", "[\"\{type2(key, 1337, 4, OTHER, U256.ofU64(8), u8[].filled(0, 0), 21000)}\"]");
+    c.that(await arrives(sys, wac, toGeth, 20000), "and one sent to geth reaches wacuum");
+    string blobToWac = await wac.text("eth_sendRawTransaction", "[\"\{zeroBlobTx(blobKey, 1337, 0, OTHER)}\"]");
+    c.that(await arrives(sys, gethRpc, blobToWac, 20000), "a blob transaction sent to wacuum reaches geth's blob pool");
+    string blobToGeth = await gethRpc.text("eth_sendRawTransaction", "[\"\{zeroBlobTx(blobKey, 1337, 1, OTHER)}\"]");
+    c.that(await arrives(sys, wac, blobToGeth, 20000), "and one sent to geth reaches wacuum, sidecar and all");
+
+    // 3. wacuum's chain into geth.
+    JsonValue? wacHead = await makeBlocks(sys, wac, wac, key, 2);
+    c.that(quantity(field(wacHead, "number")) == 5, "wacuum made two blocks on geth's three");
+    i32 txs = (await wac.get("eth_getBlockByNumber", "[\"0x4\",true]"))?.member("transactions")?.array()?.len() ?? -1;
+    c.that(txs == 5, "the first holds the four gossiped transactions and its own: \{txs}");
+    c.that(field(await wac.get("eth_getBlockByNumber", "[\"0x4\",false]"), "blobGasUsed") == "0x40000", "two blobs' worth of blob gas");
+    string wh = field(wacHead, "hash");
+    c.that(await chosen(sys, gethAuth, wh, 60000), "geth syncs wacuum's blocks from wacuum");
+    JsonValue? g5 = await gethRpc.get("eth_getBlockByNumber", "[\"0x5\",false]");
+    c.that(field(g5, "hash") == wh && field(g5, "stateRoot") == field(wacHead, "stateRoot"), "and ends on the same block and state root");
+  }
+
+  if (wacProc is not null) { await wacProc!.stop(sys); }
+  await gethProc.stop(sys);
+  await removeDir(sys, dir);
+  return c.done();
+}

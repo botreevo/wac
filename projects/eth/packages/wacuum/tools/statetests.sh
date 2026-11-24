@@ -1,0 +1,19 @@
+#!/bin/sh
+# Run every state test for a fork (Cancun by default), four processes at a time, and print the totals.
+# Each failure is printed with its test name; pass a directory or file after the fork to narrow it.
+#
+#     sh tools/statetests.sh                         # every Cancun case under fixtures/state_tests
+#     sh tools/statetests.sh Cancun fixtures/state_tests/cancun
+#     COLD=1 sh tools/statetests.sh                  # every account and slot read from a store
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+fork=${1:-Cancun}
+# A fork's own directory (fixtures/state_tests/for_cancun, as execution-specs lays them out) when there is one.
+lower=$(echo "$fork" | tr 'A-Z' 'a-z')
+default="$root/fixtures/state_tests"
+[ -d "$default/for_$lower" ] && default="$default/for_$lower"
+where=${2:-$default}
+wac build --allow-read "$root/tools/statetest.wac" -o "$root/dist/statetest" >/dev/null
+find "$where" -name '*.json' | sort | xargs -n 100 -P 4 wac "$root/dist/statetest.wasm" --fork "$fork" ${COLD:+--cold} > "$root/dist/statetests.log" 2>&1 || true
+grep '^FAIL' "$root/dist/statetests.log" || true
+grep 'passed,' "$root/dist/statetests.log" | awk '{p += $1; f += $3} END {print p " passed, " f " failed"}'

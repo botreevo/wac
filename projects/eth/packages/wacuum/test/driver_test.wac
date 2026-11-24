@@ -1,0 +1,86 @@
+// The light-client driver's payload conversion against mainnet: a Fulu block (slot 15 677 439: 297 transactions, 18
+// blobs, 3 deposit requests) as the beacon API serves it, turned into `engine_newPayloadV4`'s parameters, and those
+// checked as an execution client checks them — every field, the parent beacon root and the requests hash go into the
+// block hash, which must come out as the block's own; the versioned hashes must be its blob transactions'.
+
+import { Sys } from "std";
+import { strings } from "core";
+import { json.parse, json.JsonValue } from "wac";
+import { U256 } from "../src/u256.wac";
+import { genesisFrom, Genesis } from "../src/chain/genesis.wac";
+import { mainnet } from "../src/chain/mainnet.wac";
+import { checkPayload, Checked } from "../src/engine/engine.wac";
+import { SenderCache } from "../src/tx/decode.wac";
+import { hexToBytes } from "../src/hex.wac";
+import { payloadOf, Converted, quantity, requestsOf } from "../src/driver/payload.wac";
+import { Check } from "./check.wac";
+import { Network } from "../src/driver/drive.wac";
+import { computeForkDigest } from "../../lightclient/src/domain.wac";
+import { bytesToHex } from "../src/hex.wac";
+
+async Checked checked(Sys sys, string edit, string with) {
+  string text = string.fromBytes((await fixture(sys, "test/driver/block-15677439.json")));
+  if (edit != "") { text = text.slice(0, text.indexOf(edit)) + with + text.slice(text.indexOf(edit) + edit.len(), text.len()); }
+  Converted c = payloadOf(parse(text.toBytes()).ok()!.member("data")!);
+  JsonValue ps = parse(c.payload!.params.toBytes()).ok()!;
+  string[] why = [""];
+  Genesis g = genesisFrom(parse(mainnet().toBytes()).ok()!, why)!;
+  u8[][] requests = u8[][].defaulted(ps.array()!.get(3).array()!.len());
+  for (i32 i = 0; i < requests.len(); i++) { requests[i] = hexToBytes(ps.array()!.get(3).array()!.get(i).text()!)!; }
+  return checkPayload(g.config, U256.ofU64(1), SenderCache.create(), 4, ps.array()!, requests);
+}
+
+export async string test_a_mainnet_block_becomes_the_payload_its_hash_names(Sys sys) {
+  Check t = Check.create();
+  Checked c = await checked(sys, "", "");
+  t.eqStr(c.invalid, "", "every transaction decodes");
+  t.eqStr(c.noAncestor, "", "the derived block hash is the block's, and the versioned hashes are its blob transactions'");
+  t.ok(c.header.number.eq(U256.ofU64(26437654)), "execution block 26437654: \{c.header.number.toDecimal()}");
+  return t.report();
+}
+
+export async string test_a_changed_payload_is_not_the_block_its_hash_names(Sys sys) {
+  Check t = Check.create();
+  // A deposit's amount, which only the requests hash covers; and a commitment, which only the versioned hashes check.
+  Checked dep = await checked(sys, "\"amount\":\"", "\"amount\":\"1");
+  t.ok(dep.noAncestor.indexOf("block hash") >= 0, "a deposit request changed: the block hash differs — \{dep.noAncestor}");
+  Checked parent = await checked(sys, "\"parent_root\":\"0x", "\"parent_root\":\"0x00");
+  t.ok(parent.noAncestor != "", "the parent beacon root changed: refused — \{parent.noAncestor}");
+  return t.report();
+}
+
+export string test_numbers_and_requests_are_encoded_as_the_engine_api_wants() {
+  Check t = Check.create();
+  t.eqStr(quantity("0") ?? "", "0x0", "zero");
+  t.eqStr(quantity("4294967296") ?? "", "0x100000000", "past 32 bits");
+  t.ok(quantity("12a") is null, "not decimal");
+  t.eqStr(requestsOf(parse("{\"deposits\":[],\"withdrawals\":[],\"consolidations\":[]}".toBytes()).ok()!) ?? "x", "[]", "none: an empty list");
+  string w = requestsOf(parse(("{\"deposits\":[],\"withdrawals\":[{\"source_address\":\"0x" + strings.repeat("11", 20) + "\",\"validator_pubkey\":\"0x" +
+                               strings.repeat("22", 48) + "\",\"amount\":\"258\"}],\"consolidations\":[]}").toBytes()).ok()!) ?? "x";
+  t.eqStr(w, "[\"0x01" + strings.repeat("11", 20) + strings.repeat("22", 48) + "0201000000000000\"]", "a withdrawal request: type 1, address, key, amount little-endian");
+  return t.report();
+}
+
+// Hoodi's constants, against what Hoodi itself signed: its bootstrap ENRs carry the eth2 fork digest d2f1997f (Deneb,
+// next 0x60000910), which only Deneb's version under this genesis validators root gives.
+export string test_hoodi_is_the_network_its_enrs_were_signed_on() {
+  Check t = Check.create();
+  Network h = Network.hoodi();
+  u8[]? d = computeForkDigest(h.schedule.versionAt(0 as i64), h.genesisValidatorsRoot);
+  t.ok(d is not null && bytesToHex(d!) == "0xd2f1997f", "Deneb's fork digest under Hoodi's root: \{d is null ? "none" : bytesToHex(d!)}");
+  t.ok(bytesToHex(h.schedule.versionAt(2048 as i64)) == "0x60000910" && bytesToHex(h.schedule.versionAt(50688 as i64)) == "0x70000910",
+       "Electra from epoch 2048, Fulu from 50688");
+  t.ok(h.genesisTime == (1742213400 as i64) && h.schedule.slotsPerPeriod == (8192 as i64), "genesis 1742213400, 8192-slot periods");
+  return t.report();
+}
+
+/**
+ * A file under wacuum's `test/`, whether the tests run from `packages/wacuum` (`wac task wacuum:test`) or from the
+ * repository's root (`wac task test`).
+ */
+async u8[] fixture(Sys sys, string path) {
+  match (await sys.readFile(path)) {
+    Ok(b): { return b; }
+    Err(e): { return (await sys.readFile("packages/wacuum/" + path)).ok()!; }
+  }
+}

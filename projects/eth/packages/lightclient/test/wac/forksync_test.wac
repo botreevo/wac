@@ -1,0 +1,104 @@
+// `light_client_sync` for Capella, Deneb, Electra and Fulu (minimal config), run step by step through the same store
+// as Altair's, with the fork's own layout, gindices and fork version. Each update's attested and finalized headers
+// now carry an execution payload header and branch, and Electra's state branches are a level deeper, so this is the
+// store's fork handling end to end: one wrong depth, gindex or version and every signature or branch fails.
+//
+// Each step's checks state the finalized and optimistic headers' beacon root and execution root; both are compared.
+
+import { wactest.T } from "wac";
+import { wactest.hex } from "wac";
+import { wactest.Loaded, wactest.json } from "wac";
+import { Sys } from "std";
+import { json.JsonValue, json.JsonArray, json.JsonObject } from "wac";
+import { codec.hexDecoded as decoded } from "wac";
+import { forkNamed } from "../../../ssz/src/forks.wac";
+import { Store, initializeStoreAt, processUpdate, forceUpdate, headerSlot, headerBeaconRoot } from "../../src/store.wac";
+import { executionRoot } from "../../src/header.wac";
+
+static string MANIFEST = "packages/ssz/test/fixtures.json";
+
+u8[] un(string h) { return decoded(h.len() >= 2 && h.slice(0, 2) == "0x" ? h.slice(2, h.len()) : h); }
+
+i64 slotOf(string s) {
+  u8[] b = s.toBytes();
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { break; }
+    v = v * (10 as i64) + ((b[i] as i32 - '0') as i64);
+  }
+  return v;
+}
+
+/** A header as `slot@0xbeacon/0xexecution`, the form the checks are compared in. */
+string said(i32 fork, u8[] header) {
+  return "\{headerSlot(header)}@0x\{hex(headerBeaconRoot(header))}/0x\{hex(executionRoot(fork, header) ?? u8[]())}";
+}
+
+string wanted(JsonValue step, string which) {
+  JsonValue? h = step.member("checks")?.member(which);
+  if (h is null) { return ""; }
+  return (h!.member("slot")?.text() ?? "") + "@" + (h!.member("beacon_root")?.text() ?? "") + "/"
+    + (h!.member("execution_root")?.text() ?? "");
+}
+
+export string test_every_post_altair_sync_step_agrees(Sys sys) {
+  T t = T.create();
+  Loaded f = json(sys.stderr(), sys.files(), sys.procs(), "ssz", "light_client_sync_forks_minimal", MANIFEST);
+  t.isTrue(f.ok, f.error);
+  if (!f.ok) { return t.report(); }
+  JsonArray? cases = f.doc.member("cases")?.array();
+  if (cases is null) { t.fail("no cases"); return t.report(); }
+  i32 steps = 0;
+  for (i32 i = 0; i < cases!.len(); i++) {
+    JsonValue c = cases!.get(i);
+    string forkText = c.member("fork")?.text() ?? "";
+    i32 fork = forkNamed(forkText);
+    JsonValue? meta = c.member("meta");
+    JsonArray? ss = c.member("steps")?.array();
+    JsonObject? updates = c.member("updates")?.object();
+    if (meta is null || ss is null || updates is null) { t.fail("\{forkText}: incomplete case"); continue; }
+    Store? store = initializeStoreAt(fork, un(meta!.member("trusted_block_root")?.text() ?? ""),
+                                     un(c.member("bootstrap")?.text() ?? ""));
+    t.isTrue(store is not null, "\{forkText}: the bootstrap did not initialize a store");
+    if (store is null) { continue; }
+    u8[] gvr = un(meta!.member("genesis_validators_root")?.text() ?? "");
+    for (i32 j = 0; j < ss!.len(); j++) {
+      JsonValue s = ss!.get(j);
+      string kind = s.member("kind")?.text() ?? "";
+      i64 slot = slotOf(s.member("current_slot")?.text() ?? "");
+      string at = "\{forkText} step \{j} (\{kind})";
+      if (kind == "process_update") {
+        string which = s.member("update")?.text() ?? "";
+        t.isTrue(processUpdate(store!, un(updates!.getStr(which)?.text() ?? ""), slot, gvr),
+                 "\{at}: the client rejected a valid update");
+      } else if (kind == "force_update") {
+        forceUpdate(store!, slot);
+      } else {
+        t.fail("\{at}: unhandled step kind"); continue;
+      }
+      t.eqStr(said(fork, store!.finalizedHeader), wanted(s, "finalized_header"), "\{at}: finalized");
+      t.eqStr(said(fork, store!.optimisticHeader), wanted(s, "optimistic_header"), "\{at}: optimistic");
+      steps++;
+    }
+  }
+  t.eqI32(cases!.len(), 4, "cases run");
+  t.eqI32(steps, 40, "steps run");
+  return t.report();
+}
+
+/** The same Electra bootstrap read with Deneb's layout must not initialize: its committee branch is a level short. */
+export string test_a_bootstrap_read_as_the_wrong_fork_is_refused(Sys sys) {
+  T t = T.create();
+  Loaded f = json(sys.stderr(), sys.files(), sys.procs(), "ssz", "light_client_sync_forks_minimal", MANIFEST);
+  if (!f.ok) { t.fail(f.error); return t.report(); }
+  JsonArray? cases = f.doc.member("cases")?.array();
+  for (i32 i = 0; i < cases!.len(); i++) {
+    JsonValue c = cases!.get(i);
+    if ((c.member("fork")?.text() ?? "") != "electra") { continue; }
+    u8[] root = un(c.member("meta")?.member("trusted_block_root")?.text() ?? "");
+    u8[] boot = un(c.member("bootstrap")?.text() ?? "");
+    t.isTrue(initializeStoreAt(forkNamed("electra"), root, boot) is not null, "as Electra");
+    t.isTrue(initializeStoreAt(forkNamed("deneb"), root, boot) is null, "as Deneb");
+  }
+  return t.report();
+}

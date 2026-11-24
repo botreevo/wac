@@ -1,0 +1,348 @@
+// Reading `contracts/Registry.sol` (v2) without trusting whoever answers: every answer is a storage slot read with
+// `eth_getProof` and checked by `mpt` against the state root of one header, and the account proof's code hash is checked
+// against the registry's, so "not revoked" is a proof that a slot is empty in *this* contract rather than a node's word.
+//
+// The slots are the contract's layout (its header comment has it in full); `k` is keccak256, `p` left-padding to 32:
+//
+//     revokedAt[signer][k(cid)]      slot 0   k(k(cid) ‖ k(p(signer) ‖ 0))
+//     rejections[list][k(cid)]       slot 1   base = k(k(cid) ‖ k(p(list) ‖ 1)); +0 since, +1 reason
+//     names[publisher][k(name)]      slot 2   base = k(k(name) ‖ k(p(publisher) ‖ 2)); +0 … +7, NAME_FIELDS() in order
+//
+// Two things this produces: a `Chain` for `admit` (which of the revocations and rejections it could ask about are on the
+// chain), and a name resolved at a time. **Where the header comes from is the trust anchor**, as in v1's registry.wac:
+// `anchor` is a block hash from somewhere the user trusts (a light client, on a real chain); without one the header is
+// checked only against the node's own `hash` field, and `Snapshot.anchored` says so.
+
+import { Net } from "std";
+import { Result } from "core";
+import { crypto.keccak256, json.JsonValue, codec.hexEncode } from "wac";
+import { ethrpc.call, ethrpc.headerOf, ethrpc.proofOfSlots, ethrpc.Proof, ethrpc.Header, ethrpc.memberQuantity,
+         mpt.accountAt, mpt.storageAt, mpt.AccountProof, mpt.StorageProof,
+         ipfs.Cid, ipfs.Resolver, ipfs.RAW, ipfs.DAG_PB, ipfs.DAG_CBOR } from "@/lib.wac";
+import { Chain, Policy } from "./admit.wac";
+import { Recipe, recipeFrom } from "./claims.wac";
+import { Index, contains, pushCid } from "./graph.wac";
+import { Slot, slotsOf } from "./slots.wac";
+import { unhex } from "./hex.wac";
+
+// ---------------------------------------------------------------- the layout
+
+export i64 REVOKED_AT() { return 0 as i64; }
+export i64 REJECTIONS() { return 1 as i64; }
+export i64 NAMES() { return 2 as i64; }
+/** A rejection's words, in slot order from its base. */
+export string[] REJECTION_FIELDS() { return ["since", "reason"]; }
+/** A name's words, in slot order from its base. */
+export string[] NAME_FIELDS() {
+  return ["codec", "digest", "pendingCodec", "pendingDigest", "effectiveAt", "delay", "pendingDelay", "delayAt"];
+}
+
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+u8[] word(i64 n) {
+  u8[] out = u8[].filled(32, 0);
+  for (i32 i = 0; i < 8; i++) { out[31 - i] = ((n >> ((i * 8) as i64)) & 255) as@ u8; }
+  return out;
+}
+
+u8[] pad(u8[] b) {
+  u8[] out = u8[].filled(32, 0);
+  for (i32 i = 0; i < b.len(); i++) { out[32 - b.len() + i] = b[i]; }
+  return out;
+}
+
+u8[] cat2(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
+
+/** `m[outer][inner]` for a mapping of mappings at `slot`, the outer key an address. */
+u8[] nested(u8[] outer, u8[] inner, i64 slot) { return keccak256(cat2(inner, keccak256(cat2(pad(outer), word(slot))))); }
+
+/** `slot + k`, as 256-bit big-endian addition. */
+export u8[] plus(u8[] slot, i32 k) {
+  u8[] out = u8[].filled(32, 0);
+  i32 carry = k;
+  for (i32 i = 31; i >= 0; i--) {
+    i32 v = (slot[i] as i32) + carry;
+    out[i] = v as@ u8;
+    carry = v >> 8;
+  }
+  return out;
+}
+
+/** A CID as a mapping key: keccak256 of its binary form. */
+export u8[] cidKey(Cid c) { return keccak256(c.bytes()); }
+
+export u8[] revokedSlot(u8[] signer, Cid statement) { return nested(signer, cidKey(statement), REVOKED_AT()); }
+/** The first of a rejection's two words: since, reason. */
+export u8[] rejectionSlot(u8[] list, Cid subject) { return nested(list, cidKey(subject), REJECTIONS()); }
+/** The first of a name's eight words, NAME_FIELDS() in order. */
+export u8[] nameSlot(u8[] publisher, string name) { return nested(publisher, keccak256(name.toBytes()), NAMES()); }
+
+export bool isZero(const u8[] w) {
+  for (i32 i = 0; i < w.len(); i++) { if (w[i] != 0) { return false; } }
+  return true;
+}
+
+/** A word as a time or a delay. Values past i64 are clamped: no block reaches them. */
+export i64 toI64(u8[] w) {
+  for (i32 i = 0; i < w.len() - 8; i++) { if (w[i] != 0) { return 9223372036854775807 as i64; } }
+  i64 n = 0 as i64;
+  for (i32 i = (w.len() > 8 ? w.len() - 8 : 0); i < w.len(); i++) { n = (n << 8) | (w[i] as i64); }
+  return n & (9223372036854775807 as i64);
+}
+
+/** A CID from its codec word and digest word; null for a codec of 0 (nothing there) or one the contract refuses. */
+Cid? cidOf(u8[] codec, u8[] digest) {
+  if (isZero(codec)) { return null; }
+  i64 c = toI64(codec);
+  if (c != RAW() && c != DAG_PB() && c != DAG_CBOR()) { return null; }
+  return Cid(c, digest);
+}
+
+// ---------------------------------------------------------------- reading, proved
+
+export struct Endpoint {
+  string host;
+  i32 port;
+  u8[] registry;
+  /** A block hash to anchor to, or empty to take the node's latest block on its own word. */
+  u8[] anchor;
+  /** keccak256 of the registry's runtime code. Required: an address alone says nothing about what runs there. */
+  u8[] codeHash;
+}
+
+/** An endpoint from command-line text: `HOST:PORT`, the registry's address, its runtime code hash, and an optional anchor. */
+export Result<Endpoint, string> endpointOf(string rpc, string registry, string codeHash, string anchor) {
+  i32 colon = rpc.indexOf(":");
+  if (colon < 1) { return Result.Err("the chain is HOST:PORT, not \"\{rpc}\""); }
+  i32 port = 0;
+  u8[] ps = rpc.slice(colon + 1, rpc.len()).toBytes();
+  for (i32 i = 0; i < ps.len(); i++) {
+    if (ps[i] < 48 || ps[i] > 57 || port > 65535) { return Result.Err("the chain's port is a number: \"\{rpc}\""); }
+    port = port * 10 + (ps[i] as i32) - 48;
+  }
+  u8[]? reg = unhex(registry);
+  if (reg is null || reg!.len() != 20) { return Result.Err("the registry is a 20-byte address, not \"\{registry}\""); }
+  u8[]? code = unhex(codeHash);
+  if (code is null || code!.len() != 32) { return Result.Err("the registry's code hash is required: 32 bytes of hex"); }
+  u8[]? at = anchor == "" ? u8[]() : unhex(anchor);
+  if (at is null || (at!.len() != 0 && at!.len() != 32)) { return Result.Err("the anchor is a 32-byte block hash"); }
+  return Result.Ok(Endpoint(rpc.slice(0, colon), port, reg!, at!, code!));
+}
+
+/** One block's view of the registry: what was read, and from where. */
+export struct Snapshot {
+  u8[] blockHash;
+  i64 number;
+  /** Seconds since the epoch, from the header. */
+  i64 timestamp;
+  bool anchored;
+  u8[][] slots;
+  /** Each slot's value, 32 bytes big-endian, zero where the proof shows it absent. */
+  u8[][] values;
+}
+
+Result<Snapshot, string> readOnce(Net net, Endpoint ep, u8[][] slots) {
+  if (ep.codeHash.len() != 32) { return Result.Err("no code hash for the registry: an address alone says nothing about what runs there"); }
+  bool anchored = ep.anchor.len() == 32;
+  string where = anchored ? "[\"0x\{hex(ep.anchor)}\",false]" : "[\"latest\",false]";
+  JsonValue block = try call(net, ep.host, ep.port, anchored ? "eth_getBlockByHash" : "eth_getBlockByNumber", where);
+  if (block.isNull()) { return Result.Err("the node does not have the anchored block"); }
+  Header h = try headerOf(block, ep.anchor);
+  string[] keys = string[].defaulted(slots.len());
+  for (i32 i = 0; i < slots.len(); i++) { keys[i] = "0x" + hex(slots[i]); }
+  Proof p = try proofOfSlots(net, ep.host, ep.port, "0x" + hex(ep.registry), keys, h.hash);
+  AccountProof acct = accountAt(h.stateRoot, ep.registry, p.accountNodes);
+  if (!acct.ok) { return Result.Err("the registry's account proof: \{acct.error}"); }
+  if (!acct.present) { return Result.Err("there is no account at the registry's address in this block"); }
+  if (hex(acct.account.codeHash) != hex(ep.codeHash)) {
+    return Result.Err("the account at the registry's address runs other code (0x\{hex(acct.account.codeHash)})");
+  }
+  u8[][] values = u8[][].filled(slots.len(), u8[]());
+  for (i32 i = 0; i < slots.len(); i++) {
+    StorageProof s = storageAt(acct.account.storageRoot, slots[i], p.slots[i]);
+    if (!s.ok) { return Result.Err("slot \{keys[i]}: \{s.error}"); }
+    values[i] = pad(s.value);
+  }
+  return Result.Ok(Snapshot(h.hash, toI64(memberQuantity(block, "number")), toI64(memberQuantity(block, "timestamp")),
+                            anchored, slots, values));
+}
+
+/**
+ * Whether a failed read is worth trying again: the node did not have the block's state (a new block landed between the
+ * header and the proof, and it proves recent blocks only), or the request did not get through. A proof that does not
+ * verify, a header that does not hash to its anchor, or code that is not the expected code is the same answer every
+ * time, and trying again only delays the refusal.
+ */
+export bool transient(string e) {
+  string[] marks = ["not available", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "cannot send the request",
+                    "ended mid-message", "the node answered HTTP 5"];
+  for (string m in marks) { if (e.indexOf(m) >= 0) { return true; } }
+  return false;
+}
+
+/** Read `slots` at one block, every value proved; tried again, up to 8 times, only when the failure is `transient`. */
+export Result<Snapshot, string> read(Net net, Endpoint ep, u8[][] slots) {
+  string last = "";
+  for (i32 i = 0; i < 8; i++) {
+    match (readOnce(net, ep, slots)) {
+      Ok(s): { return Result.Ok(s); }
+      Err(e): {
+        last = e;
+        if (!transient(e)) { return Result.Err(e); }
+      }
+    }
+  }
+  return Result.Err(last);
+}
+
+// ---------------------------------------------------------------- a Chain for admit
+
+/** The questions admission could ask the chain: revocations as (signer, statement), rejections as (list, subject). */
+export struct Asks {
+  u8[][] revokedBy;
+  Cid[] revokedId;
+  u8[][] rejectedBy;
+  Cid[] rejected;
+}
+
+/**
+ * Everything admitting `target` could ask: a revocation of every statement the index holds, and a rejection, by every list
+ * the policy follows, of every object admission could reach — the target, every subject and output the statements name,
+ * and each recipe's input slots. A superset, so that what admit is not told about is proved absent rather than unasked.
+ */
+export Asks asksFor(Policy p, Index ix, Resolver r, Cid target) {
+  Asks a = Asks(u8[][](), Cid[](), u8[][](), Cid[]());
+  for (i32 i = 0; i < ix.held.len(); i++) {
+    a.revokedBy = addB(a.revokedBy, ix.held[i].signer);
+    a.revokedId = pushCid(a.revokedId, ix.held[i].id);
+  }
+  Cid[] objects = [target];
+  Cid[] recipes = Cid[]();
+  for (i32 i = 0; i < ix.held.len(); i++) {
+    match (ix.held[i].statement) {
+      Derivation(recipe, output, _): { objects = more(objects, output); if (!contains(recipes, recipe)) { recipes = pushCid(recipes, recipe); } }
+      Endorsement(subject, _): { objects = more(objects, subject); }
+      Rejection(subject, _): { objects = more(objects, subject); }
+      Revocation(_): { }
+    }
+  }
+  for (i32 i = 0; i < recipes.len(); i++) {
+    Recipe? rec = ix.recipe(recipes[i]);
+    if (rec is null) {
+      u8[]? b = r.block(recipes[i]).ok();
+      if (b is not null) { rec = recipeFrom(b!).ok(); }
+    }
+    if (rec is null) { continue; }
+    Slot[]? ss = slotsOf(r, rec!.input).ok();
+    if (ss is null) { continue; }
+    for (i32 j = 0; j < ss!.len(); j++) { objects = more(objects, ss![j].cid); }
+  }
+  for (i32 l = 0; l < p.rejectLists.len(); l++) {
+    for (i32 i = 0; i < objects.len(); i++) {
+      a.rejectedBy = addB(a.rejectedBy, p.rejectLists[l]);
+      a.rejected = pushCid(a.rejected, objects[i]);
+    }
+  }
+  return a;
+}
+
+/** The slots that answer `a`: each revocation's, then each rejection's `since`. */
+export u8[][] slotsFor(Asks a) {
+  u8[][] out = u8[][].filled(a.revokedId.len() + a.rejected.len(), u8[]());
+  for (i32 i = 0; i < a.revokedId.len(); i++) { out[i] = revokedSlot(a.revokedBy[i], a.revokedId[i]); }
+  for (i32 i = 0; i < a.rejected.len(); i++) { out[a.revokedId.len() + i] = rejectionSlot(a.rejectedBy[i], a.rejected[i]); }
+  return out;
+}
+
+/** The answers, one value per slot of `slotsFor(a)`, as the `Chain` admit takes: what is set, and nothing else. */
+export Chain chainOf(Asks a, u8[][] values) {
+  Chain c = Chain.none();
+  for (i32 i = 0; i < a.revokedId.len(); i++) {
+    if (!isZero(values[i])) { c.revokedBy = addB(c.revokedBy, a.revokedBy[i]); c.revokedId = pushCid(c.revokedId, a.revokedId[i]); }
+  }
+  i32 n = a.revokedId.len();
+  for (i32 i = 0; i < a.rejected.len(); i++) {
+    if (!isZero(values[n + i])) { c.rejectedBy = addB(c.rejectedBy, a.rejectedBy[i]); c.rejected = pushCid(c.rejected, a.rejected[i]); }
+  }
+  return c;
+}
+
+/** The chain's answers to `a` at one block, proved. */
+export struct Proved {
+  Chain chain;
+  Snapshot at;
+}
+
+export Result<Proved, string> chainFor(Net net, Endpoint ep, Asks a) {
+  u8[][] slots = slotsFor(a);
+  // eth_getProof with no slots still proves the account, which is the code hash check; one slot keeps nodes that
+  // dislike an empty list answering.
+  bool none = slots.len() == 0;
+  if (none) { slots = [revokedSlot(u8[].filled(20, 0), Cid(RAW(), u8[].filled(32, 0)))]; }
+  Snapshot s = try read(net, ep, slots);
+  return Result.Ok(Proved(none ? Chain.none() : chainOf(a, s.values), s));
+}
+
+// ---------------------------------------------------------------- names
+
+/** A name at a time. */
+export struct NameAt {
+  /** What the name means at `now`: null if it was never claimed. */
+  Cid? cid;
+  /** The delay in force at `now`: how long any change from here would wait. */
+  i64 delay;
+  /** A proposal not yet in effect at `now`, and when it will be. */
+  Cid? pending;
+  i64 effectiveAt;
+  /** A proposed delay not yet in effect at `now` (-1 if none), and when it will be. */
+  i64 pendingDelay;
+  i64 delayAt;
+}
+
+/** A name's eight words (NAME_FIELDS() order) read at time `now`: the contract's rule, applied by the reader. */
+export NameAt nameAt(u8[][] w, i64 now) {
+  Cid? current = cidOf(w[0], w[1]);
+  Cid? proposed = cidOf(w[2], w[3]);
+  i64 effectiveAt = toI64(w[4]);
+  i64 delayAt = toI64(w[7]);
+  bool moved = proposed is not null && now >= effectiveAt;
+  bool delayMoved = delayAt != (0 as i64) && now >= delayAt;
+  return NameAt(moved ? proposed : current, delayMoved ? toI64(w[6]) : toI64(w[5]),
+                moved ? null : proposed, moved ? (0 as i64) : effectiveAt,
+                delayAt != (0 as i64) && !delayMoved ? toI64(w[6]) : (-1 as i64), delayMoved ? (0 as i64) : delayAt);
+}
+
+/** A name proved at one block, and read at `now`. */
+export struct Resolved {
+  NameAt name;
+  Snapshot at;
+}
+
+/**
+ * What `publisher`'s `name` points at, at time `now` (seconds), proved. `now` is the caller's: a name's pending value is
+ * in effect from its time whatever block the proof came from, which is what lets a follower see a change coming.
+ */
+export Result<Resolved, string> resolveName(Net net, Endpoint ep, u8[] publisher, string name, i64 now) {
+  u8[] base = nameSlot(publisher, name);
+  u8[][] slots = u8[][].filled(8, u8[]());
+  for (i32 i = 0; i < 8; i++) { slots[i] = plus(base, i); }
+  Snapshot s = try read(net, ep, slots);
+  NameAt n = nameAt(s.values, now);
+  if (n.cid is null) { return Result.Err("\{name} is not a name 0x\{hex(publisher)} has claimed (proved at block \{s.number})"); }
+  return Result.Ok(Resolved(n, s));
+}
+
+// ---------------------------------------------------------------- arrays
+
+u8[][] addB(u8[][] xs, u8[] x) {
+  u8[][] out = u8[][].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+Cid[] more(Cid[] xs, Cid x) { return contains(xs, x) ? xs : pushCid(xs, x); }

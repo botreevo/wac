@@ -1,0 +1,268 @@
+// Whether a run of a trie's entries is exactly what the trie holds between two keys: snap's answers are a
+// sorted run (accounts, or one account's slots) starting at the key asked for, with the proof of the first
+// key asked and of the last key given, and this is how a client knows nothing in between was left out or
+// made up.
+//
+// The proof's nodes give the trie along the two edges. Every subtree they reach is one of: wholly left of
+// the run (kept, as its hash), wholly right of it (kept — and then there is more to ask for), wholly inside
+// it (cleared: the run must refill it), or across an edge (opened, which the proof must allow). The run's
+// entries are put into what is left, and the root must come out as the one asked about. With no proof, the
+// run must be the whole trie.
+
+import { keccak256 } from "../crypto/keccak.wac";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.itemsOf, rlp.bytesOf, rlp.isList } from "@/lib.wac";
+import { Map } from "core";
+import { hashString, stringEq } from "core";
+import { emptyRoot, hexPrefixOf, trieRoot } from "./trie.wac";
+import { nibblesOf } from "./pathtrie.wac";
+import { bytesToHex } from "../hex.wac";
+
+static i32 LEAF = 0;
+static i32 EXT = 1;
+static i32 BRANCH = 2;
+/** A subtree kept as its reference. */
+static i32 REF = 3;
+
+struct RNode {
+  i32 kind;
+  u8[] path;
+  u8[] value;
+  RNode?[] kids;
+  RNode? next;
+  Item? ref;
+}
+
+RNode rleaf(u8[] path, u8[] value) { return RNode(LEAF, path, value, RNode?[].defaulted(0), null, null); }
+RNode rext(u8[] path, RNode next) { return RNode(EXT, path, u8[].filled(0, 0), RNode?[].defaulted(0), next, null); }
+RNode rbranch() { return RNode(BRANCH, u8[].filled(0, 0), u8[].filled(0, 0), RNode?[].defaulted(16), null, null); }
+RNode rref(Item ref) { return RNode(REF, u8[].filled(0, 0), u8[].filled(0, 0), RNode?[].defaulted(0), null, ref); }
+
+/** What a range check found. */
+export struct Range {
+  bool ok;
+  /** Whether the trie has entries after the run's last key. */
+  bool more;
+  string why;
+}
+
+Range bad(string why) { return Range(false, false, why); }
+
+u8[] cat(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len() + b.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+u8[] sub(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+/** -1, 0 or 1 comparing nibble strings of equal length, or a prefix padded with `pad`. */
+i32 cmpPadded(u8[] a, u8 pad, u8[] b) {
+  for (i32 i = 0; i < b.len(); i++) {
+    u8 x = i < a.len() ? a[i] : pad;
+    if (x != b[i]) { return x < b[i] ? -1 : 1; }
+  }
+  return 0;
+}
+
+struct Trim {
+  Map<string, u8[]> nodes;
+  u8[] left;
+  u8[] right;
+  bool more;
+  string why;
+
+  /** A child reference made a node: decoded in place, or looked up among the proof's nodes. */
+  RNode? open(this, Item ref) {
+    if (isList(ref)) { return this.nodeOf(ref); }
+    u8[]? enc = this.nodes.get(bytesToHex(bytesOf(ref)));
+    if (enc is null) {
+      this.why = "the proof is missing a node it needs";
+      return null;
+    }
+    return this.nodeOf(decode(enc!).item);
+  }
+
+  RNode? nodeOf(this, Item it) {
+    if (!isList(it)) {
+      this.why = "a proof node is not a list";
+      return null;
+    }
+    Item[] f = itemsOf(it);
+    if (f.len() == 17) {
+      RNode b = rbranch();
+      for (i32 i = 0; i < 16; i++) {
+        if (isList(f[i]) || bytesOf(f[i]).len() > 0) { b.kids[i] = rref(f[i]); }
+      }
+      return b;
+    }
+    if (f.len() != 2) {
+      this.why = "a proof node is neither a branch nor a pair";
+      return null;
+    }
+    (u8[] path, bool leaf) = fromHexPrefix(bytesOf(f[0]));
+    if (leaf) { return rleaf(path, bytesOf(f[1])); }
+    return rext(path, rref(f[1]));
+  }
+
+  /** Where a subtree whose keys all start with `prefix` lies: -1 left, 1 right, 0 inside, 2 across an edge. */
+  i32 where(this, u8[] prefix) {
+    if (cmpPadded(prefix, 15, this.left) < 0) { return -1; }
+    if (cmpPadded(prefix, 0, this.right) > 0) { return 1; }
+    if (cmpPadded(prefix, 0, this.left) >= 0 && cmpPadded(prefix, 15, this.right) <= 0) { return 0; }
+    return 2;
+  }
+
+  /** What is left of the subtree `ref` at `prefix` once the run's range is cleared out of it; null if all of it. */
+  RNode? trim(this, Item ref, u8[] prefix) {
+    i32 w = this.where(prefix);
+    if (w == -1) { return rref(ref); }
+    if (w == 1) {
+      this.more = true;
+      return rref(ref);
+    }
+    if (w == 0) { return null; }
+    RNode? opened = this.open(ref);
+    if (opened is null) { return null; }
+    RNode n = opened!;
+    if (n.kind == LEAF) {
+      u8[] key = cat(prefix, n.path);
+      if (cmpPadded(key, 0, this.left) < 0) { return n; }
+      if (cmpPadded(key, 0, this.right) > 0) {
+        this.more = true;
+        return n;
+      }
+      return null;
+    }
+    if (n.kind == EXT) {
+      RNode? next = this.trim(n.next!.ref!, cat(prefix, n.path));
+      if (this.why != "") { return null; }
+      if (next is null) { return null; }
+      n.next = next;
+      return n;
+    }
+    for (i32 i = 0; i < 16; i++) {
+      if (n.kids[i] is not null) { n.kids[i] = this.trim(n.kids[i]!.ref!, cat(prefix, [i as@ u8])); }
+      if (this.why != "") { return null; }
+    }
+    return n;
+  }
+}
+
+/** Hex-prefix decoded: the nibbles, and whether it marks a leaf. */
+(u8[], bool) fromHexPrefix(u8[] b) {
+  if (b.len() == 0) { return (u8[].filled(0, 0), false); }
+  u8 flag = b[0] >> 4;
+  bool odd = (flag & 1) == 1;
+  u8[] n = u8[].filled(b.len() * 2 - (odd ? 1 : 2), 0);
+  i32 at = 0;
+  if (odd) {
+    n[0] = b[0] & 15;
+    at = 1;
+  }
+  for (i32 i = 1; i < b.len(); i++) {
+    n[at] = b[i] >> 4;
+    n[at + 1] = b[i] & 15;
+    at += 2;
+  }
+  return (n, flag >= 2);
+}
+
+/** `value` put at `key` (nibbles, from `at`) under `node`; null with `why[0]` if it would go into a kept subtree. */
+RNode? put(RNode? node, u8[] key, i32 at, u8[] value, string[] why) {
+  if (node is null) { return rleaf(sub(key, at, key.len()), value); }
+  RNode n = node!;
+  n.ref = null;
+  if (n.kind == REF) {
+    why[0] = "an entry falls in a part of the trie the proof says is outside the run";
+    return null;
+  }
+  if (n.kind == BRANCH) {
+    i32 nib = key[at] as i32;
+    RNode? k = put(n.kids[nib], key, at + 1, value, why);
+    if (k is null) { return null; }
+    n.kids[nib] = k;
+    return n;
+  }
+  i32 cp = 0;
+  while (cp < n.path.len() && at + cp < key.len() && n.path[cp] == key[at + cp]) { cp++; }
+  if (n.kind == LEAF && cp == n.path.len()) {
+    why[0] = "an entry is given twice";
+    return null;
+  }
+  if (n.kind == EXT && cp == n.path.len()) {
+    RNode? k = put(n.next, key, at + cp, value, why);
+    if (k is null) { return null; }
+    n.next = k;
+    return n;
+  }
+  RNode b = rbranch();
+  i32 mine = n.path[cp] as i32;
+  b.kids[mine] = n.kind == LEAF ? rleaf(sub(n.path, cp + 1, n.path.len()), n.value)
+                                : (cp + 1 == n.path.len() ? n.next! : rext(sub(n.path, cp + 1, n.path.len()), n.next!));
+  b.kids[key[at + cp] as i32] = rleaf(sub(key, at + cp + 1, key.len()), value);
+  return cp == 0 ? b : rext(sub(n.path, 0, cp), b);
+}
+
+Item refOf(RNode n) {
+  if (n.kind == REF) { return n.ref!; }
+  Item it = itemOf(n);
+  u8[] enc = encode(it);
+  return enc.len() < 32 ? it : Item.Bytes(keccak256(enc));
+}
+
+Item itemOf(RNode n) {
+  if (n.kind == LEAF) { return Item.List([Item.Bytes(hexPrefixOf(n.path, true)), Item.Bytes(n.value)]); }
+  if (n.kind == EXT) { return Item.List([Item.Bytes(hexPrefixOf(n.path, false)), refOf(n.next!)]); }
+  Item[] b = Item[].filled(17, Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < 16; i++) {
+    if (n.kids[i] is not null) { b[i] = refOf(n.kids[i]!); }
+  }
+  return Item.List(b);
+}
+
+/**
+ * Whether `keys` (32-byte, ascending) with `values` are exactly the entries of the trie with root `root`
+ * from `origin` to the last of them — all of them from `origin` on when there are none — given the
+ * `proof` nodes for the two edges; and whether the trie has more after the last.
+ */
+export Range verifyRange(u8[] root, u8[] origin, u8[][] keys, u8[][] values, u8[][] proof) {
+  if (keys.len() != values.len()) { return bad("as many values as keys are needed"); }
+  for (i32 i = 0; i < keys.len(); i++) {
+    if (keys[i].len() != 32) { return bad("a key is not 32 bytes"); }
+    if (values[i].len() == 0) { return bad("an empty value is not an entry"); }
+    if (i > 0 && cmpPadded(nibblesOf(keys[i - 1]), 0, nibblesOf(keys[i])) >= 0) { return bad("the keys are not in ascending order"); }
+  }
+  if (proof.len() == 0) {
+    // No proof: the run is the whole trie.
+    u8[] whole = keys.len() == 0 ? emptyRoot() : trieRoot(keys, values);
+    return same(whole, root) ? Range(true, false, "") : bad("the entries do not make the root, and there is no proof");
+  }
+  if (keys.len() > 0 && cmpPadded(nibblesOf(keys[0]), 0, nibblesOf(origin)) < 0) { return bad("the first key is before the origin"); }
+  Map<string, u8[]> nodes = Map.create(hashString, stringEq);
+  for (i32 i = 0; i < proof.len(); i++) { nodes.set(bytesToHex(keccak256(proof[i])), proof[i]); }
+  u8[] right = keys.len() > 0 ? nibblesOf(keys[keys.len() - 1]) : u8[].filled(64, 15);
+  Trim t = Trim(nodes, nibblesOf(origin), right, false, "");
+  RNode? top = t.trim(Item.Bytes(root), u8[].filled(0, 0));
+  if (t.why != "") { return bad(t.why); }
+  string[] why = [""];
+  for (i32 i = 0; i < keys.len(); i++) {
+    top = put(top, nibblesOf(keys[i]), 0, values[i], why);
+    if (top is null) { return bad(why[0]); }
+  }
+  u8[] got = top is null ? emptyRoot() : keccak256(encode(itemOf(top!)));
+  if (top is not null && top!.kind == REF) { got = bytesOf(top!.ref!); }
+  return same(got, root) ? Range(true, t.more, "") : bad("the entries and the proof do not make the root");
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}

@@ -1,0 +1,457 @@
+// Admission: whether an object may be used in a role, decided recursively over the derivation graph. A pure function of
+// the policy, the index, the objects the resolver can reach, and what the chain said (revocations, rejections).
+//
+// A policy gives each role a list of alternatives; an object is admitted in a role if any alternative holds:
+//
+//     Root                         the object is one of the policy's trust roots
+//     Endorsed(by, n)              n distinct endorsers from `by` endorsed it
+//     Derived(by, n, runners, …)   some recipe producing it has n distinct witnesses from `by` on `runners` distinct
+//                                  runners, an allowed machine and format, and every input slot admitted in the role the
+//                                  rule gives that slot's name (or `otherSlots` for the rest)
+//     Analysis(analyser, …)        a derivation of `analyser` run on the object, witnessed enough, wrote `expect` at `path`
+//     Within(role, path)           the object is the file at `path` inside an output admitted in `role`: what a build
+//                                  produced (`out/app.wasm` in a compiler's output), taken out to be run
+//     Agree(rules)                 every rule holds, each `derived` one through a different recipe: one object with
+//                                  several unrelated origins that agree on it. Diverse double-compiling is this: a
+//                                  compiler admitted only when two compilers that share nothing but the source build it
+//                                  to the same bytes, so a backdoor would have to be in both
+//
+// and refused, whatever else holds, if a followed rejection list names it. A statement revoked by its own signer —
+// on the chain, or by a signed revocation in the index — counts for nothing.
+//
+// Conformance (docs/conformance.md): a policy may name, per machine, a suite: a tree whose `cases` file lists recipes
+// and the output each must give (or `none`: a run that must yield nothing, such as one past the machine's floor). A
+// witness to a derivation under that machine then counts only if the same signer, under the same runner name, has
+// witnessed every case as the suite says and none otherwise: a runner shows it implements the machine before its
+// word about anything else is taken.
+
+import { ipfs.Cid, ipfs.parseCid, ipfs.Resolver, ipfs.readFile, ipfs.readNode, ipfs.Node } from "@/lib.wac";
+import { Result } from "core";
+import { Recipe, recipeFrom, Statement } from "./claims.wac";
+import { Index, Held, same, contains, pushCid } from "./graph.wac";
+import { Slot, slotsOf } from "./slots.wac";
+import { codec.hexEncode } from "wac";
+
+export struct Named {
+  string name;
+  u8[] address;
+}
+
+export struct SlotRole {
+  string slot;
+  string role;
+}
+
+export enum Rule {
+  Root,
+  Endorsed(string[] by, i32 atLeast),
+  Derived(string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots),
+  Analysis(Cid analyser, string slot, string path, string expect, string[] by, i32 atLeast),
+  Within(string role, string path),
+  Agree(Rule[] rules),
+}
+
+export struct RoleRules {
+  string role;
+  Rule[] anyOf;
+}
+
+/** A machine's conformance suite: a tree whose `cases` file is `RECIPE OUTPUT` (or `RECIPE none`) per line. */
+export struct Conformance {
+  string machine;
+  Cid suite;
+}
+
+export struct Policy {
+  Named[] signers;
+  Cid[] roots;
+  string[] machines;
+  string[] formats;
+  u8[][] rejectLists;
+  RoleRules[] roles;
+  Conformance[] conformance;
+}
+
+/** What the chain said: revocations as (signer, statement id), rejections as (list, subject). */
+export struct Chain {
+  u8[][] revokedBy;
+  Cid[] revokedId;
+  u8[][] rejectedBy;
+  Cid[] rejected;
+
+  Chain none() { return Chain(u8[][](), Cid[](), u8[][](), Cid[]()); }
+}
+
+export struct Decision {
+  bool ok;
+  string[] why;
+}
+
+struct Ctx {
+  Policy p;
+  Index ix;
+  Resolver r;
+  Chain chain;
+  string[] stack;
+}
+
+string short(Cid c) { string t = c.text(); return t.slice(0, 14) + "…"; }
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+string nameOf(Policy p, u8[] address) {
+  for (i32 i = 0; i < p.signers.len(); i++) { if (same(p.signers[i].address, address)) { return p.signers[i].name; } }
+  return "";
+}
+
+bool has(string[] xs, string x) {
+  for (i32 i = 0; i < xs.len(); i++) { if (xs[i] == x) { return true; } }
+  return false;
+}
+
+string[] plus(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+string[] plusAll(string[] xs, string[] ys) {
+  string[] out = xs;
+  for (i32 i = 0; i < ys.len(); i++) { out = plus(out, ys[i]); }
+  return out;
+}
+
+bool revoked(Ctx c, Held h) {
+  if (c.ix.revokedHere(h.signer, h.id)) { return true; }
+  for (i32 i = 0; i < c.chain.revokedId.len(); i++) {
+    if (c.chain.revokedId[i].eq(h.id) && same(c.chain.revokedBy[i], h.signer)) { return true; }
+  }
+  return false;
+}
+
+/** A followed list's rejection of `cid`, from the chain or a signed rejection in the index; "" when none. */
+string rejection(Ctx c, Cid cid) {
+  for (i32 l = 0; l < c.p.rejectLists.len(); l++) {
+    for (i32 i = 0; i < c.chain.rejected.len(); i++) {
+      if (c.chain.rejected[i].eq(cid) && same(c.chain.rejectedBy[i], c.p.rejectLists[l])) { return "on the chain"; }
+    }
+    Held[] about = c.ix.about(cid);
+    for (i32 i = 0; i < about.len(); i++) {
+      bool isRejection = match (about[i].statement) { Rejection(_, _): true, Endorsement(_, _): false, Derivation(_, _, _): false, Revocation(_): false };
+      if (isRejection && same(about[i].signer, c.p.rejectLists[l]) && !revoked(c, about[i])) { return "by a signed rejection"; }
+    }
+  }
+  return "";
+}
+
+/** Whether `cid` may be used as `role`, and why. */
+export Decision admit(Policy p, Index ix, Resolver r, Chain chain, Cid cid, string role) {
+  return admitIn(Ctx(p, ix, r, chain, string[]()), cid, role);
+}
+
+Decision admitIn(Ctx c, Cid cid, string role) {
+  string key = cid.text() + " as " + role;
+  if (has(c.stack, key)) { return Decision(false, ["\{short(cid)} as \{role} depends on itself"]); }
+  if (c.stack.len() > 64) { return Decision(false, ["deeper than 64 derivations"]); }
+  string rej = rejection(c, cid);
+  if (rej != "") { return Decision(false, ["\{short(cid)} is on a rejection list you follow (\{rej})"]); }
+  Rule[]? rules = null;
+  for (i32 i = 0; i < c.p.roles.len(); i++) { if (c.p.roles[i].role == role) { rules = c.p.roles[i].anyOf; } }
+  if (rules is null) { return Decision(false, ["the policy has no rule for the role \{role}"]); }
+  Ctx inner = Ctx(c.p, c.ix, c.r, c.chain, plus(c.stack, key));
+  string[] why = string[]();
+  for (i32 i = 0; i < rules!.len(); i++) {
+    Decision d = alternative(inner, cid, role, rules![i]);
+    if (d.ok) { return Decision(true, plusAll(["\{short(cid)} admitted as \{role}"], d.why)); }
+    why = plusAll(why, d.why);
+  }
+  return Decision(false, plusAll(["\{short(cid)} refused as \{role}"], why));
+}
+
+Decision alternative(Ctx c, Cid cid, string role, Rule rule) {
+  match (rule) {
+    Root: {
+      return contains(c.p.roots, cid) ? Decision(true, ["  a trust root"]) : Decision(false, ["  not a trust root"]);
+    }
+    Endorsed(by, atLeast): {
+      string[] who = string[]();
+      Held[] about = c.ix.about(cid);
+      for (i32 i = 0; i < about.len(); i++) {
+        bool isEndorsement = match (about[i].statement) { Endorsement(_, _): true, Rejection(_, _): false, Derivation(_, _, _): false, Revocation(_): false };
+        string n = nameOf(c.p, about[i].signer);
+        if (isEndorsement && has(by, n) && !has(who, n) && !revoked(c, about[i])) { who = plus(who, n); }
+      }
+      bool ok = who.len() >= atLeast;
+      return Decision(ok, ["  endorsed by \{list(who)} (need \{atLeast})"]);
+    }
+    Derived(by, atLeast, runners, slots, otherSlots): { return derived(c, cid, by, atLeast, runners, slots, otherSlots, Cid[]()).d; }
+    Analysis(analyser, slot, path, expect, by, atLeast): { return analysis(c, cid, analyser, slot, path, expect, by, atLeast); }
+    Within(role2, path): { return within(c, cid, role2, path); }
+    Agree(rules): { return agree(c, cid, role, rules); }
+  }
+}
+
+/**
+ * Every rule, each `derived` one through a recipe none of the others used. Tried in order, each taking the first recipe
+ * that satisfies it, so rules whose programs differ (which is the point of asking for more than one) never compete.
+ */
+Decision agree(Ctx c, Cid cid, string role, Rule[] rules) {
+  Cid[] used = Cid[]();
+  string[] why = ["  every one of \{rules.len()} origins must hold, each through its own recipe:"];
+  for (i32 i = 0; i < rules.len(); i++) {
+    Via v = match (rules[i]) {
+      Derived(by, atLeast, runners, slots, otherSlots): derived(c, cid, by, atLeast, runners, slots, otherSlots, used),
+      Root: Via(alternative(c, cid, role, rules[i]), null),
+      Endorsed(_, _): Via(alternative(c, cid, role, rules[i]), null),
+      Analysis(_, _, _, _, _, _): Via(alternative(c, cid, role, rules[i]), null),
+      Within(_, _): Via(alternative(c, cid, role, rules[i]), null),
+      Agree(_): Via(Decision(false, ["  an agree rule cannot hold another"]), null),
+    };
+    why = plusAll(why, indent(v.d.why));
+    if (!v.d.ok) { return Decision(false, plus(why, "  origin \{i + 1} of \{rules.len()} does not hold")); }
+    if (v.rid is not null) { used = pushCid(used, v.rid!); }
+  }
+  return Decision(true, why);
+}
+
+/** A rule's decision, and the recipe it held through when it is a derivation. */
+struct Via {
+  Decision d;
+  Cid? rid;
+}
+
+string list(string[] xs) {
+  if (xs.len() == 0) { return "nobody"; }
+  string out = "";
+  for (i32 i = 0; i < xs.len(); i++) { out += (i > 0 ? ", " : "") + xs[i]; }
+  return out;
+}
+
+/** The recipe named `id`, from the index or else from its block. */
+Recipe? recipeOf(Ctx c, Cid id) {
+  Recipe? r = c.ix.recipe(id);
+  if (r is not null) { return r; }
+  u8[]? b = c.r.block(id).ok();
+  return b is null ? null : recipeFrom(b!).ok();
+}
+
+/** Witnesses from `by`, unrevoked, claiming recipe `rid` produces `output`: their names and their runners. */
+struct Witnessed {
+  string[] names;
+  string[] runners;
+  string[] excluded;
+}
+
+Witnessed witnesses(Ctx c, Cid rid, Cid output, string[] by, string machine) {
+  Witnessed w = Witnessed(string[](), string[](), string[]());
+  Cid? suite = null;
+  for (i32 i = 0; i < c.p.conformance.len(); i++) { if (c.p.conformance[i].machine == machine) { suite = c.p.conformance[i].suite; } }
+  Held[] origins = c.ix.origins(output);
+  for (i32 i = 0; i < origins.len(); i++) {
+    match (origins[i].statement) {
+      Derivation(r, _, runner): {
+        string n = nameOf(c.p, origins[i].signer);
+        if (r.eq(rid) && has(by, n) && !has(w.names, n) && !revoked(c, origins[i])) {
+          if (suite is not null) {
+            string fault = conformanceFault(c, suite!, origins[i].signer, runner);
+            if (fault != "") { w.excluded = plus(w.excluded, "\{n} on \"\{runner}\": \{fault}"); continue; }
+          }
+          w.names = plus(w.names, n);
+          if (!has(w.runners, runner)) { w.runners = plus(w.runners, runner); }
+        }
+      }
+      Endorsement(_, _): { }
+      Rejection(_, _): { }
+      Revocation(_): { }
+    }
+  }
+  return w;
+}
+
+Via derived(Ctx c, Cid cid, string[] by, i32 atLeast, i32 runners, SlotRole[] slots, string otherSlots, Cid[] exclude) {
+  string[] why = string[]();
+  Cid[] seen = exclude;
+  Held[] origins = c.ix.origins(cid);
+  if (origins.len() == 0) { return Via(Decision(false, ["  no known recipe produces it"]), null); }
+  for (i32 i = 0; i < origins.len(); i++) {
+    Cid rid = match (origins[i].statement) { Derivation(r, _, _): r, Endorsement(s, _): s, Rejection(s, _): s, Revocation(s): s };
+    if (contains(seen, rid)) { continue; }
+    seen = pushCid(seen, rid);
+    Recipe? rec = recipeOf(c, rid);
+    if (rec is null) { why = plus(why, "  recipe \{short(rid)}: not found"); continue; }
+    if (!has(c.p.machines, rec!.machine)) { why = plus(why, "  recipe \{short(rid)}: machine \{rec!.machine} is not one the policy accepts"); continue; }
+    if (!has(c.p.formats, rec!.format)) { why = plus(why, "  recipe \{short(rid)}: format \{rec!.format} is not one the policy accepts"); continue; }
+    Witnessed w = witnesses(c, rid, cid, by, rec!.machine);
+    string count = "witnessed by \{list(w.names)} on \{w.runners.len()} runner(s) (need \{atLeast} on \{runners})";
+    for (i32 x = 0; x < w.excluded.len(); x++) { count += "; not counted: \{w.excluded[x]}"; }
+    if (w.names.len() < atLeast || w.runners.len() < runners) { why = plus(why, "  recipe \{short(rid)}: \{count}"); continue; }
+    Slot[] ss;
+    match (slotsOf(c.r, rec!.input)) {
+      Err(e): { why = plus(why, "  recipe \{short(rid)}: \{e}"); continue; }
+      Ok(x): { ss = x; }
+    }
+    bool all = true;
+    string[] sub = string[]();
+    for (i32 j = 0; j < ss.len(); j++) {
+      string want = otherSlots;
+      for (i32 k = 0; k < slots.len(); k++) { if (slots[k].slot == ss[j].name) { want = slots[k].role; } }
+      if (want == "") { all = false; sub = plus(sub, "    slot \{ss[j].name}: the rule takes no such input"); continue; }
+      Decision d = admitIn(c, ss[j].cid, want);
+      sub = plusAll(sub, indent(d.why));
+      if (!d.ok) { all = false; }
+    }
+    if (all) { return Via(Decision(true, plusAll(["  recipe \{short(rid)}: \{count}"], sub)), rid); }
+    why = plusAll(plus(why, "  recipe \{short(rid)}: \{count}, but an input is refused"), sub);
+  }
+  if (why.len() == 0) { why = ["  no other recipe produces it"]; }
+  return Via(Decision(false, why), null);
+}
+
+string[] indent(string[] xs) {
+  string[] out = string[].defaulted(xs.len());
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = "    " + xs[i]; }
+  return out;
+}
+
+Decision analysis(Ctx c, Cid cid, Cid analyser, string slot, string path, string expect, string[] by, i32 atLeast) {
+  for (i32 i = 0; i < c.ix.recipeIds.len(); i++) {
+    Recipe rec = c.ix.recipes[i];
+    Slot[]? ss = slotsOf(c.r, rec.input).ok();
+    if (ss is null) { continue; }
+    bool onIt = false;
+    bool byIt = false;
+    for (i32 j = 0; j < ss!.len(); j++) {
+      if (ss![j].name == slot && ss![j].cid.eq(cid)) { onIt = true; }
+      if (ss![j].name == "program" && ss![j].cid.eq(analyser)) { byIt = true; }
+    }
+    if (!onIt || !byIt || !has(c.p.machines, rec.machine)) { continue; }
+    Cid rid = c.ix.recipeIds[i];
+    for (i32 h = 0; h < c.ix.held.len(); h++) {
+      Cid? out = match (c.ix.held[h].statement) { Derivation(r, o, _): r.eq(rid) ? o : null, Endorsement(_, _): null, Rejection(_, _): null, Revocation(_): null };
+      if (out is null) { continue; }
+      Witnessed w = witnesses(c, rid, out!, by, rec.machine);
+      if (w.names.len() < atLeast) { continue; }
+      u8[]? got = fileAt(c.r, out!, path);
+      string text = got is null ? "(nothing)" : string.fromBytes(got!);
+      if (text == expect) { return Decision(true, ["  the analyser \{short(analyser)} says \"\{expect}\" at \{path}, witnessed by \{list(w.names)}"]); }
+      return Decision(false, ["  the analyser \{short(analyser)} says \"\{text}\" at \{path}, not \"\{expect}\""]);
+    }
+  }
+  return Decision(false, ["  no witnessed run of the analyser \{short(analyser)} on it"]);
+}
+
+/** The file at a `/`-separated path in a tree, if there is one. */
+u8[]? fileAt(Resolver r, Cid tree, string path) {
+  Cid at = tree;
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 s = rest.indexOf("/");
+    string part = s < 0 ? rest : rest.slice(0, s);
+    rest = s < 0 ? "" : rest.slice(s + 1, rest.len());
+    Slot[]? ss = slotsOf(r, at).ok();
+    if (ss is null) { return null; }
+    bool found = false;
+    for (i32 i = 0; i < ss!.len(); i++) { if (ss![i].name == part) { at = ss![i].cid; found = true; } }
+    if (!found) { return null; }
+  }
+  return readFile(r, at).ok();
+}
+
+/**
+ * Whether `cid` is the file at `path` in some derivation's output, and that output is admitted in `role`. The outputs
+ * tried are those the index has derivations for; an output that has the file but is not admitted does not count.
+ */
+Decision within(Ctx c, Cid cid, string role, string path) {
+  Cid[] seen = Cid[]();
+  string[] why = string[]();
+  for (i32 i = 0; i < c.ix.held.len(); i++) {
+    Cid? out = match (c.ix.held[i].statement) {
+      Derivation(_, o, _): o, Endorsement(_, _): null, Rejection(_, _): null, Revocation(_): null
+    };
+    if (out is null || contains(seen, out!)) { continue; }
+    seen = pushCid(seen, out!);
+    Cid? at = cidAt(c.r, out!, path);
+    if (at is null || !at!.eq(cid)) { continue; }
+    Decision d = admitIn(c, out!, role);
+    if (d.ok) { return Decision(true, plusAll(["  the file at \{path} in \{short(out!)}, which is admitted as \{role}:"], indent(d.why))); }
+    why = plusAll(plus(why, "  the file at \{path} in \{short(out!)}, which is not admitted as \{role}:"), indent(d.why));
+  }
+  if (seen.len() == 0 || why.len() == 0) { return Decision(false, plus(why, "  no derived output has it at \{path}")); }
+  return Decision(false, why);
+}
+
+/** The CID of the entry at a `/`-separated path in a tree. */
+Cid? cidAt(Resolver r, Cid tree, string path) {
+  Cid at = tree;
+  string rest = path;
+  while (rest.len() > 0) {
+    i32 s = rest.indexOf("/");
+    string part = s < 0 ? rest : rest.slice(0, s);
+    rest = s < 0 ? "" : rest.slice(s + 1, rest.len());
+    Slot[]? ss = slotsOf(r, at).ok();
+    if (ss is null) { return null; }
+    bool found = false;
+    for (i32 i = 0; i < ss!.len(); i++) { if (ss![i].name == part) { at = ss![i].cid; found = true; } }
+    if (!found) { return null; }
+  }
+  return at;
+}
+
+/**
+ * Why `signer`, running as `runner`, has not shown it implements the suite's machine; "" when it has. Every case must be
+ * witnessed by it, under that runner name and unrevoked, with the suite's output; a case whose output is `none` must
+ * have no such witness at all; and no witness of its may give a case another output.
+ */
+string conformanceFault(Ctx c, Cid suite, u8[] signer, string runner) {
+  u8[]? text = fileAt(c.r, suite, "cases");
+  if (text is null) { return "the suite \{short(suite)} has no `cases` it can read"; }
+  string[] lines = linesOf(text!);
+  i32 cases = 0;
+  i32 shown = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    string line = lines[i];
+    if (line == "" || line.slice(0, 1) == "#") { continue; }
+    i32 sp = line.indexOf(" ");
+    if (sp < 0) { return "the suite's line \"\{line}\" is not RECIPE OUTPUT"; }
+    Cid? rid = parseCid(line.slice(0, sp)).ok();
+    string want = line.slice(sp + 1, line.len());
+    if (rid is null) { return "the suite's line \"\{line}\" does not start with a CID"; }
+    if (want != "none") { cases++; }
+    bool gave = false;
+    for (i32 h = 0; h < c.ix.held.len(); h++) {
+      if (!same(c.ix.held[h].signer, signer) || revoked(c, c.ix.held[h])) { continue; }
+      match (c.ix.held[h].statement) {
+        Derivation(r, o, run): {
+          if (!r.eq(rid!) || run != runner) { continue; }
+          if (want == "none") { return "it claimed an output for \{short(rid!)}, where the machine gives none"; }
+          if (o.text() != want) { return "it gave \{short(o)} for \{short(rid!)}, where the suite says \{want.slice(0, 14)}…"; }
+          gave = true;
+        }
+        Endorsement(_, _): { }
+        Rejection(_, _): { }
+        Revocation(_): { }
+      }
+    }
+    if (gave) { shown++; }
+  }
+  if (shown < cases) { return "it has witnessed \{shown} of the suite's \{cases} cases with an output"; }
+  return "";
+}
+
+/** A text's lines, each without the spaces, tabs and carriage returns around it. */
+string[] linesOf(u8[] b) {
+  string[] out = string[]();
+  i32 from = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i < b.len() && b[i] != '\n') { continue; }
+    i32 a = from;
+    i32 z = i;
+    while (a < z && (b[a] == ' ' || b[a] == '\t' || b[a] == '\r')) { a++; }
+    while (z > a && (b[z - 1] == ' ' || b[z - 1] == '\t' || b[z - 1] == '\r')) { z--; }
+    u8[] line = u8[].filled(z - a, 0);
+    line.copyFrom(b, a, 0, z - a);
+    out = plus(out, string.fromBytes(line));
+    from = i + 1;
+  }
+  return out;
+}

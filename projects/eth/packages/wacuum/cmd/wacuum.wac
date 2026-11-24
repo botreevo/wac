@@ -1,0 +1,566 @@
+// wacuum: the execution client, serving the Engine API to a consensus client.
+//
+//     wac run --allow-read --allow-write --allow-net cmd/wacuum.wac -- --genesis genesis.json --jwt-secret jwt.hex \
+//         [--datadir DIR] [--port 8551]
+//
+// It starts from a geth-format genesis, listens on 127.0.0.1 (the Engine API is for a consensus client on
+// the same machine, and is not meant to face a network), and executes whatever payloads it is sent.
+//
+// With `--public-rpc`, a request without a token may call everything but the Engine API: the `eth_`,
+// `net_` and `web3_` methods a wallet or a library uses.
+//
+// With `--peer enode://…` (as many as wanted) it dials those nodes and keeps dialling them. With
+// `--p2p-port` it accepts others there and runs discovery v4 on the same port's UDP, starting from any
+// `--bootnode`s and dialling what it finds up to `--max-peers` (10), advertising `--ip` (127.0.0.1). Peers
+// either way: it answers their requests for headers and bodies, swaps transactions
+// with them, and fetches from them any chain the consensus client names that it has not got.
+//
+// With `--dev` it is a devnet by itself: it needs no consensus client, because every `--dev-period`
+// seconds (2) it builds a block from its mempool and makes it the head and finalized at once. Without
+// `--genesis` it starts the chain in src/chain/dev.wac — Osaka from block 0, chain id 1337, and one
+// account with a million ether whose key it prints. A `--jwt-secret` is optional, and `--public-rpc` is on.
+//
+// That account's key is 0x11…11, well known, which is right for a devnet on one machine and wrong for one
+// anyone can reach: whoever reaches the RPC can spend it, and fill every block. `--dev-key HEX` funds that
+// key's account instead, and `--dev-key random` makes one, keeps it in the data directory as `devkey` so a
+// restart is the same chain, and prints it. A `--follow` node on the dev chain needs the same `--dev-key`.
+//
+// A `--dev` node also keeps the state of the last 16 blocks, not only the head's, so that eth_getProof and eth_call
+// answer for a block that was the head a moment ago.
+//
+// With `--store` the state is on disk (docs/state-on-disk.md), and `--cache-mb MB` sizes the store's cache of
+// the entries blocks read (256 MB by default; docs/state-cache.md). Blocks' commits are staged in memory and
+// written together every `--flush-every BLOCKS` (8 by default; 1 writes each): a crash loses only what is staged,
+// and the block log replays it. The flush is part of the block that reaches it, so N trades a block's mean cost
+// against one block in N taking the flush's time: at a 2.9 GB store, 8 is 234 ms a block and 1.4 s for that one,
+// 64 is 185 ms and 4.4 s — a third of a slot, and growing with the store (tools/measure/flush.wac, docs/state-on-disk.md).
+//
+// With `--history N` it keeps only the last N finalized blocks for the eth_ methods and for peers: their
+// headers, bodies and receipts are held in memory, a few kilobytes a block. A node keeps them all by
+// default (0), a `--dev` node 10000, and a node on a store 256 — which answers for older blocks from disk.
+//
+//     wac run --allow-read --allow-write --allow-net cmd/wacuum.wac -- --dev --datadir devnet
+//
+// With `--follow` it needs no consensus client either: it takes the chain its peers serve, making the
+// highest head a peer announces its own head once it has fetched the blocks. That trusts the peer for the
+// fork choice, which is what a devnet wants — another node beside a `--dev` one, given it as a `--peer`:
+//
+//     wacuum --follow --peer enode://…@127.0.0.1:30303 --datadir follower --port 8552
+//
+// Without `--genesis` it is on the dev chain; with one it follows that chain.
+//
+// Neither port waits for ever on anyone: the RPC port answers 64 connections at once and closes any not
+// answered in five seconds, and the p2p port takes `--max-peers` connections from outside and closes any
+// whose handshake is not done in ten.
+//
+// With `--datadir`, it keeps `chain.log` there: every block it imports and every fork choice, appended
+// before the answer that reports it goes out, so a block this node has called VALID is one it still has
+// after a restart. Every `--snapshot-every` finalized blocks (1024; 0 for never) it also writes the state at
+// the finalized block to `snapshot`. Starting, it loads the snapshot if there is one and replays the log:
+// blocks up to the snapshot's are recorded without running, and only those after it run. Receipts are kept
+// only for the blocks that ran, so the eth_ methods have none before the snapshot. The
+// append is a write the operating system has taken, not one it has flushed to the disk, so a crash of the
+// process loses nothing and a crash of the machine may lose the last few records.
+
+import { Sys, Output, Socket } from "std";
+import { Vec, Result } from "core";
+import { json.parse } from "wac";
+import { rlp.encode } from "@/lib.wac";
+import { keccak256 } from "../src/crypto/keccak.wac";
+import { U256 } from "../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../src/hex.wac";
+import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
+import { Engine, Replayed } from "../src/engine/engine.wac";
+import { Store } from "../src/store/tree.wac";
+import { EntryCache } from "../src/store/cache.wac";
+import { fileDisk } from "../src/store/file.wac";
+import { StateDb } from "../src/store/state.wac";
+import { Header, headerItem } from "../src/chain/block.wac";
+import { HttpRequest, headersEnd, parseHead, answerHttp } from "../src/engine/rpc.wac";
+import { Network, dial, listen, tend } from "../src/p2p/node.wac";
+import { discover } from "../src/p2p/discovery.wac";
+import { validKey } from "../src/p2p/secp.wac";
+import { Deadlines, Watched, enforce } from "../src/net/deadlines.wac";
+import { devGenesis, DEV_KEY } from "../src/chain/dev.wac";
+import { publicKey } from "../src/p2p/secp.wac";
+
+string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--datadir DIR] [--public-rpc] [--peer ENODE]... [--p2p-port N] [--bootnode ENODE]... [--ip ADDR] [--max-peers N] [--snapshot-every N] [--history BLOCKS] [--store] [--cache-mb MB] [--flush-every BLOCKS] [--snap] [--dev] [--dev-period SECONDS] [--dev-key HEX|random] [--follow] [--addr 127.0.0.1] [--port 8551]"; }
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  string genesisPath = "";
+  string secretPath = "";
+  string addr = "127.0.0.1";
+  string datadir = "";
+  bool publicRpc = false;
+  Vec<string> peers = Vec.create();
+  i32 p2pPort = 0;
+  u64 snapshotEvery = 1024;
+  Vec<string> bootnodes = Vec.create();
+  string ip = "127.0.0.1";
+  i32 maxPeers = 10;
+  i32 port = 8551;
+  bool dev = false;
+  bool follow = false;
+  i32 devPeriod = 2;
+  string devKeyArg = "";
+  i64 history = -1;
+  // The store's cache of entries, in MB (docs/state-cache.md); its default when absent.
+  i64 cacheMb = -1;
+  // How many blocks' commits the store stages before writing them together (docs/state-on-disk.md); 1 writes each.
+  i64 flushEvery = 8;
+  for (i32 i = 0; i < args.len(); i += 2) {
+    if (args[i] == "--public-rpc" || args[i] == "--dev" || args[i] == "--follow" || args[i] == "--store" || args[i] == "--snap") {
+      if (args[i] == "--dev") { dev = true; } else if (args[i] == "--follow") { follow = true; } else if (args[i] == "--public-rpc") { publicRpc = true; }
+      i--;
+      continue;
+    }
+    if (i + 1 >= args.len()) {
+      sys.warn(usage());
+      return 2;
+    }
+    if (args[i] == "--genesis") { genesisPath = args[i + 1]; }
+    else if (args[i] == "--jwt-secret") { secretPath = args[i + 1]; }
+    else if (args[i] == "--addr") { addr = args[i + 1]; }
+    else if (args[i] == "--datadir") { datadir = args[i + 1]; }
+    else if (args[i] == "--peer") { peers.push(args[i + 1]); }
+    else if (args[i] == "--bootnode") { bootnodes.push(args[i + 1]); }
+    else if (args[i] == "--ip") { ip = args[i + 1]; }
+    else if (args[i] == "--max-peers") {
+      i32 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i32); }
+      maxPeers = n;
+    }
+    else if (args[i] == "--snapshot-every") {
+      u64 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as u64); }
+      snapshotEvery = n;
+    }
+    else if (args[i] == "--dev-key") { devKeyArg = args[i + 1]; }
+    else if (args[i] == "--dev-period") {
+      i32 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i32); }
+      devPeriod = n < 1 ? 1 : n;
+    }
+    else if (args[i] == "--flush-every") {
+      i64 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i64); }
+      flushEvery = n;
+    }
+    else if (args[i] == "--cache-mb") {
+      i64 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i64); }
+      cacheMb = n;
+    }
+    else if (args[i] == "--history") {
+      i64 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i64); }
+      history = n;
+    }
+    else if (args[i] == "--p2p-port") {
+      i32 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i32); }
+      p2pPort = n;
+    }
+    else if (args[i] == "--port") {
+      i32 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i32); }
+      port = n;
+    } else if (args[i] == "--snap-throttle" || args[i] == "--snap-repivot") {
+      // Read with --snap, below.
+    } else {
+      sys.warn(usage());
+      return 2;
+    }
+  }
+  // A follower has no consensus client either, so no secret; it needs the chain's genesis unless it is the
+  // dev chain, which it is when no --genesis is given.
+  if (!dev && !follow && (genesisPath == "" || secretPath == "")) {
+    sys.warn(usage());
+    return 2;
+  }
+  if (dev || follow) { publicRpc = true; }
+
+  // A devnet's Engine API has no consensus client to answer, so without a secret it gets one nobody knows.
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  if (secretPath != "") {
+    match (await sys.readFile(secretPath)) {
+      Err(e): { sys.warn("wacuum: \{secretPath}: \{e}"); return 1; }
+      Ok(b): {
+        // The secret file is hex, with or without 0x, and maybe a trailing newline.
+        string text = string.fromBytes(b);
+        while (text.len() > 0 && (text.slice(text.len() - 1, text.len()) == "\n" || text.slice(text.len() - 1, text.len()) == "\r")) {
+          text = text.slice(0, text.len() - 1);
+        }
+        u8[]? s = hexToBytes(text);
+        if (s is null || s!.len() != 32) { sys.warn("wacuum: the JWT secret must be 32 bytes of hex"); return 1; }
+        secret = s!;
+      }
+    }
+  }
+
+  // The dev chain's funded key: the well-known one, one given, or one made and kept.
+  string devKey = DEV_KEY;
+  if (devKeyArg == "random") {
+    u8[] made = (await sys.random().bytes(32)).ok()!;
+    devKey = bytesToHex(made);
+    if (datadir != "") {
+      await sys.files().mkdir(datadir, true);
+      match (await sys.readFile(datadir + "/devkey")) {
+        Ok(b): { devKey = string.fromBytes(b); }
+        Err(err): { await sys.writeFile(datadir + "/devkey", devKey.toBytes()); }
+      }
+    } else {
+      sys.warn("wacuum: --dev-key random without --datadir: a restart will be a different chain");
+    }
+  } else if (devKeyArg != "") {
+    devKey = devKeyArg;
+  }
+  u8[]? devKeyBytes = hexToBytes(devKey);
+  if (devKeyBytes is null || !validKey(devKeyBytes!)) {
+    sys.warn("wacuum: --dev-key must be 32 bytes of hex, a valid secp256k1 key, or random");
+    return 2;
+  }
+  string devAddress = bytesToHex(addressOf(devKeyBytes!));
+
+  Genesis? g = null;
+  u8[] genesisText = devGenesis(devAddress).toBytes();
+  if (genesisPath != "") {
+    match (await sys.readFile(genesisPath)) {
+      Err(e): { sys.warn("wacuum: \{genesisPath}: \{e}"); return 1; }
+      Ok(b): { genesisText = b; }
+    }
+  }
+  match (parse(genesisText)) {
+    Err(e): { sys.warn("wacuum: \{genesisPath} is not JSON"); return 1; }
+    Ok(doc): {
+      string[] why = [""];
+      g = genesisFrom(doc, why);
+      if (g is null) { sys.warn("wacuum: \{genesisPath}: \{why[0]}"); return 1; }
+    }
+  }
+  Genesis gen = g!;
+  // The hash genesisFrom computed, in the shape the genesis's own forks give its header.
+  bool snapping = false;
+  for (i32 i = 0; i < args.len(); i++) { snapping = snapping || args[i] == "--snap"; }
+  if (gen.beforeRun && !snapping) {
+    sys.warn("wacuum: \{genesisPath}: the genesis is before Cancun, the first fork wacuum runs: start with --store --snap, to take the state at a block past Cancun from peers");
+    return 1;
+  }
+  Engine e = Engine.create(gen.config, gen.header, gen.world);
+  bool onStore = false;
+  for (i32 i = 0; i < args.len(); i++) { onStore = onStore || args[i] == "--store"; }
+  if (onStore) {
+    // The state on disk (docs/state-on-disk.md): seeded with the genesis's the first time, and after that
+    // holding the state of the block it last committed, from which the log's later blocks replay.
+    if (datadir == "") { sys.warn("wacuum: --store needs --datadir"); return 1; }
+    await sys.files().mkdir(datadir, true);
+    auto file = await fileDisk(sys, datadir + "/state.db");
+    if (!file.isOk()) { sys.warn("wacuum: \{datadir}/state.db cannot be opened"); return 1; }
+    Store? opened = null;
+    match (await Store.open(file.unwrap())) {
+      Ok(x): { opened = x; }
+      Err(err): {
+        sys.warn("wacuum: \{datadir}/state.db: \{err}");
+        return 1;
+      }
+    }
+    Store store = opened!;
+    if (cacheMb >= 0) { store.cache = EntryCache.create(cacheMb * 1024 * 1024); }
+    StateDb db = StateDb.over(store);
+    if (store.committed().user.len() == 0) {
+      string[] why = [""];
+      u8[] at = u8[].filled(40, 0);
+      at.copyFrom(gen.header.hash.toBytes(), 0, 0, 32);
+      u8[]? root = await db.seed(gen.world, at, why);
+      if (root is null || !U256.fromBytes(root!, 0, 32).eq(gen.header.stateRoot)) {
+        sys.warn("wacuum: the genesis state did not go into the store: \{why[0]}");
+        return 1;
+      }
+    }
+    // Staged from here on: the genesis above is written at once, so that a store that has one always has it.
+    db.flushEvery = flushEvery < 1 ? 1 : flushEvery as! i32;
+    e = Engine.onStore(gen.config, gen.header, db);
+    if (e.resumeFromStore()) { sys.log("wacuum: the store holds the state of block \{e.restoredNumber.toDecimal()}"); }
+  }
+  // A devnet runs for as long as it is left, so by default it keeps a bounded history; a node keeps it all.
+  // On a store the history held in memory is the last 256 finalized blocks (headers, bodies, receipts):
+  // older ones are read from the store, where every block is written as it is committed (store/blocks.wac).
+  e.history = history >= 0 ? history as@ u64 : dev ? 10000 : onStore ? 256 : 0;
+  // And it finalizes each block as it makes it, so it keeps the last 16 states to prove recent blocks from: a reader
+  // fetching a header and then a proof for it would otherwise lose whenever a block lands in between.
+  e.states = dev ? 16 : 0;
+  sys.log("wacuum: \{gen.spec.name}, chain \{gen.config.chainId.toDecimal()}, genesis \{gen.header.hash.toHex()}");
+
+  // The node's devp2p identity: kept in the data directory so it is the same node after a restart.
+  u8[] nodeKey = (await sys.random().bytes(32)).ok()!;
+  if (datadir != "") {
+    string keyPath = datadir + "/nodekey";
+    await sys.files().mkdir(datadir, true);
+    match (await sys.readFile(keyPath)) {
+      Ok(b): {
+        u8[]? k = hexToBytes(string.fromBytes(b));
+        if (k is not null && validKey(k!)) { nodeKey = k!; }
+      }
+      Err(err): {
+        string hex = "";
+        u8[] digits = "0123456789abcdef".toBytes();
+        for (i32 i = 0; i < 32; i++) {
+          hex += string.fromBytes([digits[(nodeKey[i] >> 4) as i32], digits[(nodeKey[i] & 15) as i32]]);
+        }
+        await sys.writeFile(keyPath, hex.toBytes());
+      }
+    }
+  }
+
+  Output? log = null;
+  if (datadir != "") {
+    string path = datadir + "/chain.log";
+    await sys.files().mkdir(datadir, true);
+    bool exists = false;
+    match (await sys.files().stat(path)) {
+      Ok(st): { exists = st.exists; }
+      Err(e): {}
+    }
+    // A snapshot, if there is one, is where the replay starts from (the store, when there is one, instead).
+    match (onStore ? Result.Err("on the store") : await sys.readFile(datadir + "/snapshot")) {
+      Ok(snap): {
+        string why = e.restore(snap);
+        if (why != "") {
+          sys.warn("wacuum: \{datadir}/snapshot: \{why}");
+          return 1;
+        }
+        sys.log("wacuum: starting from the snapshot at block \{e.restoredNumber.toDecimal()}");
+      }
+      Err(err): {}
+    }
+    if (exists) {
+      match (await sys.readFile(path)) {
+        Err(e): { sys.warn("wacuum: \{path}: \{e}"); return 1; }
+        Ok(bytes): {
+          Replayed r = await e.replay(bytes);
+          if (r.error != "") {
+            sys.warn("wacuum: \{path} does not replay on this genesis: \{r.error}");
+            return 1;
+          }
+          if (r.good < bytes.len()) {
+            // The last record was cut short when the process stopped; the log goes on from before it.
+            u8[] keep = u8[].filled(r.good, 0);
+            for (i32 i = 0; i < keep.len(); i++) { keep[i] = bytes[i]; }
+            match (await sys.writeFile(path, keep)) {
+              Err(err): { sys.warn("wacuum: \{path}: \{err}"); return 1; }
+              Ok(_): {}
+            }
+            sys.warn("wacuum: dropped \{bytes.len() - r.good} bytes of a record cut short at the end of \{path}");
+          }
+          sys.log("wacuum: replayed \{r.blocks} blocks from \{path}; head \{e.head.toHex()}");
+        }
+      }
+    }
+    if (await e.adoptStored()) { sys.log("wacuum: block \{e.restoredNumber.toDecimal()} taken from the store, the log not having it"); }
+    match (await sys.files().openAppend(path)) {
+      Err(err): { sys.warn("wacuum: \{path}: \{err}"); return 1; }
+      Ok(out): { log = out; }
+    }
+  }
+
+  Network net = Network.create(e, nodeKey, gen.header.hash, gen.forkBlocks, gen.forkTimes);
+  net.maxInbound = maxPeers;
+  net.follow = follow;
+  // With --snap (and --store), a node with nothing but its genesis fetches the state at the first head it is
+  // told of by snap sync, from a peer that speaks snap/1, rather than running every block before it.
+  for (i32 i = 0; i < args.len(); i++) {
+    net.snap = net.snap || args[i] == "--snap";
+    // For tests only: a pause before each snap request, so that a sync can outlive its pivot.
+    if (args[i] == "--snap-throttle" && i + 1 < args.len()) {
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { net.snapThrottle = net.snapThrottle * 10 + ((d[k] - 48) as i32); }
+    }
+    // For tests only: as if the peer dropped the pivot's state after this many requests.
+    if (args[i] == "--snap-repivot" && i + 1 < args.len()) {
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { net.snapRepivot = net.snapRepivot * 10 + ((d[k] - 48) as i32); }
+    }
+  }
+  if (net.snap && !onStore) {
+    sys.warn("wacuum: --snap needs --store");
+    return 1;
+  }
+  for (i32 i = 0; i < peers.len(); i++) { dial(sys, net, peers.get(i)); }
+  if (p2pPort > 0) {
+    listen(sys, net, "0.0.0.0", p2pPort);
+    discover(sys, net, ip, p2pPort, bootnodes.toArray(), maxPeers);
+  }
+  Disk disk = Disk(log, datadir, snapshotEvery);
+  tend(sys, net, () => flush(sys, e, disk));
+  serveEngine(sys, e, addr, port, secret, publicRpc, disk, net.deadlines);
+  if (dev) {
+    if (genesisPath == "") { sys.log("wacuum: dev account \{devAddress}, key \{devKey}"); }
+    produce(sys, e, disk, devPeriod);
+  }
+  await sys.drain();
+  return 0;
+}
+
+/** Where the node keeps things: the chain log, the directory, and how often a snapshot is taken. */
+struct Disk {
+  Output? log;
+  string dir;
+  u64 snapshotEvery;
+}
+
+/**
+ * Append what the engine has recorded since last time to the chain log; and when finality has moved far
+ * enough since the last snapshot, write a new one — to a temporary name first, then renamed over the old,
+ * so that a snapshot on disk is always a whole one.
+ */
+async void flush(Sys sys, Engine e, Disk disk) {
+  if (disk.log is not null) {
+    for (i32 i = 0; i < e.records.len(); i++) {
+      match (await disk.log!.write(e.records.get(i))) {
+        Err(err): { sys.warn("wacuum: the chain log cannot be written: \{err}"); }
+        Ok(_): {}
+      }
+    }
+  }
+  e.records = Vec.create();
+  if (e.undo.notice != "") {
+    sys.warn("wacuum: \{e.undo.notice}");
+    e.undo.notice = "";
+  }
+  if (disk.dir == "" || disk.snapshotEvery == 0) { return; }
+  Header? f = e.headerByHash(e.finalized);
+  if (f is null || f!.number.lt(e.snapshotNumber.add(U256.ofU64(disk.snapshotEvery)))) { return; }
+  u8[]? snap = e.snapshot();
+  if (snap is null) { return; }
+  string tmp = disk.dir + "/snapshot.tmp";
+  match (await sys.writeFile(tmp, snap!)) {
+    Err(err): { sys.warn("wacuum: the snapshot cannot be written: \{err}"); }
+    Ok(_): {
+      await sys.files().rename(tmp, disk.dir + "/snapshot");
+      sys.log("wacuum: snapshot at block \{f!.number.toDecimal()}");
+    }
+  }
+}
+
+/** The address a secp256k1 private key signs for. */
+u8[] addressOf(u8[] key) {
+  u8[] h = keccak256(publicKey(key));
+  u8[] out = u8[].filled(20, 0);
+  out.copyFrom(h, 12, 0, 20);
+  return out;
+}
+
+/** `--dev`'s block producer: a block every `period` seconds, for as long as the node runs. */
+async void produce(Sys sys, Engine e, Disk disk, i32 period) {
+  sys.log("wacuum: dev mode, a block every \{period} s");
+  while (true) {
+    await sys.sleepMillis(period * 1000);
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+    i32 waiting = e.mempool.len();
+    string why = await e.produceAsync(U256.ofU64(now as@ u64), U256.zero());
+    if (why != "") {
+      sys.warn("wacuum: cannot make a block: \{why}");
+      continue;
+    }
+    await flush(sys, e, disk);
+    Header h = e.headerByHash(e.head)!;
+    if (waiting > 0) { sys.log("wacuum: block \{h.number.toDecimal()} \{h.hash.toHex()}, \{waiting - e.mempool.len()} transactions"); }
+  }
+}
+
+/**
+ * How many RPC connections are answered at once, and how long each may take. A connection holds a host call
+ * while it waits for its request, and a host gives a program only so many (wac `issues/system/0373d`): with
+ * no bound, a hundred-odd clients that connect and say nothing would leave the node unable to do anything.
+ */
+static i32 RPC_AT_ONCE = 64;
+static i64 RPC_DEADLINE = 5000;
+
+/** Connections being answered, counted so that no more than `RPC_AT_ONCE` are. */
+struct InFlight { i32 n; }
+
+async void serveEngine(Sys sys, Engine e, string addr, i32 port, u8[] secret, bool publicRpc, Disk disk, Deadlines deadlines) {
+  match (await sys.net().listen(addr, port)) {
+    Err(err): { sys.warn("wacuum: cannot listen on \{addr}:\{port}: \{err}"); }
+    Ok(listener): {
+      sys.log("wacuum: Engine API on \{listener.addr}");
+      enforce(sys, deadlines);
+      InFlight busy = InFlight(0);
+      while (true) {
+        // While full, the next connection waits in the operating system's queue rather than here.
+        while (busy.n >= RPC_AT_ONCE) { await sys.sleepMillis(20); }
+        match (await listener.accept()) {
+          Err(err): { sys.warn("wacuum: accept: \{err}"); }
+          Ok(sock): {
+            busy.n++;
+            Watched w = deadlines.watch(sock, (await sys.clock().nowMillis()).orElse(0 as i64), RPC_DEADLINE);
+            answer(sys, e, sock, secret, publicRpc, disk, w, busy);
+          }
+        }
+      }
+    }
+  }
+}
+
+/** One HTTP request on its own connection: read it whole, answer it, close. */
+async void answer(Sys sys, Engine e, Socket sock, u8[] secret, bool publicRpc, Disk disk, Watched w, InFlight busy) {
+  // Read until the headers are complete, then until the body is.
+  u8[] buf = u8[].filled(4096, 0);
+  i32 len = 0;
+  i32 end = -1;
+  HttpRequest? req = null;
+  bool done = false;
+  while (!done) {
+    match (await sock.recv()) {
+      Err(err): { done = true; }
+      Ok(r): {
+        match (r) {
+          End: { done = true; }
+          Failed(why): { done = true; }
+          Data(bytes): {
+            if (len + bytes.len() > buf.len()) {
+              i32 cap = buf.len() * 2;
+              while (cap < len + bytes.len()) { cap = cap * 2; }
+              u8[] grown = u8[].filled(cap, 0);
+              for (i32 i = 0; i < len; i++) { grown[i] = buf[i]; }
+              buf = grown;
+            }
+            for (i32 i = 0; i < bytes.len(); i++) { buf[len + i] = bytes[i]; }
+            len += bytes.len();
+            if (end < 0) {
+              end = headersEnd(buf, len);
+              if (end >= 0) {
+                req = parseHead(buf, end);
+                if (req is null) { done = true; }
+              }
+            }
+            if (req is not null && len - end >= req!.contentLength) { done = true; }
+          }
+        }
+      }
+    }
+  }
+  if (req is not null && len - end >= req!.contentLength) {
+    HttpRequest rq = req!;
+    u8[] body = u8[].filled(rq.contentLength, 0);
+    for (i32 i = 0; i < body.len(); i++) { body[i] = buf[end + i]; }
+    rq.body = body;
+    i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+    u8[] answer = await answerHttp(e, rq, secret, now, publicRpc);
+    // What the answer reports goes to the log first.
+    await flush(sys, e, disk);
+    await sock.send(answer);
+  }
+  w.done = true;
+  sock.close();
+  busy.n--;
+}

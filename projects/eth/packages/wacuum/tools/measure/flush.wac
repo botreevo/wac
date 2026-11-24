@@ -1,0 +1,122 @@
+// What `--flush-every` buys and costs, on a store `scale.wac` filled: runs of blocks — each 1000 cold account reads,
+// then 500 of them and 300 new slots of a contract written, the state root computed — committed with the overlay
+// flushed every N blocks, for each N asked. Per N: a block's time on average and at the median (stage and commit,
+// the flush included where it falls), the longest single block (the one that flushed), the overlay's size at a
+// flush, and the process's resident memory. A restart replays up to N blocks from the log: that cost is N times a
+// block's execution, which this does not measure (the soak and crash.wac print it).
+//
+//     wac --max-heap 4g run --allow-read --allow-write tools/measure/flush.wac -- PATH BLOCKS N [N…]
+//
+// PATH is a store scale.wac wrote (it reads the batch count from the store's last commit to know which accounts
+// exist). The runs go on writing it, so each N meets a store a little bigger than the one before.
+
+import { Sys } from "std";
+import { Map, Vec } from "core";
+import { U256 } from "../../src/u256.wac";
+import { AccountState, emptyCodeHash, hashU256, eqU256, slotMap } from "../../src/state/world.wac";
+import { Store } from "../../src/store/tree.wac";
+import { fileDisk } from "../../src/store/file.wac";
+import { StateDb, Staged } from "../../src/store/state.wac";
+
+/** As scale.wac makes them. */
+static i64 ACCOUNTS = 20000;
+static i64 CONTRACTS = 2;
+U256 account(i64 i) { return U256.ofU64(((i as! u64) * 0x9e3779b97f4a7c15) ^ 0x1234567); }
+U256 contract(i64 i) { return U256.ofU64(0x5000000000000 + (i as! u64)); }
+
+struct Rng {
+  u64 x;
+  u64 next(this) {
+    this.x ^= this.x << 13;
+    this.x ^= this.x >> 7;
+    this.x ^= this.x << 17;
+    return this.x;
+  }
+}
+
+i64 parse(string s) {
+  u8[] b = s.toBytes();
+  i64 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { n = n * 10 + ((b[i] - 48) as i64); }
+  return n;
+}
+
+async i64 rssMb(Sys sys) {
+  string s = string.fromBytes((await sys.readFile("/proc/self/status")).ok()!);
+  i32 at = s.indexOf("VmRSS:");
+  i64 n = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = at + 6; i < b.len() && b[i] != 107; i++) {
+    if (b[i] >= 48 && b[i] <= 57) { n = n * 10 + ((b[i] - 48) as i64); }
+  }
+  return n / 1024;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 3) {
+    sys.warn("usage: flush.wac PATH BLOCKS N [N…]");
+    return 2;
+  }
+  Store store = (await Store.open((await fileDisk(sys, a[0])).unwrap())).unwrap();
+  i32 blocks = parse(a[1]) as! i32;
+  i64 batch = 0;
+  u8[] user = store.committed().user;
+  if (user.len() == 8) {
+    for (i32 i = 0; i < 8; i++) { batch = (batch << 8) | (user[i] as i64); }
+  }
+  if (batch == 0) {
+    sys.warn("flush.wac: \{a[0]} is not a store scale.wac filled");
+    return 1;
+  }
+  Rng r = Rng(0x9e3779b97f4a7c15);
+  string[] why = [""];
+  sys.log("flush every | block ms: mean, median, longest | overlay at a flush MB | resident MB");
+  for (i32 k = 2; k < a.len(); k++) {
+    i32 every = parse(a[k]) as! i32;
+    StateDb db = StateDb.over(store);
+    db.flushEvery = every;
+    Vec<i64> ms = Vec.create();
+    i64 overlayMost = 0;
+    for (i32 b = 0; b < blocks; b++) {
+      i64 t0 = await sys.monotonicNanos();
+      U256[] touched = U256[].filled(501, U256.zero());
+      AccountState?[] after = AccountState?[].defaulted(501);
+      for (i32 i = 0; i < 1000; i++) {
+        U256 who = account((r.next() % ((batch * ACCOUNTS) as! u64)) as! i64);
+        db.account(who);
+        if (i < 500) {
+          touched[i] = who;
+          after[i] = AccountState(true, 2, U256.ofU64(r.next() & 0xffffff), u8[].filled(0, 0), emptyCodeHash());
+        }
+      }
+      U256 c = contract((r.next() % ((batch * CONTRACTS) as! u64)) as! i64);
+      touched[500] = c;
+      after[500] = AccountState(true, 1, U256.zero(), u8[].filled(0, 0), emptyCodeHash());
+      Map<U256, Map<U256, U256>> slots = Map.create(hashU256, eqU256);
+      Map<U256, U256> m = slotMap();
+      for (i32 i = 0; i < 300; i++) { m.set(U256.ofU64(r.next()), U256.ofU64(r.next() & 0xffff)); }
+      slots.set(c, m);
+      Staged? st = await db.stage(touched, after, slots, why);
+      if (st is null) {
+        sys.warn("block \{b}: \{why[0]}");
+        return 1;
+      }
+      i64 before = store.overlay.bytes;
+      string bad = await db.commitStaged(st!, user);
+      if (bad != "") {
+        sys.warn("block \{b}: \{bad}");
+        return 1;
+      }
+      // The overlay emptied: this block flushed, and what it held is the overlay's most.
+      if (store.overlay.bytes < before) { overlayMost = before > overlayMost ? before : overlayMost; }
+      ms.push((await sys.monotonicNanos() - t0) / 1000000);
+    }
+    await store.flush();
+    i64 total = 0;
+    for (i32 i = 0; i < ms.len(); i++) { total += ms.get(i); }
+    ms.sort((i64 x, i64 y) => x < y ? -1 : (x > y ? 1 : 0));
+    sys.log("\{every} | \{total / (blocks as i64)}, \{ms.get(ms.len() / 2)}, \{ms.get(ms.len() - 1)} | \{overlayMost / (1024 * 1024)} | \{await rssMb(sys)}");
+  }
+  return 0;
+}

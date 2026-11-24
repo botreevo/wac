@@ -1,0 +1,124 @@
+// Post-Altair headers against Ethereum's own `light_client_sync` vectors for Capella, Deneb, Electra and Fulu
+// (minimal config): every header a bootstrap or update carries is a real header with a real execution branch, and
+// each step's checks state its beacon root and its `execution_root`.
+//
+// Per header, this checks that
+//   - it is valid (`is_valid_light_client_header`: the payload header's root, proved into `body_root`);
+//   - its execution root is the one the vectors' checks state, wherever a check names its beacon root;
+//   - the Gloas-shaped proof of its execution block hash (`blockHashProof`, gindex 412 or 812) holds — the
+//     construction Gloas headers will use, checked here on real data before Gloas vectors exist;
+//   - one byte changed in the payload's state root, or in the branch, makes it invalid.
+
+import { wactest.T } from "wac";
+import { wactest.hex } from "wac";
+import { wactest.Loaded, wactest.json } from "wac";
+import { Sys } from "std";
+import { json.JsonValue, json.JsonArray, json.JsonObject } from "wac";
+import { codec.hexDecoded as decoded } from "wac";
+import { lightClientTypes, lightClientFields, forkNamed, FT_LIGHT_CLIENT_BOOTSTRAP, FT_LIGHT_CLIENT_UPDATE,
+         executionBlockHashGindex } from "../../../ssz/src/forks.wac";
+import { fieldBytes } from "../../../ssz/src/container.wac";
+import { isValidNormalizedMerkleBranch } from "../../../ssz/src/merkle.wac";
+import { isValidHeader, beaconRoot, executionRoot, executionBlockHash, executionStateRoot, blockHashProof,
+         headerBodyRoot } from "../../src/header.wac";
+
+static string MANIFEST = "packages/ssz/test/fixtures.json";
+
+u8[] un(string h) { return decoded(h.len() >= 2 && h.slice(0, 2) == "0x" ? h.slice(2, h.len()) : h); }
+
+bool allZero(u8[] b, i32 n) {
+  for (i32 i = 0; i < n && i < b.len(); i++) { if (b[i] != 0) { return false; } }
+  return true;
+}
+
+u8[] copyOf(u8[] a) {
+  u8[] out = u8[].filled(a.len(), 0);
+  out.copyFrom(a, 0, 0, a.len());
+  return out;
+}
+
+export string test_post_altair_headers_and_their_execution_branches(Sys sys) {
+  T t = T.create();
+  Loaded f = json(sys.stderr(), sys.files(), sys.procs(), "ssz", "light_client_sync_forks_minimal", MANIFEST);
+  t.isTrue(f.ok, f.error);
+  if (!f.ok) { return t.report(); }
+  JsonArray? cases = f.doc.member("cases")?.array();
+  if (cases is null) { t.fail("no cases"); return t.report(); }
+  i32 headers = 0;
+  i32 checked = 0;
+  for (i32 ci = 0; ci < cases!.len(); ci++) {
+    JsonValue c = cases!.get(ci);
+    string forkText = c.member("fork")?.text() ?? "";
+    i32 fork = forkNamed(forkText);
+    i32[] ty = lightClientTypes(fork, 32);
+    i32[] fs = lightClientFields(fork);
+    // Every header in the case: the bootstrap's, then each update's attested and finalized headers.
+    u8[][] hs = [fieldBytes(ty, fs, FT_LIGHT_CLIENT_BOOTSTRAP(), un(c.member("bootstrap")?.text() ?? ""), 0)];
+    JsonArray? steps = c.member("steps")?.array();
+    JsonObject? updates = c.member("updates")?.object();
+    if (steps is null || updates is null) { t.fail("\{forkText}: no steps or updates"); continue; }
+    for (i32 si = 0; si < steps!.len(); si++) {
+      string name = steps!.get(si).member("update")?.text() ?? "";
+      if (name == "") { continue; }
+      u8[] u = un(updates!.getStr(name)?.text() ?? "");
+      hs = plus(plus(hs, fieldBytes(ty, fs, FT_LIGHT_CLIENT_UPDATE(), u, 0)), fieldBytes(ty, fs, FT_LIGHT_CLIENT_UPDATE(), u, 3));
+    }
+    string[] roots = string[]();
+    string[] execs = string[]();
+    for (i32 h = 0; h < hs.len(); h++) {
+      u8[] header = hs[h];
+      if (header.len() < 112 || allZero(header, 112)) { continue; }            // no finalized header in this update
+      headers++;
+      string where = "\{forkText} header \{h}";
+      t.isTrue(isValidHeader(fork, header), "\{where}: valid");
+      u8[]? hash = executionBlockHash(fork, header);
+      u8[]? proof = blockHashProof(fork, header);
+      u8[]? body = headerBodyRoot(fork, header);
+      t.isTrue(hash is not null && proof is not null && body is not null
+               && isValidNormalizedMerkleBranch(hash!, proof!, executionBlockHashGindex(fork), body!),
+               "\{where}: the block hash proves at gindex \{executionBlockHashGindex(fork)}");
+      t.isTrue(executionStateRoot(fork, header) is not null, "\{where}: a state root");
+      roots = more(roots, hex(beaconRoot(fork, header) ?? u8[]()));
+      execs = more(execs, hex(executionRoot(fork, header) ?? u8[]()));
+      // The payload header starts after the beacon header (112) and the offset (4): parent_hash 32, fee_recipient
+      // 20, then state_root. One byte of it changed must break the branch.
+      u8[] bent = copyOf(header);
+      bent[116 + 52] = bent[116 + 52] ^ (1 as u8);
+      t.isFalse(isValidHeader(fork, bent), "\{where}: a changed state root is refused");
+      u8[] bentBranch = copyOf(header);
+      bentBranch[bentBranch.len() - 1] = bentBranch[bentBranch.len() - 1] ^ (1 as u8);
+      t.isFalse(isValidHeader(fork, bentBranch), "\{where}: a changed branch node is refused");
+    }
+    // Each check that names a beacon root this case carries must state that header's execution root.
+    for (i32 si = 0; si < steps!.len(); si++) {
+      JsonValue? checks = steps!.get(si).member("checks");
+      if (checks is null) { continue; }
+      string[] which = ["finalized_header", "optimistic_header"];
+      for (i32 w = 0; w < 2; w++) {
+        JsonValue? hc = checks!.member(which[w]);
+        if (hc is null) { continue; }
+        string br = (hc!.member("beacon_root")?.text() ?? "").slice(2, 66);
+        string er = (hc!.member("execution_root")?.text() ?? "").slice(2, 66);
+        for (i32 k = 0; k < roots.len(); k++) {
+          if (roots[k] == br) { t.eqStr(execs[k], er, "\{forkText} step \{si} \{which[w]}"); checked++; break; }
+        }
+      }
+    }
+  }
+  t.isTrue(headers >= 60, "headers seen: \{headers}");
+  t.isTrue(checked >= 80, "execution roots checked: \{checked}");
+  return t.report();
+}
+
+u8[][] plus(u8[][] xs, u8[] x) {
+  u8[][] out = u8[][].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+string[] more(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}

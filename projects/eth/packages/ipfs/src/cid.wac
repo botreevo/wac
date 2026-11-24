@@ -1,0 +1,132 @@
+// CIDs: version 1 only, SHA-256 only, three codecs (raw, dag-pb, dag-cbor). That is the whole of what the
+// `unixfs-v1-2025` profile (IPIP-0499) and DAG-CBOR records produce, so anything else is refused on reading rather
+// than half-supported. The text form is multibase base32: `b` and lower-case RFC 4648 base32 without padding.
+//
+//     binary  = varint(1) ‖ varint(codec) ‖ varint(0x12) ‖ varint(32) ‖ sha256(block)
+
+import { crypto.sha256 } from "wac";
+import { Result } from "core";
+import { Out, In, same } from "./bytes.wac";
+
+// Functions rather than `static`s: re-exported through wac-eth's lib.wac, static constants broke wac test's
+// aggregated module (packages/reckon/docs/wacc-cases).
+export i64 RAW() { return 0x55 as i64; }
+export i64 DAG_PB() { return 0x70 as i64; }
+export i64 DAG_CBOR() { return 0x71 as i64; }
+static i64 SHA2_256 = 0x12;
+
+export struct Cid {
+  i64 codec = 0 as i64;
+  u8[] digest;
+
+  /** The CID of `block` stored under `codec`. */
+  Cid of(i64 codec, u8[] block) { return Cid(codec, sha256(block)); }
+
+  u8[] bytes(const this) {
+    Out o = Out.create();
+    o.varint(1 as i64);
+    o.varint(this.codec);
+    o.varint(SHA2_256);
+    o.varint(32 as i64);
+    o.all(this.digest);
+    return o.bytes();
+  }
+
+  string text(const this) { return "b" + base32(this.bytes()); }
+
+  bool eq(const this, const Cid other) { return this.codec == other.codec && same(this.digest, other.digest); }
+
+  /** Whether `block` is what this CID names: the codec is the caller's to know, the hash is checked here. */
+  bool names(const this, u8[] block) { return same(sha256(block), this.digest); }
+}
+
+/** A CID read from binary at the reader's position. */
+export Result<Cid, string> readCid(In r) {
+  i64 version = r.varint();
+  if (r.bad != "") { return Result.Err(r.bad); }
+  if (version != (1 as i64)) { return Result.Err("a CID of version \{version}: only CIDv1 is accepted"); }
+  i64 codec = r.varint();
+  i64 hash = r.varint();
+  i64 len = r.varint();
+  if (r.bad != "") { return Result.Err(r.bad); }
+  if (codec != RAW() && codec != DAG_PB() && codec != DAG_CBOR()) { return Result.Err("a CID with codec 0x\{hexOf(codec)}"); }
+  if (hash != SHA2_256 || len != (32 as i64)) { return Result.Err("a CID whose hash is not sha2-256"); }
+  u8[] d = r.take(32);
+  if (r.bad != "") { return Result.Err(r.bad); }
+  return Result.Ok(Cid(codec, d));
+}
+
+export Result<Cid, string> cidFromBytes(u8[] b) {
+  In r = In.of(b);
+  Cid c = try readCid(r);
+  if (!r.done()) { return Result.Err("bytes after the end of a CID"); }
+  return Result.Ok(c);
+}
+
+export Result<Cid, string> parseCid(string text) {
+  if (text.len() < 2 || text.slice(0, 1) != "b") { return Result.Err("a CID in text is multibase base32, starting with b"); }
+  u8[]? b = unbase32(text.slice(1, text.len()));
+  if (b is null) { return Result.Err("not base32: \{text}"); }
+  return cidFromBytes(b!);
+}
+
+string hexOf(i64 v) {
+  string digits = "0123456789abcdef";
+  string out = "";
+  i64 x = v;
+  if (x == (0 as i64)) { return "0"; }
+  while (x > (0 as i64)) {
+    i32 d = (x & (15 as i64)) as! i32;
+    out = digits.slice(d, d + 1) + out;
+    x = x >>> (4 as i64);
+  }
+  return out;
+}
+
+static string ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
+/** RFC 4648 base32, lower case, no padding. */
+export string base32(const u8[] b) {
+  string out = "";
+  i32 buffer = 0;
+  i32 bits = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    buffer = (buffer << 8) | (b[i] as i32);
+    bits += 8;
+    while (bits >= 5) {
+      i32 idx = (buffer >> (bits - 5)) & 31;
+      out += ALPHABET.slice(idx, idx + 1);
+      bits -= 5;
+    }
+    buffer = buffer & ((1 << bits) - 1);
+  }
+  if (bits > 0) {
+    i32 idx = (buffer << (5 - bits)) & 31;
+    out += ALPHABET.slice(idx, idx + 1);
+  }
+  return out;
+}
+
+/** The inverse; null for a character outside the alphabet or trailing bits that are not zero. */
+export u8[]? unbase32(string s) {
+  Out o = Out.create();
+  i32 buffer = 0;
+  i32 bits = 0;
+  u8[] t = s.toBytes();
+  for (i32 i = 0; i < t.len(); i++) {
+    u8 c = t[i];
+    i32 v = -1;
+    if (c >= 'a' && c <= 'z') { v = (c - 'a') as i32; }
+    else if (c >= '2' && c <= '7') { v = (c - '2') as i32 + 26; }
+    if (v < 0) { return null; }
+    buffer = (buffer << 5) | v;
+    bits += 5;
+    if (bits >= 8) {
+      o.byte(((buffer >> (bits - 8)) & 255) as@ u8);
+      bits -= 8;
+      buffer = buffer & ((1 << bits) - 1);
+    }
+  }
+  if (buffer != 0) { return null; }
+  return o.bytes();
+}

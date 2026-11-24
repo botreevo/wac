@@ -1,0 +1,233 @@
+// A chain's first block from a `genesis.json` in geth's format — the one devnets and testnets publish:
+// a `config` naming the chain and its fork times, an `alloc` of accounts, and the genesis header's own
+// fields. The state root is computed from the alloc, and the header's hash is what every later block
+// chains back to, so getting any field wrong here shows as the consensus client's first payload being
+// refused for an unknown parent.
+
+import { crypto.sha256 } from "wac";
+import { json.JsonValue, json.JsonObject } from "wac";
+import { U256 } from "../u256.wac";
+import { hexToBytes } from "../hex.wac";
+import { World, Account } from "../state/world.wac";
+import { stateRoot } from "../state/root.wac";
+import { emptyRoot } from "../trie/trie.wac";
+import { Vec } from "core";
+import { Spec, ChainConfig, ForkAt, withBlobs } from "../evm/spec.wac";
+import { Header, EMPTY_OMMERS } from "./block.wac";
+import { rlp.Item, rlp.encode } from "@/lib.wac";
+import { keccak256 } from "../crypto/keccak.wac";
+import { addressBytes } from "../evm/evm.wac";
+import { u256Bytes } from "../state/root.wac";
+
+export struct Genesis {
+  ChainConfig config;
+  /** The fork the genesis block itself is under, which decides its header's shape. */
+  Spec spec;
+  Header header;
+  World world;
+  /**
+   * Every fork the config schedules after the genesis, by block number and then by time, each ascending
+   * without repeats: what EIP-2124's fork id is computed from, which a peer checks before it will talk.
+   */
+  u64[] forkBlocks;
+  u64[] forkTimes;
+  /**
+   * The genesis is before Cancun, the first fork wacuum runs (mainnet's is Frontier's): its blocks up to Cancun are
+   * never run here, so this node starts from a state snap-synced past Cancun, and only checks headers below it.
+   */
+  bool beforeRun;
+}
+
+/** The config's fork fields, in geth's order: the block-numbered ones, then the timed ones. */
+static string[] BLOCK_FORKS = ["homesteadBlock", "daoForkBlock", "eip150Block", "eip155Block", "eip158Block", "byzantiumBlock",
+                               "constantinopleBlock", "petersburgBlock", "istanbulBlock", "muirGlacierBlock", "berlinBlock",
+                               "londonBlock", "arrowGlacierBlock", "grayGlacierBlock", "mergeNetsplitBlock"];
+// Amsterdam (Glamsterdam) is in the list though wacuum does not run it: a fork a network schedules is in its fork id
+// from the day it is scheduled (Sepolia's, at 1791294816, from geth 1.17.10), and a node without it is refused.
+static string[] TIME_FORKS = ["shanghaiTime", "cancunTime", "pragueTime", "osakaTime", "bpo1Time", "bpo2Time", "bpo3Time",
+                              "bpo4Time", "bpo5Time", "amsterdamTime"];
+
+/** The values of `keys` in `config` above `after`, ascending and without repeats. */
+u64[] forkPoints(JsonValue config, const string[] keys, u64 after) {
+  Vec<u64> out = Vec.create();
+  for (i32 i = 0; i < keys.len(); i++) {
+    JsonValue? v = config.member(keys[i]);
+    if (v is null || v!.isNull()) { continue; }
+    u64 n = field(config, keys[i], U256.zero()).low();
+    if (n <= after) { continue; }
+    bool seen = false;
+    for (i32 k = 0; k < out.len(); k++) { seen = seen || out.get(k) == n; }
+    if (!seen) { out.push(n); }
+  }
+  u64[] a = out.toArray();
+  for (i32 i = 1; i < a.len(); i++) {
+    u64 v = a[i];
+    i32 j = i - 1;
+    while (j >= 0 && a[j] > v) {
+      a[j + 1] = a[j];
+      j--;
+    }
+    a[j + 1] = v;
+  }
+  return a;
+}
+
+/** A number written in hex with `0x`, or in decimal, as geth accepts both. Null for anything else. */
+export U256? quantity(string s) {
+  if (s.len() >= 2 && s.slice(0, 2) == "0x") { return s.len() == 2 ? U256.zero() : U256.fromHex(s); }
+  if (s.len() == 0) { return null; }
+  U256 v = U256.zero();
+  U256 ten = U256.ofU64(10);
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < 48 || b[i] > 57) { return null; }
+    v = v.mul(ten).add(U256.ofU64((b[i] - 48) as u64));
+  }
+  return v;
+}
+
+U256 field(JsonValue o, string key, U256 dflt) {
+  JsonValue? v = o.member(key);
+  if (v is null || v!.isNull()) { return dflt; }
+  string? s = v!.text();
+  if (s is not null) { return quantity(s!) ?? dflt; }
+  f64? n = v!.number();
+  return n is null ? dflt : U256.ofU64(n!.trunc() as~ u64);
+}
+
+u8[] data(JsonValue o, string key) {
+  JsonValue? v = o.member(key);
+  if (v is null || v!.text() is null) { return u8[].filled(0, 0); }
+  return hexToBytes(v!.text()!) ?? u8[].filled(0, 0);
+}
+
+/** The genesis described by `g`, or null with `why[0]` saying what is wrong. */
+export Genesis? genesisFrom(JsonValue g, string[] why) {
+  JsonValue? config = g.member("config");
+  if (config is null) {
+    why[0] = "no config";
+    return null;
+  }
+  U256 chainId = field(config!, "chainId", U256.one());
+  U256 timestamp = field(g, "timestamp", U256.zero());
+  // Each fork from Cancun on, at the time the config gives it; a fork with no time is not scheduled.
+  string[] names = ["Cancun", "Prague", "Osaka", "BPO1", "BPO2", "BPO3", "BPO4", "BPO5"];
+  string[] keys = ["cancunTime", "pragueTime", "osakaTime", "bpo1Time", "bpo2Time", "bpo3Time", "bpo4Time", "bpo5Time"];
+  string[] schedule = ["cancun", "prague", "osaka", "bpo1", "bpo2", "bpo3", "bpo4", "bpo5"];
+  Vec<ForkAt> forks = Vec.create();
+  for (i32 i = 0; i < names.len(); i++) {
+    JsonValue? t = config!.member(keys[i]);
+    if (t is null || t!.isNull()) { continue; }
+    Spec s = Spec.byName(names[i])!;
+    JsonValue? b = config!.member("blobSchedule")?.member(schedule[i]);
+    if (b is not null) {
+      s = withBlobs(s, names[i], field(b!, "target", U256.zero()).low(), field(b!, "max", U256.zero()).low(),
+                    field(b!, "baseFeeUpdateFraction", U256.zero()).low());
+    }
+    forks.push(ForkAt(s, field(config!, keys[i], U256.zero())));
+  }
+  if (forks.len() == 0) {
+    why[0] = "the config schedules none of Cancun, Prague and Osaka";
+    return null;
+  }
+  ChainConfig chain = ChainConfig(chainId, forks.toArray());
+  // A genesis before Cancun (mainnet's, Sepolia's) is taken for its hash and its fork schedule — what peers and the
+  // chain's first header check — and its blocks before Cancun are never run (`beforeRun`).
+  bool beforeRun = chain.forks[0].time.gt(timestamp);
+  Spec spec = chain.specAt(timestamp);
+
+  World w = World.create();
+  JsonValue? alloc = g.member("alloc");
+  JsonObject accounts = alloc?.object() ?? JsonObject.create();
+  for (i32 i = 0; i < accounts.len(); i++) {
+    string key = accounts.at(i).keyStr();
+    U256? addr = U256.fromHex(key);
+    if (addr is null) {
+      why[0] = "alloc address \{key} is not hex";
+      return null;
+    }
+    JsonValue a = accounts.at(i).value;
+    Account acct = w.touch(addr!);
+    acct.nonce = field(a, "nonce", U256.zero()).low();
+    acct.balance = field(a, "balance", U256.zero());
+    JsonObject st = a.member("storage")?.object() ?? JsonObject.create();
+    for (i32 k = 0; k < st.len(); k++) {
+      U256 v = U256.fromHex(st.at(k).value.text() ?? "0x0") ?? U256.zero();
+      if (!v.isZero()) { acct.storage.set(U256.fromHex(st.at(k).keyStr()) ?? U256.zero(), v); }
+    }
+    w.setCode(addr!, data(a, "code"));
+  }
+  w.endTransaction();
+
+  U256 empty = U256.fromBytes(emptyRoot(), 0, 32);
+  u8[] nonce = data(g, "nonce");
+  u8[] nonce8 = u8[].filled(8, 0);
+  for (i32 i = 0; i < nonce.len() && i < 8; i++) { nonce8[8 - nonce.len() + i] = nonce[i]; }
+  Header h = Header(field(g, "parentHash", U256.zero()), U256.fromHex(EMPTY_OMMERS)!, field(g, "coinbase", U256.zero()),
+                    U256.fromBytes(stateRoot(w), 0, 32), empty, empty, u8[].filled(256, 0), field(g, "difficulty", U256.zero()),
+                    field(g, "number", U256.zero()), field(g, "gasLimit", U256.ofU64(5000)), field(g, "gasUsed", U256.zero()),
+                    timestamp, data(g, "extraData"), field(g, "mixHash", U256.zero()), nonce8,
+                    field(g, "baseFeePerGas", U256.ofU64(1000000000)), empty, field(g, "blobGasUsed", U256.zero()),
+                    field(g, "excessBlobGas", U256.zero()), U256.zero(),
+                    // EIP-7685's hash of no requests at all: sha256 of nothing.
+                    U256.fromBytes(sha256(u8[].filled(0, 0)), 0, 32),
+                    // EIP-7928's hash of an empty block access list: keccak256 of the empty list's RLP.
+                    U256.fromHex(EMPTY_OMMERS)!, U256.zero(), U256.zero());
+  h.hash = U256.fromBytes(keccak256(encode(genesisItem(config!, h))), 0, 32);
+  return Genesis(chain, spec, h, w, forkPoints(config!, BLOCK_FORKS, 0), forkPoints(config!, TIME_FORKS, timestamp.low()), beforeRun);
+}
+
+/** Whether a fork the config names is in force at the genesis: at block 0, or at a time at or before the genesis's. */
+bool atGenesis(JsonValue config, string key, U256 timestamp) {
+  JsonValue? v = config.member(key);
+  if (v is null || v!.isNull()) { return false; }
+  return field(config, key, U256.zero()).le(timestamp);
+}
+
+/**
+ * The genesis header as its forks shape it — the fields each fork in force at block 0 adds, and no others:
+ * London the base fee, Shanghai the withdrawals root, Cancun the blob gas fields and the parent beacon root, Prague the
+ * requests hash. Mainnet's genesis has none of them: fifteen fields, as Frontier's.
+ */
+Item genesisItem(JsonValue config, Header h) {
+  bool london = atGenesis(config, "londonBlock", U256.zero());
+  bool shanghai = atGenesis(config, "shanghaiTime", h.timestamp);
+  bool cancun = atGenesis(config, "cancunTime", h.timestamp);
+  bool prague = atGenesis(config, "pragueTime", h.timestamp);
+  bool amsterdam = atGenesis(config, "amsterdamTime", h.timestamp);
+  prague = prague || amsterdam;
+  // A later fork at genesis means every earlier one too, whether the config names it or not (wacuum's own devnet
+  // configs name only Cancun and after).
+  cancun = cancun || prague;
+  shanghai = shanghai || cancun;
+  london = london || shanghai;
+  Vec<Item> f = Vec.create();
+  f.push(Item.Bytes(h.parentHash.toBytes()));
+  f.push(Item.Bytes(h.ommersHash.toBytes()));
+  f.push(Item.Bytes(addressBytes(h.coinbase)));
+  f.push(Item.Bytes(h.stateRoot.toBytes()));
+  f.push(Item.Bytes(h.txRoot.toBytes()));
+  f.push(Item.Bytes(h.receiptsRoot.toBytes()));
+  f.push(Item.Bytes(h.bloom));
+  f.push(Item.Bytes(u256Bytes(h.difficulty)));
+  f.push(Item.Bytes(u256Bytes(h.number)));
+  f.push(Item.Bytes(u256Bytes(h.gasLimit)));
+  f.push(Item.Bytes(u256Bytes(h.gasUsed)));
+  f.push(Item.Bytes(u256Bytes(h.timestamp)));
+  f.push(Item.Bytes(h.extraData));
+  f.push(Item.Bytes(h.prevRandao.toBytes()));
+  f.push(Item.Bytes(h.nonce));
+  if (london) { f.push(Item.Bytes(u256Bytes(h.baseFee))); }
+  if (shanghai) { f.push(Item.Bytes(h.withdrawalsRoot.toBytes())); }
+  if (cancun) {
+    f.push(Item.Bytes(u256Bytes(h.blobGasUsed)));
+    f.push(Item.Bytes(u256Bytes(h.excessBlobGas)));
+    f.push(Item.Bytes(h.parentBeaconBlockRoot.toBytes()));
+  }
+  if (prague) { f.push(Item.Bytes(h.requestsHash.toBytes())); }
+  if (amsterdam) {
+    f.push(Item.Bytes(h.blockAccessListHash.toBytes()));
+    f.push(Item.Bytes(u256Bytes(h.slotNumber)));
+  }
+  return Item.List(f.toArray());
+}

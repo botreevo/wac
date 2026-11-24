@@ -1,0 +1,156 @@
+// A beacon block (the JSON `/eth/v2/beacon/blocks/{id}` answers, Deneb to Fulu) as the `engine_newPayloadV4` call a
+// consensus client makes for it: the execution payload with its fields renamed and its numbers in hex, the blob
+// versioned hashes derived from the block's KZG commitments, the parent beacon block root, and the execution requests
+// as their typed SSZ lists.
+//
+// Nothing here is believed for its own sake. The driver sends a payload only when its block hash is one the light
+// client proved, or the parent hash of one it sent; and the execution client derives that hash from every field here —
+// the payload's, the parent beacon root's and the requests' — and checks the versioned hashes against the
+// transactions'. So a beacon node that changed anything would make the execution client refuse the block, never
+// accept a different one.
+
+import { json.JsonValue, json.JsonArray, json.JsonObject, json.stringify } from "wac";
+import { crypto.sha256 } from "wac";
+import { U256 } from "../u256.wac";
+import { hexToBytes, bytesToHex } from "../hex.wac";
+
+export struct Payload {
+  /** The four parameters of `engine_newPayloadV4`, as JSON text. */
+  string params;
+  U256 blockHash;
+  U256 parentHash;
+  u64 number;
+  /** The beacon block's parent's root, where to look for this payload's parent. */
+  string parentRoot;
+  i32 txs;
+  i32 blobs;
+}
+
+/** A decimal string as a JSON-RPC quantity: 0x and hex digits, no leading zeros. Null if not decimal. */
+export string? quantity(string dec) {
+  if (dec == "") { return null; }
+  U256 v = U256.zero();
+  U256 ten = U256.ofU64(10);
+  u8[] d = dec.toBytes();
+  for (i32 i = 0; i < d.len(); i++) {
+    if (d[i] < 48 || d[i] > 57) { return null; }
+    v = v.mul(ten).add(U256.ofU64((d[i] - 48) as u64));
+  }
+  return v.toHex();
+}
+
+u64 decimal(string dec) {
+  u64 n = 0;
+  u8[] d = dec.toBytes();
+  for (i32 i = 0; i < d.len(); i++) { n = n * 10 + ((d[i] - 48) as u64); }
+  return n;
+}
+
+JsonValue str(string s) { return JsonValue.Str(s.toBytes()); }
+
+/** Why the conversion failed, or "" — kept beside the result so a caller can name the block. */
+export struct Converted {
+  Payload? payload;
+  string why;
+}
+
+/** `data` of a block answer: `{message: {parent_root, body: {execution_payload, blob_kzg_commitments, execution_requests}}}`. */
+export Converted payloadOf(JsonValue data) {
+  JsonValue? msg = data.member("message");
+  JsonValue? body = msg?.member("body");
+  JsonValue? ep = body?.member("execution_payload");
+  if (msg is null || body is null || ep is null) { return Converted(null, "no execution payload in the block"); }
+  JsonValue e = ep!;
+  JsonObject o = JsonObject.create();
+  // Data fields pass through as they are (0x-hex in both APIs); numbers go from decimal strings to hex quantities.
+  string[] data_ = ["parent_hash", "parentHash", "fee_recipient", "feeRecipient", "state_root", "stateRoot",
+                    "receipts_root", "receiptsRoot", "logs_bloom", "logsBloom", "prev_randao", "prevRandao",
+                    "extra_data", "extraData", "block_hash", "blockHash"];
+  string[] nums = ["block_number", "blockNumber", "gas_limit", "gasLimit", "gas_used", "gasUsed", "timestamp", "timestamp",
+                   "base_fee_per_gas", "baseFeePerGas", "blob_gas_used", "blobGasUsed", "excess_blob_gas", "excessBlobGas"];
+  for (i32 i = 0; i < data_.len(); i += 2) {
+    string? v = e.member(data_[i])?.text();
+    if (v is null) { return Converted(null, "the payload has no \{data_[i]}"); }
+    o.push(data_[i + 1].toBytes(), str(v!));
+  }
+  for (i32 i = 0; i < nums.len(); i += 2) {
+    string? q = quantity(e.member(nums[i])?.text() ?? "");
+    if (q is null) { return Converted(null, "the payload's \{nums[i]} is not a number"); }
+    o.push(nums[i + 1].toBytes(), str(q!));
+  }
+  JsonArray txs = e.member("transactions")?.array() ?? JsonArray.create();
+  o.push("transactions".toBytes(), JsonValue.Array(txs));
+  JsonArray ws = JsonArray.create();
+  JsonArray inWs = e.member("withdrawals")?.array() ?? JsonArray.create();
+  for (i32 i = 0; i < inWs.len(); i++) {
+    JsonValue w = inWs.get(i);
+    JsonObject wo = JsonObject.create();
+    wo.push("index".toBytes(), str(quantity(w.member("index")?.text() ?? "") ?? "0x0"));
+    wo.push("validatorIndex".toBytes(), str(quantity(w.member("validator_index")?.text() ?? "") ?? "0x0"));
+    wo.push("address".toBytes(), str(w.member("address")?.text() ?? ""));
+    wo.push("amount".toBytes(), str(quantity(w.member("amount")?.text() ?? "") ?? "0x0"));
+    ws.push(JsonValue.Object(wo));
+  }
+  o.push("withdrawals".toBytes(), JsonValue.Array(ws));
+
+  // EIP-4844: a commitment's versioned hash is 0x01 and the last 31 bytes of its sha256.
+  JsonArray hashes = JsonArray.create();
+  JsonArray cs = body!.member("blob_kzg_commitments")?.array() ?? JsonArray.create();
+  for (i32 i = 0; i < cs.len(); i++) {
+    u8[]? c = hexToBytes(cs.get(i).text() ?? "x");
+    if (c is null || c!.len() != 48) { return Converted(null, "KZG commitment \{i} is not 48 bytes"); }
+    u8[] h = sha256(c!);
+    h[0] = 1;
+    hashes.push(str(bytesToHex(h)));
+  }
+
+  string? requests = requestsOf(body!.member("execution_requests"));
+  if (requests is null) { return Converted(null, "the execution requests do not encode"); }
+  string parentRoot = msg!.member("parent_root")?.text() ?? "";
+  string params = "[" + string.fromBytes(stringify(JsonValue.Object(o))) + "," + string.fromBytes(stringify(JsonValue.Array(hashes))) + ",\"" +
+                  parentRoot + "\"," + requests! + "]";
+  U256 hash = U256.fromHex(e.member("block_hash")?.text() ?? "") ?? U256.zero();
+  U256 parent = U256.fromHex(e.member("parent_hash")?.text() ?? "") ?? U256.zero();
+  return Converted(Payload(params, hash, parent, decimal(e.member("block_number")?.text() ?? "0"), parentRoot, txs.len(), cs.len()), "");
+}
+
+/**
+ * EIP-7685's requests as `engine_newPayloadV4` takes them: for each type with any (deposits 0, withdrawals 1,
+ * consolidations 2), its type byte and then the SSZ of its list — fixed-size containers, so their fields end to end.
+ */
+export string? requestsOf(JsonValue? er) {
+  if (er is null || er!.isNull()) { return "[]"; }
+  JsonArray out = JsonArray.create();
+  // Each type's field names, and their sizes in bytes (0 for a uint64, written little-endian).
+  string[] lists = ["deposits", "withdrawals", "consolidations"];
+  string[][] fields = [["pubkey", "withdrawal_credentials", "amount", "signature", "index"],
+                       ["source_address", "validator_pubkey", "amount"],
+                       ["source_address", "source_pubkey", "target_pubkey"]];
+  i32[][] sizes = [[48, 32, 0, 96, 0], [20, 48, 0], [20, 48, 48]];
+  for (i32 t = 0; t < 3; t++) {
+    JsonArray items = er!.member(lists[t])?.array() ?? JsonArray.create();
+    if (items.len() == 0) { continue; }
+    u8[] bytes = [t as@ u8];
+    for (i32 i = 0; i < items.len(); i++) {
+      for (i32 f = 0; f < fields[t].len(); f++) {
+        string v = items.get(i).member(fields[t][f])?.text() ?? "";
+        u8[] part;
+        if (sizes[t][f] == 0) {
+          u64 n = decimal(v);
+          part = u8[].filled(8, 0);
+          for (i32 k = 0; k < 8; k++) { part[k] = ((n >> (8 * k)) & 255) as! u8; }
+        } else {
+          u8[]? b = hexToBytes(v);
+          if (b is null || b!.len() != sizes[t][f]) { return null; }
+          part = b!;
+        }
+        u8[] grown = u8[].filled(bytes.len() + part.len(), 0);
+        grown.copyFrom(bytes, 0, 0, bytes.len());
+        grown.copyFrom(part, 0, bytes.len(), part.len());
+        bytes = grown;
+      }
+    }
+    out.push(str(bytesToHex(bytes)));
+  }
+  return string.fromBytes(stringify(JsonValue.Array(out)));
+}

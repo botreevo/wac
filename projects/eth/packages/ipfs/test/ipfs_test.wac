@@ -1,0 +1,195 @@
+// The codecs and UnixFS against the reference JavaScript implementations: tools/oracle/vectors.mjs wrote
+// test/vectors.json and test/tree1.car with multiformats, @ipld/dag-cbor, @ipld/car and ipfs-unixfs-importer under
+// IPIP-0499's `unixfs-v1-2025` profile. File contents are regenerated here from sizes and seeds by the same xorshift32.
+
+import { Result } from "core";
+import { json.parse, json.JsonValue, codec.hexEncode, codec.hexDecoded } from "wac";
+import { VECTORS, TREE1_CAR } from "./vectors.wac";
+import { Cid, RAW, DAG_PB, DAG_CBOR, parseCid, base32, unbase32 } from "../src/cid.wac";
+import { Params, Built, Block, buildFile, Node, readNode } from "../src/unixfs.wac";
+import { FileIn, buildTree } from "../src/tree.wac";
+import { Value, encode, decode } from "../src/dagcbor.wac";
+import { Car, readCar, writeCar } from "../src/car.wac";
+import { Check } from "./check.wac";
+
+u8[] content(i32 n, i64 seed) {
+  u8[] b = u8[].filled(n, 0);
+  u32 s = (seed & (0xffffffff as i64)) as@ u32;
+  if (s == 0) { s = 1; }
+  for (i32 i = 0; i < n; i++) {
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    b[i] = (s & 255) as@ u8;
+  }
+  return b;
+}
+
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+i32 num(JsonValue v, string k) { return (v.member(k)?.number() ?? 0.0) as~ i32; }
+string str(JsonValue v, string k) { return v.member(k)?.text() ?? ""; }
+
+JsonValue vectors() { return parse(VECTORS.toBytes()).ok()!; }
+
+export string test_cids_and_base32_agree_with_multiformats() {
+  Check c = Check.create();
+  JsonValue v = vectors();
+  for (i32 i = 0; i < v.member("cids")!.array()!.len(); i++) {
+    JsonValue e = v.member("cids")!.array()!.get(i);
+    Cid cid = Cid.of(RAW(), content(num(e, "size"), num(e, "seed") as i64));
+    c.eq(cid.text(), str(e, "text"), "text of a raw block of \{num(e, "size")} bytes");
+    c.eq(hex(cid.bytes()), str(e, "bytes"), "binary");
+    c.ok(parseCid(str(e, "text")).ok()?.eq(cid) ?? false, "parsed back");
+  }
+  u8[] r = content(37, 99 as i64);
+  c.eq(hex(unbase32(base32(r))!), hex(r), "base32 round trip");
+  c.ok(parseCid("bafkreiZ").isErr(), "upper case refused");
+  c.ok(parseCid("Qmf412jQZiuVUtdgnB36FXFX7xg5V6KEbSJ4dpQuhkLyfD").isErr(), "CIDv0 refused");
+  return c.report();
+}
+
+export string test_files_agree_with_the_reference_importer() {
+  Check c = Check.create();
+  JsonValue v = vectors();
+  JsonValue fs = v.member("files")!;
+  for (i32 i = 0; i < fs.array()!.len(); i++) {
+    JsonValue e = fs.array()!.get(i);
+    u8[] bytes = str(e, "text") != "" ? str(e, "text").toBytes() : content(num(e, "size"), num(e, "seed") as i64);
+    Built b = buildFile(bytes, Params(num(e, "chunk"), num(e, "width"), 262144));
+    c.eq(b.root.text(), str(e, "cid"), "file of \{num(e, "size")} bytes, chunk \{num(e, "chunk")}, width \{num(e, "width")}");
+  }
+  return c.report();
+}
+
+FileIn[] filesOf(JsonValue list) {
+  i32 n = list.array()!.len();
+  FileIn[] out = FileIn[].filled(n, FileIn("", u8[]()));
+  for (i32 i = 0; i < n; i++) {
+    JsonValue f = list.array()!.get(i);
+    out[i] = FileIn(str(f, "path"), content(num(f, "size"), num(f, "seed") as i64));
+  }
+  return out;
+}
+
+string[] dirsOf(JsonValue? list) {
+  if (list is null || list!.array() is null) { return string[](); }
+  string[] out = string[].defaulted(list!.array()!.len());
+  for (i32 i = 0; i < out.len(); i++) { out[i] = list!.array()!.get(i).text() ?? ""; }
+  return out;
+}
+
+export string test_trees_agree_with_the_reference_importer() {
+  Check c = Check.create();
+  JsonValue v = vectors();
+  for (i32 i = 0; i < v.member("trees")!.array()!.len(); i++) {
+    JsonValue t = v.member("trees")!.array()!.get(i);
+    match (buildTree(filesOf(t.member("files")!), dirsOf(t.member("dirs")), Params(num(t, "chunk"), num(t, "width"), num(t, "shard")))) {
+      Err(e): { c.fail("tree \{i}: \{e}"); }
+      Ok(b): { c.eq(b.root.text(), str(t, "cid"), "tree \{i}"); }
+    }
+  }
+  return c.report();
+}
+
+export string test_the_sharding_boundary_is_where_the_profile_puts_it() {
+  Check c = Check.create();
+  JsonValue v = vectors();
+  JsonValue p = v.member("shardProbe")!;
+  FileIn[] files = filesOf(v.member("trees")!.array()!.get(1).member("files")!);
+  i32 size = num(p, "size");
+  match (buildTree(files, string[](), Params(1048576, 1024, size))) {
+    Err(e): { c.fail("at exactly the threshold it must stay a plain directory: \{e}"); }
+    Ok(b): { c.eq(b.root.text(), str(p, "atSize"), "plain at the threshold, as the reference"); }
+  }
+  c.ok(str(p, "atSize") != str(p, "belowSize"), "the reference shards one byte below");
+  match (buildTree(files, string[](), Params(1048576, 1024, size - 1))) {
+    Err(e): { c.fail("one byte over the threshold it must shard: \{e}"); }
+    Ok(b): { c.eq(b.root.text(), str(p, "belowSize"), "and one byte over it is the reference's HAMT"); }
+  }
+  return c.report();
+}
+
+Value rec0(Cid input) {
+  Value recipe = Value.Dict(["machine", "format", "input"], [Value.Text("wasm-gc/det/1"), Value.Text("unixfs-v1-2025+hidden"), Value.Link(input)]);
+  return Value.Dict(["recipe"], [recipe]);
+}
+
+Value rec1() {
+  return Value.Dict(["f", "e", "d", "c", "bb", "a"], [
+    Value.Dict(["z", "y"], [Value.Int(0 as i64), Value.Int(4294967296 as i64)]),
+    Value.List([Value.Bool(true), Value.Bool(false), Value.Null]),
+    Value.Bytes([1 as u8, 2 as u8, 3 as u8]),
+    Value.Text("text"),
+    Value.Int(-2 as i64),
+    Value.Int(1 as i64),
+  ]);
+}
+
+Value rec2() {
+  return Value.Dict(["list", "empty", "neg", "big"], [Value.List(Value[]()), Value.Dict(string[](), Value[]()),
+                   Value.Int((0 as i64) - ((1 as i64) << (40 as i64))), Value.Int((1 as i64) << (62 as i64))]);
+}
+
+export string test_dag_cbor_agrees_with_the_reference_and_is_strict() {
+  Check c = Check.create();
+  JsonValue v = vectors();
+  Cid input = parseCid(str(v.member("cids")!.array()!.get(2), "text")).ok()!;
+  Value[] recs = [rec0(input), rec1(), rec2()];
+  for (i32 i = 0; i < recs.len(); i++) {
+    JsonValue e = v.member("cbor")!.array()!.get(i);
+    u8[] enc = encode(recs[i]);
+    c.eq(hex(enc), str(e, "hex"), "record \{i} encodes as the reference does");
+    c.eq(Cid.of(DAG_CBOR(), enc).text(), str(e, "cid"), "and has its CID");
+    match (decode(enc)) {
+      Err(x): { c.fail("record \{i} does not decode: \{x}"); }
+      Ok(back): { c.eq(hex(encode(back)), hex(enc), "record \{i} decodes and re-encodes to the same bytes"); }
+    }
+  }
+  // What DAG-CBOR forbids, each refused.
+  c.ok(decode([0xa2 as u8, 0x61, 0x62, 0x01, 0x61, 0x61, 0x02]).isErr(), "map keys out of order");
+  c.ok(decode([0xa2 as u8, 0x61, 0x61, 0x01, 0x61, 0x61, 0x02]).isErr(), "a repeated key");
+  c.ok(decode([0x18 as u8, 0x05]).isErr(), "an integer that is not minimal");
+  c.ok(decode([0xfb as u8, 0, 0, 0, 0, 0, 0, 0, 0]).isErr(), "a float");
+  c.ok(decode([0x9f as u8, 0x01, 0xff]).isErr(), "an indefinite-length list");
+  c.ok(decode([0x01 as u8, 0x02]).isErr(), "bytes after the value");
+  c.ok(decode([0xc1 as u8, 0x01]).isErr(), "a tag other than 42");
+  return c.report();
+}
+
+export string test_a_reference_car_reads_and_a_tampered_one_does_not() {
+  Check c = Check.create();
+  JsonValue v = vectors();
+  u8[] car = hexDecoded(TREE1_CAR);
+  match (readCar(car)) {
+    Err(e): { c.fail("the reference CAR: \{e}"); }
+    Ok(k): {
+      c.eq(k.roots[0].text(), str(v.member("car")!, "root"), "its root");
+      c.ok(k.blocks.len() == num(v.member("car")!, "blocks"), "every block: \{k.blocks.len()}");
+      // The same tree built here has the same root, and our own CAR of it reads back.
+      match (buildTree(filesOf(v.member("car")!.member("files")!), dirsOf(v.member("car")!.member("dirs")), Params(1048576, 1024, 262144))) {
+        Err(e): { c.fail("building it here: \{e}"); }
+        Ok(b): {
+          c.eq(b.root.text(), k.roots[0].text(), "built here, the same root");
+          Car back = readCar(writeCar([b.root], b.blocks)).ok()!;
+          c.ok(back.blocks.len() == b.blocks.len(), "our CAR of it reads back whole");
+        }
+      }
+    }
+  }
+  u8[] bad = u8[].filled(car.len(), 0);
+  for (i32 i = 0; i < car.len(); i++) { bad[i] = car[i]; }
+  bad[bad.len() - 1] = bad[bad.len() - 1] ^ 1;
+  c.ok(readCar(bad).isErr(), "one flipped bit in the last block refuses the CAR");
+  return c.report();
+}
+
+export string test_nodes_read_back_as_what_was_built() {
+  Check c = Check.create();
+  Built f = buildFile(content(100, 5 as i64), Params(16, 4, 262144));
+  match (readNode(f.root, f.blocks[0].data)) {
+    Err(e): { c.fail(e); }
+    Ok(n): { match (n) { File(size, parts, _): { c.ok(size == (100 as i64) && parts.len() == 2, "a 100-byte file of 7 chunks: two subtrees under its root"); } Dir(_): { c.fail("read as a directory"); } Shard(_, _): { c.fail("read as a HAMT shard"); } } }
+  }
+  c.ok(readNode(f.root, f.blocks[1].data).isErr(), "another block under this CID is refused");
+  return c.report();
+}

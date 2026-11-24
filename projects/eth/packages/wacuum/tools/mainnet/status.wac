@@ -1,0 +1,142 @@
+// How the mainnet shadow is doing, from its log (`follow.sh`'s, one line a block: `N ok MS ms MGAS Mgas/s`, or
+// `N DIFFERS … — why`): blocks checked and how many differed, the last one, how far behind the reference node's head
+// it is, and how long a block takes over the last 1000. Printed for whoever asks; with `--prom FILE`, also written as
+// Prometheus metrics, for node_exporter's textfile collector (`deploy/mainnet/wacuum-status.timer` runs it each
+// minute).
+//
+//     wac run --allow-read --allow-write tools/mainnet/status.wac -- LOG [HEAD] [--prom FILE]
+//
+// HEAD is the reference node's head block number (`follow.sh` gets it with `fetch.wac --head`); without it the lag
+// is not known. The counts are of the log as it is: logrotate starts a new one each week.
+
+import { Sys } from "std";
+import { Vec, strings } from "core";
+
+struct Line {
+  u64 number;
+  bool ok;
+  i64 ms;
+  i64 mgas;
+}
+
+u64 decimal(string s) {
+  u64 n = 0;
+  u8[] b = s.toBytes();
+  if (b.len() == 0) { return 0; }
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < 48 || b[i] > 57) { return 0; }
+    n = n * 10 + ((b[i] - 48) as u64);
+  }
+  return n;
+}
+
+/** A log line, or null for one that is not a block's (a partial last line, a stray message). */
+Line? lineOf(string s) {
+  string[] f = strings.split(strings.trim(s), " ");
+  if (f.len() < 2 || decimal(f[0]) == 0) { return null; }
+  if (f[1] != "ok" && f[1] != "DIFFERS") { return null; }
+  i64 ms = -1;
+  i64 mgas = -1;
+  // The speed is absent when the replay failed before it ran a block.
+  if (f.len() >= 6 && f[3] == "ms" && f[5] == "Mgas/s") {
+    ms = decimal(f[2]) as! i64;
+    mgas = decimal(f[4]) as! i64;
+  }
+  return Line(decimal(f[0]), f[1] == "ok", ms, mgas);
+}
+
+/** The value at fraction `q` of `xs`, sorted; -1 for none. */
+i64 quantile(Vec<i64> xs, i32 percent) {
+  if (xs.len() == 0) { return -1; }
+  i32 at = (xs.len() - 1) * percent / 100;
+  return xs.get(at);
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  string log = "";
+  u64 head = 0;
+  string prom = "";
+  for (i32 i = 0; i < args.len(); i++) {
+    if (args[i] == "--prom" && i + 1 < args.len()) {
+      prom = args[i + 1];
+      i++;
+    } else if (log == "") {
+      log = args[i];
+    } else {
+      head = decimal(args[i]);
+    }
+  }
+  if (log == "") {
+    sys.warn("usage: status.wac LOG [HEAD] [--prom FILE]");
+    return 2;
+  }
+  string text = string.fromBytes((await sys.readFile(log)).orElse(u8[].filled(0, 0)));
+  string[] raw = strings.split(text, "\n");
+  i64 ok = 0;
+  i64 differs = 0;
+  u64 last = 0;
+  u64 lastDiffers = 0;
+  Vec<Line> lines = Vec.create();
+  for (i32 i = 0; i < raw.len(); i++) {
+    Line? l = lineOf(raw[i]);
+    if (l is null) { continue; }
+    lines.push(l!);
+    if (l!.ok) { ok++; } else { differs++; lastDiffers = l!.number; }
+    last = l!.number > last ? l!.number : last;
+  }
+  // How long a block takes, and how fast, over the last 1000 that ran.
+  Vec<i64> ms = Vec.create();
+  Vec<i64> mgas = Vec.create();
+  for (i32 i = lines.len() - 1; i >= 0 && ms.len() < 1000; i--) {
+    Line l = lines.get(i);
+    if (l.ms < 0) { continue; }
+    ms.push(l.ms);
+    mgas.push(l.mgas);
+  }
+  ms.sort((i64 a, i64 b) => a < b ? -1 : (a > b ? 1 : 0));
+  mgas.sort((i64 a, i64 b) => a < b ? -1 : (a > b ? 1 : 0));
+  i64 lag = head > 0 && head >= last ? (head - last) as! i64 : -1;
+
+  string lagText = lag < 0 ? "not known (no head given)" : "\{lag} blocks";
+  string say = "blocks checked: \{ok + differs} (\{ok} ok, \{differs} differed\{differs > 0 ? ", the last at \{lastDiffers}" : ""})\n" +
+               "last block: \{last}; behind the head: \{lagText}\n" +
+               "a block, over the last \{ms.len()}: \{quantile(ms, 50)} ms median, \{quantile(ms, 95)} ms p95, \{quantile(ms, 100)} ms most; " +
+               "\{quantile(mgas, 50)} Mgas/s median, \{quantile(mgas, 5)} Mgas/s at the slowest 5%\n";
+  await sys.stdout().write(say.toBytes());
+
+  if (prom != "") {
+    string m = "# HELP wacuum_shadow_blocks Blocks the shadow has checked, in its current log, by result.\n" +
+               "# TYPE wacuum_shadow_blocks gauge\n" +
+               "wacuum_shadow_blocks{result=\"ok\"} \{ok}\n" +
+               "wacuum_shadow_blocks{result=\"differs\"} \{differs}\n" +
+               "# HELP wacuum_shadow_last_block The last block the shadow checked.\n" +
+               "# TYPE wacuum_shadow_last_block gauge\n" +
+               "wacuum_shadow_last_block \{last}\n" +
+               "# HELP wacuum_shadow_last_differs The last block that differed, 0 if none.\n" +
+               "# TYPE wacuum_shadow_last_differs gauge\n" +
+               "wacuum_shadow_last_differs \{lastDiffers}\n" +
+               "# HELP wacuum_shadow_lag_blocks How far the last block checked is behind the reference node's head; -1 if not known.\n" +
+               "# TYPE wacuum_shadow_lag_blocks gauge\n" +
+               "wacuum_shadow_lag_blocks \{lag}\n" +
+               "# HELP wacuum_shadow_block_ms Milliseconds a block takes, over the last 1000.\n" +
+               "# TYPE wacuum_shadow_block_ms gauge\n" +
+               "wacuum_shadow_block_ms{quantile=\"0.5\"} \{quantile(ms, 50)}\n" +
+               "wacuum_shadow_block_ms{quantile=\"0.95\"} \{quantile(ms, 95)}\n" +
+               "wacuum_shadow_block_ms{quantile=\"1\"} \{quantile(ms, 100)}\n" +
+               "# HELP wacuum_shadow_mgas_per_second Execution speed, over the last 1000 blocks.\n" +
+               "# TYPE wacuum_shadow_mgas_per_second gauge\n" +
+               "wacuum_shadow_mgas_per_second{quantile=\"0.5\"} \{quantile(mgas, 50)}\n" +
+               "wacuum_shadow_mgas_per_second{quantile=\"0.05\"} \{quantile(mgas, 5)}\n";
+    // Written beside and renamed over, so the collector never reads half a file.
+    if (!(await sys.writeFile(prom + ".tmp", m.toBytes())).isOk()) {
+      sys.warn("status.wac: cannot write \{prom}.tmp");
+      return 1;
+    }
+    if (!(await sys.files().rename(prom + ".tmp", prom)).isOk()) {
+      sys.warn("status.wac: cannot rename \{prom}.tmp to \{prom}");
+      return 1;
+    }
+  }
+  return 0;
+}

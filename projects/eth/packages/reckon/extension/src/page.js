@@ -1,0 +1,186 @@
+// The extension's page: settings, a subject to open, admission's account, and the admitted app in the sandbox loader.
+// The order is fixed: admit, then read the admitted tree from OPFS, then show it. An app is never shown otherwise.
+import { admit } from './admission.js';
+import { openTree } from './tree.js';
+import { buildDocument, typeOf } from './build-doc.js';
+import { renderAccount } from './account.js';
+
+const $ = (id) => document.getElementById(id);
+const FIELDS = ['checkpoint', 'beaconUrl', 'rpc', 'registry', 'codeHash', 'mirrors', 'mirrorsFrom', 'policy', 'now', 'recheck'];
+// No mirror by default: a public gateway is a choice to make, and one that is down slows every admission until it is
+// left out. The settings suggest one.
+/**
+ * The reckon pages site's own mirror manifest (docs/discovery.md): offered in the settings, never used unless added. What
+ * its mirrors serve is checked like any mirror's; the preset only says where else to look.
+ */
+export const SITE_MANIFEST = 'https://pages.voltrevo.com/wac-eth/reckon-mirrors.json';
+const DEFAULTS = { mirrors: '', mirrorsFrom: '', policy: '{ signers: {}, roles: {} }', recheck: '600' };
+
+async function loadSettings() {
+  const got = await chrome.storage.local.get('settings');
+  return { ...DEFAULTS, ...(got.settings || {}) };
+}
+
+async function saveSettings() {
+  const s = {};
+  for (const f of FIELDS) s[f] = $(f).value;
+  await chrome.storage.local.set({ settings: s });
+}
+
+/**
+ * The fence: no request leaves this tab unless the extension itself makes it. The app's frame is sandboxed under a CSP
+ * that refuses every fetch, but a CSP cannot stop a document navigating itself (Chrome has no navigate-to), and that
+ * navigation's request reaches the network before anything refuses its answer. So a session rule for this tab blocks
+ * every request whose initiator is not this extension: the app's, whose origin is opaque, and its navigations among
+ * them. Admission's own requests (mirrors, RPC, beacon node) are the extension's and pass. Nothing is shown until the
+ * fence is up, and none is shown if it cannot be put up. The service worker takes the rule down with the tab.
+ */
+const fenced = (async () => {
+  const tab = await chrome.tabs.getCurrent();
+  if (!tab || typeof tab.id !== 'number') throw new Error('reckon: not in a tab of its own, so no fence for the app');
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [tab.id],
+    addRules: [{ id: tab.id, priority: 1, action: { type: 'block' },
+                 condition: { tabIds: [tab.id], excludedInitiatorDomains: [chrome.runtime.id] } }],
+  });
+  return tab.id;
+})();
+
+let shown = null;   // { tree, page }: what the frame shows, and the only tree its requests are answered from
+
+function account(lines) { renderAccount($('account'), lines); }
+
+const STALE_S = 3600;   // a decision older than this is marked: the chain may have moved since (a revocation, a name)
+
+let banner = { asOf: null, ok: false };   // what the banner shows, kept so its age stays live
+
+/** The "as of" banner: which block and slot the decision was made at, when, and how long ago. */
+function showAsOf(asOf, ok) {
+  banner = { asOf, ok };
+  const el = $('asof');
+  if (!asOf || (asOf.block === null && asOf.slot === null)) { el.textContent = ''; el.className = ''; return; }
+  const t = asOf.blockTime ?? asOf.slotTime;
+  const age = t === null ? null : Math.max(0, Math.round(Date.now() / 1000 - t));
+  const ago = age === null ? '' : age < 120 ? `${age} s ago` : age < 7200 ? `${Math.round(age / 60)} min ago`
+    : age < 172800 ? `${Math.round(age / 3600)} h ago` : `${Math.round(age / 86400)} days ago`;
+  const parts = [];
+  if (asOf.block !== null) parts.push(`execution block ${asOf.block}`);
+  if (asOf.slot !== null) parts.push(`beacon slot ${asOf.slot}`);
+  el.textContent = `${ok ? 'Admitted' : 'Decided'} as of ${parts.join(', ')}` + (t === null ? '' : ` · ${new Date(t * 1000).toISOString().replace('.000Z', 'Z')} · ${ago}`)
+    + (age !== null && age > STALE_S ? ' · older than an hour: the chain may have changed since' : '');
+  el.className = age !== null && age > STALE_S ? 'stale' : 'fresh';
+}
+
+/** Show `page` of `tree` in a fresh sandbox loader. Exported for the tests, which put a tree in OPFS themselves. */
+export async function show(tree, page = 'index.html') {
+  await fenced;   // throws, and shows nothing, when the fence could not be put up
+  const { html, report } = buildDocument(tree, page);
+  shown = { tree, page };
+  const frame = $('app');
+  const fresh = frame.cloneNode(false);   // a new browsing context: nothing of the last page survives
+  fresh.classList.add('shown');
+  frame.replaceWith(fresh);
+  const ready = new Promise((ok) => {
+    const on = (e) => { if (e.source === fresh.contentWindow && e.data && e.data.ready) { removeEventListener('message', on); ok(); } };
+    addEventListener('message', on);
+  });
+  fresh.src = 'loader.html';
+  await ready;
+  fresh.contentWindow.postMessage({ document: html }, '*');
+  const notes = [];
+  if (report.missing.length) notes.push(`not in the tree: ${report.missing.join(', ')}`);
+  if (report.outside.length) notes.push(`outside the tree, so not loaded: ${report.outside.join(', ')}`);
+  if (report.bare.length) notes.push(`module specifiers no import map names, which will not load: ${report.bare.join(', ')}`);
+  if (report.cycles.length) notes.push(`module cycles a worker cannot be given: ${report.cycles.join('; ')}`);
+  return { report, notes };
+}
+
+// The app's requests: answered from the shown tree only, for the frame showing it only.
+addEventListener('message', async (e) => {
+  const frame = $('app');
+  if (!shown || e.source !== frame.contentWindow || !e.data) return;
+  if (typeof e.data.ask === 'string') {
+    const bytes = shown.tree.read(e.data.ask);
+    const body = bytes === null ? null : bytes.slice().buffer;
+    e.source.postMessage({ id: e.data.id, status: bytes === null ? 404 : 200, type: typeOf(e.data.ask), body }, '*', body ? [body] : []);
+  } else if (typeof e.data.navigate === 'string') {
+    if (shown.tree.read(e.data.navigate) !== null) await show(shown.tree, e.data.navigate);
+  }
+});
+
+/** Take down whatever was shown: a new subject is not shown until it is admitted, and the last one must not linger
+ *  beside its account as if it were the new one. */
+function clear() {
+  shown = null;
+  const frame = $('app');
+  const blank = frame.cloneNode(false);
+  blank.classList.remove('shown');
+  frame.replaceWith(blank);
+}
+
+// What is open, and the timer that admits it again: a decision is as of a block, and the chain moves on (a revocation,
+// a name pointed elsewhere), so an open app is re-admitted every `recheck` seconds and taken down if it is refused.
+let current = null;   // { subject, role, cid }
+let timer = null;
+
+function stopRecheck() { if (timer !== null) { clearInterval(timer); timer = null; } }
+
+async function recheck() {
+  if (!current) return;
+  const { subject, role, cid } = current;
+  const settings = await loadSettings();
+  const d = await admit(settings, subject, role);
+  if (!current || current.subject !== subject) return;   // something else was opened meanwhile
+  const when = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+  if (d.code !== 0 || !d.cid) {
+    stopRecheck(); current = null; clear();
+    account([`re-checked ${when}: ${subject} is no longer admitted, so it has been taken down.`, ...d.lines]);
+    showAsOf(d.asOf, false);
+    return;
+  }
+  if (d.cid !== cid) {
+    const tree = await openTree(d.cid);
+    if (!tree) { stopRecheck(); current = null; clear(); account([`re-checked ${when}: ${subject} now admits ${d.cid}, which is not in storage; taken down.`, ...d.lines]); return; }
+    current.cid = d.cid;
+    await show(tree);
+    account([`re-checked ${when}: ${subject} now points at ${d.cid}, admitted, and shown in place of ${cid}.`, ...d.lines]);
+  } else {
+    account([`re-checked ${when}: still admitted.`, ...d.lines]);
+  }
+  showAsOf(d.asOf, true);
+}
+
+async function open(subject, role) {
+  stopRecheck(); current = null;
+  clear();
+  showAsOf(null, false);
+  const settings = await loadSettings();
+  account([`admitting ${subject} as ${role}…`]);
+  const d = await admit(settings, subject, role);
+  account(d.lines);
+  showAsOf(d.asOf, d.code === 0);
+  if (d.code !== 0 || !d.cid) return;
+  const tree = await openTree(d.cid);
+  if (!tree) { account([...d.lines, `admitted, but its tree is not in storage: ${d.cid}`]); return; }
+  window.__reckon.last = { subject, cid: d.cid, paths: tree.paths };
+  const { notes } = await show(tree);
+  if (notes.length) account([...d.lines, ...notes]);
+  current = { subject, role, cid: d.cid };
+  const every = Number(settings.recheck);
+  if (every > 0) timer = setInterval(recheck, every * 1000);
+}
+
+(async () => {
+  const s = await loadSettings();
+  for (const f of FIELDS) $(f).value = s[f] ?? '';
+  $('save').addEventListener('click', saveSettings);
+  $('preset-mirrors').addEventListener('click', () => {
+    const have = $('mirrorsFrom').value.split(/\s+/).filter(Boolean);
+    if (!have.includes(SITE_MANIFEST)) $('mirrorsFrom').value = [...have, SITE_MANIFEST].join('\n');
+  });
+  setInterval(() => { if (banner.asOf) showAsOf(banner.asOf, banner.ok); }, 10000);   // the age, kept live
+  $('open').addEventListener('submit', (e) => { e.preventDefault(); open($('subject').value.trim(), $('role').value.trim() || 'app'); });
+  const q = new URLSearchParams(location.search).get('open');
+  if (q) { $('subject').value = q; open(q, $('role').value); }
+  window.__reckon = { show, openTree };   // for the tests
+})();

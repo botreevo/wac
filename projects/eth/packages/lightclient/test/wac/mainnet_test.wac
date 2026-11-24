@@ -1,0 +1,140 @@
+// The light client on real Ethereum mainnet data (Fulu, 2026-11-10; see test/mainnet/README.md), verified offline.
+//
+// Mainnet's 512-member committee and 8192-slot periods, a real bootstrap proven against a trusted root, a period
+// update, and the finality and optimistic updates. The optimistic update has 511 signers. Ethereum's own vectors
+// always have nearly full participation, so this is the case that catches a signer-selection bug: one was caught
+// here, the loop bounded by the participant count instead of the committee size.
+
+import { wactest.T } from "wac";
+import { wactest.hex } from "wac";
+import { Sys } from "std";
+import { codec.hexDecoded } from "wac";
+import { FULU } from "../../../ssz/src/forks.wac";
+import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, processOptimisticUpdate, headerSlot,
+         headerBeaconRoot } from "../../src/store.wac";
+import { Schedule } from "../../src/schedule.wac";
+import { executionBlockHash, executionStateRoot } from "../../src/header.wac";
+import { Result } from "core";
+import { json.parse, json.JsonValue, json.JsonArray } from "wac";
+import { headerOf, Header } from "../../../ethrpc/src/header.wac";
+import { hexArray } from "../../../ethrpc/src/jsonhex.wac";
+import { recordOf, Record } from "../../../ens/src/verified.wac";
+import { contenthashOf } from "../../../ens/src/contenthash.wac";
+import { namehash } from "../../../ens/src/ens.wac";
+import { cidFromBytes } from "../../../ipfs/src/cid.wac";
+
+static string DIR = "packages/lightclient/test/mainnet/";
+
+u8[] un(string h) { return hexDecoded(h.slice(2, h.len())); }
+u8[] GVR() { return un("0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"); }
+u8[] TRUSTED() { return un("0xa8356934e2fba13cb82917ea04203c75ca84bb735cefe3cf2f35976628e1e937"); }
+i64 NOW() { return 15630000 as i64; }
+
+async u8[] file(Sys sys, string name) { return (await sys.readFile(DIR + name)).orElse(u8[]()); }
+
+u8[] cut(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}
+
+u8[] copyOf(u8[] a) { return cut(a, 0, a.len()); }
+
+async Store? started(Sys sys) { return initializeStoreWith(Schedule.mainnet(), FULU(), TRUSTED(), await file(sys, "bootstrap.ssz")); }
+
+export async string test_mainnet_from_a_trusted_root_to_an_execution_state_root(Sys sys) {
+  T t = T.create();
+  Store? s = await started(sys);
+  t.isTrue(s is not null, "the bootstrap is proven against the trusted root");
+  if (s is null) { return t.report(); }
+  u8[] list = await file(sys, "updates.ssz");
+  u8[] update = cut(list, 12, list.len());                       // one chunk: 8-byte length, 4-byte digest, the SSZ
+  t.isTrue(processUpdate(s!, update, NOW(), GVR()), "period 1906's update");
+  t.isTrue(processFinalityUpdate(s!, await file(sys, "finality.ssz"), NOW(), GVR()), "the finality update");
+  t.isTrue(processOptimisticUpdate(s!, await file(sys, "optimistic.ssz"), NOW(), GVR()), "the optimistic update, 511 signers");
+  t.eqStr("\{headerSlot(s!.optimisticHeader)} \{hex(headerBeaconRoot(s!.optimisticHeader))}",
+          "15621832 a726293a3feb822ff0066363de71d821c7f293504bae9197e68f5c9ca8083dbf", "the optimistic header");
+  t.eqStr(hex(executionBlockHash(FULU(), s!.optimisticHeader) ?? u8[]()),
+          "3fdd2e3740f22fe4cf998e8ef80c4ff49060aeb826af2351c091f7e06f39fddf", "its execution block");
+  t.eqStr(hex(executionStateRoot(FULU(), s!.optimisticHeader) ?? u8[]()),
+          "64d8a6b38b6fe4d887b705d213a0907fcd23f4e2b12416f3057452f938f99870", "and that block's state root");
+  return t.report();
+}
+
+export async string test_mainnet_data_refused_where_it_should_be(Sys sys) {
+  T t = T.create();
+  u8[] boot = await file(sys, "bootstrap.ssz");
+  u8[] other = copyOf(TRUSTED());
+  other[0] = other[0] ^ (1 as u8);
+  t.isTrue(initializeStoreWith(Schedule.mainnet(), FULU(), other, boot) is null, "a different trusted root");
+  Store? s = await started(sys);
+  if (s is null) { t.fail("no store"); return t.report(); }
+  u8[] opt = await file(sys, "optimistic.ssz");
+  u8[] dropped = copyOf(opt);
+  dropped[4] = dropped[4] ^ (1 as u8);
+  t.isFalse(processOptimisticUpdate(s!, dropped, NOW(), GVR()), "one participation bit flipped");
+  Store? sepolia = initializeStoreWith(Schedule.mainnet(), FULU(), TRUSTED(), boot);
+  t.isFalse(processOptimisticUpdate(sepolia!, opt, NOW(), un("0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078")),
+            "another chain's genesis validators root");
+  t.isFalse(processOptimisticUpdate(s!, opt, 15621832 as i64, GVR()), "a clock before the signature slot");
+  return t.report();
+}
+
+/**
+ * On to state: the execution node's block (`block.json`, `eth_getBlockByNumber`) for the finalized execution block,
+ * believed only because its re-encoded header hashes to the block hash the light client proved; and the ENS registry's
+ * proofs for vitalik.eth at that block (`proof.json`), believed only as far as they reach that header's state root.
+ */
+export async string test_mainnet_from_the_trusted_root_to_an_ens_owner(Sys sys) {
+  T t = T.create();
+  Store? s = await started(sys);
+  if (s is null) { t.fail("no store"); return t.report(); }
+  u8[] header = s!.finalizedHeader;
+  u8[] hash = executionBlockHash(FULU(), header) ?? u8[]();
+  JsonValue block = (parse(await file(sys, "block.json")).ok() ?? JsonValue.Null).member("result") ?? JsonValue.Null;
+  JsonValue proof = (parse(await file(sys, "proof.json")).ok() ?? JsonValue.Null).member("result") ?? JsonValue.Null;
+  Result<Header, string> h = headerOf(block, hash);
+  t.isTrue(h.isOk(), "the block hashes to the proven block hash: \{h.isErr() ? h.err()! : ""}");
+  if (h.isErr()) { return t.report(); }
+  t.eqStr(hex(h.unwrap().stateRoot), hex(executionStateRoot(FULU(), header) ?? u8[]()), "its state root is the proven one");
+  JsonArray sp = proof.member("storageProof")?.array() ?? JsonArray.create();
+  u8[][] account = hexArray(proof.member("accountProof") ?? JsonValue.Null);
+  u8[][] ownerNodes = hexArray(sp.get(0).member("proof") ?? JsonValue.Null);
+  u8[][] resolverNodes = hexArray(sp.get(1).member("proof") ?? JsonValue.Null);
+  Record r = recordOf(h.unwrap().stateRoot, REGISTRY(), "vitalik.eth".toBytes(), account, ownerNodes, resolverNodes);
+  t.isTrue(r.ok && r.present, "the proofs hold: \{r.error}");
+  t.eqStr(hex(r.owner), "d8da6bf26964af9d7eed9e03e53415d37aa96045", "vitalik.eth's owner");
+  t.eqStr(hex(r.resolver), "231b0ee14048e9dccd1d247744d114a4eb5e8e63", "and its resolver");
+
+  // On to content: the proven resolver's contenthash for the name, version 0, 38 bytes (EIP-1577: ipfs, then a CID).
+  JsonValue ch = (parse(await file(sys, "contenthash.json")).ok() ?? JsonValue.Null).member("result") ?? JsonValue.Null;
+  JsonArray cs = ch.member("storageProof")?.array() ?? JsonArray.create();
+  u8[][][] chNodes = u8[][][].filled(cs.len(), u8[][]());
+  for (i32 i = 0; i < cs.len(); i++) { chNodes[i] = hexArray(cs.get(i).member("proof") ?? JsonValue.Null); }
+  u8[][] resolverAccount = hexArray(ch.member("accountProof") ?? JsonValue.Null);
+  Result<u8[], string> content = contenthashOf(h.unwrap().stateRoot, r.resolver, namehash("vitalik.eth".toBytes()), 0 as i64,
+                                               resolverAccount, chNodes);
+  t.isTrue(content.isOk(), "the contenthash proofs hold: \{content.isErr() ? content.err()! : ""}");
+  if (content.isOk()) {
+    u8[] b = content.unwrap();
+    t.eqStr(hex(cut(b, 0, 2)), "e301", "an ipfs contenthash");
+    t.eqStr(cidFromBytes(cut(b, 2, b.len())).unwrap().text(), "bafybeia5eyombgegdwmvfzwisveadaaok2vdjkv5rklfdmcljysjrjc4km",
+            "vitalik.eth's content, as a CID");
+  }
+  // Claimed under another record version, the same proofs fail: the version decides where the bytes are.
+  t.isTrue(contenthashOf(h.unwrap().stateRoot, r.resolver, namehash("vitalik.eth".toBytes()), 1 as i64, resolverAccount,
+                         chNodes).isErr(), "the proofs read as another record version");
+
+  // Move the optimistic header on (the finalized one stays: no newer finality in this data), then try the same
+  // proofs against its root, a later state: they prove nothing there.
+  t.isTrue(processOptimisticUpdate(s!, await file(sys, "optimistic.ssz"), NOW(), GVR()), "the optimistic update");
+  t.isTrue(headerSlot(s!.optimisticHeader) > headerSlot(header), "the optimistic header is later");
+  Record wrong = recordOf(executionStateRoot(FULU(), s!.optimisticHeader) ?? u8[](), REGISTRY(), "vitalik.eth".toBytes(),
+                          account, ownerNodes, resolverNodes);
+  t.isFalse(wrong.ok && wrong.present, "the proofs against another block's root");
+  // A block from the node whose hash is not the proven one is refused, before any proof is read.
+  t.isTrue(headerOf(block, executionBlockHash(FULU(), s!.optimisticHeader) ?? u8[]()).isErr(), "a block that is not the proven one");
+  return t.report();
+}
+
+u8[] REGISTRY() { return un("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e"); }

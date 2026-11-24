@@ -1,0 +1,325 @@
+// The light-client driver: an execution client driven as a consensus client drives it, but with nothing behind it but
+// Ethereum's light-client protocol — no beacon state, no validators, no p2p.
+//
+// **Trust model, stated plainly.** This is an *optimistic, light-client-driven* execution client, as Helios and
+// Nimbus's light client drive theirs. What is trusted: a beacon block root given at the first start (a checkpoint),
+// and the sync committees that follow from it. The head is a block the current sync committee (512 validators, chosen
+// by the chain every ~27 hours) signed with more than half of the highest participation seen over the last two periods
+// (the spec's `get_safety_threshold`); the finalized block is one two thirds of the committee signed as finalized. A beacon node supplies every byte and is trusted for none of
+// them: light-client updates are believed only as far as their BLS signatures and Merkle branches go
+// (`packages/lightclient`), and each block only as far as its execution block hash is one the light client proved —
+// or the parent hash of one already believed. What this does *not* check, that a full consensus client would: the
+// beacon state transition (attestations, slashings, the validator set), fork choice by weight, and data availability
+// of blobs. A sync committee that signed a block the rest of the chain never accepted would be followed until the
+// next finalized update says otherwise. The execution client still runs every block, so state, receipts and the
+// state root are checked in full; the consensus is the committee's word.
+//
+// The loop, every few seconds: the light-client finality and optimistic updates (and, when the store lacks the next
+// sync committee, the period's update); then, when the optimistic header names an execution block not yet sent, the
+// beacon blocks back from it, each one's payload believed because its block hash is the one expected — the proven
+// head's, then each block's parent's — until one the execution client already has; those payloads sent oldest first
+// (`engine_newPayloadV4`), and `engine_forkchoiceUpdatedV3` with the head and, as safe and finalized, the light
+// client's finalized block. A reorg is the same walk: from the new head back to a block the execution client has.
+
+import { Sys } from "std";
+import { Map, Vec, Result, hashString, stringEq } from "core";
+import { json.parse, json.JsonValue, json.stringify } from "wac";
+import { codec.hexDecoded, codec.hexEncode } from "wac";
+import { U256 } from "../u256.wac";
+import { Beacon, Ssz } from "./beacon.wac";
+import { EngineClient } from "./engineclient.wac";
+import { Payload, Converted, payloadOf } from "./payload.wac";
+import { forkNamed } from "../../../ssz/src/forks.wac";
+import { Store, initializeStoreWith, processUpdate, processFinalityUpdate, processOptimisticUpdate, forceUpdate, headerSlot,
+         headerBeaconRoot, isNextSyncCommitteeKnown } from "../../../lightclient/src/store.wac";
+import { Schedule } from "../../../lightclient/src/schedule.wac";
+import { executionBlockHash } from "../../../lightclient/src/header.wac";
+
+/** A network as the light client needs it, and its clock. */
+export struct Network {
+  Schedule schedule;
+  u8[] genesisValidatorsRoot;
+  i64 genesisTime;
+  i64 secondsPerSlot;
+
+  /** Mainnet, from consensus-specs' configs/mainnet.yaml: nothing about it is taken from a beacon node. */
+  Network mainnet() {
+    return Network(Schedule.mainnet(), unhex("0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"), 1606824023 as i64, 12 as i64);
+  }
+
+  /**
+   * Hoodi, from eth-clients/hoodi's config.yaml (fork versions 0xN0000910, Altair to Deneb at genesis, Electra at epoch
+   * 2048, Fulu at 50688; mainnet's preset) and Prysm's HoodiConfig (the genesis validators root; genesis at
+   * 1742212800 + 600 s). The root is the one Hoodi's own bootstrap ENRs were signed under: their eth2 fork digest,
+   * d2f1997f, is Deneb's version and this root's. Nothing here is taken from a beacon node.
+   */
+  Network hoodi() {
+    i64[] epochs = [0 as i64, 0 as i64, 0 as i64, 0 as i64, 2048 as i64, 50688 as i64];
+    u8[][] versions = u8[][].filled(6, u8[]());
+    for (i32 i = 0; i < 6; i++) { versions[i] = [((i + 2) * 16) as! u8, 0 as u8, 0x09 as u8, 0x10 as u8]; }
+    return Network(Schedule(epochs, versions, 32 as i64, 8192 as i64, 512), unhex("0x212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f"),
+                   1742213400 as i64, 12 as i64);
+  }
+}
+
+/**
+ * A network as a beacon node describes it (`/eth/v1/config/spec`, `/eth/v1/beacon/genesis`): for a devnet, whose
+ * versions and genesis root no built-in table has. Taken on the node's word, once, at the first start — a node that
+ * lied here would be refused by every signature after, so it can stop the driver, not mislead it.
+ */
+export async Result<Network, string> networkFrom(Beacon b) {
+  auto spec = await b.json("/eth/v1/config/spec");
+  if (spec.isErr()) { return Result.Err(spec.err()!); }
+  auto gen = await b.json("/eth/v1/beacon/genesis");
+  if (gen.isErr()) { return Result.Err(gen.err()!); }
+  JsonValue s = spec.unwrap();
+  string[] names = ["ALTAIR", "BELLATRIX", "CAPELLA", "DENEB", "ELECTRA", "FULU"];
+  i64[] epochs = i64[].filled(6, -1 as i64);
+  u8[][] versions = u8[][].filled(6, u8[]());
+  for (i32 i = 0; i < 6; i++) {
+    string e = s.member(names[i] + "_FORK_EPOCH")?.text() ?? "";
+    // FAR_FUTURE_EPOCH (2^64 - 1) is "never": longer than an i64's digits.
+    epochs[i] = e == "" || e.len() >= 19 ? (-1 as i64) : (decimal(e) as! i64);
+    versions[i] = unhex(s.member(names[i] + "_FORK_VERSION")?.text() ?? "0x00000000");
+  }
+  i64 perEpoch = decimal(s.member("SLOTS_PER_EPOCH")?.text() ?? "32") as! i64;
+  i64 period = perEpoch * (decimal(s.member("EPOCHS_PER_SYNC_COMMITTEE_PERIOD")?.text() ?? "256") as! i64);
+  i32 size = decimal(s.member("SYNC_COMMITTEE_SIZE")?.text() ?? "512") as! i32;
+  JsonValue g = gen.unwrap();
+  return Result.Ok(Network(Schedule(epochs, versions, perEpoch, period, size), unhex(g.member("genesis_validators_root")?.text() ?? ""),
+                           decimal(g.member("genesis_time")?.text() ?? "0") as! i64, decimal(s.member("SECONDS_PER_SLOT")?.text() ?? "12") as! i64));
+}
+
+export struct Driver {
+  Sys sys;
+  Beacon beacon;
+  EngineClient engine;
+  Network net;
+  Store store;
+  /** Execution blocks the execution client is known to have: sent and accepted, or answered for. */
+  Map<string, bool> known;
+  /** The execution head last made the head, "" before the first. */
+  string sentHead;
+  string sentFinal;
+  /** Where the last finalized beacon root is written, for the next start to bootstrap from; "" for nowhere. */
+  string stateFile;
+  string lastFinalRoot;
+  /** How far back a gap is walked block by block before the execution client is left to sync it itself. */
+  i32 maxWalk;
+  /** Counts, for the log. */
+  i64 blocksSent;
+  i64 reorgs;
+  /** Where each round's status goes for a monitor (`tools/mainnet/allwac.wac`); "" for nowhere. */
+  string statusFile;
+  /** wacuum's last answer to a fork choice, and how many payloads it has called INVALID. */
+  string lastAnswer;
+  i64 invalid;
+
+  i64 slotNow(this, i64 nowSeconds) { return (nowSeconds - this.net.genesisTime) / this.net.secondsPerSlot; }
+
+  async i64 clockSlot(this) {
+    i64 now = (await this.sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+    // A second's allowance: the freshest updates are signed in the slot that has just begun.
+    return this.slotNow(now + 1);
+  }
+}
+
+/** The driver from a trusted beacon block root: its bootstrap verified against it, then the periods since. */
+export async Result<Driver, string> start(Sys sys, Beacon beacon, EngineClient engine, Network net, string trustedRoot, string stateFile) {
+  auto boot = await beacon.ssz("/eth/v1/beacon/light_client/bootstrap/" + trustedRoot);
+  if (boot.isErr()) { return Result.Err("bootstrap: \{boot.err()!}"); }
+  i32 fork = forkNamed(boot.unwrap().fork);
+  if (fork < 0) { return Result.Err("bootstrap: the node names no fork this reads (\{boot.unwrap().fork})"); }
+  Store? s = initializeStoreWith(net.schedule, fork, unhex(trustedRoot), boot.unwrap().bytes);
+  if (s is null) { return Result.Err("the bootstrap is not the trusted root's, or its committee is not proven by it"); }
+  Map<string, bool> known = Map.create(hashString, stringEq);
+  Driver d = Driver(sys, beacon, engine, net, s!, known, "", "", stateFile, trustedRoot, 64, 0 as i64, 0 as i64, "", "", 0 as i64);
+  sys.log("driver: bootstrap verified against \{trustedRoot}: slot \{headerSlot(d.store.finalizedHeader)}, period \{net.schedule.periodAt(headerSlot(d.store.finalizedHeader))}");
+  await catchUp(d);
+  return Result.Ok(d);
+}
+
+/** The periods from the store's finalized one to now: each period's best update, which carries its next committee. */
+async void catchUp(Driver d) {
+  i64 now = await d.clockSlot();
+  i64 from = d.net.schedule.periodAt(headerSlot(d.store.finalizedHeader));
+  i64 to = d.net.schedule.periodAt(now);
+  auto r = await d.beacon.ssz("/eth/v1/beacon/light_client/updates?start_period=\{from}&count=\{to - from + 1}");
+  if (r.isErr()) {
+    d.sys.warn("driver: period updates: \{r.err()!}");
+    return;
+  }
+  u8[] b = r.unwrap().bytes;
+  i32 at = 0;
+  // Each chunk: an 8-byte little-endian length, then that many bytes — a 4-byte fork digest and the update's SSZ.
+  while (at + 12 <= b.len()) {
+    i32 n = le64(b, at) as~ i32;
+    if (n < 4 || at + 8 + n > b.len()) { break; }
+    u8[] u = slice(b, at + 12, at + 8 + n);
+    at = at + 8 + n;
+    bool ok = processUpdate(d.store, u, now, d.net.genesisValidatorsRoot);
+    d.sys.log("driver: period update \{ok ? "accepted" : "not taken"}: finalized slot \{headerSlot(d.store.finalizedHeader)}, next committee \{isNextSyncCommitteeKnown(d.store) ? "known" : "not known"}");
+  }
+}
+
+/** One round: the light client's updates, then the execution client brought to its head. */
+export async void round(Driver d) {
+  i64 now = await d.clockSlot();
+  await writeStatus(d, now);
+  // A committee's next is learnt from its period's update; without it the store cannot follow past the period's end.
+  if (!isNextSyncCommitteeKnown(d.store) || d.net.schedule.periodAt(now) > d.net.schedule.periodAt(headerSlot(d.store.finalizedHeader))) {
+    await catchUp(d);
+  }
+  auto fin = await d.beacon.ssz("/eth/v1/beacon/light_client/finality_update");
+  if (fin.isOk()) { processFinalityUpdate(d.store, fin.unwrap().bytes, now, d.net.genesisValidatorsRoot); }
+  else { d.sys.warn("driver: \{fin.err()!}"); }
+  auto opt = await d.beacon.ssz("/eth/v1/beacon/light_client/optimistic_update");
+  if (opt.isOk()) { processOptimisticUpdate(d.store, opt.unwrap().bytes, now, d.net.genesisValidatorsRoot); }
+  else { d.sys.warn("driver: \{opt.err()!}"); }
+  forceUpdate(d.store, now);
+
+  u8[]? headHash = executionBlockHash(d.store.fork, d.store.optimisticHeader);
+  u8[]? finHash = executionBlockHash(d.store.fork, d.store.finalizedHeader);
+  if (headHash is null) { return; }
+  string head = hex(headHash!);
+  string final = finHash is null ? zero32() : hex(finHash!);
+  if (head == d.sentHead && final == d.sentFinal) { return; }
+  if (head != d.sentHead) {
+    string why = await follow(d, head, hex(headerBeaconRoot(d.store.optimisticHeader)));
+    if (why != "") {
+      d.sys.warn("driver: head \{head}: \{why}");
+      return;
+    }
+  }
+  auto fc = await d.engine.call("engine_forkchoiceUpdatedV3",
+                                "[{\"headBlockHash\":\"\{head}\",\"safeBlockHash\":\"\{final}\",\"finalizedBlockHash\":\"\{final}\"},null]");
+  if (fc.isErr()) {
+    d.sys.warn("driver: forkchoiceUpdated: \{fc.err()!}");
+    return;
+  }
+  string st = fc.unwrap().member("payloadStatus")?.member("status")?.text() ?? "?";
+  d.sys.log("driver: head slot \{headerSlot(d.store.optimisticHeader)} \{head} \{st}; finalized slot \{headerSlot(d.store.finalizedHeader)}");
+  d.sentHead = head;
+  d.sentFinal = final;
+  d.lastAnswer = st;
+  await keepState(d);
+}
+
+/**
+ * The execution client given the blocks from one it has to `head`: the beacon blocks back from `root`, each believed
+ * because its payload's block hash is the one expected, sent oldest first. "" or why not.
+ */
+async string follow(Driver d, string head, string root) {
+  Vec<Payload> chain = Vec.create();
+  string expect = head;
+  string at = root;
+  bool joined = false;
+  while (chain.len() < d.maxWalk) {
+    if (await elHas(d, expect)) {
+      joined = true;
+      break;
+    }
+    auto blk = await d.beacon.json("/eth/v2/beacon/blocks/" + at);
+    if (blk.isErr()) { return "beacon block \{at}: \{blk.err()!}"; }
+    Converted c = payloadOf(blk.unwrap());
+    if (c.payload is null) { return "beacon block \{at}: \{c.why}"; }
+    Payload p = c.payload!;
+    // The one check that makes the beacon node's bytes ours: this block is the one the proof (or the child) names.
+    if (hex(p.blockHash.toBytes()) != expect) { return "beacon block \{at} carries execution block \{p.blockHash.toHex()}, not \{expect}"; }
+    chain.push(p);
+    if (p.number == 0) {
+      joined = true;
+      break;
+    }
+    expect = hex(p.parentHash.toBytes());
+    at = p.parentRoot;
+  }
+  if (!joined) { d.sys.log("driver: \{chain.len()} blocks back from \{head} and none the execution client has: sending these, the rest is its to sync"); }
+  if (chain.len() > 1 && d.sentHead != "") {
+    // Not one block on the last head: a gap the polls missed, or a reorg (the walk joined below the last head).
+    d.sys.log("driver: \{chain.len()} blocks to send for one head");
+  }
+  for (i32 i = chain.len() - 1; i >= 0; i--) {
+    Payload p = chain.get(i);
+    auto r = await d.engine.call("engine_newPayloadV4", p.params);
+    if (r.isErr()) { return "newPayload of block \{p.number}: \{r.err()!}"; }
+    string st = r.unwrap().member("status")?.text() ?? "?";
+    if (st == "INVALID" || st == "INVALID_BLOCK_HASH") {
+      d.invalid++;
+      return "block \{p.number} is \{st}: \{r.unwrap().member("validationError")?.text() ?? ""}";
+    }
+    if (st == "VALID") { d.known.set(hex(p.blockHash.toBytes()), true); }
+    d.blocksSent++;
+  }
+  return "";
+}
+
+/** Whether the execution client has the block: remembered, or asked. */
+async bool elHas(Driver d, string hash) {
+  if (d.known.get(hash) is not null) { return true; }
+  // Only a cache of what the execution client would say: emptied now and then rather than kept for every block of
+  // the chain (a year of mainnet is ~2.6 million).
+  if (d.known.len() > 10000) { d.known = Map.create(hashString, stringEq); }
+  auto r = await d.engine.call("eth_getBlockByHash", "[\"\{hash}\",false]");
+  bool has = r.isOk() && !r.unwrap().isNull();
+  if (has) { d.known.set(hash, true); }
+  return has;
+}
+
+/** The last finalized beacon root, for a restart to bootstrap from: one the light client verified, so as good as the first. */
+async void keepState(Driver d) {
+  if (d.stateFile == "") { return; }
+  string root = hex(headerBeaconRoot(d.store.finalizedHeader));
+  if (root == d.lastFinalRoot) { return; }
+  // Written beside and renamed over: a stop part way leaves the old root, never half of one.
+  string body = "{\"finalizedRoot\":\"\{root}\",\"slot\":\{headerSlot(d.store.finalizedHeader)}}\n";
+  if ((await d.sys.writeFile(d.stateFile + ".tmp", body.toBytes())).isOk() && (await d.sys.files().rename(d.stateFile + ".tmp", d.stateFile)).isOk()) {
+    d.lastFinalRoot = root;
+  }
+}
+
+/**
+ * The status a monitor reads, written each round: the clock's slot, the light client's head and finalized slots (what
+ * the beacon chain has proven so far), wacuum's last answer to a fork choice and the INVALIDs it has given, and the
+ * beacon node in use. A head slot falling behind the clock is the driver stalled or its beacon node gone; an INVALID
+ * is wacuum disagreeing with the chain — both worth waking someone for.
+ */
+async void writeStatus(Driver d, i64 clockSlot) {
+  if (d.statusFile == "") { return; }
+  i64 at = (await d.sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+  string body = "{\"time\":\{at},\"clockSlot\":\{clockSlot},\"headSlot\":\{headerSlot(d.store.optimisticHeader)},\"finalizedSlot\":\{headerSlot(d.store.finalizedHeader)}," +
+                "\"head\":\"\{d.sentHead}\",\"lastAnswer\":\"\{d.lastAnswer}\",\"invalid\":\{d.invalid},\"blocksSent\":\{d.blocksSent},\"beacon\":\"\{d.beacon.url()}\"}\n";
+  if ((await d.sys.writeFile(d.statusFile + ".tmp", body.toBytes())).isOk()) { await d.sys.files().rename(d.statusFile + ".tmp", d.statusFile); }
+}
+
+/** The root a previous run kept, or "". */
+export async string keptRoot(Sys sys, string stateFile) {
+  if (stateFile == "") { return ""; }
+  match (await sys.readFile(stateFile)) {
+    Err(e): { return ""; }
+    Ok(b): { return parse(b).ok()?.member("finalizedRoot")?.text() ?? ""; }
+  }
+}
+
+string hex(u8[] b) { return "0x" + string.fromBytes(hexEncode(b)); }
+string zero32() { return "0x" + string.fromBytes(hexEncode(u8[].filled(32, 0))); }
+u8[] unhex(string s) { return hexDecoded(s.len() >= 2 && s.slice(0, 2) == "0x" ? s.slice(2, s.len()) : s); }
+
+u64 decimal(string dec) {
+  u64 n = 0;
+  u8[] d = dec.toBytes();
+  for (i32 i = 0; i < d.len(); i++) { n = n * 10 + ((d[i] - 48) as u64); }
+  return n;
+}
+
+i64 le64(u8[] b, i32 at) {
+  i64 v = 0 as i64;
+  for (i32 i = 7; i >= 0; i--) { v = (v << (8 as i64)) | (b[at + i] as i64); }
+  return v;
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return out;
+}

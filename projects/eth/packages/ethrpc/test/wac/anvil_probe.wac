@@ -1,0 +1,189 @@
+// A local Ethereum node for the tests that need one, and one place that knows where it lives.
+//
+// `anvil` is a whole execution client: it parses JSON-RPC, keeps a real state trie, and answers the
+// shapes a public endpoint answers. Everything else here is tested against recorded answers; these
+// tests send a request over a socket and let a node decide what comes back.
+//
+// **The skip says why.** A skip that prints nothing reads as coverage — the failure
+// `packages/tls/test/wac/openssl.wac` exists to stop, after two ML-KEM interop tests spent their whole
+// lives "2 ignored". `~/tools/foundry` rather than `/tmp` for the same reason: /tmp does not survive a
+// restart, and a reference that vanishes is one the tests quietly stop using.
+//
+// The starting and stopping is `packages/wactest/src/daemon.wac`, which exists because `Cli.exec` runs
+// a child to completion and a node has to outlive the call.
+
+import { Exec, Stat, ChildEnv, Clock, Env, Files, Launch, Net, Procs } from "std";
+import { wactest.Daemon, wactest.Port, wactest.freePortOr, wactest.logOf, wactest.start, wactest.stop, wactest.waitForPortWithin } from "wac";
+// `quoted` is `childenv.wac`'s, not `daemon.wac`'s — importing it from the latter is a compile
+// error in every program that reaches this file, which is what `rung 3` and the lambda test caught.
+import { wactest.quoted } from "wac";
+import { flatten } from "core";
+
+/** A running node, or `port <= 0` with `why` saying what stopped it. */
+export struct Node {
+  i32 port;
+  Daemon proc;
+  string why;
+
+  bool ok(const this) { return this.port > 0; }
+}
+
+/** Where anvil is, honouring `$ANVIL` and falling back to the path the tests install it at. */
+export string anvilPath(Env env) {
+  u8[]? named = flatten(env.get("ANVIL").wait()).orElse(null);
+  if ((named is not null) && named!.len() > 0) { return string.fromBytes(named!); }
+  u8[]? home = flatten(env.get("HOME").wait()).orElse(null);
+  string at = home is null ? "/home/claude" : string.fromBytes(home!);
+  return "\{at}/tools/foundry/anvil";
+}
+
+/** Whether it is installed, so a caller can skip with the path it looked in. */
+export bool haveAnvil(Env env, Files fs) {
+  return flatten(fs.stat(anvilPath(env)).wait()).isOk();
+}
+
+/**
+ * A node on a free port, already answering.
+ *
+ * `--silent` because anvil's banner is not evidence of anything, and the log is where a failure to
+ * start goes. Readiness is a connect rather than a sleep, for the reason `daemon.wac`'s header gives:
+ * a fixed sleep is either slower than the node or shorter than it, and the second one is the flake.
+ */
+export Node anvil(Clock clock, Env env, Files fs, Net net, Procs procs) {
+  string path = anvilPath(env);
+  if (!flatten(fs.stat(path).wait()).isOk()) {
+    return Node(-1, Daemon(-1, "", ""),
+                "anvil not found at \{path} — packages/ethrpc's live tests will not run. " +
+                "Install the release tarball for this machine's architecture into ~/tools/foundry/");
+  }
+  Port p = freePortOr(net);
+  if (p.port <= 0) { return Node(-1, Daemon(-1, "", ""), "no free port — \{p.error}"); }
+  i32 port = p.port;
+
+  string log = "\{flatten(env.cwd().wait()).unwrap()}/.cache/anvil-\{port}.log";
+  fs.mkdir("\{flatten(env.cwd().wait()).unwrap()}/.cache", true).wait();
+  Daemon d = start(procs, "\{quoted(path)} --port \{port} --silent", log);
+  if (!d.ok()) { return Node(-1, d, "anvil did not start — \{d.error}"); }
+  // **A deadline, not 200,000 attempts.** `waitForPort` counts *connects*, so its patience is a
+  // function of how fast failed connects are on the day — longer on a quiet machine and shorter on a
+  // busy one, which is exactly backwards, and `packages/wactest/test/wac/daemon_test.wac` says so
+  // where it tests the two. The number never mattered while anvil was up; it decided how long a
+  // *failure* took to report, which is the half nobody times.
+  if (!waitForPortWithin(clock, net, "127.0.0.1", port, 30000)) {
+    stop(procs, d);
+    return Node(-1, d, "anvil never answered on \{port} — it said: \{logOf(fs, d)}");
+  }
+  return Node(port, d, "");
+}
+
+/** Stop it and take its log with it. */
+export void stopAnvil(Files fs, Procs procs, Node n) {
+  stop(procs, n.proc);
+  if (n.proc.log != "") { fs.remove(n.proc.log, false).wait(); }
+}
+
+/** `cast`, beside `anvil` — the same release tarball puts both there. */
+export string castPath(Env env) {
+  string a = anvilPath(env);
+  i32 cut = -1;
+  for (i32 i = 0; i < a.len(); i++) { if (a.slice(i, i + 1) == "/") { cut = i; } }
+  return cut < 0 ? "cast" : "\{a.slice(0, cut + 1)}cast";
+}
+
+/**
+ * One JSON-RPC call, through `cast` rather than through us.
+ *
+ * **A separate implementation on purpose.** These tests exist to let a node decide what comes back,
+ * and asking through `packages/ethrpc` would make the question and the answer the same code. `cast`
+ * ships with anvil, speaks the protocol, and prints the bare result — so nothing here parses JSON
+ * either, which would have been a second place for this package's own parser to be the oracle.
+ *
+ * The result arrives quoted; the quotes are stripped. Empty means the call failed, and the caller has
+ * to notice rather than compare against "".
+ */
+export string castRpc(Env env, Procs procs, i32 port, string[] args) {
+  string[] argv = string[].filled(args.len() + 3, "");
+  argv[0] = "rpc";
+  argv[1] = "--rpc-url";
+  argv[2] = "http://127.0.0.1:\{port}";
+  for (i32 i = 0; i < args.len(); i++) { argv[3 + i] = args[i]; }
+  auto rRan = flatten(procs.exec(castPath(env), argv, u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = rRan.ok();
+  if ((r is null) || r!.status != 0) { return ""; }
+  string out = string.fromBytes(r!.stdout);
+  i32 n = out.len();
+  while (n > 0 && (out.slice(n - 1, n) == "\n" || out.slice(n - 1, n) == " ")) { n = n - 1; }
+  string trimmed = out.slice(0, n);
+  if (trimmed.len() >= 2 && trimmed.slice(0, 1) == "\"" &&
+      trimmed.slice(trimmed.len() - 1, trimmed.len()) == "\"") {
+    return trimmed.slice(1, trimmed.len() - 1);
+  }
+  return trimmed;
+}
+
+/** `cast args…` with no node involved — namehash, index, and the other pure computations. */
+export string castRun(Env env, Procs procs, string[] args) {
+  auto rRan = flatten(procs.exec(castPath(env), args, u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = rRan.ok();
+  if ((r is null) || r!.status != 0) { return ""; }
+  string out = string.fromBytes(r!.stdout);
+  i32 n = out.len();
+  while (n > 0 && (out.slice(n - 1, n) == "\n" || out.slice(n - 1, n) == " ")) { n = n - 1; }
+  string trimmed = out.slice(0, n);
+  if (trimmed.len() >= 2 && trimmed.slice(0, 1) == "\"" &&
+      trimmed.slice(trimmed.len() - 1, trimmed.len()) == "\"") {
+    return trimmed.slice(1, trimmed.len() - 1);
+  }
+  return trimmed;
+}
+
+/**
+ * The latest block's hash.
+ *
+ * `cast block latest -f hash` rather than `eth_getBlockByNumber` through `castRpc`: that call answers
+ * with the whole block as JSON, and reading one field out of it would put a JSON parser in the test —
+ * most likely this repository's own, which is the parser several of these programs depend on.
+ */
+export string blockHash(Env env, Procs procs, i32 port) {
+  return castRun(env, procs, [
+                               "block", "latest", "-f", "hash",
+                               "--rpc-url", "http://127.0.0.1:\{port}"
+  ]);
+}
+
+/**
+ * A hex quantity as decimal, by `cast` rather than by `packages/bignum`.
+ *
+ * The balances here are past what an i64 holds — that is the whole reason `ethbalance` does long
+ * division over the bytes — so converting with our own bignum would be checking that code against
+ * itself. `cast to-dec` is the separate implementation.
+ */
+export string toDec(Env env, Procs procs, string hex) {
+  auto rRan = flatten(procs.exec(castPath(env), ["to-dec", hex], u8[](), ChildEnv.inherited(), Launch.plain()).wait());
+  Exec? r = rRan.ok();
+  if ((r is null) || r!.status != 0) { return ""; }
+  string out = string.fromBytes(r!.stdout);
+  i32 n = out.len();
+  while (n > 0 && (out.slice(n - 1, n) == "\n" || out.slice(n - 1, n) == " ")) { n = n - 1; }
+  return out.slice(0, n);
+}
+
+/**
+ * `wac run --allow-net <entry> -- args…`, which replaces the host-side `appRunner`.
+ *
+ * The `wac` is `$WAC`, else whichever `wac` is on `PATH`, found by `/bin/sh`. These tests came from the wac
+ * repository, where they ran its own `native/v8/target/release/wac`; here there is no such path, and nothing noticed
+ * while anvil was absent, because the tests skip without it.
+ */
+export Exec runExample(Env env, Procs procs, string entry, string[] args) {
+  string[] argv = string[].filled(args.len() + 7, "");
+  argv[0] = "-c";
+  argv[1] = "exec \"${WAC:-wac}\" \"$@\"";
+  argv[2] = "sh";
+  argv[3] = "run";
+  argv[4] = "--allow-net";
+  argv[5] = entry;
+  argv[6] = "--";
+  for (i32 i = 0; i < args.len(); i++) { argv[7 + i] = args[i]; }
+  return flatten(procs.exec("/bin/sh", argv, u8[](), ChildEnv.inherited(), Launch.plain()).wait()).unwrap();
+}

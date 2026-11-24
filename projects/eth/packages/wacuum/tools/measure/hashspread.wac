@@ -1,0 +1,83 @@
+// How the store cache's key hash (`cache.wac`'s `hashBytes`: the length and the first and last 12 bytes) spreads
+// real keys, against a hash of every byte: the distinct keys of a trace (`replay.wac --keys`), by kind, counted
+// for keys that share a full hash, and spread over a power-of-two table of their number — the fullest bucket and
+// how many are empty. Path-keyed trie nodes and chunked values are the keys that could pile up.
+//
+//     wac run --allow-read tools/measure/hashspread.wac -- TRACE
+
+import { Sys } from "std";
+import { Map, Vec } from "core";
+import { hashString, stringEq } from "core";
+import { hashBytes } from "../../src/store/cache.wac";
+
+i32 everyByte(u8[] b) {
+  i32 h = -2128831035;
+  for (i32 i = 0; i < b.len(); i++) { h = (h ^ (b[i] as i32)) * 16777619; }
+  return h;
+}
+
+string hex(u8[] b) {
+  u8[] d = "0123456789abcdef".toBytes();
+  u8[] out = u8[].filled(b.len() * 2, 0);
+  for (i32 i = 0; i < b.len(); i++) {
+    out[2 * i] = d[(b[i] >> 4) as i32];
+    out[2 * i + 1] = d[(b[i] & 15) as i32];
+  }
+  return string.fromBytes(out);
+}
+
+string spread(Vec<u8[]> keys, bool short) {
+  i32 n = keys.len();
+  i32 size = 1;
+  while (size < n) { size *= 2; }
+  i32[] buckets = i32[].filled(size, 0);
+  Map<string, bool> seen = Map.create(hashString, stringEq);
+  i32 shared = 0;
+  for (i32 i = 0; i < n; i++) {
+    i32 h = short ? hashBytes(keys.get(i)) : everyByte(keys.get(i));
+    // V8-style tables mix the hash before masking; masking the raw low bits is the harsher test.
+    buckets[h & (size - 1)]++;
+    string hs = "\{h}";
+    if (seen.has(hs)) { shared++; }
+    seen.set(hs, true);
+  }
+  i32 most = 0;
+  i32 empty = 0;
+  for (i32 i = 0; i < size; i++) {
+    if (buckets[i] > most) { most = buckets[i]; }
+    if (buckets[i] == 0) { empty++; }
+  }
+  return "\{shared} sharing a full hash, fullest bucket \{most}, \{empty * 100 / size}% of \{size} empty";
+}
+
+export async i32 main(Sys sys) {
+  u8[] b = (await sys.readFile(sys.args()[0])).ok()!;
+  Map<string, bool> distinct = Map.create(hashString, stringEq);
+  Vec<u8[]> all = Vec.create();
+  Vec<Vec<u8[]>> byKind = Vec.create();
+  for (i32 k = 0; k < 9; k++) { byKind.push(Vec.create()); }
+  i32 at = 0;
+  while (at + 2 <= b.len()) {
+    u8 kind = b[at];
+    i32 n = b[at + 1] as i32;
+    u8[] key = u8[].filled(n, 0);
+    key.copyFrom(b, at + 2, 0, n);
+    at += 2 + n;
+    if (kind == 66 || n == 0) { continue; }
+    string k = hex(key);
+    if (distinct.has(k)) { continue; }
+    distinct.set(k, true);
+    all.push(key);
+    i32 kd = (key[0] as i32) < 9 ? key[0] as i32 : 8;
+    byKind.get(kd).push(key);
+  }
+  string[] names = ["accounts", "slots", "codes", "account trie nodes", "storage trie nodes", "receipts", "blocks", "canonical", "transactions"];
+  sys.log("\{all.len()} distinct keys");
+  sys.log("  all, length and 12+12 bytes: \{spread(all, true)}");
+  sys.log("  all, every byte:             \{spread(all, false)}");
+  for (i32 k = 0; k < 9; k++) {
+    if (byKind.get(k).len() < 2) { continue; }
+    sys.log("  \{names[k]} (\{byKind.get(k).len()}), 12+12: \{spread(byKind.get(k), true)}; every byte: \{spread(byKind.get(k), false)}");
+  }
+  return 0;
+}

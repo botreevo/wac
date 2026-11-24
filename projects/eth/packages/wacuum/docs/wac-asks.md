@@ -1,0 +1,131 @@
+# What wacuum wants from wac
+
+Found while building this, at wac `a473e07`. Each one has a reproduction small enough to paste.
+
+## A 41st field on `Engine` makes a program that imports it fail to check (wac `7f559349c`)
+
+`Engine` had 38 fields. Adding any three more (`Map<U256, U256>` each, nothing else changed) leaves
+`wac check packages/wacuum/src` clean but makes `wac check packages/wacuum-devnet` report *no such field* at
+`packages/wacuum-devnet/src/explorer.wac:83:45`, on `e.call(method, …).result`, where `Answer.result` is
+there. Two more fields are fine; the types do not matter. Worked around by putting the new state in one
+struct-typed field (`Persisting`, `src/engine/engine.wac`). Reported to the coordinator for wac.
+
+## A local declared in a loop of an async function is one object for every pass (wac `issues/lang/0474w`)
+
+`Ticket<bool> t;` inside a `while` that then awaits it gets, on its second pass, the first pass's ticket —
+already settled — so a wait queue built that way spins pushing it (to out of memory) or traps resolving it
+twice. Any struct declared with no initialiser does the same (`D d;` pushed twice is one `D`); a synchronous
+function, or a declaration with an initialiser, does not. Found by the store's read/write gate, whose waits
+take their ticket from a synchronous `parked()` instead (`src/store/tree.wac`); the snap test's server does
+the same.
+
+## An async lambda where wac cannot lower one is sometimes emitted as invalid wasm rather than declined (wac `7f559349c`)
+
+`issues/lang/0294c` says where an `async` lambda is lowered: the initialiser of a `fn<Ticket<…>(…)>`. Given one
+in a nullable field, `struct Holder { fn<Ticket<u8[]>()>? get; }` with `Holder(async () => s.root)`, a small
+program is declined with that explanation. The same in a bigger one — `Asker(..., async () => …)` passed
+for snap's pivot provider in `src/p2p/node.wac` — was not declined: wacc emitted a module V8 refused
+("Compiling function … `$lambda$13`: return[0] expected type (ref null 448), found call of type (ref null 1)"),
+and in the test file, one that trapped. Worked around by making that field synchronous (`fn<u8[]()>?`) and
+doing the asynchronous part in the asker's other lambda, which is a non-nullable field's. Worth a check
+that the decline happens wherever the lowering would not.
+
+## A program holding `fetch` and the client's block types fails to emit (wac `7f559349c`)
+
+`tools/mainnet/` was one program: it asked a node over `fetch` and ran blocks. Built, it stopped at
+`wacc: cannot emit tools/mainnet/replay.wac — a constant whose value is not a constant expression`, with no
+name and no line; `wac check` on the same file finds nothing. Bisected: it needs a struct of this file's
+that holds a `fetch.Caps` *or* has a method calling `fetch`, together with any use of `Header` from
+`src/chain/block.wac` (a local `Header h = g.header;` is enough), with `genesis.wac` in the program. Each of
+those alone builds, and so does a small file with all three, so there is no paste-sized reproduction yet —
+the 0374a family (a static declined inside a method instance) is the likeliest. Worked around by splitting
+the tool: `fetch.wac` talks to the node and never sees a block type, `replay.wac` runs blocks and never
+sees `fetch`, and `replay.sh` alternates them. wac master has `6f6b1d657` (types matched by declaration,
+not spelling), which may be the fix; check on the next pin move, and if not, the message should name the
+constant.
+
+## The static evaluator: no `switch`, and one step budget for a whole file (wac `issues/lang/0422w`)
+
+Two things met while moving bn254's and secp256k1's constants to compile time:
+
+- A `switch` anywhere on a static's path is "something the compiler cannot evaluate statically yet".
+  `U256.word` was a switch; it is ifs now, which compile no worse.
+- `Ev.create()` sets an 8,000,000-step budget and the checker makes one `Ev` per file (`ensureStaticView`,
+  `check.wac`), so every static in a file draws on the same budget: a static that evaluates alone fails when
+  placed after two others. The comment by `step()` reads as if the budget were per evaluation ("no table
+  anyone writes reaches it"). bn254 fits by computing its constants from one exponentiation rather than
+  three.
+
+## An operator method is not found from another file
+
+`spec/3-expressions/22-operators.md` says `a + b` on a struct calls the left operand's `[operators.add]`
+method. That works in the file declaring the struct and nowhere else:
+
+```wac
+// v.wac
+import { operators } from "core";
+export struct V {
+  i32 x;
+  V [operators.add](const this, const V rhs) { return V(this.x + rhs.x); }
+}
+export i32 here() { V a = V(1); return (a + a).x; }      // fine
+```
+
+```wac
+// use.wac
+import { operators } from "core";                         // with or without this line
+import { V } from "./v.wac";
+export i32 f() { V a = V(1); return (a + a).x; }         // error: V has no implementation of operators.add
+```
+
+`operatorMethodOf` in `packages/wacc/src/check.wac` looks the method up under
+`c.coreMember("operators." + sym)`, which is the *using* file's spelling of the symbol. That table is filled
+only while the checker processes a file that imports from core (`api.wac`, `noteCoreSym`), and the key the
+method was registered under is the declaring file's. `convertsToText` solved the same problem for
+`toString` by also looking under core's own name.
+
+**What it costs here:** `U256` has named methods (`a.add(b)`), not operators.
+
+## Not a bug: a `const` reference to a `const struct` stays `const`
+
+This was listed here as a checker gap, and it is not one. The sentence in `spec/2-types/17-const.md` that
+says no reference to a `const struct` "was ever writable — `const` or not" describes the situation; it is
+not a rule that lets `const` be dropped, and `§wac-const-no-launder-t584c4n` (a const reference never
+becomes a plain one) applies to every type. `return this;` from a `const this` method is accepted by the
+accessor exception, `§wac-deep-const-accessor-w3kf8nq`, which makes the result const at the call site.
+
+Written the way the language means it: `const W n = this;`, or `(const W) n` to rebind, and `const W` as
+the return type. `U256` still takes a plain `this` everywhere, which is simpler and costs nothing.
+
+## Done: a dense integer `switch` is one `br_table`
+
+wacc emitted a `switch` as a comparison per case, in order, so the EVM interpreter's opcode switch made an
+opcode's place in it what dispatching it cost: checking three hot opcodes ahead of it was 22% on the Node
+host. Since `d267592b8` a switch whose cases are dense integer constants is one `br_table`, and its subject
+is read once (it was read once per case compared, which was also a bug for a subject with effects).
+
+## Done: `bls` and `bignum` are reachable from outside the repository
+
+`lib.wac` exported neither, so KZG point evaluation and EIP-2537's seven precompiles could not be written.
+Both are exported since wac `96f6bd34d`, and `src/precompiles/bls.wac` is built on `bls`: every point
+evaluation and EIP-2537 state test passes. The one thing `bls` lacked for the EVM, the map from Fp to G1
+(its SSWU and 11-isogeny), is written there.
+
+## Done: the JavaScript hosts give a program the network it is granted
+
+`wac run --allow-net` on the Node host used to start the program as a child with only its standard
+streams, so `sys.net()` answered "not granted" and the node needed a native host. `01762d3f7` fixed it,
+and since the repin to `09e49772a` the node runs on the Node host as on wasmtime: the RPC and devnet end-to-end tests
+(TCP and UDP, against geth) both pass with the Node-hosted `wac`.
+
+## Done: a running Keccak-256
+
+RLPx's frame MACs are a Keccak-256 over everything sent so far, read after every frame without ending it.
+wac's crypto package had that shape only for SHA3-256; `crypto.Keccak256` is there since `3d6824b52`, and
+wacuum's own copy of the permutation is gone.
+
+## Done: a program importing from the `wac` dependency builds again
+
+`a5a17eeba` refused any `main(Sys)` program that imported a namespace member from `"wac"` ("the exported
+function `__wacHost` is not in the module the emitter produced"); `8b92a23dd` fixed it, and the repin to it
+also brought `01762d3f7`, which gives the Node host a network.

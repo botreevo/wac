@@ -1,0 +1,304 @@
+// derive — a runner for the deterministic WebAssembly machine, versions 3 and 2 (`src/machine.wac`).
+//
+//     derive recipe --program F [--args F] [--in DIR] [--slot NAME DIR]…   an input tree and a recipe over it, into the store;
+//                                                        prints the recipe's CID. --machine M: wasm-gc/wac-host/3
+//                                                        (the default) or wasm-gc/wac-host/2, both of which `run` carries
+//     derive canon IN OUT [--scan F]                    a module with canonical NaNs, as `run` runs it
+//     derive run RECIPE [--timeout MS] [--key F --runner NAME]
+//                                                        run it: prints the output tree's CID, or nothing on an abort;
+//                                                        with --key, signs a derivation, adds it to the store's
+//                                                        claim index, and prints its statement id too
+//
+// --store DIR (default .objects), --mirror DIR (repeatable) as for `obj`.
+//
+// The program is handed the checked bytes, never a file, and holds one capability: a file system made here, in
+// memory, from the verified input tree (`src/world.wac`). Its diagnostic output is not part of the output tree; this
+// runner reads it only to learn how the run ended, and passes it on to its own.
+
+import { Sys, Authority, Launch, Child, Files, Input, TimedOut, Ended } from "std";
+import { Read, Result, Ticket, flatten } from "core";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Store, ipfs.Resolver, ipfs.FileIn, ipfs.PROFILE, ipfs.encode, ipfs.readTree,
+         ipfs.importFiles, ipfs.importDir, ipfs.emptyDirsOf, ipfs.filesOnly, ipfs.Block, ipfs.DAG_CBOR } from "@/lib.wac";
+import { Recipe, recipeFrom, recipeId, recipeValue, Statement, Signed, signStatement, signedBlock, statementId } from "../src/claims.wac";
+import { Index, loadIndex, saveIndex } from "../src/graph.wac";
+import { Written, worldFiles } from "../src/world.wac";
+import { MACHINE, MACHINE_2, isMachine, FORMAT, Ending, endingOfEnded, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
+import { unhex } from "../src/hex.wac";
+import { canonicalize } from "../src/canon.wac";
+
+string flag(string[] a, string name, string fallback) {
+  for (i32 i = 0; i + 1 < a.len(); i++) { if (a[i] == name) { return a[i + 1]; } }
+  return fallback;
+}
+
+export async i32 main(Sys sys) {
+  string[] a = sys.args();
+  if (a.len() < 1) {
+    sys.warn("usage: derive recipe --program F [--args F] [--in DIR] [--slot NAME DIR]… | derive run RECIPE [--timeout MS] [--key F --runner NAME]  [--store DIR] [--mirror DIR]…");
+    return 2;
+  }
+  Store store = Store.dir(sys.files(), flag(a, "--store", ".objects"));
+  Store[] mirrors = Store[]();
+  for (i32 i = 0; i + 1 < a.len(); i++) {
+    if (a[i] != "--mirror") { continue; }
+    Store[] next = Store[].filled(mirrors.len() + 1, Store.dir(sys.files(), a[i + 1]));
+    for (i32 j = 0; j < mirrors.len(); j++) { next[j] = mirrors[j]; }
+    mirrors = next;
+  }
+  Resolver r = Resolver(store, mirrors);
+  if (a[0] == "recipe") { return await recipeCmd(sys, store, a); }
+  if (a[0] == "canon" && a.len() >= 3) { return await canonCmd(sys, a); }
+  if (a[0] == "run" && a.len() >= 2) { return await runCmd(sys, store, r, a); }
+  sys.warn("derive: unknown command \{a[0]}");
+  return 2;
+}
+
+async i32 recipeCmd(Sys sys, Store store, string[] a) {
+  string programPath = flag(a, "--program", "");
+  if (programPath == "") { sys.warn("derive recipe: --program is required"); return 2; }
+  Tree t = Tree(FileIn[](), string[]());
+  // `--in DIR` is the slot `in`; `--slot NAME DIR`, repeatable, any other: a recipe's input is its named slots, and a
+  // policy says which role each must be admitted in (src/slots.wac).
+  string inDir = flag(a, "--in", "");
+  if (inDir != "") {
+    match (await addSlot(sys, store, t, "in", inDir)) { Err(e): { sys.warn("derive: \{e}"); return 1; } Ok(_): { } }
+  }
+  for (i32 i = 0; i + 2 < a.len(); i++) {
+    if (a[i] != "--slot") { continue; }
+    string name = a[i + 1];
+    if (name == "program" || name == "args" || name == "in" || name.indexOf("/") >= 0 || name == "") {
+      sys.warn("derive: --slot \{name}: a slot of its own, not program, args or in, and no /"); return 2;
+    }
+    match (await addSlot(sys, store, t, name, a[i + 2])) { Err(e): { sys.warn("derive: \{e}"); return 1; } Ok(_): { } }
+  }
+  FileIn[] files = t.files;
+  string[] dirs = t.dirs;
+  match (await sys.readFile(programPath)) {
+    Err(e): { sys.warn("derive: \{programPath}: \{e}"); return 1; }
+    Ok(b): { files = plus(files, FileIn("program", b)); }
+  }
+  string argsPath = flag(a, "--args", "");
+  if (argsPath != "") {
+    match (await sys.readFile(argsPath)) {
+      Err(e): { sys.warn("derive: \{argsPath}: \{e}"); return 1; }
+      Ok(b): { files = plus(files, FileIn("args", b)); }
+    }
+  }
+  Cid input;
+  match (importFiles(store, files, dirs, PROFILE())) {
+    Err(e): { sys.warn("derive: \{e}"); return 1; }
+    Ok(c): { input = c; }
+  }
+  string machine = flag(a, "--machine", MACHINE());
+  if (!isMachine(machine)) { sys.warn("derive recipe: --machine is \{MACHINE()} or \{MACHINE_2()}, not \{machine}"); return 2; }
+  Recipe recipe = Recipe(machine, FORMAT(), input);
+  Cid id = recipeId(recipe);
+  match (store.put(Block(id, encode(recipeValue(recipe))))) {
+    Err(e): { sys.warn("derive: \{e}"); return 1; }
+    Ok(_): { }
+  }
+  sys.warn("input \{input.text()}");
+  sys.log(id.text());
+  return 0;
+}
+
+/** A recipe's input as it is put together: files and empty directories, by path. */
+struct Tree {
+  FileIn[] files;
+  string[] dirs;
+}
+
+/** The directory `dir` as the slot `name`: through the importer, so it is read exactly as `obj add` reads it. */
+async Result<bool, string> addSlot(Sys sys, Store store, Tree t, string name, string dir) {
+  Cid sub;
+  match (await importDir(store, sys.files(), dir, PROFILE())) {
+    Err(e): { return Result.Err("\{dir}: \{e}"); }
+    Ok(c): { sub = c; }
+  }
+  FileIn[] fs;
+  match (readTree(Resolver(store, Store[]()), sub)) { Err(e): { return Result.Err(e); } Ok(x): { fs = x; } }
+  FileIn[] only = filesOnly(fs);
+  string[] empty = emptyDirsOf(fs);
+  for (i32 i = 0; i < only.len(); i++) { t.files = plus(t.files, FileIn(name + "/" + only[i].path, only[i].content)); }
+  t.dirs = plusS(t.dirs, name);
+  for (i32 i = 0; i < empty.len(); i++) { t.dirs = plusS(t.dirs, name + "/" + empty[i]); }
+  return Result.Ok(true);
+}
+
+string[] plusS(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+FileIn[] plus(FileIn[] xs, FileIn x) {
+  FileIn[] out = FileIn[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+async i32 runCmd(Sys sys, Store store, Resolver r, string[] a) {
+  Cid id;
+  match (parseCid(a[1])) {
+    Err(e): { sys.warn("derive: \{e}"); return 1; }
+    Ok(c): { id = c; }
+  }
+  Recipe recipe;
+  match (r.block(id)) {
+    Err(e): { sys.warn("derive: \{e}"); return 1; }
+    Ok(b): {
+      match (recipeFrom(b)) {
+        Err(e): { sys.warn("derive: \{e}"); return 1; }
+        Ok(x): { recipe = x; }
+      }
+    }
+  }
+  if (!isMachine(recipe.machine)) { sys.warn("derive: this runner is for \{MACHINE()} and \{MACHINE_2()}, not \{recipe.machine}"); return 1; }
+  if (recipe.format != FORMAT()) { sys.warn("derive: this runner reads \{FORMAT()}, not \{recipe.format}"); return 1; }
+  FileIn[] tree;
+  match (readTree(r, recipe.input)) {
+    Err(e): { sys.warn("derive: \{e}"); return 1; }
+    Ok(fs): { tree = fs; }
+  }
+  FileIn[] input = filesOnly(tree);
+  u8[]? program = null;
+  u8[]? argsFile = null;
+  for (i32 i = 0; i < input.len(); i++) {
+    if (input[i].path == "program") { program = input[i].content; }
+    if (input[i].path == "args") { argsFile = input[i].content; }
+  }
+  if (program is null) { sys.warn("derive: the input tree has no file `program`"); return 1; }
+
+  // The machine's floats: every produced NaN canonical, by rewriting the module (src/canon.wac). A module the
+  // rewrite cannot read is refused, never run without the profile.
+  u8[] runnable;
+  match (canonicalize(program!)) {
+    Err(e): { sys.warn("derive: abort: the program cannot be given canonical NaNs: \{e}"); return 3; }
+    Ok(c): { runnable = c.module; }
+  }
+
+  Written written = Written.create();
+  Files world = worldFiles(input, emptyDirsOf(tree), written);
+  Child kid;
+  // Sealed (since machine version 2): the program, and anything it spawns, has no clock and no random bytes, on every host.
+  // Version 1 could not take them away (docs/runner.md, finding 1).
+  match (await sys.procs().spawn(runnable, argsOf(argsFile), Authority(world, null, null, null),
+                                 Launch("/", false, false, false, false).sealed())) {
+    Err(e): { sys.warn("derive: abort: the program did not start: \{e}"); return 3; }
+    Ok(c): { kid = c; }
+  }
+  await kid.input().close();
+  Ticket<Result<u8[], string>> log = drained(kid.output());
+  Ticket<Result<u8[], string>> err = drained(kid.errors());
+  i32 timeout = number(flag(a, "--timeout", "-1"));
+  // How it ended, as the host reports it (`Child.ended()`): the same on every host, not read from what it printed.
+  Ended how;
+  match (await sys.clock().within(kid.ended(), timeout)) {
+    Ok(e): { how = e; }
+    Err(e): {
+      kid.stop();
+      await log;
+      await err;
+      if (e is TimedOut) { sys.warn("derive: abort: out of time after \{timeout}ms; no claim"); }
+      else { sys.warn("derive: abort: the host could not say how it ended: \{e}; no claim"); }
+      return 3;
+    }
+  }
+  Result<u8[], string> logged = await log;
+  Result<u8[], string> said = await err;
+  if (logged.isErr() || said.isErr()) { sys.warn("derive: abort: its output was not read to the end"); return 3; }
+  if (said.unwrap().len() > 0) { await sys.stderr().write(said.unwrap()); }
+  Ending ending = endingOfEnded(recipe.machine, how);
+  if (ending.kind == "abort") { sys.warn("derive: abort: \{ending.why}; no claim"); return 3; }
+
+  Cid output;
+  match (importFiles(store, outputFiles(ending, logged.unwrap(), written), outputDirs(written), PROFILE())) {
+    Err(e): { sys.warn("derive: \{e}"); return 1; }
+    Ok(c): { output = c; }
+  }
+  sys.warn("derive: \{ending.kind == "exit" ? "exit \{ending.code}" : "trap \{ending.name}"}");
+  sys.log(output.text());
+
+  string keyPath = flag(a, "--key", "");
+  if (keyPath == "") { return 0; }
+  u8[]? key = null;
+  match (await sys.readFile(keyPath)) {
+    Err(e): { sys.warn("derive: \{keyPath}: \{e}"); return 1; }
+    Ok(b): { key = unhex(withoutSpace(b)); }
+  }
+  if (key is null) { sys.warn("derive: \{keyPath} is not a hex key"); return 1; }
+  Signed s = signStatement(Statement.Derivation(id, output, flag(a, "--runner", "reckon-derive/0")), key!);
+  // Into the store's claim index, with the recipe, so `claim origins` and `claim admit` see it.
+  Index ix = loadIndex(store).index;
+  match (ix.add(s)) { Err(e): { sys.warn("derive: \{e}"); return 1; } Ok(_): { } }
+  ix.addRecipe(recipe);
+  match (saveIndex(ix, store)) { Err(e): { sys.warn("derive: \{e}"); return 1; } Ok(_): { } }
+  sys.log(statementId(s.statement).text());
+  return 0;
+}
+
+/** Everything a stream gives until it ends. */
+async Result<u8[], string> drained(Input in) {
+  u8[] all = u8[]();
+  while (true) {
+    auto got = await in.chunk();
+    if (got.isErr()) { return Result.Err("\{got.err()!}"); }
+    match (got.unwrap()) {
+      Data(bytes): {
+        u8[] next = u8[].filled(all.len() + bytes.len(), 0);
+        next.copyFrom(all, 0, 0, all.len());
+        next.copyFrom(bytes, 0, all.len(), bytes.len());
+        all = next;
+      }
+      End: { return Result.Ok(all); }
+      Failed(why): { return Result.Err("\{why}"); }
+    }
+  }
+}
+
+/** A decimal number, or -1. */
+i32 number(string s) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0 || b.len() > 9) { return -1; }
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return -1; }
+    n = n * 10 + (b[i] - '0') as i32;
+  }
+  return n;
+}
+
+/** A key file's text, without the whitespace around it. */
+string withoutSpace(u8[] b) {
+  i32 from = 0;
+  i32 to = b.len();
+  while (from < to && (b[from] == ' ' || b[from] == '\n' || b[from] == '\r' || b[from] == '\t')) { from++; }
+  while (to > from && (b[to - 1] == ' ' || b[to - 1] == '\n' || b[to - 1] == '\r' || b[to - 1] == '\t')) { to--; }
+  u8[] out = u8[].filled(to - from, 0);
+  out.copyFrom(b, from, 0, to - from);
+  return string.fromBytes(out);
+}
+
+/** `derive canon IN OUT [--scan FILE]`: the module with canonical NaNs, as the runner will run it; the scan is for the oracle. */
+async i32 canonCmd(Sys sys, string[] a) {
+  match (await sys.readFile(a[1])) {
+    Err(e): { sys.warn("derive: \{a[1]}: \{e}"); return 1; }
+    Ok(b): {
+      match (canonicalize(b)) {
+        Err(e): { sys.warn("derive: \{e}"); return 1; }
+        Ok(c): {
+          await sys.writeFile(a[2], c.module);
+          string scan = flag(a, "--scan", "");
+          if (scan != "") { await sys.writeFile(scan, c.scan.toBytes()); }
+          return 0;
+        }
+      }
+    }
+  }
+}
+
+bool has(string[] a, string name) {
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] == name) { return true; } }
+  return false;
+}

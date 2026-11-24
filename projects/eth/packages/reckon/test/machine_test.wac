@@ -1,0 +1,90 @@
+// The deterministic machine's pure parts: how a run's ending is read, and the world a program is given.
+
+import { ipfs.FileIn } from "@/lib.wac";
+import { Ended, TrapKind } from "std";
+import { MACHINE, MACHINE_2, Ending, endingOfEnded, trapName, argsOf, outputFiles, outputDirs } from "../src/machine.wac";
+import { Written, clean } from "../src/world.wac";
+import { Check } from "./check.wac";
+
+string ends(Ending e) { return e.kind == "abort" ? "abort" : e.status(); }
+
+export string testEndingsVersion3() {
+  Check c = Check.create();
+  string m = MACHINE();
+  c.eq(ends(endingOfEnded(m, Ended.Exited(0))), "exit 0\n", "a clean exit");
+  c.eq(ends(endingOfEnded(m, Ended.Exited(7))), "exit 7\n", "a status");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "whatever an engine says"))), "trap memory-bounds\n", "bounds, by kind");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.DivideByZero, ""))), "trap divide-by-zero\n", "division, with nothing said");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.NullReference, "x"))), "trap null-reference\n", "null");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.UnreachableCode, "x"))), "trap unreachable-code\n", "unreachable");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.BadConversion, "x"))), "trap bad-conversion\n", "conversion");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.BadCast, "x"))), "trap bad-cast\n", "cast");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.TableBounds, "x"))), "trap table-bounds\n", "table");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.IntegerOverflow, "x"))), "trap integer-overflow\n", "overflow");
+  Ending own = endingOfEnded(m, Ended.Trapped(TrapKind.Explicit, "half needs an even number"));
+  c.ok(ends(own) == "trap explicit\n" && own.message! == "half needs an even number", "the program's own trap, and its message");
+  FileIn[] files = outputFiles(own, u8[](), Written.create());
+  c.ok(files.len() == 3 && files[2].path == "message", "the message is in the output tree");
+  // Limits, and what no host classifies, yield nothing.
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.StackExhausted, "x"))), "abort", "out of stack");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.Unclassified, "x"))), "abort", "unclassified");
+  c.eq(ends(endingOfEnded(m, Ended.HostLimit("out of memory"))), "abort", "a host limit");
+  return c.report();
+}
+
+export string testEndingsVersion2AsBefore() {
+  Check c = Check.create();
+  string m = MACHINE_2();
+  // /2 reads its names from what the engine said, as it always did: an array's bounds and memory's are different names.
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "array element access out of bounds"))), "trap array-out-of-bounds\n", "V8 bounds");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "wasm trap: out of bounds array access"))), "trap array-out-of-bounds\n", "wasmtime bounds");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, "memory access out of bounds"))), "trap memory-out-of-bounds\n", "memory");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.MemoryBounds, ""))), "abort", "bounds with nothing said: /2 cannot tell which");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.UnreachableCode, ""))), "trap unreachable\n", "unreachable by kind");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.NullReference, "dereferencing a null pointer"))), "trap null\n", "null");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.Explicit, "the program's words"))), "trap unreachable\n", "an explicit trap, as /2 saw it");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.Unclassified, "requested new array is too large"))), "abort", "memory");
+  c.eq(ends(endingOfEnded(m, Ended.Trapped(TrapKind.StackExhausted, "x"))), "abort", "stack");
+  c.eq(trapName("illegal cast"), "cast", "V8 cast");
+  c.eq(trapName("wasm trap: cast failure"), "cast", "wasmtime cast");
+  return c.report();
+}
+
+export string testArgs() {
+  Check c = Check.create();
+  c.ok(argsOf(null).len() == 0, "no file, no arguments");
+  string[] a = argsOf("x\ny\n".toBytes());
+  c.ok(a.len() == 2 && a[0] == "x" && a[1] == "y", "two lines");
+  string[] b = argsOf("x\n\nz".toBytes());
+  c.ok(b.len() == 3 && b[1] == "" && b[2] == "z", "an empty argument kept, no final newline");
+  return c.report();
+}
+
+export string testPaths() {
+  Check c = Check.create();
+  c.eq(clean("/in/a/../b")!, "in/b", "dot-dot inside");
+  c.eq(clean("in/./b//c")!, "in/b/c", "relative from the root");
+  c.ok(clean("/in/../../etc") is null, "climbing out is nothing");
+  c.ok(clean("/..") is null, "the root's parent is nothing");
+  c.eq(clean("/")!, "", "the root");
+  return c.report();
+}
+
+// The world's file operations answer through the scheduler, which a test here does not run; `corpus/files.wac` drives
+// them through `tools/machine.sh` instead. What is pure is checked here.
+export string testOutputTree() {
+  Check c = Check.create();
+  Written w = Written.create();
+  w.dirs = ["d", "d/e"];
+  w.put("d/f", "x".toBytes());
+  w.put("top", "y".toBytes());
+  w.put("d/f", "z".toBytes());
+  FileIn[] files = outputFiles(Ending.trapped("null"), "log".toBytes(), w);
+  c.ok(files.len() == 4 && files[0].path == "status" && files[1].path == "log", "status and log first");
+  c.eq(string.fromBytes(files[0].content), "trap null\n", "the status line");
+  c.ok(files[2].path == "out/d/f" && string.fromBytes(files[2].content) == "z", "a rewrite replaces");
+  string[] dirs = outputDirs(w);
+  c.ok(dirs.len() == 3 && dirs[0] == "out" && dirs[1] == "out/d" && dirs[2] == "out/d/e", "out is always a directory");
+  c.ok(outputDirs(Written.create()).len() == 1, "even when nothing was written");
+  return c.report();
+}

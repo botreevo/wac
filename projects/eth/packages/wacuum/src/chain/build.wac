@@ -1,0 +1,101 @@
+// Building a block: what a consensus client asks for when its validator is due to propose. It names the
+// parent, the timestamp, the randomness, who gets the fees, the withdrawals and the beacon root; this fills
+// in everything else by running the candidates on the parent's state and keeping those that fit.
+//
+// A built block goes through exactly the code an imported one does — `executeBody` — so the header it gets
+// is the header import would demand. The consensus client sends it back through `engine_newPayload`, which
+// checks that from scratch.
+
+import { Map, Vec } from "core";
+import { keccak256 } from "../crypto/keccak.wac";
+import { rlp.Item, rlp.encode } from "@/lib.wac";
+import { U256 } from "../u256.wac";
+import { World, hashU256, eqU256 } from "../state/world.wac";
+import { decodeTransaction, decodeWith, SenderCache, DecodedTx } from "../tx/decode.wac";
+import { BlockEnv } from "../evm/evm.wac";
+import { Spec } from "../evm/spec.wac";
+import { blobGasPrice } from "../tx/process.wac";
+import { Header, Block, Withdrawal, Body, executeBody, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS } from "./block.wac";
+
+export struct Attributes {
+  U256 timestamp;
+  U256 prevRandao;
+  U256 feeRecipient;
+  Withdrawal[] withdrawals;
+  U256 parentBeaconBlockRoot;
+  /** EIP-7843's slot (Amsterdam), zero before. */
+  U256 slotNumber;
+}
+
+export struct Built {
+  Block block;
+  Body body;
+}
+
+/**
+ * A block on `parent` from `candidates`, run on `w` — the parent's state, which this changes. The gas
+ * limit stays the parent's. A candidate that does not fit, or is not valid on this state, is left out.
+ */
+export Built buildBlock(Spec spec, World w, Header parent, Attributes a, Item[] candidates, U256 chainId, Map<U256, U256> hashes,
+                        u8[] extraData, SenderCache? senders) {
+  Header h = Header(parent.hash, U256.fromHex(EMPTY_OMMERS)!, a.feeRecipient, U256.zero(), U256.zero(), U256.zero(),
+                    u8[].filled(256, 0), U256.zero(), parent.number.add(U256.one()), parent.gasLimit, U256.zero(),
+                    a.timestamp, extraData, a.prevRandao, u8[].filled(8, 0), nextBaseFee(parent), U256.zero(),
+                    U256.zero(), nextExcessBlobGas(spec, parent), a.parentBeaconBlockRoot, U256.zero(), U256.zero(), a.slotNumber, U256.zero());
+  BlockEnv env = BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee,
+                          blobGasPrice(spec, h.excessBlobGas), chainId, hashes, a.slotNumber);
+  Item[] order = orderCandidates(candidates, chainId, senders);
+  Body body = executeBody(spec, w, env, h, order, a.withdrawals, true, senders);
+  h.gasUsed = U256.ofU64(body.gasUsed as! u64);
+  h.blobGasUsed = U256.ofU64(body.blobGasUsed as! u64);
+  h.bloom = body.bloom;
+  h.txRoot = body.txRoot;
+  h.receiptsRoot = body.receiptsRoot;
+  h.withdrawalsRoot = body.withdrawalsRoot;
+  h.stateRoot = body.stateRoot;
+  h.requestsHash = body.requestsHash;
+  if (spec.isAmsterdam && body.bal is not null) { h.blockAccessListHash = body.bal!.hash(); }
+  h.hash = U256.fromBytes(keccak256(encode(headerItem(spec, h))), 0, 32);
+  return Built(Block(h, body.included, false, a.withdrawals), body);
+}
+
+/**
+ * The candidates grouped by sender, in the order each sender first appeared, and each sender's sorted by
+ * nonce — so a transaction that arrived before the one whose nonce it follows still gets in. One pass of
+ * `executeBody` over that order then includes everything that can be.
+ */
+Item[] orderCandidates(Item[] candidates, U256 chainId, SenderCache? cache) {
+  Vec<U256> senders = Vec.create();
+  Map<U256, Vec<i32>> bySender = Map.create(hashU256, eqU256);
+  U256[] nonces = U256[].filled(candidates.len(), U256.zero());
+  for (i32 i = 0; i < candidates.len(); i++) {
+    DecodedTx d = decodeWith(candidates[i], chainId, cache);
+    if (d.error != "") { continue; }
+    nonces[i] = d.tx.nonce;
+    Vec<i32>? group = bySender.get(d.tx.sender);
+    if (group is null) {
+      Vec<i32> fresh = Vec.create();
+      bySender.set(d.tx.sender, fresh);
+      senders.push(d.tx.sender);
+      group = fresh;
+    }
+    group!.push(i);
+  }
+  Vec<Item> out = Vec.create();
+  U256[] order = senders.toArray();
+  for (i32 s = 0; s < order.len(); s++) {
+    i32[] idx = bySender.get(order[s])!.toArray();
+    // Insertion sort by nonce: a sender's pending transactions are few.
+    for (i32 a = 1; a < idx.len(); a++) {
+      i32 v = idx[a];
+      i32 b = a - 1;
+      while (b >= 0 && nonces[idx[b]].gt(nonces[v])) {
+        idx[b + 1] = idx[b];
+        b--;
+      }
+      idx[b + 1] = v;
+    }
+    for (i32 k = 0; k < idx.len(); k++) { out.push(candidates[idx[k]]); }
+  }
+  return out.toArray();
+}

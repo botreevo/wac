@@ -1,0 +1,87 @@
+// wac.lock's imports, pinned by CID (docs/lock.md). Each entry gains `cid`: the root, under the unixfs-v1-2025
+// profile, of the commit's whole tree, which is the package cache's checkout less its completion marker.
+//
+// v1's `src/lock.wac` (deleted; in the history at 2a2241d) read the same file with a tree hash of its own; this
+// replaced it (docs/decisions/J-v1-code.md). It keeps v1's `tree` and `root` fields as they are, and refuses to rewrite a lock
+// holding a field it does not know, rather than dropping it.
+
+import { Result } from "core";
+import { json.parseJson5, json.JsonValue, json.JsonObject } from "wac";
+
+/** What the package cache adds to a checkout to say it is complete (wac's `packages/wacpkg`, and tools/deps.sh). */
+export string MARKER() { return "pack.pack"; }
+
+export struct Dep {
+  string name;
+  string git;
+  string ref;
+  string subdir;
+  string commit;
+  string cid;
+  /** v1's fields, carried through unchanged. */
+  string tree;
+  string root;
+}
+
+string[] KNOWN() { return ["git", "ref", "subdir", "commit", "cid", "tree", "root"]; }
+
+string field(JsonValue v, string key) { return v.member(key)?.text() ?? ""; }
+
+export Result<Dep[], string> readDeps(u8[] text) {
+  JsonValue doc;
+  match (parseJson5(text)) {
+    Err(e): { return Result.Err("wac.lock: \{e.text()}"); }
+    Ok(v): { doc = v; }
+  }
+  JsonObject? imports = doc.member("imports")?.object();
+  if (imports is null) { return Result.Ok(Dep[]()); }
+  Dep[] out = Dep[].defaulted(imports!.len());
+  for (i32 i = 0; i < imports!.len(); i++) {
+    string name = imports!.at(i).keyStr();
+    JsonValue e = imports!.at(i).value;
+    JsonObject? fields = e.object();
+    if (fields is null) { return Result.Err("wac.lock: \{name} is not an object"); }
+    for (i32 j = 0; j < fields!.len(); j++) {
+      string k = fields!.at(j).keyStr();
+      bool known = false;
+      for (i32 m = 0; m < KNOWN().len(); m++) { if (KNOWN()[m] == k) { known = true; } }
+      if (!known) { return Result.Err("wac.lock: \{name} has a field this does not know, \"\{k}\", and would lose it"); }
+    }
+    out[i] = Dep(name, field(e, "git"), field(e, "ref"), field(e, "subdir"), field(e, "commit"), field(e, "cid"),
+                 field(e, "tree"), field(e, "root"));
+  }
+  return Result.Ok(out);
+}
+
+/** The lock written back: one entry per line, fields in a fixed order, as this repository's lock is written. */
+export string writeDeps(Dep[] ds) {
+  string out = "{\n  \"imports\": {\n";
+  for (i32 i = 0; i < ds.len(); i++) {
+    Dep d = ds[i];
+    string line = "    \"\{d.name}\": { \"git\": \"\{d.git}\", \"ref\": \"\{d.ref}\"";
+    if (d.subdir != "") { line += ", \"subdir\": \"\{d.subdir}\""; }
+    line += ", \"commit\": \"\{d.commit}\"";
+    if (d.tree != "") { line += ", \"tree\": \"\{d.tree}\""; }
+    if (d.root != "") { line += ", \"root\": \"\{d.root}\""; }
+    if (d.cid != "") { line += ", \"cid\": \"\{d.cid}\""; }
+    out += line + " }" + (i + 1 < ds.len() ? "," : "") + "\n";
+  }
+  return out + "  }\n}\n";
+}
+
+/** A repository URL as wac's cache names it (`packages/wacpkg/src/cache.wac`'s `escapeRepo`). */
+export string escapeRepo(string url) {
+  string out = "";
+  string hexd = "0123456789ABCDEF";
+  u8[] b = url.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    u8 c = b[i];
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') { out += string.fromBytes([c]); }
+    else if (c >= 'A' && c <= 'Z') { out += "!" + string.fromBytes([c + 32]); }
+    else { out += "%" + hexd.slice((c >> 4) as i32, ((c >> 4) as i32) + 1) + hexd.slice((c & 15) as i32, ((c & 15) as i32) + 1); }
+  }
+  return out;
+}
+
+/** Where the cache under `home` ($WAC_HOME) keeps `d`. */
+export string cacheDirOf(string home, Dep d) { return home + "/cache/git/" + escapeRepo(d.git) + "/" + d.commit; }

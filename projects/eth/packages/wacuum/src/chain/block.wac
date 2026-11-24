@@ -1,0 +1,890 @@
+// A block: its header checked against its parent's, its body executed, and every commitment the header
+// makes about the result checked against what execution produced.
+//
+// This follows execution-specs' `validate_header` and `apply_body` for Cancun and Prague, in their order:
+// the system calls that begin a block (EIP-4788's beacon root, and from Prague EIP-2935's parent hash),
+// the transactions, the withdrawals, and from Prague the requests of EIP-7685. Anything wrong anywhere
+// makes the whole block invalid, and the caller runs it on a copy of the world so that an invalid block
+// leaves no trace.
+
+import { Map, Vec } from "core";
+import { crypto.sha256 } from "wac";
+import { keccak256 } from "../crypto/keccak.wac";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "@/lib.wac";
+import { U256 } from "../u256.wac";
+import { World, Log, ChangeSet, hashU256, eqU256 } from "../state/world.wac";
+import { stateRoot, u256Bytes } from "../state/root.wac";
+import { trieRoot } from "../trie/trie.wac";
+import { BlockEnv, TxEnv, Evm, Message, Meter, processMessage, addressBytes, createAddress, STATE_STORAGE_SET } from "../evm/evm.wac";
+import { Outcome } from "../evm/interp.wac";
+import { OpTable } from "../evm/table.wac";
+import { Spec, MAX_RLP_BLOCK_SIZE } from "../evm/spec.wac";
+import { precompileAddresses } from "../evm/precompiles.wac";
+import { Transaction, Processed, processTransaction, blobGasPrice, GAS_PER_BLOB } from "../tx/process.wac";
+import { processAmsterdam } from "../tx/amsterdam.wac";
+import { BlockAccessList } from "../state/bal.wac";
+import { DecodedTx, decodeTransaction, decodeWith, SenderCache } from "../tx/decode.wac";
+
+export struct Header {
+  U256 parentHash;
+  U256 ommersHash;
+  U256 coinbase;
+  U256 stateRoot;
+  U256 txRoot;
+  U256 receiptsRoot;
+  u8[] bloom;
+  U256 difficulty;
+  U256 number;
+  U256 gasLimit;
+  U256 gasUsed;
+  U256 timestamp;
+  u8[] extraData;
+  U256 prevRandao;
+  u8[] nonce;
+  U256 baseFee;
+  U256 withdrawalsRoot;
+  U256 blobGasUsed;
+  U256 excessBlobGas;
+  U256 parentBeaconBlockRoot;
+  /** Prague's EIP-7685 commitment; zero before it. */
+  U256 requestsHash;
+  /** Amsterdam's EIP-7928 commitment to the block's access list; zero before it. */
+  U256 blockAccessListHash;
+  /** Amsterdam's EIP-7843 beacon slot; zero before it. */
+  U256 slotNumber;
+  /** keccak256 of the header's RLP. */
+  U256 hash;
+
+  Header copy(this) {
+    return Header(this.parentHash, this.ommersHash, this.coinbase, this.stateRoot, this.txRoot, this.receiptsRoot, this.bloom,
+                  this.difficulty, this.number, this.gasLimit, this.gasUsed, this.timestamp, this.extraData, this.prevRandao,
+                  this.nonce, this.baseFee, this.withdrawalsRoot, this.blobGasUsed, this.excessBlobGas,
+                  this.parentBeaconBlockRoot, this.requestsHash, this.blockAccessListHash, this.slotNumber, this.hash);
+  }
+}
+
+export struct Withdrawal {
+  U256 index;
+  U256 validator;
+  U256 address;
+  /** In gwei. */
+  U256 amount;
+}
+
+export struct Block {
+  Header header;
+  Item[] txs;
+  bool hasOmmers;
+  Withdrawal[] withdrawals;
+}
+
+/** What decoding produced: a block, or why there is none. */
+export struct BlockDecode {
+  Block? block;
+  string error;
+}
+
+Header emptyHeader() {
+  return Header(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), u8[].filled(0, 0),
+                U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), u8[].filled(0, 0), U256.zero(),
+                u8[].filled(0, 0), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero());
+}
+
+/** Reads header fields in order, keeping the first problem. */
+struct Reader {
+  Item[] items;
+  i32 at;
+  string error;
+
+  u8[] bytes(this) {
+    if (this.at >= this.items.len()) {
+      if (this.error == "") { this.error = "too few header fields"; }
+      return u8[].filled(0, 0);
+    }
+    Item it = this.items[this.at];
+    this.at++;
+    if (isList(it)) {
+      if (this.error == "") { this.error = "a list in a header field"; }
+      return u8[].filled(0, 0);
+    }
+    return bytesOf(it);
+  }
+  U256 int(this) {
+    u8[] b = this.bytes();
+    if (b.len() > 32 || (b.len() > 0 && b[0] == 0)) {
+      if (this.error == "") { this.error = "a header integer that is not canonical"; }
+      return U256.zero();
+    }
+    return U256.fromBytes(b, 0, b.len());
+  }
+  U256 fixed(this, i32 n) {
+    u8[] b = this.bytes();
+    if (b.len() != n && this.error == "") { this.error = "a header field of the wrong length"; }
+    return U256.fromBytes(b, 0, n);
+  }
+}
+
+/**
+ * A header of any fork's shape, from Frontier's fifteen fields to Prague's twenty-one: each field a fork added read if
+ * it is there. Only for a header this node never runs — an ancestor before Cancun, among the 256 a snap sync keeps
+ * for BLOCKHASH, which only needs its hash, taken here from the bytes as they came.
+ */
+export Header? anyHeaderOf(Item it, string[] why) {
+  if (!isList(it)) {
+    why[0] = "the header is not a list";
+    return null;
+  }
+  Item[] f = itemsOf(it);
+  if (f.len() < 15 || f.len() > 23) {
+    why[0] = "a header with \{f.len()} fields";
+    return null;
+  }
+  Reader r = Reader(f, 0, "");
+  Header h = emptyHeader();
+  h.parentHash = r.fixed(32);
+  h.ommersHash = r.fixed(32);
+  h.coinbase = r.fixed(20);
+  h.stateRoot = r.fixed(32);
+  h.txRoot = r.fixed(32);
+  h.receiptsRoot = r.fixed(32);
+  h.bloom = r.bytes();
+  h.difficulty = r.int();
+  h.number = r.int();
+  h.gasLimit = r.int();
+  h.gasUsed = r.int();
+  h.timestamp = r.int();
+  h.extraData = r.bytes();
+  h.prevRandao = r.fixed(32);
+  h.nonce = r.bytes();
+  if (f.len() >= 16) { h.baseFee = r.int(); }
+  if (f.len() >= 17) { h.withdrawalsRoot = r.fixed(32); }
+  if (f.len() >= 20) {
+    h.blobGasUsed = r.int();
+    h.excessBlobGas = r.int();
+    h.parentBeaconBlockRoot = r.fixed(32);
+  }
+  if (f.len() >= 21) { h.requestsHash = r.fixed(32); }
+  if (f.len() >= 23) {
+    h.blockAccessListHash = r.fixed(32);
+    h.slotNumber = r.int();
+  }
+  if (r.error != "") {
+    why[0] = r.error;
+    return null;
+  }
+  h.hash = U256.fromBytes(keccak256(encode(it)), 0, 32);
+  return h;
+}
+
+/**
+ * A header from its RLP item: twenty fields for Cancun, twenty-one with Prague's requests hash, twenty-three with
+ * Amsterdam's block access list hash and slot number.
+ */
+export Header? headerOf(Spec spec, Item it, string[] why) {
+  if (!isList(it)) {
+    why[0] = "the header is not a list";
+    return null;
+  }
+  Item[] f = itemsOf(it);
+  i32 want = spec.isAmsterdam ? 23 : spec.isPrague ? 21 : 20;
+  if (f.len() != want) {
+    why[0] = "a header with \{f.len()} fields, want \{want}";
+    return null;
+  }
+  Reader r = Reader(f, 0, "");
+  Header h = emptyHeader();
+  h.parentHash = r.fixed(32);
+  h.ommersHash = r.fixed(32);
+  h.coinbase = r.fixed(20);
+  h.stateRoot = r.fixed(32);
+  h.txRoot = r.fixed(32);
+  h.receiptsRoot = r.fixed(32);
+  h.bloom = r.bytes();
+  h.difficulty = r.int();
+  h.number = r.int();
+  h.gasLimit = r.int();
+  h.gasUsed = r.int();
+  h.timestamp = r.int();
+  h.extraData = r.bytes();
+  h.prevRandao = r.fixed(32);
+  h.nonce = r.bytes();
+  h.baseFee = r.int();
+  h.withdrawalsRoot = r.fixed(32);
+  h.blobGasUsed = r.int();
+  h.excessBlobGas = r.int();
+  h.parentBeaconBlockRoot = r.fixed(32);
+  if (spec.isPrague) { h.requestsHash = r.fixed(32); }
+  if (spec.isAmsterdam) {
+    h.blockAccessListHash = r.fixed(32);
+    h.slotNumber = r.int();
+  }
+  if (h.bloom.len() != 256 && r.error == "") { r.error = "a bloom that is not 256 bytes"; }
+  if (h.nonce.len() != 8 && r.error == "") { r.error = "a nonce that is not 8 bytes"; }
+  if (r.error != "") {
+    why[0] = r.error;
+    return null;
+  }
+  h.hash = U256.fromBytes(keccak256(encode(it)), 0, 32);
+  return h;
+}
+
+/** A header item's timestamp, its twelfth field: what decides which fork the block is under. */
+export U256 timestampOf(Item header) {
+  if (!isList(header) || itemsOf(header).len() < 12 || isList(itemsOf(header)[11])) { return U256.zero(); }
+  u8[] b = bytesOf(itemsOf(header)[11]);
+  return b.len() > 32 ? U256.zero() : U256.fromBytes(b, 0, b.len());
+}
+
+/** The timestamp of a block from its RLP, zero when it does not get that far — the full decode will say why. */
+export U256 blockTimestamp(u8[] rlpBytes) {
+  Decoded d = decode(rlpBytes);
+  if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 1) { return U256.zero(); }
+  return timestampOf(itemsOf(d.item)[0]);
+}
+
+/** A block from its RLP: header, transactions, ommers and withdrawals. */
+export BlockDecode decodeBlock(Spec spec, u8[] rlpBytes) {
+  Decoded d = decode(rlpBytes);
+  if (!d.ok) { return BlockDecode(null, "block RLP: " + d.error); }
+  if (!isList(d.item)) { return BlockDecode(null, "a block that is not a list"); }
+  Item[] parts = itemsOf(d.item);
+  if (parts.len() != 4) { return BlockDecode(null, "a block with \{parts.len()} parts, want 4"); }
+  string[] why = [""];
+  Header? h = headerOf(spec, parts[0], why);
+  if (h is null) { return BlockDecode(null, why[0]); }
+  if (!isList(parts[1]) || !isList(parts[2]) || !isList(parts[3])) { return BlockDecode(null, "a block body part that is not a list"); }
+  Item[] ws = itemsOf(parts[3]);
+  Withdrawal[] withdrawals = Withdrawal[].filled(ws.len(), Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero()));
+  for (i32 i = 0; i < ws.len(); i++) {
+    if (!isList(ws[i]) || itemsOf(ws[i]).len() != 4) { return BlockDecode(null, "a malformed withdrawal"); }
+    Reader r = Reader(itemsOf(ws[i]), 0, "");
+    withdrawals[i] = Withdrawal(r.int(), r.int(), r.fixed(20), r.int());
+    if (r.error != "") { return BlockDecode(null, "withdrawal: " + r.error); }
+  }
+  return BlockDecode(Block(h!, itemsOf(parts[1]), itemsOf(parts[2]).len() > 0, withdrawals), "");
+}
+
+/** The header's RLP, field by field, as `headerOf` reads it. */
+export Item headerItem(Spec spec, Header h) {
+  Vec<Item> f = Vec.create();
+  f.push(Item.Bytes(h.parentHash.toBytes()));
+  f.push(Item.Bytes(h.ommersHash.toBytes()));
+  f.push(Item.Bytes(addressBytes(h.coinbase)));
+  f.push(Item.Bytes(h.stateRoot.toBytes()));
+  f.push(Item.Bytes(h.txRoot.toBytes()));
+  f.push(Item.Bytes(h.receiptsRoot.toBytes()));
+  f.push(Item.Bytes(h.bloom));
+  f.push(Item.Bytes(u256Bytes(h.difficulty)));
+  f.push(Item.Bytes(u256Bytes(h.number)));
+  f.push(Item.Bytes(u256Bytes(h.gasLimit)));
+  f.push(Item.Bytes(u256Bytes(h.gasUsed)));
+  f.push(Item.Bytes(u256Bytes(h.timestamp)));
+  f.push(Item.Bytes(h.extraData));
+  f.push(Item.Bytes(h.prevRandao.toBytes()));
+  f.push(Item.Bytes(h.nonce));
+  f.push(Item.Bytes(u256Bytes(h.baseFee)));
+  f.push(Item.Bytes(h.withdrawalsRoot.toBytes()));
+  f.push(Item.Bytes(u256Bytes(h.blobGasUsed)));
+  f.push(Item.Bytes(u256Bytes(h.excessBlobGas)));
+  f.push(Item.Bytes(h.parentBeaconBlockRoot.toBytes()));
+  if (spec.isPrague) { f.push(Item.Bytes(h.requestsHash.toBytes())); }
+  if (spec.isAmsterdam) {
+    f.push(Item.Bytes(h.blockAccessListHash.toBytes()));
+    f.push(Item.Bytes(u256Bytes(h.slotNumber)));
+  }
+  return Item.List(f.toArray());
+}
+
+// ── Header rules ────────────────────────────────────────────────────────────────
+
+export static string EMPTY_OMMERS = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
+
+/** EIP-1559's base fee for a child of `parent`, which moves by at most an eighth toward the gas target. */
+export U256 nextBaseFee(Header parent) {
+  U256 target = parent.gasLimit.div(U256.ofU64(2));
+  U256 used = parent.gasUsed;
+  U256 base = parent.baseFee;
+  U256 eight = U256.ofU64(8);
+  if (target.isZero() || used.eq(target)) { return base; }
+  if (used.gt(target)) {
+    U256 delta = base.mul(used.sub(target)).div(target).div(eight);
+    if (delta.isZero()) { delta = U256.one(); }
+    return base.add(delta);
+  }
+  return base.sub(base.mul(target.sub(used)).div(target).div(eight));
+}
+
+/** EIP-4844's excess blob gas for a child of `parent`. */
+export U256 nextExcessBlobGas(Spec spec, Header parent) {
+  U256 total = parent.excessBlobGas.add(parent.blobGasUsed);
+  U256 target = U256.ofU64(spec.targetBlobGasPerBlock as! u64);
+  if (total.lt(target)) { return U256.zero(); }
+  // EIP-7918: while blobs cost less than the execution gas a blob's worth of base fee would, the excess
+  // only grows — by the share of the used blob gas above the target — so the price cannot fall further.
+  if (spec.isOsaka) {
+    U256 execCost = U256.ofU64(8192).mul(parent.baseFee);
+    U256 blobCost = U256.ofU64(131072).mul(blobGasPrice(spec, parent.excessBlobGas));
+    if (execCost.gt(blobCost)) {
+      U256 max = U256.ofU64(spec.maxBlobGasPerBlock as! u64);
+      return parent.excessBlobGas.add(parent.blobGasUsed.mul(max.sub(target)).div(max));
+    }
+  }
+  return total.sub(target);
+}
+
+/** The header's own rules and its relation to its parent's. "" when it may follow it. */
+export string checkHeader(Spec spec, Header h, Header parent) {
+  if (!h.parentHash.eq(parent.hash)) { return "parent hash does not match"; }
+  if (!h.number.eq(parent.number.add(U256.one()))) { return "number is not the parent's plus one"; }
+  if (!h.timestamp.gt(parent.timestamp)) { return "timestamp does not advance"; }
+  if (h.gasUsed.gt(h.gasLimit)) { return "gas used exceeds the gas limit"; }
+  // The gas limit moves by less than 1/1024 of the parent's, and never below 5000.
+  U256 delta = parent.gasLimit.div(U256.ofU64(1024));
+  if (h.gasLimit.ge(parent.gasLimit.add(delta))) { return "gas limit rises too far"; }
+  if (h.gasLimit.add(delta).le(parent.gasLimit)) { return "gas limit falls too far"; }
+  if (h.gasLimit.lt(U256.ofU64(5000))) { return "gas limit below 5000"; }
+  if (!h.baseFee.eq(nextBaseFee(parent))) { return "base fee \{h.baseFee.toDecimal()}, want \{nextBaseFee(parent).toDecimal()}"; }
+  if (!h.excessBlobGas.eq(nextExcessBlobGas(spec, parent))) { return "excess blob gas is wrong"; }
+  if (h.extraData.len() > 32) { return "extra data over 32 bytes"; }
+  if (!h.difficulty.isZero()) { return "nonzero difficulty after the merge"; }
+  for (i32 i = 0; i < 8; i++) {
+    if (h.nonce[i] != 0) { return "nonzero nonce after the merge"; }
+  }
+  if (!h.ommersHash.eq(U256.fromHex(EMPTY_OMMERS)!)) { return "ommers hash is not the empty list's"; }
+  return "";
+}
+
+// ── Execution ───────────────────────────────────────────────────────────────────
+
+export static string SYSTEM_ADDRESS = "0xfffffffffffffffffffffffffffffffffffffffe";
+export static string BEACON_ROOTS = "0x000f3df6d732807ef1319fb7b8bb8522d0beac02";
+export static string HISTORY_STORAGE = "0x0000f90827f1c53a10cb7a02335b175320002935";
+export static string WITHDRAWAL_REQUESTS = "0x00000961ef480eb55e80d19ad83579a64c007002";
+export static string CONSOLIDATION_REQUESTS = "0x0000bbddc7ce488642fb579f8b00f3a590007251";
+/** EIP-8282's builder deposit and exit contracts (Amsterdam): request types 3 and 4. */
+export static string BUILDER_DEPOSITS = "0x0000BFF46984E3725691FA540A8C7589300D8282";
+export static string BUILDER_EXITS = "0x000064D678505AD48F8CCB093BC65613800E8282";
+export static string DEPOSIT_CONTRACT = "0x00000000219ab540356cbb839cbe05303d7705fa";
+export static string DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5";
+
+/**
+ * A system call: a message from the system address with 30 million gas that no one pays for and that does
+ * not count toward the block's gas. Its logs are discarded; its state changes are kept.
+ */
+Outcome systemCall(Spec spec, World w, BlockEnv env, U256 target, u8[] data) {
+  U256 sys = U256.fromHex(SYSTEM_ADDRESS)!;
+  Evm evm = Evm(w, env, TxEnv(sys, U256.zero(), U256[].filled(0, U256.zero())), spec.table, spec, null);
+  w.warmAddress(sys);
+  w.warmAddress(target);
+  U256[] pre = precompileAddresses(spec);
+  for (i32 i = 0; i < pre.len(); i++) { w.warmAddress(pre[i]); }
+  // Amsterdam gives a system call a reservoir for 16 new slots (EIP-8037's SYSTEM_MAX_SSTORES_PER_CALL).
+  Meter sm = Meter.of(spec.isAmsterdam ? 16 * STATE_STORAGE_SET : 0);
+  Outcome o = processMessage(evm, Message(sys, target, target, U256.zero(), data, 30000000, false, 0, true, false, sm));
+  w.logs.clear();
+  w.endTransaction();
+  return o;
+}
+
+/** A Prague request contract's call: it must have code and must succeed, or the block is invalid. */
+u8[]? requestCall(Spec spec, World w, BlockEnv env, string address) {
+  U256 target = U256.fromHex(address)!;
+  if (w.code(target).len() == 0) { return null; }
+  Outcome o = systemCall(spec, w, env, target, u8[].filled(0, 0));
+  if (!o.succeeded()) { return null; }
+  return o.output();
+}
+
+/** The trie of a list keyed by each entry's index, RLP-encoded: transactions, receipts, withdrawals. */
+export u8[] indexedRoot(u8[][] values) {
+  u8[][] keys = u8[][].defaulted(values.len());
+  for (i32 i = 0; i < values.len(); i++) { keys[i] = encode(Item.Bytes(u256Bytes(U256.ofI32(i)))); }
+  return trieRoot(keys, values);
+}
+
+/** Set the three bloom bits for `data`: pairs of the first six bytes of its hash, each picking one of 2048. */
+void bloomAdd(u8[] bloom, u8[] data) {
+  u8[] h = keccak256(data);
+  for (i32 i = 0; i < 6; i += 2) {
+    i32 bit = (((h[i] as i32) << 8) | (h[i + 1] as i32)) & 2047;
+    bloom[255 - bit / 8] = bloom[255 - bit / 8] | ((1 << (bit % 8)) as@ u8);
+  }
+}
+
+/** A receipt's encoding: rlp([status, cumulative gas, bloom, logs]), after its type byte for a typed one. */
+u8[] receiptOf(i32 txType, bool ok, i64 cumulative, u8[] bloom, Log[] logs) {
+  Item[] ls = Item[].filled(logs.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < logs.len(); i++) {
+    Item[] topics = Item[].filled(logs[i].topics.len(), Item.Bytes(u8[].filled(0, 0)));
+    for (i32 t = 0; t < topics.len(); t++) { topics[t] = Item.Bytes(logs[i].topics[t].toBytes()); }
+    Item[] fields = [Item.Bytes(addressBytes(logs[i].address)), Item.List(topics), Item.Bytes(logs[i].data)];
+    ls[i] = Item.List(fields);
+  }
+  Item[] fields = [Item.Bytes(ok ? u8[].filled(1, 1) : u8[].filled(0, 0)), Item.Bytes(u256Bytes(U256.ofU64(cumulative as! u64))),
+                   Item.Bytes(bloom), Item.List(ls)];
+  u8[] body = encode(Item.List(fields));
+  if (txType == 0) { return body; }
+  u8[] out = u8[].filled(body.len() + 1, 0);
+  out[0] = txType as! u8;
+  for (i32 i = 0; i < body.len(); i++) { out[i + 1] = body[i]; }
+  return out;
+}
+
+/**
+ * EIP-6110: a deposit's 192 bytes from a DepositEvent's ABI encoding, whose layout is fixed — five offsets,
+ * then five length-prefixed fields. Anything else is refused, and the block with it.
+ */
+u8[]? depositOf(u8[] data) {
+  if (data.len() != 576) { return null; }
+  i32[] offsets = [160, 256, 320, 384, 512];
+  i32[] sizes = [48, 32, 8, 96, 8];
+  u8[] out = u8[].filled(192, 0);
+  i32 at = 0;
+  for (i32 f = 0; f < 5; f++) {
+    if (!U256.fromBytes(data, f * 32, 32).eq(U256.ofI32(offsets[f]))) { return null; }
+    if (!U256.fromBytes(data, offsets[f], 32).eq(U256.ofI32(sizes[f]))) { return null; }
+    for (i32 i = 0; i < sizes[f]; i++) { out[at + i] = data[offsets[f] + 32 + i]; }
+    at += sizes[f];
+  }
+  return out;
+}
+
+/**
+ * Execute `b` on `w` as the child of `parent`. "" when the block is valid; otherwise why not, and `w` is
+ * in no state anyone should keep — run this on a clone.
+ */
+export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainId, Map<U256, U256> hashes) {
+  return executeBlock(spec, w, b, parent, chainId, hashes, null).error;
+}
+
+/** `applyBlock`, keeping what executing the block produced: its receipts, for whoever reports them. */
+export Body executeBlock(Spec spec, World w, Block b, Header parent, U256 chainId, Map<U256, U256> hashes, SenderCache? senders) {
+  string bad = checkBefore(spec, b, parent);
+  if (bad != "") { return failed(bad); }
+  Body r = executeBody(spec, w, envOf(spec, b.header, chainId, hashes), b.header, b.txs, b.withdrawals, false, senders);
+  bad = checkAfter(spec, b.header, r, true);
+  return bad == "" ? r : failed(bad);
+}
+
+/** What a block's header must satisfy before its body runs: its parent's rules, no ommers, its size. */
+export string checkBefore(Spec spec, Block b, Header parent) {
+  string bad = checkHeader(spec, b.header, parent);
+  if (bad != "") { return bad; }
+  if (b.hasOmmers) { return "a block with ommers after the merge"; }
+  if (spec.isOsaka && blockSize(spec, b) > MAX_RLP_BLOCK_SIZE) { return "a block over EIP-7934's size limit"; }
+  return "";
+}
+
+/** What the block's transactions see of it. */
+export BlockEnv envOf(Spec spec, Header h, U256 chainId, Map<U256, U256> hashes) {
+  return BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee, blobGasPrice(spec, h.excessBlobGas),
+                  chainId, hashes, h.slotNumber);
+}
+
+/**
+ * The body's commitments against the header's, "" when every one matches. The state root only with
+ * `stateRoot`: a world backed by a store does not hold the state, and its caller checks the store's root.
+ */
+export string checkAfter(Spec spec, Header h, Body r, bool stateRoot) {
+  if (r.error != "") { return r.error; }
+  if (spec.isPrague && !r.requestsHash.eq(h.requestsHash)) { return "requests hash does not match"; }
+  if (spec.isAmsterdam) {
+    // EIP-7928: the list this block's execution touched, as the header committed to it, and within its gas.
+    if (r.bal is null || !r.bal!.hash().eq(h.blockAccessListHash)) { return "block access list hash does not match"; }
+    if (r.bal!.items() > (h.gasLimit.low() as@ i64) / 2000) { return "block access list over its gas limit"; }
+  }
+  if (!U256.ofU64(r.gasUsed as! u64).eq(h.gasUsed)) { return "gas used \{r.gasUsed}, header says \{h.gasUsed.toDecimal()}"; }
+  if (!U256.ofU64(r.blobGasUsed as! u64).eq(h.blobGasUsed)) { return "blob gas used does not match"; }
+  if (!r.txRoot.eq(h.txRoot)) { return "transactions root does not match"; }
+  if (!r.receiptsRoot.eq(h.receiptsRoot)) { return "receipts root does not match"; }
+  for (i32 k = 0; k < 256; k++) {
+    if (r.bloom[k] != h.bloom[k]) { return "logs bloom does not match"; }
+  }
+  if (!r.withdrawalsRoot.eq(h.withdrawalsRoot)) { return "withdrawals root does not match"; }
+  if (stateRoot && !r.stateRoot.eq(h.stateRoot)) { return "state root does not match"; }
+  return "";
+}
+
+/** What executing a block's body produced: every commitment its header makes, and what went in. */
+export struct Body {
+  /** Why the body is invalid, or "". */
+  string error;
+  /** The transactions that went in: all of them when importing, those that fit when building. */
+  Item[] included;
+  i64 gasUsed;
+  i64 blobGasUsed;
+  /**
+   * What the transactions paid the fee recipient: its balance after them less before. A transaction that
+   * sends it value counts too, which is generous to the block and harmless — it only informs the
+   * consensus client's choice between this block and a builder's.
+   */
+  U256 fees;
+  u8[] bloom;
+  U256 txRoot;
+  U256 receiptsRoot;
+  U256 withdrawalsRoot;
+  U256 stateRoot;
+  /** EIP-7685's three request lists — deposits, withdrawal requests, consolidations — and their hash. */
+  u8[][] requests;
+  U256 requestsHash;
+  /** Each included transaction's receipt, for the JSON-RPC methods that report them. */
+  Receipt[] receipts;
+  /** EIP-7928's block access list (Amsterdam), built as the block ran; null before. */
+  BlockAccessList? bal;
+}
+
+/** What a transaction came to, as `eth_getTransactionReceipt` reports it. */
+export struct Receipt {
+  U256 txHash;
+  i32 txType;
+  U256 from;
+  U256? to;
+  bool success;
+  i64 gasUsed;
+  i64 cumulativeGasUsed;
+  /** What each unit of gas cost the sender. */
+  U256 effectiveGasPrice;
+  i64 blobGasUsed;
+  U256 blobGasPrice;
+  /** The address a creation made. */
+  U256? contractAddress;
+  Log[] logs;
+  u8[] bloom;
+}
+
+export Body failed(string why) {
+  return Body(why, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))), 0, 0, U256.zero(), u8[].filled(256, 0), U256.zero(), U256.zero(),
+              U256.zero(), U256.zero(), u8[][].defaulted(0), U256.zero(), Vec<Receipt>.create().toArray(), null);
+}
+
+/**
+ * Run a block's body on `w`: the system calls that open it, its transactions, its withdrawals, and from
+ * Prague its requests. Importing (`skipInvalid` false), a transaction that cannot be included makes the
+ * whole body invalid; building (`skipInvalid` true), it is left out — which is safe because an invalid
+ * transaction is refused before it writes anything.
+ */
+export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, Withdrawal[] withdrawals, bool skipInvalid,
+                        SenderCache? senders) {
+  BodyRun r = BodyRun.create(spec, w, env, h, txs, withdrawals, skipInvalid, senders, null);
+  while (r.result is null) { r.step(); }
+  return r.result!;
+}
+
+/**
+ * A body run a step at a time — the opening system calls, then each transaction, then the withdrawals and
+ * requests — so that a world reading its state from a store can stop between steps: when `clean` says a
+ * step read something that was not in memory, the step keeps none of its effects on the run (its effects
+ * on the world are the caller's to undo), and the caller reads what was missing and steps again.
+ * `executeBody` is this stepped to the end with nothing missing.
+ */
+export struct BodyRun {
+  Spec spec;
+  World w;
+  BlockEnv env;
+  Header h;
+  Item[] txs;
+  Withdrawal[] withdrawals;
+  bool skipInvalid;
+  SenderCache? senders;
+  /** Whether what a step read was all there; null when it always is. */
+  fn<bool()>? clean;
+  i64 gasLimit;
+  i64 used;
+  i64 blobUsed;
+  U256 coinbaseBefore;
+  Vec<Item> included;
+  Vec<u8[]> txRaw;
+  Vec<u8[]> receipts;
+  Vec<Receipt> receiptList;
+  bool sized;
+  i64 wsSize;
+  i64 txsSize;
+  Header shape;
+  u8[] blockBloom;
+  Vec<u8[]> deposits;
+  /** -1 for the opening system calls, then each transaction's index, then `txs.len()` for the close. */
+  i32 next;
+  Body? result;
+  /**
+   * Amsterdam's two block totals: execution gas before refunds (EIP-7778) and state gas (EIP-8037). `used` stays
+   * what the receipts' cumulative gas sums, the gas each sender paid for.
+   */
+  i64 execUsed;
+  i64 stateUsed;
+  /** EIP-7928 (Amsterdam): the block access list being built; null before Amsterdam. */
+  BlockAccessList? bal;
+
+  BodyRun create(Spec spec, World w, BlockEnv env, Header h, Item[] txs, Withdrawal[] withdrawals, bool skipInvalid,
+                 SenderCache? senders, fn<bool()>? clean) {
+    Header shape = h.copy();
+    shape.txRoot = U256.fromHex(EMPTY_OMMERS)!;
+    shape.receiptsRoot = shape.txRoot;
+    shape.stateRoot = shape.txRoot;
+    shape.requestsHash = shape.txRoot;
+    // Building under EIP-7934, a transaction goes in only if the block still fits with it, which depends on
+    // the gas it used (the header says how much), so it runs recorded and comes back out if it does not fit.
+    bool sized = skipInvalid && spec.isOsaka;
+    return BodyRun(spec, w, env, h, txs, withdrawals, skipInvalid, senders, clean, h.gasLimit.low() as@ i64, 0, 0, U256.zero(),
+                   Vec.create(), Vec.create(), Vec.create(), Vec.create(), sized, sized ? listSize(withdrawalsSize(withdrawals)) : 0, 0,
+                   shape, u8[].filled(256, 0), Vec.create(), -1, null, 0, 0, spec.isAmsterdam ? BlockAccessList.create() : null);
+  }
+
+  /** The header's gas used: the receipts' total, or under Amsterdam the larger of the two dimensions'. */
+  i64 headerGas(this) {
+    if (!this.spec.isAmsterdam) { return this.used; }
+    return this.execUsed > this.stateUsed ? this.execUsed : this.stateUsed;
+  }
+
+  bool missed(this) { return this.clean is not null && !this.clean!(); }
+
+  /** One step; false when it read something missing and kept nothing, to be stepped again. */
+  bool step(this) {
+    if (this.result is not null) { return true; }
+    if (this.bal is null) {
+      if (this.next < 0) { return this.open(); }
+      if (this.next < this.txs.len()) { return this.transaction(this.next); }
+      return this.close();
+    }
+    // Under Amsterdam each step is an index of the block access list: the world notes what it reads while the step
+    // runs, and the change set recorded across it is what the index wrote. A step that kept nothing adds nothing.
+    World w = this.w;
+    i32 included = this.included.len();
+    bool opening = this.next < 0;
+    bool closing = !opening && this.next >= this.txs.len();
+    i32 index = opening ? 0 : included + 1;
+    // The step's reads go to a list of their own, kept only if the step is part of the block: a transaction a builder
+    // leaves out read things too.
+    BlockAccessList reads = BlockAccessList.create();
+    w.bal = reads;
+    w.record();
+    bool kept = opening ? this.open() : closing ? this.close() : this.transaction(this.next);
+    ChangeSet cs = w.seal();
+    w.bal = null;
+    bool wrote = opening || closing || this.included.len() > included;
+    if (kept && wrote && !this.missed()) {
+      this.bal!.addChanges(index, cs);
+      this.bal!.mergeReads(reads);
+    }
+    if (closing && kept && this.result is not null && this.result!.error == "") { this.bal!.foldReads(); }
+    return kept;
+  }
+
+  bool open(this) {
+    Spec spec = this.spec;
+    World w = this.w;
+    systemCall(spec, w, this.env, U256.fromHex(BEACON_ROOTS)!, this.h.parentBeaconBlockRoot.toBytes());
+    if (spec.isPrague) { systemCall(spec, w, this.env, U256.fromHex(HISTORY_STORAGE)!, this.h.parentHash.toBytes()); }
+    BlockAccessList? noting = w.bal;
+    w.bal = null;
+    U256 before = w.balance(this.env.coinbase);
+    w.bal = noting;
+    if (this.missed()) { return false; }
+    this.coinbaseBefore = before;
+    this.next = 0;
+    return true;
+  }
+
+  bool transaction(this, i32 i) {
+    Spec spec = this.spec;
+    World w = this.w;
+    DecodedTx d = decodeWith(this.txs[i], this.env.chainId, this.senders);
+    if (d.error != "") {
+      if (this.skipInvalid) {
+        this.next++;
+        return true;
+      }
+      this.result = failed("transaction \{i}: \{d.error}");
+      return true;
+    }
+    Transaction tx = d.tx;
+    i64 itemSize = encode(this.txs[i]).len() as i64;
+    if (this.sized) { w.record(); }
+    Processed p = spec.isAmsterdam
+      ? processAmsterdam(spec, w, this.env, tx, this.gasLimit - this.execUsed, this.gasLimit - this.stateUsed,
+                         spec.maxBlobGasPerBlock - this.blobUsed, null)
+      : processTransaction(spec, w, this.env, tx, this.gasLimit - this.used, spec.maxBlobGasPerBlock - this.blobUsed, null);
+    if (p.invalid != "") {
+      if (this.sized) { w.seal(); }
+      // Refused for want of what was not read (a balance, a nonce) is not refused.
+      if (this.missed()) { return false; }
+      if (this.skipInvalid) {
+        this.next++;
+        return true;
+      }
+      this.result = failed("transaction \{i}: \{p.invalid}");
+      return true;
+    }
+    if (this.sized) {
+      ChangeSet mine = w.seal();
+      i64 wouldBe = this.used + p.gasUsed;
+      if (spec.isAmsterdam) {
+        i64 e = this.execUsed + p.blockGas;
+        i64 st = this.stateUsed + p.stateGas;
+        wouldBe = e > st ? e : st;
+      }
+      this.shape.gasUsed = U256.ofU64(wouldBe as@ u64);
+      this.shape.blobGasUsed = U256.ofU64((this.blobUsed + GAS_PER_BLOB * (tx.blobHashes.len() as i64)) as@ u64);
+      i64 size = listSize((encode(headerItem(spec, this.shape)).len() as i64) + listSize(this.txsSize + itemSize) + 1 + this.wsSize);
+      if (size > (MAX_RLP_BLOCK_SIZE as i64)) {
+        w.undo(mine);
+        if (this.missed()) { return false; }
+        this.next++;
+        return true;
+      }
+    }
+    if (this.missed()) { return false; }
+    u8[] bloom = u8[].filled(256, 0);
+    Vec<u8[]> found = Vec.create();
+    for (i32 l = 0; l < p.logs.len(); l++) {
+      Log log = p.logs[l];
+      bloomAdd(bloom, addressBytes(log.address));
+      for (i32 t = 0; t < log.topics.len(); t++) { bloomAdd(bloom, log.topics[t].toBytes()); }
+      if (spec.isPrague && log.address.eq(U256.fromHex(DEPOSIT_CONTRACT)!) && log.topics.len() > 0 &&
+          log.topics[0].eq(U256.fromHex(DEPOSIT_EVENT)!)) {
+        u8[]? dep = depositOf(log.data);
+        if (dep is null) {
+          this.result = failed("transaction \{i}: a malformed deposit event");
+          return true;
+        }
+        found.push(dep!);
+      }
+    }
+    this.used += p.gasUsed;
+    this.execUsed += p.blockGas;
+    this.stateUsed += p.stateGas;
+    this.blobUsed += GAS_PER_BLOB * (tx.blobHashes.len() as i64);
+    for (i32 k = 0; k < found.len(); k++) { this.deposits.push(found.get(k)); }
+    for (i32 k = 0; k < 256; k++) { this.blockBloom[k] = this.blockBloom[k] | bloom[k]; }
+    this.included.push(this.txs[i]);
+    this.txsSize += itemSize;
+    this.txRaw.push(d.raw);
+    this.receipts.push(receiptOf(tx.txType, p.success, this.used, bloom, p.logs));
+    U256 price = tx.gasPrice;
+    if (tx.txType >= 2) {
+      U256 capped = this.env.baseFee.add(tx.maxPriorityFeePerGas);
+      price = capped.lt(tx.maxFeePerGas) ? capped : tx.maxFeePerGas;
+    }
+    this.receiptList.push(Receipt(d.hash, tx.txType, tx.sender, tx.to, p.success, p.gasUsed, this.used, price,
+                                  GAS_PER_BLOB * (tx.blobHashes.len() as i64), this.env.blobBaseFee,
+                                  tx.to is null ? createAddress(tx.sender, tx.nonce.low()) : null, p.logs, bloom));
+    this.next++;
+    return true;
+  }
+
+  bool close(this) {
+    Spec spec = this.spec;
+    World w = this.w;
+    BlockEnv env = this.env;
+    BlockAccessList? noting = w.bal;
+    w.bal = null;
+    U256 fees = w.balance(env.coinbase).sub(this.coinbaseBefore);
+    w.bal = noting;
+
+    // Withdrawals credit gwei, and an account a zero withdrawal created is removed again.
+    u8[][] wsRaw = u8[][].defaulted(this.withdrawals.len());
+    U256 gwei = U256.ofU64(1000000000);
+    for (i32 i = 0; i < this.withdrawals.len(); i++) {
+      Withdrawal wd = this.withdrawals[i];
+      w.addBalance(wd.address, wd.amount.mul(gwei));
+      Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
+                       Item.Bytes(u256Bytes(wd.amount))];
+      wsRaw[i] = encode(Item.List(fields));
+    }
+    w.endTransaction();
+
+    u8[][] requests = u8[][].defaulted(0);
+    U256 requestsHash = U256.zero();
+    if (spec.isPrague) {
+      u8[]? withdrawalRequests = requestCall(spec, w, env, WITHDRAWAL_REQUESTS);
+      u8[]? consolidations = withdrawalRequests is null ? null : requestCall(spec, w, env, CONSOLIDATION_REQUESTS);
+      if (this.missed()) { return false; }
+      if (withdrawalRequests is null) {
+        this.result = failed("the withdrawal request contract failed");
+        return true;
+      }
+      if (consolidations is null) {
+        this.result = failed("the consolidation request contract failed");
+        return true;
+      }
+      u8[][] depositList = this.deposits.toArray();
+      i32 n = 0;
+      for (i32 i = 0; i < depositList.len(); i++) { n += depositList[i].len(); }
+      u8[] depositBytes = u8[].filled(n, 0);
+      i32 at = 0;
+      for (i32 i = 0; i < depositList.len(); i++) {
+        for (i32 k = 0; k < depositList[i].len(); k++) { depositBytes[at + k] = depositList[i][k]; }
+        at += depositList[i].len();
+      }
+      requests = [depositBytes, withdrawalRequests!, consolidations!];
+      if (spec.isAmsterdam) {
+        u8[]? builderDeposits = requestCall(spec, w, env, BUILDER_DEPOSITS);
+        u8[]? builderExits = builderDeposits is null ? null : requestCall(spec, w, env, BUILDER_EXITS);
+        if (this.missed()) { return false; }
+        if (builderDeposits is null || builderExits is null) {
+          this.result = failed("a builder request contract failed");
+          return true;
+        }
+        requests = [depositBytes, withdrawalRequests!, consolidations!, builderDeposits!, builderExits!];
+      }
+      requestsHash = requestsHashOf(requests);
+    }
+    if (this.missed()) { return false; }
+    // A world backed by a store holds only what was read, so its root is not the state's: the store's is.
+    U256 root = this.clean is null ? U256.fromBytes(stateRoot(w), 0, 32) : U256.zero();
+    this.result = Body("", this.included.toArray(), this.headerGas(), this.blobUsed, fees, this.blockBloom,
+                       U256.fromBytes(indexedRoot(this.txRaw.toArray()), 0, 32), U256.fromBytes(indexedRoot(this.receipts.toArray()), 0, 32),
+                       U256.fromBytes(indexedRoot(wsRaw), 0, 32), root, requests, requestsHash, this.receiptList.toArray(), this.bal);
+    return true;
+  }
+}
+
+/** The size of an RLP list whose items take `payload` bytes: the items and the list's own header. */
+i64 listSize(i64 payload) {
+  if (payload < 56) { return payload + 1; }
+  i64 n = 0;
+  for (i64 v = payload; v > 0; v = v >> 8) { n++; }
+  return payload + 1 + n;
+}
+
+/** The bytes the withdrawals take inside their list. */
+i64 withdrawalsSize(Withdrawal[] ws) {
+  i64 n = 0;
+  for (i32 i = 0; i < ws.len(); i++) {
+    Withdrawal wd = ws[i];
+    Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
+                     Item.Bytes(u256Bytes(wd.amount))];
+    n += encode(Item.List(fields)).len() as i64;
+  }
+  return n;
+}
+
+/** The length of the block's RLP. */
+i32 blockSize(Spec spec, Block b) { return encodeBlock(spec, b).len(); }
+
+/** The block's RLP: header, transactions, no ommers, withdrawals — what `decodeBlock` reads back. */
+export u8[] encodeBlock(Spec spec, Block b) {
+  Item[] ws = Item[].filled(b.withdrawals.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < ws.len(); i++) {
+    Withdrawal wd = b.withdrawals[i];
+    Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
+                     Item.Bytes(u256Bytes(wd.amount))];
+    ws[i] = Item.List(fields);
+  }
+  Item[] parts = [headerItem(spec, b.header), Item.List(b.txs), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))),
+                  Item.List(ws)];
+  return encode(Item.List(parts));
+}
+
+/** EIP-7685: sha256 over the sha256 of each non-empty request list, its type byte first. */
+export U256 requestsHashOf(u8[][] byType) {
+  Vec<u8> all = Vec.create();
+  for (i32 t = 0; t < byType.len(); t++) {
+    if (byType[t].len() == 0) { continue; }
+    u8[] typed = u8[].filled(byType[t].len() + 1, 0);
+    typed[0] = t as! u8;
+    for (i32 i = 0; i < byType[t].len(); i++) { typed[i + 1] = byType[t][i]; }
+    u8[] h = sha256(typed);
+    for (i32 i = 0; i < 32; i++) { all.push(h[i]); }
+  }
+  return U256.fromBytes(sha256(all.toArray()), 0, 32);
+}

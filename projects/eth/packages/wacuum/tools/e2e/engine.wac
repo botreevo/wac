@@ -1,0 +1,140 @@
+// Drive a running wacuum over HTTP the way a consensus client would, from one engine fixture: write the
+// fixture's pre-state as a geth genesis.json, start `wacuum` on it, then send each payload with a fresh
+// HS256 JWT and check every answer — and that a request without a token, or with a bad one, is refused.
+// Then stop it, start it again on the same data directory, and check the state it replayed against the
+// fixture's post-state.
+//
+//     wac run --allow-read --allow-write --allow-net --allow-run tools/e2e/engine.wac -- FIXTURE.json [TEST-NAME-SUBSTRING] [--store]
+//
+// With --store the node keeps its state on disk, and the restart resumes from the store rather than replaying from the genesis.
+
+import { Sys } from "std";
+import { json.parse, json.JsonValue, json.JsonObject, json.stringify } from "wac";
+import { U256 } from "../../src/u256.wac";
+import { bytesToHex } from "../../src/hex.wac";
+import { Check, Proc, Rpc, Reply, tempDir, removeDir, somePort, field, number } from "./kit.wac";
+
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+async Proc startNode(Sys sys, string dir, i32 port, bool store) {
+  string[] base = ["wac", "run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+                   "--genesis", dir + "/genesis.json", "--jwt-secret", dir + "/jwt.hex", "--datadir", dir + "/data",
+                   "--port", "\{port}"];
+  string[] argv = string[].filled(base.len() + (store ? 1 : 0), "--store");
+  for (i32 i = 0; i < base.len(); i++) { argv[i] = base[i]; }
+  Proc p = await Proc.start(sys, argv, dir + "/wacuum.log");
+  await p.says(sys, "Engine API on", 600000);
+  return p;
+}
+
+string json(JsonValue v) { return string.fromBytes(stringify(v)); }
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  if (args.len() < 1) {
+    sys.warn("usage: tools/e2e/engine.wac FIXTURE.json [TEST-NAME-SUBSTRING]");
+    return 2;
+  }
+  string filter = args.len() > 1 && args[1] != "--store" ? args[1] : "";
+  // With --store, the node keeps its state on disk (its --store), and the restart resumes from it.
+  bool store = false;
+  for (i32 i = 1; i < args.len(); i++) { store = store || args[i] == "--store"; }
+  JsonObject? doc = null;
+  match (await sys.readFile(args[0])) {
+    Err(e): { sys.warn("\{args[0]}: \{e}"); return 1; }
+    Ok(b): {
+      match (parse(b)) {
+        Err(e): { sys.warn("\{args[0]} is not JSON"); return 1; }
+        Ok(v): { doc = v.object(); }
+      }
+    }
+  }
+  JsonValue? found = null;
+  for (i32 i = 0; i < doc!.len() && found is null; i++) {
+    if (doc!.at(i).keyStr().indexOf(filter) >= 0) { found = doc!.at(i).value; }
+  }
+  if (found is null) { sys.warn("no test in \{args[0]} matches \"\{filter}\""); return 1; }
+  JsonValue t = found!;
+  JsonValue g = t.member("genesisBlockHeader")!;
+  string fork = field(t, "network");
+
+  // The fixture's genesis, as geth writes one.
+  string forks = "\"cancunTime\":0" + (fork != "Cancun" ? ",\"pragueTime\":0" : "") + (fork == "Osaka" ? ",\"osakaTime\":0" : "");
+  string genesis = "{\"config\":{\"chainId\":\{number(field(t.member("config"), "chainid")).toDecimal()},\{forks}},\"alloc\":\{json(t.member("pre")!)}";
+  string[] keys = ["coinbase", "difficulty", "extraData", "gasLimit", "nonce", "mixHash", "timestamp", "parentHash", "number",
+                   "baseFeePerGas", "excessBlobGas", "blobGasUsed"];
+  for (i32 i = 0; i < keys.len(); i++) { genesis += ",\"\{keys[i]}\":\"\{field(g, keys[i])}\""; }
+  genesis += "}";
+
+  string dir = await tempDir(sys, "wacuum-engine");
+  await sys.writeFile(dir + "/genesis.json", genesis.toBytes());
+  u8[] secret = (await sys.random().bytes(32)).ok()!;
+  await sys.writeFile(dir + "/jwt.hex", (bytesToHex(secret) + "\n").toBytes());
+  i32 port = await somePort(sys, 18551, 1000);
+  Proc proc = await startNode(sys, dir, port, store);
+  Check c = Check.on(sys);
+  if (!c.that((await proc.output(sys)).indexOf("genesis \{field(g, "hash")}") >= 0, "the genesis hash is the fixture's")) {
+    await proc.stop(sys);
+    await removeDir(sys, dir);
+    return c.done();
+  }
+
+  Rpc engine = Rpc.authed(sys, port, secret);
+  Rpc plain = Rpc.at(sys, port);
+  string chainId = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}";
+  c.that((await plain.raw(chainId, "")).status == 401, "a request without a token is refused");
+  c.that((await plain.raw(chainId, "a.b.c")).status == 401, "a request with a bad token is refused");
+
+  JsonValue payloads = t.member("engineNewPayloads")!;
+  string lastValid = "";
+  for (i32 i = 0; i < payloads.array()!.len(); i++) {
+    JsonValue p = payloads.item(i)!;
+    Reply r = await engine.call("engine_newPayloadV\{field(p, "newPayloadVersion")}", json(p.member("params")!));
+    string got = r.result() is not null ? field(r.result(), "status")
+                                         : "error \{r.body?.member("error")?.member("code")?.number() ?? 0.0}";
+    JsonValue? code = p.member("errorCode");
+    string want = code is not null && !code!.isNull() ? "error \{code!.text() ?? "\{code!.number() ?? 0.0}"}"
+                : field(p, "validationError") != "" ? "INVALID" : "VALID";
+    c.that(got == want, "payload \{i + 1}: \{got}\{got == want ? "" : ", want " + want}");
+    if (want == "VALID") {
+      string h = field(p.member("params")!.item(0), "blockHash");
+      lastValid = field(p.member("params")!.item(0), "blockNumber");
+      Reply f = await engine.call("engine_forkchoiceUpdatedV\{field(p, "forkchoiceUpdatedVersion")}",
+                                  "[{\"headBlockHash\":\"\{h}\",\"safeBlockHash\":\"\{h}\",\"finalizedBlockHash\":\"\{ZERO}\"},null]");
+      c.that(field(f.result()?.member("payloadStatus"), "status") == "VALID", "forkchoice to payload \{i + 1}");
+    }
+  }
+
+  // Stop it, and start it again on what it wrote: everything below is answered from the replayed log.
+  await proc.stop(sys);
+  proc = await startNode(sys, dir, port, store);
+  string said = await proc.output(sys);
+  c.that(said.indexOf("replayed") >= 0, "the restarted node replayed its log");
+  if (store && lastValid != "") {
+    // From the store: the blocks it holds the state of are recorded, not run again.
+    c.that(said.indexOf("the store holds the state of block") >= 0 && said.indexOf("replayed 0 blocks") >= 0,
+           "the restarted node resumed from the store, running nothing again");
+  }
+  string n = field((await engine.call("eth_blockNumber", "[]")).body, "result");
+  c.that(lastValid == "" || number(n).eq(number(lastValid)), "eth_blockNumber is \{n}");
+
+  // The state reads, against the fixture's post-state.
+  JsonObject? post = t.member("postState")?.object();
+  for (i32 i = 0; post is not null && i < post!.len(); i++) {
+    string addr = post!.at(i).keyStr();
+    JsonValue acct = post!.at(i).value;
+    string at = "[\"\{addr}\",\"latest\"]";
+    bool ok = number(await engine.text("eth_getBalance", at)).eq(number(field(acct, "balance"))) &&
+              number(await engine.text("eth_getTransactionCount", at)).eq(number(field(acct, "nonce"))) &&
+              await engine.text("eth_getCode", at) == field(acct, "code");
+    JsonObject? storage = acct.member("storage")?.object();
+    for (i32 k = 0; ok && storage is not null && k < storage!.len(); k++) {
+      string slot = storage!.at(k).keyStr();
+      ok = number(await engine.text("eth_getStorageAt", "[\"\{addr}\",\"\{slot}\",\"latest\"]")).eq(number(storage!.at(k).value.text() ?? ""));
+    }
+    c.that(ok, "state of \{addr}");
+  }
+  await proc.stop(sys);
+  await removeDir(sys, dir);
+  return c.done();
+}

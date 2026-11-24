@@ -1,0 +1,163 @@
+// A visitor and a wallet against a running devnet, over HTTP as they would be: take ether from the faucet's
+// form, deploy a contract, call it, send ether on, and check the explorer shows all of it.
+//
+//     wac run --allow-net tools/e2e.wac -- [HOST [PORT]]      (127.0.0.1 8545; or: wac task e2e)
+//
+// It asks the node only what any client could, through JSON-RPC and the site, and signs its own
+// transactions with a key it makes for the run. The faucet's visitor is an address from TEST-NET-3
+// (203.0.113.0/24) in X-Forwarded-For, different each run, so the per-visitor limit does not refuse a second
+// run — which works only against a devnet that trusts the header, as one behind its proxy does.
+
+import { Sys } from "std";
+import { json.parse, json.JsonValue } from "wac";
+import { U256, hexToBytes, bytesToHex, validKey } from "@/packages/wacuum/src/lib.wac";
+import { addressOf, checksummed, signedTx, ether } from "../src/chain.wac";
+import { headersEnd } from "../src/http.wac";
+
+/** What a run has learned so far, and how many checks failed. */
+struct Run {
+  Sys sys;
+  string host;
+  i32 port;
+  i32 failed;
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  Run run = Run(sys, args.len() > 0 ? args[0] : "127.0.0.1", args.len() > 1 ? atoi(args[1]) : 8545, 0);
+
+  u8[] key = (await sys.random().bytes(32)).ok()!;
+  while (!validKey(key)) { key = (await sys.random().bytes(32)).ok()!; }
+  U256 me = addressOf(key);
+  string mine = checksummed(me);
+  u64 chainId = small(await rpc(run, "eth_chainId", "[]"));
+  sys.log("e2e: chain \{chainId}, wallet \{mine}");
+
+  // The faucet, through its form.
+  u8[] visitor = (await sys.random().bytes(1)).ok()!;
+  Got drip = await http(run, "POST", "/faucet", "X-Forwarded-For: 203.0.113.\{visitor[0]}\r\n", "address=" + mine);
+  check(run, drip.status == 200 && drip.body.indexOf("On its way") > 0, "the faucet sends: \{drip.status}");
+  U256 balance = U256.zero();
+  for (i32 i = 0; i < 40 && balance.isZero(); i++) {
+    await sys.sleepMillis(500);
+    balance = U256.fromHex(text(await rpc(run, "eth_getBalance", "[\"\{mine}\", \"latest\"]"))) ?? U256.zero();
+  }
+  check(run, balance.eq(ether().mul(U256.ofU64(10))), "ten ether arrive: \{balance.toDecimal()} wei");
+
+  // A contract whose code returns 42: initcode that copies the ten bytes after it to memory and returns them.
+  u8[] initcode = hexToBytes("0x600a600c600039600a6000f3602a60005260206000f3")!;
+  JsonValue? created = await send(run, key, me, chainId, 100000, u8[](), U256.zero(), initcode);
+  string contract = created?.member("contractAddress")?.text() ?? "";
+  check(run, (created?.member("status")?.text() ?? "") == "0x1" && contract != "", "the contract is created: \{contract}");
+  string answer = text(await rpc(run, "eth_call", "[{\"to\": \"\{contract}\"}, \"latest\"]"));
+  check(run, U256.fromHex(answer)?.eq(U256.ofU64(42)) ?? false, "and calling it answers 42: \{answer}");
+
+  // Ether on, to somebody else.
+  string dead = "0x00000000000000000000000000000000000dead1";
+  JsonValue? sent = await send(run, key, me, chainId, 21000, hexToBytes(dead)!, ether(), u8[]());
+  check(run, (sent?.member("status")?.text() ?? "") == "0x1", "one ether is sent on");
+
+  // The explorer, which read each block as it was made.
+  Got page = await http(run, "GET", "/address/" + contract, "", "");
+  check(run, page.body.indexOf("<h1>Contract</h1>") > 0, "the explorer calls the contract a contract");
+  Got wallet = await http(run, "GET", "/address/" + mine, "", "");
+  check(run, wallet.body.indexOf(">create<") > 0 && wallet.body.indexOf(">out<") > 0 && wallet.body.indexOf(">in<") > 0,
+        "and lists the wallet's drip, create and transfer");
+  Got tx = await http(run, "GET", "/tx/" + (sent?.member("transactionHash")?.text() ?? ""), "", "");
+  check(run, tx.body.indexOf("Succeeded") > 0, "and the transfer's page says it succeeded");
+
+  sys.log(run.failed == 0 ? "e2e: all good" : "e2e: \{run.failed} failed");
+  return run.failed == 0 ? 0 : 1;
+}
+
+/** Sign and send a transaction from `me`, and wait for its receipt (null if none came). */
+async JsonValue? send(Run run, u8[] key, U256 me, u64 chainId, u64 gas, u8[] to, U256 value, u8[] data) {
+  string from = checksummed(me);
+  u64 nonce = small(await rpc(run, "eth_getTransactionCount", "[\"\{from}\", \"pending\"]"));
+  U256 tip = U256.ofU64(1000000000);
+  U256 maxFee = (U256.fromHex(text(await rpc(run, "eth_gasPrice", "[]"))) ?? U256.zero()).mul(U256.ofU64(2)).add(tip);
+  u8[] raw = signedTx(key, chainId, nonce, tip, maxFee, gas, to, value, data);
+  string hash = text(await rpc(run, "eth_sendRawTransaction", "[\"\{bytesToHex(raw)}\"]"));
+  if (hash == "") { return null; }
+  for (i32 i = 0; i < 40; i++) {
+    JsonValue? r = await rpc(run, "eth_getTransactionReceipt", "[\"\{hash}\"]");
+    if (r is not null && !r!.isNull()) { return r; }
+    await run.sys.sleepMillis(500);
+  }
+  return null;
+}
+
+/** A JSON-RPC call's `result`, or null; an error is said. */
+async JsonValue? rpc(Run run, string method, string params) {
+  Got g = await http(run, "POST", "/rpc", "Content-Type: application/json\r\n",
+                     "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"\{method}\", \"params\": \{params}}");
+  JsonValue? doc = parse(g.body.toBytes()).ok();
+  if (doc?.member("error") is not null) { run.sys.warn("e2e: \{method}: \{doc!.member("error")!.member("message")?.text() ?? "?"}"); }
+  return doc?.member("result");
+}
+
+struct Got {
+  i32 status;
+  string body;
+}
+
+/** One HTTP/1.1 request on a connection of its own, and the whole answer. */
+async Got http(Run run, string method, string path, string headers, string body) {
+  match (await run.sys.net().connect(run.host, run.port)) {
+    Err(e): { run.sys.warn("e2e: cannot reach \{run.host}:\{run.port}: \{e}"); return Got(0, ""); }
+    Ok(sock): {
+      string req = "\{method} \{path} HTTP/1.1\r\nHost: \{run.host}\r\n" + headers +
+                   "Content-Length: \{body.toBytes().len()}\r\nConnection: close\r\n\r\n" + body;
+      await sock.send(req.toBytes());
+      // Bytes until the end, and only then text: a chunk can end inside a character.
+      u8[] buf = u8[]();
+      bool done = false;
+      while (!done) {
+        match (await sock.recv()) {
+          Err(e): { done = true; }
+          Ok(r): {
+            match (r) {
+              End: { done = true; }
+              Failed(why): { done = true; }
+              Data(bytes): {
+                u8[] grown = u8[].filled(buf.len() + bytes.len(), 0);
+                for (i32 i = 0; i < buf.len(); i++) { grown[i] = buf[i]; }
+                for (i32 i = 0; i < bytes.len(); i++) { grown[buf.len() + i] = bytes[i]; }
+                buf = grown;
+              }
+            }
+          }
+        }
+      }
+      sock.close();
+      string got = string.fromBytes(buf);
+      i32 end = headersEnd(buf, buf.len());
+      if (end < 0 || got.indexOf(" ") < 0) { return Got(0, ""); }
+      return Got(atoi(got.slice(got.indexOf(" ") + 1, got.indexOf(" ") + 4)), string.fromBytes(tail(buf, end)));
+    }
+  }
+}
+
+u8[] tail(u8[] b, i32 from) {
+  u8[] out = u8[].filled(b.len() - from, 0);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = b[from + i]; }
+  return out;
+}
+
+void check(Run run, bool ok, string what) {
+  if (ok) { run.sys.log("  ok    " + what); }
+  else { run.sys.log("  FAIL  " + what); run.failed++; }
+}
+
+string text(JsonValue? v) { return v?.text() ?? ""; }
+
+u64 small(JsonValue? v) { return (U256.fromHex(text(v)) ?? U256.zero()).low(); }
+
+i32 atoi(string s) {
+  i32 n = 0;
+  for (u8 c in s.toBytes()) {
+    if (c < 48 || c > 57) { break; }
+    n = n * 10 + ((c - 48) as i32);
+  }
+  return n;
+}

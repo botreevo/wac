@@ -1,0 +1,162 @@
+// The pieces put together: statements from a mirror, the chain's answers about them, a decision, and the bytes.
+//
+// A **mirror** is anywhere bytes might be: a directory or an `http(s)://` URL, laid out as
+//
+//     blobs/<hex>              a file, named by the hash in its kb1 id
+//     statements/index         one statement file name per line
+//     statements/<name>.json   statements, any subject
+//
+// Nothing a mirror serves is trusted: a blob is used only if it hashes to the id asked for, and a statement only
+// if its signature verifies and the policy names its signer. Two mirrors that disagree are two mirrors, one of
+// them lying, and the hash says which.
+
+import { Sys, Net } from "std";
+import { Result } from "core";
+import { fetch.fetch, fetch.Caps, crypto.keccak256 } from "wac";
+import { Statement, Verified, verify, fromJson, subjectOf, hex, unhex } from "./statement.wac";
+import { Policy, Chain, ChainConf, Asks, asks } from "./policy.wac";
+import { Endpoint, Snapshot, read, revokedSlot, deniedSlot, nameSlot, plus, isZero, Pointer, pointerOf } from "./registry.wac";
+import { leafHash, parseId, Id } from "./tree.wac";
+
+/** A file from a mirror: a path under a directory, or a URL. */
+export async Result<u8[], string> fromMirror(Sys sys, string mirror, string rel) {
+  if (mirror.indexOf("http://") == 0 || mirror.indexOf("https://") == 0) {
+    Caps caps = Caps(sys.clock(), sys.random(), sys.env(), sys.net(), sys.files());
+    match (fetch(caps, "GET", mirror + "/" + rel, string[](), u8[]())) {
+      Err(e): { return Result.Err("\{mirror}/\{rel}: \{e}"); }
+      Ok(r): {
+        if (r.status != 200) { return Result.Err("\{mirror}/\{rel}: HTTP \{r.status}"); }
+        return Result.Ok(r.body);
+      }
+    }
+  }
+  match (await sys.readFile(mirror + "/" + rel)) {
+    Err(e): { return Result.Err("\{mirror}/\{rel}: \{e}"); }
+    Ok(b): { return Result.Ok(b); }
+  }
+}
+
+/** The bytes named by a kb1 id, from the first mirror whose copy hashes to it. Every refusal is reported. */
+export async Result<u8[], string> blob(Sys sys, string[] mirrors, string id, string[] log) {
+  Id? want = parseId(id);
+  if (want is null || want!.tree) { return Result.Err("\{id} is not a kb1 id"); }
+  string why = "";
+  for (string m in mirrors) {
+    match (await fromMirror(sys, m, "blobs/" + hex(want!.hash))) {
+      Err(e): { why += "\n  " + e; }
+      Ok(b): {
+        if (hex(leafHash(b)) == hex(want!.hash)) { return Result.Ok(b); }
+        why += "\n  \{m}: served \{b.len()} bytes that do not hash to \{id} — ignored";
+      }
+    }
+  }
+  return Result.Err("no mirror has \{id}:\{why}");
+}
+
+/** Every statement the mirrors hold about `subject` (or, for a built statement, its source), signatures verified. */
+export async Verified[] statements(Sys sys, string[] mirrors, string subject, string[] seenIds) {
+  Verified[] out = Verified[]();
+  for (string m in mirrors) {
+    u8[]? index = (await fromMirror(sys, m, "statements/index")).ok();
+    if (index is null) { continue; }
+    string rest = string.fromBytes(index!);
+    while (rest.len() > 0) {
+      i32 nl = rest.indexOf("\n");
+      string name = nl < 0 ? rest : rest.slice(0, nl);
+      rest = nl < 0 ? "" : rest.slice(nl + 1, rest.len());
+      if (name == "") { continue; }
+      u8[]? text = (await fromMirror(sys, m, "statements/" + name)).ok();
+      if (text is null) { continue; }
+      Statement? st = fromJson(text!).ok();
+      if (st is null) { continue; }
+      Verified? v = verify(st!).ok();
+      if (v is null) { sys.warn("ignored \{m}/statements/\{name}: its signature does not verify"); continue; }
+      string key = hex(v!.signer) + hex(v!.id);
+      bool dup = false;
+      for (Verified o in out) { if (hex(o.signer) + hex(o.id) == key) { dup = true; } }
+      if (!dup) { out = addV(out, v!); }
+    }
+  }
+  // Keep the ones about the subject, and reviews of the sources those claim.
+  string[] sources = string[]();
+  for (i32 i = 0; i < out.len(); i++) {
+    match (out[i].claim) { Built(source, _, _, _, _, output): { if (output == subject) { sources = push(sources, source); } } Reviewed(_, _): { } }
+  }
+  Verified[] keep = Verified[]();
+  for (Verified v in out) {
+    string s = subjectOf(v.claim);
+    bool sourceReview = false;
+    match (v.claim) { Reviewed(rs, _): { sourceReview = has(sources, rs); } Built(_, _, _, _, _, _): { } }
+    if (s == subject || sourceReview) { keep = addV(keep, v); }
+  }
+  return keep;
+}
+
+export Endpoint endpointOf(ChainConf c) { return Endpoint(c.host, c.port, c.registry, c.anchor, c.codeHash); }
+
+/** Read slots, retrying when a new block arrives between the header and the proof (the node proves recent blocks only). */
+export Result<Snapshot, string> readRetrying(Net net, Endpoint ep, u8[][] slots) {
+  string last = "";
+  for (i32 i = 0; i < 4; i++) {
+    match (read(net, ep, slots)) {
+      Ok(s): { return Result.Ok(s); }
+      Err(e): { last = e; }
+    }
+  }
+  return Result.Err(last);
+}
+
+/** What the chain says about everything a decision on `subject` needs, at one proved block. */
+export Result<Chain, string> chainFor(Sys sys, Policy p, string subject, Verified[] vs, i64 nowSeconds) {
+  if (p.chain is null) { return Result.Ok(Chain.unknown()); }
+  Asks a = asks(p, subject, vs);
+  i32 n = a.revokedId.len() + a.deniedHash.len();
+  u8[][] slots = u8[][].filled(n == 0 ? 1 : n, u8[]());
+  for (i32 i = 0; i < a.revokedId.len(); i++) { slots[i] = revokedSlot(a.revokedSigner[i], a.revokedId[i]); }
+  for (i32 i = 0; i < a.deniedHash.len(); i++) { slots[a.revokedId.len() + i] = deniedSlot(a.deniedList[i], a.deniedHash[i]); }
+  if (n == 0) { slots[0] = revokedSlot(u8[].filled(20, 0), u8[].filled(32, 0)); }
+  Snapshot s = try readRetrying(sys.net(), endpointOf(p.chain!), slots);
+  string[] revoked = string[]();
+  string[] denied = string[]();
+  for (i32 i = 0; i < a.revokedId.len(); i++) {
+    if (!isZero(s.values[i])) { revoked = push(revoked, hex(a.revokedSigner[i]) + hex(a.revokedId[i])); }
+  }
+  for (i32 i = 0; i < a.deniedHash.len(); i++) {
+    if (!isZero(s.values[a.revokedId.len() + i])) { denied = push(denied, hex(a.deniedList[i]) + hex(a.deniedHash[i])); }
+  }
+  sys.warn("chain: block \{s.number} 0x\{hex(s.blockHash).slice(0, 16)}…, \{n} slot(s) proved against its state root"
+           + (s.anchored ? "" : " (header anchored to the node's word: no light client on a devnet)"));
+  return Result.Ok(Chain(true, nowSeconds - s.timestamp, s.anchored, revoked, denied));
+}
+
+/** A name's pointer at one proved block, and the time at that block. */
+export struct Resolved {
+  Pointer pointer;
+  i64 timestamp;
+  i64 number;
+}
+
+export Result<Resolved, string> resolve(Net net, Policy p, u8[] publisher, string name) {
+  if (p.chain is null) { return Result.Err("the policy names no chain to resolve names on"); }
+  u8[] base = nameSlot(publisher, name);
+  Snapshot s = try readRetrying(net, endpointOf(p.chain!), [base, plus(base, 1), plus(base, 2), plus(base, 3)]);
+  return Result.Ok(Resolved(pointerOf(s.values), s.timestamp, s.number));
+}
+
+bool has(string[] xs, string x) {
+  for (string y in xs) { if (y == x) { return true; } }
+  return false;
+}
+
+string[] push(string[] xs, string x) {
+  string[] out = string[].defaulted(xs.len() + 1);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+Verified[] addV(Verified[] xs, Verified x) {
+  Verified[] out = Verified[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}

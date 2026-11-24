@@ -1,0 +1,169 @@
+// Recipes and statements as objects: DAG-CBOR records, each identified by its CID, each signed as EIP-712 typed data so an
+// ordinary wallet shows what it is signing. This replaces the experiment's build statements (statement.wac).
+//
+//     recipe       { machine, format, input: link }                       what to run: a machine, an object format, one input tree
+//     derivation   { kind: "derivation", recipe: link, output: link, runner }
+//     endorsement  { kind: "endorsement", subject: link, scope }
+//     rejection    { kind: "rejection", subject: link, reason }            on the list kept by its signer
+//     revocation   { kind: "revocation", statement: link }                 only its signer's own
+//     signed       { statement: <one of the four, inline>, signer: bytes20, signature: bytes65 }
+//
+// A statement's **id** is the CID of the statement alone, without the signature: two witnesses deriving the same output
+// make the same statement, so a revocation names (signer, id). The typed data a signer signs carries the same fields,
+// with links as CID bytes:
+//
+//     domain        EIP712Domain(string name,string version)    "reckon", "2"
+//     Derivation(bytes recipe,bytes output,string runner)
+//     Endorsement(bytes subject,string scope)
+//     Rejection(bytes subject,string reason)
+//     Revocation(bytes statement)
+
+import { crypto.keccak256 } from "wac";
+import { ipfs.Cid, ipfs.DAG_CBOR, ipfs.Value, ipfs.encode, ipfs.decode, ipfs.field, ipfs.textOf, ipfs.linkOf, ipfs.bytesOf,
+         wacuum.sign, wacuum.recover, wacuum.publicKey } from "@/lib.wac";
+import { Result } from "core";
+
+export struct Recipe {
+  string machine;
+  string format;
+  Cid input;
+}
+
+export Value recipeValue(Recipe r) {
+  return Value.Dict(["machine", "format", "input"], [Value.Text(r.machine), Value.Text(r.format), Value.Link(r.input)]);
+}
+
+export Cid recipeId(Recipe r) { return Cid.of(DAG_CBOR(), encode(recipeValue(r))); }
+
+export Result<Recipe, string> recipeFrom(u8[] block) {
+  Value v = try decode(block);
+  string? m = textOf(field(v, "machine"));
+  string? f = textOf(field(v, "format"));
+  Cid? i = linkOf(field(v, "input"));
+  if (m is null || f is null || i is null) { return Result.Err("not a recipe: it needs machine, format and input"); }
+  return Result.Ok(Recipe(m!, f!, i!));
+}
+
+export enum Statement {
+  Derivation(Cid recipe, Cid output, string runner),
+  Endorsement(Cid subject, string scope),
+  Rejection(Cid subject, string reason),
+  Revocation(Cid statement),
+}
+
+export Value statementValue(Statement s) {
+  return match (s) {
+    Derivation(recipe, output, runner): Value.Dict(["kind", "recipe", "output", "runner"],
+                                                  [Value.Text("derivation"), Value.Link(recipe), Value.Link(output), Value.Text(runner)]),
+    Endorsement(subject, scope): Value.Dict(["kind", "subject", "scope"], [Value.Text("endorsement"), Value.Link(subject), Value.Text(scope)]),
+    Rejection(subject, reason): Value.Dict(["kind", "subject", "reason"], [Value.Text("rejection"), Value.Link(subject), Value.Text(reason)]),
+    Revocation(statement): Value.Dict(["kind", "statement"], [Value.Text("revocation"), Value.Link(statement)]),
+  };
+}
+
+/** The statement's id: the CID of the statement alone. */
+export Cid statementId(Statement s) { return Cid.of(DAG_CBOR(), encode(statementValue(s))); }
+
+export Result<Statement, string> statementFrom(Value v) {
+  string? kind = textOf(field(v, "kind"));
+  if (kind is null) { return Result.Err("a statement without a kind"); }
+  if (kind! == "derivation") {
+    Cid? r = linkOf(field(v, "recipe"));
+    Cid? o = linkOf(field(v, "output"));
+    string? who = textOf(field(v, "runner"));
+    if (r is null || o is null || who is null) { return Result.Err("a derivation needs recipe, output and runner"); }
+    return Result.Ok(Statement.Derivation(r!, o!, who!));
+  }
+  if (kind! == "endorsement" || kind! == "rejection") {
+    Cid? s = linkOf(field(v, "subject"));
+    string? t = textOf(field(v, kind! == "endorsement" ? "scope" : "reason"));
+    if (s is null || t is null) { return Result.Err("an \{kind!} needs a subject and its text"); }
+    return Result.Ok(kind! == "endorsement" ? Statement.Endorsement(s!, t!) : Statement.Rejection(s!, t!));
+  }
+  if (kind! == "revocation") {
+    Cid? s = linkOf(field(v, "statement"));
+    if (s is null) { return Result.Err("a revocation needs the statement it revokes"); }
+    return Result.Ok(Statement.Revocation(s!));
+  }
+  return Result.Err("a statement of kind \{kind!}");
+}
+
+// ---------------------------------------------------------------- EIP-712
+
+u8[] k(string s) { return keccak256(s.toBytes()); }
+
+u8[] cat(u8[][] parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts[i].len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) { for (i32 j = 0; j < parts[i].len(); j++) { out[at + j] = parts[i][j]; } at += parts[i].len(); }
+  return out;
+}
+
+export u8[] domainSeparator() { return keccak256(cat([k("EIP712Domain(string name,string version)"), k("reckon"), k("2")])); }
+
+u8[] structHash(Statement s) {
+  return match (s) {
+    Derivation(recipe, output, runner): keccak256(cat([k("Derivation(bytes recipe,bytes output,string runner)"),
+                                                       keccak256(recipe.bytes()), keccak256(output.bytes()), k(runner)])),
+    Endorsement(subject, scope): keccak256(cat([k("Endorsement(bytes subject,string scope)"), keccak256(subject.bytes()), k(scope)])),
+    Rejection(subject, reason): keccak256(cat([k("Rejection(bytes subject,string reason)"), keccak256(subject.bytes()), k(reason)])),
+    Revocation(statement): keccak256(cat([k("Revocation(bytes statement)"), keccak256(statement.bytes())])),
+  };
+}
+
+/** What a signer signs. */
+export u8[] digest(Statement s) { return keccak256(cat([[0x19 as u8, 0x01 as u8], domainSeparator(), structHash(s)])); }
+
+export u8[] addressOf(u8[] pub) {
+  u8[] h = keccak256(pub);
+  u8[] out = u8[].filled(20, 0);
+  for (i32 i = 0; i < 20; i++) { out[i] = h[12 + i]; }
+  return out;
+}
+
+export u8[] addressOfKey(u8[] priv) { return addressOf(publicKey(priv)); }
+
+export struct Signed {
+  Statement statement;
+  u8[] signer;
+  u8[] signature;
+}
+
+/** Sign with a 32-byte key. wacuum's secp256k1 is not constant-time: for tests and demos, not keys that matter. */
+export Signed signStatement(Statement s, u8[] priv) {
+  u8[] sig = sign(digest(s), priv);
+  sig[64] = sig[64] + 27;
+  return Signed(s, addressOfKey(priv), sig);
+}
+
+/** The signer the signature recovers to, if it is the one the envelope names. */
+export Result<u8[], string> verifySigned(Signed s) {
+  if (s.signature.len() != 65 || (s.signature[64] != 27 && s.signature[64] != 28)) { return Result.Err("a signature is 65 bytes ending in 27 or 28"); }
+  u8[] sig = u8[].filled(65, 0);
+  for (i32 i = 0; i < 65; i++) { sig[i] = s.signature[i]; }
+  sig[64] = sig[64] - 27;
+  u8[]? pub = recover(digest(s.statement), sig);
+  if (pub is null) { return Result.Err("the signature recovers to no key"); }
+  u8[] who = addressOf(pub!);
+  for (i32 i = 0; i < 20; i++) { if (who[i] != s.signer[i]) { return Result.Err("signed by another address than it names"); } }
+  return Result.Ok(who);
+}
+
+export Value signedValue(Signed s) {
+  return Value.Dict(["statement", "signer", "signature"], [statementValue(s.statement), Value.Bytes(s.signer), Value.Bytes(s.signature)]);
+}
+
+export u8[] signedBlock(Signed s) { return encode(signedValue(s)); }
+
+export Result<Signed, string> signedFrom(u8[] block) {
+  Value v = try decode(block);
+  Value? st = field(v, "statement");
+  if (st is null) { return Result.Err("a signed record without its statement"); }
+  Statement s = try statementFrom(st!);
+  u8[]? who = bytesOf(field(v, "signer"));
+  u8[]? sig = bytesOf(field(v, "signature"));
+  if (who is null || who!.len() != 20 || sig is null) { return Result.Err("a signed record needs a 20-byte signer and a signature"); }
+  return Result.Ok(Signed(s, who!, sig!));
+}

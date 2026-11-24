@@ -1,0 +1,238 @@
+// Discovery v4 running: a UDP socket on the devp2p port, a table of the nodes it has heard of, and a loop
+// that keeps the table fresh and the peer count up.
+//
+// The table is a flat one, not Kademlia's buckets: a node is kept with when it last answered a Ping (the
+// endpoint proof every FindNode needs) and when it last pinged here, up to a cap, and the nodes nearest a
+// target are found by sorting. It is enough to find the nodes of a devnet or a testnet's bootnodes'
+// neighbourhood and to answer the nodes that ask; it is not the routing table a node that serves the
+// whole network's lookups would want.
+
+import { Sys, Datagrams } from "std";
+import { Map, Vec } from "core";
+import { rlp.Item, rlp.bytesOf } from "@/lib.wac";
+import { keccak256 } from "../crypto/keccak.wac";
+import { U256 } from "../u256.wac";
+import { bytesToHex, hexToBytes } from "../hex.wac";
+import { hashU256, eqU256 } from "../state/world.wac";
+import { publicKey } from "./secp.wac";
+import { Network, dialOnce } from "./node.wac";
+import { Packet, Endpoint, NodeRecord, open, ping, pong, findNode, neighbors, readNeighbors, endpointOf, expired, enr,
+         enrResponse, distance, ipText, ipBytes, PING, PONG, FIND_NODE, NEIGHBORS, ENR_REQUEST } from "./discv4.wac";
+
+/** How long an endpoint proof lasts: a node that answered a Ping within this is asked and answered. */
+static u64 BOND_SECONDS = 12 * 3600;
+static i32 TABLE_CAP = 512;
+
+struct Known {
+  NodeRecord rec;
+  /** When it last answered a Ping of ours: proof that it is where it says. */
+  u64 verified;
+  /** When it last pinged us: proof, to it, that we are. */
+  u64 pingedUs;
+  u64 lastDial;
+}
+
+export struct Discovery {
+  Network n;
+  Datagrams sock;
+  Endpoint self;
+  Map<U256, Known> table;
+  /** Pings in flight, by their hash, to the node each went to. */
+  Map<U256, U256> pings;
+  u64 enrSeq;
+  i32 maxPeers;
+}
+
+U256 idKey(u8[] id) { return U256.fromBytes(keccak256(id), 0, 32); }
+
+async u64 now(Sys sys) { return (((await sys.clock().nowMillis()).orElse(0 as i64)) / 1000) as! u64; }
+
+/** Start discovery on `port`, from `bootnodes`, advertising `ip`. */
+export async void discover(Sys sys, Network n, string ip, i32 port, string[] bootnodes, i32 maxPeers) {
+  match (await sys.net().bindDatagram("0.0.0.0", port)) {
+    Err(err): { sys.warn("discv4: cannot bind UDP \{port}: \{err}"); }
+    Ok(sock): {
+      u8[]? ipb = ipBytes(ip);
+      Discovery d = Discovery(n, sock, Endpoint(ipb ?? [127 as u8, 0 as u8, 0 as u8, 1 as u8], port, port),
+                              Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), 1, maxPeers);
+      for (i32 i = 0; i < bootnodes.len(); i++) {
+        NodeRecord? r = recordOf(bootnodes[i]);
+        if (r is null) {
+          sys.warn("discv4: not an enode: \{bootnodes[i]}");
+          continue;
+        }
+        d.table.set(idKey(r!.id), Known(r!, 0, 0, 0));
+      }
+      sys.log("discv4: on UDP \{port}, \{d.table.len()} bootnodes");
+      receive(sys, d);
+      await refresh(sys, d);
+    }
+  }
+}
+
+/** The node an enode URL names, its UDP port the `discport` if it gives one and its TCP port otherwise. */
+NodeRecord? recordOf(string enode) {
+  i32 at = enode.indexOf("@");
+  if (enode.indexOf("enode://") != 0 || at < 0) { return null; }
+  u8[]? id = hexToBytes(enode.slice(8, at));
+  string hostPort = enode.slice(at + 1, enode.len());
+  string query = "";
+  i32 q = hostPort.indexOf("?");
+  if (q >= 0) {
+    query = hostPort.slice(q + 1, hostPort.len());
+    hostPort = hostPort.slice(0, q);
+  }
+  i32 colon = hostPort.indexOf(":");
+  if (id is null || id!.len() != 64 || colon < 0) { return null; }
+  u8[]? ip = ipBytes(hostPort.slice(0, colon));
+  if (ip is null) { return null; }
+  i32 tcp = digits(hostPort.slice(colon + 1, hostPort.len()));
+  i32 udp = tcp;
+  if (query.indexOf("discport=") == 0) { udp = digits(query.slice(9, query.len())); }
+  return NodeRecord(id!, Endpoint(ip!, udp, tcp));
+}
+
+i32 digits(string s) {
+  i32 v = 0;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < 48 || b[i] > 57) { break; }
+    v = v * 10 + ((b[i] - 48) as i32);
+  }
+  return v;
+}
+
+async void send(Discovery d, Endpoint to, u8[] packet) { await d.sock.sendTo(ipText(to.ip), to.udp, packet); }
+
+async void sendPing(Sys sys, Discovery d, Known k) {
+  u8[] p = ping(d.n.nodeKey, d.self, k.rec.at, await now(sys), d.enrSeq);
+  d.pings.set(U256.fromBytes(p, 0, 32), idKey(k.rec.id));
+  await send(d, k.rec.at, p);
+}
+
+/** Answer and learn from every packet that arrives. */
+async void receive(Sys sys, Discovery d) {
+  while (true) {
+    match (await d.sock.receive()) {
+      Err(err): {
+        sys.warn("discv4: \{err}");
+        await sys.sleepMillis(1000);
+      }
+      Ok(dg): {
+        Packet? p = open(dg.bytes);
+        if (p is null) { continue; }
+        await handle(sys, d, p!, dg.peer, dg.port);
+      }
+    }
+  }
+}
+
+async void handle(Sys sys, Discovery d, Packet p, string fromIp, i32 fromPort) {
+  u64 t = await now(sys);
+  u8[]? ip = ipBytes(fromIp);
+  if (ip is null) { return; }
+  U256 key = idKey(p.sender);
+  Known? k = d.table.get(key);
+  if (p.kind == PING) {
+    if (expired(p.fields, 3, t)) { return; }
+    // The reply goes where the packet came from; the TCP port is the one the ping says.
+    Endpoint? said = p.fields.len() > 1 ? endpointOf(p.fields[1]) : null;
+    Endpoint at = Endpoint(ip!, fromPort, said is null ? fromPort : said!.tcp);
+    await send(d, at, pong(d.n.nodeKey, at, p.hash, t, d.enrSeq));
+    if (k is null) {
+      if (d.table.len() >= TABLE_CAP) { return; }
+      Known fresh = Known(NodeRecord(p.sender, at), 0, t, 0);
+      d.table.set(key, fresh);
+      k = fresh;
+    }
+    k!.pingedUs = t;
+    k!.rec = NodeRecord(p.sender, at);
+    if (k!.verified + BOND_SECONDS < t) { await sendPing(sys, d, k!); }
+  } else if (p.kind == PONG) {
+    if (p.fields.len() < 2) { return; }
+    U256 answered = U256.fromBytes(bytesOf(p.fields[1]), 0, 32);
+    U256? to = d.pings.get(answered);
+    if (to is null || !to!.eq(key) || k is null) { return; }
+    d.pings.remove(answered);
+    k!.verified = t;
+  } else if (p.kind == FIND_NODE) {
+    if (k is null || k!.verified + BOND_SECONDS < t || expired(p.fields, 1, t)) { return; }
+    u8[] target = bytesOf(p.fields[0]);
+    NodeRecord[] near = nearest(d, target, 12);
+    await send(d, k!.rec.at, neighbors(d.n.nodeKey, near, t));
+  } else if (p.kind == NEIGHBORS) {
+    if (k is null || expired(p.fields, 1, t)) { return; }
+    NodeRecord[] ns = readNeighbors(p.fields);
+    for (i32 i = 0; i < ns.len(); i++) {
+      U256 nk = idKey(ns[i].id);
+      if (d.table.has(nk) || d.table.len() >= TABLE_CAP) { continue; }
+      if (bytesToHex(ns[i].id) == bytesToHex(publicKey(d.n.nodeKey))) { continue; }
+      Known fresh = Known(ns[i], 0, 0, 0);
+      d.table.set(nk, fresh);
+      await sendPing(sys, d, fresh);
+    }
+  } else if (p.kind == ENR_REQUEST) {
+    if (k is null || k!.verified + BOND_SECONDS < t) { return; }
+    await send(d, k!.rec.at, enrResponse(d.n.nodeKey, p.hash, enr(d.n.nodeKey, d.enrSeq, d.self)));
+  }
+}
+
+/** The `count` known, verified nodes nearest `target` by XOR distance of their hashes. */
+NodeRecord[] nearest(Discovery d, u8[] target, i32 count) {
+  U256[] keys = d.table.keys();
+  Vec<NodeRecord> recs = Vec.create();
+  Vec<i32> dist = Vec.create();
+  for (i32 i = 0; i < keys.len(); i++) {
+    Known k = d.table.get(keys[i])!;
+    if (k.verified == 0) { continue; }
+    recs.push(k.rec);
+    dist.push(distance(k.rec.id, target));
+  }
+  NodeRecord[] r = recs.toArray();
+  i32[] ds = dist.toArray();
+  for (i32 i = 1; i < r.len(); i++) {
+    NodeRecord rv = r[i];
+    i32 dv = ds[i];
+    i32 j = i - 1;
+    while (j >= 0 && ds[j] > dv) {
+      r[j + 1] = r[j];
+      ds[j + 1] = ds[j];
+      j--;
+    }
+    r[j + 1] = rv;
+    ds[j + 1] = dv;
+  }
+  i32 m = r.len() < count ? r.len() : count;
+  NodeRecord[] out = NodeRecord[].filled(m, NodeRecord(target, d.self));
+  for (i32 i = 0; i < m; i++) { out[i] = r[i]; }
+  return out;
+}
+
+/**
+ * Every five seconds: ping what has not proved itself, ask what has for the nodes near this one and near a
+ * random target, and dial known nodes while there are fewer peers than wanted.
+ */
+async void refresh(Sys sys, Discovery d) {
+  while (true) {
+    u64 t = await now(sys);
+    U256[] keys = d.table.keys();
+    u8[] me = publicKey(d.n.nodeKey);
+    u8[] random = (await sys.random().bytes(64)).ok()!;
+    for (i32 i = 0; i < keys.len(); i++) {
+      Known k = d.table.get(keys[i])!;
+      if (k.verified + BOND_SECONDS < t) {
+        await sendPing(sys, d, k);
+      } else {
+        await send(d, k.rec.at, findNode(d.n.nodeKey, me, t));
+        await send(d, k.rec.at, findNode(d.n.nodeKey, random, t));
+      }
+    }
+    for (i32 i = 0; i < keys.len() && d.n.alivePeers() < d.maxPeers; i++) {
+      Known k = d.table.get(keys[i])!;
+      if (k.verified == 0 || k.rec.at.tcp == 0 || k.lastDial + 30 > t || d.n.connectedTo(k.rec.id)) { continue; }
+      k.lastDial = t;
+      dialOnce(sys, d.n, ipText(k.rec.at.ip), k.rec.at.tcp, k.rec.id);
+    }
+    await sys.sleepMillis(5000);
+  }
+}

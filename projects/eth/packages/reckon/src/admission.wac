@@ -1,0 +1,323 @@
+// Admission as a library (docs/admit.md; docs/browser-extension.md R1): from a subject and its settings to a
+// decision, the way `claim admit` makes it, for any entry point that has a `Sys`. That is the command line and a
+// browser's worker.
+//
+//   1. the anchor: from the light client and a checkpoint (beacon data in a directory, or from a node's REST API), or
+//      given as a block hash, or none;
+//   2. the subject: a CID, or a name read by proof at the anchor (`ens:NAME`, or `name:NAME@0xPUB` from the registry
+//      v2), followed only as the policy's `names` allows (docs/decisions/K2-names.md);
+//   3. the chain: revocations and rejections proved from the registry v2, if one is named;
+//   4. the decision: the policy over the claim index and the chain.
+//
+// What it says is returned as lines, not printed: the account (`Line.warn` false) and complaints (true), in order. The
+// caller prints them. A step asked for that cannot be done answers 3; a refusal by policy, 4; settings that are wrong,
+// 1 or 2; admitted, 0 with the CID.
+
+import { Sys } from "std";
+import { Result } from "core";
+import { ipfs.Cid, ipfs.parseCid, ipfs.Resolver, ipfs.FileIn, ipfs.Node, ipfs.readNode, ipfs.readFile, ipfs.readTree, ipfs.filesOnly,
+         ipfs.emptyDirsOf } from "@/lib.wac";
+import { Index } from "./graph.wac";
+import { Chain, Decision, admit } from "./admit.wac";
+import { readPolicyFile, NameRule, readNameRule, ensRefusal, delayRefusal } from "./policyfile.wac";
+import { Endpoint, Snapshot, NameAt, endpointOf, asksFor, chainFor, read, nameAt, nameSlot, plus } from "./registry2.wac";
+import { unhex, hex } from "./hex.wac";
+import { Anchored, Kept, anchorFrom, anchorFromNode, anchorResume, keptOf, MAINNET_GENESIS } from "./checkpoint.wac";
+
+/**
+ * The default bound on a kept state's age, in sync-committee periods (about 27 hours each): 12, about two weeks,
+ * inside mainnet's weak subjectivity period. A committee older than that may have been sold or stolen since, and a
+ * history signed by it proves nothing; a client that old starts again from a checkpoint.
+ */
+export i64 STATE_MAX_PERIODS() { return 12 as i64; }
+
+string normalRoot(string h) {
+  string body = h.len() >= 2 && h.slice(0, 2) == "0x" ? h.slice(2, h.len()) : h;
+  u8[] b = body.toBytes();
+  u8[] o = u8[].filled(b.len(), 0);
+  for (i32 i = 0; i < b.len(); i++) { o[i] = b[i] >= 65 && b[i] <= 90 ? b[i] + 32 : b[i]; }
+  return "0x" + string.fromBytes(o);
+}
+
+/** Write `text` to `path` whole or not at all: to a file beside it, then moved over it. */
+async Result<void, string> keep(Sys sys, string path, string text) {
+  match (await sys.writeFile(path + ".new", text.toBytes())) { Err(e): { return Result.Err(e); } Ok(_): { } }
+  match (await sys.files().rename(path + ".new", path)) { Err(e): { return Result.Err("\{e}"); } Ok(_): { } }
+  return Result.Ok();
+}
+import { NameAnswer, ensContent, ENS_REGISTRY, ENS_REGISTRY_CODE, PUBLIC_RESOLVER_CODE } from "./names.wac";
+
+/** What to admit, in which role, under which policy, and where to look. Empty strings are "not given". */
+export struct AdmitRequest {
+  string subject;
+  string role;
+  /** The policy file's text (JSON5). */
+  u8[] policy;
+  /** A beacon block root to start the light client from, and where its data is: a directory or a node's URL. */
+  string checkpoint;
+  string beaconDir;
+  string beaconUrl;
+  string fork;
+  /** The clock slot, fixed (recorded data); -1 reads the clock as each update is checked. */
+  i64 now;
+  /** A block hash given as the anchor, instead of a checkpoint. */
+  string anchor;
+  /** An execution node, HOST:PORT. */
+  string rpc;
+  string registry;
+  string codeHash;
+  string ensRegistry;
+  string ensRegistryCode;
+  string resolverCode;
+  /**
+   * Where the light client's state is kept between runs (R4), or "": a file natively, the browser's storage in a page.
+   * With a kept state, the light client resumes from it, and no checkpoint is needed; without one yet, the checkpoint
+   * starts it. Either way it is written back after a run that verified.
+   */
+  string statePath;
+  /** How many sync-committee periods old a kept state may be (the weak subjectivity bound); negative for the default. */
+  i64 stateMaxPeriods;
+
+  /** Nothing but the subject, the role and the policy. */
+  AdmitRequest of(string subject, string role, u8[] policy) {
+    return AdmitRequest(subject, role, policy, "", "", "", "", -1 as i64, "", "", "", "", "", "", "", "", -1 as i64);
+  }
+}
+
+export struct Line {
+  bool warn;
+  string text;
+}
+
+export struct Admitted {
+  /** 0 admitted, 4 refused by the policy, 3 a step that could not be done, 1 or 2 settings that are wrong. */
+  i32 code;
+  /** The subject's CID, once known (also when refused). */
+  Cid? cid;
+  Line[] lines;
+  /** The anchor used, `0x…`, or "" for none. */
+  string anchor;
+}
+
+/**
+ * What the decision is as of: the latest block a read was pinned to (its number and time, from the name or the chain,
+ * bound to the anchor by the header's hash) and the light client's finalized beacon slot. -1 for what is not known.
+ */
+struct AsOf {
+  i64 block;
+  i64 time;
+  i64 slot;
+
+  void block_(this, i64 n, i64 t) { if (n > this.block) { this.block = n; this.time = t; } }
+
+  string text(this) {
+    string s = "";
+    if (this.block >= (0 as i64)) { s = "execution block \{this.block} (time \{this.time})"; }
+    if (this.slot >= (0 as i64)) { s = s + (s == "" ? "" : ", ") + "beacon slot \{this.slot} (time \{MAINNET_GENESIS() + this.slot * (12 as i64)})"; }
+    return s;
+  }
+}
+
+struct Say {
+  Line[] lines;
+  void out(this, string s) { this.lines = more(this.lines, Line(false, s)); }
+  void warn(this, string s) { this.lines = more(this.lines, Line(true, s)); }
+}
+
+Line[] more(Line[] xs, Line x) {
+  Line[] out = Line[].filled(xs.len() + 1, x);
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  return out;
+}
+
+Admitted ended(Say s, i32 code, Cid? c, string anchor) { return Admitted(code, c, s.lines, anchor); }
+
+i64 decimal(string s) {
+  i64 v = 0 as i64;
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] < 48 || b[i] > 57) { return -1 as i64; } v = v * (10 as i64) + ((b[i] as i64) - (48 as i64)); }
+  return v;
+}
+
+/** The whole of admission for `q`, over the claim index `ix` and the blocks `r` reaches. */
+export async Admitted admitSubject(Sys sys, AdmitRequest q, Index ix, Resolver r) {
+  Say s = Say(Line[]());
+  AsOf asOf = AsOf(-1 as i64, -1 as i64, -1 as i64);
+  Cid? none = null;
+  // 1. The anchor (docs/admit.md): from the light client, resumed from its kept state or started from a checkpoint, or
+  // given.
+  string anchorHex = q.anchor;
+  bool resumed = false;
+  if (q.statePath != "") {
+    if (anchorHex != "") { s.warn("--state or --anchor, not both: one anchor"); return ended(s, 2, none, ""); }
+    u8[]? kept = (await sys.readFile(q.statePath)).ok();
+    if (kept is null && q.checkpoint == "") { s.warn("there is no kept light-client state at \{q.statePath} yet: give --checkpoint to start it"); return ended(s, 2, none, ""); }
+    if (kept is not null) {
+      Kept k;
+      match (keptOf(kept!)) { Err(e): { s.warn("\{q.statePath}: \{e}"); s.out("REFUSED"); return ended(s, 3, none, ""); } Ok(x): { k = x; } }
+      if (q.checkpoint != "" && normalRoot(q.checkpoint) != normalRoot(k.checkpoint)) {
+        s.warn("the light-client state at \{q.statePath} descends from checkpoint \{k.checkpoint}, not \{q.checkpoint}: remove it to start again from \{q.checkpoint}");
+        return ended(s, 2, none, "");
+      }
+      i64 bound = q.stateMaxPeriods >= (0 as i64) ? q.stateMaxPeriods : STATE_MAX_PERIODS();
+      match (await anchorResume(sys, kept!, q.beaconUrl, q.beaconDir == "" ? "." : q.beaconDir, q.now, bound)) {
+        // The kept state is left as it was: a run that could not continue it changes nothing.
+        Err(e): { s.warn(e); s.out("REFUSED"); return ended(s, 3, none, ""); }
+        Ok(an): {
+          for (i32 i = 0; i < an.log.len(); i++) { s.out(an.log[i]); }
+          anchorHex = "0x" + hex(an.blockHash);
+          asOf.slot = an.beaconSlot;
+          match (await keep(sys, q.statePath, an.state)) { Err(e): { s.warn("\{q.statePath}: the state was not kept: \{e}"); } Ok(_): { s.out("light client: state kept at \{q.statePath}, finalized slot \{an.beaconSlot}"); } }
+          resumed = true;
+        }
+      }
+    }
+  }
+  if (!resumed && q.checkpoint != "") {
+    if (anchorHex != "") { s.warn("--checkpoint or --anchor, not both: one anchor"); return ended(s, 2, none, ""); }
+    if (q.beaconUrl != "" && q.beaconDir != "") { s.warn("--beacon DIR or --beacon-url URL, not both"); return ended(s, 2, none, ""); }
+    Result<Anchored, string> got = q.beaconUrl != ""
+      ? await anchorFromNode(sys, q.checkpoint, q.beaconUrl, q.fork, q.now)
+      : await anchorFrom(sys, q.checkpoint, q.beaconDir == "" ? "." : q.beaconDir, q.fork == "" ? "fulu" : q.fork, q.now);
+    match (got) {
+      Err(e): { s.warn(e); s.out("REFUSED"); return ended(s, 3, none, ""); }
+      Ok(an): {
+        for (i32 i = 0; i < an.log.len(); i++) { s.out(an.log[i]); }
+        anchorHex = "0x" + hex(an.blockHash);
+        asOf.slot = an.beaconSlot;
+        if (q.statePath != "") {
+          match (await keep(sys, q.statePath, an.state)) { Err(e): { s.warn("\{q.statePath}: the state was not kept: \{e}"); } Ok(_): { s.out("light client: state kept at \{q.statePath}, finalized slot \{an.beaconSlot}"); } }
+        }
+      }
+    }
+  }
+
+  // 2. The subject. A name is a pointer, followed only as the policy's `names` allows, and read by proof.
+  Cid c;
+  bool named = q.subject.indexOf("ens:") == 0 || q.subject.indexOf("name:") == 0;
+  NameRule follow = NameRule(0 as i64, "");
+  if (named) {
+    match (readNameRule(q.policy)) { Err(e): { s.warn(e); return ended(s, 1, none, anchorHex); } Ok(nr): { follow = nr; } }
+  }
+  if (q.subject.indexOf("name:") == 0) {
+    // A registry name: its eight words at the anchored block, read at that block's time.
+    string spec = q.subject.slice(5, q.subject.len());
+    i32 at = spec.indexOf("@");
+    u8[]? pub = at < 1 ? null : unhex(spec.slice(at + 1, spec.len()));
+    if (pub is null || pub!.len() != 20) { s.warn("name:NAME@0xPUBLISHER, the publisher a 20-byte address"); return ended(s, 2, none, anchorHex); }
+    string name = spec.slice(0, at);
+    if (q.rpc == "" || q.registry == "") { s.warn("name:NAME@0xPUBLISHER needs --rpc and --registry"); return ended(s, 2, none, anchorHex); }
+    Endpoint ep;
+    match (endpointOf(q.rpc, q.registry, q.codeHash, anchorHex)) {
+      Err(e): { s.warn(e); s.out("REFUSED"); return ended(s, 3, none, anchorHex); }
+      Ok(x): { ep = x; }
+    }
+    u8[] base = nameSlot(pub!, name);
+    u8[][] slots = u8[][].filled(8, u8[]());
+    for (i32 i = 0; i < 8; i++) { slots[i] = plus(base, i); }
+    Snapshot snap;
+    match (read(sys.net(), ep, slots)) {
+      Err(e): { s.warn("the name: \{e}"); s.out("REFUSED"); return ended(s, 3, none, anchorHex); }
+      Ok(x): { snap = x; }
+    }
+    NameAt n = nameAt(snap.values, snap.timestamp);
+    asOf.block_(snap.number, snap.timestamp);
+    if (n.cid is null) {
+      s.out("name: \{spec}: not a name its publisher has claimed (proved at block \{snap.number})");
+      s.out("REFUSED");
+      return ended(s, 3, none, anchorHex);
+    }
+    s.out("name: \{spec} → \{n.cid!.text()}, changes wait \{n.delay}s (proved at block \{snap.number}, time \{snap.timestamp})"
+          + (snap.anchored ? "" : " (no anchor)"));
+    if (n.pending is not null) { s.out("      pending: \{n.pending!.text()} from \{n.effectiveAt}"); }
+    if (n.pendingDelay >= (0 as i64)) { s.out("      pending: a delay of \{n.pendingDelay}s from \{n.delayAt}"); }
+    string why = delayRefusal(follow, n.delay, n.pendingDelay, n.delayAt);
+    if (why != "") { s.out("not followed: \{why}"); s.out("REFUSED"); return ended(s, 4, n.cid, anchorHex); }
+    c = n.cid!;
+  } else if (q.subject.indexOf("ens:") == 0) {
+    // An ENS name: whatever its contenthash says at the anchored block, read by proof.
+    string name = q.subject.slice(4, q.subject.len());
+    string why = ensRefusal(follow);
+    if (why != "") { s.out("name: \{name}: not followed: \{why}"); s.out("REFUSED"); return ended(s, 4, none, anchorHex); }
+    i32 colon = q.rpc.indexOf(":");
+    if (colon < 1) { s.warn("ens:NAME needs --rpc HOST:PORT"); return ended(s, 2, none, anchorHex); }
+    i32 port = decimal(q.rpc.slice(colon + 1, q.rpc.len())) as~ i32;
+    u8[]? reg = unhex(q.ensRegistry == "" ? ENS_REGISTRY() : q.ensRegistry);
+    u8[]? rc = unhex(q.ensRegistryCode == "" ? ENS_REGISTRY_CODE() : q.ensRegistryCode);
+    u8[]? vc = unhex(q.resolverCode == "" ? PUBLIC_RESOLVER_CODE() : q.resolverCode);
+    u8[]? an = anchorHex == "" ? u8[]() : unhex(anchorHex);
+    if (reg is null || rc is null || vc is null || an is null) { s.warn("the ENS flags are hex"); return ended(s, 2, none, anchorHex); }
+    match (ensContent(sys.net(), name, q.rpc.slice(0, colon), port, reg!, rc!, vc!, an!)) {
+      Err(e): { s.warn("the name: \{e}"); s.out("REFUSED"); return ended(s, 3, none, anchorHex); }
+      Ok(ans): {
+        asOf.block_(ans.block, ans.time);
+        i32 nl = ans.out.indexOf("\n");
+        s.out("name: \{name} → " + (nl < 0 ? ans.out : ans.out.slice(0, nl)));
+        if (nl >= 0) { s.out("      " + ans.out.slice(nl + 1, ans.out.len())); }
+        if (ans.code != 0) { s.out("REFUSED"); return ended(s, 3, none, anchorHex); }
+        match (parseCid(ans.cid)) { Err(e): { s.warn(e); return ended(s, 1, none, anchorHex); } Ok(x): { c = x; } }
+      }
+    }
+  } else {
+    match (parseCid(q.subject)) { Err(e): { s.warn(e); return ended(s, 1, none, anchorHex); } Ok(x): { c = x; } }
+  }
+
+  // 3 and 4. The chain, if a registry is named, and the decision.
+  match (readPolicyFile(q.policy)) {
+    Err(e): { s.warn(e); return ended(s, 1, c, anchorHex); }
+    Ok(p): {
+      Chain chain = Chain.none();
+      if (q.rpc != "" && q.registry != "") {
+        // Fail closed: when the chain was asked for and cannot answer, what it would say is unknown.
+        match (endpointOf(q.rpc, q.registry, q.codeHash, anchorHex)) {
+          Err(e): { s.warn(e); s.out("REFUSED"); return ended(s, 3, c, anchorHex); }
+          Ok(ep): {
+            match (chainFor(sys.net(), ep, asksFor(p, ix, r, c))) {
+              Err(e): { s.warn("the chain: \{e}"); s.out("REFUSED"); return ended(s, 3, c, anchorHex); }
+              Ok(pr): {
+                chain = pr.chain;
+                asOf.block_(pr.at.number, pr.at.timestamp);
+                s.out("chain: block \{pr.at.number}, \{pr.at.slots.len()} slot(s) proved" + (pr.at.anchored ? "" : " (no anchor)")
+                      + "; \{chain.revokedId.len()} revocation(s), \{chain.rejected.len()} rejection(s) set");
+              }
+            }
+          }
+        }
+      }
+      if (asOf.text() != "") { s.out("as of " + asOf.text()); }
+      Decision d = admit(p, ix, r, chain, c, q.role);
+      for (i32 i = 0; i < d.why.len(); i++) { s.out(d.why[i]); }
+      s.out(d.ok ? "ADMITTED" : "REFUSED");
+      return ended(s, d.ok ? 0 : 4, c, anchorHex);
+    }
+  }
+}
+
+/**
+ * The admitted object written out at `out` from its blocks, every one checked against its CID as `r` reads it: a file's
+ * bytes to the file `out`, or a tree's files below the directory `out`. What was written, or why nothing could be.
+ * `claim run --out` uses it, and so does the browser entry, whose files are the browser's own storage.
+ */
+export async Result<string, string> writeOut(Sys sys, Resolver r, Cid c, string out) {
+  u8[] b = try r.block(c);
+  Node n = try readNode(c, b);
+  bool isDir = match (n) { Dir(_): true, Shard(_, _): true, File(_, _, _): false };
+  if (!isDir) {
+    u8[] bytes = try readFile(r, c);
+    match (await sys.writeFile(out, bytes)) { Err(e): { return Result.Err("\{out}: \{e}"); } Ok(_): { } }
+    return Result.Ok("\{c.text()}: \{bytes.len()} bytes, written to \{out}");
+  }
+  FileIn[] tree = try readTree(r, c);
+  FileIn[] files = filesOnly(tree);
+  string[] dirs = emptyDirsOf(tree);
+  for (i32 i = 0; i < dirs.len(); i++) { await sys.files().mkdir(out + "/" + dirs[i], true); }
+  await sys.files().mkdir(out, true);
+  for (i32 i = 0; i < files.len(); i++) {
+    string path = out + "/" + files[i].path;
+    i32 slash = path.len() - 1;
+    while (path.slice(slash, slash + 1) != "/") { slash--; }
+    await sys.files().mkdir(path.slice(0, slash), true);
+    match (await sys.writeFile(path, files[i].content)) { Err(e): { return Result.Err("\{path}: \{e}"); } Ok(_): { } }
+  }
+  return Result.Ok("\{c.text()}: \{files.len()} file(s), written below \{out}");
+}

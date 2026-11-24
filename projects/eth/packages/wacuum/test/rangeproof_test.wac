@@ -1,0 +1,135 @@
+// Range proofs, as snap answers carry them: a run of a trie's entries from an origin, with the proofs of
+// the origin and of the run's last key. Every honest run verifies and says rightly whether there is more;
+// every run with an entry dropped, changed, added or moved does not.
+
+import { Vec, Map } from "core";
+import { hashString, stringEq } from "core";
+import { LiveTrie } from "../src/trie/live.wac";
+import { verifyRange, Range } from "../src/trie/rangeproof.wac";
+import { compareKeys } from "../src/store/tree.wac";
+import { bytesToHex } from "../src/hex.wac";
+import { Check } from "./check.wac";
+
+struct Rng {
+  u64 x;
+
+  u64 next(this) {
+    this.x = this.x ^ (this.x << 13);
+    this.x = this.x ^ (this.x >> 7);
+    this.x = this.x ^ (this.x << 17);
+    return this.x;
+  }
+  i32 below(this, i32 n) { return (this.next() % ((n as@ u32) as u64)) as! i32; }
+  u8[] bytes(this, i32 n) {
+    u8[] b = u8[].filled(n, 0);
+    for (i32 i = 0; i < n; i++) { b[i] = (this.next() & 255) as! u8; }
+    return b;
+  }
+}
+
+/** The union of two proofs, each node once. */
+u8[][] both(u8[][] a, u8[][] b) {
+  Vec<u8[]> out = Vec.create();
+  for (i32 i = 0; i < a.len(); i++) { out.push(a[i]); }
+  for (i32 i = 0; i < b.len(); i++) {
+    bool seen = false;
+    for (i32 k = 0; k < a.len(); k++) { seen = seen || bytesToHex(a[k]) == bytesToHex(b[i]); }
+    if (!seen) { out.push(b[i]); }
+  }
+  return out.toArray();
+}
+
+u8[][] without(u8[][] a, i32 i) {
+  u8[][] out = u8[][].defaulted(a.len() - 1);
+  i32 j = 0;
+  for (i32 k = 0; k < a.len(); k++) {
+    if (k != i) {
+      out[j] = a[k];
+      j++;
+    }
+  }
+  return out;
+}
+
+export string test_honest_runs_verify_and_tampered_ones_do_not() {
+  Check t = Check.create();
+  Rng r = Rng(4141);
+  for (i32 trial = 0; trial < 40; trial++) {
+    i32 n = 1 + r.below(trial < 10 ? 8 : 400);
+    LiveTrie trie = LiveTrie.create();
+    Vec<u8[]> all = Vec.create();
+    Map<string, u8[]> valueOf = Map.create(hashString, stringEq);
+    for (i32 i = 0; i < n; i++) {
+      u8[] k = r.bytes(32);
+      u8[] v = r.bytes(r.below(5) == 0 ? 1 + r.below(2) : 1 + r.below(60));
+      trie.set(k, v);
+      all.push(k);
+      valueOf.set(bytesToHex(k), v);
+    }
+    all.sort((u8[] a, u8[] b) => compareKeys(a, b));
+    u8[] root = trie.hash();
+    // An origin: one of the keys, or between them.
+    u8[] origin = r.below(2) == 0 ? all.get(r.below(all.len())) : r.bytes(32);
+    i32 first = 0;
+    while (first < all.len() && compareKeys(all.get(first), origin) < 0) { first++; }
+    i32 m = first == all.len() ? 0 : 1 + r.below(all.len() - first);
+    u8[][] keys = u8[][].defaulted(m);
+    u8[][] vals = u8[][].defaulted(m);
+    for (i32 i = 0; i < m; i++) {
+      keys[i] = all.get(first + i);
+      vals[i] = valueOf.get(bytesToHex(keys[i]))!;
+    }
+    u8[][] proof = m == 0 ? trie.prove(origin) : both(trie.prove(origin), trie.prove(keys[m - 1]));
+    bool more = first + m < all.len();
+    Range ok = verifyRange(root, origin, keys, vals, proof);
+    t.ok(ok.ok, "trial \{trial}: \{m} of \{n} from the origin verify: \{ok.why}");
+    t.ok(ok.more == more, "trial \{trial}: more is \{more}");
+    if (m >= 1) {
+      t.ok(!verifyRange(root, origin, without(keys, 0), without(vals, 0), proof).ok, "trial \{trial}: without the first");
+      u8[][] changed = u8[][].defaulted(m);
+      for (i32 i = 0; i < m; i++) { changed[i] = vals[i]; }
+      changed[r.below(m)] = r.bytes(7);
+      t.ok(!verifyRange(root, origin, keys, changed, proof).ok, "trial \{trial}: a value changed");
+    }
+    if (m >= 3) {
+      i32 mid = 1 + r.below(m - 2);
+      t.ok(!verifyRange(root, origin, without(keys, mid), without(vals, mid), proof).ok, "trial \{trial}: one from the middle dropped");
+    }
+    if (m >= 2) {
+      // A key made up between two real ones.
+      u8[][] k2 = u8[][].defaulted(m + 1);
+      u8[][] v2 = u8[][].defaulted(m + 1);
+      k2[0] = keys[0];
+      v2[0] = vals[0];
+      u8[] fake = u8[].filled(32, 0);
+      fake.copyFrom(keys[0], 0, 0, 32);
+      fake[31] = fake[31] + 1;
+      bool fits = compareKeys(fake, keys[1]) < 0;
+      k2[1] = fake;
+      v2[1] = [9 as u8];
+      for (i32 i = 1; i < m; i++) {
+        k2[i + 1] = keys[i];
+        v2[i + 1] = vals[i];
+      }
+      if (fits) { t.ok(!verifyRange(root, origin, k2, v2, proof).ok, "trial \{trial}: an entry added"); }
+      // Out of order.
+      u8[][] swapped = u8[][].defaulted(m);
+      for (i32 i = 0; i < m; i++) { swapped[i] = keys[m - 1 - i]; }
+      t.ok(!verifyRange(root, origin, swapped, vals, proof).ok, "trial \{trial}: out of order");
+    }
+    // A run that starts later than it says: the first key skipped, the origin kept.
+    if (m >= 2 && compareKeys(keys[0], origin) > 0) {
+      t.ok(!verifyRange(root, origin, without(keys, 0), without(vals, 0), both(proof, trie.prove(keys[m - 1]))).ok,
+           "trial \{trial}: the first skipped");
+    }
+  }
+  // The whole trie with no proof, and an empty run past the end.
+  LiveTrie small = LiveTrie.create();
+  u8[] k = u8[].filled(32, 1);
+  small.set(k, [5 as u8]);
+  t.ok(verifyRange(small.hash(), u8[].filled(32, 0), [k], [[5 as u8]], u8[][].defaulted(0)).ok, "the whole trie with no proof");
+  u8[] beyond = u8[].filled(32, 200);
+  Range past = verifyRange(small.hash(), beyond, u8[][].defaulted(0), u8[][].defaulted(0), small.prove(beyond));
+  t.ok(past.ok && !past.more, "nothing past the end: \{past.why}");
+  return t.report();
+}

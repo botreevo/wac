@@ -4,17 +4,18 @@
 # and rebuilds). The reference node — reth and Lighthouse — is installed from their own releases by
 # reference.sh, since wacuum cannot sync mainnet yet and the shadow needs a node that has (docs/mainnet.md).
 #
-#     sh preflight.sh && sh install.sh [WAC_ETH_URL]
+#     sh preflight.sh && sh install.sh [WAC_REPO_URL]
 #
 # WAC_URL (environment) is where wac comes from, GitHub by default: the pin names a commit the owner syncs to both
 # GitHub and git.voltrevo.com, and the box may have credentials for only one of them.
 #
-# Layout: /opt/wac (the compiler's source), /opt/wac-eth (this repository), /data/{reth,lighthouse,wacuum}
+# Layout: /opt/wac (the compiler's source), /opt/wac-eth (wac-eth: projects/eth
+# of /opt/wac-repo, wac's repository), /data/{reth,lighthouse,wacuum}
 # (each its own directory on the NVMe disk), and a `wacuum` user that owns /data/wacuum and runs the shadow.
 # Also: the shadow's status each minute as Prometheus metrics (wacuum-status.timer → node_exporter's textfile
 # collector, node_exporter on 127.0.0.1:9100 only), and its log rotated weekly.
 set -eu
-repo=${1:-https://git.voltrevo.com/wac-eth.git}
+repo=${1:-https://github.com/voltrevo/wac.git}
 [ "$(id -u)" -eq 0 ] || { echo "install.sh: run as root" >&2; exit 1; }
 
 apt-get update
@@ -41,9 +42,15 @@ mkdir -p /data/reth /data/lighthouse /data/wacuum /data/wacuum/differs /opt
 chown wacuum:wacuum /data/wacuum /data/wacuum/differs
 
 # wac-eth, then wac at exactly the commit wac-eth's wac.lock pins.
-[ -d /opt/wac-eth/.git ] || git clone "$repo" /opt/wac-eth
+# wac-eth is projects/eth of wac's repository (since 2026-11-24). The repository goes to /opt/wac-repo, whole: its pins
+# into itself are filled out of its own history (tools/deps.sh). /opt/wac-eth is a link to projects/eth in it, so the
+# units and scripts that name /opt/wac-eth are unchanged. A machine installed before has /opt/wac-eth as a clone of
+# wac-eth; that is kept, as /opt/wac-eth.before-monorepo, not deleted.
+if [ -d /opt/wac-eth ] && [ ! -L /opt/wac-eth ]; then mv /opt/wac-eth /opt/wac-eth.before-monorepo; fi
+[ -d /opt/wac-repo/.git ] || git clone "$repo" /opt/wac-repo
 # Owned by the service user after the first install; root's git refuses such a checkout unless told it is safe.
-git -c safe.directory=/opt/wac-eth -C /opt/wac-eth pull --ff-only
+git -c safe.directory=/opt/wac-repo -C /opt/wac-repo pull --ff-only
+ln -sfn /opt/wac-repo/projects/eth /opt/wac-eth
 # The lock as one line, and the commit from the "wac" entry alone: wac.lock lists other imports beside it.
 pin=$(tr '\n' ' ' < /opt/wac-eth/wac.lock | sed -n 's/.*"wac" *: *{[^}]*"commit" *: *"\([0-9a-f]\{40\}\)".*/\1/p')
 [ -n "$pin" ] || { echo "install.sh: no wac commit in wac.lock" >&2; exit 1; }
@@ -59,9 +66,12 @@ git -C /opt/wac checkout --detach "$pin"
 # The binary goes to /usr/local/bin; its package cache is per user, so each user fills its own.
 # Built beside the old one and renamed over it: the running units hold /usr/local/bin/wac open, and a copy onto a
 # running executable fails (Text file busy), which stopped an upgrade here with the units up.
-(cd /opt/wac && ./bootstrap.sh -o /usr/local/bin/wac.new)
+# A pin from before wac moved into projects/wac has it at the root; one from after, at projects/wac.
+src=/opt/wac
+if [ -f /opt/wac/projects/wac/bootstrap.sh ]; then src=/opt/wac/projects/wac; fi
+(cd "$src" && ./bootstrap.sh -o /usr/local/bin/wac.new)
 mv -f /usr/local/bin/wac.new /usr/local/bin/wac
-chown -R wacuum:wacuum /opt/wac-eth
+chown -R wacuum:wacuum /opt/wac-repo
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth && sh tools/deps.sh'
 su -s /bin/sh wacuum -c 'cd /opt/wac-eth/packages/wacuum && wac test --allow-read test'
 # The light-client driver, built once into an executable (the all-wac mode, docs/mainnet.md), and the secret it and

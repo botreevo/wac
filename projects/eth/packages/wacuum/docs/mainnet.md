@@ -216,7 +216,7 @@ project's development containers get from a proxy and a fresh box does not have.
   so root's clones and the service user's `tools/deps.sh` both use it, at install and at every upgrade. (An SSH
   deploy key would need every URL rewritten to SSH; the token keeps the URLs as they are.)
 - **(b) The pinned commits on GitHub.** Andrew pushes wac at the pin (and wac-web at wac's pin) to
-  github.com/voltrevo, and wac-eth too, then runs `install.sh https://github.com/voltrevo/wac-eth.git`. Nothing
+  github.com/voltrevo, and wac-eth too, then runs `install.sh https://github.com/voltrevo/wac-eth.git`. (Since 2026-11-24 wac-eth is projects/eth of `https://github.com/voltrevo/wac.git`, which `install.sh` clones by default.) Nothing
   else changes; the next pin move needs the same again.
 
 `preflight.sh` says which: it fetches each of the four commits from here, as the install will, and FAILs naming any

@@ -9,7 +9,7 @@
 #
 # Needs deno and node 20+ on PATH, and the package cache filled (tools/fill-cache.sh).
 set -eu
-out=$(mkdir -p "${1:?usage: site.sh <out-dir>}" && cd "$1" && pwd)
+out=$(mkdir -p "${1:?usage: pages.sh <out-dir>}" && cd "$1" && pwd)
 cd "$(dirname "$0")/.."
 sh tools/fill-cache.sh
 deno run -A site/tools/syncDemos.ts                                  # builds .cache/wac-deno, then the demos

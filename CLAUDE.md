@@ -39,4 +39,4 @@ not have them — use a full one.
 
 `.github/workflows/ci.yml` runs the pin check on every push and pull request, and `projects/<name>/tools/ci.sh` for
 each project the change touches, with the `wac` that project pins. `pages.yml` publishes one site: wac's at the
-root, a project with `tools/site.sh` under `/<name>/`, and a project whose build fails keeps its last good one.
+root, a project with `tools/pages.sh` under `/<name>/`, and a project whose build fails keeps its last good one.

@@ -3,5 +3,6 @@
 # `wac` this project pins, built by the workflow, and the package cache already filled.
 set -eu
 cd "$(dirname "$0")/.."
+wac task deps
 wac check src
 wac task test

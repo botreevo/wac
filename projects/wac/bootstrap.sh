@@ -157,8 +157,12 @@ if [ -z "$out" ] && [ "$install" -eq 1 ]; then need_profile; fi
 cleanup=
 trap 'test -n "$cleanup" && rm -rf "$cleanup"' EXIT INT TERM
 
+# wac is `projects/wac` in its repository (since the projects moved in beside it), so a clone's root is one
+# level of `projects/` above the tree this builds from.
 if [ -f "bootstrap/boot/l1.l0" ] && [ -d "packages/wac/src" ]; then
   root="$(pwd)"
+elif [ -f "projects/wac/bootstrap/boot/l1.l0" ]; then
+  root="$(pwd)/projects/wac"
 elif [ -f "$(dirname "$0")/bootstrap/boot/l1.l0" ]; then
   root="$(cd "$(dirname "$0")" && pwd)"
 else
@@ -166,9 +170,15 @@ else
     Install git, or clone https://github.com/voltrevo/wac yourself and run ./bootstrap.sh inside it."
   cleanup="$(mktemp -d)"
   say "no clone here — fetching one into $cleanup"
-  git clone -q --depth 1 "${WAC_REPO:-https://github.com/voltrevo/wac.git}" "$cleanup/wac" \
-    || die "could not clone the repository"
-  root="$cleanup/wac"
+  # Only `projects/wac` is checked out, and only its files are downloaded where the server can filter
+  # (GitHub can): the repository holds other projects this build has no use for.
+  repo="${WAC_REPO:-https://github.com/voltrevo/wac.git}"
+  if ! git clone -q --depth 1 --filter=blob:none --sparse "$repo" "$cleanup/wac" 2>/dev/null \
+      || ! git -C "$cleanup/wac" sparse-checkout set projects/wac 2>/dev/null; then
+    rm -rf "$cleanup/wac"
+    git clone -q --depth 1 "$repo" "$cleanup/wac" || die "could not clone the repository"
+  fi
+  root="$cleanup/wac/projects/wac"
 fi
 
 cd "$root"

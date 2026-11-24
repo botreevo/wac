@@ -12,7 +12,7 @@ A C-family language for WebAssembly GC, and the systems stack written in it.
 ## Get it
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/voltrevo/wac/master/bootstrap.sh | sh -s -- --host deno
+curl -fsSL https://raw.githubusercontent.com/voltrevo/wac/master/projects/wac/bootstrap.sh | sh -s -- --host deno
 ```
 
 One line, no clone and no Rust. It builds the compiler from source — through a ladder of five rungs

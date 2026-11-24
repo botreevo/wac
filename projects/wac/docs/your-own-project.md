@@ -8,7 +8,7 @@ does not work yet it says so and names the issue, rather than being left out.
 **One line, no clone, and no Rust:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/voltrevo/wac/master/bootstrap.sh | sh -s -- --host deno
+curl -fsSL https://raw.githubusercontent.com/voltrevo/wac/master/projects/wac/bootstrap.sh | sh -s -- --host deno
 ```
 
 That builds the compiler from source and puts `wac` on your PATH. `--host nodejs` is the same command
@@ -17,7 +17,7 @@ run by node instead. Neither needs cargo, a C++ toolchain, or npm.
 **Without `--host`, you get a native binary**, which is faster and needs Rust:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/voltrevo/wac/master/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/voltrevo/wac/master/projects/wac/bootstrap.sh | sh
 ```
 
 `sh -s --` is how you pass arguments to a script that arrived on standard input; the script's own

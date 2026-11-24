@@ -13,7 +13,7 @@ export WAC
 
 # A dirty tree is refused: the tests would pass against the working copy and the push would carry the
 # last commit, reporting success for work that never left the machine.
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(git status --porcelain -- .)" ]; then
   echo "== uncommitted changes: commit them first, or the push will not include them =="
   git status --short
   exit 1
@@ -26,6 +26,7 @@ for attempt in 1 2 3; do
   # The two wac steps read the sources and write nothing the Deno tests read (those build under `.cache/pages/`
   # and temporary directories), so every verdict is still required and none waits on another. Measured on 4
   # cores, 2026-11-03: about 60s in a row.
+  "$WAC" run --allow-run --allow-read ../repo/cmd/pins.wac -- . || exit 1
   out="$(mktemp -d)"
   "$WAC" check . > "$out/check" 2>&1 & checkPid=$!
   "$WAC" test --allow-read --allow-write test/wac > "$out/wac" 2>&1 & wacPid=$!
@@ -36,7 +37,16 @@ for attempt in 1 2 3; do
   echo "== test/wac ==" && cat "$out/wac"
   rm -rf "$out"
   [ "$check" -eq 0 ] && [ "$tested" -eq 0 ] && [ "$denoStatus" -eq 0 ] || exit 1
-  if git push -u origin "$branch"; then exit 0; fi
+  # **Landed, or what landed is another project's.** The repository holds several projects, each reaching the
+  # others only through pins into its history, so a merge that changes nothing under this directory cannot
+  # change what just passed: push it rather than running everything again.
+  ran=$(git rev-parse HEAD)
+  for round in 1 2 3 4 5; do
+    if git push -q origin "HEAD:$branch"; then exit 0; fi
+    git fetch -q origin "$branch" && git merge -q --no-edit "origin/$branch" || exit 1
+    git diff --quiet "$ran" HEAD -- . || break
+    echo "== what landed is outside this project: pushing the merge without another run =="
+  done
   echo "== push refused: merging what landed and going again ($attempt) =="
 done
 exit 1

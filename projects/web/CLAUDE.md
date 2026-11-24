@@ -35,12 +35,11 @@ at `$WAC_CHROMIUM`, or under `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwri
 
 ## Working agreements
 
-- **This is wac-web: `https://git.voltrevo.com/wac-web.git`, synced by the owner to
-  `https://github.com/voltrevo/wac-web.git`** with the same commits. It was `web.git` until 2026-11-02; the package
-  is still imported as `web`. **Pushing to git.voltrevo.com is the agent's call** once `tools/push.sh` passes, as it
-  is for wac. Nothing goes to GitHub unless the owner says so.
-- **Every pin names GitHub**; run `sh tools/use-mirror.sh` once per machine so `git` fetches them from
-  git.voltrevo.com, which has the commits first.
+- **This is `projects/web` of wac's repository**, one project among several, with its own gate and versions;
+  the rules that hold across them — remotes, pushing, pins, the pin check — are in the repository's root
+  `CLAUDE.md`. It was wac-web (`web.git` before 2026-11-02) until it moved in, with its history; the package is
+  still imported as `web`, by a pin naming this repository with `subdir: ./projects/web`. Push through
+  `tools/push.sh`.
 - **wac's rule holds here: there are no users and no legacy.** When nothing needs a thing, delete it —
   not deprecate it, not keep it behind a flag. If you find yourself proposing to keep something, say
   what would break, and check that it is not just a test you could edit.

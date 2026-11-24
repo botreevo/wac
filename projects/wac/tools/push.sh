@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 # push would carry the last commit, so it reports success for work that never left the
 # machine — which is worse than failing, because there is nothing to notice. I did this
 # within an hour of writing the script.
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(git status --porcelain -- .)" ]; then
   echo "== uncommitted changes: commit them first, or the push will not include them =="
   git status --short
   exit 1
@@ -212,11 +212,18 @@ if [ "${WAC_GATE_DEPS_ANYWAY:-}" != "1" ] && ! bash tools/gatedeps.sh; then
   exit 1
 fi
 
-# **The git imports `wac.lock` pins, in the cache, before anything compiles a page.** `web` is a
-# repository of its own since 2026-10-29, pinned on GitHub and fetched from git.voltrevo.com through `git`'s
-# setting (`tools/use-mirror.sh`), which `wac update`'s fetcher does not follow — so `git` does. After the pull, because the pull is what moves the lock.
+# **The git imports `wac.lock` pins, in the cache, before anything compiles a page.** `web` is
+# `projects/web` of this repository, pinned at a commit in its history, so the cache is written out of that
+# history (`projects/repo/tools/fill-cache.sh`). After the pull, because the pull is what moves the lock.
 if ! sh tools/fill-cache.sh; then
   echo "== the locked git imports could not be fetched: nothing ran ==" >&2
+  exit 1
+fi
+
+# **Every pin into this repository is in its history** (`projects/repo/cmd/pins.wac`): a pin to a commit that
+# was rebased away, or never merged, works here and nowhere else. Milliseconds, and local git only.
+if ! "$WAC" run --allow-run --allow-read ../repo/cmd/pins.wac -- .; then
+  echo "== a pin above is not in this repository's history: nothing ran ==" >&2
   exit 1
 fi
 
@@ -658,6 +665,25 @@ for attempt in 1 2 3; do
   # again, since a docs-only push takes no lock and needs seconds. That rerun is most of what
   # `issues/system/0213a` and `0154` measured. A push lost even then merges once more and asks again; the
   # first answer of no goes round the loop and runs the suite, as before.
+  # **A merge that brought only other projects' work is pushed without another suite, the same way.** This
+  # repository holds several projects, each reaching the others only through pins to commits already in its
+  # history, so a commit that changes nothing under projects/wac cannot change what this suite tested — and
+  # without this, every push by any other project would send this gate round its twenty minutes again.
+  for otherRound in 1 2 3 4 5; do
+    git diff --quiet "$tested" HEAD -- . || break
+    echo "== what landed is outside projects/wac, so the tested code is unchanged: pushing the merge =="
+    if git push --quiet origin HEAD:master 2>/dev/null; then
+      echo "== pushed $(git rev-parse --short HEAD), the merge of $(git rev-parse --short "$tested") with other projects' work =="
+      rm -f "$log" "$log".*
+      starveClear
+      exit 0
+    fi
+    echo "== rejected again ($otherRound): merging what landed =="
+    if ! git pull --no-rebase --no-edit --quiet origin master; then
+      echo "== merge needs hands: resolve, then run this again =="
+      exit 1
+    fi
+  done
   for docsRound in 1 2 3 4 5; do
     said=$("$WAC" run --allow-read --allow-run tools/docsOnly.wac -- "$tested" HEAD 2>&1); docsOnly=$?
     printf '%s\n' "$said" | sed 's/^/   /'

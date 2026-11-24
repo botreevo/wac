@@ -53,18 +53,18 @@ program that used to compile has stopped.
 and 79 numbers collide. A reference to "wac 0076" means `issues/lang/`, and "wac-mono 0103" means
 `issues/system/`. New issues continue whichever sequence they belong to.
 
-**`web` is not here: since 2026-10-29 it is a repository of its own — wac-web, `https://github.com/voltrevo/wac-web.git`
-(`web.git` on git.voltrevo.com until 2026-11-02)** — with its history, its app template (`templates/webapp` was
-here) and a gate of its own that runs in half a minute. The site and the page examples under `packages/` import it
-as `web`, pinned to one commit by `wac.json5` and `wac.lock`; moving that pin is how a change there reaches here,
-and it goes through this gate. **Pins name GitHub**, where the owner syncs the same commits — except wac-web's own,
-which names git.voltrevo.com while GitHub's copy lags (2026-11-17: it stops at e642c79, before every commit pinned
-here since; `wac.json5` says so); development fetches
-them from git.voltrevo.com, which has them first, through one git setting (`sh tools/use-mirror.sh`, once per
-machine — `wac update`'s fetcher follows it too, `packages/wacpkg/src/mirror.wac`). And `sh tools/fill-cache.sh` puts the locked commit in the
-cache with `git` — the gate runs it, and a fresh checkout runs it once after `./bootstrap.sh`. A page is built from here with `tools/wac/buildpage.wac`.
+**wac is `projects/wac` of its repository**, beside the projects built on it (`projects/web`, `projects/eth`,
+`projects/desktop` and others); each has its own gate and versions, and the rules that hold across them are in the
+repository's root `CLAUDE.md`. This gate runs from here and only this project's changes send it round again.
 
-**Ethereum is not here either: since 2026-11-09 it is wac-eth, `https://git.voltrevo.com/wac-eth.git`.**
+**`web` is not here: it is `projects/web`** — a separate project since 2026-10-29 (wac-web, `web.git` before
+2026-11-02), with its history, its app template (`templates/webapp` was here) and a gate of its own that runs in half
+a minute. The site and the page examples under `packages/` import it as `web`, pinned to one commit by `wac.json5`
+and `wac.lock` with `subdir: ./projects/web`; moving that pin is how a change there reaches here, and it goes through
+this gate. `sh tools/fill-cache.sh` puts the locked commit in the cache out of this repository's history — the gate
+runs it, and a fresh checkout runs it once after `./bootstrap.sh`. A page is built from here with `tools/wac/buildpage.wac`.
+
+**Ethereum is not here either: since 2026-11-09 it is wac-eth, now `projects/eth`.**
 `ssz`, `lightclient`, `rlp`, `abi`, `ens`, `mpt` and `ethrpc` moved there with their history, with design 0003 and
 the issues about them (0063, 0064, 0066, 0084–0086, 0119), beside wacuum and wacuum-devnet, which joined it from
 their own repositories. wac-eth pins this repository once and imports what is not Ethereum's through `lib.wac` —

@@ -13,9 +13,9 @@ good deal of it has landed upstream.
 
 ## Working agreements
 
-- **Pushing.** Since 2026-10-28 this repository lives beside wac as a bare repo on the shared machine
-  (`~/bare-repos/wac-desktop.git`), and pushing finished work there is the agent's call, as it is for wac
-  itself. Nothing goes to GitHub unless the owner says so.
+- **This is `projects/desktop` of wac's repository**, one project among several, with its own gate and
+  versions; the rules that hold across them — remotes, pushing, pins, the pin check — are in the repository's
+  root `CLAUDE.md`. It was `wac-desktop.git` until it moved in, with its history.
 - **Ask before a big direction change.** Features have been chosen together, from short lists of
   options with a recommendation.
 - **Icons are SVG `data:` URLs used as CSS masks** (`src/style.wac`), by the owner's choice.
@@ -49,17 +49,14 @@ should be built from the wac commit (see README). Change a pin's refs and the lo
   build's twelve page builds and `tools/wacbin.py` run side by side too, for the same reason: each writes only its own
   output directory, and `site.wac`, which indexes them all, runs after.
 
-- **Pins name GitHub** (`https://github.com/voltrevo/`), where the owner syncs the same commits. During development
-  they are on git.voltrevo.com first: **run `sh tools/use-mirror.sh` once per machine**, so `git` fetches GitHub's
-  URLs from there. `wac update`'s own fetcher does not follow it, so **`tools/fill-cache.sh`, not `wac update`**.
+- **Pins name this repository**, at commits in its history: wac, `projects/web` and `projects/ide`.
+  **`tools/fill-cache.sh`, not `wac update`**, puts them in the package cache, out of that history.
 - `test:desk`, `test:stackfall`, `test:stackfall-audio`, `test:mandelbrot`, `test:paint`, `test:pip`, `test:settings`, `test:phone` and `test:drops` drive Chromium with Playwright against `dist/`, so **build first**.
   All of them pass at the latest commit (120 unit tests, 112 desktop checks, 18 drop cases, 12 Paint steps). The build makes the
   desktop, each of its apps (`src/apps/`, and the Archive Explorer) and the `wac` command for the site
   (`tools/wacbin.py`), then `site.wac`; `test:desk` serves `dist/` as a site, builds the programs in `samples/` and
   runs them, so it needs `wac` on `PATH`.
-- `sh tools/ci-build.sh` is the from-nothing build GitHub Actions runs, from GitHub; with the mirror set, it runs
-  here from git.voltrevo.com the same way. Sync wac, wac-web and wac-ide to GitHub before this repository, or its
-  run finds a pinned commit missing.
+- `sh tools/ci-build.sh` is the from-nothing build the repository's Pages workflow runs for `/desktop/`.
 - Run unit tests with `wac task test`, which grants what they need; `wac test --allow-read test/one_test.wac`
   runs one file. A test file importing a namespace member from `"wac"` (`fs.ProcTable`) needs a wac from
   `3792c730d` on: before it, its tests taking a `Sys` were silently skipped.

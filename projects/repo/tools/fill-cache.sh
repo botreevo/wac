@@ -11,7 +11,12 @@
 # straight out of local history with `git archive` — the commit is already here, and the pin check
 # (projects/repo/cmd/pins.wac) is what makes sure it is. Anything else is fetched with git, falling back to
 # git.voltrevo.com for a GitHub URL whose commit GitHub does not have: older pins name repositories that only
-# the mirror holds. A dependency's own lock is followed at its `subdir`, so transitive pins are filled too.
+# the mirror holds. A dependency's own lock is followed at its `subdir`, so transitive pins are filled too —
+# **as well as can be**: a pin only a dependency names may be one nothing here reaches (wac resolves imports as a
+# build reaches them, and wac's own lock pins `web` for its site alone), and may name a repository that needs
+# credentials, as git.voltrevo.com does from a CI runner. So one of those that cannot be fetched is a warning; a
+# pin in a lock given on the command line must be filled, or this fails. A build that does reach a missing one
+# stops at it, saying it is not in the cache.
 set -eu
 top=$(git rev-parse --show-toplevel)
 canon=$(sed -n 1p "$top/projects/repo/repository.txt")
@@ -48,7 +53,7 @@ entries() {
   done
 }
 
-fill() {   # lock
+fill() {   # lock depth
   entries "$1" | sort -u | while read -r url commit sub; do
     dest="$cache/$(escape "$url")/$commit"
     if [ ! -f "$dest/pack.pack" ]; then
@@ -59,8 +64,14 @@ fill() {   # lock
         tmp=$(mktemp -d); git -C "$tmp" init -q
         if ! git -C "$tmp" fetch -q --depth 1 "$url" "$commit" 2>/dev/null; then
           mirror=$(printf '%s' "$url" | sed -n 's|^https://github.com/voltrevo/|https://git.voltrevo.com/|p')
-          [ -n "$mirror" ] || { echo "fill-cache: cannot fetch $commit from $url" >&2; exit 1; }
-          git -C "$tmp" fetch -q --depth 1 "$mirror" "$commit"
+          if [ -z "$mirror" ] || ! git -C "$tmp" fetch -q --depth 1 "$mirror" "$commit" 2>/dev/null; then
+            rm -rf "$tmp" "$dest"
+            if [ "$2" -gt 0 ]; then
+              echo "fill-cache: warning: $url $commit, which $1 pins, could not be fetched; left out" >&2
+              continue
+            fi
+            echo "fill-cache: cannot fetch $commit from $url${mirror:+ or $mirror}" >&2; exit 1
+          fi
         fi
         git -C "$tmp" archive "$commit" | tar -x -C "$dest"
         rm -rf "$tmp"
@@ -69,7 +80,7 @@ fill() {   # lock
       echo "fill-cache: $url $commit"
     fi
     inner="$dest/${sub#./}/wac.lock"
-    if [ -f "$inner" ]; then fill "$inner"; fi
+    if [ -f "$inner" ]; then fill "$inner" $(($2 + 1)); fi
   done
 }
 
@@ -77,4 +88,4 @@ if [ -n "$list" ]; then
   for lock in "$@"; do entries "$lock"; done | while read -r url commit sub; do echo "$url $commit"; done | sort -u
   exit 0
 fi
-for lock in "$@"; do fill "$lock"; done
+for lock in "$@"; do fill "$lock" 0; done

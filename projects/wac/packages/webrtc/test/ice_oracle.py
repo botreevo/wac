@@ -2,7 +2,7 @@
 # aioice's STUN parser and candidate reader, as an oracle for `src/ice.wac`.
 #
 # **This is the reference, not the test.** aioice is the ICE implementation inside aiortc; the
-# interesting half is that `parse_message` takes an integrity key and *raises* when it disagrees, so
+# interesting half is that it checks MESSAGE-INTEGRITY against a key (`parse_authenticated`, below), so
 # a check it accepts is one it authenticated with its own code against the password we published.
 # Reading our bytes back with our own reader would agree with itself whatever either did.
 #
@@ -29,7 +29,23 @@ import binascii
 import sys
 
 from aioice import Candidate
-from aioice.stun import parse_message
+from aioice.stun import Message, parse_message
+
+
+def parse_authenticated(data, key):
+    """aioice's parse, then its MESSAGE-INTEGRITY check under `key`, raising when they disagree.
+
+    aioice 0.13 moved the check out of `parse_message(…, integrity_key=…)` into
+    `Message.check_message_integrity`, which also fails a message with no MESSAGE-INTEGRITY at all — stricter
+    than before, and right here: everything judged with a key is meant to be signed. Older releases still have
+    only the keyword, so both are spoken (a gate machine need not upgrade on the day this lands).
+    """
+    if hasattr(Message, "check_message_integrity"):
+        m = parse_message(data)
+        if not m.check_message_integrity(key):
+            raise ValueError("STUN message integrity does not match")
+        return m
+    return parse_message(data, integrity_key=key)
 
 out = []
 
@@ -52,7 +68,7 @@ for line in lines:
     try:
         if op == "check":
             msg_hex, key, username, priority, attr, tiebreak, nominated = parts[1:8]
-            m = parse_message(binascii.unhexlify(msg_hex), integrity_key=key.encode())
+            m = parse_authenticated(binascii.unhexlify(msg_hex), key.encode())
             eq("message method", m.message_method.value, 1)
             eq("message class", m.message_class.value, 0)
             # The peer's fragment first — a check names the receiver, not the sender.
@@ -67,7 +83,7 @@ for line in lines:
 
         elif op == "refused":
             try:
-                parse_message(binascii.unhexlify(parts[1]), integrity_key=parts[2].encode())
+                parse_authenticated(binascii.unhexlify(parts[1]), parts[2].encode())
                 say("aioice accepted a check signed with the wrong password, so acceptance elsewhere "
                     "proves nothing")
             except Exception:

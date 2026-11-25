@@ -25,7 +25,7 @@
 # lines, because a caller reads them by position and a disagreement elsewhere would shift them.
 #
 #   parse       <msg-hex> <method> <class> <tid-hex> <software>   — judges; `-` for no SOFTWARE
-#   verify      <msg-hex> <key-hex> <software>                    — judges, with integrity_key set
+#   verify      <msg-hex> <key-hex> <software>                    — judges, with MESSAGE-INTEGRITY checked under the key
 #   fingerprint <msg-hex>                                         — judges; aioice validates it
 #   build       <tid-hex>                       →  `built <hex>`  a response with XOR-MAPPED-ADDRESS
 #   sign        <tid-hex> <key-hex>             →  `built <hex>`  a request with integrity
@@ -36,6 +36,22 @@ import binascii
 import sys
 
 from aioice import stun
+
+
+def parse_authenticated(data, key):
+    """aioice's parse, then its MESSAGE-INTEGRITY check under `key`, raising when they disagree.
+
+    aioice 0.13 moved the check out of `stun.parse_message(…, integrity_key=…)` into
+    `stun.Message.check_message_integrity`, which also fails a message with no MESSAGE-INTEGRITY at all — stricter
+    than before, and right here: everything judged with a key is meant to be signed. Older releases still have
+    only the keyword, so both are spoken (a gate machine need not upgrade on the day this lands).
+    """
+    if hasattr(stun.Message, "check_message_integrity"):
+        m = stun.parse_message(data)
+        if not m.check_message_integrity(key):
+            raise ValueError("STUN message integrity does not match")
+        return m
+    return stun.parse_message(data, integrity_key=key)
 
 out = []
 emit = []
@@ -67,10 +83,10 @@ for line in lines:
             eq("SOFTWARE", "-" if got is None else got, want)
 
         elif op == "verify":
-            # `integrity_key` makes aioice recompute the HMAC over the message with the header
-            # length set as though MESSAGE-INTEGRITY were present, and raise if it disagrees.
+            # aioice recomputes the HMAC over the message with the header length set as though
+            # MESSAGE-INTEGRITY were present, and `parse_authenticated` raises if it disagrees.
             key = binascii.unhexlify(parts[2])
-            m = stun.parse_message(binascii.unhexlify(parts[1]), integrity_key=key)
+            m = parse_authenticated(binascii.unhexlify(parts[1]), key)
             want = parts[3] if len(parts) > 3 else "-"
             got = m.attributes.get("SOFTWARE")
             eq("SOFTWARE on the verified message", "-" if got is None else got, want)

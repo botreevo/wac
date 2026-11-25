@@ -379,7 +379,8 @@ Things worth knowing when writing wac, found while building this:
 
 - `from` is a keyword (`import ... from`), so it cannot be a variable or
   parameter name. The resulting parse error can point tens of lines away.
-- There are no top-level constants; use a small function instead.
+- Module-level constants are written `static` (`static u32[] T = [...]`); the
+  initialiser runs at compile time. `const` at module scope is refused.
 - No trailing comma in a parameter list.
 - `while (true) { ... return x; }` does not count as returning on all paths —
   the checker has no reachability analysis for it. Use a loop condition and a

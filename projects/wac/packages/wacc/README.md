@@ -158,7 +158,8 @@ TS except for astral characters, which TS counts as two) or to declare byte colu
 correct and adjust the reference. Deferred until rung 1 measures how often it
 actually differs.
 
-**Token kinds have to be functions.** No module-level constants, so ~80 token kinds
+**Token kinds have to be functions.** wac-L5, which compiles wacc, has no module-level
+constants (wac has `static`; the rung does not), so ~80 token kinds
 become ~80 zero-argument functions. Mechanical, but it is the clearest measurement
 yet of that gap: an enum of 80 variants costs 80 function declarations, and the
 numbering has to be kept in sync with the harness by hand.
@@ -4251,7 +4252,7 @@ nothing else here can.
 Worth recording precisely, since measuring this is the point.
 
 **83 token kinds became 83 zero-argument functions** (`kinds.wac`, 264 lines) with
-no module-level constants. The numbering has to match the reference's union order,
+no module-level constants on wac-L5. The numbering has to match the reference's union order,
 so the test derives that order from `wacLex.ts` at run time rather than trusting a
 copy — a hand-synced enum would drift silently.
 

@@ -319,8 +319,9 @@ how much each cost:
    gap for months and *this file* was the example most often cited. The gap was
    real; the fix pays for code reuse, not for speed, and the container it was argued
    from is the one that wants to stay hand-written.
-4. **No module-level constants.** Kind tags are zero-argument functions; the
-   powers-of-ten table is a `switch` returning literals.
+4. **No module-level constants — no longer true.** wac has `static` now. When
+   this was written, kind tags were zero-argument functions and the powers-of-ten
+   table was a `switch` returning literals.
 5. **No sum types — fixed.** `JsonValue` is now an `enum` and every fold is a
    `match`, so a forgotten case is a compile error rather than a runtime `trap`. It
    replaced a base struct, an `i32 kind`, six tag constants, a `switch` and an `as!`

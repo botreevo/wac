@@ -475,9 +475,9 @@ the clearest case: no tables, no field arithmetic, just sixteen `u32` words.
 
 Two places wac's shape shows through:
 
-- **No module-level constants.** SHA-256's 64 round constants come from a
-  function that builds an array. It is called once per digest rather than once
-  per block, or a long message would rebuild the table every 64 bytes.
+- **No module-level constants — fixed.** SHA-256's 64 round constants were a
+  function that built an array, called once per digest so a long message would
+  not rebuild the table every 64 bytes. They are a `static u32[] K` now.
 - **No multiple returns and no out-parameters.** ChaCha20's quarter round takes
   four *indices* into the state array rather than four words, because the array
   is the only way to hand four values back.

@@ -1,6 +1,6 @@
 # 0354a — two stale language claims in comments, and a measurement that says the sweep is not worth it
 
-- **Status:** open
+- **Status:** closed 2026-11-25 (cloud) — both sentences say the real reason; five other stale copies of the constants claim corrected
 - **Reported by:** agent-a
 - **Date:** 2026-09-05
 - **Kind:** bug
@@ -99,3 +99,20 @@ sweep, by making `case relayBegin():` stop compiling.
   is wider.
 - `issues/lang/0269a` — requiring `switch` cases to be constant, which is what would force the issue.
 - `issues/system/0356a` — the same rot in cross-references, and a check that catches four of it.
+
+## Resolution
+
+Closed 2026-11-25. Both sentences now give the real reason, and nothing was converted:
+
+- `packages/wacc/src/kinds.wac` says the constraint is wac-L5's. L5 has gained `static` at module
+  scope since this was filed, but only with a zero initialiser (`bootstrap/boot/l5.l4`, *"`static`
+  at module scope is consumed and otherwise ignored"*), so the function form is still forced.
+  `packages/wacc/README.md`'s two copies of the claim say the same.
+- `packages/fmt/src/atof.wac`'s `bisect32` gives `f32.fromBits` as the reason it is not generic.
+
+The same false claim was also in five places this issue did not list. Each one is corrected where it
+was advice and marked as history where it was a record: `packages/gzip/README.md` (advice: *"use a
+small function instead"*), `packages/crypto/README.md` (SHA-256's `K` has been a `static u32[]` for
+a while), `packages/json/README.md`, and `packages/fmt`'s README and `ftoa.wac` on why not Ryu. The
+module-scope keyword is `static` now, not `const`; this issue predates the rename. `projects/git/vendor/wac` is a vendored copy and keeps its text.
+

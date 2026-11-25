@@ -55,8 +55,9 @@ subtract, multiply by a small constant and shift left, and finds each digit by
 trial subtraction, so there is no division and no FixedBig×FixedBig multiply.
 
 Ryu would be faster and needs no bignum, but wants two tables of ~600 128-bit
-constants; with no module-level constants those become a `switch` of 1200 literals.
-Formatting is not a hot path.
+constants. When this was chosen, wac had no module-level constants and those would
+have been a `switch` of 1200 literals; they could be `static` arrays now. Formatting
+is still not a hot path.
 
 Three details carry the correctness, and each was found by a failing case rather
 than reasoned about up front:
